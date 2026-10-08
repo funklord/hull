@@ -17,6 +17,11 @@ ascii_exclude_markdown = true
 
 # A fraction of every path git lists: the gated count must be at least
 # this share, so an edit that collapses the selection fires while adding
-# files never does. Half the ratio measured when the gate was added
-# (8 of 8, 2026-10-08).
-floor = 0.5
+# files never does. Half the ratio last measured: 16 of 19, 2026-10-09,
+# when the reader arrived with a submodule git lists as one path.
+floor = 0.42
+
+# situ's schemas and its committed contract files are text this tree
+# writes, so they get the whitespace, final-newline and ASCII checks.
+# `.map` is in the defaults already; naming the list replaces it.
+text_suffixes = [".md", ".json", ".toml", ".cfg", ".map", ".situ", ".wire"]

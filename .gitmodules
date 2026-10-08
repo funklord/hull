@@ -1,0 +1,3 @@
+[submodule "vendor/situ"]
+	path = vendor/situ
+	url = https://github.com/funklord/situ.git

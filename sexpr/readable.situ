@@ -1,0 +1,66 @@
+// hull's readable s-expressions: hull.conf and every other file a person
+// edits (project.md section 4.1). One form at a time; the run of forms that
+// makes a list, and every rule about which bytes may follow which, is
+// sexpr.c's walk -- situ frames a form and leaves its elements to the
+// caller, as it does for any run of structs.
+//
+// Started from situ's example/sexpr and differing from it in three places,
+// each measured: strings carry `[escape]`, without which `"x\"y"` frames as
+// two forms; a `;` comment is a form of its own, because a lead is single
+// bytes and a comment is a run; and `#...#` octets are a form, for atoms
+// that are not printable text (A.1).
+
+target buffer;
+endian big;
+encoding ascii | utf8;
+
+whitespace ' ' | '\t' | '\r' | '\n';
+
+// The first byte decides the kind, and `peek` leaves it to the arm. A
+// symbol has no opening byte and is the default for that reason.
+//
+// `[depth]` counts structs, and a level of parens is two of them (form,
+// then list), so 64 is 32 levels of lists -- HULL_SEXPR_MAX_DEPTH.
+struct form [depth = 64] {
+	peek u8  kind  skip;
+	variant body switch (kind) {
+		case '(':  list     as_list;
+		case '"':  text     as_text;
+		case ';':  comment  as_comment;
+		case '#':  octets   as_octets;
+		default:   symbol   as_symbol;
+	}
+}
+
+struct list [depth = 64] {
+	u8    open;
+	form  items[]  until ")";
+}
+
+// Escapes are framed here and decoded by the reader, which also refuses
+// any escape but the four section 4.1 names.
+struct text {
+	u8  open  skip;
+	u8  chars[]  until "\"" [escape = "\\"];
+}
+
+// To the end of the line. A comment on the last line of a file needs the
+// newline after it: `until` has no end-of-buffer alternative, and situ was
+// told so (situ suggestion/hull.md, 8).
+struct comment {
+	u8  open  skip;
+	u8  chars[]  until "\n";
+}
+
+// Hexadecimal between `#` signs: Rivest's notation for an atom that is not
+// printable text. The reader checks the digits.
+struct octets {
+	u8  open  skip;
+	u8  digits[]  until "#";
+}
+
+// Anything up to whitespace, a paren, a quote or a comment. `before`,
+// because the byte that ends a symbol belongs to whatever comes next.
+struct symbol {
+	u8  name[]  before ' ' | '\t' | '\r' | '\n' | '(' | ')' | '"' | ';';
+}

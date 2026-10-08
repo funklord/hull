@@ -17,16 +17,21 @@ each of them.
 
 ## Status
 
-Design only. Nothing is built yet. `project.md` is the design, including
-the `hull.conf` schema reference, and `hull_engine.h` is a draft of the C
-plugin interface that engines implement.
+Mostly design. `project.md` is the design, including the `hull.conf`
+schema reference. The first code is the s-expression reader in `sexpr/`,
+generated in part by [situ](https://github.com/funklord/situ) from two
+schemas, and `hull_engine.h` is a draft of the C plugin interface that
+engines implement.
 
-## Checks
+## Building
 
 ```sh
-make check   # the style gate, then the gate's own tests
+make         # the reader; fetches vendor/situ the first time
+make check   # the style gate, the situ contracts, then the tests
 make hooks   # install the commit-msg hook
 ```
+
+Build with make for now: fmake does not yet find the vendored situ.
 
 ## Copyright
 

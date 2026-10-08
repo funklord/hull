@@ -1,0 +1,31 @@
+// hull's canonical s-expressions: the form that is hashed, stored and
+// signed (project.md A.1), and the agent protocol's messages (B.2).
+// Rivest's SPKI encoding: an atom is its decimal length, a colon and the
+// bytes; a list is atoms and lists in parentheses; there is no whitespace
+// and nothing else. As in readable.situ, situ frames one form and the walk
+// over a list's elements is sexpr.c's.
+
+target buffer;
+endian big;
+
+// No `skip`: canonical form has no leads, so a space where a form should
+// start is read as the start of an atom, and refused there.
+struct form [depth = 64] {
+	peek u8  kind;
+	variant body switch (kind) {
+		case '(':  list  as_list;
+		default:   atom  as_atom;
+	}
+}
+
+struct list [depth = 64] {
+	u8    open;
+	form  items[]  until ")";
+}
+
+// `[minimal]` refuses a leading zero, which is what makes the length's
+// spelling unique; ten digits is every u32.
+struct atom {
+	decimal u32  length  until ":" max 10 [minimal];
+	u8           bytes[length];
+}
