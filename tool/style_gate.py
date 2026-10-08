@@ -2081,7 +2081,17 @@ def main(argv: list[str]) -> int:
 		for problem in problems:
 			print(problem, file=sys.stderr)
 		if problems:
-			print(f"\n{len(problems)} documentation inconsistency(ies)", file=sys.stderr)
+			# The size goes on the FAILURE line too, and that is the whole
+			# point rather than a nicety: this mode returns here, so a tree
+			# with an inconsistency never reached the report below and never
+			# saw its own figure. The documents most worth measuring are the
+			# ones with something wrong in them -- measured 2026-10-09, tde
+			# was the one red tree of twenty-one and the only one the new
+			# figure could not reach.
+			size = doc_size(counts).lstrip(", ")
+			where = f"{cfg['doc_file']}" + (f" ({size})" if size else "")
+			print(f"\n{len(problems)} documentation inconsistency(ies) "
+			      f"in {where}", file=sys.stderr)
 			return 1
 		# The population, for the same reason `check` prints its file count
 		# and refuses a collapsed list: a verdict with no count cannot tell

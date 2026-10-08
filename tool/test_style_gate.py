@@ -1172,6 +1172,27 @@ class DocsModeReportsWhatItRead(unittest.TestCase):
 		                    "project.md": "# One\n## Two"})
 		self.assertIn("2 line(s)", out)
 
+	def test_a_FAILING_document_still_reports_its_size(self):
+		"""The mode returns on the first problem, so before this the trees
+		with something wrong in them were the only ones that never saw
+		their own figure -- and those are the ones worth measuring.
+		Measured 2026-10-09: tde was the one red tree of twenty-one."""
+		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                     "project.md": "# One\n# One\n"})
+		self.assertNotEqual(rc, 0, out)
+		self.assertIn("heading repeats", out)
+		self.assertIn("2 line(s)", out)
+
+	def test_a_MISSING_document_reports_no_size_and_does_not_crash(self):
+		"""The other side of the same line: there is nothing to measure, so
+		it says nothing rather than reporting zero, which would read as a
+		document that exists and is empty."""
+		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n"})
+		self.assertNotEqual(rc, 0, out)
+		self.assertIn("no such file", out)
+		self.assertNotIn("line(s)", out)
+		self.assertNotIn("token", out)
+
 	def test_a_repeated_section_NUMBER_is_reported(self):
 		"""A number is an identifier, and the repeat check above cannot
 		see one: two sections carrying 130 with different titles are
