@@ -412,6 +412,11 @@ are expected to be regenerated from situ descriptions (`project.md`
 section 3.12); a generated replacement becomes exempt per the header above.
 Its indentation was converted from two spaces to tabs when this copy was
 added, proved by expanding each leading tab back to two spaces and
-recovering the original byte for byte.
+recovering the original byte for byte. Its comments were transliterated
+to ASCII when `ascii_only` was turned on, proved by stripping comments
+from both versions and comparing the code that remains.
+
+`make style` runs both of the gate's modes and `make check` adds the
+gate's own suite; `make hooks` installs the commit-msg hook.
 
 No formatter has been evaluated for this tree.

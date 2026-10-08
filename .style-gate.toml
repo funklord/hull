@@ -1,0 +1,22 @@
+# Configuration for tool/style_gate.py -- see code-style.md.
+#
+# Nothing here changes the rules. It says which files in *this* tree they
+# apply to.
+
+# A Makefile has neither a suffix nor a shebang, so without this line it is
+# not checked at all. Naming it applies the tab rule too, which is right
+# while the Makefile has no `ifeq` (whose body must be space-indented).
+indent_names = ["Makefile"]
+
+# ASCII outside string literals, Markdown exempt -- the global rule.
+# project.md uses typographic punctuation and box drawing, which
+# documentation may; hull_engine.h was transliterated to ASCII when this
+# was turned on.
+ascii_only = true
+ascii_exclude_markdown = true
+
+# A fraction of every path git lists: the gated count must be at least
+# this share, so an edit that collapses the selection fires while adding
+# files never does. Half the ratio measured when the gate was added
+# (8 of 8, 2026-10-08).
+floor = 0.5
