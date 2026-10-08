@@ -344,6 +344,52 @@ binfmt = false            # opt in to qemu-user for foreign-arch sources (matrix
 
 Design rules: the top-level `[machine]` table is **backend-neutral by definition** — nothing may appear there that can't be expressed on every backend or cleanly rejected by the capability matrix. Backend-specific tuning is quarantined under `[machine.backend.*]`, where tables may be named for a *class* (applies to any engine of that class) or a *concrete engine* (overrides the class table); tables not applicable to the selected backend are ignored with a warning. The complete key inventory is Appendix J.
 
+### 4.1 Syntax: s-expressions, not TOML
+
+**Decided 2026-10-09: hull's own file formats are written as s-expressions.** That covers the machine spec, the `[build]` section, media sidecars (`media.toml`, `bad-sectors.toml`), host policy (`policy.toml`), per-machine state (`state.toml`, `spec.resolved.toml`) and the readable view of a manifest (A.1). **The examples in this document and the reference in Appendix J still use TOML syntax.** They predate the decision and are converted as the open points below settle; until then, read their keys and structure as the schema and their syntax as superseded. Tool configuration carried from elsewhere, such as `.style-gate.toml`, is not a hull format and is unaffected.
+
+TOML was never chosen deliberately: it was what the planning draft wrote in, and no reason for it was recorded. The holder's reason for the change is familiarity: TOML was new to them, and s-expressions are known to substantially more people. The technical case points the same way:
+
+- **The parser is small enough to own.** A complete s-expression reader in C is a few hundred lines with no dependency, where TOML means vendoring a library. That matters twice: for the core, and for the guest agent, a static binary with no libc (Appendix B).
+- **Nesting is uniform.** Multi-machine files, build steps and per-engine tuning nest the same way at every depth. TOML spreads one machine across headers that repeat its full path (`[machines.db]`, then `[machines.db.backend.vm]`) and expresses a list of tables as `[[build.step]]`, its least obvious construct and the one hull would lean on most.
+- **One family can serve both reading and hashing.** Canonical s-expressions (Rivest's SPKI form) length-prefix every atom and allow no optional whitespace, so a value has exactly one byte encoding. TOML cannot be hashed reliably, which is why A.1 pairs it with CBOR; s-expressions could make the readable form and the hashed form two spellings of one format (open point 3).
+
+The single-machine example from this section, as it would read:
+
+```scheme
+(machine
+  (source "dir:./rootfs")
+  (command "./server" "--port" "80")
+  (env (RUST_LOG "info"))
+  (ports (port (host 8080) (guest 80) (proto tcp)))
+  (volumes (volume (host "./data") (guest "/var/data") (mode rw)))
+  (memory "2G")
+  (backend ns)
+  (ssh #t)
+  (security (readonly-root #t))
+  (tuning
+    (vm   (profile micro) (kernel bundled))
+    (qemu (accel auto))))
+```
+
+Rejected, so the comparison is not repeated:
+
+- **TOML** -- specified types and an INI-like flat file are real strengths, but deep nesting is awkward, a C parser is a dependency, and it needs a second format for hashing.
+- **INI** -- no standard, no lists, no nesting; `ports` and `volumes` would need a home-made encoding.
+- **JSON** -- no comments, and noisy to write by hand.
+- **YAML** -- a very large specification, implicit typing (`no` reads as false, `3.10` as 3.1), and meaning that depends on indentation.
+- **systemd unit syntax** -- familiar, but no typed lists and no nesting.
+
+**The files are data, never code.** No evaluation, variables, includes or conditionals: the reader refuses anything that is not a datum. This is not a new rule but an existing one applied to the new syntax. The planner must see every field to check it against the capability matrix (§6), which is also why the Vagrant dialect rejects arbitrary Ruby (§9). It needs stating because s-expressions invite exactly that growth, as Guix's configuration did.
+
+Open, to settle before the Phase 1 parser is written:
+
+1. **The map convention.** `(key value...)` lists, as in the example above, or keyword property lists (`:key value`).
+2. **Atom types and their spellings.** Numbers, strings, bare symbols for enumerated values (`ns`, `rw`), booleans (`#t`/`#f` above), and sizes (`"2G"`).
+3. **The canonical form.** Whether canonical s-expressions replace CBOR as the hashed and signed form in A.1, or CBOR stays and s-expressions are only the readable view. §3.1 currently calls stored manifests TOML while A.1 says CBOR; this answer settles both.
+4. **File names.** `hull.toml` and the `*.toml` sidecars need a new suffix.
+5. **Hand-written or generated.** Whether the reader is written by hand or generated from a situ description (§3.12). situ's own files use a C-like syntax of their own, so neither choice follows from it.
+
 ---
 
 ## 5. Engines
@@ -510,7 +556,7 @@ A manifest is the canonical description of a filesystem tree. Its identity is `s
 ## A.1 Two representations, one identity
 
 - **Canonical form:** deterministic CBOR — definite-length encoding, map keys sorted bytewise, no floats, no timestamps except where specified. This is what gets hashed, stored, and signed. CBOR rather than TOML/JSON because hashing text formats means litigating whitespace and key order forever.
-- **Human form:** `hull manifest show <ref>` renders lossless TOML for eyeballs and diffs. The TOML is a *view*; editing it and running `hull manifest compile` produces a new canonical manifest with a new identity. Nothing ever mutates in place.
+- **Human form:** `hull manifest show <ref>` renders lossless TOML for eyeballs and diffs. The TOML is a *view*; editing it and running `hull manifest compile` produces a new canonical manifest with a new identity. Nothing ever mutates in place. *(The readable form is s-expressions since §4.1, and whether CBOR remains the canonical form is open point 3 there.)*
 
 ## A.2 Structure
 
