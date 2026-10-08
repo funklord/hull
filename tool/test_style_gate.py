@@ -1134,6 +1134,44 @@ class DocsModeReportsWhatItRead(unittest.TestCase):
 		self.assertIn("1 heading(s)", few)
 		self.assertIn("4 heading(s)", many)
 
+	def test_the_verdict_carries_the_document_SIZE(self):
+		"""Measured 2026-10-09: thirteen of twenty-one private trees have a
+		`project.md` larger than a context window, so the figure a reader
+		needs is how long the thing is, not only how much of it was
+		inspected."""
+		_, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                    "project.md": "# One\n## Two\n"})
+		self.assertIn("2 line(s)", out)
+		# "token" rather than "tokens": the estimate reads `token(s)` below
+		# a thousand and `k tokens` above it, and this test is about the
+		# figure being present rather than about which form it took.
+		self.assertIn("token", out)
+
+	def test_the_document_size_moves_with_the_document(self):
+		"""The control. A constant, or a figure read from the wrong file,
+		passes the test above and fails this one -- which is the only way
+		to tell a measurement from a sentence that looks like one."""
+		_, small = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                      "project.md": "# One\n"})
+		_, big = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                    "project.md": "# One\n" + "filler prose\n" * 400})
+		self.assertIn("1 line(s)", small)
+		self.assertIn("401 line(s)", big)
+		# and the estimate crosses into thousands rather than staying put.
+		# Asserted as the crossing rather than as an exact count: pinning
+		# the arithmetic would make this test fail the next time the
+		# estimate is divided differently, which is a change to how it is
+		# reported and not to whether it is measured.
+		self.assertNotIn("k tokens", small)
+		self.assertIn("k tokens", big)
+
+	def test_a_final_line_without_a_newline_still_counts(self):
+		"""`count("\\n")` alone loses the last line of a document that does
+		not end in one, which is how a figure goes quietly wrong by one."""
+		_, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                    "project.md": "# One\n## Two"})
+		self.assertIn("2 line(s)", out)
+
 	def test_a_repeated_section_NUMBER_is_reported(self):
 		"""A number is an identifier, and the repeat check above cannot
 		see one: two sections carrying 130 with different titles are

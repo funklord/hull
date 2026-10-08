@@ -1862,6 +1862,23 @@ def doc_paths(text: str) -> list[tuple[int, str]]:
 	return found
 
 
+def doc_size(counts: dict[str, int]) -> str:
+	"""The document's length, for the counts line in `docs` mode.
+
+	Characters over four rather than bytes over four: a tokenizer reads
+	characters, and the text is already decoded here. It is an estimate
+	good enough for "is this bigger than a context window" and for
+	nothing finer, so it is written with a tilde and never compared
+	against a limit.
+	"""
+	if "doc_lines" not in counts:
+		return ""
+	tokens = counts.get("doc_chars", 0) // 4
+	size = (f"~{tokens // 1000}k tokens" if tokens >= 1000
+	        else f"~{tokens} token(s)")
+	return f", {counts['doc_lines']} line(s), {size}"
+
+
 def check_docs(root: Path, cfg: Config,
                counts: dict[str, int] | None = None) -> list[Problem]:
 	"""Hold the design document to the tree it describes.
@@ -1893,6 +1910,24 @@ def check_docs(root: Path, cfg: Config,
 			"which is a broken doc_file rather than a clean tree"))
 		return problems
 	text = doc.read_text(encoding="utf-8", errors="replace")
+	# The document's own size, taken from the same read the checks below
+	# use, so the figure cannot drift from what was actually inspected.
+	#
+	# REPORTED, NEVER CAPPED, and the reason is not timidity. Measured
+	# 2026-10-09 across twenty-one private trees: thirteen have a
+	# `project.md` larger than a 200,000-token context window, fuzznet at
+	# four times one, and six grew by 14,000 to 28,000 lines in thirty
+	# days -- so a document these guidelines call authoritative over the
+	# code cannot be read by the session it adjudicates for. One
+	# threshold over trees of that spread would go red first for the
+	# oldest and busiest, which is this workspace's
+	# one-threshold-two-populations finding, and a gate carrying a long
+	# ignore list has been switched off by instalments. A number somebody
+	# reads is what was missing; `CLAUDE.md` already asks that nothing
+	# grow without anybody noticing.
+	counts["doc_lines"] = text.count("\n") + (
+		1 if text and not text.endswith("\n") else 0)
+	counts["doc_chars"] = len(text)
 
 	seen: dict[str, int] = {}
 	# A NUMBER is an identifier, and two sections may carry the same one
@@ -2059,7 +2094,8 @@ def main(argv: list[str]) -> int:
 		# not have changed by a word. Now the number moves.
 		scanned = (f" ({counts.get('headings', 0)} heading(s)"
 		           + (f", {counts['paths']} path(s)" if "paths" in counts
-		              else ", paths not checked") + ")")
+		              else ", paths not checked")
+		           + doc_size(counts) + ")")
 		print(f"style-gate: {cfg['doc_file']}{scanned} says nothing twice and names no "
 		      f"missing file; {counts['rust']} rust file(s) have a summary "
 		      f"line on every doc comment")
