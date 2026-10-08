@@ -349,7 +349,7 @@ TOML was never chosen deliberately: it was what the planning draft wrote in, and
 
 - **The parser is small enough to own.** A complete s-expression reader in C is a few hundred lines with no dependency, where TOML means vendoring a library. That matters twice: for the core, and for the guest agent, a static binary with no libc (Appendix B).
 - **Nesting is uniform.** Multi-machine files, build steps and per-engine tuning nest the same way at every depth. TOML spreads one machine across headers that repeat its full path (`[machines.db]`, then `[machines.db.backend.vm]`) and expresses a list of tables as `[[build.step]]`, its least obvious construct and the one hull would lean on most.
-- **One family can serve both reading and hashing.** Canonical s-expressions (Rivest's SPKI form) length-prefix every atom and allow no optional whitespace, so a value has exactly one byte encoding. TOML cannot be hashed reliably, which is why A.1 pairs it with CBOR; s-expressions could make the readable form and the hashed form two spellings of one format (the first open point below).
+- **One family serves both reading and hashing.** Canonical s-expressions (Rivest's SPKI form) length-prefix every atom and allow no optional whitespace, so a value has exactly one byte encoding. TOML could not be hashed reliably, which is why the draft paired it with CBOR; with s-expressions the readable form and the hashed form are two spellings of one format.
 
 The conventions, settled with the decision and followed by every example in this document:
 
@@ -370,10 +370,9 @@ Rejected, so the comparison is not repeated:
 
 **The files are data, never code.** No evaluation, variables, includes or conditionals: the reader refuses anything that is not a datum. This is not a new rule but an existing one applied to the new syntax. The planner must see every field to check it against the capability matrix (§6), which is also why the Vagrant dialect rejects arbitrary Ruby (§9). It needs stating because s-expressions invite exactly that growth, as Guix's configuration did.
 
-Still open, to settle before the Phase 1 parser is written:
+**Decided 2026-10-09 as well: canonical s-expressions replace CBOR everywhere the draft used it.** That is the manifest's hashed and signed form (A.1), the guest agent's messages (B.2), and so the encoded buffers that cross the engine ABI, which are defined as the manifest's encoding (`hull_engine.h`). One reader and one writer serve every byte format hull defines. Rivest's syntax lets a length-prefixed atom (`4:root`) stand anywhere an ordinary atom can, so a reader that accepts it parses the canonical form and the readable form alike; hull's reader accepts it.
 
-1. **The canonical form.** Whether canonical s-expressions replace CBOR as the hashed and signed form in A.1, or CBOR stays and s-expressions are only the readable view.
-2. **Hand-written or generated.** Whether the reader is written by hand or generated from a situ description (§3.12). situ's own files use a C-like syntax of their own, so neither choice follows from it.
+Still open, to settle before the Phase 1 parser is written: **hand-written or generated.** Whether the reader is written by hand or generated from a situ description (§3.12). situ's own files use a C-like syntax of their own, so neither choice follows from it.
 
 ---
 
@@ -540,8 +539,12 @@ A manifest is the canonical description of a filesystem tree. Its identity is `s
 
 ## A.1 Two representations, one identity
 
-- **Canonical form:** deterministic CBOR — definite-length encoding, map keys sorted bytewise, no floats, no timestamps except where specified. This is what gets hashed, stored, and signed. CBOR rather than TOML/JSON because hashing text formats means litigating whitespace and key order forever.
-- **Human form:** `hull manifest show <ref>` renders a lossless s-expression form for eyeballs and diffs. That form is a *view*; editing it and running `hull manifest compile` produces a new canonical manifest with a new identity. Nothing ever mutates in place. *(Whether CBOR remains the canonical form is open in §4.1.)*
+- **Canonical form:** a canonical s-expression (§4.1), Rivest's SPKI encoding — every atom written as its decimal byte length, a colon and the bytes (`4:root`), lists in parentheses, and no whitespace or other syntax at all. This is what gets hashed, stored, and signed. Hashing a text format usually means litigating whitespace and key order forever; this one has no whitespace, and the rules below fix everything else, so a value has exactly one encoding:
+  - the entries of a record are sorted bytewise by key, and a key appears at most once; the entries of a list (`(ports (port …) …)`, the manifest's `entries`) keep their order, which the schema fixes where it matters — A.2 sorts entries by path;
+  - an integer is decimal ASCII with no leading zeros and no `+`, so a mode is `3:493`, never `#o755`;
+  - no floats, no display hints (Rivest's `[type]` prefix), and no timestamps except where specified;
+  - atoms carry no type: the symbol `ns` and the string `"ns"` encode identically as `2:ns`, and so do `true` and `"true"`. The readable form parses to the canonical one with no help, but rendering canonical back to readable needs the schema, which says which fields are strings.
+- **Human form:** `hull manifest show <ref>` renders a lossless s-expression form for eyeballs and diffs. That form is a *view*; editing it and running `hull manifest compile` produces a new canonical manifest with a new identity. Nothing ever mutates in place. An atom that is not printable UTF-8 — an xattr value, say — is shown as hexadecimal between `#` signs (`#7b22…#`), Rivest's own notation for it, so the view stays lossless.
 
 ## A.2 Structure
 
@@ -617,7 +620,7 @@ Target: steps 1–6 inside the 100–300 ms boot budget. On full-profile and vir
 
 One vsock connection is the control plane; there is exactly one, and the agent drops any second connection attempt (single-controller invariant — vsock is host↔guest only, so no further authentication is needed; the host side of the socket is the Hull process that owns the VM).
 
-Framing: `u32 length ‖ CBOR message`. Every message: `{ ch: u32, type: str, … }`. Channel 0 is control; each exec/log stream gets its own channel id allocated by the host. Data frames carry raw bytes: `{ ch, type:"data", fd:1|2, buf }`. Flow control: per-channel credit windows (`{type:"credit", ch, bytes}`) so one chatty exec can't starve the control channel.
+Framing: `u32 length ‖ canonical s-expression` (A.1). A canonical s-expression delimits itself, so the length is not needed to parse; it is there so the receiver can refuse an oversized message before reading it. Every message: `(<type> (ch <n>) …)`. Channel 0 is control; each exec/log stream gets its own channel id allocated by the host. Data frames carry raw bytes, which a length-prefixed atom holds as they are with no escaping: `(data (buf <bytes>) (ch <n>) (fd 1|2))`, entries in canonical key order. Flow control: per-channel credit windows (`(credit (bytes <n>) (ch <n>))`) so one chatty exec can't starve the control channel.
 
 ## B.3 Message set (v1, complete)
 
