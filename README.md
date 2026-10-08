@@ -1,7 +1,7 @@
 # hull
 
 A rootless runtime for isolated machines, built on plain files. One
-`hull.toml` describes a machine, and changing one line moves it between
+`hull.conf` describes a machine, and changing one line moves it between
 namespaces (`ns`), a hardware-virtualized machine (`vm`) and full software
 emulation (`emu`). The machine runs from the same directory of files on
 each of them.
@@ -18,7 +18,7 @@ each of them.
 ## Status
 
 Design only. Nothing is built yet. `project.md` is the design, including
-the `hull.toml` schema reference, and `hull_engine.h` is a draft of the C
+the `hull.conf` schema reference, and `hull_engine.h` is a draft of the C
 plugin interface that engines implement.
 
 ## Checks

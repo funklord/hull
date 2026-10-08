@@ -47,7 +47,7 @@ Beneath all four sits one mechanism, Hull's core idea: **every image-shaped arti
         ┌───────────────────┼──────────────────────┐
         │                   │                      │
    spec compiler       sources               engine plugins (by class)
-   (hull.toml →       (dir: trees, or       ┌───────────────────────┐
+   (hull.conf →       (dir: trees, or       ┌───────────────────────┐
     ExecutionPlan)      CAS image store      │ ns:  docker → native  │
         │               + composefs)         │ vm:  qemu, virtualbox,│
         └── capability      │                │      vmware           │
@@ -62,12 +62,12 @@ Beneath all four sits one mechanism, Hull's core idea: **every image-shaped arti
 
 Lifecycle of `hull run`:
 
-1. Parse `hull.toml` → abstract **MachineSpec**.
+1. Parse `hull.conf` → abstract **MachineSpec**.
 2. Resolve the source: a `dir:` path is used as-is (§3.7); an image ref is resolved against the local store (pull + convert from OCI if absent).
 3. **Plan:** compile MachineSpec + chosen backend into an ExecutionPlan; run every spec field through the capability matrix; refuse with a precise error if any field can't be honored on this backend.
 4. **Execute:** hand the plan to the engine. Machines run as children of the per-user core (or of a generated systemd user unit) — there is no root daemon anywhere; the core is an unprivileged service belonging to the invoking user, and the CLI, TUI, and Qt GUI are peer frontends speaking the shared encrypted protocol to it (local or remote). *(The exact frontend/core split is finalized against the project guidelines — see Handoff notes.)*
 
-The first-wave engines (docker, qemu, virtualbox, vmware — §5.0) ship with the core, but the driver interface is a stable plugin API: further engines — DOSBox, Wine, user-mode Linux, wasm runtimes — register themselves together with a capability declaration and become `backend = "…"` values like any other.
+The first-wave engines (docker, qemu, virtualbox, vmware — §5.0) ship with the core, but the driver interface is a stable plugin API: further engines — DOSBox, Wine, user-mode Linux, wasm runtimes — register themselves together with a capability declaration and become `(backend …)` values like any other.
 
 ---
 
@@ -82,21 +82,21 @@ Everything lives under `~/.local/share/hull/` (XDG-compliant, overridable):
 ```
 store/
   objects/sha256/ab/abcdef…        # content-addressed regular files, mode 0444
-  manifests/sha256/…               # image manifests (TOML, small)
+  manifests/sha256/…               # image manifests (canonical, A.1)
   refs/
     registry.example.com/webapp/2.1 → ../manifests/sha256/…   # symlinks; tags are just symlinks
   mounts/                          # composefs images generated from manifests (cache, disposable)
 machines/
   <machine-id>/
-    spec.resolved.toml             # frozen copy of the spec at creation time
+    spec.resolved.conf             # frozen copy of the spec at creation time
     upper/                         # writable layer (plain directory)
-    state.toml                     # pid/cid, backend, ports, timestamps
+    state.conf                     # pid/cid, backend, ports, timestamps
 ```
 
 Key properties:
 
 - **`objects/` is a plain CAS.** One copy of each unique file across *all* images and *all* snapshots, hard-link-friendly, `rsync`-able, `du`-honest. Executable bit is the only mode stored on the object itself; full metadata lives in manifests.
-- **A manifest is the image.** It's a small TOML/binary table mapping `path → (object hash, mode, uid/gid mapping class, xattrs, symlink target | directory | hardlink group)`. Pulling an image whose files you mostly have transfers only the missing objects — dedup is global and automatic, not layer-accidental.
+- **A manifest is the image.** It's a small table mapping `path → (object hash, mode, uid/gid mapping class, xattrs, symlink target | directory | hardlink group)`. Pulling an image whose files you mostly have transfers only the missing objects — dedup is global and automatic, not layer-accidental.
 - **Tags are symlinks.** `hull tag`, `hull images`, and rollbacks are filesystem operations you can audit with `ls -l`.
 - **No layer stack at rest.** Layers are a *transport and build-cache* concept, not a storage concept. Two images that share 95% of files share 95% of objects regardless of how their Dockerfile-era layers were arranged.
 
@@ -122,34 +122,33 @@ The machine's `upper/` is a plain directory — the overlayfs upper under `bind`
 
 ### 3.6 Builds
 
-`hull build` consumes a `[build]` section (same TOML file or `hull.build.toml`):
+`hull build` consumes a `(build …)` form (in the same file or in `hull.build.conf`):
 
-```toml
-[build]
-base = "docker.io/library/debian:13-slim"
-
-[[build.step]]
-name    = "deps"
-run     = "apt-get update && apt-get install -y --no-install-recommends python3"
-inputs  = []                    # cache key: base manifest + this command only
-
-[[build.step]]
-name    = "app"
-copy    = [{ from = "./src", to = "/app" }]
-run     = "pip install -e /app"
-inputs  = ["./src"]             # cache key includes a content hash of ./src
+```scheme
+(build
+  (base "docker.io/library/debian:13-slim")
+  (steps
+    (step
+      (name "deps")
+      (run "apt-get update && apt-get install -y --no-install-recommends python3")
+      (inputs))                 ; cache key: base manifest + this command only
+    (step
+      (name "app")
+      (copy (path (from "./src") (to "/app")))
+      (run "pip install -e /app")
+      (inputs "./src"))))       ; cache key includes a content hash of ./src
 ```
 
 Each step runs in a throwaway machine (any backend; ns by default) and commits to a manifest. The cache key of a step is `hash(parent manifest, step definition, content hash of declared inputs)` — caching is **correct by construction**, not by Dockerfile line-order heuristics. Undeclared inputs simply aren't visible to the step (the build mount namespace only maps declared paths), which is what makes the cache sound rather than hopeful.
 
 ### 3.7 Directory sources — the primary mode
 
-`source = "dir:./rootfs"` runs a plain directory as the machine's root. This is Hull's default way of working, not an escape hatch: the store, manifests, and pulls are bypassed entirely; the directory *is* the machine's filesystem, on every backend, with no conversion step: ns idmap-bind-mounts it as rootfs, and vm/emu export the same directory as the rootfs virtiofs share.
+`(source "dir:./rootfs")` runs a plain directory as the machine's root. This is Hull's default way of working, not an escape hatch: the store, manifests, and pulls are bypassed entirely; the directory *is* the machine's filesystem, on every backend, with no conversion step: ns idmap-bind-mounts it as rootfs, and vm/emu export the same directory as the rootfs virtiofs share.
 
 Write semantics are per machine:
 
-- `mutable = "direct"` (the default for dir sources): writes land in the directory itself. Edit a config file on the host, restart the service in the guest — or the reverse. `git status` your rootfs if you like; the files are the truth. (This describes `bind` and `passthrough` projections; a block projection cannot write through to the directory, so the matrix rejects `direct` there unless `writeback` is declared — §3.9.)
-- `mutable = "overlay"`: the directory stays pristine; writes go to the machine's `upper/` exactly as with image sources.
+- `(mutable direct)` (the default for dir sources): writes land in the directory itself. Edit a config file on the host, restart the service in the guest — or the reverse. `git status` your rootfs if you like; the files are the truth. (This describes `bind` and `passthrough` projections; a block projection cannot write through to the directory, so the matrix rejects `direct` there unless `writeback` is declared — §3.9.)
+- `(mutable overlay)`: the directory stays pristine; writes go to the machine's `upper/` exactly as with image sources.
 
 Ownership: a single-uid tree — the common case for a service rootfs — needs nothing special; everything maps through the root/user ownership classes (A.3). Multi-uid trees store ownership in xattrs (`user.hull.owner`), written naturally by chown *inside* a running machine or seeded by `hull dir init`; backends map them via idmapped mounts (ns) or virtiofs xattr mapping (vm/emu). A tree without ownership xattrs simply appears root-owned, which is correct for most rootfs trees.
 
@@ -163,7 +162,7 @@ The dominant pipeline today is: build → `docker build` (re-tar the artifacts y
 # CI job
 make build DESTDIR=out/rootfs                       # or unpack any release tarball
 rsync -a --delete out/rootfs/ deploy@host:/srv/app/rootfs/
-ssh deploy@host hull restart app                    # hull.toml: source = "dir:/srv/app/rootfs"
+ssh deploy@host hull restart app                    # hull.conf: (source "dir:/srv/app/rootfs")
 ```
 
 - **The deployable unit is a directory.** Transport is anything that moves files; rsync's delta transfer is strictly better granularity than image layers, and `hull check` in CI guarantees the tree runs on every backend you care about — without a registry, auth tokens, image GC policy, or tag-mutation surprises anywhere in the pipeline.
@@ -188,8 +187,8 @@ One tree, three projections:
 Rules that keep block projections honest:
 
 1. **Derived, never authoritative.** A block image is keyed by the content hash of its source tree/manifest; identical tree ⇒ identical image bytes (reproducible mkfs), so caching is sound and `hull verify` can prove a cached image still matches. Deleting every projection loses nothing.
-2. **The write path must be explicit.** Under a block projection, guest writes land in a qcow2 overlay — not in your directory. Therefore `mutable = "direct"` + block projection is **rejected** by the matrix (your files would silently go stale) unless you opt into `writeback = "sync-on-stop"`, which syncs the overlay back to the directory on clean shutdown and documents its crash window. There is no configuration in which the directory and the image can quietly disagree about which one is real.
-3. **Need is declared, not discovered.** `projection = "auto"` (default) lets the plan step choose per engine; a spec that needs passthrough-hostile semantics declares them — `fidelity = ["inotify", "flock", "odirect"]` — and the plan either selects a projection satisfying every declared need or rejects with the reason. Fidelity gaps become matrix rows, found at plan time instead of by 2 a.m. breakage.
+2. **The write path must be explicit.** Under a block projection, guest writes land in a qcow2 overlay — not in your directory. Therefore `(mutable direct)` + block projection is **rejected** by the matrix (your files would silently go stale) unless you opt into `(writeback sync-on-stop)`, which syncs the overlay back to the directory on clean shutdown and documents its crash window. There is no configuration in which the directory and the image can quietly disagree about which one is real.
+3. **Need is declared, not discovered.** `(projection auto)` (default) lets the plan step choose per engine; a spec that needs passthrough-hostile semantics declares them — `(fidelity inotify flock odirect)` — and the plan either selects a projection satisfying every declared need or rejects with the reason. Fidelity gaps become matrix rows, found at plan time instead of by 2 a.m. breakage.
 4. **Self-containment is an export, not a mode.** When a machine must leave Hull — boot under plain QEMU, ship to a cloud, run under VirtualBox on someone else's laptop — `hull export --bootable <machine> disk.img` emits a standalone image (partition table, bootloader, kernel, tree) as a deliberate border artifact, exactly like OCI push: a copy that leaves the truth behind, and says so.
 
 ### 3.10 Media sources — file collections for what we used to store as images
@@ -198,28 +197,30 @@ The motivating case: DOS-era games installed from CD-ROM, frequently with copy p
 
 ```
 game/
-  hull.toml                 # backend = "dosbox"
+  hull.conf                 # (backend dosbox)
   c/                        # the installed game: plain files, the DOS C: drive
   cd/
     files/                  # the disc's ISO9660 tree, plain files
-    media.toml              # TOC: track layout, modes, pregaps, volume id, timestamps
+    media.conf              # TOC: track layout, modes, pregaps, volume id, timestamps
     tracks/02-audio.wav     # audio tracks as ordinary audio files
     quirks/
       subchannel.bin        # subchannel stream (the copy-protection carrier)
-      bad-sectors.toml      # addresses expected to error, and how
+      bad-sectors.conf      # addresses expected to error, and how
       sectors/0x1A40.raw    # raw overrides where mastered bytes ≠ file bytes
 ```
 
-```toml
-[[machine.media]]
-type   = "cdrom"
-source = "dir:./cd"         # or tar:./cd.tar
+```scheme
+(machine
+  (media
+    (medium
+      (type cdrom)
+      (source "dir:./cd"))))    ; or "tar:./cd.tar"
 ```
 
 - **Projection does the reconciling.** The engine needs a disc, so Hull compiles the collection into a bit-faithful virtual disc on demand — derived, content-keyed, disposable; §3.9's rules apply unchanged. Copy-protection checks pass because bad sectors, subchannel data, and the TOC are replayed from the quirk files at the right addresses. And read-only media has no write-path problem at all — the game's *saves* go to `c/`, which is an ordinary dir source with `direct` writes.
-- **Quirks are formally a patch.** The definition is exact: `naive = project(files, media.toml)` is deterministic; `quirks = delta(original, naive)`, computed at import and stored as addressed byte/sector patches; reconstruction is `naive + quirks`, verified against the recorded hash of the original dump. Three consequences. *Import is automatic:* `hull media import disc.bin` extracts the files, projects naively, diffs at sector level — whatever fails to round-trip **is** the quirk set; nobody authors quirk files by hand. *Losslessness is provable:* `hull media verify` reconstructs and compares hashes, so converting an image to a file collection is demonstrably exact, not hopefully exact. *Projector versions are frozen:* a patch is only stable against a stable base, so projection algorithms are versioned and immutable once shipped — `media.toml` names the projector version its quirks patch against, new versions ship alongside old ones (like compression formats), and `hull media rebase` re-derives the quirk set against a newer projector as an explicit, hash-verified operation.
+- **Quirks are formally a patch.** The definition is exact: `naive = project(files, media.conf)` is deterministic; `quirks = delta(original, naive)`, computed at import and stored as addressed byte/sector patches; reconstruction is `naive + quirks`, verified against the recorded hash of the original dump. Three consequences. *Import is automatic:* `hull media import disc.bin` extracts the files, projects naively, diffs at sector level — whatever fails to round-trip **is** the quirk set; nobody authors quirk files by hand. *Losslessness is provable:* `hull media verify` reconstructs and compares hashes, so converting an image to a file collection is demonstrably exact, not hopefully exact. *Projector versions are frozen:* a patch is only stable against a stable base, so projection algorithms are versioned and immutable once shipped — `media.conf` names the projector version its quirks patch against, new versions ship alongside old ones (like compression formats), and `hull media rebase` re-derives the quirk set against a newer projector as an explicit, hash-verified operation.
 - **Graceful degradation ladder.** Best case, everything is meaningful files. Middle case, files plus small binary quirk sidecars. Worst case — a protection scheme that defeats reconstruction — one honest `raw.bin` blob *as a file inside the collection*. The worst case equals today's status quo; the typical case is a diffable, greppable, dedup-friendly directory where the game's files are just files.
-- **`tar:` sources.** Any dir-shaped source can be a tarball (`source = "tar:./game.tar"`), transparently unpacked to a content-keyed cache — a transport convenience, not another format.
+- **`tar:` sources.** Any dir-shaped source can be a tarball (`(source "tar:./game.tar")`), transparently unpacked to a content-keyed cache — a transport convenience, not another format.
 - **The pattern generalizes.** Floppies (files + boot sector + interleave quirks), cartridge dumps (blob + header metadata as files), and media nobody has thought of yet: sidecar schemas are per media type and versioned, and each engine declares which media types it accepts in its capability table — a dosbox engine accepts `cdrom` and `floppy`; a vm engine accepts `cdrom` (as an emulated drive) and `disk`. §3.11 states the generalization in full.
 
 ### 3.11 The universal decomposition — structure + patch
@@ -232,7 +233,7 @@ source = "dir:./cd"         # or tar:./cd.tar
 |---|---|---|---|
 | Container image (OCI) | file tree + manifest | layer serializer | layer boundaries + compression quirks (only when digest-exact round-trip is wanted, §3.5) |
 | Filesystem image | file tree + fs metadata (type, UUID, label, flags) | deterministic mkfs | bootloader gaps, hidden/unallocated residue, layout the rebuild doesn't reproduce |
-| Partitioned disk (appliance firmware, SD-card image) | per-partition trees + partition-table TOML | repart-style builder | MBR gap bytes, vendor blobs between partitions |
+| Partitioned disk (appliance firmware, SD-card image) | per-partition trees + partition-table file | repart-style builder | MBR gap bytes, vendor blobs between partitions |
 | CD-ROM | ISO tree + TOC + audio track files | ISO/cue builder | subchannel data, bad sectors, raw sector overrides |
 | Floppy / cartridge | files (or blob) + metadata | per-format builder | interleave, headers, undecoded regions |
 
@@ -251,7 +252,7 @@ Projectors are not primarily code. A related project, **situ**, describes arbitr
 
 - **A projector = a situ description + an optional policy module.** The situ spec supplies the parser (import/decompose), the serializer (reassemble), and the very definition of "structure" for a format. Purely declarative formats — partition tables, cue/TOC layouts, headers, cartridge formats — need *no* procedural code at all: a new projector is a new situ file. Only formats with genuine policy (ext4's block allocation in mkfs, ISO9660 sector layout choices) add a small deterministic policy module alongside.
 - **The closure:** the patch is, by construction, *exactly what the situ description does not yet describe*. Patch size across a corpus becomes a live completeness metric for the description; refining a situ spec measurably shrinks patches (via `rebase`, hash-verified, risk-free). "Quantified opacity" stops being a metaphor and becomes a number attached to a description file.
-- **Projector versioning inherits from situ:** the frozen-version invariant maps to pinned situ description versions; a collection's `media.toml` names the description (and its hash) it was decomposed against.
+- **Projector versioning inherits from situ:** the frozen-version invariant maps to pinned situ description versions; a collection's `media.conf` names the description (and its hash) it was decomposed against.
 - **Everything else that speaks bytes uses the same layer.** The agent control protocol (Appendix B), the manifest canonical encoding (Appendix A), and sidecar schemas can all be situ descriptions, with accessors generated for every component — C core, Qt GUI, TUI, guest agent — from one source of truth. One description language ends the codec-drift problem between components, and situ's ancillary generators (validators, pretty-printers, fuzzers) give `hull inspect <artifact>` and protocol fuzzing essentially for free.
 
 Open item: align on situ's description-file syntax and generator targets before Appendix A/B are finalized, so the manifest encoding and agent protocol are authored as situ descriptions from day one rather than retrofitted.
@@ -266,14 +267,14 @@ A machine's content has exactly one identity (its manifest hash / tree hash) and
 
 - **Canonical:** deterministic serialization — the same collection always produces byte-identical packs, so the pack's hash *is* the content identity (tar can't promise this; ordering, padding, and metadata make it non-canonical).
 - **Structured:** header + manifest index + content-defined-chunked, zstd-compressed object pack + patch section. situ-described end to end, so accessors, validators, and `hull inspect` come from the description.
-- **Seekable & mountable:** the index is upfront; single files are extractable without reading the pack, and the pack is directly mountable (composefs/FUSE) — a pack can *be* a machine source (`source = "pack:./app.hull"`) without unpacking.
+- **Seekable & mountable:** the index is upfront; single files are extractable without reading the pack, and the pack is directly mountable (composefs/FUSE) — a pack can *be* a machine source (`(source "pack:./app.hull")`) without unpacking.
 - **Dedup-aware transport:** chunk boundaries are content-defined (§C), so transferring a pack to a host that has a previous version moves only changed chunks; two packs sharing content share chunks in the store.
 - `hull pack <dir> <file.hull>` / `hull unpack` round-trip exactly; `tar:` remains accepted as a lowest-common-denominator input, never an output format.
 
 **3. Foreign image files — load and import other software's formats.** Two modes, both engine-visible in the matrix:
 
 - **Import** — the §3.11 one-algorithm path: qcow2, VMDK, VHD/VHDX, VDI, raw disks, ISO/BIN-CUE, OVA/OVF appliances, OCI/docker-save tarballs, Vagrant boxes → decompose into a collection (files + metadata + patch), provably lossless, re-exportable to the original format bit-exact when the projector permits.
-- **Attach** — run a foreign image *in place*, no conversion: `source = "image:./disk.vmdk"` hands the file to an engine that speaks it natively (vmware↔VMDK, hyperv↔VHDX, qemu↔qcow2/raw, virtualbox↔VDI). Attach trades away inspectability and dir-workflows for zero-cost onboarding of existing VMs — declared per engine in its capability table, and `hull import` is always one command away when the user wants the files-first benefits.
+- **Attach** — run a foreign image *in place*, no conversion: `(source "image:./disk.vmdk")` hands the file to an engine that speaks it natively (vmware↔VMDK, hyperv↔VHDX, qemu↔qcow2/raw, virtualbox↔VDI). Attach trades away inspectability and dir-workflows for zero-cost onboarding of existing VMs — declared per engine in its capability table, and `hull import` is always one command away when the user wants the files-first benefits.
 
 ### 3.14 Why files beat loop-mounted images — the technical case
 
@@ -289,88 +290,75 @@ The design consequence, stated once: **block projections are a border facility f
 
 ---
 
-## 4. The spec: `hull.toml`
+## 4. The spec: `hull.conf`
 
-One file describes a machine. Compose-style multi-machine files are the same schema under `[machines.<name>]` tables.
+One file describes a machine. Multi-machine files, compose-style, are the same schema under `(machines (<name> …) …)`.
 
-```toml
-[machine]
-source   = "registry.example.com/webapp:2.1"   # an image ref…
-# source = "dir:./rootfs"       # …or just a directory of files (§3.7)
-# mutable = "direct"            # direct | overlay (dir sources default to direct)
-arch     = "host"               # host | amd64 | arm64 | riscv64 … (foreign arch ⇒ emu, or ns+binfmt)
-command  = ["./server", "--port", "80"]
-workdir  = "/app"
-env      = { RUST_LOG = "info" }
-env_file = ".env"                       # optional, gitignored secrets
+```scheme
+(machine
+  (source "registry.example.com/webapp:2.1")  ; an image ref…
+  ; (source "dir:./rootfs")                   ; …or just a directory of files (§3.7)
+  ; (mutable direct)                          ; direct | overlay (dir sources default to direct)
+  (arch host)                    ; host | amd64 | arm64 | riscv64 … (foreign arch ⇒ emu, or ns+binfmt)
+  (command "./server" "--port" "80")
+  (workdir "/app")
+  (env (RUST_LOG "info"))
+  (env_file ".env")              ; optional, gitignored secrets
 
-ports    = [{ host = 8080, guest = 80, proto = "tcp" }]
-volumes  = [
-  { host = "./data", guest = "/var/data", mode = "rw" },
-  { host = "./cfg",  guest = "/etc/app", mode = "ro" },
-]
+  (ports (port (host 8080) (guest 80) (proto tcp)))
+  (volumes
+    (volume (host "./data") (guest "/var/data") (mode rw))
+    (volume (host "./cfg")  (guest "/etc/app")  (mode ro)))
 
-cpus     = 2
-memory   = "2G"
+  (cpus 2)
+  (memory "2G")
 
-backend  = "ns"          # a CLASS (ns | vm | emu) or a CONCRETE ENGINE
-                         # ("docker", "qemu", "virtualbox", "vmware", …) — the only line that changes;
-                         # a class picks the host's default engine of that class
+  (backend ns)                   ; a CLASS (ns | vm | emu) or a CONCRETE ENGINE
+                                 ; (docker, qemu, virtualbox, vmware, …) — the only line that changes;
+                                 ; a class picks the host's default engine of that class
 
-ssh      = true          # Hull provisions sshd + your authorized_keys, all backends (§8.1)
-restart  = "on-failure"  # consumed by the systemd generator, not a daemon
+  (ssh true)                     ; Hull provisions sshd + your authorized_keys, all backends (§8.1)
+  (restart on-failure)           ; consumed by the systemd generator, not a daemon
 
-[machine.security]
-readonly_root = true
-no_new_privs  = true      # default true
-allow         = []        # additive capability grants (ns) / device passthrough (VMs)
+  (security
+    (readonly_root true)
+    (no_new_privs true)          ; default true
+    (allow))                     ; additive capability grants (ns) / device passthrough (VMs)
 
-[machine.backend.vm]      # CLASS-level tuning: applies to whichever vm engine runs
-profile  = "micro"        # micro (microVM; qemu & native engines) | full (full machine type)
-kernel   = "bundled"      # bundled | image | path:./bzImage
-
-[machine.backend.qemu]    # ENGINE-level tuning: overrides class-level when this engine runs
-accel    = "auto"         # auto | kvm | tcg
-
-[machine.backend.virtualbox]
-gui = false
-
-[machine.backend.emu]     # emu class (qemu with accel=tcg); adds emulation tuning
-cores_scale = 2           # over-provision vCPUs to claw back TCG speed
-
-[machine.backend.ns]
-binfmt = false            # opt in to qemu-user for foreign-arch sources (matrix: emulated)
+  (tuning
+    (vm                          ; CLASS-level tuning: applies to whichever vm engine runs
+      (profile micro)            ; micro (microVM; qemu & native engines) | full (full machine type)
+      (kernel bundled))          ; bundled | image | "path:./bzImage"
+    (qemu                        ; ENGINE-level tuning: overrides class-level when this engine runs
+      (accel auto))              ; auto | kvm | tcg
+    (virtualbox
+      (gui false))
+    (emu                         ; emu class (qemu with accel=tcg); adds emulation tuning
+      (cores_scale 2))           ; over-provision vCPUs to claw back TCG speed
+    (ns
+      (binfmt false))))          ; opt in to qemu-user for foreign-arch sources (matrix: emulated)
 ```
 
-Design rules: the top-level `[machine]` table is **backend-neutral by definition** — nothing may appear there that can't be expressed on every backend or cleanly rejected by the capability matrix. Backend-specific tuning is quarantined under `[machine.backend.*]`, where tables may be named for a *class* (applies to any engine of that class) or a *concrete engine* (overrides the class table); tables not applicable to the selected backend are ignored with a warning. The complete key inventory is Appendix J.
+Design rules: the `(machine …)` form is **backend-neutral by definition** — nothing may appear there that can't be expressed on every backend or cleanly rejected by the capability matrix. Backend-specific tuning is quarantined under `(tuning …)`, where entries may be named for a *class* (applies to any engine of that class) or a *concrete engine* (overrides the class entry); entries not applicable to the selected backend are ignored with a warning. The complete key inventory is Appendix J.
 
 ### 4.1 Syntax: s-expressions, not TOML
 
-**Decided 2026-10-09: hull's own file formats are written as s-expressions.** That covers the machine spec, the `[build]` section, media sidecars (`media.toml`, `bad-sectors.toml`), host policy (`policy.toml`), per-machine state (`state.toml`, `spec.resolved.toml`) and the readable view of a manifest (A.1). **The examples in this document and the reference in Appendix J still use TOML syntax.** They predate the decision and are converted as the open points below settle; until then, read their keys and structure as the schema and their syntax as superseded. Tool configuration carried from elsewhere, such as `.style-gate.toml`, is not a hull format and is unaffected.
+**Decided 2026-10-09: hull's own file formats are s-expressions, in files named `*.conf`.** That covers the machine spec (`hull.conf`), the build form, media sidecars (`media.conf`, `bad-sectors.conf`), host policy (`policy.conf`), per-machine state (`state.conf`, `spec.resolved.conf`) and the readable view of a manifest (A.1). Tool configuration carried from elsewhere, such as `.style-gate.toml`, is not a hull format and is unaffected.
 
 TOML was never chosen deliberately: it was what the planning draft wrote in, and no reason for it was recorded. The holder's reason for the change is familiarity: TOML was new to them, and s-expressions are known to substantially more people. The technical case points the same way:
 
 - **The parser is small enough to own.** A complete s-expression reader in C is a few hundred lines with no dependency, where TOML means vendoring a library. That matters twice: for the core, and for the guest agent, a static binary with no libc (Appendix B).
 - **Nesting is uniform.** Multi-machine files, build steps and per-engine tuning nest the same way at every depth. TOML spreads one machine across headers that repeat its full path (`[machines.db]`, then `[machines.db.backend.vm]`) and expresses a list of tables as `[[build.step]]`, its least obvious construct and the one hull would lean on most.
-- **One family can serve both reading and hashing.** Canonical s-expressions (Rivest's SPKI form) length-prefix every atom and allow no optional whitespace, so a value has exactly one byte encoding. TOML cannot be hashed reliably, which is why A.1 pairs it with CBOR; s-expressions could make the readable form and the hashed form two spellings of one format (open point 3).
+- **One family can serve both reading and hashing.** Canonical s-expressions (Rivest's SPKI form) length-prefix every atom and allow no optional whitespace, so a value has exactly one byte encoding. TOML cannot be hashed reliably, which is why A.1 pairs it with CBOR; s-expressions could make the readable form and the hashed form two spellings of one format (the first open point below).
 
-The single-machine example from this section, as it would read:
+The conventions, settled with the decision and followed by every example in this document:
 
-```scheme
-(machine
-  (source "dir:./rootfs")
-  (command "./server" "--port" "80")
-  (env (RUST_LOG "info"))
-  (ports (port (host 8080) (guest 80) (proto tcp)))
-  (volumes (volume (host "./data") (guest "/var/data") (mode rw)))
-  (memory "2G")
-  (backend ns)
-  (ssh #t)
-  (security (readonly-root #t))
-  (tuning
-    (vm   (profile micro) (kernel bundled))
-    (qemu (accel auto))))
-```
+- **A record is a list of `(key value…)` entries**: `(machine (source "dir:./rootfs") (ssh true))`. A key takes zero or more values, so `(command "./server" "--port" "80")` is a list and `(allow)` an empty one.
+- **A list of records is a plural key holding singular entries**: `(ports (port …) (port …))`, `(volumes (volume …))`, `(media (medium …))`, `(steps (step …))`, and `(copy (path …))` for what a build step copies in.
+- **A map whose keys the user chooses has the same shape**, the name standing as the key: `(env (RUST_LOG "info"))`, `(machines (web …) (db …))`, `(secrets (db_password …))`.
+- **Atoms.** Numbers are bare (`8080`). Strings are double-quoted (`"./data"`), and so are sizes and durations (`"2G"`, `"7d"`) and anything carrying a scheme prefix (`"dir:./rootfs"`). Enumerated values are bare symbols (`ns`, `rw`, `on-failure`). Booleans are the symbols `true` and `false`, recognised as booleans by the schema rather than by the reader. A comment runs from `;` to the end of the line.
+- **Keys are `snake_case`**, as `code-style.md` requires of every name this project defines; they become field ids and `--accept` tokens, which cannot be renamed later.
+- **Per-backend tuning lives under `tuning`, not under `backend`.** The TOML draft put it at `[machine.backend.vm]` beside `backend = "ns"`, which TOML itself rejects, since one key cannot be both a string and a table. As separate keys, `(backend ns)` and `(tuning (vm …))` sit side by side.
 
 Rejected, so the comparison is not repeated:
 
@@ -382,13 +370,10 @@ Rejected, so the comparison is not repeated:
 
 **The files are data, never code.** No evaluation, variables, includes or conditionals: the reader refuses anything that is not a datum. This is not a new rule but an existing one applied to the new syntax. The planner must see every field to check it against the capability matrix (§6), which is also why the Vagrant dialect rejects arbitrary Ruby (§9). It needs stating because s-expressions invite exactly that growth, as Guix's configuration did.
 
-Open, to settle before the Phase 1 parser is written:
+Still open, to settle before the Phase 1 parser is written:
 
-1. **The map convention.** `(key value...)` lists, as in the example above, or keyword property lists (`:key value`).
-2. **Atom types and their spellings.** Numbers, strings, bare symbols for enumerated values (`ns`, `rw`), booleans (`#t`/`#f` above), and sizes (`"2G"`).
-3. **The canonical form.** Whether canonical s-expressions replace CBOR as the hashed and signed form in A.1, or CBOR stays and s-expressions are only the readable view. §3.1 currently calls stored manifests TOML while A.1 says CBOR; this answer settles both.
-4. **File names.** `hull.toml` and the `*.toml` sidecars need a new suffix.
-5. **Hand-written or generated.** Whether the reader is written by hand or generated from a situ description (§3.12). situ's own files use a C-like syntax of their own, so neither choice follows from it.
+1. **The canonical form.** Whether canonical s-expressions replace CBOR as the hashed and signed form in A.1, or CBOR stays and s-expressions are only the readable view.
+2. **Hand-written or generated.** Whether the reader is written by hand or generated from a situ description (§3.12). situ's own files use a C-like syntax of their own, so neither choice follows from it.
 
 ---
 
@@ -398,11 +383,11 @@ Open, to settle before the Phase 1 parser is written:
 
 The driver interface is not internal plumbing; it is Hull's **stable plugin API**: `plan(spec) → Plan`, `create/start/stop/destroy`, `exec`, `logs`, `port_map`, `stats`, plus a **capability declaration** — the engine's column of the §6 matrix, published by the engine itself rather than hardcoded in Hull. Everything the CLI exposes goes through this interface, which is what makes backends honestly interchangeable, and (per the project guidelines) it is a natural fit for a C ABI: an engine is a shared object or external helper binary implementing the interface.
 
-**Classes and engines.** ns, vm, and emu are engine *classes* — they define the rows of the capability matrix, the ingress contract, and the migration analysis. Concrete **engines** implement classes: the docker adapter implements ns; the qemu engine implements both vm (KVM acceleration) and emu (TCG); the virtualbox and vmware adapters implement vm. `backend =` accepts either a class (host's default engine of that class) or an engine by name. Class-level guarantees are what the conformance suite tests; engine-specific deltas overlay the class column in the matrix.
+**Classes and engines.** ns, vm, and emu are engine *classes* — they define the rows of the capability matrix, the ingress contract, and the migration analysis. Concrete **engines** implement classes: the docker adapter implements ns; the qemu engine implements both vm (KVM acceleration) and emu (TCG); the virtualbox and vmware adapters implement vm. `(backend …)` accepts either a class (host's default engine of that class) or an engine by name. Class-level guarantees are what the conformance suite tests; engine-specific deltas overlay the class column in the matrix.
 
 **First wave — adapter engines** (wrap what users already have installed; maximum reach, minimum novelty):
 
-- **docker** — drives the Docker daemon via its API: spec → container config, `ports`/`volumes`/`env` map directly, `hull exec/logs` ride Docker's own exec/log streams. Honest impedance, declared in its matrix column: dir sources with `mutable = "direct"` are *rejected* (Docker can't run an arbitrary rootfs directory in place; `overlay` mode works via a cached `docker import` of the tree), and the adapter **inherits dockerd's root daemon and security posture** — the rootless goal (§7) is delivered by the native ns engine in wave two, not by this adapter. A podman variant is nearly free (same API surface, plus `--rootfs` makes `direct` dir sources native and restores rootless).
+- **docker** — drives the Docker daemon via its API: spec → container config, `ports`/`volumes`/`env` map directly, `hull exec/logs` ride Docker's own exec/log streams. Honest impedance, declared in its matrix column: dir sources with `(mutable direct)` are *rejected* (Docker can't run an arbitrary rootfs directory in place; `overlay` mode works via a cached `docker import` of the tree), and the adapter **inherits dockerd's root daemon and security posture** — the rootless goal (§7) is delivered by the native ns engine in wave two, not by this adapter. A podman variant is nearly free (same API surface, plus `--rootfs` makes `direct` dir sources native and restores rootless).
 - **qemu** — the reference engine, no daemon to adapt to: implements vm (accel=kvm) and emu (accel=tcg) with everything §5.2–5.3 describe (virtiofs, vsock agent, micro/full profiles).
 - **virtualbox** — full-profile vm-class via `VBoxManage`: block projection (§3.9) for the rootfs, vboxsf for volumes, NAT rules for ports, agent via seed ISO.
 - **vmware** — full-profile vm-class for Workstation/Fusion via `vmrun`/VIX (ESXi/vCenter is enterprise-tier territory, Appendix I): generated `.vmx` + VMDK via block projection, HGFS shared folders for volumes, agent via seed ISO. Live migration on desktop VMware: none (vMotion is vCenter's, and that's fine — it maps to the paid tier anyway).
@@ -416,10 +401,10 @@ The driver interface is not internal plumbing; it is Hull's **stable plugin API*
 That admits further engines like:
 
 - **chroot** — near-trivial, useful as the reference plugin implementation;
-- **DOSBox** — `source = "dir:./c"` mounts as `C:`, `command` becomes the autoexec line, extra `volumes` become additional DOS mounts, `[[machine.media]]` cdrom entries appear as disc drives reconstructed from file collections (§3.10, copy protection included), and nearly everything else (`ports`, `memory` semantics, `ssh`) is declared `rejected` in its capability table — which is fine, because the matrix makes partial engines *safe* rather than broken;
+- **DOSBox** — `(source "dir:./c")` mounts as `C:`, `command` becomes the autoexec line, extra `volumes` become additional DOS mounts, `(media …)` cdrom entries appear as disc drives reconstructed from file collections (§3.10, copy protection included), and nearly everything else (`ports`, `memory` semantics, `ssh`) is declared `rejected` in its capability table — which is fine, because the matrix makes partial engines *safe* rather than broken;
 - **Wine**, **user-mode Linux**, **wasm runtimes** — same story with different capability subsets.
 
-An engine declares what it can do; the plan step enforces it; the conformance suite is tagged per capability, so any third-party engine can run exactly the subset of the shared tests its declaration claims — and gets held to it. Spec fields an engine doesn't know are `rejected` by default, never ignored. The result: the same `hull.toml` + files-in-a-directory workflow drives any execution substrate anyone cares to plug in, and "switch backend" stays a one-line change all the way from crun to DOSBox.
+An engine declares what it can do; the plan step enforces it; the conformance suite is tagged per capability, so any third-party engine can run exactly the subset of the shared tests its declaration claims — and gets held to it. Spec fields an engine doesn't know are `rejected` by default, never ignored. The result: the same `hull.conf` + files-in-a-directory workflow drives any execution substrate anyone cares to plug in, and "switch backend" stays a one-line change all the way from crun to DOSBox.
 
 ### 5.1 The `ns` class — namespaces (default)
 
@@ -430,10 +415,10 @@ Wave one implements this class with the **docker adapter** (§5.0). The wave-two
 The default `micro` profile:
 
 - QEMU `-M microvm` (or cloud-hypervisor) with a **bundled minimal guest kernel** (virtio, virtiofs, vsock, overlayfs; built from a pinned LTS config, updated with Hull releases). Boot target: 100–300 ms.
-- Rootfs: the composefs image — or the dir source — over virtiofs (plus `upper/` over a second share when `mutable = "overlay"`), assembled by a ~200 KB static **guest agent** that is PID 1, mounts the root, applies the spec (env, workdir, uid), and exec's the workload.
+- Rootfs: the composefs image — or the dir source — over virtiofs (plus `upper/` over a second share when `(mutable overlay)`), assembled by a ~200 KB static **guest agent** that is PID 1, mounts the root, applies the spec (env, workdir, uid), and exec's the workload.
 - The agent speaks a small protocol over **vsock**: exec, logs/stdio streaming, stats, graceful stop. This is what makes `hull exec`/`hull logs` byte-for-byte identical UX across backends.
 - Ports: host-side forwarders mapped from the same `ports` spec onto the machine's stable ingress address (§8.1).
-- `kernel = "image"` lets an image ship its own kernel at a well-known path for kernel-dependent workloads.
+- `(kernel image)` lets an image ship its own kernel at a well-known path for kernel-dependent workloads.
 
 The `full` profile boots a standard QEMU machine type instead — full distro init, custom kernels/modules, PCI/USB passthrough, optional GUI. Startup in seconds; the matrix makes the cost visible. The **virtualbox** and **vmware** engines (§5.0) implement this class in full-profile form only, via the block-projection path (§3.9) — same class contract, their own matrix deltas. If VirtualBox's API drag ever exceeds its value it is the first engine to cut — the spec doesn't change either way.
 
@@ -442,9 +427,9 @@ The `full` profile boots a standard QEMU machine type instead — full distro in
 The same driver as `vm` with hardware acceleration removed — same profiles, same kernel strategy, same virtiofs shares, same guest agent, same vsock control plane (with a virtio-serial fallback where vhost-vsock isn't available). Two reasons it exists:
 
 - **No KVM:** locked-down hosts, nested environments, CI runners without /dev/kvm. The spec runs unchanged, just slower.
-- **Foreign architecture:** set `arch = "arm64"` (or riscv64, …) and the machine boots a foreign-arch kernel and rootfs on any host. Combined with dir sources this means: put an ARM rootfs in a directory, run it on your x86 laptop, switch it to `backend = "vm"` unchanged when you're on ARM hardware.
+- **Foreign architecture:** set `(arch arm64)` (or riscv64, …) and the machine boots a foreign-arch kernel and rootfs on any host. Combined with dir sources this means: put an ARM rootfs in a directory, run it on your x86 laptop, switch it to `(backend vm)` unchanged when you're on ARM hardware.
 
-Cost is honesty-first: TCG runs roughly 5–20× slower than native and the matrix says so. A middle path for foreign-arch *processes* (not kernels) is `ns` with `binfmt = true` — qemu-user under binfmt_misc, faster than full-system emulation, flagged `emulated` in the matrix because syscall emulation has edge cases.
+Cost is honesty-first: TCG runs roughly 5–20× slower than native and the matrix says so. A middle path for foreign-arch *processes* (not kernels) is `ns` with `(binfmt true)` — qemu-user under binfmt_misc, faster than full-system emulation, flagged `emulated` in the matrix because syscall emulation has edge cases.
 
 ---
 
@@ -459,16 +444,16 @@ The matrix is data, not documentation: assembled at load time from each engine's
 | Spec field / feature | ns | vm | emu |
 |---|---|---|---|
 | `command`, `env`, `workdir` | native | native (agent) | native (agent) |
-| `source = dir:` (+ `mutable = direct`) | native (idmapped bind) | native under passthrough; block projection rejects unless `writeback` (§3.9) | native under passthrough; same block rule |
+| `(source "dir:…")` (+ `(mutable direct)`) | native (idmapped bind) | native under passthrough; block projection rejects unless `writeback` (§3.9) | native under passthrough; same block rule |
 | `ports` → stable ingress address (§8.1) | native (pasta) | emulated: host forwarder | emulated: host forwarder |
-| `ssh = true` / `hull ssh` | native | native | native |
+| `(ssh true)` / `hull ssh` | native | native | native |
 | `volumes rw/ro` | native (idmapped bind) | native (virtiofs; vboxsf/HGFS on the virtualbox/vmware engines is slow) | native (virtiofs) |
 | `cpus`, `memory` | native (cgroups; memory = ceiling) | native (hard allocation) | native (hard allocation; cpus = threads) |
 | `readonly_root` | native | native | native |
-| `arch` ≠ host | rejected → `emulated` with `binfmt = true` (qemu-user) | rejected: KVM is same-arch → use emu | native (that's the point) |
+| `arch` ≠ host | rejected → `emulated` with `(binfmt true)` (qemu-user) | rejected: KVM is same-arch → use emu | native (that's the point) |
 | host networking | native, **opt-in flag** | rejected: no shared netns → use `ports` | rejected: same |
 | device passthrough | rejected in rootless (no nodes) | emulated: virtio/VFIO/USB where permitted | emulated: QEMU-emulated devices only |
-| custom kernel / modules | rejected: shared host kernel | native (`kernel=` key; `full` profile for distro kernels) | native |
+| custom kernel / modules | rejected: shared host kernel | native (`kernel` key; `full` profile for distro kernels) | native |
 | inotify on volumes | native | rejected-by-default: virtiofs event gaps → poll option offered | rejected-by-default: same |
 | startup latency (informational) | ~10 ms | ~100–300 ms (micro), seconds (full) | seconds; workload 5–20× slower |
 | kernel isolation boundary (informational) | none (namespaces) | hardware VM | full guest stack, software boundary |
@@ -485,9 +470,9 @@ Two rules keep this honest:
 ## 7. Security model
 
 - No root daemon, no setuid helpers, no privileged socket. The resident component is the per-user core (§2), an unprivileged service owned by the invoking user; the attack surface of "Hull installed" is user-owned processes and a user-owned socket. Adapter engines inherit the wrapped runtime's posture — the docker adapter rides dockerd's root daemon, and its matrix column declares it — while native engines carry the full rootless model.
-- ns backend: user namespaces map root-in-container to an unprivileged subordinate uid; seccomp default profile (crun's) + `no_new_privs` on by default; capabilities are empty-by-default and additive via `security.allow` — there is deliberately **no `--privileged`**. Workloads that need it are told to use the vm backend, which is the correct tool.
+- ns backend: user namespaces map root-in-container to an unprivileged subordinate uid; seccomp default profile (crun's) + `no_new_privs` on by default; capabilities are empty-by-default and additive via `(security (allow …))` — there is deliberately **no `--privileged`**. Workloads that need it are told to use the vm backend, which is the correct tool.
 - vm/emu backends: the kernel boundary is the headline feature. The guest agent treats the vsock channel as the only control plane; no host filesystem is visible except declared volumes.
-- Image integrity: fs-verity on objects + signed manifests (§3.5); `hull pull` can require signatures per-registry via policy in `~/.config/hull/policy.toml`.
+- Image integrity: fs-verity on objects + signed manifests (§3.5); `hull pull` can require signatures per-registry via policy in `~/.config/hull/policy.conf`.
 
 ## 8. Networking
 
@@ -499,13 +484,13 @@ The contract: **how you get *into* a machine never depends on its backend.** Thr
 
 1. **Stable per-machine address.** Every machine gets a deterministic loopback IP (`127.107.x.y`, derived from the machine name — stable across restarts, rebuilds, *and backend switches*) plus a name in Hull's per-user stub resolver: `web.hull → 127.107.x.y`. Every declared port is forwarded from that IP to the machine by whichever plumbing the backend uses (pasta, user-net forwarder) — invisible at this layer. `psql -h db.hull` and `curl web.hull:8080` are byte-identical commands on ns, vm, and emu, and they keep working mid-project when a machine changes backend.
 2. **SSH without thinking.** `hull ssh <machine>` always works: if the machine runs sshd it proxies to its port 22; if not, it falls back to an agent exec with a real PTY (ns: namespace enter; vm/emu: vsock exec) — same keystrokes either way. For native tooling — plain `ssh`, `scp`, `rsync`, IDE remote-development — `hull ssh-config` maintains a block in `~/.ssh/config`: `Host *.hull → ProxyCommand hull proxy-ssh %h`. After that, `ssh web.hull` works from anything that speaks SSH, on every backend. Critically, **host keys are machine state, not boot state**: Hull generates the host key at machine creation and injects it on every start, so switching ns → vm → emu never trips a known_hosts warning. The machine's SSH identity belongs to the machine, not to the backend.
-3. **sshd provisioning.** `ssh = true` makes Hull inject and supervise a minimal sshd (with your authorized_keys) through the same start path on all backends — so even a bare `dir:` rootfs with nothing installed is reachable over real SSH with one line of config.
+3. **sshd provisioning.** `(ssh true)` makes Hull inject and supervise a minimal sshd (with your authorized_keys) through the same start path on all backends — so even a bare `dir:` rootfs with nothing installed is reachable over real SSH with one line of config.
 
 ## 9. Integration
 
 - **systemd:** `hull systemd <machine>` emits a quadlet-style user unit (`Restart=` from the spec's `restart`, journald-native logging, socket activation optional). Boot-start is `systemctl --user enable` + linger — all standard.
-- **Migration:** `hull import Dockerfile` converts to a `[build]` section (best-effort, annotated where semantics differ); `hull import docker-compose.yml` converts to a multi-machine file. Both are one-way generators that print what they couldn't translate.
-- **Spec dialects — a second pigeonhole axis.** Engines plug in on the execution side (§5.0); **dialects** plug in on the input side: alternative spec formats that compile to the same MachineSpecs + segments the native hull.toml produces. The **compose dialect** slot is reserved now: `hull up` in a directory containing a `docker-compose.yml`/`compose.yaml` runs it *directly* — no conversion step, the compose file stays the live source of truth (the podman-compose posture, for teams whose compose files are entrenched). Mapping shape: services → machines, networks → segments (Appendix D), `depends_on` → start ordering, healthchecks → agent probes, profiles → machine subsets; compose keys outside the supported subset get the same honesty treatment as everything else — **rejected or warned at plan time, never silently ignored** — and `hull plan --explain -f compose.yaml` shows exactly how each service compiled. The payoff of dialect-over-import: a compose team gets backend switching, ingress identity, and dir sources *without changing their file*, and converts to hull.toml only when they want Hull-native features compose can't express. Dialects are pluggable like engines; the native format remains hull.toml, and dialects never grow features the native format lacks.
+- **Migration:** `hull import Dockerfile` converts to a `(build …)` form (best-effort, annotated where semantics differ); `hull import docker-compose.yml` converts to a multi-machine file. Both are one-way generators that print what they couldn't translate.
+- **Spec dialects — a second pigeonhole axis.** Engines plug in on the execution side (§5.0); **dialects** plug in on the input side: alternative spec formats that compile to the same MachineSpecs + segments the native hull.conf produces. The **compose dialect** slot is reserved now: `hull up` in a directory containing a `docker-compose.yml`/`compose.yaml` runs it *directly* — no conversion step, the compose file stays the live source of truth (the podman-compose posture, for teams whose compose files are entrenched). Mapping shape: services → machines, networks → segments (Appendix D), `depends_on` → start ordering, healthchecks → agent probes, profiles → machine subsets; compose keys outside the supported subset get the same honesty treatment as everything else — **rejected or warned at plan time, never silently ignored** — and `hull plan --explain -f compose.yaml` shows exactly how each service compiled. The payoff of dialect-over-import: a compose team gets backend switching, ingress identity, and dir sources *without changing their file*, and converts to hull.conf only when they want Hull-native features compose can't express. Dialects are pluggable like engines; the native format remains hull.conf, and dialects never grow features the native format lacks.
 - **Vagrant dialect — reserved slot.** `hull up` beside a `Vagrantfile`: `config.vm.box` → an attached/imported box (§3.13 handles the .box format), provider blocks → backend hints (`virtualbox`/`vmware` map to the first-wave engines directly), `synced_folder` → volumes, `forwarded_port` → ports, shell provisioners → build steps or start hooks. One honest complication, declared up front: a Vagrantfile is executable Ruby, not data — the dialect supports the declarative subset that covers the overwhelming majority of real Vagrantfiles and **rejects arbitrary Ruby logic at plan time** rather than embedding a Ruby interpreter. Strategic timing is favorable: Vagrant under HashiCorp's BSL is stagnant and its community is receptive to an exit ramp — this dialect plus the virtualbox/vmware engines *is* that exit ramp.
 - **Registries:** any OCI registry works today (§3.5).
 - **Kubernetes (later):** the driver interface is deliberately shaped so a CRI shim can sit on top, with the vm driver playing the Kata role. Out of scope for v1.
@@ -514,7 +499,7 @@ The contract: **how you get *into* a machine never depends on its backend.** Thr
 ## 10. CLI sketch
 
 ```
-hull run [-f hull.toml] [--backend vm] [name]
+hull run [-f hull.conf] [--backend vm] [name]
 hull build / pull / push / tag / images / diff A B
 hull exec <machine> -- cmd… · hull logs -f <machine> · hull stop/rm
 hull ssh <machine> · hull ssh-config            # ingress identity (§8.1)
@@ -529,7 +514,7 @@ hull engines                          # list installed engines + their capabilit
 
 ## 11. Risks & open questions
 
-1. **Guest kernel maintenance** (vm): bundling a kernel means owning CVE response for it. Mitigation: pinned LTS, tiny config, auto-rebuild pipeline; `kernel="image"` as the escape hatch. This is the single largest ongoing cost of the design.
+1. **Guest kernel maintenance** (vm): bundling a kernel means owning CVE response for it. Mitigation: pinned LTS, tiny config, auto-rebuild pipeline; `(kernel image)` as the escape hatch. This is the single largest ongoing cost of the design.
 2. **virtiofs fidelity:** inotify gaps, mmap coherence, and performance vs. bind mounts are the main sources of ns↔vm behavioral difference. The matrix marks them honestly; upstream virtiofsd keeps improving.
 3. **Desktop-hypervisor API drag:** `VBoxManage` and `vmrun` scripting are workable but brittle across versions — the cost of the adapter strategy. Contained by the class contract (an adapter that breaks is dropped or pinned without touching the spec); decision point at end of Phase 2 for each: keep, pin to known-good versions, or cut.
 4. **composefs availability:** requires a reasonably recent kernel (EROFS + overlayfs data-only layers). Fallback path for older kernels: plain overlayfs over an extracted tree (loses verity, keeps the CAS).
@@ -538,8 +523,8 @@ hull engines                          # list installed engines + their capabilit
 
 ## 12. Roadmap
 
-- **Phase 1 — Core + docker & qemu engines:** spec parser, plan/matrix engine, the plugin driver API (chroot as reference plugin), `dir:` sources with direct/overlay mutability, the **docker adapter** (ns-class) and the **qemu engine** (vm-class via KVM + emu-class via TCG, guest agent + vsock, virtiofs), `run/exec/logs/stop`, stable ingress addresses + `hull ssh`. No store code at all. *Exit: one hull.toml flips between docker and qemu — container to VM to emulation — and deploys as a plain rsync'd directory.*
-- **Phase 2 — virtualbox & vmware adapters:** block projection + deterministic disk materializer (§3.9), seed-ISO agent path, `VBoxManage` and `vmrun` drivers, full ingress identity (`hull ssh-config`, host-key pinning, `ssh = true` provisioning), `hull check` CI gate. *Exit: all four first-wave engines pass their declared class conformance; an ARM directory rootfs runs on x86 via qemu-tcg.*
+- **Phase 1 — Core + docker & qemu engines:** spec parser, plan/matrix engine, the plugin driver API (chroot as reference plugin), `dir:` sources with direct/overlay mutability, the **docker adapter** (ns-class) and the **qemu engine** (vm-class via KVM + emu-class via TCG, guest agent + vsock, virtiofs), `run/exec/logs/stop`, stable ingress addresses + `hull ssh`. No store code at all. *Exit: one hull.conf flips between docker and qemu — container to VM to emulation — and deploys as a plain rsync'd directory.*
+- **Phase 2 — virtualbox & vmware adapters:** block projection + deterministic disk materializer (§3.9), seed-ISO agent path, `VBoxManage` and `vmrun` drivers, full ingress identity (`hull ssh-config`, host-key pinning, `(ssh true)` provisioning), `hull check` CI gate. *Exit: all four first-wave engines pass their declared class conformance; an ARM directory rootfs runs on x86 via qemu-tcg.*
 - **Phase 3 — Optional store & OCI border:** CAS + manifests, commit/diff/gc, composefs mounting, fs-verity, OCI pull/push (any Docker Hub image becomes runnable or `materialize`-able to a directory), `hull build` with content-hash caching. *Exit: pull, unpack-to-dir, build, and publish images with correct caching — all still optional.*
 - **Phase 4 — Native engines & polish:** the rootless crun-based ns engine (delivering §7's security model natively; pasta networking) and the microVM profile with bundled kernel pipeline (Appendix F), systemd generator, Dockerfile/compose importers. *Exit: the rootless promise holds without Docker installed; the multi-engine story is conformance-tested across adapters and native engines alike.*
 
@@ -556,7 +541,7 @@ A manifest is the canonical description of a filesystem tree. Its identity is `s
 ## A.1 Two representations, one identity
 
 - **Canonical form:** deterministic CBOR — definite-length encoding, map keys sorted bytewise, no floats, no timestamps except where specified. This is what gets hashed, stored, and signed. CBOR rather than TOML/JSON because hashing text formats means litigating whitespace and key order forever.
-- **Human form:** `hull manifest show <ref>` renders lossless TOML for eyeballs and diffs. The TOML is a *view*; editing it and running `hull manifest compile` produces a new canonical manifest with a new identity. Nothing ever mutates in place. *(The readable form is s-expressions since §4.1, and whether CBOR remains the canonical form is open point 3 there.)*
+- **Human form:** `hull manifest show <ref>` renders a lossless s-expression form for eyeballs and diffs. That form is a *view*; editing it and running `hull manifest compile` produces a new canonical manifest with a new identity. Nothing ever mutates in place. *(Whether CBOR remains the canonical form is open in §4.1.)*
 
 ## A.2 Structure
 
@@ -601,7 +586,7 @@ OCI imports map `0 → "root"`, the image's configured user → `"user"`, everyt
 
 ## A.4 RuntimeDefaults
 
-The OCI config-blob equivalents, overridable by `hull.toml`: `entrypoint`, `cmd`, `env`, `workdir`, `user`, `stop_signal`, declared `ports`/`volumes` (advisory). Kept in the manifest so `hull run <ref>` with no spec file behaves like `docker run`.
+The OCI config-blob equivalents, overridable by `hull.conf`: `entrypoint`, `cmd`, `env`, `workdir`, `user`, `stop_signal`, declared `ports`/`volumes` (advisory). Kept in the manifest so `hull run <ref>` with no spec file behaves like `docker run`.
 
 ## A.5 Provenance
 
@@ -654,7 +639,7 @@ Unknown message types are answered with `ERROR {unsupported}` rather than droppe
 ## B.4 Failure semantics
 
 - Agent crash ⇒ PID 1 dies ⇒ guest kernel panics ⇒ hypervisor reports exit ⇒ host surfaces "machine died: agent" with the last log tail it had streamed. Nothing hangs.
-- Host process crash ⇒ vsock closes ⇒ agent's policy is spec-driven: `on_disconnect = "stop"` (default: workload is torn down, mirroring ns-backend child-process semantics) or `"keep"` (for systemd-managed machines that should survive a CLI restart and be re-adopted via `hull attach`).
+- Host process crash ⇒ vsock closes ⇒ agent's policy is spec-driven: `(on_disconnect stop)` (default: workload is torn down, mirroring ns-backend child-process semantics) or `keep` (for systemd-managed machines that should survive a CLI restart and be re-adopted via `hull attach`).
 - Exit codes are reported exactly (code + signal), so `hull run; echo $?` is backend-identical — this is a conformance-suite assertion, not a hope.
 
 ---
@@ -663,7 +648,7 @@ Unknown message types are answered with `ERROR {unsupported}` rather than droppe
 
 **Chunked pull (was §11.6a).** Adopt content-defined chunking (casync/FastCDC-style) as a *transport* option: `hull push --chunked` uploads a chunk index alongside the OCI export; `hull pull` with a warm store fetches only missing chunks and reassembles objects locally. Falls back transparently to plain OCI layer pull against dumb registries. The CAS is unchanged either way — chunking never leaks into the store format.
 
-**Secrets (was §11.6b).** Never in env by default. `[machine.secrets]` maps names to sources (`file:`, `age:` encrypted file, `exec:` command output); Hull materializes them at start into a machine-private tmpfs (`/run/hull/secrets/<name>`, mode 0400) on every backend — tmpfs via bind on ns, via the agent on VMs — and they are excluded from `hull commit` by construction since tmpfs never touches the writable layer. Env injection remains available per-secret via `expose = "env"` with a warning, because pragmatism.
+**Secrets (was §11.6b).** Never in env by default. `(secrets …)` maps names to sources (`file:`, `age:` encrypted file, `exec:` command output); Hull materializes them at start into a machine-private tmpfs (`/run/hull/secrets/<name>`, mode 0400) on every backend — tmpfs via bind on ns, via the agent on VMs — and they are excluded from `hull commit` by construction since tmpfs never touches the writable layer. Env injection remains available per-secret via `(expose env)` with a warning, because pragmatism.
 
 ---
 
@@ -671,11 +656,10 @@ Unknown message types are answered with `ERROR {unsupported}` rather than droppe
 
 A multi-machine file defines a **segment**: a private L2/L3 scope where machines reach each other by name. The spec is backend-neutral; each backend implements it differently but observably identically.
 
-```toml
-[machines.web]
-image = "…"; ports = [{ host = 8080, guest = 80 }]
-[machines.db]
-image = "…"                      # no host ports: reachable only inside the segment
+```scheme
+(machines
+  (web (source "…") (ports (port (host 8080) (guest 80))))
+  (db  (source "…")))            ; no host ports: reachable only inside the segment
 ```
 
 Semantics, tested by the conformance suite: every machine resolves every sibling by name (`db` → its segment IP); DNS is served by Hull itself (a stub resolver injected via `/etc/resolv.conf`), not by patching `/etc/hosts`; only `ports`-declared endpoints are reachable from the host; nothing in the segment is reachable from the LAN.
@@ -691,11 +675,11 @@ Multi-machine files can also arrive via the **compose dialect** (§9): a `docker
 Sound caching (§3.6) requires that a step *cannot* read anything outside its declared inputs. The contract:
 
 - The step's mount namespace contains exactly: the parent manifest's tree (ro, composefs), the step's scratch overlay (rw), declared `copy` inputs (ro, bind-mounted from a content-hashed staging snapshot — the build hashes inputs *before* mounting, so mid-build edits of `./src` can't tear a step), `/proc`, `/dev` minimal, tmpfs `/tmp`.
-- **Network is off by default.** A step that fetches (`apt-get`, `pip`) declares `network = true`, which does two things: allows pasta attachment, and *demotes the step's cache entry to time-bucketed* (`refresh = "7d"` default, configurable) since network steps are inherently unreproducible. The doc-level advice: fetch in few `network=true` steps, build in pure ones.
+- **Network is off by default.** A step that fetches (`apt-get`, `pip`) declares `(network true)`, which does two things: allows pasta attachment, and *demotes the step's cache entry to time-bucketed* (`(refresh "7d")` default, configurable) since network steps are inherently unreproducible. The doc-level advice: fetch in few `(network true)` steps, build in pure ones.
 - Environment is scrubbed to a fixed allowlist plus declared `env`; no host uid leakage (steps always run as manifest-`root` in a userns); clock is real but `SOURCE_DATE_EPOCH` is set for toolchains that honor it.
 - Output normalization on commit: mtimes → epoch (A.2), stable file ordering, `/tmp` and declared `discard` paths dropped. Result: pure steps are bit-reproducible in practice, and `hull build --check` (build twice, compare manifest hashes) is the reproducibility test.
 
-Builds run on the ns backend by default but honor `backend = "vm"` per step — needed when a build step must load kernel modules or exercise /dev, and otherwise identical thanks to the same contract applied via the agent.
+Builds run on the ns backend by default but honor `(backend vm)` per step — needed when a build step must load kernel modules or exercise /dev, and otherwise identical thanks to the same contract applied via the agent.
 
 # Appendix F — Guest kernel pipeline (vm backend)
 
@@ -704,7 +688,7 @@ The bundled kernel is the vm backend's biggest liability (§11.1); this is the c
 - **One kernel, tiny config:** latest LTS, `microvm` defconfig-derived: virtio-{fs,net,vsock,blk,rng}, overlayfs, EROFS, cgroups, seccomp, no modules (everything built in, `CONFIG_MODULES=n` — no module loading means a whole attack class gone), no graphics/sound/USB/legacy. Target < 5 MB compressed, boot-to-init < 50 ms.
 - **Reproducible build:** kernel + config + toolchain pinned in a lockfile; CI rebuilds bit-identically and signs the artifact; the kernel ships inside the Hull release archive, versioned with it (no separate download, no TOFU).
 - **CVE response:** subscribe to the LTS stable queue; a kernel-only patch release channel (`hull self-update --kernel-only`) decouples security updates from feature releases. Because the config is tiny, the honest expectation is that most kernel CVEs don't apply — each advisory gets a public applies/doesn't-apply note.
-- **Escape hatches, in order of preference:** `kernel = "path:./bzImage"` (bring your own), `kernel = "image"` (the image ships `/hull/kernel`, for kernel-testing workloads — this is also how you run a *different kernel version per machine*, something Docker structurally cannot do), and the vm `full` profile for full-distro kernels.
+- **Escape hatches, in order of preference:** `(kernel "path:./bzImage")` (bring your own), `(kernel image)` (the image ships `/hull/kernel`, for kernel-testing workloads — this is also how you run a *different kernel version per machine*, something Docker structurally cannot do), and the vm `full` profile for full-distro kernels.
 - Non-goal: general module support in the microVM kernel. A workload needing arbitrary modules is a full-VM workload; the matrix says so.
 
 ---
@@ -721,7 +705,7 @@ Where Hull still differentiates: Incus is a **system-daemon architecture** (incu
 
 ## G.2 libkrun / crun-krun — validation of the vm backend
 
-Podman can already run a container in a microVM by swapping the OCI runtime to `krun` (libkrun) — same image, same invocation, hardware isolation — which is precisely Hull's `backend = "vm"` concept expressed at the OCI-runtime layer. Red Hat is pushing it for AI-workload isolation (RamaLama). Current state: early-stage, Linux-only, GPU enablement still in progress, and the isolation choice is a runtime *flag* rather than a first-class, capability-checked spec field — `podman exec` support in krun was, notably, a tracked issue rather than a given, which is exactly the class of drift Hull's conformance suite exists to prevent. Verdict: **adopt, don't fork** — evaluate libkrun as the vm driver's hypervisor library (it would replace bespoke QEMU-microvm orchestration and possibly the bundled-kernel burden, since libkrun ships its own), with cloud-hypervisor as fallback. This could materially shrink Phase 4's native-microVM work and de-risk §11.1.
+Podman can already run a container in a microVM by swapping the OCI runtime to `krun` (libkrun) — same image, same invocation, hardware isolation — which is precisely Hull's `(backend vm)` concept expressed at the OCI-runtime layer. Red Hat is pushing it for AI-workload isolation (RamaLama). Current state: early-stage, Linux-only, GPU enablement still in progress, and the isolation choice is a runtime *flag* rather than a first-class, capability-checked spec field — `podman exec` support in krun was, notably, a tracked issue rather than a given, which is exactly the class of drift Hull's conformance suite exists to prevent. Verdict: **adopt, don't fork** — evaluate libkrun as the vm driver's hypervisor library (it would replace bespoke QEMU-microvm orchestration and possibly the bundled-kernel burden, since libkrun ships its own), with cloud-hypervisor as fallback. This could materially shrink Phase 4's native-microVM work and de-risk §11.1.
 
 ## G.3 composefs / podman store — the tide is with us
 
@@ -800,7 +784,7 @@ Summary of "who can never": nothing is *categorically* never at the whole-engine
 
 ## H.4 Migratability is computed, not assumed
 
-The matrix machinery (§6) applies directly: migration class is a derived property of `engine ∩ features used`. Examples: **device passthrough pins any machine on any hypervisor** — VFIO state cannot be serialized (this is true in every virtualization stack, not a Hull limitation); host networking pins an ns machine; `fidelity = ["odirect"]` with a local block projection requires storage migration or shared storage. `hull plan --explain` therefore answers, per machine, before it ever runs: *live / warm / pinned, and why* — the same honesty contract as everything else, extended to mobility.
+The matrix machinery (§6) applies directly: migration class is a derived property of `engine ∩ features used`. Examples: **device passthrough pins any machine on any hypervisor** — VFIO state cannot be serialized (this is true in every virtualization stack, not a Hull limitation); host networking pins an ns machine; `(fidelity odirect)` with a local block projection requires storage migration or shared storage. `hull plan --explain` therefore answers, per machine, before it ever runs: *live / warm / pinned, and why* — the same honesty contract as everything else, extended to mobility.
 
 ## H.5 What Hull's existing design contributes
 
@@ -864,95 +848,100 @@ Binary-only components are a bane for exactly the users Hull courts: they can't 
 
 ---
 
-# Appendix J — `hull.toml` schema reference (DRAFT v0.1)
+# Appendix J — `hull.conf` schema reference (DRAFT v0.1)
 
-The complete key inventory for §4, as designed. The authoritative machine-readable schema
-will be a situ description generated from this draft. Canonical spec-field ids (used by
-capability tables and `--accept` tokens) are the dotted paths shown in the left columns.
+The complete key inventory for §4, as designed, in the syntax of §4.1. The authoritative
+machine-readable schema will be a situ description generated from this draft. Canonical
+spec-field ids (used by capability tables and `--accept` tokens) are the dotted paths shown
+in the left columns.
 
-Single-machine files use `[machine]`; multi-machine files use `[machines.<name>]` with the
-same schema per machine (machines in one file form a segment, Appendix D). A `[build]`
-section may live in the same file or `hull.build.toml`.
+Single-machine files use `(machine …)`; multi-machine files use `(machines (<name> …) …)`
+with the same schema per machine (machines in one file form a segment, Appendix D). A
+`(build …)` form may live in the same file or in `hull.build.conf`.
 
-## J.1 `[machine]` — core keys
+## J.1 `(machine …)` — core keys
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `source` | string | *required* | `dir:<path>` (§3.7, primary) · `tar:<path>` · `pack:<path>` (§3.13) · `image:<path>` foreign attach (§3.13) · bare string = image ref in store/registry (§3.5) |
-| `mutable` | `"direct"` \| `"overlay"` | `direct` for `dir:`, else `overlay` | `direct` writes to the source tree (bind/passthrough only — block projection rejects without `writeback`, §3.9) |
-| `writeback` | `"none"` \| `"sync-on-stop"` | `none` | Only meaningful with block projection + `direct`; documents a crash window (§3.9 rule 2) |
-| `projection` | `"auto"` \| `"bind"` \| `"passthrough"` \| `"block"` | `auto` | Planner chooses per engine unless forced (§3.9) |
-| `fidelity` | array of string | `[]` | Declared semantic needs: `"inotify"`, `"flock"`, `"odirect"`, … — planner must satisfy every entry or reject (§3.9 rule 3) |
-| `arch` | string | `"host"` | `amd64`, `arm64`, `riscv64`, … Foreign arch ⇒ emu class, or ns with `binfmt=true` (§5.3) |
-| `command` | array of string | manifest `RuntimeDefaults.cmd` | Argv; no shell. `entrypoint` semantics come from the manifest (A.4) |
+| `source` | string | *required* | `"dir:<path>"` (§3.7, primary) · `"tar:<path>"` · `"pack:<path>"` (§3.13) · `"image:<path>"` foreign attach (§3.13) · bare string = image ref in store/registry (§3.5) |
+| `mutable` | `direct` \| `overlay` | `direct` for `dir:`, else `overlay` | `direct` writes to the source tree (bind/passthrough only — block projection rejects without `writeback`, §3.9) |
+| `writeback` | `none` \| `sync-on-stop` | `none` | Only meaningful with block projection + `direct`; documents a crash window (§3.9 rule 2) |
+| `projection` | `auto` \| `bind` \| `passthrough` \| `block` | `auto` | Planner chooses per engine unless forced (§3.9) |
+| `fidelity` | symbols | empty | Declared semantic needs: `inotify`, `flock`, `odirect`, … — planner must satisfy every entry or reject (§3.9 rule 3) |
+| `arch` | symbol | `host` | `amd64`, `arm64`, `riscv64`, … Foreign arch ⇒ emu class, or ns with `(binfmt true)` (§5.3) |
+| `command` | strings | manifest `RuntimeDefaults.cmd` | Argv; no shell. `entrypoint` semantics come from the manifest (A.4) |
 | `workdir` | string | manifest default or `/` | |
-| `env` | table str→str | `{}` | Merged over manifest env |
-| `env_file` | string | — | dotenv-format file; gitignored secrets belong in `[machine.secrets]` instead |
-| `ports` | array of table | `[]` | `{ host, guest, proto = "tcp"\|"udp" }`; bound on the machine's stable ingress IP (§8.1) |
-| `volumes` | array of table | `[]` | `{ host, guest, mode = "rw"\|"ro" }` |
-| `cpus` | int | engine default | ns: cgroup weight/quota · vm/emu: vCPUs |
+| `env` | `(NAME "value")` entries | empty | Merged over manifest env |
+| `env_file` | string | — | dotenv-format file; gitignored secrets belong in `(secrets …)` instead |
+| `ports` | `(port …)` entries | empty | `(port (host N) (guest N) (proto tcp\|udp))`; bound on the machine's stable ingress IP (§8.1) |
+| `volumes` | `(volume …)` entries | empty | `(volume (host "<path>") (guest "<path>") (mode rw\|ro))` |
+| `cpus` | integer | engine default | ns: cgroup weight/quota · vm/emu: vCPUs |
 | `memory` | string | engine default | `"2G"`; ns: cgroup ceiling · vm/emu: hard allocation (§6) |
-| `backend` | string | `"ns"` | Class (`ns`/`vm`/`emu` → host default engine of class) or engine (`docker`, `qemu`, `virtualbox`, `vmware`, reserved: `hyperv`, `dosbox`, …) (§5.0) |
-| `ssh` | bool | `false` | Provision + supervise minimal sshd with user's authorized_keys, all backends (§8.1.3) |
-| `restart` | `"no"` \| `"on-failure"` \| `"always"` | `"no"` | Consumed by the systemd generator (§9), not by a daemon |
-| `on_disconnect` | `"stop"` \| `"keep"` | `"stop"` | Machine behavior if the core/CLI dies (B.4); `keep` requires later `hull attach` |
+| `backend` | symbol | `ns` | Class (`ns`/`vm`/`emu` → host default engine of class) or engine (`docker`, `qemu`, `virtualbox`, `vmware`, reserved: `hyperv`, `dosbox`, …) (§5.0) |
+| `ssh` | boolean | `false` | Provision + supervise minimal sshd with user's authorized_keys, all backends (§8.1.3) |
+| `restart` | `no` \| `on-failure` \| `always` | `no` | Consumed by the systemd generator (§9), not by a daemon |
+| `on_disconnect` | `stop` \| `keep` | `stop` | Machine behavior if the core/CLI dies (B.4); `keep` requires later `hull attach` |
 | `hostname` | string | machine name | Also the ingress DNS label `<name>.hull` (§8.1) |
 
-## J.2 `[machine.security]` (§7)
+## J.2 `(security …)` (§7)
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `readonly_root` | bool | `false` | |
-| `no_new_privs` | bool | `true` | ns class |
-| `allow` | array of string | `[]` | Additive: capability grants (ns) / device passthrough ids (vm). There is deliberately no `privileged` key — the vm class is the escape hatch |
+| `readonly_root` | boolean | `false` | |
+| `no_new_privs` | boolean | `true` | ns class |
+| `allow` | symbols | empty | Additive: capability grants (ns) / device passthrough ids (vm). There is deliberately no `privileged` key — the vm class is the escape hatch |
 
-## J.3 `[machine.secrets]` (Appendix C)
+## J.3 `(secrets …)` (Appendix C)
 
-Table of `name = { source, expose? }`. `source`: `file:<path>` · `age:<path>` · `exec:<argv>`.
-Materialized to machine-private tmpfs `/run/hull/secrets/<name>` (mode 0400) on every
-backend; excluded from `hull commit` by construction. `expose = "env"` opts one secret into
-env injection (warned).
+Entries `(<name> (source "…") (expose env))`, `expose` optional. `source`: `"file:<path>"` ·
+`"age:<path>"` · `"exec:<argv>"`. Materialized to machine-private tmpfs
+`/run/hull/secrets/<name>` (mode 0400) on every backend; excluded from `hull commit` by
+construction. `(expose env)` opts one secret into env injection (warned).
 
-## J.4 `[[machine.media]]` (§3.10, §3.13)
+## J.4 `(media …)` (§3.10, §3.13)
+
+Entries are `(medium …)`:
 
 | Key | Type | Notes |
 |---|---|---|
-| `type` | string | `"cdrom"`, `"floppy"`, `"disk"`, … — engine must list it in `media_types` |
-| `source` | string | `dir:` collection (files + `media.toml` + `quirks/`), `tar:`, `pack:`, or foreign `image:` |
+| `type` | symbol | `cdrom`, `floppy`, `disk`, … — engine must list it in `media_types` |
+| `source` | string | `dir:` collection (files + `media.conf` + `quirks/`), `tar:`, `pack:`, or foreign `image:` |
 
-## J.5 `[machine.backend.*]` — class- and engine-level tuning (§4)
+## J.5 `(tuning …)` — class- and engine-level tuning (§4)
 
-Tables may be named for a **class** (applies to any engine of that class) or a **concrete
-engine** (overrides the class table). Non-applicable tables warn.
+Entries may be named for a **class** (applies to any engine of that class) or a **concrete
+engine** (overrides the class entry). Non-applicable entries warn.
 
-| Table.Key | Type | Default | Notes |
+| Entry.Key | Type | Default | Notes |
 |---|---|---|---|
-| `vm.profile` | `"micro"` \| `"full"` | `micro` | micro: qemu & native engines only; virtualbox/vmware/hyperv are full-only (§5.2) |
-| `vm.kernel` | `"bundled"` \| `"image"` \| `path:<file>` | `bundled` | Appendix F |
-| `vm.cpu_profile` | `"host"` \| `"migratable"` | `host` | `migratable` = constrained model, enables vm↔emu/live migration (H.5/H.6) |
-| `qemu.accel` | `"auto"` \| `"kvm"` \| `"tcg"` | `auto` | `tcg` ⇒ emu class semantics |
+| `vm.profile` | `micro` \| `full` | `micro` | micro: qemu & native engines only; virtualbox/vmware/hyperv are full-only (§5.2) |
+| `vm.kernel` | `bundled` \| `image` \| `"path:<file>"` | `bundled` | Appendix F |
+| `vm.cpu_profile` | `host` \| `migratable` | `host` | `migratable` = constrained model, enables vm↔emu/live migration (H.5/H.6) |
+| `qemu.accel` | `auto` \| `kvm` \| `tcg` | `auto` | `tcg` ⇒ emu class semantics |
 | `emu.cores_scale` | number | `1` | vCPU over-provision to offset TCG cost (§5.3) |
-| `ns.binfmt` | bool | `false` | qemu-user for foreign-arch sources; matrix: emulated (§5.3) |
-| `virtualbox.gui` | bool | `false` | |
+| `ns.binfmt` | boolean | `false` | qemu-user for foreign-arch sources; matrix: emulated (§5.3) |
+| `virtualbox.gui` | boolean | `false` | |
 | `docker.*` / `vmware.*` / `hyperv.*` | — | — | Reserved; defined with each adapter |
 
-## J.6 `[build]` and `[[build.step]]` (§3.6, Appendix E)
+## J.6 `(build …)` and its steps (§3.6, Appendix E)
+
+`(build (base …) (steps (step …) …))`; the `step.` keys below are each step's entries.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `build.base` | string | *required* | Image ref or `dir:` |
 | `step.name` | string | *required* | |
 | `step.run` | string | — | Shell line, run in the step sandbox |
-| `step.copy` | array of `{from,to}` | `[]` | Declared inputs, content-hashed before mount |
-| `step.inputs` | array of string | `[]` | Extra cache-key inputs (paths, content-hashed) |
-| `step.network` | bool | `false` | `true` demotes cache to time-bucketed (`refresh`) |
-| `step.refresh` | duration | `"7d"` | Only with `network = true` |
-| `step.backend` | string | `"ns"` | Per-step engine (module-building steps: vm) |
-| `step.discard` | array of string | `[]` | Paths dropped at commit |
+| `step.copy` | `(path (from …) (to …))` entries | empty | Declared inputs, content-hashed before mount |
+| `step.inputs` | strings | empty | Extra cache-key inputs (paths, content-hashed) |
+| `step.network` | boolean | `false` | `true` demotes cache to time-bucketed (`refresh`) |
+| `step.refresh` | duration string | `"7d"` | Only with `(network true)` |
+| `step.backend` | symbol | `ns` | Per-step engine (module-building steps: vm) |
+| `step.discard` | strings | empty | Paths dropped at commit |
 
 ## J.7 Multi-machine files (Appendix D)
 
-`[machines.<name>]` tables; all machines in one file share a segment: sibling DNS by name,
+`(machines (<name> …) …)`; all machines in one file share a segment: sibling DNS by name,
 Hull stub resolver, only `ports`-declared endpoints reachable from the host. Mixed
 `backend` per machine is supported and is the point. Compose and Vagrant dialects (§9)
 compile onto exactly this schema; dialects never add keys this schema lacks.
@@ -973,5 +962,5 @@ This document was drafted in planning-only mode on mobile. When this project mov
 
 1. **Read the situ repo.** Judge actual capabilities and syntax; then rewrite Appendix A (manifest canonical encoding) and Appendix B (agent protocol) as situ descriptions if expressible — checking specifically whether deterministic canonical encoding (sorted keys, definite lengths) is expressible in situ as-is or needs an extension. Validate §3.12's assumptions. The `.hull` pack format and the in-fs collection format (§3.13) are the other two situ-first specs.
 2. **Ingest the project guidelines** (not yet received here): Qt/Widgets GUI, TUI, C core server, shared encrypted protocol. §2 and §7 already sketch the frontend/core split (per-user, unprivileged, socket-activated core; CLI/TUI/GUI as peer frontends); finalize it against the real guidelines and reconcile the shared protocol with Appendix B — likely: shared protocol frontend↔core, minimal vsock protocol core↔guest-agent.
-3. **Review the two Phase 1 artifact drafts** `hull_engine.h` and Appendix J: the C plugin ABI header (engine interface + capability declaration, §5.0) and the complete hull.toml schema reference (§4, folded in as Appendix J). Both are marked DRAFT — regenerate their encodings/ids from situ once step 1 lands.
+3. **Review the two Phase 1 artifact drafts** `hull_engine.h` and Appendix J: the C plugin ABI header (engine interface + capability declaration, §5.0) and the complete hull.conf schema reference (§4, folded in as Appendix J). Both are marked DRAFT — regenerate their encodings/ids from situ once step 1 lands.
 4. Then the Phase 1 build order (§12) applies as written: core + docker & qemu engines first.

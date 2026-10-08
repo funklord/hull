@@ -154,7 +154,7 @@ typedef struct hull_engine_ops {
 	/* Lifecycle. create() materializes runtime-side state (container, .vmx,
 	 * VBox machine...); start() runs it. Handles: engine allocates, core frees
 	 * via destroy(). adopt() re-binds to a machine that survived a core
-	 * restart (on_disconnect="keep"), from persisted state. */
+	 * restart under (on_disconnect keep), from persisted state. */
 	hull_status (*create) (hull_core*, hull_buf plan, hull_machine**, hull_error*);
 	hull_status (*start)  (hull_core*, hull_machine*, hull_error*);
 	hull_status (*stop)   (hull_core*, hull_machine*, int timeout_ms, hull_error*);
