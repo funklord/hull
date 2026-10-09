@@ -395,7 +395,9 @@ Measured, by `make check` and by sabotage in a scratch copy of the tree:
 
 **situ was told what adopting it found**, in situ's suggestion file for hull: nine findings, four of which reproduce on situ's own example. A list closed after whitespace gains a phantom empty element; the example frames an escaped quote as two forms; a run of structs never has its terminator checked; and `situc verify` reports bytes as conforming whose elements it never validated. The reader does not depend on any of them: it skips leads itself before deciding between an element and a `)`, the schema carries `[escape]`, and the walk checks every terminator. A fixed situ leaves it correct.
 
-Still to come, at higher situ layers over the same schemas: the canonical writer (`--layer edit`, which builds messages) and the agent protocol's framing (`--layer frame`, B.2).
+**The canonical writer waits for situ, decided 2026-10-09.** situ's ladder gives `edit` as the rung that builds a message, but no backend builds one yet. In C, `--layer edit` emits only an owned decode, refuses a variant such as `form`, and for this schema's `decimal` length emits a header that does not compile. The view layer gives the atom's length and bytes no setter, and its remedies would change the format rather than describe it. Both were reported to situ (findings 10 and 11). The holder chose to have situ build that rung first, not to hand-write a writer meanwhile, so hull has no canonical output until it does. What hull needs from a builder, sent to situ as a consumer's requirements: appending an atom from bytes, opening and closing lists to the same depth, a measure pass and caller-supplied storage, and every write read back through the view layer. Sorting a record's entries by key stays with hull (A.1).
+
+Still to come over the same schemas: the agent protocol's framing (`--layer frame`, B.2).
 
 ---
 
