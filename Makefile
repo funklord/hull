@@ -18,6 +18,13 @@ SITU_DIR  = vendor/situ
 SITU_MARK = $(SITU_DIR)/bin/situc
 SITUC     = $(PYTHON) $(SITU_MARK)
 
+# What generated code depends on: the whole compiler, not only the script
+# that starts it. Moving the pin to a situ whose code generator changed and
+# whose bin/situc did not regenerated nothing when only the script was
+# named, and the suite then passed against code the old situ had written.
+SITU_COMPILER = $(SITU_MARK) $(wildcard $(SITU_DIR)/situc/*.py \
+                $(SITU_DIR)/situc/*/*.py $(SITU_DIR)/situc/*/*/*.py)
+
 # Fetched on demand, and only for goals that need it: `style`, `clean`,
 # `help` and `hooks` must work in a tree whose submodule was never
 # initialised. MAKECMDGOALS is empty for a bare `make`, which does need it.
@@ -88,11 +95,11 @@ help:
 
 # Each schema generates a header and a source in one situc run, so both are
 # one grouped target and a parallel build runs it once.
-$(GEN_DIR)/readable.c $(GEN_DIR)/readable.h &: sexpr/readable.situ $(SITU_MARK)
+$(GEN_DIR)/readable.c $(GEN_DIR)/readable.h &: sexpr/readable.situ $(SITU_COMPILER)
 	@mkdir -p '$(GEN_DIR)'
 	$(SITUC) build --target c --prefix hull_sexpr_r --out '$(GEN_DIR)' sexpr/readable.situ
 
-$(GEN_DIR)/canonical.c $(GEN_DIR)/canonical.h &: sexpr/canonical.situ $(SITU_MARK)
+$(GEN_DIR)/canonical.c $(GEN_DIR)/canonical.h &: sexpr/canonical.situ $(SITU_COMPILER)
 	@mkdir -p '$(GEN_DIR)'
 	$(SITUC) build --target c --prefix hull_sexpr_c --out '$(GEN_DIR)' sexpr/canonical.situ
 
