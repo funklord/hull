@@ -1,0 +1,484 @@
+// A manifest in its canonical form (project.md Appendix A): the bytes that
+// are hashed, stored and signed. sexpr/canonical.situ says what any
+// canonical s-expression is; this says which one is a manifest.
+//
+// HOW A RECORD IS SPELLED. A record entry is `(key value...)`, and in
+// canonical form its key is a length-prefixed atom, so `(arch "amd64")` is
+// `(4:arch5:amd64)`. Entries are sorted bytewise by key (A.1), so each
+// record has one order and this schema states it: a required entry is its
+// fixed opening bytes, `preamble u8[7] = "(4:arch"`, and an optional one is
+// chosen by peeking the next four bytes, `(` with the key's length and its
+// first letter, which tells it from every key that may follow it. Bytes in
+// any other order fail at the first preamble they miss.
+//
+// Atoms are untyped, as A.1 says. A number is an atom of decimal digits,
+// and is framed here as an atom: situ reads a `decimal` run whose width a
+// field gives as that many elements of its type rather than that many
+// digits (situ, suggestion/hull.md finding 13), so `3:493` cannot yet be a
+// typed number. What a number, a path or a kind must hold is hull's to
+// check, with the rules situ cannot state: see the foot of this file.
+
+target buffer;
+endian big;
+
+import "../sexpr/canonical.situ";
+
+// The four bytes that open each optional entry, `(` and the start of its
+// key, which is what the variants below switch on.
+const OPEN_BUILD       = ('(' << 24) | ('5' << 16) | (':' << 8) | 'b';
+const OPEN_CMD         = ('(' << 24) | ('3' << 16) | (':' << 8) | 'c';
+const OPEN_DEV         = ('(' << 24) | ('3' << 16) | (':' << 8) | 'd';
+const OPEN_ENTRYPOINT  = ('(' << 24) | ('1' << 16) | ('0' << 8) | ':';
+const OPEN_ENV         = ('(' << 24) | ('3' << 16) | (':' << 8) | 'e';
+const OPEN_GROUP       = ('(' << 24) | ('5' << 16) | (':' << 8) | 'g';
+const OPEN_OBJECT      = ('(' << 24) | ('6' << 16) | (':' << 8) | 'o';
+const OPEN_OCI         = ('(' << 24) | ('3' << 16) | (':' << 8) | 'o';
+const OPEN_PORTS       = ('(' << 24) | ('5' << 16) | (':' << 8) | 'p';
+const OPEN_PROVENANCE  = ('(' << 24) | ('1' << 16) | ('0' << 8) | ':';
+const OPEN_RUNTIME     = ('(' << 24) | ('7' << 16) | (':' << 8) | 'r';
+const OPEN_SIZE        = ('(' << 24) | ('4' << 16) | (':' << 8) | 's';
+const OPEN_STOP_SIGNAL = ('(' << 24) | ('1' << 16) | ('1' << 8) | ':';
+const OPEN_TARGET      = ('(' << 24) | ('6' << 16) | (':' << 8) | 't';
+const OPEN_USER        = ('(' << 24) | ('4' << 16) | (':' << 8) | 'u';
+const OPEN_VERITY      = ('(' << 24) | ('6' << 16) | (':' << 8) | 'v';
+const OPEN_VOLUMES     = ('(' << 24) | ('7' << 16) | (':' << 8) | 'v';
+const OPEN_WORKDIR     = ('(' << 24) | ('7' << 16) | (':' << 8) | 'w';
+const OPEN_XATTRS      = ('(' << 24) | ('6' << 16) | (':' << 8) | 'x';
+
+// The start of an `entry`'s kind and owner, after their keys.
+const KIND_REG      = ('3' << 24) | (':' << 16) | ('r' << 8) | 'e';
+const KIND_DIR      = ('3' << 24) | (':' << 16) | ('d' << 8) | 'i';
+const KIND_SYMLINK  = ('7' << 24) | (':' << 16) | ('s' << 8) | 'y';
+const KIND_HARDLINK = ('8' << 24) | (':' << 16) | ('h' << 8) | 'a';
+const KIND_FIFO     = ('4' << 24) | (':' << 16) | ('f' << 8) | 'i';
+const KIND_DEV      = ('3' << 24) | (':' << 16) | ('d' << 8) | 'e';
+const OWNER_ROOT    = ('4' << 24) | (':' << 16) | ('r' << 8) | 'o';
+const OWNER_USER    = ('4' << 24) | (':' << 16) | ('u' << 8) | 's';
+const OWNER_IDS     = ('(' << 24) | ('3' << 16) | (':' << 8) | 'g';
+
+// Nothing: the arm an optional entry takes when it is absent.
+struct absent {
+}
+
+// A sha256 digest, held as its 32 bytes rather than as text. The readable
+// view shows it as `#...#` hexadecimal (A.1).
+struct digest {
+	preamble u8[3] = "32:";
+	u8  bytes[32];
+}
+
+// `(name value)`, for a map whose keys the user chooses (section 4.1):
+// `env` and `xattrs`.
+struct pair {
+	u8    open   [must_eq = '('];
+	atom  name;
+	atom  value;
+	u8    close  [must_eq = ')'];
+}
+
+// --- the manifest ----------------------------------------------------------
+
+struct manifest {
+	preamble u8[11] = "(8:manifest";
+	arch_entry     arch;
+	entries_entry  entries;
+	peek u32  after_entries;
+	variant provenance switch (after_entries) {
+		case OPEN_PROVENANCE:  provenance_entry  has_provenance;
+		default:               absent            no_provenance;
+	}
+	peek u32  after_provenance;
+	variant runtime switch (after_provenance) {
+		case OPEN_RUNTIME:  runtime_entry  has_runtime;
+		default:            absent         no_runtime;
+	}
+	schema_entry   schema;
+	stats_entry    stats;
+	u8  close  [must_eq = ')'];
+}
+
+// One architecture per manifest; a multi-arch image is an index of refs.
+struct arch_entry {
+	preamble u8[7] = "(4:arch";
+	atom  name;
+	u8    close  [must_eq = ')'];
+}
+
+// Sorted by path, bytewise.
+struct entries_entry {
+	preamble u8[10] = "(7:entries";
+	entry  items[]  until ")";
+}
+
+// Version 1, and only version 1: the whole entry is fixed bytes.
+struct schema_entry {
+	preamble u8[13] = "(6:schema1:1)";
+}
+
+// Advisory, and verified on import.
+struct stats_entry {
+	preamble u8[8] = "(5:stats";
+	preamble u8[14] = "(10:file_count";
+	atom  file_count;
+	preamble u8[17] = ")(12:object_count";
+	atom  object_count;
+	preamble u8[15] = ")(10:total_size";
+	atom  total_size;
+	preamble u8[2] = "))";
+}
+
+// --- an entry: one path in the tree (A.2) -----------------------------------
+
+struct entry {
+	preamble u8[8] = "(5:entry";
+	peek u32  first;
+	variant dev switch (first) {
+		case OPEN_DEV:  dev_entry  has_dev;
+		default:        absent     no_dev;
+	}
+	peek u32  after_dev;
+	variant group switch (after_dev) {
+		case OPEN_GROUP:  group_entry  has_group;
+		default:          absent       no_group;
+	}
+	kind_entry   kind;
+	mode_entry   mode;
+	peek u32  after_mode;
+	variant object switch (after_mode) {
+		case OPEN_OBJECT:  object_entry  has_object;
+		default:           absent        no_object;
+	}
+	owner_entry  owner;
+	path_entry   path;
+	// Everything after `path` is optional, so the entry may end at any
+	// point from here, with fewer than four bytes left to peek at. One byte
+	// says whether an entry follows, and only then are four read.
+	peek u8  after_path;
+	variant size switch (after_path) {
+		case '(':  maybe_size  from_size;
+		default:   absent      ends_before_size;
+	}
+	peek u8  after_size;
+	variant target switch (after_size) {
+		case '(':  maybe_target  from_target;
+		default:   absent        ends_before_target;
+	}
+	peek u8  after_target;
+	variant verity switch (after_target) {
+		case '(':  maybe_verity  from_verity;
+		default:   absent        ends_before_verity;
+	}
+	peek u8  after_verity;
+	variant xattrs switch (after_verity) {
+		case '(':  maybe_xattrs  from_xattrs;
+		default:   absent        ends_before_xattrs;
+	}
+	u8  close  [must_eq = ')'];
+}
+
+// The optional tail of an entry: each is entered only when a `(` follows,
+// so its four-byte peek is inside the entry.
+//
+// The one-byte peeks that choose them stay in `entry` itself. In a struct
+// of its own, a peek after a member of varying length is refused as
+// outside the frame though the byte is there (situ, suggestion/hull.md
+// finding 14).
+struct maybe_size {
+	peek u32  key;
+	variant size switch (key) {
+		case OPEN_SIZE:  size_entry  has_size;
+		default:         absent      no_size;
+	}
+}
+
+struct maybe_target {
+	peek u32  key;
+	variant target switch (key) {
+		case OPEN_TARGET:  target_entry  has_target;
+		default:           absent        no_target;
+	}
+}
+
+struct maybe_verity {
+	peek u32  key;
+	variant verity switch (key) {
+		case OPEN_VERITY:  verity_entry  has_verity;
+		default:           absent        no_verity;
+	}
+}
+
+struct maybe_xattrs {
+	peek u32  key;
+	variant xattrs switch (key) {
+		case OPEN_XATTRS:  xattrs_entry  has_xattrs;
+		default:           absent        no_xattrs;
+	}
+}
+
+// A device node, recorded always and made only on VM backends.
+// `(dev (major 8) (minor 1) (type c))`: a character or block device.
+struct dev_entry {
+	preamble u8[14] = "(3:dev(5:major";
+	atom  major;
+	preamble u8[9] = ")(5:minor";
+	atom  minor;
+	preamble u8[10] = ")(4:type1:";
+	u8    type  [min = 'b', max = 'c'];
+	preamble u8[2] = "))";
+}
+
+// Hardlinks: entries sharing a group are one inode.
+struct group_entry {
+	preamble u8[8] = "(5:group";
+	atom  id;
+	u8    close  [must_eq = ')'];
+}
+
+// The file type, which `mode` does not carry.
+struct kind_entry {
+	preamble u8[7] = "(4:kind";
+	peek u32  spelling;
+	variant name switch (spelling) {
+		case KIND_REG:       kind_reg       reg;
+		case KIND_DIR:       kind_dir       dir;
+		case KIND_SYMLINK:   kind_symlink   symlink;
+		case KIND_HARDLINK:  kind_hardlink  hardlink;
+		case KIND_FIFO:      kind_fifo      fifo;
+		case KIND_DEV:       kind_dev       dev;
+		default:             error;
+	}
+	u8  close  [must_eq = ')'];
+}
+
+struct kind_reg      { preamble u8[5] = "3:reg"; }
+struct kind_dir      { preamble u8[5] = "3:dir"; }
+struct kind_symlink  { preamble u8[9] = "7:symlink"; }
+struct kind_hardlink { preamble u8[10] = "8:hardlink"; }
+struct kind_fifo     { preamble u8[6] = "4:fifo"; }
+struct kind_dev      { preamble u8[5] = "3:dev"; }
+
+// Permission bits only, in decimal: 0755 is `3:493`.
+struct mode_entry {
+	preamble u8[7] = "(4:mode";
+	atom  bits;
+	u8    close  [must_eq = ')'];
+}
+
+// A regular file's content, by its hash in the object store.
+struct object_entry {
+	preamble u8[9] = "(6:object";
+	digest  hash;
+	u8      close  [must_eq = ')'];
+}
+
+// An ownership class (A.3): `root`, `user`, or explicit ids.
+struct owner_entry {
+	preamble u8[8] = "(5:owner";
+	peek u32  spelling;
+	variant class switch (spelling) {
+		case OWNER_ROOT:  owner_root  root;
+		case OWNER_USER:  owner_user  user;
+		case OWNER_IDS:   owner_ids   ids;
+		default:          error;
+	}
+	u8  close  [must_eq = ')'];
+}
+
+struct owner_root { preamble u8[6] = "4:root"; }
+struct owner_user { preamble u8[6] = "4:user"; }
+
+// `((gid 100) (uid 1000))`, preserved verbatim.
+struct owner_ids {
+	preamble u8[6] = "(3:gid";
+	atom  gid;
+	preamble u8[7] = ")(3:uid";
+	atom  uid;
+	u8    close  [must_eq = ')'];
+}
+
+// Relative, NFC-normalized UTF-8, `/` separated.
+struct path_entry {
+	preamble u8[7] = "(4:path";
+	atom  name;
+	u8    close  [must_eq = ')'];
+}
+
+// A regular file's size in bytes, so a planner need not open the object.
+struct size_entry {
+	preamble u8[7] = "(4:size";
+	atom  bytes;
+	u8    close  [must_eq = ')'];
+}
+
+// A symlink's target, as written.
+struct target_entry {
+	preamble u8[9] = "(6:target";
+	atom  name;
+	u8    close  [must_eq = ')'];
+}
+
+// A regular file's fs-verity digest, where verity is enabled (A.6).
+struct verity_entry {
+	preamble u8[9] = "(6:verity";
+	digest  hash;
+	u8      close  [must_eq = ')'];
+}
+
+// Sorted by name; `user.*` and `security.*` only.
+struct xattrs_entry {
+	preamble u8[9] = "(6:xattrs";
+	pair  items[]  until ")";
+}
+
+// --- runtime defaults (A.4) -------------------------------------------------
+
+// Every entry is optional, and `hull.conf` overrides each.
+struct runtime_entry {
+	preamble u8[10] = "(7:runtime";
+	peek u32  first;
+	variant cmd switch (first) {
+		case OPEN_CMD:  cmd_entry  has_cmd;
+		default:        absent     no_cmd;
+	}
+	peek u32  after_cmd;
+	variant entrypoint switch (after_cmd) {
+		case OPEN_ENTRYPOINT:  entrypoint_entry  has_entrypoint;
+		default:               absent            no_entrypoint;
+	}
+	peek u32  after_entrypoint;
+	variant env switch (after_entrypoint) {
+		case OPEN_ENV:  env_entry  has_env;
+		default:        absent     no_env;
+	}
+	peek u32  after_env;
+	variant ports switch (after_env) {
+		case OPEN_PORTS:  ports_entry  has_ports;
+		default:          absent       no_ports;
+	}
+	peek u32  after_ports;
+	variant stop_signal switch (after_ports) {
+		case OPEN_STOP_SIGNAL:  stop_signal_entry  has_stop_signal;
+		default:                absent             no_stop_signal;
+	}
+	peek u32  after_stop_signal;
+	variant user switch (after_stop_signal) {
+		case OPEN_USER:  user_entry  has_user;
+		default:         absent      no_user;
+	}
+	peek u32  after_user;
+	variant volumes switch (after_user) {
+		case OPEN_VOLUMES:  volumes_entry  has_volumes;
+		default:            absent         no_volumes;
+	}
+	peek u32  after_volumes;
+	variant workdir switch (after_volumes) {
+		case OPEN_WORKDIR:  workdir_entry  has_workdir;
+		default:            absent         no_workdir;
+	}
+	u8  close  [must_eq = ')'];
+}
+
+// The command, as OCI splits it.
+struct cmd_entry {
+	preamble u8[6] = "(3:cmd";
+	atom  words[]  until ")";
+}
+
+struct entrypoint_entry {
+	preamble u8[14] = "(10:entrypoint";
+	atom  words[]  until ")";
+}
+
+// Declared, and advisory. OCI's spellings, `80/tcp` and `/data`, so that a
+// round trip through OCI is lossless.
+struct ports_entry {
+	preamble u8[8] = "(5:ports";
+	atom  ports[]  until ")";
+}
+
+struct volumes_entry {
+	preamble u8[10] = "(7:volumes";
+	atom  paths[]  until ")";
+}
+
+struct stop_signal_entry {
+	preamble u8[15] = "(11:stop_signal";
+	atom  name;
+	u8    close  [must_eq = ')'];
+}
+
+struct user_entry {
+	preamble u8[7] = "(4:user";
+	atom  name;
+	u8    close  [must_eq = ')'];
+}
+
+struct workdir_entry {
+	preamble u8[10] = "(7:workdir";
+	atom  path;
+	u8    close  [must_eq = ')'];
+}
+
+struct env_entry {
+	preamble u8[6] = "(3:env";
+	pair  items[]  until ")";
+}
+
+// --- provenance (A.5) ------------------------------------------------------
+
+// Hashed with the rest, and left out of the build cache's key.
+struct provenance_entry {
+	preamble u8[14] = "(10:provenance";
+	peek u32  first;
+	variant build switch (first) {
+		case OPEN_BUILD:  build_entry  has_build;
+		default:          absent       no_build;
+	}
+	builder_entry  builder;
+	peek u8  after_builder;
+	variant oci switch (after_builder) {
+		case '(':  oci_entry  has_oci;
+		default:   absent     no_oci;
+	}
+	u8  close  [must_eq = ')'];
+}
+
+// A built manifest: its inputs' hashes, its parent, and the step that made
+// it, which is an s-expression of its own (Appendix E).
+struct build_entry {
+	preamble u8[17] = "(5:build(6:inputs";
+	digest  inputs[]  until ")";
+	preamble u8[9] = "(6:parent";
+	digest  parent;
+	preamble u8[8] = ")(4:step";
+	form    step;
+	preamble u8[2] = "))";
+}
+
+struct builder_entry {
+	preamble u8[10] = "(7:builder";
+	atom  version;
+	u8    close  [must_eq = ')'];
+}
+
+// A pulled manifest: the registry and the digests it came as, in OCI's own
+// spelling (`sha256:...`).
+struct oci_entry {
+	preamble u8[16] = "(3:oci(7:digests";
+	atom  digests[]  until ")";
+	preamble u8[11] = "(8:registry";
+	atom  registry;
+	preamble u8[2] = "))";
+}
+
+// ---------------------------------------------------------------------------
+//
+// WHAT THIS SCHEMA DOES NOT SAY, and hull checks instead:
+//
+// - that `entries` are sorted by path and no path appears twice, and that
+//   `xattrs` and `env` are sorted by name: an order across the elements of
+//   a run is not a layout;
+// - which entries a kind requires: `object` and `size` on `reg` and nowhere
+//   else, `target` on `symlink`, `group` on `hardlink`, `dev` on `dev`;
+// - that a number atom is minimal decimal digits, a path has no `.`, `..`
+//   or leading `/`, and an xattr name is `user.*` or `security.*`.

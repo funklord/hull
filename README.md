@@ -32,7 +32,8 @@ make check   # the style gate, the situ contracts, then the tests
 make hooks   # install the commit-msg hook
 ```
 
-Build with make for now: fmake does not yet find the vendored situ.
+Build with make for now: fmake finds the vendored situ, but also compiles
+situ's own examples beside hull, and their symbols collide.
 
 ## Copyright
 

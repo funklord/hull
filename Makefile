@@ -89,7 +89,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test
 
 CPPFLAGS += -Isexpr -Iagent -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all check test style style-source style-docs contract hooks clean help
+.PHONY: all check test vectors style style-source style-docs contract hooks clean help
 
 all: $(SEXPR_OBJS) $(AGENT_OBJS)
 
@@ -97,7 +97,8 @@ help:
 	@echo 'Targets:'
 	@echo '  all       build the reader (the default)'
 	@echo '  check     style, the situ contracts, then the tests'
-	@echo '  test      build and run the reader tests, then the gate'"'"'s'
+	@echo '  test      build and run the reader tests, the vectors, then the gate'"'"'s'
+	@echo '  vectors   the described schemas against bytes they must accept and refuse'
 	@echo '  style     the indentation and whitespace gate'
 	@echo '  contract  the schemas'"'"' capability maps against the committed ones'
 	@echo '  hooks     install the commit-msg hook from tool/hooks/'
@@ -149,14 +150,37 @@ $(BUILD_DIR)/test/framing_test: $(TEST_FRAMING_OBJS) $(AGENT_OBJS) $(SEXPR_OBJS)
 
 # --- checks -----------------------------------------------------------------
 
+# Appendices A and B as situ describes them: schemas nothing is generated
+# from yet, held to their committed maps and to vectors of real bytes.
+DESCRIBED = manifest/manifest agent/protocol
+
 check: style contract test
 
 # The reader's tests, then the gate's own suite, which travels with the
 # gate. Tests are built here and only here: a plain `make` does not.
-test: $(TEST_BINS)
+test: $(TEST_BINS) vectors
 	$(BUILD_DIR)/test/sexpr_test
 	$(BUILD_DIR)/test/framing_test
 	$(PYTHON) tool/test_style_gate.py
+
+# Each schema accepts every vector in its .vectors and refuses every one in
+# its .refused.vectors. Both are counted against the file, since situc
+# reports success over a file holding none, and it says nothing about a
+# vector it refused for a reason other than the one meant: the comments in
+# the files say what each is for.
+vectors: $(SITU_MARK)
+	@for d in $(DESCRIBED); do \
+		n=$$(grep -c '^[a-z]' $$d.vectors); \
+		out=$$($(SITUC) verify $$d.situ $$d.vectors 2>&1); \
+		echo "$$out" | grep -q "^situc: $$n vectors conform to $$d.situ" || \
+			{ echo "$$out"; echo "vectors: $$d.vectors: not all $$n accepted" >&2; exit 1; }; \
+		echo "vectors: $$d.situ accepts all $$n in $$d.vectors"; \
+		n=$$(grep -c '^[a-z]' $$d.refused.vectors); \
+		out=$$($(SITUC) verify $$d.situ $$d.refused.vectors 2>&1); \
+		echo "$$out" | grep -qx "situc: $$n of $$n vectors do not conform to $$d.situ" || \
+			{ echo "$$out"; echo "vectors: $$d.refused.vectors: not all $$n refused" >&2; exit 1; }; \
+		echo "vectors: $$d.situ refuses all $$n in $$d.refused.vectors"; \
+	done
 
 # The indentation and whitespace gate, shared verbatim with the sibling
 # projects; `docs` additionally holds project.md to the tree it describes.
@@ -175,6 +199,8 @@ contract: $(SITU_MARK)
 	$(SITUC) map --check sexpr/readable.situ
 	$(SITUC) map --check sexpr/canonical.situ
 	$(SITUC) map --check agent/message.situ
+	$(SITUC) map --check manifest/manifest.situ
+	$(SITUC) map --check agent/protocol.situ
 
 hooks:
 	@if ! command -v git >/dev/null 2>&1; then \

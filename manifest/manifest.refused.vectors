@@ -1,0 +1,44 @@
+# Bytes that manifest/manifest.situ must refuse, every one of them: `make
+# test` fails unless situc reports each vector here as not conforming.
+
+# unsorted: (8:manifest(6:schema1:1)(4:arch5:amd64)(7:entries)(5:stats(10:file_count1:0)(12:object_count1:0)(10:total_size1:0)))
+manifest unsorted 28 38 3A 6D 61 6E 69 66 65 73 74 28 36 3A 73 63 68 65 6D 61 31 3A 31 29 28 34 3A 61 72 63 68 35 3A 61 6D 64 36 34 29 28 37 3A 65 6E 74 72 69 65 73 29 28 35 3A 73 74 61 74 73 28 31 30 3A 66 69 6C 65 5F 63 6F 75 6E 74 31 3A 30 29 28 31 32 3A 6F 62 6A 65 63 74 5F 63 6F 75 6E 74 31 3A 30 29 28 31 30 3A 74 6F 74 61 6C 5F 73 69 7A 65 31 3A 30 29 29 29
+
+# schema_2: (8:manifest(4:arch5:amd64)(7:entries)(6:schema1:2)(5:stats(10:file_count1:0)(12:object_count1:0)(10:total_size1:0)))
+manifest schema_2 28 38 3A 6D 61 6E 69 66 65 73 74 28 34 3A 61 72 63 68 35 3A 61 6D 64 36 34 29 28 37 3A 65 6E 74 72 69 65 73 29 28 36 3A 73 63 68 65 6D 61 31 3A 32 29 28 35 3A 73 74 61 74 73 28 31 30 3A 66 69 6C 65 5F 63 6F 75 6E 74 31 3A 30 29 28 31 32 3A 6F 62 6A 65 63 74 5F 63 6F 75 6E 74 31 3A 30 29 28 31 30 3A 74 6F 74 61 6C 5F 73 69 7A 65 31 3A 30 29 29 29
+
+# no_stats: (8:manifest(4:arch5:amd64)(7:entries)(6:schema1:1))
+manifest no_stats 28 38 3A 6D 61 6E 69 66 65 73 74 28 34 3A 61 72 63 68 35 3A 61 6D 64 36 34 29 28 37 3A 65 6E 74 72 69 65 73 29 28 36 3A 73 63 68 65 6D 61 31 3A 31 29 29
+
+# spaced: (8:manifest (4:arch5:amd64)(7:entries)(6:schema1:1)(5:stats(10:file_count1:0)(12:object_count1:0)(10:total_size1:0)))
+manifest spaced 28 38 3A 6D 61 6E 69 66 65 73 74 20 28 34 3A 61 72 63 68 35 3A 61 6D 64 36 34 29 28 37 3A 65 6E 74 72 69 65 73 29 28 36 3A 73 63 68 65 6D 61 31 3A 31 29 28 35 3A 73 74 61 74 73 28 31 30 3A 66 69 6C 65 5F 63 6F 75 6E 74 31 3A 30 29 28 31 32 3A 6F 62 6A 65 63 74 5F 63 6F 75 6E 74 31 3A 30 29 28 31 30 3A 74 6F 74 61 6C 5F 73 69 7A 65 31 3A 30 29 29 29
+
+# socket: (5:entry(4:kind6:socket)(4:mode3:420)(5:owner4:root)(4:path1:s))
+entry socket 28 35 3A 65 6E 74 72 79 28 34 3A 6B 69 6E 64 36 3A 73 6F 63 6B 65 74 29 28 34 3A 6D 6F 64 65 33 3A 34 32 30 29 28 35 3A 6F 77 6E 65 72 34 3A 72 6F 6F 74 29 28 34 3A 70 61 74 68 31 3A 73 29 29
+
+# nobody: (5:entry(4:kind3:dir)(4:mode3:420)(5:owner6:nobody)(4:path1:s))
+entry nobody 28 35 3A 65 6E 74 72 79 28 34 3A 6B 69 6E 64 33 3A 64 69 72 29 28 34 3A 6D 6F 64 65 33 3A 34 32 30 29 28 35 3A 6F 77 6E 65 72 36 3A 6E 6F 62 6F 64 79 29 28 34 3A 70 61 74 68 31 3A 73 29 29
+
+# no_mode: (5:entry(4:kind3:dir)(5:owner4:root)(4:path1:s))
+entry no_mode 28 35 3A 65 6E 74 72 79 28 34 3A 6B 69 6E 64 33 3A 64 69 72 29 28 35 3A 6F 77 6E 65 72 34 3A 72 6F 6F 74 29 28 34 3A 70 61 74 68 31 3A 73 29 29
+
+# uid_first: (5:entry(4:kind3:dir)(4:mode3:420)(5:owner(3:uid1:1)(3:gid1:1))(4:path1:s))
+entry uid_first 28 35 3A 65 6E 74 72 79 28 34 3A 6B 69 6E 64 33 3A 64 69 72 29 28 34 3A 6D 6F 64 65 33 3A 34 32 30 29 28 35 3A 6F 77 6E 65 72 28 33 3A 75 69 64 31 3A 31 29 28 33 3A 67 69 64 31 3A 31 29 29 28 34 3A 70 61 74 68 31 3A 73 29 29
+
+# short_digest: (5:entry(4:kind3:reg)(4:mode3:420)(6:object31:#000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e#)(5:owner4:root)(4:path1:s))
+entry short_digest 28 35 3A 65 6E 74 72 79 28 34 3A 6B 69 6E 64 33 3A 72 65 67 29 28 34 3A 6D 6F 64 65 33 3A 34 32 30 29 28 36 3A 6F 62 6A 65 63 74 33 31 3A 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 10 11 12 13 14 15 16 17 18 19 1A 1B 1C 1D 1E 29 28 35 3A 6F 77 6E 65 72 34 3A 72 6F 6F 74 29 28 34 3A 70 61 74 68 31 3A 73 29 29
+
+# dev_type: (5:entry(3:dev(5:major1:1)(5:minor1:3)(4:type1:x))(4:kind3:dev)(4:mode3:438)(5:owner4:root)(4:path1:d))
+entry dev_type 28 35 3A 65 6E 74 72 79 28 33 3A 64 65 76 28 35 3A 6D 61 6A 6F 72 31 3A 31 29 28 35 3A 6D 69 6E 6F 72 31 3A 33 29 28 34 3A 74 79 70 65 31 3A 78 29 29 28 34 3A 6B 69 6E 64 33 3A 64 65 76 29 28 34 3A 6D 6F 64 65 33 3A 34 33 38 29 28 35 3A 6F 77 6E 65 72 34 3A 72 6F 6F 74 29 28 34 3A 70 61 74 68 31 3A 64 29 29
+
+# long_length: (5:entry(4:kind03:dir)(4:mode3:420)(5:owner4:root)(4:path1:s))
+entry long_length 28 35 3A 65 6E 74 72 79 28 34 3A 6B 69 6E 64 30 33 3A 64 69 72 29 28 34 3A 6D 6F 64 65 33 3A 34 32 30 29 28 35 3A 6F 77 6E 65 72 34 3A 72 6F 6F 74 29 28 34 3A 70 61 74 68 31 3A 73 29 29
+
+# size_after_target: (5:entry(4:kind3:reg)(4:mode3:420)(5:owner4:root)(4:path1:s)(6:target1:t)(4:size1:1))
+entry size_after_target 28 35 3A 65 6E 74 72 79 28 34 3A 6B 69 6E 64 33 3A 72 65 67 29 28 34 3A 6D 6F 64 65 33 3A 34 32 30 29 28 35 3A 6F 77 6E 65 72 34 3A 72 6F 6F 74 29 28 34 3A 70 61 74 68 31 3A 73 29 28 36 3A 74 61 72 67 65 74 31 3A 74 29 28 34 3A 73 69 7A 65 31 3A 31 29 29
+
+# runtime_cxx: (8:manifest(4:arch5:amd64)(7:entries)(7:runtime(3:cxx2:ls))(6:schema1:1)(5:stats(10:file_count1:0)(12:object_count1:0)(10:total_size1:0)))
+manifest runtime_cxx 28 38 3A 6D 61 6E 69 66 65 73 74 28 34 3A 61 72 63 68 35 3A 61 6D 64 36 34 29 28 37 3A 65 6E 74 72 69 65 73 29 28 37 3A 72 75 6E 74 69 6D 65 28 33 3A 63 78 78 32 3A 6C 73 29 29 28 36 3A 73 63 68 65 6D 61 31 3A 31 29 28 35 3A 73 74 61 74 73 28 31 30 3A 66 69 6C 65 5F 63 6F 75 6E 74 31 3A 30 29 28 31 32 3A 6F 62 6A 65 63 74 5F 63 6F 75 6E 74 31 3A 30 29 28 31 30 3A 74 6F 74 61 6C 5F 73 69 7A 65 31 3A 30 29 29 29
+
+# runtime_unsorted: (8:manifest(4:arch5:amd64)(7:entries)(7:runtime(7:workdir1:/)(3:cmd2:ls))(6:schema1:1)(5:stats(10:file_count1:0)(12:object_count1:0)(10:total_size1:0)))
+manifest runtime_unsorted 28 38 3A 6D 61 6E 69 66 65 73 74 28 34 3A 61 72 63 68 35 3A 61 6D 64 36 34 29 28 37 3A 65 6E 74 72 69 65 73 29 28 37 3A 72 75 6E 74 69 6D 65 28 37 3A 77 6F 72 6B 64 69 72 31 3A 2F 29 28 33 3A 63 6D 64 32 3A 6C 73 29 29 28 36 3A 73 63 68 65 6D 61 31 3A 31 29 28 35 3A 73 74 61 74 73 28 31 30 3A 66 69 6C 65 5F 63 6F 75 6E 74 31 3A 30 29 28 31 32 3A 6F 62 6A 65 63 74 5F 63 6F 75 6E 74 31 3A 30 29 28 31 30 3A 74 6F 74 61 6C 5F 73 69 7A 65 31 3A 30 29 29 29

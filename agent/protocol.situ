@@ -1,0 +1,403 @@
+// The guest agent protocol's messages (project.md Appendix B): what the
+// body of each frame in agent/message.situ holds. Every body is one
+// canonical s-expression (sexpr/canonical.situ), and this says which ones
+// are messages.
+//
+// A message is `(type (ch n) ...)`, its entries sorted bytewise by key as
+// in any canonical record (A.1), so each is spelled the way
+// manifest/manifest.situ spells a record: a required entry is its fixed
+// opening bytes and an optional one is chosen by peeking at what follows.
+// The type is chosen the same way, from the four bytes after the `(`: the
+// type's length and its first two letters, which tell every type in one
+// direction from the others.
+//
+// The two directions are two vocabularies. `hello`, `data`, `eof`,
+// `error` and `credit` travel both ways, and the first two carry different
+// entries each way, so each side's schema is the struct it receives.
+//
+// Numbers are atoms, for manifest.situ's reason (situ finding 13), and are
+// minimal decimal digits by hull's check rather than situ's.
+
+target buffer;
+endian big;
+
+import "../sexpr/canonical.situ";
+
+const HELLO   = ('5' << 24) | (':' << 16) | ('h' << 8) | 'e';
+const SPEC    = ('4' << 24) | (':' << 16) | ('s' << 8) | 'p';
+const START   = ('5' << 24) | (':' << 16) | ('s' << 8) | 't';
+const EXEC    = ('4' << 24) | (':' << 16) | ('e' << 8) | 'x';
+const DATA    = ('4' << 24) | (':' << 16) | ('d' << 8) | 'a';
+const EOF     = ('3' << 24) | (':' << 16) | ('e' << 8) | 'o';
+const WINCH   = ('5' << 24) | (':' << 16) | ('w' << 8) | 'i';
+const SIGNAL  = ('6' << 24) | (':' << 16) | ('s' << 8) | 'i';
+const SUB     = ('3' << 24) | (':' << 16) | ('s' << 8) | 'u';
+const STOP    = ('4' << 24) | (':' << 16) | ('s' << 8) | 't';
+const PING    = ('4' << 24) | (':' << 16) | ('p' << 8) | 'i';
+const CREDIT  = ('6' << 24) | (':' << 16) | ('c' << 8) | 'r';
+const READY   = ('5' << 24) | (':' << 16) | ('r' << 8) | 'e';
+const ERROR   = ('5' << 24) | (':' << 16) | ('e' << 8) | 'r';
+const STARTED = ('7' << 24) | (':' << 16) | ('s' << 8) | 't';
+const EXITED  = ('6' << 24) | (':' << 16) | ('e' << 8) | 'x';
+const STATS   = ('5' << 24) | (':' << 16) | ('s' << 8) | 't';
+const BYE     = ('3' << 24) | (':' << 16) | ('b' << 8) | 'y';
+const PONG    = ('4' << 24) | (':' << 16) | ('p' << 8) | 'o';
+
+// The openings of the optional entries, `(` and the start of the key.
+const OPEN_CWD   = ('(' << 24) | ('3' << 16) | (':' << 8) | 'c';
+const OPEN_ENV   = ('(' << 24) | ('3' << 16) | (':' << 8) | 'e';
+const OPEN_SINCE = ('(' << 24) | ('5' << 16) | (':' << 8) | 's';
+
+struct absent {
+}
+
+// --- what the host sends ------------------------------------------------------
+
+struct host_message {
+	u8  open  [must_eq = '('];
+	peek u32  type;
+	variant body switch (type) {
+		case HELLO:   host_hello  hello;
+		case SPEC:    spec        spec;
+		case START:   start       start;
+		case EXEC:    exec        exec;
+		case DATA:    host_data   data;
+		case EOF:     eof         eof;
+		case WINCH:   winch       winch;
+		case SIGNAL:  signal      signal;
+		case SUB:     sub         sub;
+		case STOP:    stop        stop;
+		case PING:    ping        ping;
+		case CREDIT:  credit      credit;
+		default:      unknown     unknown;
+	}
+}
+
+// Version and features; the lowest common `proto` wins.
+struct host_hello {
+	preamble u8[7] = "5:hello";
+	control         ch;
+	features_entry  features;
+	preamble u8[8] = "(5:proto";
+	atom  proto;
+	preamble u8[2] = "))";
+}
+
+// The resolved machine spec, `(machine ...)` as in hull.conf (section 4),
+// applied before `start`.
+struct spec {
+	preamble u8[6] = "4:spec";
+	control  ch;
+	preamble u8[10] = "(7:machine";
+	form  entries[]  until ")";
+	u8  close  [must_eq = ')'];
+}
+
+struct start {
+	preamble u8[7] = "5:start";
+	control  ch;
+	u8  close  [must_eq = ')'];
+}
+
+// `hull exec`, on a channel the host allocated for it.
+struct exec {
+	preamble u8[6] = "4:exec";
+	argv_entry   argv;
+	channel      ch;
+	peek u32  after_ch;
+	variant cwd switch (after_ch) {
+		case OPEN_CWD:  cwd_entry  has_cwd;
+		default:        absent     no_cwd;
+	}
+	peek u32  after_cwd;
+	variant env switch (after_cwd) {
+		case OPEN_ENV:  env_entry  has_env;
+		default:        absent     no_env;
+	}
+	tty_entry  tty;
+	// `user` is last, and may be absent with only the closing `)` left.
+	peek u8  after_tty;
+	variant user switch (after_tty) {
+		case '(':  user_entry  has_user;
+		default:   absent      no_user;
+	}
+	u8  close  [must_eq = ')'];
+}
+
+// `(tty true)` or `(tty false)`.
+struct tty_entry {
+	preamble u8[6] = "(3:tty";
+	peek u8  length;
+	variant value switch (length) {
+		case '4':  yes  on;
+		case '5':  no   off;
+		default:   error;
+	}
+	u8  close  [must_eq = ')'];
+}
+
+struct yes { preamble u8[6] = "4:true"; }
+struct no  { preamble u8[7] = "5:false"; }
+
+// The workload's or an exec's stdin: always fd 0.
+struct host_data {
+	preamble u8[12] = "4:data(3:buf";
+	atom     bytes;
+	u8       close_buf  [must_eq = ')'];
+	channel  ch;
+	preamble u8[10] = "(2:fd1:0))";
+}
+
+struct winch {
+	preamble u8[7] = "5:winch";
+	channel  ch;
+	preamble u8[7] = "(4:cols";
+	atom  cols;
+	preamble u8[8] = ")(4:rows";
+	atom  rows;
+	preamble u8[2] = "))";
+}
+
+// Channel 0 signals the workload, any other channel its exec.
+struct signal {
+	preamble u8[8] = "6:signal";
+	channel  ch;
+	preamble u8[9] = "(6:signal";
+	atom  name;
+	preamble u8[2] = "))";
+}
+
+// `hull logs -f` and `hull stats`.
+struct sub {
+	preamble u8[5] = "3:sub";
+	channel  ch;
+	peek u32  after_ch;
+	variant since switch (after_ch) {
+		case OPEN_SINCE:  since_entry  has_since;
+		default:          absent       no_since;
+	}
+	preamble u8[7] = "(4:what";
+	peek u8  length;
+	variant what switch (length) {
+		case '4':  logs   logs;
+		case '5':  stats  stats;
+		default:   error;
+	}
+	preamble u8[2] = "))";
+}
+
+struct logs  { preamble u8[6] = "4:logs"; }
+struct stats { preamble u8[7] = "5:stats"; }
+
+// Signal, wait, report; the host kills the VM after `bye` or the timeout.
+struct stop {
+	preamble u8[6] = "4:stop";
+	control  ch;
+	preamble u8[14] = "(10:timeout_ms";
+	atom  milliseconds;
+	preamble u8[2] = "))";
+}
+
+struct ping {
+	preamble u8[6] = "4:ping";
+	control  ch;
+	u8  close  [must_eq = ')'];
+}
+
+// --- what the agent sends -----------------------------------------------------
+
+struct agent_message {
+	u8  open  [must_eq = '('];
+	peek u32  type;
+	variant body switch (type) {
+		case HELLO:    agent_hello  hello;
+		case READY:    ready        ready;
+		case ERROR:    failure      error;
+		case STARTED:  started      started;
+		case EXITED:   exited       exited;
+		case DATA:     agent_data   data;
+		case EOF:      eof          eof;
+		case STATS:    usage        stats;
+		case BYE:      bye          bye;
+		case PONG:     pong         pong;
+		case CREDIT:   credit       credit;
+		default:       unknown      unknown;
+	}
+}
+
+struct agent_hello {
+	preamble u8[24] = "5:hello(13:agent_version";
+	atom  version;
+	u8    close_version  [must_eq = ')'];
+	control         ch;
+	features_entry  features;
+	preamble u8[8] = "(5:proto";
+	atom  proto;
+	preamble u8[2] = "))";
+}
+
+struct ready {
+	preamble u8[7] = "5:ready";
+	control  ch;
+	u8  close  [must_eq = ')'];
+}
+
+// A refusal, on the channel of what was refused; `unsupported` answers a
+// type the agent does not know.
+struct failure {
+	preamble u8[7] = "5:error";
+	channel  ch;
+	preamble u8[9] = "(6:reason";
+	atom  reason;
+	preamble u8[2] = "))";
+}
+
+struct started {
+	preamble u8[9] = "7:started";
+	channel  ch;
+	preamble u8[6] = "(3:pid";
+	atom  pid;
+	preamble u8[2] = "))";
+}
+
+// Exactly as the process ended, so `hull run; echo $?` is the same on
+// every backend: an exit code, and the signal that ended it or 0.
+struct exited {
+	preamble u8[8] = "6:exited";
+	channel  ch;
+	preamble u8[7] = "(4:code";
+	atom  code;
+	preamble u8[10] = ")(6:signal";
+	atom  signal;
+	preamble u8[2] = "))";
+}
+
+// stdout or stderr: fd 1 or 2.
+struct agent_data {
+	preamble u8[12] = "4:data(3:buf";
+	atom     bytes;
+	u8       close_buf  [must_eq = ')'];
+	channel  ch;
+	preamble u8[7] = "(2:fd1:";
+	decimal u8  fd[1]  [min = 1, max = 2];
+	preamble u8[2] = "))";
+}
+
+// One `hull stats` sample.
+struct usage {
+	preamble u8[7] = "5:stats";
+	channel  ch;
+	preamble u8[6] = "(3:cpu";
+	atom  cpu;
+	preamble u8[6] = ")(2:io";
+	atom  io;
+	preamble u8[7] = ")(3:mem";
+	atom  mem;
+	preamble u8[2] = "))";
+}
+
+struct bye {
+	preamble u8[5] = "3:bye";
+	control  ch;
+	u8  close  [must_eq = ')'];
+}
+
+struct pong {
+	preamble u8[6] = "4:pong";
+	control  ch;
+	preamble u8[9] = "(6:uptime";
+	atom  seconds;
+	preamble u8[2] = "))";
+}
+
+// --- both ways ----------------------------------------------------------------
+
+struct eof {
+	preamble u8[5] = "3:eof";
+	channel  ch;
+	u8  close  [must_eq = ')'];
+}
+
+// A channel's credit window, so one chatty exec cannot starve the control
+// channel.
+struct credit {
+	preamble u8[16] = "6:credit(5:bytes";
+	atom     bytes;
+	u8       close_bytes  [must_eq = ')'];
+	channel  ch;
+	u8       close  [must_eq = ')'];
+}
+
+// A type this side does not know: still one canonical s-expression, framed
+// whole so that it can be answered with `(error ... (reason unsupported))`
+// rather than dropped.
+struct unknown {
+	atom  type;
+	form  entries[]  until ")";
+}
+
+// --- entries -----------------------------------------------------------------
+
+// Channel 0 is control.
+struct control {
+	preamble u8[9] = "(2:ch1:0)";
+}
+
+// Any channel, the host allocating every one but 0.
+struct channel {
+	preamble u8[5] = "(2:ch";
+	atom  id;
+	u8    close  [must_eq = ')'];
+}
+
+// The words of `exec`'s command, and what a `hello` offers.
+struct argv_entry {
+	preamble u8[7] = "(4:argv";
+	atom  words[]  until ")";
+}
+
+struct features_entry {
+	preamble u8[11] = "(8:features";
+	atom  names[]  until ")";
+}
+
+struct cwd_entry {
+	preamble u8[6] = "(3:cwd";
+	atom  path;
+	u8    close  [must_eq = ')'];
+}
+
+struct user_entry {
+	preamble u8[7] = "(4:user";
+	atom  name;
+	u8    close  [must_eq = ')'];
+}
+
+// A time to replay logs from.
+struct since_entry {
+	preamble u8[8] = "(5:since";
+	atom  time;
+	u8    close  [must_eq = ')'];
+}
+
+struct env_entry {
+	preamble u8[6] = "(3:env";
+	pair  items[]  until ")";
+}
+
+struct pair {
+	u8    open   [must_eq = '('];
+	atom  name;
+	atom  value;
+	u8    close  [must_eq = ')'];
+}
+
+// ---------------------------------------------------------------------------
+//
+// WHAT THIS SCHEMA DOES NOT SAY, and the agent and host check instead:
+//
+// - that an `env` name is not repeated and its entries are sorted;
+// - that a channel other than 0 was allocated, and that `credit` is never
+//   exceeded;
+// - that `fd` is 0 in what the host sends is stated; that `buf` is
+//   non-empty, and the signal names, are not.

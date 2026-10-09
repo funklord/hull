@@ -24,4 +24,4 @@ floor = 0.42
 # situ's schemas and its committed contract files are text this tree
 # writes, so they get the whitespace, final-newline and ASCII checks.
 # `.map` is in the defaults already; naming the list replaces it.
-text_suffixes = [".md", ".json", ".toml", ".cfg", ".map", ".situ", ".wire"]
+text_suffixes = [".md", ".json", ".toml", ".cfg", ".map", ".situ", ".wire", ".vectors"]
