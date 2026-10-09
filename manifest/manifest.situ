@@ -179,10 +179,12 @@ struct entry {
 // The optional tail of an entry: each is entered only when a `(` follows,
 // so its four-byte peek is inside the entry.
 //
-// The one-byte peeks that choose them stay in `entry` itself. In a struct
-// of its own, a peek after a member of varying length is refused as
-// outside the frame though the byte is there (situ, suggestion/hull.md
-// finding 14).
+// The one-byte peeks that choose them stay in `entry` itself, the struct
+// that owns the byte they read. A struct's frame ends at its own extent,
+// so a peek at its end cannot see the byte after it, which belongs to the
+// enclosing struct. situ calls that the model rather than a defect, and
+// whether a nested peek should see further is its holder's question (situ
+// finding 14, 2026-10-09).
 struct maybe_size {
 	peek u32  key;
 	variant size switch (key) {
