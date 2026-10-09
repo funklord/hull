@@ -1,0 +1,22 @@
+// One message of the guest agent's protocol, as it crosses the vsock
+// connection (project.md B.2): a length, then that many bytes of canonical
+// s-expression. situ's frame layer turns a byte stream into these, and its
+// build layer writes them; what the body holds is sexpr/canonical.situ's
+// to say, and agent/framing.c asks it.
+//
+// Big-endian, because B.2 names a u32 and not its byte order, and under
+// the emu class the host and guest can be different architectures: native
+// order would be a different number at each end.
+
+target buffer;
+endian big;
+
+// The largest body a peer may announce. The length exists so that a
+// receiver can refuse an oversized message before reading it (B.2), and
+// that needs a number to refuse above.
+const MAX_MESSAGE = 1048576;
+
+struct message {
+	u32  length  [max = MAX_MESSAGE];
+	u8   body[length];
+}

@@ -74,14 +74,24 @@ GEN_HEADERS = $(GEN_DIR)/readable.h $(GEN_DIR)/canonical.h
 
 SEXPR_OBJS = $(BUILD_DIR)/sexpr/sexpr.o $(GEN_DIR)/readable.o \
              $(GEN_DIR)/canonical.o $(BUILD_DIR)/situ/situ.o
-TEST_OBJS  = $(BUILD_DIR)/test/sexpr_test.o
-TEST_BIN   = $(BUILD_DIR)/test/sexpr_test
 
-CPPFLAGS += -Isexpr -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
+# The agent protocol's framing (B.2), generated at situ's frame layer,
+# which also writes the build and edit headers of the rungs below it.
+AGENT_GEN  = $(GEN_DIR)/message.c $(GEN_DIR)/message.h \
+             $(GEN_DIR)/message_frame.h $(GEN_DIR)/message_build.h \
+             $(GEN_DIR)/message_edit.h
+AGENT_OBJS = $(BUILD_DIR)/agent/framing.o $(GEN_DIR)/message.o
+
+TEST_SEXPR_OBJS   = $(BUILD_DIR)/test/sexpr_test.o
+TEST_FRAMING_OBJS = $(BUILD_DIR)/test/framing_test.o
+TEST_OBJS = $(TEST_SEXPR_OBJS) $(TEST_FRAMING_OBJS)
+TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test
+
+CPPFLAGS += -Isexpr -Iagent -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: all check test style style-source style-docs contract hooks clean help
 
-all: $(SEXPR_OBJS)
+all: $(SEXPR_OBJS) $(AGENT_OBJS)
 
 help:
 	@echo 'Targets:'
@@ -103,10 +113,18 @@ $(GEN_DIR)/canonical.c $(GEN_DIR)/canonical.h &: sexpr/canonical.situ $(SITU_COM
 	@mkdir -p '$(GEN_DIR)'
 	$(SITUC) build --target c --prefix hull_sexpr_c --out '$(GEN_DIR)' sexpr/canonical.situ
 
+$(AGENT_GEN) &: agent/message.situ $(SITU_COMPILER)
+	@mkdir -p '$(GEN_DIR)'
+	$(SITUC) build --target c --layer frame --prefix hull_agent --out '$(GEN_DIR)' agent/message.situ
+
 # The generated headers are order-only for hand-written objects: they must
 # exist before the first compile, and after that the .d files say when a
 # change to one should rebuild what includes it.
 $(BUILD_DIR)/sexpr/%.o: sexpr/%.c | $(GEN_HEADERS)
+	@mkdir -p '$(@D)'
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+
+$(BUILD_DIR)/agent/%.o: agent/%.c | $(GEN_HEADERS) $(AGENT_GEN)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
@@ -117,14 +135,17 @@ $(BUILD_DIR)/situ/situ.o: $(SITU_DIR)/runtime/c/situ.c
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/test/%.o: test/%.c | $(GEN_HEADERS)
+$(BUILD_DIR)/test/%.o: test/%.c | $(GEN_HEADERS) $(AGENT_GEN)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
-$(TEST_BIN): $(TEST_OBJS) $(SEXPR_OBJS)
+$(BUILD_DIR)/test/sexpr_test: $(TEST_SEXPR_OBJS) $(SEXPR_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
--include $(SEXPR_OBJS:.o=.d) $(TEST_OBJS:.o=.d)
+$(BUILD_DIR)/test/framing_test: $(TEST_FRAMING_OBJS) $(AGENT_OBJS) $(SEXPR_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^
+
+-include $(SEXPR_OBJS:.o=.d) $(AGENT_OBJS:.o=.d) $(TEST_OBJS:.o=.d)
 
 # --- checks -----------------------------------------------------------------
 
@@ -132,8 +153,9 @@ check: style contract test
 
 # The reader's tests, then the gate's own suite, which travels with the
 # gate. Tests are built here and only here: a plain `make` does not.
-test: $(TEST_BIN)
-	$(TEST_BIN)
+test: $(TEST_BINS)
+	$(BUILD_DIR)/test/sexpr_test
+	$(BUILD_DIR)/test/framing_test
 	$(PYTHON) tool/test_style_gate.py
 
 # The indentation and whitespace gate, shared verbatim with the sibling
@@ -152,6 +174,7 @@ style-docs:
 contract: $(SITU_MARK)
 	$(SITUC) map --check sexpr/readable.situ
 	$(SITUC) map --check sexpr/canonical.situ
+	$(SITUC) map --check agent/message.situ
 
 hooks:
 	@if ! command -v git >/dev/null 2>&1; then \
@@ -169,5 +192,6 @@ hooks:
 
 # Named files only, each printed as it goes. The directories stay.
 clean:
-	@rm -fv $(TEST_BIN) $(TEST_OBJS) $(TEST_OBJS:.o=.d) \
-	        $(SEXPR_OBJS) $(SEXPR_OBJS:.o=.d) $(GEN_SOURCES) $(GEN_HEADERS)
+	@rm -fv $(TEST_BINS) $(TEST_OBJS) $(TEST_OBJS:.o=.d) \
+	        $(SEXPR_OBJS) $(SEXPR_OBJS:.o=.d) $(GEN_SOURCES) $(GEN_HEADERS) \
+	        $(AGENT_OBJS) $(AGENT_OBJS:.o=.d) $(AGENT_GEN)

@@ -18,10 +18,11 @@ each of them.
 ## Status
 
 Mostly design. `project.md` is the design, including the `hull.conf`
-schema reference. The first code is the s-expression reader in `sexpr/`,
-generated in part by [situ](https://github.com/funklord/situ) from two
-schemas, and `hull_engine.h` is a draft of the C plugin interface that
-engines implement.
+schema reference. The first code is the s-expression reader in `sexpr/`
+and the guest agent protocol's framing in `agent/`, both generated in part
+by [situ](https://github.com/funklord/situ) from schemas, and
+`hull_engine.h` is a draft of the C plugin interface that engines
+implement.
 
 ## Building
 

@@ -1,0 +1,16 @@
+# situ capability map v1
+# schema: message.situ
+# core:   offset size align repr atomic
+#
+# Core axes are always shown. Any other axis appears only where it has
+# been weakened below its strongest value.
+#
+# Offsets are byte values, or byte:bit where a field does not start on
+# a byte boundary. Sizes are bytes unless suffixed with `bit`.
+#
+# A struct's size is a bare number where it is fixed, `min..max` where
+# it is bounded, and `min..` where nothing bounds it.
+
+struct message size=4..1048580 mutate=Shifting repr=ValueConverted
+  message.length                         offset=AbsoluteStatic(0x00) size=Fixed(4) align=Aligned(8) repr=ValueConverted atomic=AtomicWord
+  message.body                           offset=AbsoluteStatic(0x04) size=Bounded(0, 1048576) align=Aligned(4) repr=MemoryIdentical atomic=AtomicWord mutate=Shifting
