@@ -49,7 +49,7 @@ struct agent_hello size=58.. access=Sequential mutate=Shifting address=Unstable 
   agent_hello.proto.bytes                offset=Scanned size=Bounded(0, 4294967295) align=Unaligned repr=MemoryIdentical atomic=AtomicWord access=Sequential mutate=Shifting address=Unstable
   agent_hello.<reserved2>                offset=Dynamic size=Fixed(2) align=Unaligned repr=MemoryIdentical atomic=NonAtomic address=Unstable
 
-struct agent_message size=3.. access=Sequential mutate=Shifting address=Unstable repr=TextConverted atomic=NonAtomic effect=EffectOnRead
+struct agent_message size=5.. access=Sequential mutate=Shifting address=Unstable repr=TextConverted atomic=NonAtomic effect=EffectOnRead
   agent_message.open                     offset=AbsoluteStatic(0x00) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord
   agent_message.type                     offset=AbsoluteStatic(0x01) size=Fixed(4) align=Aligned(1) repr=ValueConverted atomic=NonAtomic
   agent_message.body                     offset=AbsoluteStatic(0x01) size=Unbounded align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting
@@ -415,7 +415,7 @@ struct host_hello size=39.. access=Sequential mutate=Shifting address=Unstable r
   host_hello.proto.bytes                 offset=Scanned size=Bounded(0, 4294967295) align=Unaligned repr=MemoryIdentical atomic=AtomicWord access=Sequential mutate=Shifting address=Unstable
   host_hello.<reserved2>                 offset=Dynamic size=Fixed(2) align=Unaligned repr=MemoryIdentical atomic=NonAtomic address=Unstable
 
-struct host_message size=3.. access=Sequential mutate=Shifting address=Unstable repr=TextConverted atomic=NonAtomic effect=EffectOnRead
+struct host_message size=5.. access=Sequential mutate=Shifting address=Unstable repr=TextConverted atomic=NonAtomic effect=EffectOnRead
   host_message.open                      offset=AbsoluteStatic(0x00) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord
   host_message.type                      offset=AbsoluteStatic(0x01) size=Fixed(4) align=Aligned(1) repr=ValueConverted atomic=NonAtomic
   host_message.body                      offset=AbsoluteStatic(0x01) size=Unbounded align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting

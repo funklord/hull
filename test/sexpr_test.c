@@ -9,8 +9,11 @@
  * framing is not enough.
  */
 
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "sexpr.h"
 
@@ -280,14 +283,133 @@ static void test_values(void)
 	value_of("((a))", HULL_SEXPR_ERR_KIND, "", 0, 64);
 }
 
+/* The canonical writer: exact bytes, `*at` moved only on success, and the
+ * same refusals as the reader. */
+static void expect_run(const uint8_t *got, uint32_t length, const char *want,
+                       size_t want_length, const char *what)
+{
+	cases++;
+	if (length != want_length || memcmp(got, want, length) != 0)
+		FAIL("%s: wrote %.*s, wanted %s", what, (int)length, (const char *)got, want);
+}
+
+static void expect_status(hull_sexpr_status got, hull_sexpr_status want, const char *what)
+{
+	cases++;
+	if (got != want)
+		FAIL("%s: status %d, wanted %d", what, (int)got, (int)want);
+}
+
+#define expect_bytes(got, length, want, what) \
+	expect_run(got, length, want, sizeof want - 1, what)
+#define PUT_OK(call, what) expect_status(call, HULL_SEXPR_OK, what)
+
+static void test_writer(void)
+{
+	uint8_t  a[256];
+	uint8_t  b[256];
+	uint8_t  c[256];
+	uint32_t na = 0;
+	uint32_t nb = 0;
+	uint32_t nc = 0;
+
+	PUT_OK(hull_sexpr_put_atom(a, sizeof a, &na, (const uint8_t *)"root", 4), "atom");
+	PUT_OK(hull_sexpr_put_atom(a, sizeof a, &na, (const uint8_t *)"", 0), "empty atom");
+	PUT_OK(hull_sexpr_put_atom(a, sizeof a, &na, (const uint8_t *)"\0\xff", 2), "binary atom");
+	expect_run(a, na, "4:root0:2:\0\xff", 12, "atoms appended in turn");
+
+	na = 0;
+	PUT_OK(hull_sexpr_put_list(a, sizeof a, &na, NULL, 0), "empty list");
+	expect_bytes(a, na, "()", "empty list");
+
+	/* (4:exec(4:argv2:ls)), from the inside out. */
+	na = nb = nc = 0;
+	PUT_OK(hull_sexpr_put_atom(a, sizeof a, &na, (const uint8_t *)"argv", 4), "argv");
+	PUT_OK(hull_sexpr_put_atom(a, sizeof a, &na, (const uint8_t *)"ls", 2), "ls");
+	PUT_OK(hull_sexpr_put_atom(b, sizeof b, &nb, (const uint8_t *)"exec", 4), "exec");
+	PUT_OK(hull_sexpr_put_list(b, sizeof b, &nb, a, na), "(argv ls)");
+	PUT_OK(hull_sexpr_put_list(c, sizeof c, &nc, b, nb), "the message");
+	expect_bytes(c, nc, "(4:exec(4:argv2:ls))", "a nested list");
+
+	/* A record's entries in any order come out sorted by key, a key that
+	 * is a prefix of another first. */
+	{
+		static const char given[] = "(2:ch1:3)(2:ab1:x)(4:argv2:ls)(1:a1:y)";
+		static const char sorted[] = "(1:a1:y)(2:ab1:x)(4:argv2:ls)(2:ch1:3)";
+
+		na = 0;
+		PUT_OK(hull_sexpr_put_sorted(a, sizeof a, &na, (const uint8_t *)given,
+		                             sizeof given - 1), "sorted");
+		expect_bytes(a, na, sorted, "entries in key order");
+	}
+
+	/* Refusals, each leaving `*at` where it was. */
+	na = 3;
+	expect_status(hull_sexpr_put_atom(a, 8, &na, (const uint8_t *)"root", 4),
+	              HULL_SEXPR_ERR_SPACE, "an atom one byte short");
+	expect_status(hull_sexpr_put_list(a, sizeof a, &na, (const uint8_t *)"4:ro", 4),
+	              HULL_SEXPR_ERR_SYNTAX, "a truncated element");
+	expect_status(hull_sexpr_put_list(a, sizeof a, &na, (const uint8_t *)" 1:a", 4),
+	              HULL_SEXPR_ERR_SYNTAX, "whitespace among the elements");
+	expect_status(hull_sexpr_put_list(a, sizeof a, &na, (const uint8_t *)"(1:a", 4),
+	              HULL_SEXPR_ERR_SYNTAX, "an unclosed element");
+	expect_status(hull_sexpr_put_list(a, sizeof a, &na, (const uint8_t *)"01:a", 4),
+	              HULL_SEXPR_ERR_SYNTAX, "a length that is not minimal");
+	expect_status(hull_sexpr_put_list(a, sizeof a, &na, a + 4, 2),
+	              HULL_SEXPR_ERR_SPACE, "elements where the list goes");
+	expect_status(hull_sexpr_put_sorted(a, sizeof a, &na,
+	                                    (const uint8_t *)"(1:a1:x)(1:a1:y)", 16),
+	              HULL_SEXPR_ERR_DUPLICATE, "a key given twice");
+	expect_status(hull_sexpr_put_sorted(a, sizeof a, &na, (const uint8_t *)"4:root", 6),
+	              HULL_SEXPR_ERR_KIND, "an entry that is not a list");
+	expect_status(hull_sexpr_put_sorted(a, sizeof a, &na, (const uint8_t *)"((1:a))", 7),
+	              HULL_SEXPR_ERR_KIND, "an entry whose key is a list");
+	expect_status(hull_sexpr_put_sorted(a, sizeof a, &na, (const uint8_t *)"()", 2),
+	              HULL_SEXPR_ERR_KIND, "an entry with no key");
+	expect_status(hull_sexpr_put_sorted(a, 3 + 8, &na, (const uint8_t *)"(1:b)(1:a1:x)", 13),
+	              HULL_SEXPR_ERR_SPACE, "entries that do not fit");
+	cases++;
+	if (na != 3)
+		FAIL("a refusal moved *at to %u", na);
+
+	/* The reader's depth, from the writer's side: 32 levels written, the
+	 * 33rd refused. */
+	{
+		uint8_t  *from = a;
+		uint8_t  *to   = b;
+		uint32_t  n    = 0;
+		hull_sexpr_status status = HULL_SEXPR_OK;
+
+		for (unsigned level = 1; level <= HULL_SEXPR_MAX_DEPTH + 1u; level++) {
+			uint32_t at = 0;
+			uint8_t *swap;
+
+			status = hull_sexpr_put_list(to, sizeof a, &at, from, n);
+			if (status != HULL_SEXPR_OK) {
+				expect_status(level, HULL_SEXPR_MAX_DEPTH + 1u, "the level refused");
+				break;
+			}
+			n    = at;
+			swap = from;
+			from = to;
+			to   = swap;
+		}
+		expect_status(status, HULL_SEXPR_ERR_DEPTH, "a list one level too deep");
+	}
+}
+
 int main(void)
 {
+	/* A fault in what is tested can loop rather than fail, and a suite
+	 * nobody is watching would wait on it for ever. SIGALRM ends it. */
+	alarm(60);
 	test_readable();
 	test_situ_findings();
 	test_depth();
 	test_canonical();
 	test_navigation();
 	test_values();
+	test_writer();
 
 	/* A suite that ran nothing passes exactly as loudly as one that ran
 	 * everything, so an empty run is a failure of its own. */

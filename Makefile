@@ -70,10 +70,12 @@ endif
 GEN_DIR     = $(BUILD_DIR)/gen
 SCHEMAS     = sexpr/readable.situ sexpr/canonical.situ
 GEN_SOURCES = $(GEN_DIR)/readable.c $(GEN_DIR)/canonical.c
-GEN_HEADERS = $(GEN_DIR)/readable.h $(GEN_DIR)/canonical.h
+GEN_HEADERS = $(GEN_DIR)/readable.h $(GEN_DIR)/canonical.h \
+              $(GEN_DIR)/canonical_build.h $(GEN_DIR)/canonical_edit.h
 
-SEXPR_OBJS = $(BUILD_DIR)/sexpr/sexpr.o $(GEN_DIR)/readable.o \
-             $(GEN_DIR)/canonical.o $(BUILD_DIR)/situ/situ.o
+SEXPR_OBJS = $(BUILD_DIR)/sexpr/sexpr.o $(BUILD_DIR)/sexpr/writer.o \
+             $(GEN_DIR)/readable.o $(GEN_DIR)/canonical.o \
+             $(BUILD_DIR)/situ/situ.o
 
 # The agent protocol's framing (B.2), generated at situ's frame layer,
 # which also writes the build and edit headers of the rungs below it.
@@ -110,9 +112,13 @@ $(GEN_DIR)/readable.c $(GEN_DIR)/readable.h &: sexpr/readable.situ $(SITU_COMPIL
 	@mkdir -p '$(GEN_DIR)'
 	$(SITUC) build --target c --prefix hull_sexpr_r --out '$(GEN_DIR)' sexpr/readable.situ
 
-$(GEN_DIR)/canonical.c $(GEN_DIR)/canonical.h &: sexpr/canonical.situ $(SITU_COMPILER)
+# Canonical form is generated at the edit layer, whose build header is
+# what the writer appends with. The edit header beside it is not used:
+# situ finding 10, it does not compile for a `decimal` member.
+$(GEN_DIR)/canonical.c $(GEN_DIR)/canonical.h $(GEN_DIR)/canonical_build.h \
+$(GEN_DIR)/canonical_edit.h &: sexpr/canonical.situ $(SITU_COMPILER)
 	@mkdir -p '$(GEN_DIR)'
-	$(SITUC) build --target c --prefix hull_sexpr_c --out '$(GEN_DIR)' sexpr/canonical.situ
+	$(SITUC) build --target c --layer edit --prefix hull_sexpr_c --out '$(GEN_DIR)' sexpr/canonical.situ
 
 $(AGENT_GEN) &: agent/message.situ $(SITU_COMPILER)
 	@mkdir -p '$(GEN_DIR)'

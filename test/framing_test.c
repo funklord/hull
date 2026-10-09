@@ -7,8 +7,11 @@
  * never reach a caller.
  */
 
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "framing.h"
 
@@ -236,6 +239,9 @@ static void test_frame(void)
 
 int main(void)
 {
+	/* A fault in what is tested can loop rather than fail, and a suite
+	 * nobody is watching would wait on it for ever. SIGALRM ends it. */
+	alarm(60);
 	test_whole_and_split();
 	test_two_in_one_push();
 	test_sizes();

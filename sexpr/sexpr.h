@@ -50,8 +50,10 @@ typedef enum hull_sexpr_status {
 	HULL_SEXPR_ERR_SYNTAX,  /* the bytes are not this syntax */
 	HULL_SEXPR_ERR_DEPTH,   /* lists nested deeper than the maximum */
 	HULL_SEXPR_ERR_SIZE,    /* a document larger than 4 GiB */
-	HULL_SEXPR_ERR_SPACE,   /* a decode buffer too small */
+	HULL_SEXPR_ERR_SPACE,   /* a decode or output buffer too small, or
+	                           input lying where the output goes */
 	HULL_SEXPR_ERR_KIND,    /* asked of a form of the wrong kind */
+	HULL_SEXPR_ERR_DUPLICATE,  /* a record key given twice */
 } hull_sexpr_status;
 
 /* Where reading stopped, and why. `reason` is a static string. */
@@ -107,6 +109,34 @@ int hull_sexpr_is(const hull_sexpr_doc *doc, const hull_sexpr_form *form,
 hull_sexpr_status hull_sexpr_value(const hull_sexpr_doc *doc,
                                    const hull_sexpr_form *form, uint8_t *out,
                                    size_t capacity, size_t *length);
+
+/*
+ * The canonical writer (A.1). Each call appends to `out` at `*at`, never
+ * past `cap`, and advances `*at` only on HULL_SEXPR_OK; on failure the
+ * bytes from `*at` on are unspecified. Forms are written by situ's build
+ * layer from sexpr/canonical.situ and built from the inside out: the
+ * elements of a list are written first, into a buffer of their own, and
+ * handed to hull_sexpr_put_list whole. Every form written is read back
+ * with hull_sexpr_open before `*at` moves, so the writer refuses exactly
+ * what the reader would, depth included.
+ */
+
+/* One atom holding `length` bytes. */
+hull_sexpr_status hull_sexpr_put_atom(uint8_t *out, uint32_t cap, uint32_t *at,
+                                      const uint8_t *bytes, uint32_t length);
+
+/* One list whose elements are `items`: canonical forms, back to back, as
+ * these functions wrote them. `items` must not overlap `out`. */
+hull_sexpr_status hull_sexpr_put_list(uint8_t *out, uint32_t cap, uint32_t *at,
+                                      const uint8_t *items, uint32_t length);
+
+/* A record's entries in canonical order: `entries` holds lists, each
+ * opening with its key's atom, in any order, and they are appended sorted
+ * bytewise by key. A key given twice is HULL_SEXPR_ERR_DUPLICATE. For the
+ * handful of keys a record has: each entry is placed by a pass over all of
+ * them. `entries` must not overlap `out`. */
+hull_sexpr_status hull_sexpr_put_sorted(uint8_t *out, uint32_t cap, uint32_t *at,
+                                        const uint8_t *entries, uint32_t length);
 
 #ifdef __cplusplus
 }

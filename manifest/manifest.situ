@@ -42,8 +42,6 @@ const OPEN_TARGET      = ('(' << 24) | ('6' << 16) | (':' << 8) | 't';
 const OPEN_USER        = ('(' << 24) | ('4' << 16) | (':' << 8) | 'u';
 const OPEN_VERITY      = ('(' << 24) | ('6' << 16) | (':' << 8) | 'v';
 const OPEN_VOLUMES     = ('(' << 24) | ('7' << 16) | (':' << 8) | 'v';
-const OPEN_WORKDIR     = ('(' << 24) | ('7' << 16) | (':' << 8) | 'w';
-const OPEN_XATTRS      = ('(' << 24) | ('6' << 16) | (':' << 8) | 'x';
 
 // The start of an `entry`'s kind and owner, after their keys.
 const KIND_REG      = ('3' << 24) | (':' << 16) | ('r' << 8) | 'e';
@@ -58,6 +56,11 @@ const OWNER_IDS     = ('(' << 24) | ('3' << 16) | (':' << 8) | 'g';
 
 // Nothing: the arm an optional entry takes when it is absent.
 struct absent {
+}
+
+// The `)` that ends a record, for an arm that ends it.
+struct closing {
+	u8  close  [must_eq = ')'];
 }
 
 // A sha256 digest, held as its 32 bytes rather than as text. The readable
@@ -104,9 +107,19 @@ struct arch_entry {
 	u8    close  [must_eq = ')'];
 }
 
-// Sorted by path, bytewise.
+// Sorted by path, bytewise. An empty list is its own arm: a run whose
+// element peeks is given that element's minimum size even when it holds
+// none (situ finding 16), so `(7:entries)` would be refused.
 struct entries_entry {
 	preamble u8[10] = "(7:entries";
+	peek u8  first;
+	variant items switch (first) {
+		case '(':  entry_run  some;
+		default:   closing    none;
+	}
+}
+
+struct entry_run {
 	entry  items[]  until ")";
 }
 
@@ -150,71 +163,76 @@ struct entry {
 	}
 	owner_entry  owner;
 	path_entry   path;
-	// Everything after `path` is optional, so the entry may end at any
-	// point from here, with fewer than four bytes left to peek at. One byte
-	// says whether an entry follows, and only then are four read.
+	// Everything after `path` is optional, so the entry may end here.
+	// One byte says whether it does; what follows is the chain below,
+	// which reads the rest of the entry and its closing `)`.
 	peek u8  after_path;
-	variant size switch (after_path) {
-		case '(':  maybe_size  from_size;
-		default:   absent      ends_before_size;
+	variant tail switch (after_path) {
+		case '(':  entry_from_size  more;
+		default:   closing          end;
 	}
-	peek u8  after_size;
-	variant target switch (after_size) {
-		case '(':  maybe_target  from_target;
-		default:   absent        ends_before_target;
-	}
-	peek u8  after_target;
-	variant verity switch (after_target) {
-		case '(':  maybe_verity  from_verity;
-		default:   absent        ends_before_verity;
-	}
-	peek u8  after_verity;
-	variant xattrs switch (after_verity) {
-		case '(':  maybe_xattrs  from_xattrs;
-		default:   absent        ends_before_xattrs;
-	}
-	u8  close  [must_eq = ')'];
 }
 
-// The optional tail of an entry: each is entered only when a `(` follows,
-// so its four-byte peek is inside the entry.
-//
-// The one-byte peeks that choose them stay in `entry` itself, the struct
-// that owns the byte they read. A struct's frame ends at its own extent,
-// so a peek at its end cannot see the byte after it, which belongs to the
-// enclosing struct. situ calls that the model rather than a defect, and
-// whether a nested peek should see further is its holder's question (situ
-// finding 14, 2026-10-09).
-struct maybe_size {
+// The optional tail of an entry, one key at a time in canonical order.
+// Each link is entered only when a `(` follows, and every peek in it reads
+// bytes that the same link goes on to consume: a struct's frame ends at its
+// own extent, so a peek past it reads what belongs to its parent (situ
+// finding 14, which situ answered as the model working). That is why the
+// chain carries the entry's closing `)` rather than leaving it to `entry`.
+struct entry_from_size {
 	peek u32  key;
 	variant size switch (key) {
-		case OPEN_SIZE:  size_entry  has_size;
-		default:         absent      no_size;
+		case OPEN_SIZE:  entry_size_then    has_size;
+		default:         entry_from_target  no_size;
 	}
 }
 
-struct maybe_target {
+struct entry_size_then {
+	size_entry  size;
+	peek u8  next;
+	variant tail switch (next) {
+		case '(':  entry_from_target  more;
+		default:   closing            end;
+	}
+}
+
+struct entry_from_target {
 	peek u32  key;
 	variant target switch (key) {
-		case OPEN_TARGET:  target_entry  has_target;
-		default:           absent        no_target;
+		case OPEN_TARGET:  entry_target_then  has_target;
+		default:           entry_from_verity  no_target;
 	}
 }
 
-struct maybe_verity {
+struct entry_target_then {
+	target_entry  target;
+	peek u8  next;
+	variant tail switch (next) {
+		case '(':  entry_from_verity  more;
+		default:   closing            end;
+	}
+}
+
+struct entry_from_verity {
 	peek u32  key;
 	variant verity switch (key) {
-		case OPEN_VERITY:  verity_entry  has_verity;
-		default:           absent        no_verity;
+		case OPEN_VERITY:  entry_verity_then  has_verity;
+		default:           entry_from_xattrs  no_verity;
 	}
 }
 
-struct maybe_xattrs {
-	peek u32  key;
-	variant xattrs switch (key) {
-		case OPEN_XATTRS:  xattrs_entry  has_xattrs;
-		default:           absent        no_xattrs;
+struct entry_verity_then {
+	verity_entry  verity;
+	peek u8  next;
+	variant tail switch (next) {
+		case '(':  entry_from_xattrs  more;
+		default:   closing            end;
 	}
+}
+
+struct entry_from_xattrs {
+	xattrs_entry  xattrs;
+	u8  close  [must_eq = ')'];
 }
 
 // A device node, recorded always and made only on VM backends.
@@ -337,46 +355,135 @@ struct xattrs_entry {
 // Every entry is optional, and `hull.conf` overrides each.
 struct runtime_entry {
 	preamble u8[10] = "(7:runtime";
-	peek u32  first;
-	variant cmd switch (first) {
-		case OPEN_CMD:  cmd_entry  has_cmd;
-		default:        absent     no_cmd;
+	peek u8  first;
+	variant tail switch (first) {
+		case '(':  runtime_from_cmd  more;
+		default:   closing           end;
 	}
-	peek u32  after_cmd;
-	variant entrypoint switch (after_cmd) {
-		case OPEN_ENTRYPOINT:  entrypoint_entry  has_entrypoint;
-		default:               absent            no_entrypoint;
+}
+
+// Its entries, chained as an entry's tail is and for the same reason.
+struct runtime_from_cmd {
+	peek u32  key;
+	variant cmd switch (key) {
+		case OPEN_CMD:  runtime_cmd_then         has_cmd;
+		default:        runtime_from_entrypoint  no_cmd;
 	}
-	peek u32  after_entrypoint;
-	variant env switch (after_entrypoint) {
-		case OPEN_ENV:  env_entry  has_env;
-		default:        absent     no_env;
+}
+
+struct runtime_cmd_then {
+	cmd_entry  cmd;
+	peek u8  next;
+	variant tail switch (next) {
+		case '(':  runtime_from_entrypoint  more;
+		default:   closing                  end;
 	}
-	peek u32  after_env;
-	variant ports switch (after_env) {
-		case OPEN_PORTS:  ports_entry  has_ports;
-		default:          absent       no_ports;
+}
+
+struct runtime_from_entrypoint {
+	peek u32  key;
+	variant entrypoint switch (key) {
+		case OPEN_ENTRYPOINT:  runtime_entrypoint_then  has_entrypoint;
+		default:               runtime_from_env         no_entrypoint;
 	}
-	peek u32  after_ports;
-	variant stop_signal switch (after_ports) {
-		case OPEN_STOP_SIGNAL:  stop_signal_entry  has_stop_signal;
-		default:                absent             no_stop_signal;
+}
+
+struct runtime_entrypoint_then {
+	entrypoint_entry  entrypoint;
+	peek u8  next;
+	variant tail switch (next) {
+		case '(':  runtime_from_env  more;
+		default:   closing           end;
 	}
-	peek u32  after_stop_signal;
-	variant user switch (after_stop_signal) {
-		case OPEN_USER:  user_entry  has_user;
-		default:         absent      no_user;
+}
+
+struct runtime_from_env {
+	peek u32  key;
+	variant env switch (key) {
+		case OPEN_ENV:  runtime_env_then    has_env;
+		default:        runtime_from_ports  no_env;
 	}
-	peek u32  after_user;
-	variant volumes switch (after_user) {
-		case OPEN_VOLUMES:  volumes_entry  has_volumes;
-		default:            absent         no_volumes;
+}
+
+struct runtime_env_then {
+	env_entry  env;
+	peek u8  next;
+	variant tail switch (next) {
+		case '(':  runtime_from_ports  more;
+		default:   closing             end;
 	}
-	peek u32  after_volumes;
-	variant workdir switch (after_volumes) {
-		case OPEN_WORKDIR:  workdir_entry  has_workdir;
-		default:            absent         no_workdir;
+}
+
+struct runtime_from_ports {
+	peek u32  key;
+	variant ports switch (key) {
+		case OPEN_PORTS:  runtime_ports_then        has_ports;
+		default:          runtime_from_stop_signal  no_ports;
 	}
+}
+
+struct runtime_ports_then {
+	ports_entry  ports;
+	peek u8  next;
+	variant tail switch (next) {
+		case '(':  runtime_from_stop_signal  more;
+		default:   closing                   end;
+	}
+}
+
+struct runtime_from_stop_signal {
+	peek u32  key;
+	variant stop_signal switch (key) {
+		case OPEN_STOP_SIGNAL:  runtime_stop_signal_then  has_stop_signal;
+		default:                runtime_from_user         no_stop_signal;
+	}
+}
+
+struct runtime_stop_signal_then {
+	stop_signal_entry  stop_signal;
+	peek u8  next;
+	variant tail switch (next) {
+		case '(':  runtime_from_user  more;
+		default:   closing            end;
+	}
+}
+
+struct runtime_from_user {
+	peek u32  key;
+	variant user switch (key) {
+		case OPEN_USER:  runtime_user_then     has_user;
+		default:         runtime_from_volumes  no_user;
+	}
+}
+
+struct runtime_user_then {
+	user_entry  user;
+	peek u8  next;
+	variant tail switch (next) {
+		case '(':  runtime_from_volumes  more;
+		default:   closing               end;
+	}
+}
+
+struct runtime_from_volumes {
+	peek u32  key;
+	variant volumes switch (key) {
+		case OPEN_VOLUMES:  runtime_volumes_then  has_volumes;
+		default:            runtime_from_workdir  no_volumes;
+	}
+}
+
+struct runtime_volumes_then {
+	volumes_entry  volumes;
+	peek u8  next;
+	variant tail switch (next) {
+		case '(':  runtime_from_workdir  more;
+		default:   closing               end;
+	}
+}
+
+struct runtime_from_workdir {
+	workdir_entry  workdir;
 	u8  close  [must_eq = ')'];
 }
 
