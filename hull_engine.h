@@ -114,7 +114,7 @@ typedef struct hull_capabilities {
 	const char           *engine_version;  /* engine plugin version           */
 	const char *const    *classes;         /* NULL-terminated: "ns","vm","emu" */
 	const hull_cap_entry *entries;         /* terminated by entry.field==NULL  */
-	const char *const    *media_types;     /* accepted [[machine.media]] types */
+	const char *const    *media_types;     /* accepted (medium (type ...)) types */
 	const char *const    *attach_formats;  /* foreign formats runnable in place
 	                                          ("vmdk","qcow2",...), see
 	                                          section 3.13                     */

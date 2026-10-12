@@ -89,6 +89,11 @@ hull_sexpr_status hull_sexpr_open(hull_sexpr_doc *doc, const uint8_t *data,
                                   size_t length, hull_sexpr_syntax syntax,
                                   hull_sexpr_error *error);
 
+/* The 1-based line and byte column of `offset` in `doc`, as an error
+ * reports them. */
+void hull_sexpr_locate(const hull_sexpr_doc *doc, uint32_t offset,
+                       uint32_t *line, uint32_t *column);
+
 /* Navigation. Each returns 1 and fills `out`, or returns 0 when there is
  * nothing there: no first form, no next sibling, an empty list. */
 int hull_sexpr_first(const hull_sexpr_doc *doc, hull_sexpr_form *out);

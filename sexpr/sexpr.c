@@ -47,26 +47,29 @@ static void bind(const hull_sexpr_doc *doc, situ_msg_t *msg)
 	situ_msg_init(msg, (uint8_t *)(uintptr_t)doc->data, doc->length);
 }
 
+void hull_sexpr_locate(const hull_sexpr_doc *doc, uint32_t offset,
+                       uint32_t *line, uint32_t *column)
+{
+	*line   = 1u;
+	*column = 1u;
+	for (uint32_t i = 0; i < offset && i < doc->length; i++) {
+		if (doc->data[i] == '\n') {
+			(*line)++;
+			*column = 1u;
+		} else {
+			(*column)++;
+		}
+	}
+}
+
 static void locate(const hull_sexpr_doc *doc, hull_sexpr_error *error,
                    hull_sexpr_status status, uint32_t offset, const char *reason)
 {
-	uint32_t line = 1u;
-	uint32_t column = 1u;
-
 	if (error == NULL)
 		return;
-	for (uint32_t i = 0; i < offset && i < doc->length; i++) {
-		if (doc->data[i] == '\n') {
-			line++;
-			column = 1u;
-		} else {
-			column++;
-		}
-	}
+	hull_sexpr_locate(doc, offset, &error->line, &error->column);
 	error->status = status;
 	error->offset = offset;
-	error->line   = line;
-	error->column = column;
 	error->reason = reason;
 }
 

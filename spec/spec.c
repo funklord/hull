@@ -1,0 +1,865 @@
+/*
+ * spec.c -- hull.conf held to Appendix J.
+ *
+ * The inventory is data. Each record is a table of keys, each key a value
+ * type and whatever that type needs: a set of symbols, the record it
+ * holds, a rule for a string. One walk applies every table, so a key added
+ * to Appendix J is a row here rather than a function.
+ *
+ * The reader has already checked the syntax, so the walk only ever meets
+ * well-formed lists, symbols and strings. A string's rule reads its
+ * content as written, escapes and all; no rule here accepts a backslash,
+ * so an escape fails a rule rather than slipping past one.
+ */
+
+#include <string.h>
+
+#include "spec.h"
+
+/* The most keys one record has, which bounds the walk's bookkeeping. */
+#define MAX_KEYS 32u
+
+typedef enum value_type {
+	STRING,    /* one string */
+	STRINGS,   /* any number of strings */
+	SYMBOL,    /* one symbol from an open set: an arch, an engine */
+	SYMBOLS,   /* any number of them */
+	CHOICE,    /* one symbol from `choices` */
+	BOOLEAN,   /* true or false */
+	COUNT,     /* a whole number, from 1 */
+	PORT,      /* a whole number, from 1 to 65535 */
+	NUMBER,    /* a positive decimal: 2, 1.5 */
+	KERNEL,    /* bundled, image, or "path:<file>" */
+	RECORD,    /* (key (entry ...) ...), held to `record` */
+	ENTRIES,   /* a plural key holding (singular ...) records */
+	MAP,       /* names the user chooses: (name ...) records, or (name "value") */
+	RESERVED,  /* named by Appendix J, defined with its adapter */
+} value_type;
+
+/* A rule returns NULL for content it accepts, or why it refuses it. */
+typedef const char *(*rule)(const uint8_t *text, uint32_t length);
+
+struct schema;
+
+typedef struct key {
+	const char          *name;
+	value_type           type;
+	int                  required;
+	int                  nonempty;  /* STRINGS, SYMBOLS, ENTRIES, MAP: at least one */
+	const char *const   *choices;   /* CHOICE, NULL-terminated */
+	const struct schema *record;    /* RECORD, ENTRIES; MAP when its names hold records */
+	const char          *entry;     /* ENTRIES: the singular key */
+	rule                 value;     /* strings, and symbols from an open set */
+	rule                 names;     /* MAP: the names */
+} key;
+
+typedef struct walk walk;
+
+typedef struct schema {
+	const key  *keys;
+	unsigned    count;
+	/* Rules across keys, run once every key has passed on its own. */
+	hull_spec_status (*across)(walk *w, const hull_sexpr_form *record,
+	                           const hull_sexpr_form *found, uint32_t present);
+} schema;
+
+struct walk {
+	const hull_sexpr_doc *doc;
+	hull_spec_error      *error;
+	char                  path[sizeof ((hull_spec_error *)0)->path];
+	size_t                path_length;
+};
+
+/* --- the walk's own state ------------------------------------------------ */
+
+static hull_spec_status fail(walk *w, hull_spec_status status, uint32_t offset,
+                             const char *reason)
+{
+	if (w->error == NULL)
+		return status;
+	hull_sexpr_locate(w->doc, offset, &w->error->line, &w->error->column);
+	w->error->status = status;
+	w->error->offset = offset;
+	w->error->reason = reason;
+	memcpy(w->error->path, w->path, w->path_length + 1u);
+	return status;
+}
+
+/* Add a name to the path, and return what to cut it back to. */
+static size_t push(walk *w, const uint8_t *name, uint32_t length)
+{
+	size_t saved = w->path_length;
+	size_t room  = sizeof w->path - 1u - w->path_length;
+
+	if (w->path_length != 0u && room != 0u) {
+		w->path[w->path_length++] = '.';
+		room--;
+	}
+	if (length > room)
+		length = (uint32_t)room;
+	memcpy(w->path + w->path_length, name, length);
+	w->path_length += length;
+	w->path[w->path_length] = '\0';
+	return saved;
+}
+
+static void pop(walk *w, size_t saved)
+{
+	w->path_length = saved;
+	w->path[saved] = '\0';
+}
+
+static size_t push_form(walk *w, const hull_sexpr_form *form)
+{
+	return push(w, w->doc->data + form->content, form->content_length);
+}
+
+static size_t push_text(walk *w, const char *name)
+{
+	return push(w, (const uint8_t *)name, (uint32_t)strlen(name));
+}
+
+static int same_name(const hull_sexpr_doc *doc, const hull_sexpr_form *a,
+                     const hull_sexpr_form *b)
+{
+	return a->content_length == b->content_length &&
+	       memcmp(doc->data + a->content, doc->data + b->content, a->content_length) == 0;
+}
+
+/* --- rules --------------------------------------------------------------- */
+
+static int is_digit(uint8_t byte)
+{
+	return byte >= '0' && byte <= '9';
+}
+
+static int is_lower(uint8_t byte)
+{
+	return byte >= 'a' && byte <= 'z';
+}
+
+static int is_upper(uint8_t byte)
+{
+	return byte >= 'A' && byte <= 'Z';
+}
+
+static const char *nonempty(const uint8_t *text, uint32_t length)
+{
+	(void)text;
+	return length == 0u ? "may not be empty" : NULL;
+}
+
+static const char *absolute(const uint8_t *text, uint32_t length)
+{
+	return length != 0u && text[0] == '/' ? NULL : "must be an absolute path";
+}
+
+/* Lowercase words: an arch, an engine, a medium's type, a fidelity need. */
+static const char *identifier(const uint8_t *text, uint32_t length)
+{
+	if (length == 0u || !(is_lower(text[0]) || is_digit(text[0])))
+		return "must be lowercase letters, digits, `_` and `-`";
+	for (uint32_t i = 1u; i < length; i++)
+		if (!is_lower(text[i]) && !is_digit(text[i]) && text[i] != '_' && text[i] != '-')
+			return "must be lowercase letters, digits, `_` and `-`";
+	return NULL;
+}
+
+/* A DNS label, since a machine's name and hostname become `<name>.hull`. */
+static const char *label(const uint8_t *text, uint32_t length)
+{
+	static const char reason[] = "must be a DNS label: up to 63 lowercase "
+	                             "letters, digits and inner `-`";
+
+	if (length == 0u || length > 63u || text[0] == '-' || text[length - 1u] == '-')
+		return reason;
+	for (uint32_t i = 0u; i < length; i++)
+		if (!is_lower(text[i]) && !is_digit(text[i]) && text[i] != '-')
+			return reason;
+	return NULL;
+}
+
+static const char *env_name(const uint8_t *text, uint32_t length)
+{
+	static const char reason[] = "must be letters, digits and `_`, not starting "
+	                             "with a digit";
+
+	if (length == 0u || is_digit(text[0]))
+		return reason;
+	for (uint32_t i = 0u; i < length; i++)
+		if (!is_lower(text[i]) && !is_upper(text[i]) && !is_digit(text[i]) && text[i] != '_')
+			return reason;
+	return NULL;
+}
+
+/* A secret is materialised as /run/hull/secrets/<name>, so its name is
+ * one path component, and never `.` or `..`. */
+static const char *secret_name(const uint8_t *text, uint32_t length)
+{
+	static const char reason[] = "must be letters, digits, `_` and `-`";
+
+	if (length == 0u || length > 255u)
+		return reason;
+	for (uint32_t i = 0u; i < length; i++)
+		if (!is_lower(text[i]) && !is_upper(text[i]) && !is_digit(text[i]) &&
+		    text[i] != '_' && text[i] != '-')
+			return reason;
+	return NULL;
+}
+
+/* Digits, not zero, then at most one byte from `units`. */
+static int amount(const uint8_t *text, uint32_t length, const char *units, int unit_required)
+{
+	uint32_t digits = 0u;
+	int      zero   = 1;
+
+	while (digits < length && is_digit(text[digits])) {
+		if (text[digits] != '0')
+			zero = 0;
+		digits++;
+	}
+	if (digits == 0u || zero)
+		return 0;
+	if (digits == length)
+		return !unit_required;
+	return digits + 1u == length && strchr(units, text[digits]) != NULL;
+}
+
+static const char *size(const uint8_t *text, uint32_t length)
+{
+	return amount(text, length, "KMGT", 0) ? NULL :
+	       "must be a size above zero: digits, then K, M, G or T or nothing";
+}
+
+static const char *duration(const uint8_t *text, uint32_t length)
+{
+	return amount(text, length, "smhdw", 1) ? NULL :
+	       "must be a duration above zero: digits, then s, m, h, d or w";
+}
+
+/* One of `schemes`, with something after it. */
+static int has_scheme(const uint8_t *text, uint32_t length, const char *const *schemes)
+{
+	for (; *schemes != NULL; schemes++) {
+		size_t n = strlen(*schemes);
+
+		if (length > n && memcmp(text, *schemes, n) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+static const char *medium_source(const uint8_t *text, uint32_t length)
+{
+	static const char *const schemes[] = { "dir:", "tar:", "pack:", "image:", NULL };
+
+	return has_scheme(text, length, schemes) ? NULL :
+	       "must be \"dir:\", \"tar:\", \"pack:\" or \"image:\" and a path";
+}
+
+static const char *secret_source(const uint8_t *text, uint32_t length)
+{
+	static const char *const schemes[] = { "file:", "age:", "exec:", NULL };
+
+	return has_scheme(text, length, schemes) ? NULL :
+	       "must be \"file:\", \"age:\" or \"exec:\" and what it names";
+}
+
+/* --- Appendix J ---------------------------------------------------------- */
+
+static const char *const mutable_values[]    = { "direct", "overlay", NULL };
+static const char *const writeback_values[]  = { "none", "sync-on-stop", NULL };
+static const char *const projection_values[] = { "auto", "bind", "passthrough", "block", NULL };
+static const char *const restart_values[]    = { "no", "on-failure", "always", NULL };
+static const char *const disconnect_values[] = { "stop", "keep", NULL };
+static const char *const proto_values[]      = { "tcp", "udp", NULL };
+static const char *const mode_values[]       = { "rw", "ro", NULL };
+static const char *const expose_values[]     = { "env", NULL };
+static const char *const profile_values[]    = { "micro", "full", NULL };
+static const char *const cpu_values[]        = { "host", "migratable", NULL };
+static const char *const accel_values[]      = { "auto", "kvm", "tcg", NULL };
+
+#define TABLE(keys) { keys, (unsigned)(sizeof keys / sizeof keys[0]), NULL }
+#define TABLE_ACROSS(keys, across) { keys, (unsigned)(sizeof keys / sizeof keys[0]), across }
+
+/* (port (host 8080) (guest 80) (proto tcp)) */
+static const key port_keys[] = {
+	{ .name = "host",  .type = PORT, .required = 1 },
+	{ .name = "guest", .type = PORT, .required = 1 },
+	{ .name = "proto", .type = CHOICE, .choices = proto_values },
+};
+static const schema port = TABLE(port_keys);
+
+/* (volume (host "./data") (guest "/var/data") (mode rw)) */
+static const key volume_keys[] = {
+	{ .name = "host",  .type = STRING, .required = 1, .value = nonempty },
+	{ .name = "guest", .type = STRING, .required = 1, .value = absolute },
+	{ .name = "mode",  .type = CHOICE, .choices = mode_values },
+};
+static const schema volume = TABLE(volume_keys);
+
+/* J.2 */
+static const key security_keys[] = {
+	{ .name = "readonly_root", .type = BOOLEAN },
+	{ .name = "no_new_privs",  .type = BOOLEAN },
+	{ .name = "allow",         .type = SYMBOLS },
+};
+static const schema security = TABLE(security_keys);
+
+/* J.3: what follows a secret's name. */
+static const key secret_keys[] = {
+	{ .name = "source", .type = STRING, .required = 1, .value = secret_source },
+	{ .name = "expose", .type = CHOICE, .choices = expose_values },
+};
+static const schema secret = TABLE(secret_keys);
+
+/* J.4 */
+static const key medium_keys[] = {
+	{ .name = "type",   .type = SYMBOL, .required = 1, .value = identifier },
+	{ .name = "source", .type = STRING, .required = 1, .value = medium_source },
+};
+static const schema medium = TABLE(medium_keys);
+
+/* J.5, an entry per class and per engine. */
+static const key vm_keys[] = {
+	{ .name = "profile",     .type = CHOICE, .choices = profile_values },
+	{ .name = "kernel",      .type = KERNEL },
+	{ .name = "cpu_profile", .type = CHOICE, .choices = cpu_values },
+};
+static const schema vm = TABLE(vm_keys);
+
+static const key emu_keys[] = {
+	{ .name = "cores_scale", .type = NUMBER },
+};
+static const schema emu = TABLE(emu_keys);
+
+static const key ns_keys[] = {
+	{ .name = "binfmt", .type = BOOLEAN },
+};
+static const schema ns = TABLE(ns_keys);
+
+static const key qemu_keys[] = {
+	{ .name = "accel", .type = CHOICE, .choices = accel_values },
+};
+static const schema qemu = TABLE(qemu_keys);
+
+static const key virtualbox_keys[] = {
+	{ .name = "gui", .type = BOOLEAN },
+};
+static const schema virtualbox = TABLE(virtualbox_keys);
+
+static const key tuning_keys[] = {
+	{ .name = "vm",         .type = RECORD, .record = &vm },
+	{ .name = "emu",        .type = RECORD, .record = &emu },
+	{ .name = "ns",         .type = RECORD, .record = &ns },
+	{ .name = "qemu",       .type = RECORD, .record = &qemu },
+	{ .name = "virtualbox", .type = RECORD, .record = &virtualbox },
+	{ .name = "docker",     .type = RESERVED },
+	{ .name = "vmware",     .type = RESERVED },
+	{ .name = "hyperv",     .type = RESERVED },
+};
+static const schema tuning = TABLE(tuning_keys);
+
+/* J.1 */
+static const key machine_keys[] = {
+	{ .name = "source",        .type = STRING, .required = 1, .value = nonempty },
+	{ .name = "mutable",       .type = CHOICE, .choices = mutable_values },
+	{ .name = "writeback",     .type = CHOICE, .choices = writeback_values },
+	{ .name = "projection",    .type = CHOICE, .choices = projection_values },
+	{ .name = "fidelity",      .type = SYMBOLS, .value = identifier },
+	{ .name = "arch",          .type = SYMBOL, .value = identifier },
+	{ .name = "command",       .type = STRINGS, .nonempty = 1 },
+	{ .name = "workdir",       .type = STRING, .value = absolute },
+	{ .name = "env",           .type = MAP, .names = env_name },
+	{ .name = "env_file",      .type = STRING, .value = nonempty },
+	{ .name = "ports",         .type = ENTRIES, .record = &port, .entry = "port" },
+	{ .name = "volumes",       .type = ENTRIES, .record = &volume, .entry = "volume" },
+	{ .name = "cpus",          .type = COUNT },
+	{ .name = "memory",        .type = STRING, .value = size },
+	{ .name = "backend",       .type = SYMBOL, .value = identifier },
+	{ .name = "ssh",           .type = BOOLEAN },
+	{ .name = "restart",       .type = CHOICE, .choices = restart_values },
+	{ .name = "on_disconnect", .type = CHOICE, .choices = disconnect_values },
+	{ .name = "hostname",      .type = STRING, .value = label },
+	{ .name = "security",      .type = RECORD, .record = &security },
+	{ .name = "secrets",       .type = MAP, .record = &secret, .names = secret_name },
+	{ .name = "media",         .type = ENTRIES, .record = &medium, .entry = "medium" },
+	{ .name = "tuning",        .type = RECORD, .record = &tuning },
+};
+static const schema machine = TABLE(machine_keys);
+
+/* J.6: (path (from "./src") (to "/app")), what a step copies in. */
+static const key path_keys[] = {
+	{ .name = "from", .type = STRING, .required = 1, .value = nonempty },
+	{ .name = "to",   .type = STRING, .required = 1, .value = absolute },
+};
+static const schema path = TABLE(path_keys);
+
+static hull_spec_status step_across(walk *w, const hull_sexpr_form *record,
+                                    const hull_sexpr_form *found, uint32_t present);
+
+static const key step_keys[] = {
+	{ .name = "name",    .type = STRING, .required = 1, .value = nonempty },
+	{ .name = "run",     .type = STRING, .value = nonempty },
+	{ .name = "copy",    .type = ENTRIES, .record = &path, .entry = "path" },
+	{ .name = "inputs",  .type = STRINGS, .value = nonempty },
+	{ .name = "network", .type = BOOLEAN },
+	{ .name = "refresh", .type = STRING, .value = duration },
+	{ .name = "backend", .type = SYMBOL, .value = identifier },
+	{ .name = "discard", .type = STRINGS, .value = absolute },
+};
+static const schema step = TABLE_ACROSS(step_keys, step_across);
+
+/* Where these sit in step_keys, for step_across. */
+#define STEP_NETWORK 4u
+#define STEP_REFRESH 5u
+
+static const key build_keys[] = {
+	{ .name = "base",  .type = STRING, .required = 1, .value = nonempty },
+	{ .name = "steps", .type = ENTRIES, .record = &step, .entry = "step" },
+};
+static const schema build = TABLE(build_keys);
+
+static hull_spec_status file_across(walk *w, const hull_sexpr_form *record,
+                                    const hull_sexpr_form *found, uint32_t present);
+
+/* The top of a file (J.7): one machine, or several by name, and a build. */
+static const key file_keys[] = {
+	{ .name = "machine",  .type = RECORD, .record = &machine },
+	{ .name = "machines", .type = MAP, .record = &machine, .names = label, .nonempty = 1 },
+	{ .name = "build",    .type = RECORD, .record = &build },
+};
+static const schema file = TABLE_ACROSS(file_keys, file_across);
+
+#define FILE_MACHINE  0u
+#define FILE_MACHINES 1u
+#define FILE_BUILD    2u
+
+_Static_assert(sizeof machine_keys / sizeof machine_keys[0] <= MAX_KEYS,
+               "a record has more keys than the walk can track");
+
+/* --- values -------------------------------------------------------------- */
+
+static hull_spec_status check_entries(walk *w, const hull_sexpr_form *first, int has_first,
+                                      const hull_sexpr_form *record, uint32_t missing_at,
+                                      const schema *s, hull_sexpr_form *found,
+                                      uint32_t *present);
+
+/* The one value of `entry`, whose key is `head`, which must be of `kind`. */
+static hull_spec_status one_value(walk *w, const hull_sexpr_form *entry,
+                                  const hull_sexpr_form *head, hull_sexpr_kind kind,
+                                  hull_sexpr_form *value, const char *reason)
+{
+	hull_sexpr_form extra;
+
+	if (!hull_sexpr_next(w->doc, head, value))
+		return fail(w, HULL_SPEC_ERR_SHAPE, entry->offset, reason);
+	if (value->kind != kind)
+		return fail(w, HULL_SPEC_ERR_SHAPE, value->offset, reason);
+	if (hull_sexpr_next(w->doc, value, &extra))
+		return fail(w, HULL_SPEC_ERR_SHAPE, extra.offset, reason);
+	return HULL_SPEC_OK;
+}
+
+/* A whole number in minimal decimal, from 1 to `max`. */
+static int whole(const hull_sexpr_doc *doc, const hull_sexpr_form *form, uint32_t max)
+{
+	const uint8_t *text  = doc->data + form->content;
+	uint32_t       value = 0u;
+
+	if (form->content_length == 0u || text[0] == '0')
+		return 0;
+	for (uint32_t i = 0u; i < form->content_length; i++) {
+		if (!is_digit(text[i]) || value > (max - (uint32_t)(text[i] - '0')) / 10u)
+			return 0;
+		value = value * 10u + (uint32_t)(text[i] - '0');
+	}
+	return 1;
+}
+
+/* Digits, then optionally a point and more digits, and not zero. */
+static int decimal(const hull_sexpr_doc *doc, const hull_sexpr_form *form)
+{
+	const uint8_t *text   = doc->data + form->content;
+	uint32_t       length = form->content_length;
+	uint32_t       i      = 0u;
+	int            zero   = 1;
+
+	while (i < length && is_digit(text[i])) {
+		zero &= text[i] == '0';
+		i++;
+	}
+	if (i == 0u || (i > 1u && text[0] == '0'))
+		return 0;
+	if (i < length) {
+		uint32_t point = i++;
+
+		while (i < length && is_digit(text[i])) {
+			zero &= text[i] == '0';
+			i++;
+		}
+		if (i == point + 1u)
+			return 0;
+	}
+	return i == length && !zero;
+}
+
+static hull_spec_status apply(walk *w, rule r, const hull_sexpr_form *form)
+{
+	const char *reason;
+
+	if (r == NULL)
+		return HULL_SPEC_OK;
+	reason = r(w->doc->data + form->content, form->content_length);
+	return reason == NULL ? HULL_SPEC_OK : fail(w, HULL_SPEC_ERR_VALUE, form->offset, reason);
+}
+
+static int chosen(const hull_sexpr_doc *doc, const hull_sexpr_form *form,
+                  const char *const *choices)
+{
+	for (; *choices != NULL; choices++)
+		if (hull_sexpr_is(doc, form, *choices))
+			return 1;
+	return 0;
+}
+
+/* Every value after `head` is of `kind` and passes `r`. */
+static hull_spec_status each_value(walk *w, const hull_sexpr_form *entry,
+                                   const hull_sexpr_form *head, const key *k,
+                                   hull_sexpr_kind kind, const char *reason)
+{
+	hull_sexpr_form  value;
+	hull_spec_status status;
+	int              more = hull_sexpr_next(w->doc, head, &value);
+
+	if (!more && k->nonempty)
+		return fail(w, HULL_SPEC_ERR_SHAPE, entry->offset, reason);
+	for (; more; more = hull_sexpr_next(w->doc, &value, &value)) {
+		if (value.kind != kind)
+			return fail(w, HULL_SPEC_ERR_SHAPE, value.offset, reason);
+		status = apply(w, k->value, &value);
+		if (status != HULL_SPEC_OK)
+			return status;
+	}
+	return HULL_SPEC_OK;
+}
+
+static hull_spec_status check_record(walk *w, const hull_sexpr_form *record,
+                                     const hull_sexpr_form *head, const schema *s)
+{
+	hull_sexpr_form found[MAX_KEYS];
+	hull_sexpr_form first;
+	uint32_t        present = 0u;
+	int             has     = hull_sexpr_next(w->doc, head, &first);
+
+	return check_entries(w, &first, has, record, record->offset, s, found, &present);
+}
+
+/* (plural (singular ...) ...) */
+static hull_spec_status check_list(walk *w, const hull_sexpr_form *entry,
+                                   const hull_sexpr_form *head, const key *k)
+{
+	hull_sexpr_form  item;
+	hull_sexpr_form  name;
+	hull_spec_status status;
+	int              more = hull_sexpr_next(w->doc, head, &item);
+
+	if (!more && k->nonempty)
+		return fail(w, HULL_SPEC_ERR_SHAPE, entry->offset, "holds at least one entry");
+	for (; more; more = hull_sexpr_next(w->doc, &item, &item)) {
+		size_t saved;
+
+		if (item.kind != HULL_SEXPR_LIST || !hull_sexpr_child(w->doc, &item, &name) ||
+		    name.kind != HULL_SEXPR_SYMBOL)
+			return fail(w, HULL_SPEC_ERR_SHAPE, item.offset,
+			            "holds only entries, each a list opening with its key");
+		saved = push_form(w, &name);
+		if (!hull_sexpr_is(w->doc, &name, k->entry))
+			return fail(w, HULL_SPEC_ERR_UNKNOWN, name.offset,
+			            "is not the entry this list holds");
+		status = check_record(w, &item, &name, k->record);
+		if (status != HULL_SPEC_OK)
+			return status;
+		pop(w, saved);
+	}
+	return HULL_SPEC_OK;
+}
+
+/* (key (name ...) ...), the names the user's own. */
+static hull_spec_status check_map(walk *w, const hull_sexpr_form *entry,
+                                  const hull_sexpr_form *head, const key *k)
+{
+	hull_sexpr_form  item;
+	hull_sexpr_form  name;
+	hull_sexpr_form  value;
+	hull_spec_status status;
+	int              more = hull_sexpr_next(w->doc, head, &item);
+
+	if (!more && k->nonempty)
+		return fail(w, HULL_SPEC_ERR_SHAPE, entry->offset, "holds at least one name");
+	for (; more; more = hull_sexpr_next(w->doc, &item, &item)) {
+		hull_sexpr_form earlier;
+		hull_sexpr_form earlier_name;
+		size_t          saved;
+
+		if (item.kind != HULL_SEXPR_LIST || !hull_sexpr_child(w->doc, &item, &name) ||
+		    name.kind != HULL_SEXPR_SYMBOL)
+			return fail(w, HULL_SPEC_ERR_SHAPE, item.offset,
+			            "holds only entries, each a list opening with its name");
+		saved = push_form(w, &name);
+		status = apply(w, k->names, &name);
+		if (status != HULL_SPEC_OK)
+			return status;
+		hull_sexpr_next(w->doc, head, &earlier);
+		for (; earlier.offset != item.offset; hull_sexpr_next(w->doc, &earlier, &earlier)) {
+			hull_sexpr_child(w->doc, &earlier, &earlier_name);
+			if (same_name(w->doc, &earlier_name, &name))
+				return fail(w, HULL_SPEC_ERR_DUPLICATE, item.offset, "is named twice");
+		}
+		if (k->record != NULL)
+			status = check_record(w, &item, &name, k->record);
+		else
+			status = one_value(w, &item, &name, HULL_SEXPR_STRING, &value,
+			                   "takes one string");
+		if (status != HULL_SPEC_OK)
+			return status;
+		pop(w, saved);
+	}
+	return HULL_SPEC_OK;
+}
+
+/* The values of `entry`, whose key `head` is `k`. */
+static hull_spec_status check_value(walk *w, const hull_sexpr_form *entry,
+                                    const hull_sexpr_form *head, const key *k)
+{
+	hull_sexpr_form  value;
+	hull_spec_status status;
+
+	switch (k->type) {
+	case STRING:
+		status = one_value(w, entry, head, HULL_SEXPR_STRING, &value, "takes one string");
+		return status != HULL_SPEC_OK ? status : apply(w, k->value, &value);
+	case STRINGS:
+		return each_value(w, entry, head, k, HULL_SEXPR_STRING,
+		                  k->nonempty ? "takes one string or more" : "takes only strings");
+	case SYMBOL:
+		status = one_value(w, entry, head, HULL_SEXPR_SYMBOL, &value, "takes one symbol");
+		return status != HULL_SPEC_OK ? status : apply(w, k->value, &value);
+	case SYMBOLS:
+		return each_value(w, entry, head, k, HULL_SEXPR_SYMBOL, "takes only symbols");
+	case CHOICE:
+		status = one_value(w, entry, head, HULL_SEXPR_SYMBOL, &value, "takes one symbol");
+		if (status == HULL_SPEC_OK && !chosen(w->doc, &value, k->choices))
+			return fail(w, HULL_SPEC_ERR_VALUE, value.offset, "is not one of this key's values");
+		return status;
+	case BOOLEAN:
+		status = one_value(w, entry, head, HULL_SEXPR_SYMBOL, &value, "takes true or false");
+		if (status == HULL_SPEC_OK && !hull_sexpr_is(w->doc, &value, "true") &&
+		    !hull_sexpr_is(w->doc, &value, "false"))
+			return fail(w, HULL_SPEC_ERR_VALUE, value.offset, "takes true or false");
+		return status;
+	case COUNT:
+	case PORT:
+		status = one_value(w, entry, head, HULL_SEXPR_SYMBOL, &value, "takes one number");
+		if (status == HULL_SPEC_OK && !whole(w->doc, &value, k->type == PORT ? 65535u : UINT32_MAX))
+			return fail(w, HULL_SPEC_ERR_VALUE, value.offset, k->type == PORT ?
+			            "must be a port, from 1 to 65535" :
+			            "must be a whole number from 1, without leading zeros");
+		return status;
+	case NUMBER:
+		status = one_value(w, entry, head, HULL_SEXPR_SYMBOL, &value, "takes one number");
+		if (status == HULL_SPEC_OK && !decimal(w->doc, &value))
+			return fail(w, HULL_SPEC_ERR_VALUE, value.offset,
+			            "must be a number above zero: 2, 1.5");
+		return status;
+	case KERNEL:
+		if (hull_sexpr_next(w->doc, head, &value) && value.kind == HULL_SEXPR_STRING)
+			status = one_value(w, entry, head, HULL_SEXPR_STRING, &value, "takes one value");
+		else
+			status = one_value(w, entry, head, HULL_SEXPR_SYMBOL, &value, "takes one value");
+		if (status != HULL_SPEC_OK)
+			return status;
+		if (value.kind == HULL_SEXPR_STRING) {
+			static const char *const schemes[] = { "path:", NULL };
+
+			if (!has_scheme(w->doc->data + value.content, value.content_length, schemes))
+				return fail(w, HULL_SPEC_ERR_VALUE, value.offset,
+				            "must be bundled, image or \"path:<file>\"");
+		} else if (!hull_sexpr_is(w->doc, &value, "bundled") &&
+		           !hull_sexpr_is(w->doc, &value, "image")) {
+			return fail(w, HULL_SPEC_ERR_VALUE, value.offset,
+			            "must be bundled, image or \"path:<file>\"");
+		}
+		return HULL_SPEC_OK;
+	case RECORD:
+		return check_record(w, entry, head, k->record);
+	case ENTRIES:
+		return check_list(w, entry, head, k);
+	case MAP:
+		return check_map(w, entry, head, k);
+	case RESERVED:
+		return fail(w, HULL_SPEC_ERR_UNKNOWN, head->offset,
+		            "is reserved, and defined with its engine's adapter");
+	}
+	return fail(w, HULL_SPEC_ERR_UNKNOWN, head->offset, "has no type");
+}
+
+/* --- records ------------------------------------------------------------- */
+
+/*
+ * The entries from `first` on, held to `s`. `found` and `present` say
+ * which keys were given and where, for the rules across keys and for the
+ * caller. A required key that is missing is reported at `missing_at`.
+ */
+static hull_spec_status check_entries(walk *w, const hull_sexpr_form *first, int has_first,
+                                      const hull_sexpr_form *record, uint32_t missing_at,
+                                      const schema *s, hull_sexpr_form *found,
+                                      uint32_t *present)
+{
+	hull_sexpr_form  entry = *first;
+	hull_sexpr_form  head;
+	hull_spec_status status;
+	int              more  = has_first;
+
+	*present = 0u;
+	for (; more; more = hull_sexpr_next(w->doc, &entry, &entry)) {
+		unsigned i;
+		size_t   saved;
+
+		if (entry.kind != HULL_SEXPR_LIST || !hull_sexpr_child(w->doc, &entry, &head) ||
+		    head.kind != HULL_SEXPR_SYMBOL)
+			return fail(w, HULL_SPEC_ERR_SHAPE, entry.offset,
+			            "is not an entry: a list opening with its key");
+		saved = push_form(w, &head);
+		for (i = 0u; i < s->count; i++)
+			if (hull_sexpr_is(w->doc, &head, s->keys[i].name))
+				break;
+		if (i == s->count)
+			return fail(w, HULL_SPEC_ERR_UNKNOWN, head.offset, "is not a key here");
+		if (*present & (1u << i))
+			return fail(w, HULL_SPEC_ERR_DUPLICATE, entry.offset, "is given twice");
+		*present |= 1u << i;
+		found[i] = entry;
+		status = check_value(w, &entry, &head, &s->keys[i]);
+		if (status != HULL_SPEC_OK)
+			return status;
+		pop(w, saved);
+	}
+	for (unsigned i = 0u; i < s->count; i++) {
+		if (s->keys[i].required && !(*present & (1u << i))) {
+			size_t saved = push_text(w, s->keys[i].name);
+
+			status = fail(w, HULL_SPEC_ERR_MISSING, missing_at, "is required");
+			pop(w, saved);
+			return status;
+		}
+	}
+	return s->across == NULL ? HULL_SPEC_OK : s->across(w, record, found, *present);
+}
+
+/* J.6: refresh dates a step's cache, which is only dated with a network. */
+static hull_spec_status step_across(walk *w, const hull_sexpr_form *record,
+                                    const hull_sexpr_form *found, uint32_t present)
+{
+	hull_sexpr_form head;
+	hull_sexpr_form value;
+	size_t          saved;
+
+	(void)record;
+	if (!(present & (1u << STEP_REFRESH)))
+		return HULL_SPEC_OK;
+	if (present & (1u << STEP_NETWORK)) {
+		hull_sexpr_child(w->doc, &found[STEP_NETWORK], &head);
+		hull_sexpr_next(w->doc, &head, &value);
+		if (hull_sexpr_is(w->doc, &value, "true"))
+			return HULL_SPEC_OK;
+	}
+	saved = push_text(w, "refresh");
+	fail(w, HULL_SPEC_ERR_VALUE, found[STEP_REFRESH].offset, "needs (network true)");
+	pop(w, saved);
+	return HULL_SPEC_ERR_VALUE;
+}
+
+static hull_spec_status file_across(walk *w, const hull_sexpr_form *record,
+                                    const hull_sexpr_form *found, uint32_t present)
+{
+	(void)record;
+	if ((present & (1u << FILE_MACHINE)) && (present & (1u << FILE_MACHINES))) {
+		size_t saved = push_text(w, "machines");
+
+		fail(w, HULL_SPEC_ERR_SHAPE, found[FILE_MACHINES].offset,
+		     "cannot stand beside machine: a file holds one or the other");
+		pop(w, saved);
+		return HULL_SPEC_ERR_SHAPE;
+	}
+	if (present == 0u)
+		return fail(w, HULL_SPEC_ERR_MISSING, 0u, "a file holds machine, machines or build");
+	return HULL_SPEC_OK;
+}
+
+/* --- the calls ----------------------------------------------------------- */
+
+hull_spec_status hull_spec_open(hull_spec *spec, const uint8_t *data, size_t length,
+                                hull_spec_error *error)
+{
+	hull_sexpr_error  syntax;
+	hull_sexpr_form   found[MAX_KEYS];
+	hull_sexpr_form   first;
+	hull_spec_status  status;
+	uint32_t          present = 0u;
+	walk              w;
+
+	memset(spec, 0, sizeof *spec);
+	if (error != NULL)
+		memset(error, 0, sizeof *error);
+	if (hull_sexpr_open(&spec->doc, data, length, HULL_SEXPR_READABLE, &syntax) != HULL_SEXPR_OK) {
+		if (error != NULL) {
+			error->status = HULL_SPEC_ERR_SYNTAX;
+			error->offset = syntax.offset;
+			error->line   = syntax.line;
+			error->column = syntax.column;
+			error->reason = syntax.reason;
+		}
+		return HULL_SPEC_ERR_SYNTAX;
+	}
+	w.doc         = &spec->doc;
+	w.error       = error;
+	w.path[0]     = '\0';
+	w.path_length = 0u;
+	status = check_entries(&w, &first, hull_sexpr_first(&spec->doc, &first), NULL, 0u,
+	                       &file, found, &present);
+	if (status != HULL_SPEC_OK)
+		return status;
+	spec->has_machine  = !!(present & (1u << FILE_MACHINE));
+	spec->has_machines = !!(present & (1u << FILE_MACHINES));
+	spec->has_build    = !!(present & (1u << FILE_BUILD));
+	if (spec->has_machine)
+		spec->machine = found[FILE_MACHINE];
+	if (spec->has_machines)
+		spec->machines = found[FILE_MACHINES];
+	if (spec->has_build)
+		spec->build = found[FILE_BUILD];
+	return HULL_SPEC_OK;
+}
+
+int hull_spec_find(const hull_spec *spec, const hull_sexpr_form *record,
+                   const char *key, hull_sexpr_form *entry)
+{
+	hull_sexpr_form head;
+	hull_sexpr_form item;
+	int             more;
+
+	if (!hull_sexpr_child(&spec->doc, record, &head))
+		return 0;
+	for (more = hull_sexpr_next(&spec->doc, &head, &item); more;
+	     more = hull_sexpr_next(&spec->doc, &item, &item)) {
+		hull_sexpr_form name;
+
+		if (hull_sexpr_child(&spec->doc, &item, &name) &&
+		    hull_sexpr_is(&spec->doc, &name, key)) {
+			*entry = item;
+			return 1;
+		}
+	}
+	return 0;
+}
