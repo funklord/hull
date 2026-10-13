@@ -636,6 +636,59 @@ In a scratch copy, breaking each of these failed the test:
 
 Three of these had first passed: stderr, stop and the session. Each was caught only after the test was changed to see it.
 
+### 4.9 The docker adapter
+
+**`engine/docker.c` drives the Docker daemon through its API**, as §5.0 says: HTTP/1.1 over the daemon's unix socket (`$DOCKER_HOST` when it names one), API `v1.41`, one connection per request.
+
+- **A machine is one container.** It is created from the plan, then attached to before it starts, so nothing it writes is lost, then started.
+- **Output** arrives on the attach stream in docker's multiplexed frames and goes to the core through `on_data`. When the stream ends, the reader asks `/wait` for the exit status.
+- **`stop`** is the daemon's stop: SIGTERM, then SIGKILL after the timeout. `destroy` removes the container by force.
+- **Every container is named `hull-<hostname>-<pid>-<n>` and labelled `hull.machine`,** so one left behind by a hull that was killed can be found and removed by name. That is `running-code.md`'s point about a container: it belongs to the daemon, and a killed client cannot clean it up.
+
+**What the create request carries:**
+
+- **The basics:** the image ref, `Cmd`, `WorkingDir`, `Hostname` and `Env`.
+- **Volumes:** `Binds`, with host paths made absolute, since the daemon resolves nothing relative. `hull run` stands in the file's directory.
+- **Ports:** `PortBindings` on 127.0.0.1 until §8.1's stable addresses exist.
+- **Limits:** `NanoCpus` and `Memory`.
+- **Security:** `ReadonlyRootfs`, and `no-new-privileges`. §7's capabilities, "empty-by-default and additive", become `CapDrop ALL` plus a `CapAdd` for each `(allow …)`; the daemon takes lowercase names.
+- **`Init`, docker's own tini, as PID 1,** for the same reason §4.8's chroot engine has an init: a workload at PID 1 ignores `stop`'s SIGTERM, and nothing reaps. A command that is not there is therefore the init failing to exec it, status 127, as a shell would report it, not a failed start.
+
+**The declaration shrank to what the adapter does.** `ssh` and `secrets` left it, because nothing provisions sshd or materialises a secret yet. A dir source as an overlay is declared rejected until §5.0's "cached docker import of the tree" is written. One consequence: §4's example, which has `(ssh true)`, is refused on ns for that one field. Declaring `ssh` would run the machine without sshd and without a word, which §6's rule 1 forbids.
+
+Open:
+
+- **A read-write volume cannot be written by a container running as root.** Rootful docker runs the container's root as host root, and with §7's empty capabilities that root lacks `CAP_DAC_OVERRIDE`, so it cannot write into a directory the user owns. Granting it would leave root-owned files in the user's tree, which the user could not then delete. The fixes are to run the workload as the invoking user, or the daemon's user-namespace remapping. Either is a decision about §7's uid model and A.3's ownership classes, and it is not made here. The test reads through a read-write volume and does not write.
+- **Images must already be local.** Nothing pulls; the OCI border (§3.5) is Phase 3.
+
+**`make check-docker`**, not part of `make check`, runs `test/docker_test.sh` against the daemon the account can reach. It uses `alpine:latest` and does not pull it. There are 17 cases:
+
+- output on its own stream, the exit status, env, workdir and hostname;
+- volumes and a read-only root;
+- capabilities with and without a grant;
+- a signal from the workload, and SIGTERM to `hull run` stopping the machine inside docker's ten seconds;
+- a port reached from the host;
+- a missing image and a missing command;
+- no `hull-dtest-` container left at the end.
+
+In a scratch copy, breaking each of these failed it:
+
+- the init;
+- dropping capabilities;
+- granting them;
+- keeping stderr apart;
+- the read-only root;
+- the read-only volume;
+- the port bindings;
+- the environment;
+- the workdir;
+- the exit status;
+- removing the container, which left 15 behind, and the harness removed them by name.
+
+The read-only volume had first passed. A write into a read-write volume is refused as well, for want of the capability, so a test asking only whether the write was refused could not tell the two apart. Both read-only cases now require "Read-only file system" by name.
+
+`make check` itself needs no daemon: its case for an engine with no operations moved from docker to qemu.
+
 ---
 
 ## 5. Engines

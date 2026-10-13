@@ -28,7 +28,8 @@ judges it against that engine's declaration. `build/hull plan` and
 `build/hull check --backend ns,vm,emu` run them against a `hull.conf`,
 with docker and qemu declared but not yet driven. `build/hull run` runs
 a dir source with `(backend chroot)`, the rootless reference engine in
-`engine/`.
+`engine/`, and an image ref through the docker adapter, the default for
+`ns`.
 `hull_engine.h` is a draft of the C plugin interface that engines
 implement.
 
@@ -37,6 +38,7 @@ implement.
 ```sh
 make         # build/hull; fetches vendor/situ the first time
 make check   # the style gate, the situ contracts, then the tests
+make check-docker  # hull run on the docker adapter, against the daemon
 make hooks   # install the commit-msg hook
 ```
 

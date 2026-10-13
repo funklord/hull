@@ -115,11 +115,15 @@ expect 0 'no machine to plan, only a build$' "$hull" plan -f "$dir/build.conf"
 expect 2 'bad\.conf:1:11: machine\.sauce: is not a key here$' "$hull" plan -f "$dir/bad.conf"
 expect 2 'missing\.conf: No such file' "$hull" plan -f "$dir/missing.conf"
 
-# Section 4's example holds on every class, which is the point of it.
-expect 0 'example\.conf: machine on docker \(ns\): ok$' \
-	"$hull" check -f "$dir/example.conf" --backend ns,vm,emu
+# Section 4's example holds on vm and emu. On ns it is refused for one
+# field, (ssh true): no engine provisions sshd yet (section 8.1), and the
+# docker adapter, which runs, says so rather than run without one.
 expect 0 'example\.conf: machine on qemu \(emu\): ok$' \
-	"$hull" check -f "$dir/example.conf" --backend ns,vm,emu
+	"$hull" check -f "$dir/example.conf" --backend vm,emu
+expect 1 'example\.conf: machine on docker \(ns\): rejected, 1 field$' \
+	"$hull" check -f "$dir/example.conf" --backend ns
+expect 1 'example\.conf:[0-9]+:[0-9]+: machine on docker \(ns\): ssh: rejected' \
+	"$hull" check -f "$dir/example.conf" --backend ns
 expect 0 'example\.conf:[0-9]+:[0-9]+: machine on qemu \(vm\): virtualbox: ignored' \
 	"$hull" check -f "$dir/example.conf" --backend vm
 
@@ -216,8 +220,8 @@ conf noargs '(workdir "/srv")'
 from_root 125 'needs \(command \.\.\.\)' -f "$root/noargs.conf"
 conf nope '(command "/nope")'
 from_root 125 '/nope: No such file or directory' -f "$root/nope.conf"
-printf '%s\n' '(machine (source "debian:13") (command "x"))' > "$root/docker.conf"
-from_root 125 'the docker engine cannot run a machine yet' -f "$root/docker.conf"
+printf '%s\n' '(machine (source "dir:./rootfs") (backend qemu) (command "x"))' > "$root/qemu.conf"
+from_root 125 'the qemu engine cannot run a machine yet' -f "$root/qemu.conf"
 printf '%s\n' '(machines (alpha (source "dir:./rootfs") (backend chroot) (command "/probe" "host")))' \
 	> "$root/pair.conf"
 from_root 0 '^host=alpha$' -f "$root/pair.conf" alpha

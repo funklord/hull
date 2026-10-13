@@ -95,7 +95,7 @@ PLAN_OBJS = $(BUILD_DIR)/plan/matrix.o $(BUILD_DIR)/plan/registry.o \
 # command line that plans with them. VERSION is the one place the number
 # lives; `hull --version` prints it.
 ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
-              $(BUILD_DIR)/engine/chroot.o
+              $(BUILD_DIR)/engine/chroot.o $(BUILD_DIR)/engine/access.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o
 HULL        = $(BUILD_DIR)/hull
 VERSION    := $(shell cat VERSION)
@@ -106,8 +106,13 @@ TEST_FRAMING_OBJS = $(BUILD_DIR)/test/framing_test.o
 CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.conf \
                  foreign.conf machines.conf build.conf bad.conf example.conf run.conf \
                  writable.conf readonly.conf die.conf wait.conf ports.conf noargs.conf nope.conf \
-                 docker.conf pair.conf rootfs/written vol.conf volro.conf vollink.conf \
+                 qemu.conf pair.conf rootfs/written vol.conf volro.conf vollink.conf \
                  volmissing.conf volhost.conf pid.conf data/in data/out rootfs/mnt-link)
+
+# What test/docker_test.sh writes.
+DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf volro.conf \
+                    rootro.conf nocap.conf cap.conf die.conf wait.conf port.conf noimage.conf \
+                    nocmd.conf data/in)
 
 # The reference engine's test rootfs holds one static program.
 PROBE = $(BUILD_DIR)/test/cli/rootfs/probe
@@ -124,7 +129,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all check test vectors style style-source style-docs contract hooks clean help
+.PHONY: all check check-docker test vectors style style-source style-docs contract hooks clean help
 
 all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL)
 
@@ -132,6 +137,7 @@ help:
 	@echo 'Targets:'
 	@echo '  all       build the libraries and build/hull (the default)'
 	@echo '  check     style, the situ contracts, then the tests'
+	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
 	@echo '  test      build and run the reader tests, the vectors, then the gate'"'"'s'
 	@echo '  vectors   the described schemas against bytes they must accept and refuse'
 	@echo '  style     the indentation and whitespace gate'
@@ -264,6 +270,12 @@ vectors: $(SITU_MARK)
 		echo "vectors: $$d.situ refuses all $$n in $$d.refused.vectors"; \
 	done
 
+# The docker adapter against a real daemon. Not in `check`, which needs
+# none: this one starts containers on the daemon the account can reach,
+# from alpine:latest, which it does not pull.
+check-docker: $(HULL)
+	BUILD_DIR='$(BUILD_DIR)' sh test/docker_test.sh '$(HULL)'
+
 # The indentation and whitespace gate, shared verbatim with the sibling
 # projects; `docs` additionally holds project.md to the tree it describes.
 style: style-source style-docs
@@ -305,4 +317,4 @@ clean:
 	        $(AGENT_OBJS) $(AGENT_OBJS:.o=.d) $(AGENT_GEN) \
 	        $(SPEC_OBJS) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS) $(PLAN_OBJS:.o=.d) \
 	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) \
-	        $(CLI_TEST_FILES) $(PROBE)
+	        $(CLI_TEST_FILES) $(PROBE) $(DOCKER_TEST_FILES)

@@ -45,8 +45,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "access.h"
 #include "builtin.h"
-#include "sexpr.h"
 
 #define MAX_ARGS    256u
 #define MAX_ENV     256u
@@ -83,64 +83,6 @@ static const hull_host_ops *host;
 
 /* --- reading the plan ---------------------------------------------------- */
 
-static int find(const hull_sexpr_doc *doc, const hull_sexpr_form *list, const char *key,
-                hull_sexpr_form *entry)
-{
-	hull_sexpr_form item;
-	hull_sexpr_form name;
-	int             more;
-
-	if (!hull_sexpr_child(doc, list, &item))
-		return 0;
-	for (more = hull_sexpr_next(doc, &item, &item); more;
-	     more = hull_sexpr_next(doc, &item, &item)) {
-		if (item.kind == HULL_SEXPR_LIST && hull_sexpr_child(doc, &item, &name) &&
-		    hull_sexpr_is(doc, &name, key)) {
-			*entry = item;
-			return 1;
-		}
-	}
-	return 0;
-}
-
-/* An atom's bytes as a C string, or NULL if it holds a NUL. */
-static char *text_of(const hull_sexpr_doc *doc, const hull_sexpr_form *form)
-{
-	char *text;
-
-	if (form->kind != HULL_SEXPR_ATOM || memchr(doc->data + form->content, '\0',
-	                                            form->content_length) != NULL)
-		return NULL;
-	text = malloc((size_t)form->content_length + 1u);
-	if (text == NULL)
-		return NULL;
-	memcpy(text, doc->data + form->content, form->content_length);
-	text[form->content_length] = '\0';
-	return text;
-}
-
-/* The value of `(key value)` in `record`, as a string, or NULL. */
-static char *value_of(const hull_sexpr_doc *doc, const hull_sexpr_form *record, const char *key)
-{
-	hull_sexpr_form entry;
-	hull_sexpr_form head;
-	hull_sexpr_form value;
-
-	if (!find(doc, record, key, &entry) || !hull_sexpr_child(doc, &entry, &head) ||
-	    !hull_sexpr_next(doc, &head, &value))
-		return NULL;
-	return text_of(doc, &value);
-}
-
-static int is_true(const hull_sexpr_doc *doc, const hull_sexpr_form *record, const char *key)
-{
-	char *value = value_of(doc, record, key);
-	int   yes   = value != NULL && strcmp(value, "true") == 0;
-
-	free(value);
-	return yes;
-}
-
 static void release(hull_machine *m)
 {
 	free(m->root);
@@ -172,7 +114,6 @@ static hull_status fail(hull_error *error, hull_status code, const char *detail)
 /* The plan's machine, read into `m`. Returns a reason, or NULL. */
 static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 {
-	hull_sexpr_form plan;
 	hull_sexpr_form machine;
 	hull_sexpr_form entry;
 	hull_sexpr_form item;
@@ -180,21 +121,22 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	unsigned        n;
 	int             more;
 
-	if (!hull_sexpr_first(doc, &plan) || !find(doc, &plan, "machine", &machine))
+	if (!hull_sexpr_first(doc, &machine) ||
+	    !hull_access_find(doc, &machine, "machine", &machine))
 		return "the plan holds no machine";
-	source = value_of(doc, &machine, "source");
+	source = hull_access_value(doc, &machine, "source");
 	if (source == NULL || strncmp(source, "dir:", 4u) != 0 || source[4] == '\0') {
 		free(source);
 		return "chroot runs only a dir source";
 	}
 	m->root = strdup(source + 4);
 	free(source);
-	m->workdir  = value_of(doc, &machine, "workdir");
-	m->hostname = value_of(doc, &machine, "hostname");
+	m->workdir  = hull_access_value(doc, &machine, "workdir");
+	m->hostname = hull_access_value(doc, &machine, "hostname");
 	if (m->root == NULL || m->workdir == NULL)
 		return "the plan is missing its source or workdir";
 
-	if (!find(doc, &machine, "command", &entry))
+	if (!hull_access_find(doc, &machine, "command", &entry))
 		return "chroot has no manifest to supply a command, so the spec needs (command ...)";
 	hull_sexpr_child(doc, &entry, &item);
 	n = 0u;
@@ -202,13 +144,13 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	     more = hull_sexpr_next(doc, &item, &item)) {
 		if (n == MAX_ARGS)
 			return "the command has too many arguments";
-		m->argv[n] = text_of(doc, &item);
+		m->argv[n] = hull_access_text(doc, &item);
 		if (m->argv[n++] == NULL)
 			return "an argument holds a NUL byte";
 	}
 
 	n = 0u;
-	if (find(doc, &machine, "env", &entry)) {
+	if (hull_access_find(doc, &machine, "env", &entry)) {
 		hull_sexpr_child(doc, &entry, &item);
 		for (more = hull_sexpr_next(doc, &item, &item); more;
 		     more = hull_sexpr_next(doc, &item, &item)) {
@@ -221,8 +163,8 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 				return "env has too many names";
 			hull_sexpr_child(doc, &item, &name);
 			hull_sexpr_next(doc, &name, &value);
-			key  = text_of(doc, &name);
-			text = text_of(doc, &value);
+			key  = hull_access_text(doc, &name);
+			text = hull_access_text(doc, &value);
 			if (key != NULL && text != NULL)
 				m->envp[n] = malloc(strlen(key) + strlen(text) + 2u);
 			if (m->envp[n] != NULL)
@@ -234,7 +176,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		}
 	}
 
-	if (find(doc, &machine, "volumes", &entry)) {
+	if (hull_access_find(doc, &machine, "volumes", &entry)) {
 		hull_sexpr_child(doc, &entry, &item);
 		for (more = hull_sexpr_next(doc, &item, &item); more;
 		     more = hull_sexpr_next(doc, &item, &item)) {
@@ -242,9 +184,9 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 
 			if (m->volume_count == MAX_VOLUMES)
 				return "there are too many volumes";
-			m->volume_host[m->volume_count]  = value_of(doc, &item, "host");
-			m->volume_guest[m->volume_count] = value_of(doc, &item, "guest");
-			mode = value_of(doc, &item, "mode");
+			m->volume_host[m->volume_count]  = hull_access_value(doc, &item, "host");
+			m->volume_guest[m->volume_count] = hull_access_value(doc, &item, "guest");
+			mode = hull_access_value(doc, &item, "mode");
 			m->volume_readonly[m->volume_count] = mode != NULL && strcmp(mode, "ro") == 0;
 			free(mode);
 			if (m->volume_host[m->volume_count] == NULL ||
@@ -253,9 +195,9 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		}
 	}
 
-	if (find(doc, &machine, "security", &entry)) {
-		m->readonly_root = is_true(doc, &entry, "readonly_root");
-		m->no_new_privs  = is_true(doc, &entry, "no_new_privs");
+	if (hull_access_find(doc, &machine, "security", &entry)) {
+		m->readonly_root = hull_access_true(doc, &entry, "readonly_root");
+		m->no_new_privs  = hull_access_true(doc, &entry, "no_new_privs");
 	}
 	return NULL;
 }
