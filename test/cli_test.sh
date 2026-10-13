@@ -176,6 +176,32 @@ got=$?
 [ "$got" = 143 ] && printf '%s\n' "$out" | grep -q '^waiting$' ||
 	fail "SIGTERM to hull run exited $got, wanted 143 after the probe said waiting" "$out"
 
+# Volumes: a host dir bound in, written through or read-only, and its
+# guest path resolved inside the machine. rootfs/mnt-link points at /mnt:
+# resolved on the host it would reach the host's own /mnt, and the probe
+# would find nothing there.
+mkdir -p "$root/data" "$root/rootfs/mnt"
+printf 'from the host\n' > "$root/data/in"
+rm -f "$root/data/out" "$root/rootfs/mnt-link"
+ln -s /mnt "$root/rootfs/mnt-link"
+conf vol '(command "/probe" "read" "/mnt/in" "write" "/mnt/out")' \
+	'(volumes (volume (host "./data") (guest "/mnt")))'
+from_root 0 '^read=from the host$' -f "$root/vol.conf"
+from_root 0 '^write=ok$' -f "$root/vol.conf"
+cases=$((cases + 1))
+[ -f "$root/data/out" ] || fail "a write through a volume did not reach the host" ""
+conf volro '(command "/probe" "read" "/mnt/in" "write" "/mnt/out")' \
+	'(volumes (volume (host "./data") (guest "/mnt") (mode ro)))'
+from_root 0 '^write=Read-only file system$' -f "$root/volro.conf"
+from_root 0 '^read=from the host$' -f "$root/volro.conf"
+conf vollink '(command "/probe" "read" "/mnt/in")' \
+	'(volumes (volume (host "./data") (guest "/mnt-link")))'
+from_root 0 '^read=from the host$' -f "$root/vollink.conf"
+conf volmissing '(command "/probe")' '(volumes (volume (host "./data") (guest "/absent")))'
+from_root 125 'volume /absent: No such file or directory' -f "$root/volmissing.conf"
+conf volhost '(command "/probe")' '(volumes (volume (host "./nodata") (guest "/mnt")))'
+from_root 125 'volume \./nodata: No such file or directory' -f "$root/volhost.conf"
+
 # What cannot be planned or started is 125, and says why.
 conf ports '(command "/probe") (ports (port (host 8080) (guest 80)))'
 from_root 125 'ports: rejected: chroot shares the host.s network' -f "$root/ports.conf"

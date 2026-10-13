@@ -8,6 +8,11 @@
  * more: no network namespace, so a port is the host's own, and no PID
  * namespace or /proc.
  *
+ * A volume's host side is cloned with open_tree() before the chroot and
+ * attached with move_mount() after it, so its guest path is resolved
+ * inside the machine. Mounted before the chroot, a symlink in the rootfs
+ * would be followed on the host, and the volume land wherever it led.
+ *
  * The workload's output goes to the core through on_data (hull_engine.h,
  * rule 3), read by one thread per machine that also waits for it and
  * reports on_exit. Every engine-owned allocation is the machine handle's,
@@ -35,8 +40,9 @@
 #include "builtin.h"
 #include "sexpr.h"
 
-#define MAX_ARGS 256u
-#define MAX_ENV  256u
+#define MAX_ARGS    256u
+#define MAX_ENV     256u
+#define MAX_VOLUMES 64u
 
 struct hull_machine {
 	hull_core       *core;       /* what create() was given, for the callbacks */
@@ -47,6 +53,10 @@ struct hull_machine {
 	char            *envp[MAX_ENV + 1u];
 	int              readonly_root;
 	int              no_new_privs;
+	char            *volume_host[MAX_VOLUMES];
+	char            *volume_guest[MAX_VOLUMES];
+	int              volume_readonly[MAX_VOLUMES];
+	unsigned         volume_count;
 
 	pid_t            pid;
 	int              out;        /* the workload's stdout and stderr, read ends */
@@ -130,6 +140,10 @@ static void release(hull_machine *m)
 		free(m->argv[i]);
 	for (unsigned i = 0u; m->envp[i] != NULL; i++)
 		free(m->envp[i]);
+	for (unsigned i = 0u; i < m->volume_count; i++) {
+		free(m->volume_host[i]);
+		free(m->volume_guest[i]);
+	}
 	pthread_mutex_destroy(&m->lock);
 	pthread_cond_destroy(&m->done_cond);
 	free(m);
@@ -210,6 +224,25 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		}
 	}
 
+	if (find(doc, &machine, "volumes", &entry)) {
+		hull_sexpr_child(doc, &entry, &item);
+		for (more = hull_sexpr_next(doc, &item, &item); more;
+		     more = hull_sexpr_next(doc, &item, &item)) {
+			char *mode;
+
+			if (m->volume_count == MAX_VOLUMES)
+				return "there are too many volumes";
+			m->volume_host[m->volume_count]  = value_of(doc, &item, "host");
+			m->volume_guest[m->volume_count] = value_of(doc, &item, "guest");
+			mode = value_of(doc, &item, "mode");
+			m->volume_readonly[m->volume_count] = mode != NULL && strcmp(mode, "ro") == 0;
+			free(mode);
+			if (m->volume_host[m->volume_count] == NULL ||
+			    m->volume_guest[m->volume_count++] == NULL)
+				return "a volume is missing its host or guest path";
+		}
+	}
+
 	if (find(doc, &machine, "security", &entry)) {
 		m->readonly_root = is_true(doc, &entry, "readonly_root");
 		m->no_new_privs  = is_true(doc, &entry, "no_new_privs");
@@ -270,6 +303,8 @@ static unsigned long locked_flags(const char *path)
 static void run_child(const hull_machine *m, uid_t uid, gid_t gid, int out, int err, int report)
 {
 	char map[64];
+	char step[320];
+	int  volumes[MAX_VOLUMES];
 	int  null = open("/dev/null", O_RDONLY | O_CLOEXEC);
 
 	if (null < 0 || dup2(null, 0) < 0 || dup2(out, 1) < 0 || dup2(err, 2) < 0)
@@ -295,10 +330,30 @@ static void run_child(const hull_machine *m, uid_t uid, gid_t gid, int out, int 
 	    mount(NULL, m->root, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | locked_flags(m->root),
 	          NULL) != 0)
 		child_fail(report, "making the root read-only");
+	for (unsigned i = 0u; i < m->volume_count; i++) {
+		struct mount_attr readonly = { .attr_set = MOUNT_ATTR_RDONLY };
+
+		snprintf(step, sizeof step, "volume %s", m->volume_host[i]);
+		volumes[i] = open_tree(AT_FDCWD, m->volume_host[i],
+		                       OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_RECURSIVE);
+		if (volumes[i] < 0)
+			child_fail(report, step);
+		if (m->volume_readonly[i] &&
+		    mount_setattr(volumes[i], "", AT_EMPTY_PATH | AT_RECURSIVE, &readonly,
+		                  sizeof readonly) != 0)
+			child_fail(report, step);
+	}
 	if (m->hostname != NULL && sethostname(m->hostname, strlen(m->hostname)) != 0)
 		child_fail(report, "sethostname");
 	if (chroot(m->root) != 0)
 		child_fail(report, "chroot");
+	for (unsigned i = 0u; i < m->volume_count; i++) {
+		snprintf(step, sizeof step, "volume %s", m->volume_guest[i]);
+		/* A symlink at the guest path is followed, inside the machine. */
+		if (move_mount(volumes[i], "", AT_FDCWD, m->volume_guest[i],
+		               MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_SYMLINKS) != 0)
+			child_fail(report, step);
+	}
 	if (chdir(m->workdir) != 0)
 		child_fail(report, "workdir");
 	if (m->no_new_privs && prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) != 0)
@@ -488,6 +543,8 @@ static const hull_cap_entry entries[] = {
 	{ "env",                    HULL_SUP_NATIVE,   "the environment is only what env names",
 	  NULL },
 	{ "hostname",               HULL_SUP_NATIVE,   NULL, NULL },
+	{ "volumes",                HULL_SUP_NATIVE,
+	  "the guest path must exist in the dir; it is not created", NULL },
 	{ "security.readonly_root", HULL_SUP_NATIVE,   NULL, NULL },
 	{ "security.no_new_privs",  HULL_SUP_NATIVE,   NULL, NULL },
 	{ "on_disconnect.stop",     HULL_SUP_NATIVE,   NULL, NULL },

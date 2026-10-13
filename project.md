@@ -576,9 +576,16 @@ Two of these had first passed: copying other tuning and copied offsets. Each was
 
 - **Namespaces:** it starts in new user, mount and UTS namespaces, with the invoking user mapped to root. The dir source is bound onto itself, read-only for `(readonly_root true)`, and chrooted into.
 - **Then, in order:** it changes to `workdir`, sets `hostname` and `no_new_privs`, and execs `command` with the environment `env` names and nothing else.
-- **Its declaration says exactly that.** It is an `ns`-class engine. It shares the host's network, so `ports` is declared rejected with that reason. `volumes`, `cpus`, `memory` and an image ref are left out, so they are rejected.
+- **Its declaration says exactly that.** It is an `ns`-class engine. It shares the host's network, so `ports` is declared rejected with that reason. `cpus`, `memory` and an image ref are left out, so they are rejected.
 - **Registration order:** it registers after docker, so `(backend ns)` still picks docker, and `(backend chroot)` asks for it.
 - **The bind remount must keep the flags its mount was copied with.** A user namespace locks `nosuid`, `nodev` and the rest, so the engine reads them with `statvfs` and keeps them. bwrap meets the same rule.
+
+**Volumes are bound in with the new mount API, so the guest path is resolved inside the machine.** Each host side is cloned with `open_tree()` before the chroot, made read-only with `mount_setattr()` for `(mode ro)`, and attached with `move_mount()` after it.
+
+- **Why not a plain bind mount:** one made before the chroot, at the rootfs path plus the guest path, would follow a symlink in the rootfs on the host. A rootfs holding `/var/data` → `/home/you` would get the volume on the host's path, not its own.
+- **Following a symlink is safe here:** the chroot confines where it can lead, so `MOVE_MOUNT_T_SYMLINKS` follows one at the guest path inside the machine.
+- **The guest path must exist:** nothing creates it, since creating it would write into the user's dir, and the declaration says so.
+- **A host path is relative to the file**, like every other.
 
 **Output goes to the core through `on_data`**, as `hull_engine.h`'s rule 3 requires: one thread per machine reads the workload's stdout and stderr, then waits for it and reports `on_exit`. `stop` sends SIGTERM, then SIGKILL after its timeout.
 
@@ -596,7 +603,7 @@ Open:
 - **No `/proc`, no PID namespace.** A workload that reads `/proc` sees nothing. A PID namespace needs a fork after `unshare`, and an init to reap orphans, which is what §5.2's guest agent is for VMs.
 - **`command` is a path.** There is no PATH search, and no manifest supplies a default, so a chroot machine must write `(command …)`.
 
-**Measured:** `test/cli_test.sh` runs 57 cases. 22 of them are `hull run` against a rootfs holding one static program, `test/probe.c`, which reports from inside what the machine looks like: env, cwd, hostname, uid, `no_new_privs`, whether it can write, and whether it leads its session. The probe's `wait` step ends itself after 20 seconds, so a broken `stop` cannot leave one behind.
+**Measured:** `test/cli_test.sh` runs 65 cases. 30 of them are `hull run` against a rootfs holding one static program, `test/probe.c`, which reports from inside what the machine looks like: env, cwd, hostname, uid, `no_new_privs`, whether it can write, and whether it leads its session. The probe's `wait` step ends itself after 20 seconds, so a broken `stop` cannot leave one behind.
 
 In a scratch copy, breaking each of these failed the test:
 
@@ -610,7 +617,11 @@ In a scratch copy, breaking each of these failed the test:
 - reporting an exec failure;
 - stop's signals;
 - the uid map;
-- the workload's own session.
+- the workload's own session;
+- volumes read from the plan;
+- a volume's mode;
+- its read-only attribute;
+- attaching volumes before the chroot, on the host, which the case with a symlink to `/mnt` exists for.
 
 Three of these had first passed: stderr, stop and the session. Each was caught only after the test was changed to see it.
 

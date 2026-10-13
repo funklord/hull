@@ -9,6 +9,7 @@
  *   env NAME    NAME's value          cwd         the working directory
  *   host        the hostname          uid         the uid
  *   write PATH  whether PATH can be created
+ *   read PATH   PATH's first line
  *   nnp         whether no_new_privs is set
  *   session     whether it leads a session of its own
  *   exit N      exit with N           die         end by SIGTERM
@@ -60,6 +61,16 @@ int main(int argc, char **argv)
 			i++;
 		} else if (strcmp(step, "session") == 0) {
 			printf("leader=%d\n", getsid(0) == getpid());
+		} else if (strcmp(step, "read") == 0) {
+			FILE *file = fopen(arg, "r");
+
+			if (file == NULL || fgets(text, sizeof text, file) == NULL)
+				printf("read=%s\n", strerror(errno));
+			else
+				printf("read=%s", text);
+			if (file != NULL)
+				fclose(file);
+			i++;
 		} else if (strcmp(step, "nnp") == 0) {
 			printf("nnp=%d\n", prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0));
 		} else if (strcmp(step, "exit") == 0) {
