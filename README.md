@@ -21,8 +21,9 @@ Mostly design. `project.md` is the design, including the `hull.conf`
 schema reference. The first code is the s-expression reader and the
 canonical writer in `sexpr/` and the guest agent protocol's framing in
 `agent/`, both generated in part by [situ](https://github.com/funklord/situ)
-from schemas; the `hull.conf` check in `spec/`; and the capability matrix
-in `plan/`, which resolves a machine against one engine's declaration.
+from schemas; the `hull.conf` check in `spec/`; and in `plan/`, the
+engine registry that picks what `(backend ...)` names and the capability
+matrix that resolves a machine against that engine's declaration.
 `hull_engine.h` is a draft of the C plugin interface that engines
 implement.
 

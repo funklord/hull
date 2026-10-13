@@ -87,15 +87,18 @@ AGENT_OBJS = $(BUILD_DIR)/agent/framing.o $(GEN_DIR)/message.o
 # hull.conf, checked against Appendix J by a walk over the reader's forms,
 # and a checked machine resolved against an engine's capabilities.
 SPEC_OBJS = $(BUILD_DIR)/spec/spec.o
-PLAN_OBJS = $(BUILD_DIR)/plan/matrix.o
+PLAN_OBJS = $(BUILD_DIR)/plan/matrix.o $(BUILD_DIR)/plan/registry.o
 
 TEST_SEXPR_OBJS   = $(BUILD_DIR)/test/sexpr_test.o
 TEST_FRAMING_OBJS = $(BUILD_DIR)/test/framing_test.o
 TEST_SPEC_OBJS    = $(BUILD_DIR)/test/spec_test.o
 TEST_MATRIX_OBJS  = $(BUILD_DIR)/test/matrix_test.o
-TEST_OBJS = $(TEST_SEXPR_OBJS) $(TEST_FRAMING_OBJS) $(TEST_SPEC_OBJS) $(TEST_MATRIX_OBJS)
+TEST_REGISTRY_OBJS = $(BUILD_DIR)/test/registry_test.o
+TEST_OBJS = $(TEST_SEXPR_OBJS) $(TEST_FRAMING_OBJS) $(TEST_SPEC_OBJS) $(TEST_MATRIX_OBJS) \
+            $(TEST_REGISTRY_OBJS)
 TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
-            $(BUILD_DIR)/test/spec_test $(BUILD_DIR)/test/matrix_test
+            $(BUILD_DIR)/test/spec_test $(BUILD_DIR)/test/matrix_test \
+            $(BUILD_DIR)/test/registry_test
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
@@ -105,7 +108,7 @@ all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS)
 
 help:
 	@echo 'Targets:'
-	@echo '  all       build the reader, the framing, the spec check and the matrix (the default)'
+	@echo '  all       build the reader, the framing, the spec check and the planner (the default)'
 	@echo '  check     style, the situ contracts, then the tests'
 	@echo '  test      build and run the reader tests, the vectors, then the gate'"'"'s'
 	@echo '  vectors   the described schemas against bytes they must accept and refuse'
@@ -174,6 +177,9 @@ $(BUILD_DIR)/test/spec_test: $(TEST_SPEC_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
 $(BUILD_DIR)/test/matrix_test: $(TEST_MATRIX_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
+$(BUILD_DIR)/test/registry_test: $(TEST_REGISTRY_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^
+
 -include $(SEXPR_OBJS:.o=.d) $(AGENT_OBJS:.o=.d) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS:.o=.d) $(TEST_OBJS:.o=.d)
 
 # --- checks -----------------------------------------------------------------
@@ -192,6 +198,7 @@ test: $(TEST_BINS) vectors
 	$(BUILD_DIR)/test/framing_test
 	$(BUILD_DIR)/test/spec_test project.md
 	$(BUILD_DIR)/test/matrix_test
+	$(BUILD_DIR)/test/registry_test
 	$(PYTHON) tool/test_style_gate.py
 
 # Each schema accepts every vector in its .vectors and refuses every one in
