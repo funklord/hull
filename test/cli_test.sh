@@ -202,6 +202,13 @@ from_root 125 'volume /absent: No such file or directory' -f "$root/volmissing.c
 conf volhost '(command "/probe")' '(volumes (volume (host "./nodata") (guest "/mnt")))'
 from_root 125 'volume \./nodata: No such file or directory' -f "$root/volhost.conf"
 
+# A PID namespace, its /proc, and an init that reaps what is orphaned to it:
+# a zombie would still be listed, making three.
+mkdir -p "$root/rootfs/proc"
+conf pid '(command "/probe" "pid" "orphan" "procs")'
+from_root 0 '^pid=2$' -f "$root/pid.conf"
+from_root 0 '^procs=2$' -f "$root/pid.conf"
+
 # What cannot be planned or started is 125, and says why.
 conf ports '(command "/probe") (ports (port (host 8080) (guest 80)))'
 from_root 125 'ports: rejected: chroot shares the host.s network' -f "$root/ports.conf"

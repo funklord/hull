@@ -107,7 +107,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  foreign.conf machines.conf build.conf bad.conf example.conf run.conf \
                  writable.conf readonly.conf die.conf wait.conf ports.conf noargs.conf nope.conf \
                  docker.conf pair.conf rootfs/written vol.conf volro.conf vollink.conf \
-                 volmissing.conf volhost.conf data/in data/out rootfs/mnt-link)
+                 volmissing.conf volhost.conf pid.conf data/in data/out rootfs/mnt-link)
 
 # The reference engine's test rootfs holds one static program.
 PROBE = $(BUILD_DIR)/test/cli/rootfs/probe

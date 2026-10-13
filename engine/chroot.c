@@ -2,11 +2,17 @@
  * chroot.c -- the reference engine: a dir source run in place, rootless
  * (project.md sections 5.0 and 4.8).
  *
- * A machine is one process, started in new user, mount and UTS namespaces
- * with the invoking user mapped to root, bound onto its own directory and
- * chrooted into it. That is enough for the fields declared below and no
- * more: no network namespace, so a port is the host's own, and no PID
- * namespace or /proc.
+ * A machine is cloned into new user, mount, UTS and PID namespaces, with
+ * the invoking user mapped to root, its directory bound onto itself and
+ * chrooted into. The first process is a small init, PID 1: it forks the
+ * workload as PID 2, forwards it signals, reaps whatever is orphaned to
+ * it, and reports the workload's wait status to the engine through a
+ * pipe. PID 1 ignores a signal it has no handler for, so the workload
+ * cannot be PID 1 itself, or stop's SIGTERM would do nothing; and a
+ * SIGKILL to the init ends the whole namespace, so nothing the workload
+ * started outlives the machine. That is enough for the fields declared
+ * below and no more: there is no network namespace, so a port is the
+ * host's own.
  *
  * A volume's host side is cloned with open_tree() before the chroot and
  * attached with move_mount() after it, so its guest path is resolved
@@ -32,7 +38,9 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -58,9 +66,11 @@ struct hull_machine {
 	int              volume_readonly[MAX_VOLUMES];
 	unsigned         volume_count;
 
-	pid_t            pid;
+	pid_t            pid;        /* the machine's init */
 	int              out;        /* the workload's stdout and stderr, read ends */
 	int              err;
+	int              status;     /* the read end of the init's status pipe */
+	int              status_seen;
 	pthread_t        reader;
 	int              started;
 	pthread_mutex_t  lock;
@@ -300,21 +310,39 @@ static unsigned long locked_flags(const char *path)
 	return flags;
 }
 
-static void run_child(const hull_machine *m, uid_t uid, gid_t gid, int out, int err, int report)
+static volatile sig_atomic_t pending;
+
+static void hold(int signal)
 {
-	char map[64];
-	char step[320];
-	int  volumes[MAX_VOLUMES];
-	int  null = open("/dev/null", O_RDONLY | O_CLOEXEC);
+	pending = signal;
+}
+
+/*
+ * The machine's PID 1. Everything up to the workload's exec happens here,
+ * so the workload inherits it; then the workload runs as PID 2 and this
+ * waits. A signal forwarded is checked before each wait and on every
+ * interrupted one: one that lands just before a wait blocks is forwarded
+ * at the next wakeup, and stop's SIGKILL is the backstop either way.
+ */
+static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int out, int err, int report,
+                     int status_pipe)
+{
+	static const int forwarded[] = { SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2 };
+	struct sigaction action;
+	struct stat      st;
+	char             map[64];
+	char             step[320];
+	int              volumes[MAX_VOLUMES];
+	int              null = open("/dev/null", O_RDONLY | O_CLOEXEC);
+	int              status = 0;
+	pid_t            workload;
 
 	if (null < 0 || dup2(null, 0) < 0 || dup2(out, 1) < 0 || dup2(err, 2) < 0)
 		child_fail(report, "stdio");
 	/* A session of its own, so a terminal's Ctrl-C reaches hull and not the
-	 * workload behind its back: only stop() signals a machine. */
+	 * machine behind its back: only stop() signals a machine. */
 	if (setsid() < 0)
 		child_fail(report, "setsid");
-	if (unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWUTS) != 0)
-		child_fail(report, "unshare");
 	snprintf(map, sizeof map, "0 %u 1", (unsigned)uid);
 	if (write_file("/proc/self/setgroups", "deny") != 0 ||
 	    write_file("/proc/self/uid_map", map) != 0)
@@ -354,12 +382,56 @@ static void run_child(const hull_machine *m, uid_t uid, gid_t gid, int out, int 
 		               MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_SYMLINKS) != 0)
 			child_fail(report, step);
 	}
+	/* This namespace's processes, where the dir has room for them: nothing
+	 * is created in the user's dir. */
+	if (stat("/proc", &st) == 0 && S_ISDIR(st.st_mode) &&
+	    mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) != 0)
+		child_fail(report, "mounting /proc");
 	if (chdir(m->workdir) != 0)
 		child_fail(report, "workdir");
 	if (m->no_new_privs && prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) != 0)
 		child_fail(report, "no_new_privs");
-	execve(m->argv[0], (char *const *)m->argv, (char *const *)m->envp);
-	child_fail(report, m->argv[0]);
+
+	memset(&action, 0, sizeof action);
+	action.sa_handler = hold;
+	for (unsigned i = 0u; i < sizeof forwarded / sizeof forwarded[0]; i++)
+		sigaction(forwarded[i], &action, NULL);
+	workload = fork();
+	if (workload < 0)
+		child_fail(report, "fork");
+	if (workload == 0) {
+		action.sa_handler = SIG_DFL;
+		for (unsigned i = 0u; i < sizeof forwarded / sizeof forwarded[0]; i++)
+			sigaction(forwarded[i], &action, NULL);
+		if (setsid() < 0)
+			child_fail(report, "setsid");
+		execve(m->argv[0], (char *const *)m->argv, (char *const *)m->envp);
+		child_fail(report, m->argv[0]);
+	}
+	/* The engine reads `report` to its end: this copy, and the workload's
+	 * once it execs. */
+	close(report);
+	for (;;) {
+		int   s;
+		pid_t reaped;
+
+		if (pending != 0) {
+			kill(workload, (int)pending);
+			pending = 0;
+		}
+		reaped = waitpid(-1, &s, 0);
+		if (reaped < 0 && errno == EINTR)
+			continue;
+		if (reaped < 0)
+			break;
+		if (reaped == workload) {
+			status = s;
+			break;
+		}
+	}
+	if (write(status_pipe, &status, sizeof status) != (ssize_t)sizeof status)
+		_exit(126);
+	_exit(0);
 }
 
 /* --- the reader ---------------------------------------------------------- */
@@ -395,6 +467,11 @@ static void *read_workload(void *arg)
 	}
 	while (waitpid(m->pid, &status, 0) < 0 && errno == EINTR)
 		;
+	/* The workload's status, as its init reported it; if the init could
+	 * not, as when stop killed it, the init's own. */
+	if (read(m->status, &m->status_seen, sizeof m->status_seen) == (ssize_t)sizeof m->status_seen)
+		status = m->status_seen;
+	close(m->status);
 	pthread_mutex_lock(&m->lock);
 	m->done = 1;
 	pthread_cond_broadcast(&m->done_cond);
@@ -440,23 +517,33 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	int     out[2];
 	int     err[2];
 	int     report[2];
+	int     status[2];
+	uid_t   uid = getuid();
+	gid_t   gid = getgid();
 	ssize_t n;
 
 	if (m->started)
 		return fail(error, HULL_ERR_BUSY, "the machine has been started already");
 	if (pipe2(out, O_CLOEXEC) != 0 || pipe2(err, O_CLOEXEC) != 0 ||
-	    pipe2(report, O_CLOEXEC) != 0)
+	    pipe2(report, O_CLOEXEC) != 0 || pipe2(status, O_CLOEXEC) != 0)
 		return fail(error, HULL_ERR_RUNTIME, "pipe");
-	m->pid = fork();
+	/* clone with no stack is fork into new namespaces: the child is PID 1
+	 * of its own. The ids are read first, since in the child's new user
+	 * namespace they are unmapped until it maps them. */
+	m->pid = (pid_t)syscall(SYS_clone, CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWUTS |
+	                        CLONE_NEWPID | SIGCHLD, NULL, NULL, NULL, 0L);
 	if (m->pid < 0)
-		return fail(error, HULL_ERR_RUNTIME, "fork");
+		return fail(error, HULL_ERR_RUNTIME, "clone");
 	if (m->pid == 0) {
 		close(report[0]);
-		run_child(m, getuid(), getgid(), out[1], err[1], report[1]);
+		close(status[0]);
+		run_init(m, uid, gid, out[1], err[1], report[1], status[1]);
 	}
 	close(out[1]);
 	close(err[1]);
 	close(report[1]);
+	close(status[1]);
+	m->status = status[0];
 
 	/* The report pipe closes on exec; anything written on it is why the
 	 * child could not get that far. */
@@ -467,6 +554,7 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 		waitpid(m->pid, NULL, 0);
 		close(out[0]);
 		close(err[0]);
+		close(m->status);
 		m->done = 1;
 		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	}
@@ -475,6 +563,7 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	if (pthread_create(&m->reader, NULL, read_workload, m) != 0) {
 		kill(m->pid, SIGKILL);
 		waitpid(m->pid, NULL, 0);
+		close(m->status);
 		m->done = 1;
 		return fail(error, HULL_ERR_INTERNAL, "the reader thread could not start");
 	}

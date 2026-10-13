@@ -574,7 +574,7 @@ Two of these had first passed: copying other tuning and copied offsets. Each was
 
 **`engine/chroot.c` is the first engine that runs a machine**: §5.0's "chroot — near-trivial, useful as the reference plugin implementation", done rootless. A machine is one process.
 
-- **Namespaces:** it starts in new user, mount and UTS namespaces, with the invoking user mapped to root. The dir source is bound onto itself, read-only for `(readonly_root true)`, and chrooted into.
+- **Namespaces:** it is cloned into new user, mount, UTS and PID namespaces, with the invoking user mapped to root. The dir source is bound onto itself, read-only for `(readonly_root true)`, and chrooted into. `/proc` is mounted where the dir has a `/proc` to mount it on; nothing is created in the user's dir.
 - **Then, in order:** it changes to `workdir`, sets `hostname` and `no_new_privs`, and execs `command` with the environment `env` names and nothing else.
 - **Its declaration says exactly that.** It is an `ns`-class engine. It shares the host's network, so `ports` is declared rejected with that reason. `cpus`, `memory` and an image ref are left out, so they are rejected.
 - **Registration order:** it registers after docker, so `(backend ns)` still picks docker, and `(backend chroot)` asks for it.
@@ -586,6 +586,13 @@ Two of these had first passed: copying other tuning and copied offsets. Each was
 - **Following a symlink is safe here:** the chroot confines where it can lead, so `MOVE_MOUNT_T_SYMLINKS` follows one at the guest path inside the machine.
 - **The guest path must exist:** nothing creates it, since creating it would write into the user's dir, and the declaration says so.
 - **A host path is relative to the file**, like every other.
+
+**The first process is a small init, and the workload is PID 2.**
+
+- **Why not the workload as PID 1:** PID 1 ignores any signal it has no handler for, so a workload there would not die on `stop`'s SIGTERM. And it would have to reap orphans, which most programs never do.
+- **What the init does:** it does all the setup, forks the workload, forwards it SIGTERM, SIGINT, SIGHUP, SIGQUIT and the two user signals, and reaps everything orphaned to it. It reports the workload's wait status to the engine through a pipe, so a signal is still reported as a signal.
+- **A SIGKILL to the init ends the whole namespace,** so nothing the workload started outlives the machine. This is §5.2's guest agent in miniature.
+- **A signal that lands just before the init's wait blocks is forwarded one wakeup late.** `stop`'s SIGKILL after its timeout is the backstop.
 
 **Output goes to the core through `on_data`**, as `hull_engine.h`'s rule 3 requires: one thread per machine reads the workload's stdout and stderr, then waits for it and reports `on_exit`. `stop` sends SIGTERM, then SIGKILL after its timeout.
 
@@ -600,10 +607,9 @@ Two of these had first passed: copying other tuning and copied offsets. Each was
 
 Open:
 
-- **No `/proc`, no PID namespace.** A workload that reads `/proc` sees nothing. A PID namespace needs a fork after `unshare`, and an init to reap orphans, which is what §5.2's guest agent is for VMs.
 - **`command` is a path.** There is no PATH search, and no manifest supplies a default, so a chroot machine must write `(command …)`.
 
-**Measured:** `test/cli_test.sh` runs 65 cases. 30 of them are `hull run` against a rootfs holding one static program, `test/probe.c`, which reports from inside what the machine looks like: env, cwd, hostname, uid, `no_new_privs`, whether it can write, and whether it leads its session. The probe's `wait` step ends itself after 20 seconds, so a broken `stop` cannot leave one behind.
+**Measured:** `test/cli_test.sh` runs 67 cases. 32 of them are `hull run` against a rootfs holding one static program, `test/probe.c`, which reports from inside what the machine looks like: env, cwd, hostname, uid, `no_new_privs`, whether it can write, and whether it leads its session. The probe's `wait` step ends itself after 20 seconds, so a broken `stop` cannot leave one behind.
 
 In a scratch copy, breaking each of these failed the test:
 
@@ -621,7 +627,12 @@ In a scratch copy, breaking each of these failed the test:
 - volumes read from the plan;
 - a volume's mode;
 - its read-only attribute;
-- attaching volumes before the chroot, on the host, which the case with a symlink to `/mnt` exists for.
+- attaching volumes before the chroot, on the host, which the case with a symlink to `/mnt` exists for;
+- the PID namespace;
+- mounting `/proc`;
+- the init reaping orphans: the probe leaves a grandchild to it and counts `/proc`, where a zombie would show;
+- forwarding signals;
+- the status pipe.
 
 Three of these had first passed: stderr, stop and the session. Each was caught only after the test was changed to see it.
 

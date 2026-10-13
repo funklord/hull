@@ -12,6 +12,10 @@
  *   read PATH   PATH's first line
  *   nnp         whether no_new_privs is set
  *   session     whether it leads a session of its own
+ *   pid         its pid
+ *   procs       how many processes /proc lists, or -1 without one
+ *   orphan      leave a grandchild to the machine's init, which ends a
+ *               second later, and wait two for the init to reap it
  *   exit N      exit with N           die         end by SIGTERM
  *   wait        wait for a signal, for 20 seconds at most, so that a
  *               test whose stop fails leaves no probe behind
@@ -25,7 +29,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/prctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 int main(int argc, char **argv)
@@ -71,6 +77,30 @@ int main(int argc, char **argv)
 			if (file != NULL)
 				fclose(file);
 			i++;
+		} else if (strcmp(step, "pid") == 0) {
+			printf("pid=%d\n", (int)getpid());
+		} else if (strcmp(step, "procs") == 0) {
+			DIR           *proc  = opendir("/proc");
+			struct dirent *entry;
+			int            count = 0;
+
+			while (proc != NULL && (entry = readdir(proc)) != NULL)
+				count += entry->d_name[0] >= '1' && entry->d_name[0] <= '9';
+			printf("procs=%d\n", proc != NULL ? count : -1);
+			if (proc != NULL)
+				closedir(proc);
+		} else if (strcmp(step, "orphan") == 0) {
+			pid_t child = fork();
+
+			if (child == 0) {
+				if (fork() == 0) {
+					sleep(1);
+					_exit(0);
+				}
+				_exit(0);
+			}
+			waitpid(child, NULL, 0);
+			sleep(2);
 		} else if (strcmp(step, "nnp") == 0) {
 			printf("nnp=%d\n", prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0));
 		} else if (strcmp(step, "exit") == 0) {
