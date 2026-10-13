@@ -123,5 +123,73 @@ expect 0 'example\.conf: machine on qemu \(emu\): ok$' \
 expect 0 'example\.conf:[0-9]+:[0-9]+: machine on qemu \(vm\): virtualbox: ignored' \
 	"$hull" check -f "$dir/example.conf" --backend vm
 
+# hull run, on the reference engine: a rootfs holding only the probe, which
+# make builds. Paths in a file are the file's, so these run from /.
+root=$(cd "$dir" && pwd)
+mkdir -p "$root/rootfs/srv"
+conf() { # NAME ENTRIES...
+	name=$1
+	shift
+	printf '(machine (source "dir:./rootfs") (backend chroot) %s)\n' "$*" > "$root/$name.conf"
+}
+from_root() { # STATUS PATTERN ARGS...: hull run from /, so nothing is relative to here
+	want=$1
+	pattern=$2
+	shift 2
+	expect "$want" "$pattern" sh -c 'cd / && exec "$0" run "$@"' "$(cd "$(dirname "$hull")" && pwd)/$(basename "$hull")" "$@"
+}
+
+conf run '(command "/probe" "say" "out" "err" "to stderr" "env" "GREETING" "cwd" "host" "uid" "nnp" "session" "exit" "3")' \
+	'(workdir "/srv") (hostname "box") (env (GREETING "hi"))'
+from_root 3 '^out$' -f "$root/run.conf"
+from_root 3 '^to stderr$' -f "$root/run.conf"
+from_root 3 '^GREETING=hi$' -f "$root/run.conf"
+from_root 3 '^cwd=/srv$' -f "$root/run.conf"
+from_root 3 '^host=box$' -f "$root/run.conf"
+from_root 3 '^uid=0$' -f "$root/run.conf"
+from_root 3 '^nnp=1$' -f "$root/run.conf"
+from_root 3 '^leader=1$' -f "$root/run.conf"
+refute 'machine on chroot' sh -c 'cd / && exec "$0" run -f "$1" 2>/dev/null' \
+	"$(cd "$(dirname "$hull")" && pwd)/$(basename "$hull")" "$root/run.conf"
+refute '^to stderr$' sh -c 'cd / && exec "$0" run -f "$1" 2>/dev/null' \
+	"$(cd "$(dirname "$hull")" && pwd)/$(basename "$hull")" "$root/run.conf"
+
+# Written in place, or refused read-only.
+rm -f "$root/rootfs/written"
+conf writable '(command "/probe" "write" "/written")'
+from_root 0 '^write=ok$' -f "$root/writable.conf"
+cases=$((cases + 1))
+[ -f "$root/rootfs/written" ] || fail "a direct write did not reach the directory" ""
+rm -f "$root/rootfs/written"
+conf readonly '(command "/probe" "write" "/written")' '(security (readonly_root true))'
+from_root 0 '^write=Read-only file system$' -f "$root/readonly.conf"
+
+# A signal is 128 and its number, from the workload or sent to hull. The
+# workload has a session of its own, so timeout's signal to its process
+# group reaches hull alone, and only hull's stop can end the probe.
+conf die '(command "/probe" "die")'
+from_root 143 '' -f "$root/die.conf"
+conf wait '(command "/probe" "wait")'
+cases=$((cases + 1))
+out=$(timeout --preserve-status -s TERM 2 "$hull" run -f "$root/wait.conf" 2>&1)
+got=$?
+[ "$got" = 143 ] && printf '%s\n' "$out" | grep -q '^waiting$' ||
+	fail "SIGTERM to hull run exited $got, wanted 143 after the probe said waiting" "$out"
+
+# What cannot be planned or started is 125, and says why.
+conf ports '(command "/probe") (ports (port (host 8080) (guest 80)))'
+from_root 125 'ports: rejected: chroot shares the host.s network' -f "$root/ports.conf"
+conf noargs '(workdir "/srv")'
+from_root 125 'needs \(command \.\.\.\)' -f "$root/noargs.conf"
+conf nope '(command "/nope")'
+from_root 125 '/nope: No such file or directory' -f "$root/nope.conf"
+printf '%s\n' '(machine (source "debian:13") (command "x"))' > "$root/docker.conf"
+from_root 125 'the docker engine cannot run a machine yet' -f "$root/docker.conf"
+printf '%s\n' '(machines (alpha (source "dir:./rootfs") (backend chroot) (command "/probe" "host")))' \
+	> "$root/pair.conf"
+from_root 0 '^host=alpha$' -f "$root/pair.conf" alpha
+from_root 125 'name the machine to run' -f "$root/pair.conf"
+from_root 125 'run takes one backend' -f "$root/pair.conf" --backend ns,vm alpha
+
 printf 'cli: %u cases, %u failed\n' "$cases" "$failures"
 [ "$failures" -eq 0 ]

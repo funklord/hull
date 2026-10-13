@@ -26,7 +26,9 @@ engine registry that picks what `(backend ...)` names, the planner that
 writes every default into a machine, and the capability matrix that
 judges it against that engine's declaration. `build/hull plan` and
 `build/hull check --backend ns,vm,emu` run them against a `hull.conf`,
-with docker and qemu declared but not yet driven.
+with docker and qemu declared but not yet driven. `build/hull run` runs
+a dir source with `(backend chroot)`, the rootless reference engine in
+`engine/`.
 `hull_engine.h` is a draft of the C plugin interface that engines
 implement.
 

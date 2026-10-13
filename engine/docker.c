@@ -69,7 +69,8 @@ static const hull_engine engine = {
 	.ops         = &ops,
 };
 
-const hull_engine *hull_engine_docker(void)
+const hull_engine *hull_engine_docker(const hull_host_ops *host)
 {
+	(void)host;
 	return &engine;
 }

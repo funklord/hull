@@ -94,7 +94,8 @@ PLAN_OBJS = $(BUILD_DIR)/plan/matrix.o $(BUILD_DIR)/plan/registry.o \
 # The engines that ship with the core, as declarations so far, and the
 # command line that plans with them. VERSION is the one place the number
 # lives; `hull --version` prints it.
-ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o
+ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
+              $(BUILD_DIR)/engine/chroot.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o
 HULL        = $(BUILD_DIR)/hull
 VERSION    := $(shell cat VERSION)
@@ -103,7 +104,12 @@ TEST_SEXPR_OBJS   = $(BUILD_DIR)/test/sexpr_test.o
 TEST_FRAMING_OBJS = $(BUILD_DIR)/test/framing_test.o
 # What test/cli_test.sh writes, so that clean can name it.
 CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.conf \
-                 foreign.conf machines.conf build.conf bad.conf example.conf)
+                 foreign.conf machines.conf build.conf bad.conf example.conf run.conf \
+                 writable.conf readonly.conf die.conf wait.conf ports.conf noargs.conf nope.conf \
+                 docker.conf pair.conf rootfs/written)
+
+# The reference engine's test rootfs holds one static program.
+PROBE = $(BUILD_DIR)/test/cli/rootfs/probe
 
 TEST_SPEC_OBJS    = $(BUILD_DIR)/test/spec_test.o
 TEST_MATRIX_OBJS  = $(BUILD_DIR)/test/matrix_test.o
@@ -178,8 +184,12 @@ $(BUILD_DIR)/cli/%.o: cli/%.c VERSION | $(GEN_HEADERS)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) -DHULL_VERSION='"$(VERSION)"' $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
+$(PROBE): test/probe.c
+	@mkdir -p '$(@D)'
+	$(CC) -static $(CFLAGS) -o $@ $<
+
 $(HULL): $(CLI_OBJS) $(ENGINE_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -pthread -o $@ $^
 
 $(GEN_DIR)/%.o: $(GEN_DIR)/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
@@ -224,7 +234,7 @@ check: style contract test
 # The reader's tests -- the spec's against every ```scheme example in
 # project.md as well -- then the gate's own suite, which travels with the
 # gate. Tests are built here and only here: a plain `make` does not.
-test: $(TEST_BINS) $(HULL) vectors
+test: $(TEST_BINS) $(HULL) $(PROBE) vectors
 	$(BUILD_DIR)/test/sexpr_test
 	$(BUILD_DIR)/test/framing_test
 	$(BUILD_DIR)/test/spec_test project.md
@@ -294,4 +304,4 @@ clean:
 	        $(AGENT_OBJS) $(AGENT_OBJS:.o=.d) $(AGENT_GEN) \
 	        $(SPEC_OBJS) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS) $(PLAN_OBJS:.o=.d) \
 	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) \
-	        $(CLI_TEST_FILES)
+	        $(CLI_TEST_FILES) $(PROBE)

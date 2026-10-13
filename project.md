@@ -570,6 +570,50 @@ A.1's "no floats" sits oddly with J.5's `cores_scale`, which takes `1.5`. Canoni
 
 Two of these had first passed: copying other tuning and copied offsets. Each was caught only after a case was added for it, one with a section missing a key and one with an offset inside a copied entry, not at its start.
 
+### 4.8 The reference engine, and `hull run`
+
+**`engine/chroot.c` is the first engine that runs a machine**: §5.0's "chroot — near-trivial, useful as the reference plugin implementation", done rootless. A machine is one process.
+
+- **Namespaces:** it starts in new user, mount and UTS namespaces, with the invoking user mapped to root. The dir source is bound onto itself, read-only for `(readonly_root true)`, and chrooted into.
+- **Then, in order:** it changes to `workdir`, sets `hostname` and `no_new_privs`, and execs `command` with the environment `env` names and nothing else.
+- **Its declaration says exactly that.** It is an `ns`-class engine. It shares the host's network, so `ports` is declared rejected with that reason. `volumes`, `cpus`, `memory` and an image ref are left out, so they are rejected.
+- **Registration order:** it registers after docker, so `(backend ns)` still picks docker, and `(backend chroot)` asks for it.
+- **The bind remount must keep the flags its mount was copied with.** A user namespace locks `nosuid`, `nodev` and the rest, so the engine reads them with `statvfs` and keeps them. bwrap meets the same rule.
+
+**Output goes to the core through `on_data`**, as `hull_engine.h`'s rule 3 requires: one thread per machine reads the workload's stdout and stderr, then waits for it and reports `on_exit`. `stop` sends SIGTERM, then SIGKILL after its timeout.
+
+**The workload leads a session of its own.** Without it, a terminal's Ctrl-C, or any signal sent to hull's process group, reaches the workload directly, behind the engine. Only `stop` should end a machine. The test found this: `timeout` signals its whole process group, so the probe was being killed by `timeout`'s signal, not by hull's `stop`, and a broken `stop` passed.
+
+**`hull run [-f FILE] [--backend B] [--accept TOKEN]... [NAME]`** plans one machine: the file's, or the one NAME names in a `(machines …)` file. It then creates, starts and waits for it, relaying output, and turns SIGINT or SIGTERM into the engine's `stop`.
+
+- **Paths in a file are the file's:** `run` changes into the file's directory before creating the machine, so `(source "dir:./rootfs")` works from anywhere.
+- **Plan reports go to stderr**, so the workload's stdout stays its own.
+- **Exit status follows docker's convention:** the workload's status, 128 plus the signal that ended it, or 125 when hull could not plan or start it. A rejected plan therefore cannot be mistaken for a workload exiting 1.
+- **An engine whose operations are not written**, docker and qemu so far, says so and exits 125.
+
+Open:
+
+- **No `/proc`, no PID namespace.** A workload that reads `/proc` sees nothing. A PID namespace needs a fork after `unshare`, and an init to reap orphans, which is what §5.2's guest agent is for VMs.
+- **`command` is a path.** There is no PATH search, and no manifest supplies a default, so a chroot machine must write `(command …)`.
+
+**Measured:** `test/cli_test.sh` runs 57 cases. 22 of them are `hull run` against a rootfs holding one static program, `test/probe.c`, which reports from inside what the machine looks like: env, cwd, hostname, uid, `no_new_privs`, whether it can write, and whether it leads its session. The probe's `wait` step ends itself after 20 seconds, so a broken `stop` cannot leave one behind.
+
+In a scratch copy, breaking each of these failed the test:
+
+- the read-only remount;
+- the hostname;
+- the workdir;
+- `no_new_privs`;
+- the environment;
+- keeping stderr apart from stdout;
+- reporting a signal as a signal;
+- reporting an exec failure;
+- stop's signals;
+- the uid map;
+- the workload's own session.
+
+Three of these had first passed: stderr, stop and the session. Each was caught only after the test was changed to see it.
+
 ---
 
 ## 5. Engines

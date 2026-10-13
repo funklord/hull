@@ -88,7 +88,8 @@ static const hull_engine engine = {
 	.ops         = &ops,
 };
 
-const hull_engine *hull_engine_qemu(void)
+const hull_engine *hull_engine_qemu(const hull_host_ops *host)
 {
+	(void)host;
 	return &engine;
 }
