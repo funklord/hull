@@ -336,6 +336,38 @@ static void test_offsets(void)
 		FAIL("vm on an ns engine");
 }
 
+/* What crosses the ABI: the machine in canonical form, sorted, with its
+ * class, and the same bytes however the user spelled it. */
+static void test_canonical(void)
+{
+	static const char want[] =
+	        "(4:plan(5:class2:ns)(7:machine(7:mutable6:direct)(13:on_disconnect4:stop)"
+	        "(10:projection4:bind)(8:security(12:no_new_privs4:true)(13:readonly_root5:false))"
+	        "(6:source5:dir:.)(3:ssh5:false)(6:tuning(2:ns(6:binfmt5:false)))(7:workdir1:/)"
+	        "(9:writeback4:none)))";
+	static const char *const spellings[] = {
+		"(machine (source \"dir:.\"))",
+		"; the same machine\n(machine (ssh false)\n  (source \"dir:.\") (projection auto)"
+		" (security (no_new_privs true)))\n",
+	};
+	seen s;
+
+	for (unsigned i = 0u; i < sizeof spellings / sizeof spellings[0]; i++) {
+		cases++;
+		if (run(__LINE__, spellings[i], NULL, &binder, "ns", &s) != HULL_PLAN_OK ||
+		    plan.canonical_length != sizeof want - 1u ||
+		    memcmp(plan.canonical, want, sizeof want - 1u) != 0)
+			FAIL("spelling %u: %.*s", i, (int)plan.canonical_length,
+			     (const char *)plan.canonical);
+	}
+
+	/* The class is the one it runs as. */
+	cases++;
+	run(__LINE__, "(machine (source \"debian:13\"))", NULL, &both, "emu", &s);
+	if (memcmp(plan.canonical, "(4:plan(5:class3:emu)(7:machine", 31) != 0)
+		FAIL("emu: %.*s", (int)plan.canonical_length, (const char *)plan.canonical);
+}
+
 int main(void)
 {
 	alarm(60);
@@ -344,6 +376,7 @@ int main(void)
 	test_projection();
 	test_writeback();
 	test_offsets();
+	test_canonical();
 	printf("plan: %u cases, %u failed\n", cases, failures);
 	return failures == 0u ? 0 : 1;
 }

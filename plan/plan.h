@@ -4,9 +4,13 @@
  * (project.md section 4.7).
  *
  * The resolved machine is readable text, the form `spec.resolved.conf`
- * takes (sections 3.1 and 4.1). Entries the user wrote are copied byte
- * for byte, so a report about one points at the user's own line; what
- * the planner adds is attributed to the entry it was added for. The text
+ * takes (sections 3.1 and 4.1), and the plan an engine receives is that
+ * machine in canonical form with the class it runs as,
+ * `(plan (class vm) (machine ...))` (A.1, hull_engine.h).
+ *
+ * Entries the user wrote are copied byte for byte, so a report about one
+ * points at the user's own line; what the planner adds is attributed to
+ * the entry it was added for. The text
  * is opened again with hull_spec_open(), so the planner's own output is
  * held to Appendix J, and resolved with hull_matrix_resolve(), so a
  * default asks of an engine exactly what the same value written would.
@@ -54,6 +58,9 @@ typedef struct hull_plan {
 	hull_plan_segment  segments[HULL_PLAN_SEGMENTS];
 	uint32_t           segment_count;
 	const char        *reason;      /* why HULL_PLAN_ERR_INTERNAL */
+	uint8_t            canonical[HULL_PLAN_TEXT];  /* what crosses the ABI */
+	uint32_t           canonical_length;
+	uint8_t            work[3u * HULL_PLAN_TEXT];  /* the encoding's scratch */
 } hull_plan;
 
 /*

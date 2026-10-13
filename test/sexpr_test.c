@@ -398,6 +398,74 @@ static void test_writer(void)
 	}
 }
 
+/* A readable form in canonical form: `want` exactly, or `status`. */
+static void convert_to(const char *text, size_t length, hull_sexpr_status want_status,
+                       const char *want, size_t want_length, uint32_t cap, uint32_t scratch_cap)
+{
+	static uint8_t   out[4096];
+	static uint8_t   scratch[4096];
+	hull_sexpr_doc   doc;
+	hull_sexpr_error error;
+	hull_sexpr_form  form;
+	hull_sexpr_status got;
+	uint32_t         at = 3u;
+
+	cases++;
+	if (hull_sexpr_open(&doc, (const uint8_t *)text, length, HULL_SEXPR_READABLE, &error) !=
+	    HULL_SEXPR_OK || !hull_sexpr_first(&doc, &form)) {
+		FAIL("%s: refused: %s", text, error.reason);
+		return;
+	}
+	memset(out, '!', sizeof out);
+	got = hull_sexpr_to_canonical(&doc, &form, out, cap, &at, scratch, scratch_cap);
+	if (got != want_status) {
+		FAIL("%s: status %d, wanted %d", text, (int)got, (int)want_status);
+	} else if (got != HULL_SEXPR_OK) {
+		if (at != 3u)
+			FAIL("%s: refused, and still moved *at to %u", text, at);
+	} else if (at - 3u != want_length || memcmp(out + 3, want, want_length) != 0 ||
+	           memcmp(out, "!!!", 3) != 0) {
+		FAIL("%s: wrote %.*s, wanted %.*s", text, (int)(at - 3u), (const char *)out + 3,
+		     (int)want_length, want);
+	}
+}
+
+#define CONVERTS(text, want) \
+	convert_to(text, sizeof text - 1, HULL_SEXPR_OK, want, sizeof want - 1, 4096u, 4096u)
+
+static void test_convert(void)
+{
+	/* Atoms are their bytes, whatever their spelling. */
+	CONVERTS("(a \"b c\" #00ff# \"a\\\"b\\n\")", "(1:a3:b c2:\0\xff" "4:a\"b\n)");
+	CONVERTS("()", "()");
+	CONVERTS("((a) b)", "((1:a)1:b)");
+	/* Only a list opening with an atom is a record. */
+	CONVERTS("((x) (b 1) (a 2))", "((1:x)(1:b1:1)(1:a1:2))");
+
+	/* A record's entries are sorted, a prefix first; nothing else is. */
+	CONVERTS("(machine (ssh true) (source \"dir:.\") (arch host))",
+	         "(7:machine(4:arch4:host)(6:source5:dir:.)(3:ssh4:true))");
+	CONVERTS("(r (ab 1) (a 2))", "(1:r(1:a1:2)(2:ab1:1))");
+	CONVERTS("(command \"b\" \"a\")", "(7:command1:b1:a)");
+	CONVERTS("(env (B \"1\") (A \"2\"))", "(3:env(1:A1:2)(1:B1:1))");
+
+	/* A plural list keeps its order, and its items are records. */
+	CONVERTS("(m (ports (port (host 80) (guest 1)) (port (guest 2) (host 53))))",
+	         "(1:m(5:ports(4:port(5:guest1:1)(4:host2:80))(4:port(5:guest1:2)(4:host2:53))))");
+	CONVERTS("(r (a 1) (b 2) (a 3))", "(1:r(1:a1:1)(1:b1:2)(1:a1:3))");
+
+	/* One value, one encoding: comments, whitespace and order are gone. */
+	CONVERTS("; a machine\n(machine\n  (source \"dir:.\")  ; where\n  (ssh true))\n",
+	         "(7:machine(6:source5:dir:.)(3:ssh4:true))");
+	CONVERTS("(machine (ssh true)(source dir:.))",
+	         "(7:machine(6:source5:dir:.)(3:ssh4:true))");
+
+	/* Too little room, in the output or the scratch, moves nothing. */
+	convert_to("(a (b c))", 9, HULL_SEXPR_ERR_SPACE, "", 0, 3u + 11u, 4096u);
+	convert_to("(a (b c))", 9, HULL_SEXPR_OK, "(1:a(1:b1:c))", 13, 3u + 13u, 4096u);
+	convert_to("(a (b c))", 9, HULL_SEXPR_ERR_SPACE, "", 0, 4096u, 12u);
+}
+
 int main(void)
 {
 	/* A fault in what is tested can loop rather than fail, and a suite
@@ -410,6 +478,7 @@ int main(void)
 	test_navigation();
 	test_values();
 	test_writer();
+	test_convert();
 
 	/* A suite that ran nothing passes exactly as loudly as one that ran
 	 * everything, so an empty run is a failure of its own. */

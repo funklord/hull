@@ -143,6 +143,18 @@ hull_sexpr_status hull_sexpr_put_list(uint8_t *out, uint32_t cap, uint32_t *at,
 hull_sexpr_status hull_sexpr_put_sorted(uint8_t *out, uint32_t cap, uint32_t *at,
                                         const uint8_t *entries, uint32_t length);
 
+/*
+ * A readable form, written in canonical form at `*at` (A.1): every atom
+ * the bytes it stands for, and a record's entries sorted by key. A record
+ * is a list whose elements after the first are all lists opening with an
+ * atom, no two alike; any other list keeps its order. The form is built
+ * in `scratch`, which must not overlap `out` and needs room for about
+ * twice the result. `*at` moves only on HULL_SEXPR_OK.
+ */
+hull_sexpr_status hull_sexpr_to_canonical(const hull_sexpr_doc *doc, const hull_sexpr_form *form,
+                                          uint8_t *out, uint32_t cap, uint32_t *at,
+                                          uint8_t *scratch, uint32_t scratch_cap);
+
 #ifdef __cplusplus
 }
 #endif

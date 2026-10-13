@@ -416,6 +416,36 @@ static hull_plan_status judge(writer *w, const char *projection, const char *con
 	return r->rejected == 0u ? HULL_PLAN_OK : HULL_PLAN_REJECTED;
 }
 
+/*
+ * `(plan (class vm) (machine ...))`, canonical (A.1): the class entry and
+ * the machine built in one part of `work`, then sorted behind the plan's
+ * key in another, and closed into `canonical`. The machine's scratch is
+ * the first two thirds of `work`, free again once it is written.
+ */
+static hull_plan_status encode(hull_plan *plan, const char *class_name)
+{
+	uint8_t  *items   = plan->work;
+	uint8_t  *entries = plan->work + 2u * HULL_PLAN_TEXT;
+	uint8_t   pair[64];
+	uint32_t  n_pair  = 0u;
+	uint32_t  n_items = 0u;
+	uint32_t  n       = 0u;
+
+	plan->canonical_length = 0u;
+	if (hull_sexpr_put_atom(pair, sizeof pair, &n_pair, (const uint8_t *)"class", 5u) ||
+	    hull_sexpr_put_atom(pair, sizeof pair, &n_pair, (const uint8_t *)class_name,
+	                        (uint32_t)strlen(class_name)) ||
+	    hull_sexpr_put_list(entries, HULL_PLAN_TEXT, &n, pair, n_pair) ||
+	    hull_sexpr_to_canonical(&plan->resolved.doc, &plan->resolved.machine, entries,
+	                            HULL_PLAN_TEXT, &n, plan->work, 2u * HULL_PLAN_TEXT) ||
+	    hull_sexpr_put_atom(items, 2u * HULL_PLAN_TEXT, &n_items, (const uint8_t *)"plan", 4u) ||
+	    hull_sexpr_put_sorted(items, 2u * HULL_PLAN_TEXT, &n_items, entries, n) ||
+	    hull_sexpr_put_list(plan->canonical, sizeof plan->canonical, &plan->canonical_length,
+	                        items, n_items))
+		return HULL_PLAN_ERR_SIZE;
+	return HULL_PLAN_OK;
+}
+
 hull_plan_status hull_plan_build(hull_plan *plan, const hull_spec *spec,
                                  const hull_sexpr_form *machine, const char *name,
                                  const hull_choice *choice, const char *host_arch,
@@ -474,5 +504,8 @@ hull_plan_status hull_plan_build(hull_plan *plan, const hull_spec *spec,
 	}
 	r.report  = report;
 	r.context = context;
-	return judge(&w, projection, accepted, &r);
+	status = judge(&w, projection, accepted, &r);
+	if (status != HULL_PLAN_OK && status != HULL_PLAN_REJECTED)
+		return status;
+	return encode(plan, choice->class_name) != HULL_PLAN_OK ? HULL_PLAN_ERR_SIZE : status;
 }

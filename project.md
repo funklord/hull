@@ -401,6 +401,7 @@ Measured, by `make check` and by sabotage in a scratch copy of the tree:
 - **Every result is read back** with `hull_sexpr_open` before `*at` moves, because situ's list builder validates the list and not its elements. It returns success for `( 1:a)`, the unclosed `((1:a)` and the non-minimal `(01:a)`, which went to situ as finding 17. The read-back is also what makes the writer refuse a 33rd level exactly as the reader does.
 - **situ's variant builders are not used.** A canonical form's first byte is its own arm, so the list and atom builders plus the read-back already do what their arm check does.
 - **The edit header** generated beside the builders is still not compiled (finding 10), and nothing includes it.
+- **`hull_sexpr_to_canonical()` turns a readable form into canonical form** (`sexpr/convert.c`), since A.1 says "the readable form parses to the canonical one with no help". Symbols, strings and octets become atoms of their bytes. The one rule beyond that is order, and the shape decides it. A list opening with an atom whose other elements are all lists opening with atoms, no two alike, is a record, and its entries are sorted. Any other list keeps its order: arguments, and plural lists like `ports`, whose items share a key. For J's shapes this is exact: §4.3's check refuses a key given twice in a record, and a plural list repeats its singular key. Every piece goes through the writer, so it is read back as it is made. `test/sexpr_test.c` holds 15 conversions to exact bytes. In a scratch copy, breaking the sorting, the plural rule, the atom head, the decoding of values or the room check each failed it; the atom head failed only after a case for a list-headed list was added.
 - **Measured:** `test/sexpr_test.c` gains 28 cases for exact bytes, `*at` left alone on every refusal, ordering with a key that prefixes another, and depth 32 against 33. Sabotage in a scratch copy fails the cases aimed at the read-back, the overlap check, the duplicate check, the prefix rule and the space check. Removing the check of each entry before placing it made the suite loop rather than fail, so the placing pass now checks each entry itself, and both test programs bound themselves with `alarm(60)`.
 
 
@@ -547,9 +548,12 @@ Their operations are not written: every slot is NULL, which is enough for planni
 Open:
 
 - **A fidelity need is not judged per projection.** Rule 3 has the plan pick a projection that satisfies every declared need, but `fidelity.inotify` is one id whatever the projection, so a need never moves `auto`. Fixing that means ids like `fidelity.inotify.passthrough`, or a projection field on an entry. Either changes what engines declare.
-- **What crosses the ABI.** `hull_engine.h` says a plan crosses as a canonical buffer. The readable text is the plan's content; encoding it with §4.2's writer is the step before an engine's `create()` can take it.
 
-**Measured:** `test/plan_test.c` runs 20 cases, each stating the whole resolved text or every report with its offset, against made-up engines that force each choice both ways. In a scratch copy, breaking each of twelve rules failed it:
+**What crosses the ABI is `(plan (class vm) (machine …))` in canonical form** (A.1, `hull_engine.h`): the resolved machine, converted as §4.2 describes, and the class it runs as, which qemu needs because it runs as vm or emu. Two spellings of one machine encode to the same bytes, as A.1 promises: differing in comments, key order, `(projection auto)` and defaults written out.
+
+A.1's "no floats" sits oddly with J.5's `cores_scale`, which takes `1.5`. Canonical atoms carry no type, so it is just the atom `3:1.5`, and nothing breaks. But A.1 was written for the manifest, and a decimal in the plan is a decision J.5 made without saying so.
+
+**Measured:** `test/plan_test.c` runs 23 cases, each stating the whole resolved text or every report with its offset, against made-up engines that force each choice both ways. In a scratch copy, breaking each of twelve rules failed it:
 
 - keeping what a record wrote;
 - emu taking vm's tuning;

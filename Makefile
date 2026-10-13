@@ -74,6 +74,7 @@ GEN_HEADERS = $(GEN_DIR)/readable.h $(GEN_DIR)/canonical.h \
               $(GEN_DIR)/canonical_build.h $(GEN_DIR)/canonical_edit.h
 
 SEXPR_OBJS = $(BUILD_DIR)/sexpr/sexpr.o $(BUILD_DIR)/sexpr/writer.o \
+             $(BUILD_DIR)/sexpr/convert.o \
              $(GEN_DIR)/readable.o $(GEN_DIR)/canonical.o \
              $(BUILD_DIR)/situ/situ.o
 
