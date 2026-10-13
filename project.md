@@ -431,11 +431,42 @@ J left these open, so the check settles them, and each is a row to change if it 
 
 **Open: `tuning` and plugin engines.** J.5 defines entries for `vm`, `emu`, `ns`, `qemu` and `virtualbox`. The check refuses `docker`, `vmware` and `hyperv` as reserved, and any other name as unknown. But the engine set is open (§5.0), so a plugin's tuning keys will need a schema from somewhere, presumably its capability declaration in `hull_engine.h`. Until that exists, a plugin engine cannot be tuned.
 
-**Open: J says its schema "will be a situ description", and for the readable file that does not fit situ as it stands.** situ describes bytes in a fixed order. A readable record takes its keys in any order, with whitespace and comments anywhere. A manifest's canonical bytes fit, which is why A.2 could become `manifest/manifest.situ`, and a canonical `spec.resolved.conf` would too. Until it is decided whether the readable inventory is generated from a description, these tables are the inventory. `hull_engine.h` says the field-id list "lives with the spec schema", and they are its nearest home.
+**Open: J says its schema "will be a situ description", and for the readable file that does not fit situ as it stands.** situ describes bytes in a fixed order. A readable record takes its keys in any order, with whitespace and comments anywhere. A manifest's canonical bytes fit, which is why A.2 could become `manifest/manifest.situ`, and a canonical `spec.resolved.conf` would too. Until it is decided whether the readable inventory is generated from a description, these tables are the inventory.
 
 **Every ```` ```scheme ```` block in this document is a whole `hull.conf`**, and `make test` holds it to the check: `test/spec_test.c` reads `project.md` and opens each one. It fails on fewer than four, the count when it was written, so a missed block cannot pass as an empty scan. The §3.10 media example had no `source` and gained the dir source its own prose names.
 
 **Measured:** `test/spec_test.c` runs 113 cases, each refusal checked for its status, offset and path. In a scratch copy, sabotaging each of the twelve checks failed the suite: duplicate key, missing key, unknown key, choice, port range, the refresh rule, duplicate name, the path, the size rule, the label rule, the entry head and the extra value. Giving the example scan a file with no blocks failed it too.
+
+### 4.4 The matrix: a machine against one engine's column
+
+**`plan/matrix.c` resolves a checked machine against one engine's capability declaration**, the step §6 calls "consulted at plan time". `hull_matrix_resolve()` takes a machine, either `(machine …)` or a named entry of `(machines …)`, together with the engine's `hull_capabilities`, the class the engine runs it as, and the user's `--accept` tokens. It reports every field the machine asks for, in the order the spec writes them, as native, emulated, accepted, rejected or ignored, so `hull plan --explain` can print the lot. A field the engine does not declare is rejected, never ignored (§5.0). A class the engine does not implement is refused before anything is reported.
+
+**Field ids are derived from the spec as written**, which is where `hull_engine.h` said the list lives:
+
+- **Below the machine, a key's id is its path:** `command`, `security.readonly_root`. For a `tuning` entry it is J.5's form, `vm.profile`, without `tuning.`.
+- **A value chosen from a set is carried in the id:** `projection.block`, `on_disconnect.keep`, `vm.profile.micro`, `qemu.accel.tcg`. An engine can then support one choice and refuse another, as virtualbox must refuse `vm.profile.micro` (J.5). `vm.kernel` carries `bundled`, `image` or `path`.
+- **`source` carries its scheme and its mutability:** `source.dir.direct`, `source.ref.overlay` (`ref` is a bare image ref). This is what lets docker refuse a dir source in place and emulate one with an overlay (§5.0). `mutable` is folded into it, with J.1's default where it is not written.
+- **Each `fidelity` need is a field:** `fidelity.inotify`.
+- **`false`, and a list with nothing in it, ask nothing.** Numbers and strings ask for the key itself: `cpus`, `memory`.
+- **`ports`, `volumes`, `env`, `secrets` and `security.allow` are asked for once, by key.**
+- **`backend`, `restart` and `env_file` are hull's own:** the first chose the engine, the systemd generator reads the second, and the core folds the third into `env`. They are reported native without being looked up.
+
+Two keys are checked against lists the declaration already has rather than against ids:
+
+- **A medium's type is checked against `media_types`**, since J.4 says so. The key is looked up as `media`. `hull_engine.h` used `media.cdrom` as an id example, which would have been a second way to say the same thing, and it is gone.
+- **An arch other than `host` must be in `arches`**, where `NULL` means host-only.
+
+**`--accept` tokens are their own field.** §6's rule 1 lets the user honour a rejection, and `hull_cap_entry` gained `accept` for the token that does it. The draft had put the token inside the free-text `note`, which would have had to be parsed out. A rejection with no token cannot be honoured.
+
+**`tuning`** applies an entry that names the class the engine runs the machine as, or the engine itself. Any other entry is reported ignored, the warning §4 promises. J.5 also says an engine's entry overrides its class's, but no key of J sits under both, and §4.3's check refuses any other key. Nothing is there to override yet, so there is no code for it until a key is shared.
+
+Open, each for the planner's next step:
+
+- **Defaults are not asked for.** A key that is not written asks nothing, though J gives some defaults that would ask something of an engine: `no_new_privs` is true by default. The planner applies defaults before resolving, or the engine assumes them; which one is not decided.
+- **`(ns (binfmt true))` does not change `arches` yet.** An ns engine that can run foreign arches with qemu-user (§5.3) has no way to say "only with binfmt".
+- **Choosing the engine is not here.** `(backend vm)` picks the host's default engine of a class (§5.0), which needs the registry of loaded engines. That registry, and the plan an engine's `create()` receives, come next.
+
+**Measured:** `test/matrix_test.c` runs 32 cases against two made-up columns, shaped like §5.0's qemu and docker. Each case states every field it expects reported, so an extra field fails as surely as a missing one. In a scratch copy, sabotaging each of thirteen rules failed the suite: undeclared rejected, a token honoured, a token required, the class check, ignoring other tuning, `false` asking nothing, the choice in the id, the source's default mutability, arches, media types, `allow`, the returned status, and hull's own keys.
 
 ---
 

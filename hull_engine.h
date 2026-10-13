@@ -88,8 +88,9 @@ typedef struct hull_buf {
 /* ---- Capability declaration ---------------------------------------------
  * The engine's column of the matrix (section 6), published as data at register
  * time. field ids are the canonical spec-field identifiers ("ports",
- * "arch", "source.dir.direct", "media.cdrom", "fidelity.inotify", ...) --
- * the authoritative id list lives with the spec schema, not here. */
+ * "arch", "source.dir.direct", "projection.block", "fidelity.inotify",
+ * ...), derived from the spec as project.md section 4.4 says -- not
+ * listed here. A medium's type is checked against media_types (J.4). */
 
 typedef enum hull_support {
 	HULL_SUP_NATIVE   = 0,
@@ -100,8 +101,10 @@ typedef enum hull_support {
 typedef struct hull_cap_entry {
 	const char  *field;      /* canonical spec-field id                   */
 	hull_support support;
-	const char  *note;       /* cost (EMULATED) or reason (REJECTED); may
-	                            name an opt-in token, e.g. "vm:inotify-poll" */
+	const char  *note;       /* cost (EMULATED) or reason (REJECTED)      */
+	const char  *accept;     /* REJECTED only: the `--accept` token that
+	                            honours it anyway, e.g. "vm:inotify-poll",
+	                            or NULL where nothing does (section 6, rule 1) */
 } hull_cap_entry;
 
 typedef enum hull_migration_class {
