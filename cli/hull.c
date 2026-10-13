@@ -2,14 +2,15 @@
  * hull.c -- the command line, as far as planning reaches (project.md
  * section 10).
  *
- *   hull plan [-f FILE] [--backend B] [--accept TOKEN]... [--explain]
+ *   hull plan [-f FILE] [--backend B] [--accept TOKEN]... [--explain] [--resolved]
  *   hull check [-f FILE] --backend B[,B...] [--accept TOKEN]...
  *   hull engines
  *
  * `plan` resolves each machine for the backend it names, or for --backend;
  * `check` does so for every backend listed, and is the CI gate (J.8).
  * Both print what was rejected, emulated or ignored, and --explain prints
- * every field. Messages name the file, line and column of the entry that
+ * every field; --resolved prints each machine as the plan resolved it,
+ * every default written in (project.md section 4.7). Messages name the file, line and column of the entry that
  * asked, as a compiler would.
  *
  * Exit status: 0 when nothing was rejected, 1 when something was, 2 when
@@ -25,6 +26,7 @@
 
 #include "builtin.h"
 #include "matrix.h"
+#include "plan.h"
 #include "registry.h"
 #include "spec.h"
 
@@ -39,6 +41,7 @@ typedef struct options {
 	unsigned    backend_count;
 	unsigned    token_count;
 	int         explain;
+	int         resolved;
 } options;
 
 /* One machine on one backend, as the report callback sees it. */
@@ -52,7 +55,8 @@ typedef struct report {
 
 static void usage(FILE *out)
 {
-	fputs("usage: hull plan [-f FILE] [--backend B] [--accept TOKEN]... [--explain]\n"
+	fputs("usage: hull plan [-f FILE] [--backend B] [--accept TOKEN]... [--explain]"
+	      " [--resolved]\n"
 	      "       hull check [-f FILE] --backend B[,B...] [--accept TOKEN]...\n"
 	      "       hull engines\n"
 	      "       hull --version\n", out);
@@ -139,34 +143,48 @@ static uint8_t *read_file(const char *path, size_t *length)
 }
 
 /* One machine on one backend. Returns 1 if anything was rejected, 0 if
- * not, and 2 if the backend could not be chosen. */
+ * not, and 2 if it could not be planned at all. `name` is NULL for a
+ * file's single `(machine ...)`. */
 static int resolve_one(const options *o, const hull_registry *registry, const hull_spec *spec,
                        const hull_sexpr_form *machine, const char *name, const char *backend)
 {
+	static hull_plan     plan;
 	hull_choice          choice;
 	const char          *reason = NULL;
+	const char          *shown  = name != NULL ? name : "machine";
 	report               r;
 	hull_registry_status status;
+	hull_plan_status     planned;
 
 	status = hull_registry_choose(registry, spec, machine, backend, &choice, &reason);
 	if (status != HULL_REGISTRY_OK) {
-		fprintf(stderr, "%s: %s on %s: %s\n", o->file, name,
+		fprintf(stderr, "%s: %s on %s: %s\n", o->file, shown,
 		        backend != NULL ? backend : "its own backend", reason);
 		return 2;
 	}
 	r.options  = o;
 	r.spec     = spec;
-	r.machine  = name;
+	r.machine  = shown;
 	r.choice   = &choice;
 	r.rejected = 0u;
-	hull_matrix_resolve(spec, machine, choice.engine->caps, choice.class_name,
-	                    registry->host_arch, o->tokens, print_resolution, &r);
+	planned = hull_plan_build(&plan, spec, machine, name, &choice, registry->host_arch,
+	                          o->tokens, print_resolution, &r);
+	if (planned != HULL_PLAN_OK && planned != HULL_PLAN_REJECTED) {
+		fprintf(stderr, "%s: %s on %s: %s\n", o->file, shown,
+		        choice.engine->caps->engine_name,
+		        planned == HULL_PLAN_ERR_SIZE ? "the machine is too large to plan" :
+		        planned == HULL_PLAN_ERR_CLASS ? "the engine does not implement the class" :
+		        "the plan failed its own check, which is a bug in hull");
+		return 2;
+	}
+	if (o->resolved)
+		printf("%.*s", (int)plan.length, plan.text);
 	if (r.rejected != 0u)
-		printf("%s: %s on %s (%s): rejected, %u field%s\n", o->file, name,
+		printf("%s: %s on %s (%s): rejected, %u field%s\n", o->file, shown,
 		       choice.engine->caps->engine_name, choice.class_name, r.rejected,
 		       r.rejected == 1u ? "" : "s");
 	else
-		printf("%s: %s on %s (%s): ok\n", o->file, name, choice.engine->caps->engine_name,
+		printf("%s: %s on %s (%s): ok\n", o->file, shown, choice.engine->caps->engine_name,
 		       choice.class_name);
 	return r.rejected != 0u;
 }
@@ -194,7 +212,7 @@ static int resolve_all(const options *o, const hull_registry *registry)
 		int         result  = 0;
 
 		if (spec.has_machine) {
-			result = resolve_one(o, registry, &spec, &spec.machine, "machine", backend);
+			result = resolve_one(o, registry, &spec, &spec.machine, NULL, backend);
 		} else if (spec.has_machines) {
 			hull_sexpr_form entry;
 			hull_sexpr_form name;
@@ -311,6 +329,8 @@ int main(int argc, char **argv)
 			o.tokens[o.token_count++] = argv[++i];
 		} else if (strcmp(arg, "--explain") == 0 && strcmp(command, "plan") == 0) {
 			o.explain = 1;
+		} else if (strcmp(arg, "--resolved") == 0 && strcmp(command, "plan") == 0) {
+			o.resolved = 1;
 		} else {
 			usage(stderr);
 			return 2;

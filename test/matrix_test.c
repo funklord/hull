@@ -212,7 +212,11 @@ static void test_tuning(void)
 	   " virtualbox:i ns:i");
 	OK("(machine (source \"dir:.\") (tuning (vm (kernel \"path:./bzImage\"))"
 	   " (emu (cores_scale 2))))", &qemu, "emu",
-	   "source.dir.direct:n vm:i emu.cores_scale:n");
+	   "source.dir.direct:n vm.kernel.path:n emu.cores_scale:n");
+	NO("(machine (source \"dir:.\") (tuning (emu (cores_scale 2)) (vm (profile full))))",
+	   &qemu, "emu", "source.dir.direct:n emu.cores_scale:n vm.profile.full:r");
+	OK("(machine (source \"dir:.\") (tuning (emu (cores_scale 2))))", &qemu, "vm",
+	   "source.dir.direct:n emu:i");
 	NO("(machine (source \"dir:.\") (tuning (vm (profile full))))", &qemu, "vm",
 	   "source.dir.direct:n vm.profile.full:r");
 	OK("(machine (source \"dir:.\") (tuning (vm (kernel \"path:./bzImage\"))))", &qemu, "vm",

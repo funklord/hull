@@ -458,15 +458,16 @@ Two keys are checked against lists the declaration already has rather than again
 
 **`--accept` tokens are their own field.** §6's rule 1 lets the user honour a rejection, and `hull_cap_entry` gained `accept` for the token that does it. The draft had put the token inside the free-text `note`, which would have had to be parsed out. A rejection with no token cannot be honoured.
 
-**`tuning`** applies an entry that names the class the engine runs the machine as, or the engine itself. Any other entry is reported ignored, the warning §4 promises. J.5 also says an engine's entry overrides its class's, but no key of J sits under both, and §4.3's check refuses any other key. Nothing is there to override yet, so there is no code for it until a key is shared.
+**`tuning`** applies an entry that names the class the engine runs the machine as, or the engine itself, and `vm`'s under emu as well. §4's example calls emu's entry the one that "adds emulation tuning", and §5.3 gives emu "same profiles, same kernel strategy". Any other entry is reported ignored, the warning §4 promises. J.5 also says an engine's entry overrides its class's, but no key of J sits under both, and §4.3's check refuses any other key. Nothing is there to override yet, so there is no code for it until a key is shared.
 
 Open, each for the planner's next step:
 
-- **Defaults are not asked for.** A key that is not written asks nothing, though J gives some defaults that would ask something of an engine: `no_new_privs` is true by default. The planner applies defaults before resolving, or the engine assumes them; which one is not decided.
 - **`(ns (binfmt true))` does not change `arches` yet.** An ns engine that can run foreign arches with qemu-user (§5.3) has no way to say "only with binfmt".
 - **Choosing the engine is §4.5's.** What an engine's `create()` receives, the plan itself, comes after both.
 
-**Measured:** `test/matrix_test.c` runs 35 cases against two made-up columns, shaped like §5.0's qemu and docker. Each case states every field it expects reported, so an extra field fails as surely as a missing one. In a scratch copy, sabotaging each of thirteen rules failed the suite: undeclared rejected, a token honoured, a token required, the class check, ignoring other tuning, `false` asking nothing, the choice in the id, the source's default mutability, arches, media types, `allow`, the returned status, and hull's own keys. So did breaking the class rule for a foreign arch and the host's arch by name, added after the first version took `(arch amd64)` on an amd64 host for a foreign one.
+**The matrix judges what it is given and supplies no defaults.** §4.7's plan writes them in first, so through `hull plan` a default asks of an engine what the same value written would.
+
+**Measured:** `test/matrix_test.c` runs 37 cases against two made-up columns, shaped like §5.0's qemu and docker. Each case states every field it expects reported, so an extra field fails as surely as a missing one. In a scratch copy, sabotaging each of thirteen rules failed the suite: undeclared rejected, a token honoured, a token required, the class check, ignoring other tuning, `false` asking nothing, the choice in the id, the source's default mutability, arches, media types, `allow`, the returned status, and hull's own keys. So did breaking the class rule for a foreign arch and the host's arch by name, added after the first version took `(arch amd64)` on an amd64 host for a foreign one.
 
 ### 4.5 The registry: which engine a backend chooses
 
@@ -496,7 +497,7 @@ Open, each for the planner's next step:
 
 **`build/hull` is the first binary**, and it reaches as far as planning: §10's `plan` and `check`, and `engines`.
 
-- **`hull plan`** resolves each machine in a file for the backend the machine names, or for one given with `--backend`. It prints what was rejected, emulated, accepted or ignored, and with `--explain` every field.
+- **`hull plan`** resolves each machine in a file for the backend the machine names, or for one given with `--backend`. It prints what was rejected, emulated, accepted or ignored, and with `--explain` every field. `--resolved` prints the machine as §4.7's plan wrote it, every default in.
 - **`hull check --backend ns,vm,emu`** does the same for every backend listed. It is J.8's CI gate: it exits 1 if any machine is rejected on any of them.
 - **Every message names the file, line and column** of the entry that asked, as a compiler's would. A rejection that a token can lift says which token.
 - **Exit status:** 0 when nothing is rejected, 1 when something is, 2 when the file cannot be read or checked, or the command is wrong.
@@ -510,7 +511,60 @@ Their operations are not written: every slot is NULL, which is enough for planni
 
 **The host's arch comes from `uname`**, in the spec's spelling: `x86_64` is `amd64` and `aarch64` is `arm64`.
 
-**Measured:** `test/cli_test.sh` runs 33 cases against `build/hull`, each an exit status and a line of output. Among them, §4's example passes `check --backend ns,vm,emu`, read straight out of this document. In a scratch copy, breaking the exit status, the passing of `--accept` tokens, the loop over backends, the loop over machines and the location of a message each failed it.
+**Measured:** `test/cli_test.sh` runs 35 cases against `build/hull`, each an exit status and a line of output. Among them, §4's example passes `check --backend ns,vm,emu`, read straight out of this document. In a scratch copy, breaking the exit status, the passing of `--accept` tokens, the loop over backends, the loop over machines and the location of a message each failed it.
+
+### 4.7 The plan: every default written in
+
+**Decided 2026-10-13: the planner resolves defaults, and engines assume none.** The question was open in §4.4. It turned out to be settled already under another name: §2's lifecycle compiles "MachineSpec + chosen backend into an ExecutionPlan" and runs "every spec field" through the matrix, and §3.1 keeps a `spec.resolved.conf` beside each machine.
+
+**`plan/plan.c` writes the resolved machine as readable text**, the form `spec.resolved.conf` takes (§4.1). Writing it is copying:
+
+- Every entry the user wrote is copied byte for byte. Comments between entries are dropped, and those inside an entry stay.
+- The planner adds only what was left out: a default inside a record that was written, or a whole entry that was not. Three records are opened up to add to: `security`, each `port` and `volume`, and the `tuning` sections that apply.
+- Tuning for another class or engine is copied as it stands, and the matrix reports it ignored.
+
+**The text is then judged as if the user had written it.** It is opened again with `hull_spec_open()`, which holds the planner's own output to Appendix J; a failure there is a bug in hull and is reported as one. It is then resolved by §4.4's matrix, so a default asks of an engine exactly what the same value written would, by the same ids. Every report is moved back to the user's file. A position inside a copied entry maps to its own byte, and an added default maps to the entry it was added for: `(proto tcp)` points at its `(port`, and `(writeback none)` at the machine.
+
+**Defaults written in**, from J or from §4.3's choices:
+
+- `mutable` direct for a dir source, overlay otherwise; `writeback none`, `ssh false`, `on_disconnect stop`.
+- `workdir "/"` for every source but a bare image ref, whose manifest supplies one (A.4).
+- `hostname` as the machine's name, in a `(machines …)` file.
+- `security` with `readonly_root false` and `no_new_privs true`.
+- `proto tcp` and `mode rw`.
+- The tuning sections that apply, with J.5's defaults.
+
+**Left out, because it is not the plan's to give:**
+
+- `command` and a ref's `workdir`, which are the manifest's; the plan reads no store yet.
+- `cpus` and `memory`, which J leaves to the engine.
+- `restart`, `env_file` and `backend`, which are hull's own (§4.4).
+
+**`(projection auto)` is §3.9's rule 3.** The plan tries bind, passthrough and block in that order and keeps the first that leaves nothing rejected. If none does, it keeps the first the engine declares, so the report names what is actually wrong. No engine is asked for `auto`, so neither built-in declares it. A projection written by name is kept.
+
+**§3.9's rule 2 is checked here**, since it spans keys and the matrix judges one field at a time. `(mutable direct)` under a block projection is rejected, as `writeback`, unless `(writeback sync-on-stop)` is set.
+
+Open:
+
+- **A fidelity need is not judged per projection.** Rule 3 has the plan pick a projection that satisfies every declared need, but `fidelity.inotify` is one id whatever the projection, so a need never moves `auto`. Fixing that means ids like `fidelity.inotify.passthrough`, or a projection field on an entry. Either changes what engines declare.
+- **What crosses the ABI.** `hull_engine.h` says a plan crosses as a canonical buffer. The readable text is the plan's content; encoding it with §4.2's writer is the step before an engine's `create()` can take it.
+
+**Measured:** `test/plan_test.c` runs 20 cases, each stating the whole resolved text or every report with its offset, against made-up engines that force each choice both ways. In a scratch copy, breaking each of twelve rules failed it:
+
+- keeping what a record wrote;
+- emu taking vm's tuning;
+- copying other engines' tuning untouched;
+- direct for a dir source;
+- no workdir for a ref;
+- the hostname from the name;
+- auto trying each projection in turn;
+- the writeback rule;
+- copied offsets;
+- added offsets;
+- the size limit;
+- moving reports to the user's file.
+
+Two of these had first passed: copying other tuning and copied offsets. Each was caught only after a case was added for it, one with a section missing a key and one with an offset inside a copied entry, not at its start.
 
 ---
 

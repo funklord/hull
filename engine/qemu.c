@@ -33,7 +33,6 @@ static const hull_cap_entry entries[] = {
 	{ "fidelity.inotify",   HULL_SUP_REJECTED, "virtiofs does not see changes made on the host",
 	  "vm:inotify-poll" },
 
-	{ "projection.auto",        HULL_SUP_NATIVE, NULL, NULL },
 	{ "projection.passthrough", HULL_SUP_NATIVE, NULL, NULL },
 	{ "writeback.none",         HULL_SUP_NATIVE, NULL, NULL },
 	{ "media",                  HULL_SUP_NATIVE, NULL, NULL },

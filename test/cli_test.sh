@@ -81,6 +81,10 @@ expect 1 ':1:10: machine on docker \(ns\): source\.dir\.direct: rejected: docker
 	"$hull" plan -f "$dir/dir.conf"
 expect 1 'machine on docker \(ns\): rejected, 1 field$' "$hull" plan -f "$dir/dir.conf"
 expect 2 'plan takes one backend' "$hull" plan -f "$dir/ref.conf" --backend ns,vm
+expect 0 '^\(machine \(source "debian:13"\) \(ports \(port \(host 8080\) \(guest 80\) \(proto tcp\)\)\) .*\(projection bind\)\)$' \
+	"$hull" plan --resolved -f "$dir/ref.conf"
+expect 0 '\(tuning \(vm \(profile micro\) \(kernel bundled\) \(cpu_profile host\)\) \(qemu \(accel auto\)\)\) \(projection passthrough\)\)$' \
+	"$hull" plan --resolved -f "$dir/ref.conf" --backend vm
 
 # --accept honours exactly the rejection that names it.
 expect 1 'fidelity\.inotify: rejected: .* \(--accept vm:inotify-poll honours it\)$' \

@@ -311,8 +311,10 @@ static void resolve_tuning_entry(resolver *r, const char *prefix, const hull_sex
 
 /*
  * `(tuning (vm ...) (qemu ...))`. An entry applies when it names the class
- * the engine runs the machine as, or the engine itself; any other is
- * ignored with a warning (section 4).
+ * the engine runs the machine as, or the engine itself, and vm's applies
+ * under emu too, which adds to vm's tuning rather than replacing it
+ * (sections 4 and 5.3: "same profiles, same kernel strategy"). Any other
+ * is ignored with a warning (section 4).
  *
  * J.5 also says an engine's entry overrides its class's, but no key of J
  * is under both, and spec_open refuses any other, so there is nothing yet
@@ -334,7 +336,8 @@ static void resolve_tuning(resolver *r, const hull_sexpr_form *entry)
 		hull_sexpr_child(&r->spec->doc, &section, &name);
 		join_form(r, prefix, NULL, &name);
 		if (!hull_sexpr_is(&r->spec->doc, &name, r->caps->engine_name) &&
-		    !hull_sexpr_is(&r->spec->doc, &name, r->class_name)) {
+		    !hull_sexpr_is(&r->spec->doc, &name, r->class_name) &&
+		    !(hull_sexpr_is(&r->spec->doc, &name, "vm") && strcmp(r->class_name, "emu") == 0)) {
 			emit(r, prefix, HULL_OUTCOME_IGNORED,
 			     "tuning for another class or engine", NULL, section.offset);
 			continue;

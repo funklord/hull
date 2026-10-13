@@ -87,7 +87,8 @@ AGENT_OBJS = $(BUILD_DIR)/agent/framing.o $(GEN_DIR)/message.o
 # hull.conf, checked against Appendix J by a walk over the reader's forms,
 # and a checked machine resolved against an engine's capabilities.
 SPEC_OBJS = $(BUILD_DIR)/spec/spec.o
-PLAN_OBJS = $(BUILD_DIR)/plan/matrix.o $(BUILD_DIR)/plan/registry.o
+PLAN_OBJS = $(BUILD_DIR)/plan/matrix.o $(BUILD_DIR)/plan/registry.o \
+            $(BUILD_DIR)/plan/plan.o
 
 # The engines that ship with the core, as declarations so far, and the
 # command line that plans with them. VERSION is the one place the number
@@ -106,11 +107,12 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
 TEST_SPEC_OBJS    = $(BUILD_DIR)/test/spec_test.o
 TEST_MATRIX_OBJS  = $(BUILD_DIR)/test/matrix_test.o
 TEST_REGISTRY_OBJS = $(BUILD_DIR)/test/registry_test.o
+TEST_PLAN_OBJS    = $(BUILD_DIR)/test/plan_test.o
 TEST_OBJS = $(TEST_SEXPR_OBJS) $(TEST_FRAMING_OBJS) $(TEST_SPEC_OBJS) $(TEST_MATRIX_OBJS) \
-            $(TEST_REGISTRY_OBJS)
+            $(TEST_REGISTRY_OBJS) $(TEST_PLAN_OBJS)
 TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
             $(BUILD_DIR)/test/spec_test $(BUILD_DIR)/test/matrix_test \
-            $(BUILD_DIR)/test/registry_test
+            $(BUILD_DIR)/test/registry_test $(BUILD_DIR)/test/plan_test
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
@@ -204,6 +206,9 @@ $(BUILD_DIR)/test/matrix_test: $(TEST_MATRIX_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(S
 $(BUILD_DIR)/test/registry_test: $(TEST_REGISTRY_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
+$(BUILD_DIR)/test/plan_test: $(TEST_PLAN_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^
+
 -include $(SEXPR_OBJS:.o=.d) $(AGENT_OBJS:.o=.d) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS:.o=.d) \
          $(ENGINE_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(TEST_OBJS:.o=.d)
 
@@ -224,6 +229,7 @@ test: $(TEST_BINS) $(HULL) vectors
 	$(BUILD_DIR)/test/spec_test project.md
 	$(BUILD_DIR)/test/matrix_test
 	$(BUILD_DIR)/test/registry_test
+	$(BUILD_DIR)/test/plan_test
 	BUILD_DIR='$(BUILD_DIR)' sh test/cli_test.sh '$(HULL)'
 	$(PYTHON) tool/test_style_gate.py
 

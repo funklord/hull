@@ -37,7 +37,7 @@ static const hull_cap_entry entries[] = {
 	{ "fidelity.inotify",   HULL_SUP_NATIVE,   NULL, NULL },
 	{ "fidelity.flock",     HULL_SUP_NATIVE,   NULL, NULL },
 
-	{ "projection.auto",    HULL_SUP_NATIVE,   NULL, NULL },
+	/* auto never reaches an engine: the plan chooses (3.9, rule 3). */
 	{ "projection.bind",    HULL_SUP_NATIVE,   NULL, NULL },
 	{ "writeback.none",     HULL_SUP_NATIVE,   NULL, NULL },
 	{ "on_disconnect.stop", HULL_SUP_NATIVE,   NULL, NULL },

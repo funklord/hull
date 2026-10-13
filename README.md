@@ -22,10 +22,11 @@ schema reference. The first code is the s-expression reader and the
 canonical writer in `sexpr/` and the guest agent protocol's framing in
 `agent/`, both generated in part by [situ](https://github.com/funklord/situ)
 from schemas; the `hull.conf` check in `spec/`; and in `plan/`, the
-engine registry that picks what `(backend ...)` names and the capability
-matrix that resolves a machine against that engine's declaration.
-`build/hull plan` and `build/hull check --backend ns,vm,emu` run them
-against a `hull.conf`, with docker and qemu declared but not yet driven.
+engine registry that picks what `(backend ...)` names, the planner that
+writes every default into a machine, and the capability matrix that
+judges it against that engine's declaration. `build/hull plan` and
+`build/hull check --backend ns,vm,emu` run them against a `hull.conf`,
+with docker and qemu declared but not yet driven.
 `hull_engine.h` is a draft of the C plugin interface that engines
 implement.
 
