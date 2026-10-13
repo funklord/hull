@@ -492,6 +492,26 @@ Open, each for the planner's next step:
 
 **Measured:** `test/registry_test.c` runs 37 cases, and every refusal must carry a reason. In a scratch copy, sabotaging each of thirteen rules failed the suite: the major ABI, the struct sizes, the name rule, the class list, duplicates, the limit, the policy default, first-registered order, foreign means emu, the host's own arch, `ns` when unwritten, an exact name match, and a default that must implement its class.
 
+### 4.6 `hull plan` and `hull check`
+
+**`build/hull` is the first binary**, and it reaches as far as planning: §10's `plan` and `check`, and `engines`.
+
+- **`hull plan`** resolves each machine in a file for the backend the machine names, or for one given with `--backend`. It prints what was rejected, emulated, accepted or ignored, and with `--explain` every field.
+- **`hull check --backend ns,vm,emu`** does the same for every backend listed. It is J.8's CI gate: it exits 1 if any machine is rejected on any of them.
+- **Every message names the file, line and column** of the entry that asked, as a compiler's would. A rejection that a token can lift says which token.
+- **Exit status:** 0 when nothing is rejected, 1 when something is, 2 when the file cannot be read or checked, or the command is wrong.
+
+**The two engines that ship with the core are declared in `engine/`**, docker and qemu. Each entry comes from what §5 and §6 say of that engine, with a comment naming the section. A field the document does not say an engine honours is left out, and so is rejected:
+
+- **docker** has no `fidelity.odirect`, no `on_disconnect.keep` and no media.
+- **qemu** offers `fidelity.inotify` only with `--accept vm:inotify-poll`.
+
+Their operations are not written: every slot is NULL, which is enough for planning and nothing else. `hull --version` prints `VERSION` and the copyright line.
+
+**The host's arch comes from `uname`**, in the spec's spelling: `x86_64` is `amd64` and `aarch64` is `arm64`.
+
+**Measured:** `test/cli_test.sh` runs 33 cases against `build/hull`, each an exit status and a line of output. Among them, §4's example passes `check --backend ns,vm,emu`, read straight out of this document. In a scratch copy, breaking the exit status, the passing of `--accept` tokens, the loop over backends, the loop over machines and the location of a message each failed it.
+
 ---
 
 ## 5. Engines

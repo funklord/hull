@@ -24,13 +24,15 @@ canonical writer in `sexpr/` and the guest agent protocol's framing in
 from schemas; the `hull.conf` check in `spec/`; and in `plan/`, the
 engine registry that picks what `(backend ...)` names and the capability
 matrix that resolves a machine against that engine's declaration.
+`build/hull plan` and `build/hull check --backend ns,vm,emu` run them
+against a `hull.conf`, with docker and qemu declared but not yet driven.
 `hull_engine.h` is a draft of the C plugin interface that engines
 implement.
 
 ## Building
 
 ```sh
-make         # the reader; fetches vendor/situ the first time
+make         # build/hull; fetches vendor/situ the first time
 make check   # the style gate, the situ contracts, then the tests
 make hooks   # install the commit-msg hook
 ```

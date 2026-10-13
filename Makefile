@@ -89,8 +89,20 @@ AGENT_OBJS = $(BUILD_DIR)/agent/framing.o $(GEN_DIR)/message.o
 SPEC_OBJS = $(BUILD_DIR)/spec/spec.o
 PLAN_OBJS = $(BUILD_DIR)/plan/matrix.o $(BUILD_DIR)/plan/registry.o
 
+# The engines that ship with the core, as declarations so far, and the
+# command line that plans with them. VERSION is the one place the number
+# lives; `hull --version` prints it.
+ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o
+CLI_OBJS    = $(BUILD_DIR)/cli/hull.o
+HULL        = $(BUILD_DIR)/hull
+VERSION    := $(shell cat VERSION)
+
 TEST_SEXPR_OBJS   = $(BUILD_DIR)/test/sexpr_test.o
 TEST_FRAMING_OBJS = $(BUILD_DIR)/test/framing_test.o
+# What test/cli_test.sh writes, so that clean can name it.
+CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.conf \
+                 foreign.conf machines.conf build.conf bad.conf example.conf)
+
 TEST_SPEC_OBJS    = $(BUILD_DIR)/test/spec_test.o
 TEST_MATRIX_OBJS  = $(BUILD_DIR)/test/matrix_test.o
 TEST_REGISTRY_OBJS = $(BUILD_DIR)/test/registry_test.o
@@ -100,15 +112,15 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
             $(BUILD_DIR)/test/spec_test $(BUILD_DIR)/test/matrix_test \
             $(BUILD_DIR)/test/registry_test
 
-CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
+CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: all check test vectors style style-source style-docs contract hooks clean help
 
-all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS)
+all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL)
 
 help:
 	@echo 'Targets:'
-	@echo '  all       build the reader, the framing, the spec check and the planner (the default)'
+	@echo '  all       build the libraries and build/hull (the default)'
 	@echo '  check     style, the situ contracts, then the tests'
 	@echo '  test      build and run the reader tests, the vectors, then the gate'"'"'s'
 	@echo '  vectors   the described schemas against bytes they must accept and refuse'
@@ -154,6 +166,18 @@ $(BUILD_DIR)/plan/%.o: plan/%.c | $(GEN_HEADERS)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
+$(BUILD_DIR)/engine/%.o: engine/%.c
+	@mkdir -p '$(@D)'
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+
+# The version is a prerequisite, so a new number rebuilds what prints it.
+$(BUILD_DIR)/cli/%.o: cli/%.c VERSION | $(GEN_HEADERS)
+	@mkdir -p '$(@D)'
+	$(CC) $(CPPFLAGS) -DHULL_VERSION='"$(VERSION)"' $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+
+$(HULL): $(CLI_OBJS) $(ENGINE_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^
+
 $(GEN_DIR)/%.o: $(GEN_DIR)/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
@@ -180,7 +204,8 @@ $(BUILD_DIR)/test/matrix_test: $(TEST_MATRIX_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(S
 $(BUILD_DIR)/test/registry_test: $(TEST_REGISTRY_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
--include $(SEXPR_OBJS:.o=.d) $(AGENT_OBJS:.o=.d) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS:.o=.d) $(TEST_OBJS:.o=.d)
+-include $(SEXPR_OBJS:.o=.d) $(AGENT_OBJS:.o=.d) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS:.o=.d) \
+         $(ENGINE_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(TEST_OBJS:.o=.d)
 
 # --- checks -----------------------------------------------------------------
 
@@ -193,12 +218,13 @@ check: style contract test
 # The reader's tests -- the spec's against every ```scheme example in
 # project.md as well -- then the gate's own suite, which travels with the
 # gate. Tests are built here and only here: a plain `make` does not.
-test: $(TEST_BINS) vectors
+test: $(TEST_BINS) $(HULL) vectors
 	$(BUILD_DIR)/test/sexpr_test
 	$(BUILD_DIR)/test/framing_test
 	$(BUILD_DIR)/test/spec_test project.md
 	$(BUILD_DIR)/test/matrix_test
 	$(BUILD_DIR)/test/registry_test
+	BUILD_DIR='$(BUILD_DIR)' sh test/cli_test.sh '$(HULL)'
 	$(PYTHON) tool/test_style_gate.py
 
 # Each schema accepts every vector in its .vectors and refuses every one in
@@ -259,4 +285,6 @@ clean:
 	@rm -fv $(TEST_BINS) $(TEST_OBJS) $(TEST_OBJS:.o=.d) \
 	        $(SEXPR_OBJS) $(SEXPR_OBJS:.o=.d) $(GEN_SOURCES) $(GEN_HEADERS) \
 	        $(AGENT_OBJS) $(AGENT_OBJS:.o=.d) $(AGENT_GEN) \
-	        $(SPEC_OBJS) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS) $(PLAN_OBJS:.o=.d)
+	        $(SPEC_OBJS) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS) $(PLAN_OBJS:.o=.d) \
+	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) \
+	        $(CLI_TEST_FILES)
