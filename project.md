@@ -454,7 +454,7 @@ J left these open, so the check settles them, and each is a row to change if it 
 Two keys are checked against lists the declaration already has rather than against ids:
 
 - **A medium's type is checked against `media_types`**, since J.4 says so. The key is looked up as `media`. `hull_engine.h` used `media.cdrom` as an id example, which would have been a second way to say the same thing, and it is gone.
-- **An arch other than `host` must be in `arches`**, where `NULL` means host-only.
+- **An arch is a class's question before it is an engine's.** The host's own asks nothing, written as `host` or by name, which is why the matrix is given the host's arch. Any other is refused outright for `ns` and `vm`, which share the host's kernel or accelerate it (§6). For `emu` it must be in the engine's `arches`. A per-engine list alone was wrong: qemu lists foreign arches for emu and would have offered them to vm as well.
 
 **`--accept` tokens are their own field.** §6's rule 1 lets the user honour a rejection, and `hull_cap_entry` gained `accept` for the token that does it. The draft had put the token inside the free-text `note`, which would have had to be parsed out. A rejection with no token cannot be honoured.
 
@@ -466,7 +466,7 @@ Open, each for the planner's next step:
 - **`(ns (binfmt true))` does not change `arches` yet.** An ns engine that can run foreign arches with qemu-user (§5.3) has no way to say "only with binfmt".
 - **Choosing the engine is §4.5's.** What an engine's `create()` receives, the plan itself, comes after both.
 
-**Measured:** `test/matrix_test.c` runs 32 cases against two made-up columns, shaped like §5.0's qemu and docker. Each case states every field it expects reported, so an extra field fails as surely as a missing one. In a scratch copy, sabotaging each of thirteen rules failed the suite: undeclared rejected, a token honoured, a token required, the class check, ignoring other tuning, `false` asking nothing, the choice in the id, the source's default mutability, arches, media types, `allow`, the returned status, and hull's own keys.
+**Measured:** `test/matrix_test.c` runs 35 cases against two made-up columns, shaped like §5.0's qemu and docker. Each case states every field it expects reported, so an extra field fails as surely as a missing one. In a scratch copy, sabotaging each of thirteen rules failed the suite: undeclared rejected, a token honoured, a token required, the class check, ignoring other tuning, `false` asking nothing, the choice in the id, the source's default mutability, arches, media types, `allow`, the returned status, and hull's own keys. So did breaking the class rule for a foreign arch and the host's arch by name, added after the first version took `(arch amd64)` on an amd64 host for a foreign one.
 
 ### 4.5 The registry: which engine a backend chooses
 
@@ -483,14 +483,14 @@ Open, each for the planner's next step:
 
 **A class chooses the host's default engine of it.** That is the engine host policy names through `hull_registry_set_default()`, which `policy.conf` (§4.1) will call. Until a default is set, it is the first engine registered that implements the class, so registration order is the host's preference.
 
-**An engine named outright runs as the first class it lists**, unless the machine's arch is foreign and the engine implements `emu`, which J.1 says a foreign arch means. "Foreign" is anything but `host` and the registry's own host arch: `(arch amd64)` on an amd64 host is not foreign. A class named outright is not second-guessed: `(backend vm)` with `(arch arm64)` stays vm, and the matrix refuses the arch. With no `backend` written, J.1's `ns` applies.
+**An engine named outright runs as the first class it lists**, unless the machine's arch is foreign and the engine implements `emu`, which J.1 says a foreign arch means. "Foreign" is anything but `host` and the registry's own host arch: `(arch amd64)` on an amd64 host is not foreign. A class named outright is not second-guessed: `(backend vm)` with `(arch arm64)` stays vm, and the matrix refuses the arch. With no `backend` written, J.1's `ns` applies. A caller may name the backend instead of the spec, as `hull check --backend a,b,c` (J.8) must.
 
 **Open:**
 
 - **`(qemu (accel tcg))` does not make qemu run as emu.** J.5 says tcg "⇒ emu class semantics", but that is a fact about one engine's tuning key, and the registry knows no engine's keys. Either the declaration says which of its tuning values imply a class, or `(backend emu)` is the only way to ask. For now it is the latter.
 - **Nothing calls `set_default` yet**: `policy.conf` has no schema.
 
-**Measured:** `test/registry_test.c` runs 34 cases, and every refusal must carry a reason. In a scratch copy, sabotaging each of thirteen rules failed the suite: the major ABI, the struct sizes, the name rule, the class list, duplicates, the limit, the policy default, first-registered order, foreign means emu, the host's own arch, `ns` when unwritten, an exact name match, and a default that must implement its class.
+**Measured:** `test/registry_test.c` runs 37 cases, and every refusal must carry a reason. In a scratch copy, sabotaging each of thirteen rules failed the suite: the major ABI, the struct sizes, the name rule, the class list, duplicates, the limit, the policy default, first-registered order, foreign means emu, the host's own arch, `ns` when unwritten, an exact name match, and a default that must implement its class.
 
 ---
 

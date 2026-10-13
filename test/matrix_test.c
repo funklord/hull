@@ -125,7 +125,8 @@ static void expect(int line, const char *text, const hull_capabilities *caps,
 		       error.reason);
 		return;
 	}
-	got = hull_matrix_resolve(&spec, &spec.machine, caps, class_name, accepted, collect, &s);
+	got = hull_matrix_resolve(&spec, &spec.machine, caps, class_name, "amd64", accepted,
+	                          collect, &s);
 	if (got != want || strcmp(s.text, want_text) != 0) {
 		failures++;
 		printf("FAIL %s:%d: status %d, [%s]\n     wanted %d, [%s]\n", __FILE__, line,
@@ -178,8 +179,13 @@ static void test_ids(void)
 
 static void test_lists(void)
 {
-	/* Arches: the host's asks nothing; another must be listed. */
+	/* Arches: the host's asks nothing, by either name; another is emu's
+	 * alone, and then must be listed. */
 	OK("(machine (source \"debian:13\") (arch host))", &docker, "ns", "source.ref.overlay:n");
+	OK("(machine (source \"debian:13\") (arch amd64))", &docker, "ns", "source.ref.overlay:n");
+	OK("(machine (source \"debian:13\") (arch amd64))", &qemu, "vm", "source.ref.overlay:n");
+	NO("(machine (source \"debian:13\") (arch arm64))", &qemu, "vm",
+	   "source.ref.overlay:n arch:r");
 	OK("(machine (source \"debian:13\") (arch arm64))", &qemu, "emu",
 	   "source.ref.overlay:n arch:n");
 	NO("(machine (source \"debian:13\") (arch riscv64))", &qemu, "emu",
@@ -237,7 +243,7 @@ static void test_accept(void)
 	cases++;
 	memset(&s, 0, sizeof s);
 	hull_spec_open(&spec, (const uint8_t *)text, sizeof text - 1u, &error);
-	hull_matrix_resolve(&spec, &spec.machine, &qemu, "vm", NULL, collect, &s);
+	hull_matrix_resolve(&spec, &spec.machine, &qemu, "vm", "amd64", NULL, collect, &s);
 	if (strcmp(s.token, "vm:inotify-poll") != 0 ||
 	    s.first_rejected != (uint32_t)(strstr(text, "inotify") - text))
 		FAIL("token `%s` at %u", s.token, s.first_rejected);
@@ -249,7 +255,7 @@ static void test_accept(void)
 	/* A class the engine does not implement is refused before anything. */
 	cases++;
 	memset(&s, 0, sizeof s);
-	if (hull_matrix_resolve(&spec, &spec.machine, &qemu, "ns", NULL, collect, &s) !=
+	if (hull_matrix_resolve(&spec, &spec.machine, &qemu, "ns", "amd64", NULL, collect, &s) !=
 	    HULL_MATRIX_ERR_CLASS || s.length != 0u)
 		FAIL("ns on qemu");
 }
@@ -268,7 +274,7 @@ static void test_machines(void)
 	memset(&s, 0, sizeof s);
 	if (hull_spec_open(&spec, (const uint8_t *)text, sizeof text - 1u, &error) != HULL_SPEC_OK ||
 	    !hull_spec_find(&spec, &spec.machines, "web", &web) ||
-	    hull_matrix_resolve(&spec, &web, &qemu, "vm", NULL, collect, &s) != HULL_MATRIX_OK ||
+	    hull_matrix_resolve(&spec, &web, &qemu, "vm", "amd64", NULL, collect, &s) != HULL_MATRIX_OK ||
 	    strcmp(s.text, "source.dir.direct:n ports:e") != 0)
 		FAIL("[%s]", s.text);
 }

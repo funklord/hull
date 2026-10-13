@@ -20,6 +20,7 @@ typedef struct resolver {
 	const hull_spec         *spec;
 	const hull_capabilities *caps;
 	const char              *class_name;
+	const char              *host_arch;
 	const char *const       *accepted;
 	hull_matrix_report       report;
 	void                    *context;
@@ -223,7 +224,12 @@ static void resolve_source(resolver *r, const hull_sexpr_form *machine,
 	resolve(r, id, entry->offset);
 }
 
-/* `(arch arm64)`: the host's asks nothing; another must be listed. */
+/*
+ * `(arch arm64)`. The host's own asks nothing, by name or as `host`.
+ * Another is a class's question before it is an engine's (section 6): ns
+ * shares the host's kernel and vm is accelerated, so only emu runs a
+ * foreign arch, and then only one the engine lists.
+ */
 static void resolve_arch(resolver *r, const hull_sexpr_form *entry)
 {
 	hull_sexpr_form head;
@@ -231,9 +237,13 @@ static void resolve_arch(resolver *r, const hull_sexpr_form *entry)
 
 	hull_sexpr_child(&r->spec->doc, entry, &head);
 	hull_sexpr_next(&r->spec->doc, &head, &value);
-	if (hull_sexpr_is(&r->spec->doc, &value, "host"))
+	if (hull_sexpr_is(&r->spec->doc, &value, "host") ||
+	    (r->host_arch != NULL && hull_sexpr_is(&r->spec->doc, &value, r->host_arch)))
 		return;
-	if (listed(r->caps->arches, &r->spec->doc, &value))
+	if (strcmp(r->class_name, "emu") != 0)
+		emit(r, "arch", HULL_OUTCOME_REJECTED,
+		     "only the emu class runs an arch other than the host's", NULL, entry->offset);
+	else if (listed(r->caps->arches, &r->spec->doc, &value))
 		emit(r, "arch", HULL_OUTCOME_NATIVE, NULL, NULL, entry->offset);
 	else
 		emit(r, "arch", HULL_OUTCOME_REJECTED, "the engine does not run this arch",
@@ -340,7 +350,7 @@ static void resolve_tuning(resolver *r, const hull_sexpr_form *entry)
 
 hull_matrix_status hull_matrix_resolve(const hull_spec *spec, const hull_sexpr_form *machine,
                                        const hull_capabilities *caps, const char *class_name,
-                                       const char *const *accepted,
+                                       const char *host_arch, const char *const *accepted,
                                        hull_matrix_report report, void *context)
 {
 	resolver        r;
@@ -352,6 +362,7 @@ hull_matrix_status hull_matrix_resolve(const hull_spec *spec, const hull_sexpr_f
 	r.spec       = spec;
 	r.caps       = caps;
 	r.class_name = class_name;
+	r.host_arch  = host_arch;
 	r.accepted   = accepted;
 	r.report     = report;
 	r.context    = context;

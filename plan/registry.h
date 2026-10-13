@@ -61,12 +61,15 @@ hull_registry_status hull_registry_set_default(hull_registry *registry,
                                                const char *class_name,
                                                const char *engine_name);
 
-/* The engine and class `machine`'s backend chooses: J.1's `ns` where it
- * names none. `machine` is a machine in a spec hull_spec_open() accepted. */
+/* The engine and class a backend chooses for `machine`, a machine in a
+ * spec hull_spec_open() accepted. `backend` is the class or engine to
+ * choose, as `hull check --backend` names one, or NULL for the machine's
+ * own `(backend ...)`: J.1's `ns` where it names none. */
 hull_registry_status hull_registry_choose(const hull_registry *registry,
                                           const hull_spec *spec,
                                           const hull_sexpr_form *machine,
-                                          hull_choice *choice, const char **reason);
+                                          const char *backend, hull_choice *choice,
+                                          const char **reason);
 
 #ifdef __cplusplus
 }

@@ -157,14 +157,18 @@ static int foreign(const hull_registry *registry, const hull_spec *spec,
 hull_registry_status hull_registry_choose(const hull_registry *registry,
                                           const hull_spec *spec,
                                           const hull_sexpr_form *machine,
-                                          hull_choice *choice, const char **reason)
+                                          const char *backend_name, hull_choice *choice,
+                                          const char **reason)
 {
 	hull_sexpr_form    backend;
 	const char        *name   = "ns";
 	size_t             length = 2u;
 	const hull_engine *engine;
 
-	if (value_of(spec, machine, "backend", &backend)) {
+	if (backend_name != NULL) {
+		name   = backend_name;
+		length = strlen(backend_name);
+	} else if (value_of(spec, machine, "backend", &backend)) {
 		name   = (const char *)spec->doc.data + backend.content;
 		length = backend.content_length;
 	}

@@ -157,8 +157,8 @@ static void test_full(void)
 
 /* `(backend ...)` in `text`, against a registry of docker, crun, qemu and
  * virtualbox in that order, after `setup` has run on it. */
-static void expect_choice(int line, const char *text, const char *host_arch,
-                          hull_registry_status want, const hull_engine *engine,
+static void expect_choice(int line, const char *text, const char *backend,
+                          const char *host_arch, hull_registry_status want, const hull_engine *engine,
                           const char *class_name,
                           void (*setup)(hull_registry *registry))
 {
@@ -182,7 +182,7 @@ static void expect_choice(int line, const char *text, const char *host_arch,
 		return;
 	}
 	memset(&choice, 0, sizeof choice);
-	got = hull_registry_choose(&registry, &spec, &spec.machine, &choice, &reason);
+	got = hull_registry_choose(&registry, &spec, &spec.machine, backend, &choice, &reason);
 	if (got != want) {
 		failures++;
 		printf("FAIL %s:%d: status %d (%s), wanted %d\n", __FILE__, line, (int)got,
@@ -200,9 +200,9 @@ static void expect_choice(int line, const char *text, const char *host_arch,
 }
 
 #define CHOOSE(text, engine, class_name) \
-	expect_choice(__LINE__, text, "amd64", HULL_REGISTRY_OK, engine, class_name, NULL)
+	expect_choice(__LINE__, text, NULL, "amd64", HULL_REGISTRY_OK, engine, class_name, NULL)
 #define REFUSE(text, status) \
-	expect_choice(__LINE__, text, "amd64", HULL_REGISTRY_##status, NULL, NULL, NULL)
+	expect_choice(__LINE__, text, NULL, "amd64", HULL_REGISTRY_##status, NULL, NULL, NULL)
 
 static void crun_for_ns(hull_registry *registry)
 {
@@ -224,7 +224,7 @@ static void test_choose(void)
 	CHOOSE("(machine (source \"a\") (backend emu))", &qemu, "emu");
 
 	/* Until host policy names another. */
-	expect_choice(__LINE__, "(machine (source \"a\"))", "amd64", HULL_REGISTRY_OK,
+	expect_choice(__LINE__, "(machine (source \"a\"))", NULL, "amd64", HULL_REGISTRY_OK,
 	              &crun, "ns", crun_for_ns);
 
 	/* An engine by name runs as its first class... */
@@ -234,17 +234,25 @@ static void test_choose(void)
 	CHOOSE("(machine (source \"a\") (backend qemu) (arch host))", &qemu, "vm");
 	/* ...unless the arch is foreign and it can emulate. */
 	CHOOSE("(machine (source \"a\") (backend qemu) (arch arm64))", &qemu, "emu");
-	expect_choice(__LINE__, "(machine (source \"a\") (backend qemu) (arch arm64))", "arm64",
+	expect_choice(__LINE__, "(machine (source \"a\") (backend qemu) (arch arm64))", NULL, "arm64",
 	              HULL_REGISTRY_OK, &qemu, "vm", NULL);
 	/* An engine that cannot is left for the matrix to refuse the arch. */
 	CHOOSE("(machine (source \"a\") (backend virtualbox) (arch arm64))", &virtualbox, "vm");
 	/* A class named outright is not second-guessed. */
 	CHOOSE("(machine (source \"a\") (backend vm) (arch arm64))", &qemu, "vm");
 
+	/* A backend named from outside wins over the spec's own. */
+	expect_choice(__LINE__, "(machine (source \"a\") (backend docker))", "vm", "amd64",
+	              HULL_REGISTRY_OK, &qemu, "vm", NULL);
+	expect_choice(__LINE__, "(machine (source \"a\") (arch arm64))", "qemu", "amd64",
+	              HULL_REGISTRY_OK, &qemu, "emu", NULL);
+	expect_choice(__LINE__, "(machine (source \"a\"))", "lxc", "amd64",
+	              HULL_REGISTRY_ERR_UNKNOWN, NULL, NULL, NULL);
+
 	REFUSE("(machine (source \"a\") (backend hyperv))", ERR_UNKNOWN);
 	REFUSE("(machine (source \"a\") (backend dock))", ERR_UNKNOWN);
 	REFUSE("(machine (source \"a\") (backend dockers))", ERR_UNKNOWN);
-	expect_choice(__LINE__, "(machine (source \"a\") (backend vm))", "amd64",
+	expect_choice(__LINE__, "(machine (source \"a\") (backend vm))", NULL, "amd64",
 	              HULL_REGISTRY_ERR_NO_ENGINE, NULL, NULL, only_docker);
 }
 

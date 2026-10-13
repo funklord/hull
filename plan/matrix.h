@@ -53,14 +53,15 @@ typedef enum hull_matrix_status {
 /*
  * Resolve `machine`, a `(machine ...)` form or a named entry of
  * `(machines ...)` in a spec hull_spec_open() accepted, for the engine
- * `caps` running it as `class_name`. `accepted` is the user's tokens,
+ * `caps` running it as `class_name` on a host whose arch is `host_arch`,
+ * or NULL where only `host` names it. `accepted` is the user's tokens,
  * NULL-terminated, or NULL for none. Every field is reported, in the
  * order the spec gives them, so `hull plan --explain` can print the lot;
  * the status says whether any was rejected.
  */
 hull_matrix_status hull_matrix_resolve(const hull_spec *spec, const hull_sexpr_form *machine,
                                        const hull_capabilities *caps, const char *class_name,
-                                       const char *const *accepted,
+                                       const char *host_arch, const char *const *accepted,
                                        hull_matrix_report report, void *context);
 
 #ifdef __cplusplus
