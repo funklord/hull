@@ -422,7 +422,8 @@ static hull_plan_status judge(writer *w, const char *projection, const char *con
  * key in another, and closed into `canonical`. The machine's scratch is
  * the first two thirds of `work`, free again once it is written.
  */
-static hull_plan_status encode(hull_plan *plan, const char *class_name, const char *base)
+static hull_plan_status encode(hull_plan *plan, const char *class_name, const char *engine_name,
+                               const char *base)
 {
 	uint8_t  *items   = plan->work;
 	uint8_t  *entries = plan->work + 2u * HULL_PLAN_TEXT;
@@ -442,6 +443,12 @@ static hull_plan_status encode(hull_plan *plan, const char *class_name, const ch
 	if (hull_sexpr_put_atom(pair, sizeof pair, &n_pair, (const uint8_t *)"class", 5u) ||
 	    hull_sexpr_put_atom(pair, sizeof pair, &n_pair, (const uint8_t *)class_name,
 	                        (uint32_t)strlen(class_name)) ||
+	    hull_sexpr_put_list(entries, HULL_PLAN_TEXT, &n, pair, n_pair))
+		return HULL_PLAN_ERR_SIZE;
+	n_pair = 0u;
+	if (hull_sexpr_put_atom(pair, sizeof pair, &n_pair, (const uint8_t *)"engine", 6u) ||
+	    hull_sexpr_put_atom(pair, sizeof pair, &n_pair, (const uint8_t *)engine_name,
+	                        (uint32_t)strlen(engine_name)) ||
 	    hull_sexpr_put_list(entries, HULL_PLAN_TEXT, &n, pair, n_pair) ||
 	    hull_sexpr_to_canonical(&plan->resolved.doc, &plan->resolved.machine, entries,
 	                            HULL_PLAN_TEXT, &n, plan->work, 2u * HULL_PLAN_TEXT) ||
@@ -514,5 +521,6 @@ hull_plan_status hull_plan_build(hull_plan *plan, const hull_spec *spec,
 	status = judge(&w, projection, accepted, &r);
 	if (status != HULL_PLAN_OK && status != HULL_PLAN_REJECTED)
 		return status;
-	return encode(plan, choice->class_name, base) != HULL_PLAN_OK ? HULL_PLAN_ERR_SIZE : status;
+	return encode(plan, choice->class_name, choice->engine->caps->engine_name, base) !=
+	       HULL_PLAN_OK ? HULL_PLAN_ERR_SIZE : status;
 }

@@ -1,4 +1,4 @@
-# Messages that core/protocol.situ must refuse, every one of them: `make
+# Messages that core/frontend.situ must refuse, every one of them: `make
 # test` fails unless situc reports each vector here as not conforming. The
 # comment says which rule each is aimed at.
 

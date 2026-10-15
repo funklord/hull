@@ -342,7 +342,7 @@ static void test_offsets(void)
 static void test_canonical(void)
 {
 	static const char want[] =
-	        "(4:plan(5:class2:ns)(7:machine(7:mutable6:direct)(13:on_disconnect4:stop)"
+	        "(4:plan(5:class2:ns)(6:engine6:binder)(7:machine(7:mutable6:direct)(13:on_disconnect4:stop)"
 	        "(10:projection4:bind)(8:security(12:no_new_privs4:true)(13:readonly_root5:false))"
 	        "(6:source5:dir:.)(3:ssh5:false)(6:tuning(2:ns(6:binfmt5:false)))(7:workdir1:/)"
 	        "(9:writeback4:none)))";
@@ -367,13 +367,13 @@ static void test_canonical(void)
 	base = "/srv/app";
 	run(__LINE__, "(machine (source \"dir:.\"))", NULL, &binder, "ns", &s);
 	base = NULL;
-	if (memcmp(plan.canonical, "(4:plan(4:base8:/srv/app)(5:class2:ns)(7:machine", 48) != 0)
+	if (memcmp(plan.canonical, "(4:plan(4:base8:/srv/app)(5:class2:ns)(6:engine6:binder)(7:machine", 66) != 0)
 		FAIL("base: %.*s", (int)plan.canonical_length, (const char *)plan.canonical);
 
 	/* The class is the one it runs as. */
 	cases++;
 	run(__LINE__, "(machine (source \"debian:13\"))", NULL, &both, "emu", &s);
-	if (memcmp(plan.canonical, "(4:plan(5:class3:emu)(7:machine", 31) != 0)
+	if (memcmp(plan.canonical, "(4:plan(5:class3:emu)(6:engine4:both)(7:machine", 47) != 0)
 		FAIL("emu: %.*s", (int)plan.canonical_length, (const char *)plan.canonical);
 }
 

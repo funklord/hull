@@ -13,6 +13,12 @@ set -u
 
 hull=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 dir=${BUILD_DIR:?}/test/docker
+# A core of the test's own, as in cli_test.sh.
+XDG_RUNTIME_DIR=$(cd "${BUILD_DIR:?}" && pwd)/test/run
+export XDG_RUNTIME_DIR
+export HULL_CORE_IDLE=1
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
 mkdir -p "$dir/data"
 root=$(cd "$dir" && pwd)
 cases=0
@@ -134,6 +140,15 @@ expect 127 'exec /nope failed' nocmd
 cases=$((cases + 1))
 left=$(timeout 10 docker ps -a --filter name=hull-dtest- --format '{{.Names}}')
 [ -z "$left" ] || fail "containers left behind" "$left"
+
+# And the test's core leaves once nothing needs it.
+cases=$((cases + 1))
+tries=0
+while [ -S "$XDG_RUNTIME_DIR/hull/core.sock" ] && [ "$tries" -lt 80 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+[ ! -S "$XDG_RUNTIME_DIR/hull/core.sock" ] || fail "the core did not leave when idle" ""
 
 printf 'docker: %u cases, %u failed\n' "$cases" "$failures"
 [ "$failures" -eq 0 ]

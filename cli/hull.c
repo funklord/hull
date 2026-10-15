@@ -24,7 +24,7 @@
  * plan or start it.
  */
 
-#define _XOPEN_SOURCE 700
+#define _GNU_SOURCE
 
 #include <errno.h>
 #include <libgen.h>
@@ -33,15 +33,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "builtin.h"
+#include "core.h"
 #include "matrix.h"
 #include "plan.h"
 #include "registry.h"
 #include "spec.h"
+#include "wire.h"
 
 #define MAX_FILE      (16u << 20)
 #define MAX_TOKENS    32u
@@ -74,6 +81,8 @@ static void usage(FILE *out)
 	      " [--resolved]\n"
 	      "       hull check [-f FILE] --backend B[,B...] [--accept TOKEN]...\n"
 	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [NAME]\n"
+	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
+	      "       hull core\n"
 	      "       hull engines\n"
 	      "       hull --version\n", out);
 }
@@ -268,27 +277,158 @@ static char *base_of(const char *file)
 	return base;
 }
 
-/* --- run ---------------------------------------------------------------- */
+/* --- the core ----------------------------------------------------------- */
 
-/* What the engine reports back while one machine runs. */
-struct hull_core {
-	pthread_mutex_t lock;
-	pthread_cond_t  cond;
-	int             exited;
-	int             code;
-	int             signal;
-};
+static volatile sig_atomic_t interrupted;
 
-static hull_core              core = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER,
-                                       0, 0, 0 };
-static volatile sig_atomic_t  interrupted;
-
-static void on_data(hull_core *c, hull_stream *stream, int fd, const uint8_t *data, size_t n)
+static void interrupt(int signal)
 {
-	(void)c;
-	(void)stream;
+	(void)signal;
+	interrupted = 1;
+}
+
+/* $XDG_RUNTIME_DIR/hull/<leaf>, or 0 if the runtime directory is unset. */
+static int runtime_path(char *out, size_t cap, const char *leaf)
+{
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+
+	if (runtime == NULL || runtime[0] != '/')
+		return 0;
+	return (size_t)snprintf(out, cap, "%s/hull/%s", runtime, leaf) < cap;
+}
+
+static int dial_core(void)
+{
+	struct sockaddr_un address;
+	char               path[sizeof address.sun_path];
+	int                fd;
+
+	char               dir[4096];
+	int                at = -1;
+
+	if (!runtime_path(dir, sizeof dir, ""))
+		return -1;
+	memset(&address, 0, sizeof address);
+	address.sun_family = AF_UNIX;
+	/* As the core names it: through a descriptor on the directory when
+	 * the whole path does not fit in a socket address. */
+	if (runtime_path(path, sizeof path, "core.sock")) {
+		strcpy(address.sun_path, path);
+	} else {
+		at = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+		if (at < 0)
+			return -1;
+		snprintf(address.sun_path, sizeof address.sun_path, "/proc/self/fd/%d/core.sock", at);
+	}
+	fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (fd >= 0 && connect(fd, (struct sockaddr *)&address, sizeof address) != 0) {
+		close(fd);
+		fd = -1;
+	}
+	if (at >= 0)
+		close(at);
+	return fd;
+}
+
+/* Start a core, as `hull core`, in a session of its own and reparented at
+ * once, so it is never this process's zombie; its output goes to
+ * core.log, truncated, beside the socket. */
+static void start_core(void)
+{
+	char  dir[4096];
+	char  log[4096];
+	pid_t child;
+
+	if (!runtime_path(dir, sizeof dir, "") || !runtime_path(log, sizeof log, "core.log"))
+		return;
+	mkdir(dir, 0700);
+	child = fork();
+	if (child == 0) {
+		if (fork() == 0) {
+			int null = open("/dev/null", O_RDONLY);
+			int out  = open(log, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+			setsid();
+			if (null >= 0)
+				dup2(null, 0);
+			if (out >= 0) {
+				dup2(out, 1);
+				dup2(out, 2);
+			}
+			execl("/proc/self/exe", "hull", "core", (char *)NULL);
+			_exit(127);
+		}
+		_exit(0);
+	}
+	if (child > 0)
+		waitpid(child, NULL, 0);
+}
+
+/* A connection to the core, said hello on. With `start`, a core is started
+ * when none answers. Returns 0, or -1 having said why. */
+static int connect_core(hull_wire *wire, int start)
+{
+	hull_msg       hello = { 0 };
+	hull_sexpr_doc body;
+	int            fd = dial_core();
+
+	if (fd < 0 && start && getenv("XDG_RUNTIME_DIR") != NULL) {
+		start_core();
+		for (int tries = 0; fd < 0 && tries < 100; tries++) {
+			struct timespec pause = { 0, 50000000L };
+
+			nanosleep(&pause, NULL);
+			fd = dial_core();
+		}
+	}
+	if (fd < 0) {
+		if (getenv("XDG_RUNTIME_DIR") == NULL)
+			fprintf(stderr, "hull: XDG_RUNTIME_DIR is not set, so there is no core\n");
+		else if (start)
+			fprintf(stderr, "hull: the core did not start; see $XDG_RUNTIME_DIR/hull/core.log\n");
+		return -1;
+	}
+	if (hull_wire_open(wire, fd, HULL_WIRE_FROM_CORE) != 0) {
+		close(fd);
+		return -1;
+	}
+	hull_msg_raw(&hello, "(5:hello(2:ch1:0)(5:proto1:1))");
+	if (hull_wire_send(fd, &hello) != 0 || hull_wire_read(wire, &body) != HULL_WIRE_OK ||
+	    !hull_msg_is(&body, "hello")) {
+		fprintf(stderr, "hull: the core did not answer hello\n");
+		hull_msg_free(&hello);
+		hull_wire_close(wire);
+		return -1;
+	}
+	hull_msg_free(&hello);
+	return 0;
+}
+
+static void send_request(hull_wire *wire, const char *type, uint32_t ch, const char *id,
+                         const char *rest)
+{
+	hull_msg m = { 0 };
+
+	hull_msg_raw(&m, type);
+	hull_msg_channel(&m, ch);
+	if (rest != NULL && strncmp(rest, "(6:follow", 9u) == 0)
+		hull_msg_raw(&m, rest);
+	if (id != NULL) {
+		hull_msg_raw(&m, "(7:machine");
+		hull_msg_text(&m, id);
+		hull_msg_raw(&m, ")");
+	}
+	if (rest != NULL && strncmp(rest, "(6:follow", 9u) != 0)
+		hull_msg_raw(&m, rest);
+	hull_msg_raw(&m, ")");
+	hull_wire_send(wire->fd, &m);
+	hull_msg_free(&m);
+}
+
+static void write_all(int fd, const uint8_t *data, size_t n)
+{
 	while (n > 0u) {
-		ssize_t wrote = write(fd == 2 ? 2 : 1, data, n);
+		ssize_t wrote = write(fd, data, n);
 
 		if (wrote < 0 && errno == EINTR)
 			continue;
@@ -299,85 +439,108 @@ static void on_data(hull_core *c, hull_stream *stream, int fd, const uint8_t *da
 	}
 }
 
-static void on_eof(hull_core *c, hull_stream *stream, int fd)
-{
-	(void)c;
-	(void)stream;
-	(void)fd;
-}
-
-static void on_exit_status(hull_core *c, hull_machine *machine, hull_stream *stream, int code,
-                           int signal)
-{
-	(void)machine;
-	(void)stream;
-	pthread_mutex_lock(&c->lock);
-	c->exited = 1;
-	c->code   = code;
-	c->signal = signal;
-	pthread_cond_broadcast(&c->cond);
-	pthread_mutex_unlock(&c->lock);
-}
-
-static void on_state(hull_core *c, hull_machine *machine, const char *state)
-{
-	(void)c;
-	(void)machine;
-	(void)state;
-}
-
-static void on_log(hull_core *c, int level, const char *message)
-{
-	(void)c;
-	if (level >= 2)
-		fprintf(stderr, "hull: %s\n", message);
-}
-
-static const hull_host_ops host_ops = {
-	.struct_size = sizeof (hull_host_ops),
-	.on_data     = on_data,
-	.on_eof      = on_eof,
-	.on_exit     = on_exit_status,
-	.on_state    = on_state,
-	.log         = on_log,
-};
-
-static void interrupt(int signal)
-{
-	(void)signal;
-	interrupted = 1;
-}
-
-/* Until the workload exits, asking the engine to stop it on SIGINT or
- * SIGTERM. Returns the status run exits with. */
-static int wait_for(const hull_engine_ops *ops, hull_machine *machine)
+/* Messages on channel `ch` until it ends: output written out, an exit
+ * turned into the status `run` exits with. `stop_id`, when set, is the
+ * machine a SIGINT or SIGTERM stops. Returns the status, 0 for a plain
+ * end, or 125 for an error, which is printed. */
+static int follow(hull_wire *wire, uint32_t ch, const char *stop_id)
 {
 	int stopping = 0;
 
-	pthread_mutex_lock(&core.lock);
-	while (!core.exited) {
-		struct timespec deadline;
+	for (;;) {
+		hull_sexpr_doc   body;
+		hull_sexpr_form  value;
+		long long        channel = -1;
+		hull_wire_status status;
 
-		if (interrupted && !stopping) {
-			hull_error error = { .struct_size = sizeof error };
-
+		if (interrupted && stop_id != NULL && !stopping) {
 			stopping = 1;
-			pthread_mutex_unlock(&core.lock);
-			ops->stop(&core, machine, 10000, &error);
-			pthread_mutex_lock(&core.lock);
+			send_request(wire, "(4:stop", ch + 1u, stop_id, "(10:timeout_ms5:10000)");
+		}
+		status = hull_wire_read(wire, &body);
+		if (status == HULL_WIRE_WAIT)
 			continue;
+		if (status != HULL_WIRE_OK) {
+			fprintf(stderr, "hull: the core went away\n");
+			return 125;
 		}
-		clock_gettime(CLOCK_REALTIME, &deadline);
-		deadline.tv_nsec += 200000000L;
-		if (deadline.tv_nsec >= 1000000000L) {
-			deadline.tv_sec++;
-			deadline.tv_nsec -= 1000000000L;
+		if (!hull_msg_find(&body, "ch", &value) || !hull_msg_long(&body, &value, &channel) ||
+		    channel != (long long)ch)
+			continue;
+		if (hull_msg_is(&body, "data")) {
+			hull_sexpr_form buf;
+			hull_sexpr_form fd;
+
+			if (hull_msg_find(&body, "buf", &buf) && hull_msg_find(&body, "fd", &fd))
+				write_all(hull_sexpr_is(&body, &fd, "2") ? 2 : 1, body.data + buf.content,
+				          buf.content_length);
+		} else if (hull_msg_is(&body, "exited")) {
+			long long code = 0;
+			long long sig  = 0;
+
+			if (hull_msg_find(&body, "code", &value))
+				hull_msg_long(&body, &value, &code);
+			if (hull_msg_find(&body, "signal", &value))
+				hull_msg_long(&body, &value, &sig);
+			return sig != 0 ? 128 + (int)sig : (int)code;
+		} else if (hull_msg_is(&body, "error")) {
+			char reason[512] = "an error";
+
+			if (hull_msg_find(&body, "reason", &value))
+				hull_msg_string(&body, &value, reason, sizeof reason);
+			fprintf(stderr, "hull: %s\n", reason);
+			return 125;
+		} else if (hull_msg_is(&body, "eof") || hull_msg_is(&body, "done")) {
+			return 0;
 		}
-		pthread_cond_timedwait(&core.cond, &core.lock, &deadline);
 	}
-	pthread_mutex_unlock(&core.lock);
-	return core.signal != 0 ? 128 + core.signal : core.code;
 }
+
+/* The machine's id: its name in (machines ...), else its hostname, else
+ * the file's directory's name, lowercased into a DNS label. */
+static int machine_id(const hull_spec *spec, const hull_sexpr_form *machine, const char *name,
+                      const char *base, char *out, size_t cap)
+{
+	hull_sexpr_form entry;
+	const char     *from = name;
+	char            hostname[64];
+	size_t          n = 0u;
+
+	if (from == NULL && hull_spec_find(spec, machine, "hostname", &entry)) {
+		hull_sexpr_form head;
+		hull_sexpr_form value;
+		size_t          length;
+
+		hull_sexpr_child(&spec->doc, &entry, &head);
+		hull_sexpr_next(&spec->doc, &head, &value);
+		if (hull_sexpr_value(&spec->doc, &value, (uint8_t *)hostname, sizeof hostname - 1u,
+		                     &length) == HULL_SEXPR_OK) {
+			hostname[length] = '\0';
+			from = hostname;
+		}
+	}
+	if (from == NULL) {
+		from = strrchr(base, '/');
+		from = from != NULL ? from + 1 : base;
+	}
+	for (; *from != '\0' && n + 1u < cap && n < 63u; from++) {
+		char c = *from;
+
+		if (c >= 'A' && c <= 'Z')
+			c = (char)(c - 'A' + 'a');
+		if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')))
+			c = '-';
+		if (c == '-' && (n == 0u || out[n - 1u] == '-'))
+			continue;
+		out[n++] = c;
+	}
+	while (n > 0u && out[n - 1u] == '-')
+		n--;
+	out[n] = '\0';
+	return n != 0u;
+}
+
+/* --- run ---------------------------------------------------------------- */
 
 static int run(options *o, const hull_registry *registry, const char *name)
 {
@@ -386,9 +549,8 @@ static int run(options *o, const hull_registry *registry, const char *name)
 	hull_spec_error      error;
 	hull_sexpr_form      machine;
 	hull_choice          choice;
-	hull_machine        *handle = NULL;
-	hull_error           failure = { .struct_size = sizeof failure };
-	const hull_engine_ops *ops;
+	hull_wire            wire;
+	hull_msg             request = { 0 };
 	const char          *reason = NULL;
 	const char          *shown;
 	struct sigaction     action;
@@ -396,6 +558,7 @@ static int run(options *o, const hull_registry *registry, const char *name)
 	hull_plan_status     planned;
 	uint8_t             *data;
 	size_t               length;
+	char                 id[64];
 	int                  status;
 
 	data = read_file(o->file, &length);
@@ -418,6 +581,10 @@ static int run(options *o, const hull_registry *registry, const char *name)
 		return 125;
 	}
 	shown = name != NULL ? name : "machine";
+	if (!machine_id(&spec, &machine, name, o->base, id, sizeof id)) {
+		fprintf(stderr, "%s: name the machine with (hostname ...)\n", o->file);
+		return 125;
+	}
 	if (hull_registry_choose(registry, &spec, &machine,
 	                         o->backend_count != 0u ? o->backends[0] : NULL, &choice,
 	                         &reason) != HULL_REGISTRY_OK) {
@@ -437,34 +604,136 @@ static int run(options *o, const hull_registry *registry, const char *name)
 		        planned == HULL_PLAN_REJECTED ? "the plan is rejected" : "it could not be planned");
 		return 125;
 	}
-	ops = choice.engine->ops;
-	if (ops->create == NULL || ops->start == NULL || ops->stop == NULL || ops->destroy == NULL) {
-		fprintf(stderr, "%s: %s: the %s engine cannot run a machine yet\n", o->file, shown,
-		        choice.engine->caps->engine_name);
-		return 125;
+	free(data);
+	{
+		const hull_engine_ops *ops = choice.engine->ops;
+
+		if (ops->create == NULL || ops->start == NULL || ops->stop == NULL ||
+		    ops->destroy == NULL) {
+			fprintf(stderr, "%s: %s: the %s engine cannot run a machine yet\n", o->file,
+			        shown, choice.engine->caps->engine_name);
+			return 125;
+		}
 	}
 
+	/* SIGINT and SIGTERM stop the machine; a hangup only leaves it, to
+	 * whatever (on_disconnect ...) says. */
 	memset(&action, 0, sizeof action);
 	action.sa_handler = interrupt;
 	sigaction(SIGINT, &action, NULL);
 	sigaction(SIGTERM, &action, NULL);
-
-	if (ops->create(&core, (hull_buf){ plan.canonical, plan.canonical_length }, &handle,
-	                &failure) != HULL_OK) {
-		fprintf(stderr, "%s: %s on %s: %s\n", o->file, shown,
-		        choice.engine->caps->engine_name, failure.detail);
+	if (connect_core(&wire, 1) != 0)
+		return 125;
+	hull_msg_raw(&request, "(3:run(2:ch1:1)(7:machine");
+	hull_msg_text(&request, id);
+	hull_msg_raw(&request, ")");
+	hull_msg_bytes(&request, plan.canonical, plan.canonical_length);
+	hull_msg_raw(&request, ")");
+	if (request.failed || hull_wire_send(wire.fd, &request) != 0) {
+		fprintf(stderr, "hull: the run could not be sent\n");
+		hull_msg_free(&request);
+		hull_wire_close(&wire);
 		return 125;
 	}
-	if (ops->start(&core, handle, &failure) != HULL_OK) {
-		fprintf(stderr, "%s: %s on %s: %s\n", o->file, shown,
-		        choice.engine->caps->engine_name, failure.detail);
-		ops->destroy(&core, handle, &failure);
-		return 125;
-	}
-	status = wait_for(ops, handle);
-	ops->destroy(&core, handle, &failure);
-	free(data);
+	hull_msg_free(&request);
+	status = follow(&wire, 1u, id);
+	hull_wire_close(&wire);
 	return status;
+}
+
+/* --- the other commands -------------------------------------------------- */
+
+/* Whether a core answers, without starting one. */
+static int core_running(void)
+{
+	int fd = dial_core();
+
+	if (fd < 0)
+		return 0;
+	close(fd);
+	return 1;
+}
+
+static int list_machines(void)
+{
+	hull_wire      wire;
+	hull_sexpr_doc body;
+	hull_sexpr_form message;
+	hull_sexpr_form item;
+	int            more;
+
+	if (!core_running()) {
+		printf("%-24s %-10s %-6s %s\n", "ID", "ENGINE", "CLASS", "STATE");
+		return 0;
+	}
+	if (connect_core(&wire, 0) != 0)
+		return 2;
+	send_request(&wire, "(4:list", 1u, NULL, NULL);
+	if (hull_wire_read(&wire, &body) != HULL_WIRE_OK || !hull_msg_is(&body, "machines")) {
+		hull_wire_close(&wire);
+		return 2;
+	}
+	printf("%-24s %-10s %-6s %s\n", "ID", "ENGINE", "CLASS", "STATE");
+	hull_sexpr_first(&body, &message);
+	hull_sexpr_child(&body, &message, &item);
+	for (more = hull_sexpr_next(&body, &item, &item); more;
+	     more = hull_sexpr_next(&body, &item, &item)) {
+		const char *keys[] = { "id", "engine", "class", "state" };
+		char        values[4][64] = { "", "", "", "" };
+		hull_sexpr_form head;
+
+		hull_sexpr_child(&body, &item, &head);
+		if (!hull_sexpr_is(&body, &head, "machine"))
+			continue;
+		for (unsigned k = 0u; k < 4u; k++) {
+			hull_sexpr_form entry;
+			hull_sexpr_form name;
+			hull_sexpr_form value;
+			int             entries;
+
+			hull_sexpr_child(&body, &item, &entry);
+			for (entries = hull_sexpr_next(&body, &entry, &entry); entries;
+			     entries = hull_sexpr_next(&body, &entry, &entry))
+				if (hull_sexpr_child(&body, &entry, &name) &&
+				    hull_sexpr_is(&body, &name, keys[k]) &&
+				    hull_sexpr_next(&body, &name, &value))
+					hull_msg_string(&body, &value, values[k], sizeof values[k]);
+		}
+		printf("%-24s %-10s %-6s %s\n", values[0], values[1], values[2], values[3]);
+	}
+	hull_wire_close(&wire);
+	return 0;
+}
+
+/* stop, logs and attach: one request about one machine, followed to its
+ * end. A Ctrl-C under attach or logs only leaves. */
+static int about(const char *command, const char *id, int follow_logs, long timeout_ms)
+{
+	hull_wire wire;
+	char      rest[64];
+	int       status;
+
+	if (!core_running()) {
+		fprintf(stderr, "hull: no core is running, so no machine is\n");
+		return 1;
+	}
+	if (connect_core(&wire, 0) != 0)
+		return 2;
+	if (strcmp(command, "stop") == 0) {
+		snprintf(rest, sizeof rest, "(10:timeout_ms%zu:%ld)",
+		         (size_t)snprintf(NULL, 0, "%ld", timeout_ms), timeout_ms);
+		send_request(&wire, "(4:stop", 1u, id, rest);
+	} else if (strcmp(command, "logs") == 0) {
+		send_request(&wire, "(4:logs", 1u, id,
+		             follow_logs ? "(6:follow4:true)" : "(6:follow5:false)");
+	} else {
+		send_request(&wire, "(6:attach", 1u, id, NULL);
+	}
+	status = follow(&wire, 1u, NULL);
+	hull_wire_close(&wire);
+	if (strcmp(command, "attach") == 0)
+		return status;
+	return status == 125 ? 1 : 0;
 }
 
 static void list_engines(const hull_registry *registry)
@@ -527,9 +796,41 @@ int main(int argc, char **argv)
 	}
 
 	hull_registry_init(&registry, host_arch());
-	if (hull_registry_add(&registry, hull_engine_docker(&host_ops), &reason) != HULL_REGISTRY_OK ||
-	    hull_registry_add(&registry, hull_engine_qemu(&host_ops), &reason) != HULL_REGISTRY_OK ||
-	    hull_registry_add(&registry, hull_engine_chroot(&host_ops), &reason) != HULL_REGISTRY_OK) {
+	if (strcmp(command, "core") == 0 && argc == 2)
+		return hull_core_run(host_arch());
+	if (strcmp(command, "ps") == 0 && argc == 2)
+		return list_machines();
+	if ((strcmp(command, "stop") == 0 || strcmp(command, "attach") == 0 ||
+	     strcmp(command, "logs") == 0) && argc >= 3) {
+		const char *id      = NULL;
+		int         follow  = 0;
+		long        timeout = 10000;
+
+		for (int i = 2; i < argc; i++) {
+			if (strcmp(command, "logs") == 0 && strcmp(argv[i], "-f") == 0)
+				follow = 1;
+			else if (strcmp(command, "stop") == 0 && strcmp(argv[i], "--timeout") == 0 &&
+			         i + 1 < argc)
+				timeout = strtol(argv[++i], NULL, 10) * 1000L;
+			else if (argv[i][0] != '-' && id == NULL)
+				id = argv[i];
+			else {
+				id = NULL;
+				break;
+			}
+		}
+		if (id == NULL) {
+			usage(stderr);
+			return 2;
+		}
+		return about(command, id, follow, timeout < 0 ? 0 : timeout);
+	}
+
+	/* Planning needs the engines' declarations, not their operations,
+	 * which run in the core: nothing here reports to a core. */
+	if (hull_registry_add(&registry, hull_engine_docker(NULL), &reason) != HULL_REGISTRY_OK ||
+	    hull_registry_add(&registry, hull_engine_qemu(NULL), &reason) != HULL_REGISTRY_OK ||
+	    hull_registry_add(&registry, hull_engine_chroot(NULL), &reason) != HULL_REGISTRY_OK) {
 		fprintf(stderr, "hull: a built-in engine is refused: %s\n", reason);
 		return 2;
 	}

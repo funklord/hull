@@ -29,7 +29,9 @@ judges it against that engine's declaration. `build/hull plan` and
 with docker and qemu declared but not yet driven. `build/hull run` runs
 a dir source with `(backend chroot)`, the rootless reference engine in
 `engine/`, and an image ref through the docker adapter, the default for
-`ns`.
+`ns`. Machines run in a per-user core in `core/`, which `hull run`
+starts when none is running and which leaves once idle; `hull ps`,
+`hull stop`, `hull logs` and `hull attach` reach what it holds.
 `hull_engine.h` is a draft of the C plugin interface that engines
 implement.
 

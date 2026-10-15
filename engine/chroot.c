@@ -285,6 +285,11 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int out, int e
 
 	if (null < 0 || dup2(null, 0) < 0 || dup2(out, 1) < 0 || dup2(err, 2) < 0)
 		child_fail(report, "stdio");
+	/* The machine dies with the process that runs its engine, the core:
+	 * nothing could manage it after, since adopt() is not written, and
+	 * nothing is to outlive what started it. */
+	if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0L, 0L, 0L) != 0)
+		child_fail(report, "the parent-death signal");
 	/* A session of its own, so a terminal's Ctrl-C reaches hull and not the
 	 * machine behind its back: only stop() signals a machine. */
 	if (setsid() < 0)
@@ -583,6 +588,8 @@ static const hull_cap_entry entries[] = {
 	{ "security.readonly_root", HULL_SUP_NATIVE,   NULL, NULL },
 	{ "security.no_new_privs",  HULL_SUP_NATIVE,   NULL, NULL },
 	{ "on_disconnect.stop",     HULL_SUP_NATIVE,   NULL, NULL },
+	{ "on_disconnect.keep",     HULL_SUP_NATIVE,
+	  "kept while the core runs; the machine dies with the core", NULL },
 	{ "ports",                  HULL_SUP_REJECTED,
 	  "chroot shares the host's network, so a port is the host's own", NULL },
 	{ NULL,                     HULL_SUP_NATIVE,   NULL, NULL },

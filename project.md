@@ -602,6 +602,7 @@ Two of these had first passed: copying other tuning and copied offsets. Each was
 
 - **Paths in a file are the file's:** the plan carries the file's directory as `(plan (base "/dir") …)`, and engines resolve a relative path against it through `engine/access.c`. `(source "dir:./rootfs")` works from anywhere, and nothing reading a plan depends on where it was started, which a long-lived core serving many files needs. Ignoring the base fails 25 of the CLI test's cases, which run from `/`.
 - **Plan reports go to stderr**, so the workload's stdout stays its own.
+- **Since §4.10, `run` goes through the core**, and the machine's output and exit come back over the frontend protocol.
 - **Exit status follows docker's convention:** the workload's status, 128 plus the signal that ended it, or 125 when hull could not plan or start it. A rejected plan therefore cannot be mistaken for a workload exiting 1.
 - **An engine whose operations are not written**, docker and qemu so far, says so and exits 125.
 
@@ -698,13 +699,13 @@ The read-only volume had first passed: while the container ran as root, a write 
 
 **Decided 2026-10-15, by the holder: build the per-user core now, on a local socket, with a protocol of hull's own.** §2's core is what exec, logs, machines that outlive a terminal and `(on_disconnect keep)` all need. The shared encrypted protocol §2 names for frontends is still unsettled (Handoff notes, item 2), so the core starts local. What it does is fixed now; moving it onto the shared protocol later changes how frontends reach it, not what it does.
 
-**The socket is `$XDG_RUNTIME_DIR/hull/core.sock`**, mode 0600 in a 0700 directory: the user's own, and nobody else's, which is §7's "user-owned socket".
+**The socket is `$XDG_RUNTIME_DIR/hull/core.sock`**, mode 0600 in a 0700 directory: the user's own, and nobody else's, which is §7's "user-owned socket". A socket address holds 108 bytes, and a runtime directory can be deeper than that leaves room for. When it is, the core and the frontend both name the socket through a descriptor on its directory, `/proc/self/fd/N/core.sock`, which is short whatever the directory's path. That was found because the first sabotage run's scratch directory was that deep: its core never started, and every sabotage failed the same 39 cases for that reason alone.
 
-**The protocol is described in situ, `core/protocol.situ`**, beside Appendix B's. It uses the same framing (`agent/message.situ`: a big-endian u32 length, then one canonical s-expression of at most 1 MiB) and the same spelling.
+**The protocol is described in situ, `core/frontend.situ`**, beside Appendix B's. It uses the same framing (`agent/message.situ`: a big-endian u32 length, then one canonical s-expression of at most 1 MiB) and the same spelling.
 
 - **A message** is `(type (ch n) …)` with its entries in canonical order. The type is chosen by the four bytes after the `(`.
 - **Channels:** channel 0 is control. The frontend allocates every other channel, one per request, and the core answers on the request's channel.
-- **`make test` holds the schema to vectors:** `core/protocol.vectors`, every type in the direction that sends it, and `core/protocol.refused.vectors`.
+- **`make test` holds the schema to vectors:** `core/frontend.vectors`, every type in the direction that sends it, and `core/frontend.refused.vectors`.
 
 | Frontend → core | Core → frontend | Purpose |
 |---|---|---|
@@ -717,6 +718,38 @@ The read-only volume had first passed: while the container ran as root, a write 
 | | `(data (buf b) (ch n) (fd 1\|2))`, `(exited (ch n) (code n) (signal n))`, `(eof (ch n))`, `(error (ch n) (reason r))` | as B.3's |
 
 **The schema leaves three things to the core:** that a channel is not 0 and not in use, that a machine id is a DNS label, and the elements of a run. situ frames `machines`' entries and the plan inside `run` without reading them. The refused vector `machine_no_state` is refused because the run's framing falls short, not because an entry was checked, and its comment says so.
+
+**Every message read is validated by C situ generates from the schema**, for its direction, before anything reads it (`core/wire.c`). The generated C does not compile as situ writes it: it uses a validator of the imported `canonical.situ` before declaring it. That is situ's finding 18, and reproduces with a three-line schema at the pin and at situ's newest. `core/frontend_view.h` declares that one function ahead of the generated header, and is put in front of the generated `.c` with `-include`. Nothing situ wrote is edited, and the file and its make rule go when situ fixes it.
+
+**`hull core` is the core: `core/core.c`.**
+
+- **Structure:** one thread owns the machine table and polls the socket, the clients and a wake pipe. Engines report from their own threads into a queue, so the table has one writer.
+- **Each machine gets its own `hull_core` to hand its engine,** because `on_data` names a core and not a machine. Its generation is carried on every event, so a last state an engine reports after an exit cannot land on a later machine in the same slot.
+- **A stop runs on a thread of its own,** since an engine's `stop` blocks for up to its timeout.
+- **What it keeps:** the newest 1 MiB of each machine's output, for `logs`, and every machine it has run, `exited` once it has, until a new run takes the slot or the core goes.
+- **One core per user:** an `flock` on `core.lock`, which also holds its pid. A second core gives way to the first and exits 0.
+- **It exits once it has had no client and no running machine for `HULL_CORE_IDLE` seconds,** 30 by default. On SIGINT or SIGTERM it stops its machines and waits for them. Nothing else is left to stop it, which is why it must stop itself.
+
+**The frontend starts the core when none answers**, double-forked so that it is never the frontend's zombie, in a session of its own, with its output in `core.log` beside the socket, truncated each time. `hull run` now plans in the frontend and runs through the core. `hull ps`, `hull stop [--timeout S] ID`, `hull logs [-f] ID` and `hull attach ID` reach machines the core holds, and none of them starts a core.
+
+- **A machine's id** is its name in `(machines …)`, else its `hostname`, else the file's directory's name, lowercased into a DNS label. Two running machines cannot share one.
+- **SIGINT or SIGTERM to `hull run` stops the machine.** A hangup, or the frontend killed outright, is a disconnect, and the machine then does what `(on_disconnect …)` says. `stop`, the default, has the core stop it. `keep` has the core keep it, for `attach`, `logs` and `stop` from another terminal.
+- **`keep` lasts while the core runs.** Re-adopting a machine after the core restarts is §5.0's `adopt()`, which is not written. So a chroot machine's init sets `PR_SET_PDEATHSIG` and dies with the core: nothing could manage it afterwards, and nothing is to outlive what started it. A docker container belongs to the daemon and survives; its name and label are for finding it.
+- **The tests never touch the account's own core:** each sets `XDG_RUNTIME_DIR` to a directory under `BUILD_DIR`, with `HULL_CORE_IDLE=1`, and requires the core to have left by the end.
+
+Open:
+
+- **`exec` waits for the engines' stream operations.**
+- **A slow frontend is dropped after 5 seconds of a blocked write,** rather than stalling the loop. There is no flow control yet, although the protocol could carry B.2's credits.
+- **Moving onto the shared encrypted protocol**, when that is settled.
+
+**Measured:**
+
+- `test/wire_test.c` runs 19 cases: each direction's messages let through and the other's refused, non-canonical bodies refused, and the numbers read minimal decimal. Disabling the validator fails four of them.
+- `test/cli_test.sh` runs 84 cases. Among them: `ps`, `logs` after an exit, a duplicate id refused, a kept machine surviving its frontend's SIGKILL where an unkept one is stopped, `attach` ending with a stopped machine's 143, a second core giving way and the first still answering, a machine dying with a SIGKILLed core, and the core leaving when idle.
+- **Sabotage,** in a scratch copy, with an unmodified baseline first that had to pass. Breaking each of these failed the test: honouring `keep`, stopping on disconnect, replaying logs, `attach` following, one id at a time, the idle exit, the lock, and the parent-death signal.
+  - The last two first passed. The lock case only checked that a second core exited 0. Without the lock, the second core takes the socket over, then leaves and removes it, stranding the first. The case now requires the first to still answer.
+  - The parent-death case's wait could give up silently, so it now fails when the kept machine never ran. Without the signal, the probe was measured alive a second after its core died, and gone once the shell reaped the client. No cause was found: the probe has its own session, its output was written, and its alarm was 20 seconds off. So the case looks for the probe before the client is reaped, where the two behaviours differ. **That later death is unexplained, and is recorded as such.**
 
 ---
 

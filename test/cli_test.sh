@@ -11,6 +11,15 @@ set -u
 hull=$1
 dir=${BUILD_DIR:?}/test/cli
 mkdir -p "$dir"
+
+# A core of the test's own: hull run starts one here, never in the
+# account's own runtime directory, and it leaves a second after its last
+# machine and client.
+XDG_RUNTIME_DIR=$(cd "${BUILD_DIR:?}" && pwd)/test/run
+export XDG_RUNTIME_DIR
+export HULL_CORE_IDLE=1
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
 cases=0
 failures=0
 
@@ -213,6 +222,76 @@ conf pid '(command "/probe" "pid" "orphan" "procs")'
 from_root 0 '^pid=2$' -f "$root/pid.conf"
 from_root 0 '^procs=2$' -f "$root/pid.conf"
 
+# The core: what it holds, what it kept, who can follow a machine, and
+# what (on_disconnect ...) does when the frontend that ran it is killed.
+hull_abs="$(cd "$(dirname "$hull")" && pwd)/$(basename "$hull")"
+expect 0 '^box +chroot +ns +exited$' "$hull" ps
+expect 0 '^out$' "$hull" logs box
+expect 0 '^GREETING=hi$' "$hull" logs box
+expect 1 'no such machine' "$hull" logs nobody
+expect 1 'no such machine' "$hull" stop nobody
+
+conf keep '(command "/probe" "say" "kept" "wait")' '(hostname "kept") (on_disconnect keep)'
+conf gone '(command "/probe" "say" "gone" "wait")' '(hostname "gone")'
+(cd / && exec "$hull_abs" run -f "$root/keep.conf" > /dev/null 2>&1) &
+keeper=$!
+(cd / && exec "$hull_abs" run -f "$root/gone.conf" > /dev/null 2>&1) &
+goner=$!
+tries=0
+until "$hull" ps 2>/dev/null | grep -q '^gone .*running$' &&
+      "$hull" ps 2>/dev/null | grep -q '^kept .*running$' || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+expect 125 'a machine of that name is running' sh -c 'cd / && exec "$0" run -f "$1"' \
+	"$hull_abs" "$root/keep.conf"
+kill -KILL "$keeper" "$goner"
+wait "$keeper" "$goner" 2>/dev/null
+sleep 1
+expect 0 '^kept +chroot +ns +running$' "$hull" ps
+expect 0 '^gone +chroot +ns +exited$' "$hull" ps
+expect 0 '^kept$' "$hull" logs kept
+(timeout 30 "$hull" attach kept > "$root/attach.out" 2>&1; echo "status=$?" >> "$root/attach.out") &
+attacher=$!
+sleep 0.5
+expect 0 '' "$hull" stop kept
+wait "$attacher"
+cases=$((cases + 1))
+grep -q '^status=143$' "$root/attach.out" ||
+	fail "attach did not end with the stopped machine's 143" "$(cat "$root/attach.out")"
+expect 0 '^kept +chroot +ns +exited$' "$hull" ps
+
+# One core: a second gives way to the first, says nothing, and leaves the
+# first answering on its socket.
+expect 0 '' "$hull" core
+expect 0 '^kept +chroot +ns +exited$' "$hull" ps
+
+# A machine dies with its core, even a kept one: nothing could manage it
+# after. The probe is found by its argv[0], which only ours carries.
+(cd / && exec "$hull_abs" run -f "$root/keep.conf" > /dev/null 2>&1) &
+keeper=$!
+tries=0
+until "$hull" ps 2>/dev/null | grep -q '^kept .*running$' || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+cases=$((cases + 1))
+core=$(head -1 "$XDG_RUNTIME_DIR/hull/core.lock" 2>/dev/null)
+if ! "$hull" ps 2>/dev/null | grep -q '^kept .*running$' || [ -z "$core" ]; then
+	fail "the kept machine never ran, so its core's death could not be tried" \
+		"$("$hull" ps 2>&1)"
+else
+	# Looked for before the client is reaped: without the parent-death
+	# signal the probe was measured alive a second after the core, and
+	# gone only once the client was reaped, for a reason not found
+	# (project.md section 4.10).
+	kill -KILL "$core"
+	sleep 0.5
+	left=$(ps -eo pid=,args= | awk '$2 == "/probe"')
+	[ -z "$left" ] || fail "a machine outlived its core" "$left"
+	wait "$keeper" 2>/dev/null
+fi
+
 # What cannot be planned or started is 125, and says why.
 conf ports '(command "/probe") (ports (port (host 8080) (guest 80)))'
 from_root 125 'ports: rejected: chroot shares the host.s network' -f "$root/ports.conf"
@@ -227,6 +306,15 @@ printf '%s\n' '(machines (alpha (source "dir:./rootfs") (backend chroot) (comman
 from_root 0 '^host=alpha$' -f "$root/pair.conf" alpha
 from_root 125 'name the machine to run' -f "$root/pair.conf"
 from_root 125 'run takes one backend' -f "$root/pair.conf" --backend ns,vm alpha
+
+# And the core leaves once nothing needs it.
+cases=$((cases + 1))
+tries=0
+while [ -S "$XDG_RUNTIME_DIR/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+[ ! -S "$XDG_RUNTIME_DIR/hull/core.sock" ] || fail "the core did not leave when idle" ""
 
 printf 'cli: %u cases, %u failed\n' "$cases" "$failures"
 [ "$failures" -eq 0 ]

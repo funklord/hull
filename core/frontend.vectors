@@ -1,4 +1,4 @@
-# Messages that core/protocol.situ must accept, checked by `make test` with
+# Messages that core/frontend.situ must accept, checked by `make test` with
 # `situc verify`: every type, in the direction that sends it. Each is
 # preceded by its bytes as text, non-printable runs shown as #hex#.
 

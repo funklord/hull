@@ -873,6 +873,8 @@ static const hull_cap_entry entries[] = {
 	{ "projection.bind",    HULL_SUP_NATIVE,   NULL, NULL },
 	{ "writeback.none",     HULL_SUP_NATIVE,   NULL, NULL },
 	{ "on_disconnect.stop", HULL_SUP_NATIVE,   NULL, NULL },
+	{ "on_disconnect.keep", HULL_SUP_NATIVE,
+	  "kept while the core runs; adopting it after the core restarts is not written", NULL },
 
 	{ NULL,                 HULL_SUP_NATIVE,   NULL, NULL },
 };

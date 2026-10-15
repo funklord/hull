@@ -1,5 +1,5 @@
 # situ capability map v1
-# schema: protocol.situ
+# schema: frontend.situ
 # core:   offset size align repr atomic
 #
 # Core axes are always shown. Any other axis appears only where it has

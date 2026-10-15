@@ -6,8 +6,8 @@
  * The resolved machine is readable text, the form `spec.resolved.conf`
  * takes (sections 3.1 and 4.1), and the plan an engine receives is that
  * machine in canonical form with the class it runs as and the directory
- * its paths are relative to, `(plan (base "/dir") (class vm) (machine
- * ...))` (A.1, hull_engine.h).
+ * its paths are relative to, `(plan (base "/dir") (class vm) (engine
+ * qemu) (machine ...))` (A.1, hull_engine.h).
  *
  * Entries the user wrote are copied byte for byte, so a report about one
  * points at the user's own line; what the planner adds is attributed to

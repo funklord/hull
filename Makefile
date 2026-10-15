@@ -97,6 +97,12 @@ PLAN_OBJS = $(BUILD_DIR)/plan/matrix.o $(BUILD_DIR)/plan/registry.o \
 ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/chroot.o $(BUILD_DIR)/engine/access.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o
+
+# The per-user core, and the frontend protocol it speaks (section 4.10),
+# validated by C situ generates from core/frontend.situ.
+FRONTEND_GEN = $(GEN_DIR)/frontend.c $(GEN_DIR)/frontend.h
+CORE_OBJS    = $(BUILD_DIR)/core/core.o $(BUILD_DIR)/core/wire.o $(GEN_DIR)/frontend.o \
+               $(BUILD_DIR)/agent/framing.o $(GEN_DIR)/message.o
 HULL        = $(BUILD_DIR)/hull
 VERSION    := $(shell cat VERSION)
 
@@ -107,7 +113,9 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  foreign.conf machines.conf build.conf bad.conf example.conf run.conf \
                  writable.conf readonly.conf die.conf wait.conf ports.conf noargs.conf nope.conf \
                  qemu.conf pair.conf rootfs/written vol.conf volro.conf vollink.conf \
-                 volmissing.conf volhost.conf pid.conf data/in data/out rootfs/mnt-link)
+                 volmissing.conf volhost.conf pid.conf keep.conf gone.conf attach.out \
+                 data/in data/out rootfs/mnt-link) \
+                 $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
 # What test/docker_test.sh writes.
 DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf volro.conf \
@@ -121,13 +129,15 @@ TEST_SPEC_OBJS    = $(BUILD_DIR)/test/spec_test.o
 TEST_MATRIX_OBJS  = $(BUILD_DIR)/test/matrix_test.o
 TEST_REGISTRY_OBJS = $(BUILD_DIR)/test/registry_test.o
 TEST_PLAN_OBJS    = $(BUILD_DIR)/test/plan_test.o
+TEST_WIRE_OBJS    = $(BUILD_DIR)/test/wire_test.o
 TEST_OBJS = $(TEST_SEXPR_OBJS) $(TEST_FRAMING_OBJS) $(TEST_SPEC_OBJS) $(TEST_MATRIX_OBJS) \
-            $(TEST_REGISTRY_OBJS) $(TEST_PLAN_OBJS)
+            $(TEST_REGISTRY_OBJS) $(TEST_PLAN_OBJS) $(TEST_WIRE_OBJS)
 TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
             $(BUILD_DIR)/test/spec_test $(BUILD_DIR)/test/matrix_test \
-            $(BUILD_DIR)/test/registry_test $(BUILD_DIR)/test/plan_test
+            $(BUILD_DIR)/test/registry_test $(BUILD_DIR)/test/plan_test \
+            $(BUILD_DIR)/test/wire_test
 
-CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
+CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: all check check-docker test vectors style style-source style-docs contract hooks clean help
 
@@ -159,6 +169,10 @@ $(GEN_DIR)/canonical_edit.h &: sexpr/canonical.situ $(SITU_COMPILER)
 	@mkdir -p '$(GEN_DIR)'
 	$(SITUC) build --target c --layer edit --prefix hull_sexpr_c --out '$(GEN_DIR)' sexpr/canonical.situ
 
+$(FRONTEND_GEN) &: core/frontend.situ sexpr/canonical.situ $(SITU_COMPILER)
+	@mkdir -p '$(GEN_DIR)'
+	$(SITUC) build --target c --prefix hull_frontend --out '$(GEN_DIR)' core/frontend.situ
+
 $(AGENT_GEN) &: agent/message.situ $(SITU_COMPILER)
 	@mkdir -p '$(GEN_DIR)'
 	$(SITUC) build --target c --layer frame --prefix hull_agent --out '$(GEN_DIR)' agent/message.situ
@@ -186,8 +200,12 @@ $(BUILD_DIR)/engine/%.o: engine/%.c
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
+$(BUILD_DIR)/core/%.o: core/%.c VERSION | $(GEN_HEADERS) $(AGENT_GEN) $(FRONTEND_GEN)
+	@mkdir -p '$(@D)'
+	$(CC) $(CPPFLAGS) -DHULL_VERSION='"$(VERSION)"' $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+
 # The version is a prerequisite, so a new number rebuilds what prints it.
-$(BUILD_DIR)/cli/%.o: cli/%.c VERSION | $(GEN_HEADERS)
+$(BUILD_DIR)/cli/%.o: cli/%.c VERSION | $(GEN_HEADERS) $(AGENT_GEN) $(FRONTEND_GEN)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) -DHULL_VERSION='"$(VERSION)"' $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
@@ -195,11 +213,19 @@ $(PROBE): test/probe.c
 	@mkdir -p '$(@D)'
 	$(CC) -static $(CFLAGS) -o $@ $<
 
-$(HULL): $(CLI_OBJS) $(ENGINE_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
+$(HULL): $(CLI_OBJS) $(CORE_OBJS) $(ENGINE_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
 	$(CC) $(CFLAGS) -pthread -o $@ $^
 
 $(GEN_DIR)/%.o: $(GEN_DIR)/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+
+# The generated frontend protocol compiles only behind a forward
+# declaration (situ finding 18): core/frontend_view.h comes first, and the
+# header's own guard makes the file's include of it a no-op. This rule
+# goes with that file.
+$(GEN_DIR)/frontend.o: $(GEN_DIR)/frontend.c core/frontend_view.h
+	$(CC) $(CPPFLAGS) -include core/frontend_view.h $(CFLAGS) $(WARNINGS) $(DEPFLAGS) \
+	      -c -o $@ $(filter %.c,$^)
 
 $(BUILD_DIR)/situ/situ.o: $(SITU_DIR)/runtime/c/situ.c
 	@mkdir -p '$(@D)'
@@ -227,15 +253,19 @@ $(BUILD_DIR)/test/registry_test: $(TEST_REGISTRY_OBJS) $(PLAN_OBJS) $(SPEC_OBJS)
 $(BUILD_DIR)/test/plan_test: $(TEST_PLAN_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
+$(BUILD_DIR)/test/wire_test: $(TEST_WIRE_OBJS) $(BUILD_DIR)/core/wire.o $(GEN_DIR)/frontend.o \
+                             $(BUILD_DIR)/agent/framing.o $(GEN_DIR)/message.o $(SEXPR_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^
+
 -include $(SEXPR_OBJS:.o=.d) $(AGENT_OBJS:.o=.d) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS:.o=.d) \
-         $(ENGINE_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(TEST_OBJS:.o=.d)
+         $(ENGINE_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(CORE_OBJS:.o=.d) $(TEST_OBJS:.o=.d)
 
 # --- checks -----------------------------------------------------------------
 
 # Appendices A and B and the core protocol (project.md section 4.10) as
 # situ describes them: schemas nothing is generated from yet, held to
 # their committed maps and to vectors of real bytes.
-DESCRIBED = manifest/manifest agent/protocol core/protocol
+DESCRIBED = manifest/manifest agent/protocol core/frontend
 
 check: style contract test
 
@@ -249,6 +279,7 @@ test: $(TEST_BINS) $(HULL) $(PROBE) vectors
 	$(BUILD_DIR)/test/matrix_test
 	$(BUILD_DIR)/test/registry_test
 	$(BUILD_DIR)/test/plan_test
+	$(BUILD_DIR)/test/wire_test
 	BUILD_DIR='$(BUILD_DIR)' sh test/cli_test.sh '$(HULL)'
 	$(PYTHON) tool/test_style_gate.py
 
@@ -296,7 +327,7 @@ contract: $(SITU_MARK)
 	$(SITUC) map --check agent/message.situ
 	$(SITUC) map --check manifest/manifest.situ
 	$(SITUC) map --check agent/protocol.situ
-	$(SITUC) map --check core/protocol.situ
+	$(SITUC) map --check core/frontend.situ
 
 hooks:
 	@if ! command -v git >/dev/null 2>&1; then \
@@ -319,4 +350,5 @@ clean:
 	        $(AGENT_OBJS) $(AGENT_OBJS:.o=.d) $(AGENT_GEN) \
 	        $(SPEC_OBJS) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS) $(PLAN_OBJS:.o=.d) \
 	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) \
+	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) \
 	        $(CLI_TEST_FILES) $(PROBE) $(DOCKER_TEST_FILES)
