@@ -232,9 +232,10 @@ $(BUILD_DIR)/test/plan_test: $(TEST_PLAN_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR
 
 # --- checks -----------------------------------------------------------------
 
-# Appendices A and B as situ describes them: schemas nothing is generated
-# from yet, held to their committed maps and to vectors of real bytes.
-DESCRIBED = manifest/manifest agent/protocol
+# Appendices A and B and the core protocol (project.md section 4.10) as
+# situ describes them: schemas nothing is generated from yet, held to
+# their committed maps and to vectors of real bytes.
+DESCRIBED = manifest/manifest agent/protocol core/protocol
 
 check: style contract test
 
@@ -295,6 +296,7 @@ contract: $(SITU_MARK)
 	$(SITUC) map --check agent/message.situ
 	$(SITUC) map --check manifest/manifest.situ
 	$(SITUC) map --check agent/protocol.situ
+	$(SITUC) map --check core/protocol.situ
 
 hooks:
 	@if ! command -v git >/dev/null 2>&1; then \

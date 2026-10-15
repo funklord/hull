@@ -694,6 +694,30 @@ The read-only volume had first passed: while the container ran as root, a write 
 
 `make check` itself needs no daemon: its case for an engine with no operations moved from docker to qemu.
 
+### 4.10 The core: one per user, local first
+
+**Decided 2026-10-15, by the holder: build the per-user core now, on a local socket, with a protocol of hull's own.** §2's core is what exec, logs, machines that outlive a terminal and `(on_disconnect keep)` all need. The shared encrypted protocol §2 names for frontends is still unsettled (Handoff notes, item 2), so the core starts local. What it does is fixed now; moving it onto the shared protocol later changes how frontends reach it, not what it does.
+
+**The socket is `$XDG_RUNTIME_DIR/hull/core.sock`**, mode 0600 in a 0700 directory: the user's own, and nobody else's, which is §7's "user-owned socket".
+
+**The protocol is described in situ, `core/protocol.situ`**, beside Appendix B's. It uses the same framing (`agent/message.situ`: a big-endian u32 length, then one canonical s-expression of at most 1 MiB) and the same spelling.
+
+- **A message** is `(type (ch n) …)` with its entries in canonical order. The type is chosen by the four bytes after the `(`.
+- **Channels:** channel 0 is control. The frontend allocates every other channel, one per request, and the core answers on the request's channel.
+- **`make test` holds the schema to vectors:** `core/protocol.vectors`, every type in the direction that sends it, and `core/protocol.refused.vectors`.
+
+| Frontend → core | Core → frontend | Purpose |
+|---|---|---|
+| `(hello (ch 0) (proto n))` | `(hello (ch 0) (core_version v) (proto n))` | version |
+| `(run (ch n) (machine id) (plan …))` | `(started (ch n) (machine id))`, then `data` and `exited` | run a machine from a plan the frontend made (§4.7) |
+| `(attach (ch n) (machine id))` | `data`, `exited` | a running machine's output from now on |
+| `(logs (ch n) (follow true\|false) (machine id))` | `data` …, then `eof` unless following | what it has written, kept by the core |
+| `(stop (ch n) (machine id) (timeout_ms n))` | `(done (ch n))` | SIGTERM, then SIGKILL |
+| `(list (ch n))` | `(machines (ch n) (machine (class) (engine) (id) (state))…)` | what the core holds |
+| | `(data (buf b) (ch n) (fd 1\|2))`, `(exited (ch n) (code n) (signal n))`, `(eof (ch n))`, `(error (ch n) (reason r))` | as B.3's |
+
+**The schema leaves three things to the core:** that a channel is not 0 and not in use, that a machine id is a DNS label, and the elements of a run. situ frames `machines`' entries and the plan inside `run` without reading them. The refused vector `machine_no_state` is refused because the run's framing falls short, not because an entry was checked, and its comment says so.
+
 ---
 
 ## 5. Engines

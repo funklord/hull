@@ -1,0 +1,61 @@
+# Messages that core/protocol.situ must refuse, every one of them: `make
+# test` fails unless situc reports each vector here as not conforming. The
+# comment says which rule each is aimed at.
+
+# hello_on_3: (5:hello(2:ch1:3)(5:proto1:1))
+# control: hello is on channel 0
+client_message hello_on_3 28 35 3A 68 65 6C 6C 6F 28 32 3A 63 68 31 3A 33 29 28 35 3A 70 72 6F 74 6F 31 3A 31 29 29
+
+# run_no_plan: (3:run(2:ch1:1)(7:machine3:web))
+# run: the plan is required
+client_message run_no_plan 28 33 3A 72 75 6E 28 32 3A 63 68 31 3A 31 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 29
+
+# run_no_machine: (3:run(2:ch1:1)(4:plan(4:base8:/srv/app)(5:class2:ns)(7:machine(6:source5:dir:.))))
+# run: the machine is required
+client_message run_no_machine 28 33 3A 72 75 6E 28 32 3A 63 68 31 3A 31 29 28 34 3A 70 6C 61 6E 28 34 3A 62 61 73 65 38 3A 2F 73 72 76 2F 61 70 70 29 28 35 3A 63 6C 61 73 73 32 3A 6E 73 29 28 37 3A 6D 61 63 68 69 6E 65 28 36 3A 73 6F 75 72 63 65 35 3A 64 69 72 3A 2E 29 29 29 29
+
+# attach_no_machine: (6:attach(2:ch1:3))
+# attach: the machine is required
+client_message attach_no_machine 28 36 3A 61 74 74 61 63 68 28 32 3A 63 68 31 3A 33 29 29
+
+# logs_follow_yes: (4:logs(2:ch1:4)(6:follow3:yes)(7:machine3:web))
+# follow_entry: true or false
+client_message logs_follow_yes 28 34 3A 6C 6F 67 73 28 32 3A 63 68 31 3A 34 29 28 36 3A 66 6F 6C 6C 6F 77 33 3A 79 65 73 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 29
+
+# logs_no_follow: (4:logs(2:ch1:4)(7:machine3:web))
+# logs: follow is required
+client_message logs_no_follow 28 34 3A 6C 6F 67 73 28 32 3A 63 68 31 3A 34 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 29
+
+# stop_no_timeout: (4:stop(2:ch1:5)(7:machine3:web))
+# stop: the timeout is required
+client_message stop_no_timeout 28 34 3A 73 74 6F 70 28 32 3A 63 68 31 3A 35 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 29
+
+# list_with_more: (4:list(2:ch1:6)(4:what3:all))
+# listing: nothing after the channel
+client_message list_with_more 28 34 3A 6C 69 73 74 28 32 3A 63 68 31 3A 36 29 28 34 3A 77 68 61 74 33 3A 61 6C 6C 29 29
+
+# data_fd_0: (4:data(3:buf2:hi)(2:ch1:1)(2:fd1:0))
+# data: the core sends only 1 and 2
+core_message data_fd_0 28 34 3A 64 61 74 61 28 33 3A 62 75 66 32 3A 68 69 29 28 32 3A 63 68 31 3A 31 29 28 32 3A 66 64 31 3A 30 29 29
+
+# data_fd_3: (4:data(3:buf2:hi)(2:ch1:1)(2:fd1:3))
+# data: the core sends only 1 and 2
+core_message data_fd_3 28 34 3A 64 61 74 61 28 33 3A 62 75 66 32 3A 68 69 29 28 32 3A 63 68 31 3A 31 29 28 32 3A 66 64 31 3A 33 29 29
+
+# exited_no_signal: (6:exited(2:ch1:1)(4:code1:3))
+# exited: both numbers, always
+core_message exited_no_signal 28 36 3A 65 78 69 74 65 64 28 32 3A 63 68 31 3A 31 29 28 34 3A 63 6F 64 65 31 3A 33 29 29
+
+# hello_no_version: (5:hello(2:ch1:0)(5:proto1:1))
+# core_hello: the version is required
+core_message hello_no_version 28 35 3A 68 65 6C 6C 6F 28 32 3A 63 68 31 3A 30 29 28 35 3A 70 72 6F 74 6F 31 3A 31 29 29
+
+# machine_no_state: (8:machines(2:ch1:6)(7:machine(5:class2:ns)(6:engine6:chroot)(2:id3:web)))
+# listed: every entry. situ does not read a run's elements, so this is
+# refused by the run's framing falling short, not by `listed`: the core
+# checks every machine entry itself.
+core_message machine_no_state 28 38 3A 6D 61 63 68 69 6E 65 73 28 32 3A 63 68 31 3A 36 29 28 37 3A 6D 61 63 68 69 6E 65 28 35 3A 63 6C 61 73 73 32 3A 6E 73 29 28 36 3A 65 6E 67 69 6E 65 36 3A 63 68 72 6F 6F 74 29 28 32 3A 69 64 33 3A 77 65 62 29 29 29
+
+# started_no_machine: (7:started(2:ch1:1))
+# started: the machine is required
+core_message started_no_machine 28 37 3A 73 74 61 72 74 65 64 28 32 3A 63 68 31 3A 31 29 29

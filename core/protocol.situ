@@ -1,0 +1,258 @@
+// The core protocol's messages (project.md section 4.10): what a frontend
+// and the per-user core say to each other, in the body of each frame of
+// agent/message.situ -- the same u32 length and one canonical s-expression
+// as the guest agent's, at most 1 MiB.
+//
+// Spelled as agent/protocol.situ spells the agent's: a message is
+// `(type (ch n) ...)` with its entries sorted bytewise by key (A.1), a
+// required entry is its fixed opening bytes, and the type is chosen by the
+// four bytes after the `(`, which differ for every type in one direction.
+// Channel 0 is control; a frontend allocates every other, one per request,
+// and the core answers on the request's channel.
+//
+// Numbers are atoms, minimal decimal by the core's check (situ finding 13).
+
+target buffer;
+endian big;
+
+import "../sexpr/canonical.situ";
+
+const HELLO    = ('5' << 24) | (':' << 16) | ('h' << 8) | 'e';
+const RUN      = ('3' << 24) | (':' << 16) | ('r' << 8) | 'u';
+const ATTACH   = ('6' << 24) | (':' << 16) | ('a' << 8) | 't';
+const LOGS     = ('4' << 24) | (':' << 16) | ('l' << 8) | 'o';
+const STOP     = ('4' << 24) | (':' << 16) | ('s' << 8) | 't';
+const LIST     = ('4' << 24) | (':' << 16) | ('l' << 8) | 'i';
+const STARTED  = ('7' << 24) | (':' << 16) | ('s' << 8) | 't';
+const DATA     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'a';
+const EXITED   = ('6' << 24) | (':' << 16) | ('e' << 8) | 'x';
+const EOF      = ('3' << 24) | (':' << 16) | ('e' << 8) | 'o';
+const MACHINES = ('8' << 24) | (':' << 16) | ('m' << 8) | 'a';
+const DONE     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'o';
+const ERROR    = ('5' << 24) | (':' << 16) | ('e' << 8) | 'r';
+
+// --- what a frontend sends ----------------------------------------------------
+
+struct client_message {
+	u8  open  [must_eq = '('];
+	peek u32  type;
+	variant body switch (type) {
+		case HELLO:   client_hello  hello;
+		case RUN:     run           run;
+		case ATTACH:  attach        attach;
+		case LOGS:    logs          logs;
+		case STOP:    stop          stop;
+		case LIST:    listing       list;
+		default:      unknown       unknown;
+	}
+}
+
+// The protocol version the frontend speaks; the core answers with its own.
+struct client_hello {
+	preamble u8[7] = "5:hello";
+	control  ch;
+	preamble u8[8] = "(5:proto";
+	atom  proto;
+	preamble u8[2] = "))";
+}
+
+// Run a machine: its id, and the plan the frontend made for it (section
+// 4.7), `(plan (base ...)? (class ...) (machine ...))`, whole. The core
+// answers `started` or `error`, then the machine's output and its exit on
+// this channel for as long as the frontend stays.
+struct run {
+	preamble u8[5] = "3:run";
+	channel        ch;
+	machine_entry  machine;
+	preamble u8[7] = "(4:plan";
+	form  entries[]  until ")";
+	u8  close  [must_eq = ')'];
+}
+
+// A running machine's output and exit, from now on, on this channel.
+struct attach {
+	preamble u8[8] = "6:attach";
+	channel        ch;
+	machine_entry  machine;
+	u8  close  [must_eq = ')'];
+}
+
+// What the machine has written, kept by the core; then `eof`, or with
+// `(follow true)` what it writes next, as `attach` would give.
+struct logs {
+	preamble u8[6] = "4:logs";
+	channel        ch;
+	follow_entry   follow;
+	machine_entry  machine;
+	u8  close  [must_eq = ')'];
+}
+
+// SIGTERM, then SIGKILL after the timeout; answered `done` once it is
+// gone.
+struct stop {
+	preamble u8[6] = "4:stop";
+	channel        ch;
+	machine_entry  machine;
+	preamble u8[14] = "(10:timeout_ms";
+	atom  milliseconds;
+	preamble u8[2] = "))";
+}
+
+// The machines the core holds, answered `machines`.
+struct listing {
+	preamble u8[6] = "4:list";
+	channel  ch;
+	u8  close  [must_eq = ')'];
+}
+
+// `(follow true)` or `(follow false)`.
+struct follow_entry {
+	preamble u8[9] = "(6:follow";
+	peek u8  length;
+	variant value switch (length) {
+		case '4':  yes  on;
+		case '5':  no   off;
+		default:   error;
+	}
+	u8  close  [must_eq = ')'];
+}
+
+struct yes { preamble u8[6] = "4:true"; }
+struct no  { preamble u8[7] = "5:false"; }
+
+// --- what the core sends ------------------------------------------------------
+
+struct core_message {
+	u8  open  [must_eq = '('];
+	peek u32  type;
+	variant body switch (type) {
+		case HELLO:     core_hello  hello;
+		case STARTED:   started     started;
+		case DATA:      data        data;
+		case EXITED:    exited      exited;
+		case EOF:       eof         eof;
+		case MACHINES:  machines    machines;
+		case DONE:      done        done;
+		case ERROR:     failure     error;
+		default:        unknown     unknown;
+	}
+}
+
+struct core_hello {
+	preamble u8[7] = "5:hello";
+	control  ch;
+	preamble u8[16] = "(12:core_version";
+	atom  version;
+	preamble u8[9] = ")(5:proto";
+	atom  proto;
+	preamble u8[2] = "))";
+}
+
+struct started {
+	preamble u8[9] = "7:started";
+	channel        ch;
+	machine_entry  machine;
+	u8  close  [must_eq = ')'];
+}
+
+// stdout or stderr: fd 1 or 2.
+struct data {
+	preamble u8[12] = "4:data(3:buf";
+	atom     bytes;
+	u8       close_buf  [must_eq = ')'];
+	channel  ch;
+	preamble u8[7] = "(2:fd1:";
+	decimal u8  fd[1]  [min = 1, max = 2];
+	preamble u8[2] = "))";
+}
+
+// As B.3's: an exit code, and the signal that ended it or 0.
+struct exited {
+	preamble u8[8] = "6:exited";
+	channel  ch;
+	preamble u8[7] = "(4:code";
+	atom  code;
+	preamble u8[10] = ")(6:signal";
+	atom  signal;
+	preamble u8[2] = "))";
+}
+
+// The end of what `logs` replays, when it does not follow.
+struct eof {
+	preamble u8[5] = "3:eof";
+	channel  ch;
+	u8  close  [must_eq = ')'];
+}
+
+struct machines {
+	preamble u8[10] = "8:machines";
+	channel  ch;
+	listed   items[]  until ")";
+}
+
+// One machine of `machines`.
+struct listed {
+	preamble u8[18] = "(7:machine(5:class";
+	atom  class;
+	preamble u8[10] = ")(6:engine";
+	atom  engine;
+	preamble u8[6] = ")(2:id";
+	atom  id;
+	preamble u8[9] = ")(5:state";
+	atom  state;
+	preamble u8[2] = "))";
+}
+
+// A request carried out, where there is nothing more to say: `stop`.
+struct done {
+	preamble u8[6] = "4:done";
+	channel  ch;
+	u8  close  [must_eq = ')'];
+}
+
+// A refusal, on the channel of what was refused; `unsupported` answers a
+// type the core does not know.
+struct failure {
+	preamble u8[7] = "5:error";
+	channel  ch;
+	preamble u8[9] = "(6:reason";
+	atom  reason;
+	preamble u8[2] = "))";
+}
+
+// --- both ways ----------------------------------------------------------------
+
+// A type this side does not know, framed whole so that it can be answered.
+struct unknown {
+	atom  type;
+	form  entries[]  until ")";
+}
+
+// --- entries -----------------------------------------------------------------
+
+struct control {
+	preamble u8[9] = "(2:ch1:0)";
+}
+
+struct channel {
+	preamble u8[5] = "(2:ch";
+	atom  id;
+	u8    close  [must_eq = ')'];
+}
+
+struct machine_entry {
+	preamble u8[10] = "(7:machine";
+	atom  id;
+	u8    close  [must_eq = ')'];
+}
+
+// ---------------------------------------------------------------------------
+//
+// WHAT THIS SCHEMA DOES NOT SAY, and the core and frontends check instead:
+//
+// - that a request's channel is not 0 and not already in use;
+// - that a machine id is a DNS label (section 4.10), and a plan one
+//   hull_plan_build() would write;
+// - that the numbers are minimal decimal;
+// - the elements of a run -- each `listed` of `machines`, the plan's
+//   entries in `run` -- which situ frames and does not read.
