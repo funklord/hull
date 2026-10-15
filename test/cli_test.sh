@@ -204,7 +204,7 @@ from_root 0 '^read=from the host$' -f "$root/vollink.conf"
 conf volmissing '(command "/probe")' '(volumes (volume (host "./data") (guest "/absent")))'
 from_root 125 'volume /absent: No such file or directory' -f "$root/volmissing.conf"
 conf volhost '(command "/probe")' '(volumes (volume (host "./nodata") (guest "/mnt")))'
-from_root 125 'volume \./nodata: No such file or directory' -f "$root/volhost.conf"
+from_root 125 'volume /.*/test/cli/\./nodata: No such file or directory' -f "$root/volhost.conf"
 
 # A PID namespace, its /proc, and an init that reaps what is orphaned to it:
 # a zombie would still be listed, making three.

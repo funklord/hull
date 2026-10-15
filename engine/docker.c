@@ -437,9 +437,9 @@ static void add_env(text *t, const hull_sexpr_doc *doc, const hull_sexpr_form *e
 	}
 }
 
-/* `(volumes (volume ...))` as Binds, each host path made absolute: the
- * daemon resolves nothing, and hull run stands in the file's dir.
- * Returns a reason, or NULL. */
+/* `(volumes (volume ...))` as Binds, each host path made absolute against
+ * the plan's base: the daemon resolves nothing relative. Returns a
+ * reason, or NULL. */
 static const char *add_binds(text *t, const hull_sexpr_doc *doc, const hull_sexpr_form *entry,
                              char *detail, size_t cap)
 {
@@ -450,12 +450,14 @@ static const char *add_binds(text *t, const hull_sexpr_doc *doc, const hull_sexp
 	hull_sexpr_child(doc, entry, &item);
 	for (more = hull_sexpr_next(doc, &item, &item); more;
 	     more = hull_sexpr_next(doc, &item, &item)) {
-		char *host_path = hull_access_value(doc, &item, "host");
+		char *written   = hull_access_value(doc, &item, "host");
+		char *host_path = written != NULL ? hull_access_path(doc, written) : NULL;
 		char *guest     = hull_access_value(doc, &item, "guest");
 		char *mode      = hull_access_value(doc, &item, "mode");
 		char  absolute[PATH_MAX];
 		text  bind = { 0 };
 
+		free(written);
 		if (host_path == NULL || guest == NULL || realpath(host_path, absolute) == NULL) {
 			snprintf(detail, cap, "volume %s: %s", host_path != NULL ? host_path : "?",
 			         strerror(errno));

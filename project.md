@@ -600,7 +600,7 @@ Two of these had first passed: copying other tuning and copied offsets. Each was
 
 **`hull run [-f FILE] [--backend B] [--accept TOKEN]... [NAME]`** plans one machine: the file's, or the one NAME names in a `(machines …)` file. It then creates, starts and waits for it, relaying output, and turns SIGINT or SIGTERM into the engine's `stop`.
 
-- **Paths in a file are the file's:** `run` changes into the file's directory before creating the machine, so `(source "dir:./rootfs")` works from anywhere.
+- **Paths in a file are the file's:** the plan carries the file's directory as `(plan (base "/dir") …)`, and engines resolve a relative path against it through `engine/access.c`. `(source "dir:./rootfs")` works from anywhere, and nothing reading a plan depends on where it was started, which a long-lived core serving many files needs. Ignoring the base fails 25 of the CLI test's cases, which run from `/`.
 - **Plan reports go to stderr**, so the workload's stdout stays its own.
 - **Exit status follows docker's convention:** the workload's status, 128 plus the signal that ended it, or 125 when hull could not plan or start it. A rejected plan therefore cannot be mistaken for a workload exiting 1.
 - **An engine whose operations are not written**, docker and qemu so far, says so and exits 125.

@@ -108,7 +108,8 @@ static void collect(void *context, const hull_resolution *resolution)
 		s->length += (size_t)n;
 }
 
-static hull_plan plan;
+static hull_plan   plan;
+static const char *base;  /* what run() passes as the plan's base */
 
 /* Plan the file's machine, or its machine named `name`. */
 static hull_plan_status run(int line, const char *text, const char *name,
@@ -132,7 +133,7 @@ static hull_plan_status run(int line, const char *text, const char *name,
 		machine = spec.machine;
 	choice.engine     = engine;
 	choice.class_name = class_name;
-	return hull_plan_build(&plan, &spec, &machine, name, &choice, "amd64", NULL, collect, s);
+	return hull_plan_build(&plan, &spec, &machine, name, base, &choice, "amd64", NULL, collect, s);
 }
 
 /* The resolved text, whole, and the status. */
@@ -360,6 +361,14 @@ static void test_canonical(void)
 			FAIL("spelling %u: %.*s", i, (int)plan.canonical_length,
 			     (const char *)plan.canonical);
 	}
+
+	/* The base comes first, being the first key, and is the caller's. */
+	cases++;
+	base = "/srv/app";
+	run(__LINE__, "(machine (source \"dir:.\"))", NULL, &binder, "ns", &s);
+	base = NULL;
+	if (memcmp(plan.canonical, "(4:plan(4:base8:/srv/app)(5:class2:ns)(7:machine", 48) != 0)
+		FAIL("base: %.*s", (int)plan.canonical_length, (const char *)plan.canonical);
 
 	/* The class is the one it runs as. */
 	cases++;

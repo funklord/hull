@@ -2,6 +2,8 @@
  * access.c -- reading a plan, for engines.
  */
 
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -62,6 +64,25 @@ int hull_access_true(const hull_sexpr_doc *doc, const hull_sexpr_form *record, c
 
 	free(value);
 	return yes;
+}
+
+char *hull_access_path(const hull_sexpr_doc *doc, const char *path)
+{
+	hull_sexpr_form top;
+	char           *base;
+	char           *joined;
+
+	if (path[0] == '/' || !hull_sexpr_first(doc, &top) ||
+	    (base = hull_access_value(doc, &top, "base")) == NULL)
+		return strdup(path);
+	joined = malloc(strlen(base) + strlen(path) + 2u);
+	if (joined != NULL) {
+		strcpy(joined, base);
+		strcat(joined, "/");
+		strcat(joined, path);
+	}
+	free(base);
+	return joined;
 }
 
 int hull_access_machine(hull_sexpr_doc *doc, const uint8_t *plan, size_t length,

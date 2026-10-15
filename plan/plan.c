@@ -422,16 +422,23 @@ static hull_plan_status judge(writer *w, const char *projection, const char *con
  * key in another, and closed into `canonical`. The machine's scratch is
  * the first two thirds of `work`, free again once it is written.
  */
-static hull_plan_status encode(hull_plan *plan, const char *class_name)
+static hull_plan_status encode(hull_plan *plan, const char *class_name, const char *base)
 {
 	uint8_t  *items   = plan->work;
 	uint8_t  *entries = plan->work + 2u * HULL_PLAN_TEXT;
-	uint8_t   pair[64];
+	uint8_t   pair[4200];
 	uint32_t  n_pair  = 0u;
 	uint32_t  n_items = 0u;
 	uint32_t  n       = 0u;
 
 	plan->canonical_length = 0u;
+	if (base != NULL &&
+	    (hull_sexpr_put_atom(pair, sizeof pair, &n_pair, (const uint8_t *)"base", 4u) ||
+	     hull_sexpr_put_atom(pair, sizeof pair, &n_pair, (const uint8_t *)base,
+	                         (uint32_t)strlen(base)) ||
+	     hull_sexpr_put_list(entries, HULL_PLAN_TEXT, &n, pair, n_pair)))
+		return HULL_PLAN_ERR_SIZE;
+	n_pair = 0u;
 	if (hull_sexpr_put_atom(pair, sizeof pair, &n_pair, (const uint8_t *)"class", 5u) ||
 	    hull_sexpr_put_atom(pair, sizeof pair, &n_pair, (const uint8_t *)class_name,
 	                        (uint32_t)strlen(class_name)) ||
@@ -448,8 +455,8 @@ static hull_plan_status encode(hull_plan *plan, const char *class_name)
 
 hull_plan_status hull_plan_build(hull_plan *plan, const hull_spec *spec,
                                  const hull_sexpr_form *machine, const char *name,
-                                 const hull_choice *choice, const char *host_arch,
-                                 const char *const *accepted,
+                                 const char *base, const hull_choice *choice,
+                                 const char *host_arch, const char *const *accepted,
                                  hull_matrix_report report, void *context)
 {
 	writer           w;
@@ -507,5 +514,5 @@ hull_plan_status hull_plan_build(hull_plan *plan, const hull_spec *spec,
 	status = judge(&w, projection, accepted, &r);
 	if (status != HULL_PLAN_OK && status != HULL_PLAN_REJECTED)
 		return status;
-	return encode(plan, choice->class_name) != HULL_PLAN_OK ? HULL_PLAN_ERR_SIZE : status;
+	return encode(plan, choice->class_name, base) != HULL_PLAN_OK ? HULL_PLAN_ERR_SIZE : status;
 }

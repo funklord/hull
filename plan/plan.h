@@ -5,8 +5,9 @@
  *
  * The resolved machine is readable text, the form `spec.resolved.conf`
  * takes (sections 3.1 and 4.1), and the plan an engine receives is that
- * machine in canonical form with the class it runs as,
- * `(plan (class vm) (machine ...))` (A.1, hull_engine.h).
+ * machine in canonical form with the class it runs as and the directory
+ * its paths are relative to, `(plan (base "/dir") (class vm) (machine
+ * ...))` (A.1, hull_engine.h).
  *
  * Entries the user wrote are copied byte for byte, so a report about one
  * points at the user's own line; what the planner adds is attributed to
@@ -66,14 +67,18 @@ typedef struct hull_plan {
 /*
  * Resolve `machine` from `spec` for `choice` on a host whose arch is
  * `host_arch`. `name` is the machine's name in a `(machines ...)` file,
- * which is its hostname unless it says otherwise, or NULL. Every field is
+ * which is its hostname unless it says otherwise, or NULL. `base` is the
+ * absolute directory the file's relative paths mean, the file's own, or
+ * NULL for none: the plan carries it so that nothing reading the plan
+ * depends on where it was started. Every field is
  * reported, as hull_matrix_resolve() does, with its offset in the user's
  * file. `plan` is large; it is the caller's, and holds the resolved text
  * afterwards.
  */
 hull_plan_status hull_plan_build(hull_plan *plan, const hull_spec *spec,
                                  const hull_sexpr_form *machine, const char *name,
-                                 const hull_choice *choice, const char *host_arch,
+                                 const char *base, const hull_choice *choice,
+                                 const char *host_arch,
                                  const char *const *accepted,
                                  hull_matrix_report report, void *context);
 

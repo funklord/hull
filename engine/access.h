@@ -32,6 +32,11 @@ char *hull_access_value(const hull_sexpr_doc *doc, const hull_sexpr_form *record
 /* Whether `(key true)` is in `record`. */
 int hull_access_true(const hull_sexpr_doc *doc, const hull_sexpr_form *record, const char *key);
 
+/* `path` as the plan means it: relative to its `(base ...)`, if it has one
+ * and the path is not absolute. The caller frees it; NULL if memory ran
+ * out. */
+char *hull_access_path(const hull_sexpr_doc *doc, const char *path);
+
 /* Open `plan` and find its machine. Returns 0 if it is not a plan. */
 int hull_access_machine(hull_sexpr_doc *doc, const uint8_t *plan, size_t length,
                         hull_sexpr_form *machine);

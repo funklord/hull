@@ -129,7 +129,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		free(source);
 		return "chroot runs only a dir source";
 	}
-	m->root = strdup(source + 4);
+	m->root = hull_access_path(doc, source + 4);
 	free(source);
 	m->workdir  = hull_access_value(doc, &machine, "workdir");
 	m->hostname = hull_access_value(doc, &machine, "hostname");
@@ -181,10 +181,14 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		for (more = hull_sexpr_next(doc, &item, &item); more;
 		     more = hull_sexpr_next(doc, &item, &item)) {
 			char *mode;
+			char *host_path;
 
 			if (m->volume_count == MAX_VOLUMES)
 				return "there are too many volumes";
-			m->volume_host[m->volume_count]  = hull_access_value(doc, &item, "host");
+			host_path = hull_access_value(doc, &item, "host");
+			m->volume_host[m->volume_count] =
+			    host_path != NULL ? hull_access_path(doc, host_path) : NULL;
+			free(host_path);
 			m->volume_guest[m->volume_count] = hull_access_value(doc, &item, "guest");
 			mode = hull_access_value(doc, &item, "mode");
 			m->volume_readonly[m->volume_count] = mode != NULL && strcmp(mode, "ro") == 0;

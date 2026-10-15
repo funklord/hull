@@ -14,8 +14,8 @@
  * file, line and column of the entry that asked, as a compiler would.
  *
  * `run` plans one machine, the file's or the one NAME names, and runs it
- * in the foreground, from the file's directory, so paths in the file are
- * relative to it (section 4.8).
+ * in the foreground. Paths in a file are relative to the file: the plan
+ * carries its directory as `(base ...)` (section 4.8).
  *
  * Exit status for plan and check: 0 when nothing was rejected, 1 when
  * something was, 2 when the file could not be read or checked, or the
@@ -24,7 +24,7 @@
  * plan or start it.
  */
 
-#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
 
 #include <errno.h>
 #include <libgen.h>
@@ -56,6 +56,7 @@ typedef struct options {
 	int         explain;
 	int         resolved;
 	FILE       *stream;  /* where reports go: stdout, or stderr under run */
+	char       *base;    /* the file's directory, absolute */
 } options;
 
 /* One machine on one backend, as the report callback sees it. */
@@ -182,8 +183,8 @@ static int resolve_one(const options *o, const hull_registry *registry, const hu
 	r.machine  = shown;
 	r.choice   = &choice;
 	r.rejected = 0u;
-	planned = hull_plan_build(&plan, spec, machine, name, &choice, registry->host_arch,
-	                          o->tokens, print_resolution, &r);
+	planned = hull_plan_build(&plan, spec, machine, name, o->base, &choice,
+	                          registry->host_arch, o->tokens, print_resolution, &r);
 	if (planned != HULL_PLAN_OK && planned != HULL_PLAN_REJECTED) {
 		fprintf(stderr, "%s: %s on %s: %s\n", o->file, shown,
 		        choice.engine->caps->engine_name,
@@ -254,6 +255,17 @@ static int resolve_all(const options *o, const hull_registry *registry)
 	}
 	free(data);
 	return worst;
+}
+
+/* The absolute directory `file` is in, which its relative paths mean, or
+ * NULL. The caller frees it. */
+static char *base_of(const char *file)
+{
+	char *copy = strdup(file);
+	char *base = copy != NULL ? realpath(dirname(copy), NULL) : NULL;
+
+	free(copy);
+	return base;
 }
 
 /* --- run ---------------------------------------------------------------- */
@@ -384,7 +396,6 @@ static int run(options *o, const hull_registry *registry, const char *name)
 	hull_plan_status     planned;
 	uint8_t             *data;
 	size_t               length;
-	char                *where;
 	int                  status;
 
 	data = read_file(o->file, &length);
@@ -418,8 +429,8 @@ static int run(options *o, const hull_registry *registry, const char *name)
 	r.machine  = shown;
 	r.choice   = &choice;
 	r.rejected = 0u;
-	planned = hull_plan_build(&plan, &spec, &machine, name, &choice, registry->host_arch,
-	                          o->tokens, print_resolution, &r);
+	planned = hull_plan_build(&plan, &spec, &machine, name, o->base, &choice,
+	                          registry->host_arch, o->tokens, print_resolution, &r);
 	if (planned != HULL_PLAN_OK) {
 		fprintf(stderr, "%s: %s on %s (%s): not run: %s\n", o->file, shown,
 		        choice.engine->caps->engine_name, choice.class_name,
@@ -432,15 +443,6 @@ static int run(options *o, const hull_registry *registry, const char *name)
 		        choice.engine->caps->engine_name);
 		return 125;
 	}
-
-	/* Paths in the file are the file's: run from where it is. */
-	where = strdup(o->file);
-	if (where == NULL || chdir(dirname(where)) != 0) {
-		fprintf(stderr, "%s: cannot change to its directory\n", o->file);
-		free(where);
-		return 125;
-	}
-	free(where);
 
 	memset(&action, 0, sizeof action);
 	action.sa_handler = interrupt;
@@ -568,6 +570,11 @@ int main(int argc, char **argv)
 	}
 	if (strcmp(command, "check") != 0 && o.backend_count > 1u) {
 		fprintf(stderr, "hull: %s takes one backend; check takes several\n", command);
+		return strcmp(command, "run") == 0 ? 125 : 2;
+	}
+	o.base = base_of(o.file);
+	if (o.base == NULL) {
+		fprintf(stderr, "%s: %s\n", o.file, strerror(errno));
 		return strcmp(command, "run") == 0 ? 125 : 2;
 	}
 	if (strcmp(command, "run") == 0) {
