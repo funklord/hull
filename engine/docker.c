@@ -11,6 +11,14 @@
  * label `hull.machine`, so one left by a hull that was killed can be
  * found and removed by name.
  *
+ * The workload runs as the invoking user's uid and gid, not as root:
+ * decided 2026-10-15, hull does everything it can as the user and asks
+ * for root only at the very end of the line. Under a rootful daemon the
+ * container's root is the host's, which is the end of a line no spec has
+ * reached yet. So volumes and the files hull hands in are the user's own
+ * on both sides, and capability grants are refused: docker gives them to
+ * a root workload only.
+ *
  * Output arrives on the attach stream in docker's frames -- a byte for
  * the stream, three of padding, a big-endian length, the bytes -- and
  * goes to the core through on_data, by a thread per machine that then
@@ -552,6 +560,7 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 		add_all(&body, &exposed);
 		add_text(&body, "}");
 	}
+	addf(&body, ",\"User\":\"%u:%u\"", (unsigned)getuid(), (unsigned)getgid());
 	add_text(&body, ",\"Labels\":{\"hull.machine\":");
 	add_json(&body, m->name);
 	add_text(&body, "}");
@@ -582,17 +591,10 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 		free(value);
 	}
 	if (hull_access_find(doc, machine, "security", &entry)) {
-		hull_sexpr_form allow;
-
 		if (hull_access_true(doc, &entry, "readonly_root"))
 			add_text(&body, ",\"ReadonlyRootfs\":true");
 		if (hull_access_true(doc, &entry, "no_new_privs"))
 			add_text(&body, ",\"SecurityOpt\":[\"no-new-privileges\"]");
-		if (hull_access_find(doc, &entry, "allow", &allow)) {
-			add_text(&body, ",\"CapAdd\":[");
-			add_strings(&body, doc, &allow);
-			add_text(&body, "]");
-		}
 	}
 	add_text(&body, "}}");
 	free(exposed.data);
@@ -854,10 +856,12 @@ static const hull_cap_entry entries[] = {
 	{ "cpus",               HULL_SUP_NATIVE,   NULL, NULL },
 	{ "memory",             HULL_SUP_NATIVE,   "a ceiling, not an allocation", NULL },
 
-	/* Section 7: capabilities empty, then the grants. */
+	/* Section 7: no capabilities, and none granted to a workload that is
+	 * not root, which is docker's rule and not ours to bend. */
 	{ "security.readonly_root", HULL_SUP_NATIVE, NULL, NULL },
 	{ "security.no_new_privs",  HULL_SUP_NATIVE, NULL, NULL },
-	{ "security.allow",         HULL_SUP_NATIVE, "capability grants", NULL },
+	{ "security.allow",         HULL_SUP_REJECTED,
+	  "docker grants capabilities only to root, and its root is the host's", NULL },
 
 	/* A shared kernel sees every event and lock (6). */
 	{ "fidelity.inotify",   HULL_SUP_NATIVE,   NULL, NULL },

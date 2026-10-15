@@ -112,7 +112,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
 # What test/docker_test.sh writes.
 DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf volro.conf \
                     rootro.conf nocap.conf cap.conf die.conf wait.conf port.conf noimage.conf \
-                    nocmd.conf data/in)
+                    nocmd.conf data/in data/out)
 
 # The reference engine's test rootfs holds one static program.
 PROBE = $(BUILD_DIR)/test/cli/rootfs/probe

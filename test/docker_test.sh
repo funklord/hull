@@ -54,39 +54,43 @@ printf 'from the host\n' > "$root/data/in"
 rm -f "$root/data/out"
 
 # Output, status, and what the machine looks like from inside.
-conf run '(command "sh" "-c" "echo out; echo to stderr >&2; echo GREETING=$GREETING; pwd; hostname; exit 3")' \
+conf run '(command "sh" "-c" "echo out; echo to stderr >&2; echo GREETING=$GREETING; pwd; hostname; echo uid=$(id -u):$(id -g); exit 3")' \
 	'(workdir "/tmp") (env (GREETING "hi"))'
 expect 3 '^out$' run
 expect 3 '^to stderr$' run
 expect 3 '^GREETING=hi$' run
 expect 3 '^/tmp$' run
 expect 3 '^dtest$' run
+expect 3 "^uid=$(id -u):$(id -g)\$" run
 cases=$((cases + 1))
 if (cd / && timeout 60 "$hull" run -f "$root/run.conf" 2>/dev/null) | grep -q '^to stderr$'; then
 	fail "stderr reached stdout" ""
 fi
 
-# Volumes, read-write and read-only, and a read-only root. Only the
-# reading of a read-write volume is tested: rootful docker writes as host
-# root, which section 7's empty capabilities leave without the
-# CAP_DAC_OVERRIDE a dir of this account's needs (project.md section 4.9).
-conf vol '(command "cat" "/data/in")' '(volumes (volume (host "./data") (guest "/data")))'
+# Volumes, read-write and read-only, and a read-only root. The workload is
+# this account's uid, so what it writes through a volume is this
+# account's file.
+conf vol '(command "sh" "-c" "cat /data/in; echo written > /data/out && echo write=ok")' \
+	'(volumes (volume (host "./data") (guest "/data")))'
 expect 0 '^from the host$' vol
-# Refused for being read-only, by name: a write into the read-write mount
-# is refused too, for want of a capability, so "refused" alone tells the
-# two apart not at all.
+expect 0 '^write=ok$' vol
+cases=$((cases + 1))
+[ -O "$root/data/out" ] || fail "a write through a volume is not this account's file" "$(ls -l "$root/data")"
+rm -f "$root/data/out"
+# Refused for being read-only, by name, and somewhere this uid could
+# otherwise write: /tmp, on the root, is everybody's.
 conf volro '(command "sh" "-c" "echo x > /data/out || true")' \
 	'(volumes (volume (host "./data") (guest "/data") (mode ro)))'
 expect 0 'Read-only file system' volro
-conf rootro '(command "sh" "-c" "touch /x || true")' '(security (readonly_root true))'
+conf rootro '(command "sh" "-c" "touch /tmp/x || true")' '(security (readonly_root true))'
 expect 0 'Read-only file system' rootro
 
-# Section 7: no capability unless granted.
-conf nocap '(command "sh" "-c" "touch /f && chown 1 /f && echo chown=ok || echo chown=refused")'
+# Section 7: no capability, and a grant refused at plan time, since docker
+# gives capabilities only to a root workload.
+conf nocap '(command "sh" "-c" "touch /tmp/f && chown 1 /tmp/f && echo chown=ok || echo chown=refused")'
 expect 0 '^chown=refused$' nocap
-conf cap '(command "sh" "-c" "touch /f && chown 1 /f && echo chown=ok || echo chown=refused")' \
-	'(security (allow chown))'
-expect 0 '^chown=ok$' cap
+conf cap '(command "true")' '(security (allow chown))'
+expect 125 'security\.allow: rejected: docker grants capabilities only to root' cap
 
 # A signal is 128 and its number, from the workload or sent to hull. With
 # an init at PID 1, a SIGTERM to hull stops the machine well inside the

@@ -645,27 +645,32 @@ Three of these had first passed: stderr, stop and the session. Each was caught o
 - **`stop`** is the daemon's stop: SIGTERM, then SIGKILL after the timeout. `destroy` removes the container by force.
 - **Every container is named `hull-<hostname>-<pid>-<n>` and labelled `hull.machine`,** so one left behind by a hull that was killed can be found and removed by name. That is `running-code.md`'s point about a container: it belongs to the daemon, and a killed client cannot clean it up.
 
+**The workload runs as the invoking user's uid and gid**, by §7's rule. Under a rootful daemon the container's root is host root, so the adapter does not use it.
+
+- **Volumes:** what a workload writes through one is the user's own file, and the test checks it.
+- **Capabilities:** docker gives them only to a root workload, so `(allow …)` is declared rejected on docker with that reason. Granting them by running as root would be the end of the line, reached by default.
+
 **What the create request carries:**
 
 - **The basics:** the image ref, `Cmd`, `WorkingDir`, `Hostname` and `Env`.
 - **Volumes:** `Binds`, with host paths made absolute, since the daemon resolves nothing relative. `hull run` stands in the file's directory.
 - **Ports:** `PortBindings` on 127.0.0.1 until §8.1's stable addresses exist.
 - **Limits:** `NanoCpus` and `Memory`.
-- **Security:** `ReadonlyRootfs`, and `no-new-privileges`. §7's capabilities, "empty-by-default and additive", become `CapDrop ALL` plus a `CapAdd` for each `(allow …)`; the daemon takes lowercase names.
+- **Security:** `ReadonlyRootfs`, `no-new-privileges` and `CapDrop ALL`.
 - **`Init`, docker's own tini, as PID 1,** for the same reason §4.8's chroot engine has an init: a workload at PID 1 ignores `stop`'s SIGTERM, and nothing reaps. A command that is not there is therefore the init failing to exec it, status 127, as a shell would report it, not a failed start.
 
 **The declaration shrank to what the adapter does.** `ssh` and `secrets` left it, because nothing provisions sshd or materialises a secret yet. A dir source as an overlay is declared rejected until §5.0's "cached docker import of the tree" is written. One consequence: §4's example, which has `(ssh true)`, is refused on ns for that one field. Declaring `ssh` would run the machine without sshd and without a word, which §6's rule 1 forbids.
 
 Open:
 
-- **A read-write volume cannot be written by a container running as root.** Rootful docker runs the container's root as host root, and with §7's empty capabilities that root lacks `CAP_DAC_OVERRIDE`, so it cannot write into a directory the user owns. Granting it would leave root-owned files in the user's tree, which the user could not then delete. The fixes are to run the workload as the invoking user, or the daemon's user-namespace remapping. Either is a decision about §7's uid model and A.3's ownership classes, and it is not made here. The test reads through a read-write volume and does not write.
+- **An image that needs root inside**, an `apt-get` in a build step say, fails on docker as the user. It wants an engine that maps root to the user, as chroot and the native ns engine do, not docker's root.
 - **Images must already be local.** Nothing pulls; the OCI border (§3.5) is Phase 3.
 
-**`make check-docker`**, not part of `make check`, runs `test/docker_test.sh` against the daemon the account can reach. It uses `alpine:latest` and does not pull it. There are 17 cases:
+**`make check-docker`**, not part of `make check`, runs `test/docker_test.sh` against the daemon the account can reach. It uses `alpine:latest` and does not pull it. There are 20 cases:
 
-- output on its own stream, the exit status, env, workdir and hostname;
-- volumes and a read-only root;
-- capabilities with and without a grant;
+- output on its own stream, the exit status, env, workdir, hostname and the user's uid;
+- volumes, a write through one that lands as the user's file, and a read-only root;
+- no capabilities, and a grant refused;
 - a signal from the workload, and SIGTERM to `hull run` stopping the machine inside docker's ten seconds;
 - a port reached from the host;
 - a missing image and a missing command;
@@ -675,7 +680,7 @@ In a scratch copy, breaking each of these failed it:
 
 - the init;
 - dropping capabilities;
-- granting them;
+- running as the user, which also made the write through a volume fail;
 - keeping stderr apart;
 - the read-only root;
 - the read-only volume;
@@ -685,7 +690,7 @@ In a scratch copy, breaking each of these failed it:
 - the exit status;
 - removing the container, which left 15 behind, and the harness removed them by name.
 
-The read-only volume had first passed. A write into a read-write volume is refused as well, for want of the capability, so a test asking only whether the write was refused could not tell the two apart. Both read-only cases now require "Read-only file system" by name.
+The read-only volume had first passed: while the container ran as root, a write into a read-write volume was refused as well, for want of a capability. A test asking only whether the write was refused could not tell the two apart, so both read-only cases now require "Read-only file system" by name.
 
 `make check` itself needs no daemon: its case for an engine with no operations moved from docker to qemu.
 
@@ -782,6 +787,8 @@ Two rules keep this honest:
 ---
 
 ## 7. Security model
+
+**Decided 2026-10-15, by the holder: hull does everything it can as the user, and asks for root only at the very end of the line.** In the holder's words, "our basic ideology is that docker is broken precisely because it needs root for everything". So root is never a convenience or a default. Where something can be done as the user, through a user namespace, a user-owned socket or a file the user owns, it is. A design that reaches for root has not yet found the user's way, and the engines that inherit root from what they wrap say so in their declarations. How a spec asks for root at the end of the line is not designed, because no spec has reached it.
 
 - No root daemon, no setuid helpers, no privileged socket. The resident component is the per-user core (§2), an unprivileged service owned by the invoking user; the attack surface of "Hull installed" is user-owned processes and a user-owned socket. Adapter engines inherit the wrapped runtime's posture — the docker adapter rides dockerd's root daemon, and its matrix column declares it — while native engines carry the full rootless model.
 - ns backend: user namespaces map root-in-container to an unprivileged subordinate uid; seccomp default profile (crun's) + `no_new_privs` on by default; capabilities are empty-by-default and additive via `(security (allow …))` — there is deliberately **no `--privileged`**. Workloads that need it are told to use the vm backend, which is the correct tool.
