@@ -23,6 +23,7 @@ const ATTACH   = ('6' << 24) | (':' << 16) | ('a' << 8) | 't';
 const LOGS     = ('4' << 24) | (':' << 16) | ('l' << 8) | 'o';
 const STOP     = ('4' << 24) | (':' << 16) | ('s' << 8) | 't';
 const LIST     = ('4' << 24) | (':' << 16) | ('l' << 8) | 'i';
+const EXEC     = ('4' << 24) | (':' << 16) | ('e' << 8) | 'x';
 const STARTED  = ('7' << 24) | (':' << 16) | ('s' << 8) | 't';
 const DATA     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'a';
 const EXITED   = ('6' << 24) | (':' << 16) | ('e' << 8) | 'x';
@@ -43,6 +44,9 @@ struct client_message {
 		case LOGS:    logs          logs;
 		case STOP:    stop          stop;
 		case LIST:    listing       list;
+		case EXEC:    exec          exec;
+		case DATA:    client_data   data;
+		case EOF:     eof           eof;
 		default:      unknown       unknown;
 	}
 }
@@ -103,6 +107,26 @@ struct listing {
 	preamble u8[6] = "4:list";
 	channel  ch;
 	u8  close  [must_eq = ')'];
+}
+
+// A command in a running machine, on a channel of its own: its stdin is
+// `data` on fd 0 and `eof` from the frontend, its output `data` on 1 and 2
+// and its end `exited` from the core, as for a machine.
+struct exec {
+	preamble u8[6] = "4:exec";
+	argv_entry     argv;
+	channel        ch;
+	machine_entry  machine;
+	u8  close  [must_eq = ')'];
+}
+
+// An exec's stdin: always fd 0.
+struct client_data {
+	preamble u8[12] = "4:data(3:buf";
+	atom     bytes;
+	u8       close_buf  [must_eq = ')'];
+	channel  ch;
+	preamble u8[10] = "(2:fd1:0))";
 }
 
 // `(follow true)` or `(follow false)`.
@@ -177,7 +201,8 @@ struct exited {
 	preamble u8[2] = "))";
 }
 
-// The end of what `logs` replays, when it does not follow.
+// The end of what `logs` replays, when it does not follow; from a
+// frontend, the end of an exec's stdin.
 struct eof {
 	preamble u8[5] = "3:eof";
 	channel  ch;
@@ -240,6 +265,12 @@ struct channel {
 	u8    close  [must_eq = ')'];
 }
 
+// The words of an exec's command: at least one, which the core checks.
+struct argv_entry {
+	preamble u8[7] = "(4:argv";
+	atom  words[]  until ")";
+}
+
 struct machine_entry {
 	preamble u8[10] = "(7:machine";
 	atom  id;
@@ -250,7 +281,9 @@ struct machine_entry {
 //
 // WHAT THIS SCHEMA DOES NOT SAY, and the core and frontends check instead:
 //
-// - that a request's channel is not 0 and not already in use;
+// - that a request's channel is not 0 and not already in use, and that
+//   `data` and `eof` from a frontend are on an exec's channel;
+// - that an exec's argv holds a word;
 // - that a machine id is a DNS label (section 4.10), and a plan one
 //   hull_plan_build() would write;
 // - that the numbers are minimal decimal;

@@ -261,6 +261,46 @@ grep -q '^status=143$' "$root/attach.out" ||
 	fail "attach did not end with the stopped machine's 143" "$(cat "$root/attach.out")"
 expect 0 '^kept +chroot +ns +exited$' "$hull" ps
 
+# exec: a command in the running machine, with its environment and
+# workdir, this process's stdin, and its own status; it ends with the
+# frontend that ran it, and an exited machine takes none.
+conf execd '(command "/probe" "wait")' '(hostname "execd") (on_disconnect keep) (workdir "/srv")' \
+	'(env (GREETING "hi"))'
+(cd / && exec "$hull_abs" run -f "$root/execd.conf" > /dev/null 2>&1) &
+execer=$!
+tries=0
+until "$hull" ps 2>/dev/null | grep -q '^execd .*running$' || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+expect 0 '^host=execd$' "$hull" exec execd -- /probe host cwd env GREETING pid
+expect 0 '^cwd=/srv$' "$hull" exec execd -- /probe cwd
+expect 0 '^GREETING=hi$' "$hull" exec execd /probe env GREETING
+# Small, and counted from 3 in the machine's own PID namespace, where a
+# host pid would be neither.
+expect 0 '^pid=([3-9]|[1-9][0-9])$' "$hull" exec execd /probe pid
+expect 0 '^stdin=from the frontend$' sh -c 'echo from the frontend | "$0" exec execd /probe stdin' \
+	"$hull_abs"
+expect 0 '^stdin=\(none\)$' sh -c '"$0" exec execd /probe stdin < /dev/null' "$hull_abs"
+expect 7 '' "$hull" exec execd /probe exit 7
+# The machine's init holds nothing of the core's: no socket, and not its
+# lock, which a machine outliving its core would otherwise keep held.
+cases=$((cases + 1))
+workload=$(ps -eo pid=,args= | awk '$2 == "/probe" && $3 == "wait" {print $1; exit}')
+init=$(ps -o ppid= -p "$workload" | tr -d ' ')
+held=$(ls -l "/proc/$init/fd" 2>/dev/null | grep -E 'socket:|core\.lock')
+[ -n "$init" ] && [ -z "$held" ] || fail "the machine's init holds the core's descriptors" "$held"
+expect 125 '/nope: No such file or directory' "$hull" exec execd /nope
+expect 125 'no such machine' "$hull" exec nobody /probe
+cases=$((cases + 1))
+timeout -s KILL 1 "$hull" exec execd /probe say exec wait > /dev/null 2>&1
+sleep 0.5
+count=$(ps -eo args= | grep -c '^/probe ')
+[ "$count" = 1 ] || fail "a command outlived the frontend that ran it" "$(ps -eo pid=,args= | awk '$2 == "/probe"')"
+"$hull" stop execd > /dev/null 2>&1
+wait "$execer" 2>/dev/null
+expect 125 'the machine is not running' "$hull" exec execd /probe
+
 # One core: a second gives way to the first, says nothing, and leaves the
 # first answering on its socket.
 expect 0 '' "$hull" core

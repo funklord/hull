@@ -64,3 +64,15 @@ core_message error 28 35 3A 65 72 72 6F 72 28 32 3A 63 68 31 3A 31 29 28 36 3A 7
 
 # unknown: (5:hints(2:ch1:0)(4:more))
 core_message unknown 28 35 3A 68 69 6E 74 73 28 32 3A 63 68 31 3A 30 29 28 34 3A 6D 6F 72 65 29 29
+
+# exec: (4:exec(4:argv2:ls)(2:ch1:7)(7:machine3:web))
+client_message exec 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 6C 73 29 28 32 3A 63 68 31 3A 37 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 29
+
+# exec_words: (4:exec(4:argv2:sh2:-c10:echo $HOME)(2:ch1:8)(7:machine3:web))
+client_message exec_words 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 73 68 32 3A 2D 63 31 30 3A 65 63 68 6F 20 24 48 4F 4D 45 29 28 32 3A 63 68 31 3A 38 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 29
+
+# stdin: (4:data(3:buf3:#00#a#0a#)(2:ch1:7)(2:fd1:0))
+client_message stdin 28 34 3A 64 61 74 61 28 33 3A 62 75 66 33 3A 00 61 0A 29 28 32 3A 63 68 31 3A 37 29 28 32 3A 66 64 31 3A 30 29 29
+
+# stdin_eof: (3:eof(2:ch1:7))
+client_message stdin_eof 28 33 3A 65 6F 66 28 32 3A 63 68 31 3A 37 29 29

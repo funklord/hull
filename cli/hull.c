@@ -28,6 +28,7 @@
 
 #include <errno.h>
 #include <libgen.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -82,6 +83,7 @@ static void usage(FILE *out)
 	      "       hull check [-f FILE] --backend B[,B...] [--accept TOKEN]...\n"
 	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [NAME]\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
+	      "       hull exec ID [--] CMD [ARG...]\n"
 	      "       hull core\n"
 	      "       hull engines\n"
 	      "       hull --version\n", out);
@@ -705,6 +707,103 @@ static int list_machines(void)
 	return 0;
 }
 
+/* `hull exec ID [--] CMD [ARG...]`: the command's output written out, this
+ * process's stdin its input, and its status this process's. */
+static int exec_in(const char *id, char **argv, int argc)
+{
+	hull_wire wire;
+	hull_msg  request = { 0 };
+	int       input_open = 1;
+
+	if (!core_running()) {
+		fprintf(stderr, "hull: no core is running, so no machine is\n");
+		return 125;
+	}
+	if (connect_core(&wire, 0) != 0)
+		return 125;
+	hull_msg_raw(&request, "(4:exec(4:argv");
+	for (int i = 0; i < argc; i++)
+		hull_msg_text(&request, argv[i]);
+	hull_msg_raw(&request, ")");
+	hull_msg_channel(&request, 1u);
+	hull_msg_raw(&request, "(7:machine");
+	hull_msg_text(&request, id);
+	hull_msg_raw(&request, "))");
+	if (hull_wire_send(wire.fd, &request) != 0) {
+		hull_msg_free(&request);
+		hull_wire_close(&wire);
+		return 125;
+	}
+	hull_msg_free(&request);
+	for (;;) {
+		struct pollfd    fds[2] = { { wire.fd, POLLIN, 0 }, { 0, POLLIN, 0 } };
+		hull_sexpr_doc   body;
+		hull_wire_status status;
+
+		if (poll(fds, input_open ? 2u : 1u, -1) < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (input_open && fds[1].revents != 0) {
+			uint8_t  chunk[16384];
+			ssize_t  n = read(0, chunk, sizeof chunk);
+			hull_msg m = { 0 };
+
+			if (n > 0) {
+				hull_msg_raw(&m, "(4:data(3:buf");
+				hull_msg_atom(&m, chunk, (size_t)n);
+				hull_msg_raw(&m, ")(2:ch1:1)(2:fd1:0))");
+			} else {
+				hull_msg_raw(&m, "(3:eof(2:ch1:1))");
+				input_open = 0;
+			}
+			hull_wire_send(wire.fd, &m);
+			hull_msg_free(&m);
+		}
+		if (fds[0].revents == 0)
+			continue;
+		status = hull_wire_fill(&wire);
+		if (status == HULL_WIRE_CLOSED || status == HULL_WIRE_BROKEN) {
+			fprintf(stderr, "hull: the core went away\n");
+			break;
+		}
+		while ((status = hull_wire_next(&wire, &body)) == HULL_WIRE_OK) {
+			hull_sexpr_form value;
+			long long       code = 0;
+			long long       sig  = 0;
+
+			if (hull_msg_is(&body, "data")) {
+				hull_sexpr_form buf;
+				hull_sexpr_form fd;
+
+				if (hull_msg_find(&body, "buf", &buf) && hull_msg_find(&body, "fd", &fd))
+					write_all(hull_sexpr_is(&body, &fd, "2") ? 2 : 1, body.data + buf.content,
+					          buf.content_length);
+			} else if (hull_msg_is(&body, "exited")) {
+				if (hull_msg_find(&body, "code", &value))
+					hull_msg_long(&body, &value, &code);
+				if (hull_msg_find(&body, "signal", &value))
+					hull_msg_long(&body, &value, &sig);
+				hull_wire_close(&wire);
+				return sig != 0 ? 128 + (int)sig : (int)code;
+			} else if (hull_msg_is(&body, "error")) {
+				char reason[512] = "an error";
+
+				if (hull_msg_find(&body, "reason", &value))
+					hull_msg_string(&body, &value, reason, sizeof reason);
+				fprintf(stderr, "hull: %s\n", reason);
+				hull_wire_close(&wire);
+				return 125;
+			}
+		}
+		if (status == HULL_WIRE_BROKEN)
+			break;
+	}
+	hull_wire_close(&wire);
+	return 125;
+}
+
 /* stop, logs and attach: one request about one machine, followed to its
  * end. A Ctrl-C under attach or logs only leaves. */
 static int about(const char *command, const char *id, int follow_logs, long timeout_ms)
@@ -800,6 +899,21 @@ int main(int argc, char **argv)
 		return hull_core_run(host_arch());
 	if (strcmp(command, "ps") == 0 && argc == 2)
 		return list_machines();
+	if (strcmp(command, "exec") == 0) {
+		int first = 3;
+
+		if (argc < 4 || argv[2][0] == '-') {
+			usage(stderr);
+			return 125;
+		}
+		if (strcmp(argv[3], "--") == 0)
+			first = 4;
+		if (first >= argc) {
+			usage(stderr);
+			return 125;
+		}
+		return exec_in(argv[2], argv + first, argc - first);
+	}
 	if ((strcmp(command, "stop") == 0 || strcmp(command, "attach") == 0 ||
 	     strcmp(command, "logs") == 0) && argc >= 3) {
 		const char *id      = NULL;

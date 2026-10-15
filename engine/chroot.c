@@ -256,6 +256,35 @@ static unsigned long locked_flags(const char *path)
 	return flags;
 }
 
+/*
+ * Close every descriptor from 3 up but those in `keep`. The init and the
+ * exec helper are forked from the process running the engine and never
+ * exec, so they would otherwise hold whatever it had open: its sockets,
+ * its lock, and the far end of a stdin pipe, which then never reached
+ * EOF. close_range() over the gaps allocates nothing, which matters in a
+ * child forked from a threaded process.
+ */
+static void close_others(int *keep, unsigned n)
+{
+	unsigned from = 3u;
+
+	for (unsigned i = 1u; i < n; i++)
+		for (unsigned j = i; j > 0u && keep[j - 1u] > keep[j]; j--) {
+			int t = keep[j];
+
+			keep[j] = keep[j - 1u];
+			keep[j - 1u] = t;
+		}
+	for (unsigned i = 0u; i < n; i++) {
+		if (keep[i] < 3)
+			continue;
+		if ((unsigned)keep[i] > from)
+			close_range(from, (unsigned)keep[i] - 1u, 0);
+		from = (unsigned)keep[i] + 1u;
+	}
+	close_range(from, ~0u, 0);
+}
+
 static volatile sig_atomic_t pending;
 
 static void hold(int signal)
@@ -285,6 +314,11 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int out, int e
 
 	if (null < 0 || dup2(null, 0) < 0 || dup2(out, 1) < 0 || dup2(err, 2) < 0)
 		child_fail(report, "stdio");
+	{
+		int keep[2] = { report, status_pipe };
+
+		close_others(keep, 2u);
+	}
 	/* The machine dies with the process that runs its engine, the core:
 	 * nothing could manage it after, since adopt() is not written, and
 	 * nothing is to outlive what started it. */
@@ -416,17 +450,25 @@ static void *read_workload(void *arg)
 			}
 		}
 	}
-	while (waitpid(m->pid, &status, 0) < 0 && errno == EINTR)
-		;
+	/* Waited for without reaping, then reaped and marked done under the
+	 * lock, so that stop() signals the init's pid only while it is the
+	 * init's or its zombie's. */
+	{
+		siginfo_t info;
+
+		while (waitid(P_PID, (id_t)m->pid, &info, WEXITED | WNOWAIT) < 0 && errno == EINTR)
+			;
+	}
+	pthread_mutex_lock(&m->lock);
+	waitpid(m->pid, &status, 0);
+	m->done = 1;
+	pthread_cond_broadcast(&m->done_cond);
+	pthread_mutex_unlock(&m->lock);
 	/* The workload's status, as its init reported it; if the init could
 	 * not, as when stop killed it, the init's own. */
 	if (read(m->status, &m->status_seen, sizeof m->status_seen) == (ssize_t)sizeof m->status_seen)
 		status = m->status_seen;
 	close(m->status);
-	pthread_mutex_lock(&m->lock);
-	m->done = 1;
-	pthread_cond_broadcast(&m->done_cond);
-	pthread_mutex_unlock(&m->lock);
 	if (WIFSIGNALED(status))
 		host->on_exit(m->core, m, NULL, -1, WTERMSIG(status));
 	else
@@ -544,6 +586,15 @@ static int wait_done(hull_machine *m, int timeout_ms)
 	return done;
 }
 
+/* `signal` to the init, unless it has been reaped and its pid freed. */
+static void signal_init(hull_machine *m, int signal)
+{
+	pthread_mutex_lock(&m->lock);
+	if (!m->done)
+		kill(m->pid, signal);
+	pthread_mutex_unlock(&m->lock);
+}
+
 /* SIGTERM, and SIGKILL if that is not enough within `timeout_ms`. */
 static hull_status chroot_stop(hull_core *core, hull_machine *m, int timeout_ms,
                                hull_error *error)
@@ -553,9 +604,9 @@ static hull_status chroot_stop(hull_core *core, hull_machine *m, int timeout_ms,
 	if (!m->started || wait_done(m, 0))
 		return HULL_OK;
 	host->on_state(core, m, "stopping");
-	kill(m->pid, SIGTERM);
+	signal_init(m, SIGTERM);
 	if (!wait_done(m, timeout_ms)) {
-		kill(m->pid, SIGKILL);
+		signal_init(m, SIGKILL);
 		wait_done(m, 60000);
 	}
 	return HULL_OK;
@@ -568,6 +619,290 @@ static hull_status chroot_destroy(hull_core *core, hull_machine *m, hull_error *
 		pthread_join(m->reader, NULL);
 	}
 	release(m);
+	return HULL_OK;
+}
+
+/* --- exec --------------------------------------------------------------- */
+
+/*
+ * A command in a running machine. A helper forked from the engine joins
+ * the init's user, mount, UTS and PID namespaces -- it can, being single
+ * threaded, which the process running the engine is not -- chroots
+ * through the init's root, and forks the command, which is then a
+ * process of the machine. The helper waits for it and reports its wait
+ * status through a pipe, as the init does for the workload. The command
+ * has PR_SET_PDEATHSIG, so killing the helper ends it: that is
+ * stream_close().
+ */
+struct hull_stream {
+	hull_machine *machine;
+	hull_core    *core;
+	pid_t         helper;
+	int           in;      /* the command's stdin, write end; -1 once ended */
+	int           out;
+	int           err;
+	int           status;  /* the helper's status pipe */
+	pthread_t     reader;
+	pthread_mutex_t lock;
+	int           reaped;  /* the helper's pid is no longer its own */
+};
+
+static void *read_exec(void *arg)
+{
+	hull_stream  *st = arg;
+	struct pollfd fds[2] = { { st->out, POLLIN, 0 }, { st->err, POLLIN, 0 } };
+	uint8_t       buffer[4096];
+	int           open_count = 2;
+	int           status = 0;
+	int           seen;
+
+	while (open_count > 0) {
+		if (poll(fds, 2, -1) < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		for (int i = 0; i < 2; i++) {
+			ssize_t n;
+
+			if (fds[i].fd < 0 || fds[i].revents == 0)
+				continue;
+			n = read(fds[i].fd, buffer, sizeof buffer);
+			if (n > 0) {
+				host->on_data(st->core, st, i + 1, buffer, (size_t)n);
+			} else if (n == 0 || errno != EINTR) {
+				close(fds[i].fd);
+				fds[i].fd = -1;
+				open_count--;
+			}
+		}
+	}
+	/* Waited for without reaping, then reaped under the lock: until it
+	 * is, the pid is the helper's or its zombie's, and stream_close() may
+	 * signal it; after, it may be anybody's. */
+	{
+		siginfo_t info;
+
+		while (waitid(P_PID, (id_t)st->helper, &info, WEXITED | WNOWAIT) < 0 && errno == EINTR)
+			;
+	}
+	pthread_mutex_lock(&st->lock);
+	waitpid(st->helper, &status, 0);
+	st->reaped = 1;
+	pthread_mutex_unlock(&st->lock);
+	if (read(st->status, &seen, sizeof seen) == (ssize_t)sizeof seen)
+		status = seen;
+	close(st->status);
+	if (WIFSIGNALED(status))
+		host->on_exit(st->core, st->machine, st, -1, WTERMSIG(status));
+	else
+		host->on_exit(st->core, st->machine, st, WEXITSTATUS(status), 0);
+	return NULL;
+}
+
+/* The helper: into the machine, then the command. */
+static void run_helper(const hull_machine *m, char *const *argv, const int *ns, int root,
+                       int in, int out, int err, int report, int status_pipe)
+{
+	static const int kinds[] = { CLONE_NEWUSER, CLONE_NEWNS, CLONE_NEWUTS, CLONE_NEWPID };
+	int              status = 0;
+	pid_t            command;
+	int              keep[11] = { ns[0], ns[1], ns[2], ns[3], root, in, out, err, report,
+	                              status_pipe, -1 };
+
+	close_others(keep, 10u);
+	for (unsigned i = 0u; i < 4u; i++)
+		if (setns(ns[i], kinds[i]) != 0)
+			child_fail(report, "joining the machine");
+	if (fchdir(root) != 0 || chroot(".") != 0 || chdir(m->workdir) != 0)
+		child_fail(report, "the machine's root");
+	command = fork();
+	if (command < 0)
+		child_fail(report, "fork");
+	if (command == 0) {
+		if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0L, 0L, 0L) != 0 || dup2(in, 0) < 0 ||
+		    dup2(out, 1) < 0 || dup2(err, 2) < 0 || setsid() < 0)
+			child_fail(report, "the command's stdio");
+		if (m->no_new_privs && prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) != 0)
+			child_fail(report, "no_new_privs");
+		execve(argv[0], argv, (char *const *)m->envp);
+		child_fail(report, argv[0]);
+	}
+	close(report);
+	while (waitpid(command, &status, 0) < 0 && errno == EINTR)
+		;
+	if (write(status_pipe, &status, sizeof status) != (ssize_t)sizeof status)
+		_exit(126);
+	_exit(0);
+}
+
+/* The words of `(exec (argv ...) ...)`, NULL-terminated, into `argv`. */
+static int read_argv(hull_buf spec, char **argv)
+{
+	hull_sexpr_doc  doc;
+	hull_sexpr_form message;
+	hull_sexpr_form entry;
+	hull_sexpr_form word;
+	unsigned        n = 0u;
+	int             more;
+
+	if (hull_sexpr_open(&doc, spec.data, spec.len, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
+	    !hull_sexpr_first(&doc, &message) || !hull_access_find(&doc, &message, "argv", &entry))
+		return 0;
+	hull_sexpr_child(&doc, &entry, &word);
+	for (more = hull_sexpr_next(&doc, &word, &word); more && n < MAX_ARGS;
+	     more = hull_sexpr_next(&doc, &word, &word))
+		if ((argv[n++] = hull_access_text(&doc, &word)) == NULL)
+			return 0;
+	argv[n] = NULL;
+	return n != 0u && !more;
+}
+
+static void free_argv(char **argv)
+{
+	for (unsigned i = 0u; argv[i] != NULL; i++)
+		free(argv[i]);
+}
+
+static hull_status chroot_exec(hull_core *core, hull_machine *m, hull_buf spec,
+                               hull_stream **out, hull_error *error)
+{
+	static const char *const kinds[] = { "user", "mnt", "uts", "pid" };
+	char        *argv[MAX_ARGS + 1u] = { NULL };
+	char         path[64];
+	int          ns[4] = { -1, -1, -1, -1 };
+	int          root;
+	int          in[2], o[2], e[2], report[2], status[2];
+	hull_stream *st;
+	ssize_t      n;
+	int          done;
+
+	pthread_mutex_lock(&m->lock);
+	done = m->done;
+	pthread_mutex_unlock(&m->lock);
+	if (!m->started || done)
+		return fail(error, HULL_ERR_GONE, "the machine is not running");
+	if (!read_argv(spec, argv)) {
+		free_argv(argv);
+		return fail(error, HULL_ERR_UNSUPPORTED, "an exec names a command");
+	}
+	for (unsigned i = 0u; i < 4u; i++) {
+		snprintf(path, sizeof path, "/proc/%ld/ns/%s", (long)m->pid, kinds[i]);
+		ns[i] = open(path, O_RDONLY | O_CLOEXEC);
+	}
+	snprintf(path, sizeof path, "/proc/%ld/root", (long)m->pid);
+	root = open(path, O_PATH | O_DIRECTORY | O_CLOEXEC);
+	st = calloc(1u, sizeof *st);
+	if (ns[0] < 0 || ns[1] < 0 || ns[2] < 0 || ns[3] < 0 || root < 0 || st == NULL ||
+	    pipe2(in, O_CLOEXEC) != 0 || pipe2(o, O_CLOEXEC) != 0 || pipe2(e, O_CLOEXEC) != 0 ||
+	    pipe2(report, O_CLOEXEC) != 0 || pipe2(status, O_CLOEXEC) != 0) {
+		for (unsigned i = 0u; i < 4u; i++)
+			if (ns[i] >= 0)
+				close(ns[i]);
+		if (root >= 0)
+			close(root);
+		free(st);
+		free_argv(argv);
+		return fail(error, HULL_ERR_RUNTIME, "the machine's namespaces cannot be opened");
+	}
+	st->machine = m;
+	st->core    = core;
+	pthread_mutex_init(&st->lock, NULL);
+	st->helper  = fork();
+	if (st->helper == 0) {
+		close(report[0]);
+		close(status[0]);
+		run_helper(m, argv, ns, root, in[0], o[1], e[1], report[1], status[1]);
+	}
+	for (unsigned i = 0u; i < 4u; i++)
+		close(ns[i]);
+	close(root);
+	close(in[0]);
+	close(o[1]);
+	close(e[1]);
+	close(report[1]);
+	close(status[1]);
+	free_argv(argv);
+	st->in     = in[1];
+	st->out    = o[0];
+	st->err    = e[0];
+	st->status = status[0];
+	n = st->helper < 0 ? -1 : read(report[0], m->detail, sizeof m->detail - 1u);
+	close(report[0]);
+	if (n != 0) {
+		if (n > 0)
+			m->detail[n] = '\0';
+		else
+			snprintf(m->detail, sizeof m->detail, "the helper could not start");
+		if (st->helper > 0)
+			waitpid(st->helper, NULL, 0);
+		close(st->in);
+		close(st->out);
+		close(st->err);
+		close(st->status);
+		free(st);
+		return fail(error, HULL_ERR_RUNTIME, m->detail);
+	}
+	if (pthread_create(&st->reader, NULL, read_exec, st) != 0) {
+		kill(st->helper, SIGKILL);
+		waitpid(st->helper, NULL, 0);
+		close(st->in);
+		close(st->out);
+		close(st->err);
+		close(st->status);
+		free(st);
+		return fail(error, HULL_ERR_INTERNAL, "the reader thread could not start");
+	}
+	*out = st;
+	return HULL_OK;
+}
+
+/* stdin, written whole or not at all: a command that does not read it
+ * for five seconds is refused more, rather than allowed to stall the
+ * caller. */
+static hull_status chroot_stream_write(hull_core *core, hull_stream *st, const uint8_t *data,
+                                       size_t length, hull_error *error)
+{
+	(void)core;
+	while (length > 0u) {
+		struct pollfd ready = { st->in, POLLOUT, 0 };
+		ssize_t       n;
+
+		if (st->in < 0 || poll(&ready, 1, 5000) <= 0 || (ready.revents & POLLOUT) == 0)
+			return fail(error, HULL_ERR_BUSY, "the command is not reading its input");
+		n = write(st->in, data, length);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			return fail(error, HULL_ERR_GONE, "the command's input has closed");
+		data += n;
+		length -= (size_t)n;
+	}
+	return HULL_OK;
+}
+
+static hull_status chroot_stream_eof(hull_core *core, hull_stream *st, hull_error *error)
+{
+	(void)core;
+	(void)error;
+	if (st->in >= 0)
+		close(st->in);
+	st->in = -1;
+	return HULL_OK;
+}
+
+/* Ends the command, if it has not ended, and frees the stream; on_exit
+ * has been or is then reported. */
+static hull_status chroot_stream_close(hull_core *core, hull_stream *st, hull_error *error)
+{
+	chroot_stream_eof(core, st, error);
+	pthread_mutex_lock(&st->lock);
+	if (!st->reaped)
+		kill(st->helper, SIGKILL);
+	pthread_mutex_unlock(&st->lock);
+	pthread_join(st->reader, NULL);
+	pthread_mutex_destroy(&st->lock);
+	free(st);
 	return HULL_OK;
 }
 
@@ -612,6 +947,10 @@ static const hull_engine_ops ops = {
 	.start       = chroot_start,
 	.stop        = chroot_stop,
 	.destroy     = chroot_destroy,
+	.exec         = chroot_exec,
+	.stream_write = chroot_stream_write,
+	.stream_eof   = chroot_stream_eof,
+	.stream_close = chroot_stream_close,
 };
 
 static const hull_engine engine = {

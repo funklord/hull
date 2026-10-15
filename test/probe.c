@@ -10,6 +10,7 @@
  *   host        the hostname          uid         the uid
  *   write PATH  whether PATH can be created
  *   read PATH   PATH's first line
+ *   stdin       the first line of its stdin
  *   nnp         whether no_new_privs is set
  *   session     whether it leads a session of its own
  *   pid         its pid
@@ -77,6 +78,11 @@ int main(int argc, char **argv)
 			if (file != NULL)
 				fclose(file);
 			i++;
+		} else if (strcmp(step, "stdin") == 0) {
+			ssize_t n = read(0, text, sizeof text - 1u);
+
+			text[n > 0 ? n : 0] = '\0';
+			printf("stdin=%s", n > 0 ? text : "(none)\n");
 		} else if (strcmp(step, "pid") == 0) {
 			printf("pid=%d\n", (int)getpid());
 		} else if (strcmp(step, "procs") == 0) {

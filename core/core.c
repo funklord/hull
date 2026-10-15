@@ -47,6 +47,7 @@
 #define MAX_MACHINES     64u
 #define MAX_ATTACHED     16u
 #define MAX_STOPS        16u
+#define MAX_EXECS        64u
 #define LOG_LIMIT        (1u << 20)
 #define DATA_CHUNK       65536u
 
@@ -101,8 +102,23 @@ struct slot {
 	size_t             log_size;
 };
 
+/* A command a frontend runs in a machine, on one of its channels. The
+ * engine knows it only by its stream pointer, which is what its events
+ * carry; an entry lasts until the stream's exit has been seen, and the
+ * queue is drained to the end before any client is served again, so a
+ * pointer freed by stream_close() is never mistaken for a new one. */
+typedef struct exec_entry {
+	int          used;
+	int          closed;  /* stream_close() done; waiting for the exit */
+	client      *client;
+	uint32_t     ch;
+	slot        *machine;
+	hull_stream *stream;
+} exec_entry;
+
 static client        clients[MAX_CLIENTS];
 static slot          machines[MAX_MACHINES];
+static exec_entry    execs[MAX_EXECS];
 static hull_registry registry;
 
 /* --- events from engine threads ------------------------------------------ */
@@ -113,6 +129,7 @@ typedef struct event {
 	event_kind     kind;
 	slot          *slot;
 	unsigned       generation;
+	hull_stream   *stream;  /* an exec's, or NULL for the machine's own */
 	int            fd;
 	int            code;
 	int            signal;
@@ -160,11 +177,11 @@ static void on_data(hull_core *core, hull_stream *stream, int fd, const uint8_t 
 {
 	event *e = new_event(EVENT_DATA, core, n);
 
-	(void)stream;
 	if (e == NULL || e->slot == NULL) {
 		free(e);
 		return;
 	}
+	e->stream = stream;
 	e->fd = fd;
 	memcpy(e->bytes, data, n);
 	enqueue(e);
@@ -183,11 +200,11 @@ static void on_exit_status(hull_core *core, hull_machine *machine, hull_stream *
 	event *e = new_event(EVENT_EXIT, core, 0u);
 
 	(void)machine;
-	(void)stream;
 	if (e == NULL || e->slot == NULL) {
 		free(e);
 		return;
 	}
+	e->stream = stream;
 	e->code   = code;
 	e->signal = signal;
 	enqueue(e);
@@ -270,18 +287,52 @@ static void send_data(client *c, uint32_t ch, int fd, const uint8_t *bytes, size
 	}
 }
 
-static void send_exited(client *c, uint32_t ch, const slot *s)
+static void send_status(client *c, uint32_t ch, int code, int signal)
 {
 	hull_msg m = { 0 };
 
 	hull_msg_raw(&m, "(6:exited");
 	hull_msg_channel(&m, ch);
 	hull_msg_raw(&m, "(4:code");
-	hull_msg_number(&m, s->code);
+	hull_msg_number(&m, code);
 	hull_msg_raw(&m, ")(6:signal");
-	hull_msg_number(&m, s->signal);
+	hull_msg_number(&m, signal);
 	hull_msg_raw(&m, "))");
 	send_to(c, &m);
+}
+
+static void send_exited(client *c, uint32_t ch, const slot *s)
+{
+	send_status(c, ch, s->code, s->signal);
+}
+
+/* --- execs --------------------------------------------------------------- */
+
+static exec_entry *exec_of(hull_stream *stream)
+{
+	for (unsigned i = 0u; i < MAX_EXECS; i++)
+		if (execs[i].used && execs[i].stream == stream)
+			return &execs[i];
+	return NULL;
+}
+
+static exec_entry *exec_on(const client *c, uint32_t ch)
+{
+	for (unsigned i = 0u; i < MAX_EXECS; i++)
+		if (execs[i].used && !execs[i].closed && execs[i].client == c && execs[i].ch == ch)
+			return &execs[i];
+	return NULL;
+}
+
+/* End the command; its exit is still to come, and frees the entry. */
+static void close_exec(exec_entry *x)
+{
+	hull_error error = { .struct_size = sizeof error };
+
+	if (x->closed)
+		return;
+	x->closed = 1;
+	x->machine->engine->ops->stream_close(&x->machine->core, x->stream, &error);
 }
 
 /* --- machines ------------------------------------------------------------ */
@@ -390,26 +441,69 @@ static void machine_exited(slot *s, int code, int signal)
 	s->follower_count = 0u;
 	s->stop_count     = 0u;
 	s->owner          = NULL;
+	/* Its commands end with it; their exits are queued, and seen before
+	 * this drain is over. */
+	for (unsigned i = 0u; i < MAX_EXECS; i++)
+		if (execs[i].used && execs[i].machine == s)
+			close_exec(&execs[i]);
 	if (s->handle != NULL) {
 		s->engine->ops->destroy(&s->core, s->handle, &error);
 		s->handle = NULL;
 	}
 }
 
+static void drain_list(event *e);
+
+/* An event about one of a machine's commands. */
+static void exec_event(const event *e)
+{
+	exec_entry *x = exec_of(e->stream);
+
+	if (x == NULL)
+		return;
+	if (e->kind == EVENT_DATA && !x->closed) {
+		send_data(x->client, x->ch, e->fd, e->bytes, e->length);
+	} else if (e->kind == EVENT_EXIT) {
+		if (!x->closed) {
+			send_status(x->client, x->ch, e->code, e->signal);
+			close_exec(x);
+		}
+		x->used = 0;
+	}
+}
+
+/* Everything queued, to the end, including what handling it queues. */
 static void drain_events(void)
 {
-	event *e;
-	char   bytes[64];
+	char bytes[64];
 
 	while (read(wake[0], bytes, sizeof bytes) > 0)
 		;
-	pthread_mutex_lock(&queue_lock);
-	e = queue_head;
-	queue_head = queue_tail = NULL;
-	pthread_mutex_unlock(&queue_lock);
+	for (;;) {
+		event *e;
+
+		pthread_mutex_lock(&queue_lock);
+		e = queue_head;
+		queue_head = queue_tail = NULL;
+		pthread_mutex_unlock(&queue_lock);
+		if (e == NULL)
+			return;
+		drain_list(e);
+	}
+}
+
+static void drain_list(event *e)
+{
 	while (e != NULL) {
 		event *next = e->next;
 		slot  *s    = e->slot;
+
+		if (e->stream != NULL) {
+			exec_event(e);
+			free(e);
+			e = next;
+			continue;
+		}
 
 		/* An engine's thread can report a last state after the exit, by
 		 * when the slot may hold another machine: that is not news. */
@@ -635,6 +729,69 @@ static void handle_stop(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	stop_machine(s, timeout < 0 ? 0 : timeout > 600000 ? 600000 : (int)timeout);
 }
 
+/* A command in a running machine; the request itself is the engine's
+ * exec_spec, being canonical already. */
+static void handle_exec(client *c, uint32_t ch, const hull_sexpr_doc *body)
+{
+	hull_error   error = { .struct_size = sizeof error };
+	hull_stream *stream = NULL;
+	exec_entry  *x = NULL;
+	slot        *s = named(c, ch, body);
+	hull_buf     spec;
+
+	if (s == NULL)
+		return;
+	if (s->exited || s->handle == NULL) {
+		send_error(c, ch, "the machine is not running");
+		return;
+	}
+	if (s->engine->ops->exec == NULL || s->engine->ops->stream_write == NULL ||
+	    s->engine->ops->stream_eof == NULL || s->engine->ops->stream_close == NULL) {
+		send_error(c, ch, "that engine cannot exec yet");
+		return;
+	}
+	if (exec_on(c, ch) != NULL) {
+		send_error(c, ch, "that channel is in use");
+		return;
+	}
+	for (unsigned i = 0u; i < MAX_EXECS && x == NULL; i++)
+		if (!execs[i].used)
+			x = &execs[i];
+	if (x == NULL) {
+		send_error(c, ch, "the core runs as many commands as it can");
+		return;
+	}
+	spec.data = body->data;
+	spec.len  = body->length;
+	if (s->engine->ops->exec(&s->core, s->handle, spec, &stream, &error) != HULL_OK) {
+		send_error(c, ch, error.detail != NULL ? error.detail : "exec failed");
+		return;
+	}
+	*x = (exec_entry){ 1, 0, c, ch, s, stream };
+}
+
+/* An exec's stdin, and its end. */
+static void handle_input(client *c, uint32_t ch, const hull_sexpr_doc *body, int eof)
+{
+	hull_error      error = { .struct_size = sizeof error };
+	hull_sexpr_form buf;
+	exec_entry     *x = exec_on(c, ch);
+	const hull_engine_ops *ops;
+
+	if (x == NULL) {
+		send_error(c, ch, "no command on that channel");
+		return;
+	}
+	ops = x->machine->engine->ops;
+	if (eof) {
+		ops->stream_eof(&x->machine->core, x->stream, &error);
+	} else if (hull_msg_find(body, "buf", &buf) &&
+	           ops->stream_write(&x->machine->core, x->stream, body->data + buf.content,
+	                             buf.content_length, &error) != HULL_OK) {
+		send_error(c, ch, error.detail != NULL ? error.detail : "the input was refused");
+	}
+}
+
 static void handle_list(client *c, uint32_t ch)
 {
 	hull_msg m = { 0 };
@@ -689,14 +846,24 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		handle_stop(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "list")) {
 		handle_list(c, (uint32_t)ch);
+	} else if (hull_msg_is(body, "exec")) {
+		handle_exec(c, (uint32_t)ch, body);
+	} else if (hull_msg_is(body, "data")) {
+		handle_input(c, (uint32_t)ch, body, 0);
+	} else if (hull_msg_is(body, "eof")) {
+		handle_input(c, (uint32_t)ch, body, 1);
 	} else {
 		send_error(c, (uint32_t)ch, "unsupported");
 	}
 }
 
-/* A frontend has gone: its machines go with it unless they keep. */
+/* A frontend has gone: its commands with it, and its machines unless
+ * they keep. */
 static void disconnect(client *c)
 {
+	for (unsigned i = 0u; i < MAX_EXECS; i++)
+		if (execs[i].used && execs[i].client == c)
+			close_exec(&execs[i]);
 	for (unsigned i = 0u; i < MAX_MACHINES; i++) {
 		slot    *s = &machines[i];
 		unsigned kept = 0u;
@@ -721,6 +888,9 @@ static void disconnect(client *c)
 	hull_wire_close(&c->wire);
 	c->used = 0;
 	c->dead = 0;
+	/* The closed commands' exits are queued: seen now, before any new
+	 * stream could be given a freed one's pointer. */
+	drain_events();
 }
 
 /* --- the loop ------------------------------------------------------------ */

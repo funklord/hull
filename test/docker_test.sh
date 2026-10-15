@@ -128,6 +128,36 @@ done
 wait "$server"
 [ "$got" = "hello from the machine" ] || fail "port 18080 answered '$got'" ""
 
+# exec in the running container: output and status, stdin, the user's
+# uid, and a command ended with the frontend that ran it.
+conf execd '(command "sleep" "30")' '(on_disconnect keep)'
+(cd / && exec "$hull" run -f "$root/execd.conf" > /dev/null 2>&1) &
+execer=$!
+tries=0
+until "$hull" ps 2>/dev/null | grep -q '^dtest .*running$' || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+cases=$((cases + 1))
+out=$(timeout 30 "$hull" exec dtest -- sh -c 'echo out; echo err >&2; id -u; exit 4' 2>&1)
+got=$?
+[ "$got" = 4 ] && printf '%s\n' "$out" | grep -q '^out$' && printf '%s\n' "$out" | grep -q '^err$' &&
+	printf '%s\n' "$out" | grep -q "^$(id -u)\$" || fail "exec exited $got" "$out"
+cases=$((cases + 1))
+out=$(echo through stdin | timeout 30 "$hull" exec dtest cat 2>&1)
+[ "$out" = "through stdin" ] || fail "exec's stdin came back as '$out'" ""
+cases=$((cases + 1))
+out=$(timeout 30 "$hull" exec dtest /nope 2>&1)
+got=$?
+[ "$got" != 0 ] || fail "a missing command exited 0" "$out"
+cases=$((cases + 1))
+timeout -s KILL 2 "$hull" exec dtest sleep 300 > /dev/null 2>&1
+sleep 1
+left=$(timeout 10 docker top "$(timeout 10 docker ps -q --filter name=hull-dtest-)" 2>/dev/null | grep -c 'sleep 300')
+[ "$left" = 0 ] || fail "an exec outlived the frontend that ran it" "$left"
+timeout 30 "$hull" stop dtest > /dev/null 2>&1
+wait "$execer" 2>/dev/null
+
 # What cannot be created is 125, and says why. A command that is not
 # there is docker's init failing to exec it, 127, as a shell would say.
 printf '%s\n' '(machine (source "hull-no-such-image:0") (backend docker) (hostname "dtest") (command "x"))' \

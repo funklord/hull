@@ -28,12 +28,14 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <signal.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -834,6 +836,187 @@ static hull_status docker_destroy(hull_core *core, hull_machine *m, hull_error *
 	return HULL_OK;
 }
 
+/* --- exec --------------------------------------------------------------- */
+
+/*
+ * A command in the running container, through docker's exec API: created
+ * with stdin, stdout and stderr attached, as the invoking user like the
+ * workload, then started on a hijacked connection. stdin is written to
+ * that socket and ended by shutting down its writing half; output comes
+ * back in the attach stream's frames, and the exit code from the exec's
+ * inspection once the stream ends.
+ *
+ * Docker has no call to end an exec. As it runs as the user, its host pid
+ * -- read from the same inspection, while it is still running, at the
+ * moment it is to be ended -- can be signalled, which is stream_close().
+ */
+struct hull_stream {
+	hull_machine *machine;
+	hull_core    *core;
+	char          id[80];
+	int           socket;
+	pthread_t     reader;
+	int           ended;   /* stdin shut */
+};
+
+static void *read_exec(void *arg)
+{
+	hull_stream *st = arg;
+	uint8_t      header[8];
+	uint8_t      buffer[4096];
+	char         path[160];
+	char        *answer = NULL;
+	long         code   = 125;
+	int          status = 0;
+
+	while (read_full(st->socket, header, sizeof header) == 0) {
+		uint32_t size = (uint32_t)header[4] << 24 | (uint32_t)header[5] << 16 |
+		                (uint32_t)header[6] << 8 | header[7];
+
+		while (size > 0u) {
+			size_t n = size < sizeof buffer ? size : sizeof buffer;
+
+			if (read_full(st->socket, buffer, n) != 0)
+				break;
+			host->on_data(st->core, st, header[0] == 2 ? 2 : 1, buffer, n);
+			size -= (uint32_t)n;
+		}
+	}
+	snprintf(path, sizeof path, "/exec/%s/json", st->id);
+	if (call("GET", path, NULL, &status, &answer) == 0 && status == 200)
+		json_number(answer, "ExitCode", &code);
+	free(answer);
+	host->on_exit(st->core, st->machine, st, (int)code, 0);
+	return NULL;
+}
+
+static hull_status docker_exec(hull_core *core, hull_machine *m, hull_buf spec,
+                               hull_stream **out, hull_error *error)
+{
+	hull_sexpr_doc  doc;
+	hull_sexpr_form message;
+	hull_sexpr_form argv;
+	hull_stream    *st;
+	text            body = { 0 };
+	char            path[160];
+	char            head[512];
+	char           *answer = NULL;
+	size_t          n = 0u;
+	int             status = 0;
+
+	if (hull_sexpr_open(&doc, spec.data, spec.len, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
+	    !hull_sexpr_first(&doc, &message) || !hull_access_find(&doc, &message, "argv", &argv))
+		return fail(error, HULL_ERR_UNSUPPORTED, "an exec names a command");
+	add_text(&body, "{\"AttachStdin\":true,\"AttachStdout\":true,\"AttachStderr\":true,");
+	addf(&body, "\"User\":\"%u:%u\",\"Cmd\":[", (unsigned)getuid(), (unsigned)getgid());
+	add_strings(&body, &doc, &argv);
+	add_text(&body, "]}");
+	st = calloc(1u, sizeof *st);
+	if (body.failed || st == NULL) {
+		free(body.data);
+		free(st);
+		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+	}
+	st->machine = m;
+	st->core    = core;
+	st->socket  = -1;
+	snprintf(path, sizeof path, "/containers/%s/exec", m->id);
+	if (call("POST", path, body.data, &status, &answer) != 0 || status != 201 ||
+	    !json_string(answer, "Id", st->id, sizeof st->id)) {
+		daemon_says(m->detail, sizeof m->detail, "exec", status, answer);
+		free(answer);
+		free(body.data);
+		free(st);
+		return fail(error, HULL_ERR_RUNTIME, m->detail);
+	}
+	free(answer);
+	free(body.data);
+
+	st->socket = dial();
+	snprintf(path, sizeof path, "/exec/%s/start", st->id);
+	if (st->socket < 0 ||
+	    send_request(st->socket, "POST", path, "{\"Detach\":false,\"Tty\":false}",
+	                 "Connection: Upgrade\r\nUpgrade: tcp\r\n") != 0) {
+		if (st->socket >= 0)
+			close(st->socket);
+		free(st);
+		return fail(error, HULL_ERR_RUNTIME, "the exec's start request failed");
+	}
+	while (n + 1u < sizeof head && read(st->socket, head + n, 1u) == 1) {
+		n++;
+		if (n >= 4u && memcmp(head + n - 4u, "\r\n\r\n", 4u) == 0)
+			break;
+	}
+	head[n] = '\0';
+	if (sscanf(head, "HTTP/1.%*d %d", &status) != 1 || (status != 101 && status != 200)) {
+		close(st->socket);
+		free(st);
+		snprintf(m->detail, sizeof m->detail, "exec start: HTTP %d", status);
+		return fail(error, HULL_ERR_RUNTIME, m->detail);
+	}
+	if (pthread_create(&st->reader, NULL, read_exec, st) != 0) {
+		close(st->socket);
+		free(st);
+		return fail(error, HULL_ERR_INTERNAL, "the reader thread could not start");
+	}
+	*out = st;
+	return HULL_OK;
+}
+
+/* stdin, whole or refused after five seconds of not being read. */
+static hull_status docker_stream_write(hull_core *core, hull_stream *st, const uint8_t *data,
+                                       size_t length, hull_error *error)
+{
+	(void)core;
+	while (length > 0u) {
+		struct pollfd ready = { st->socket, POLLOUT, 0 };
+		ssize_t       n;
+
+		if (st->ended || poll(&ready, 1, 5000) <= 0 || (ready.revents & POLLOUT) == 0)
+			return fail(error, HULL_ERR_BUSY, "the command is not reading its input");
+		n = send(st->socket, data, length, MSG_NOSIGNAL);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			return fail(error, HULL_ERR_GONE, "the command's input has closed");
+		data += n;
+		length -= (size_t)n;
+	}
+	return HULL_OK;
+}
+
+static hull_status docker_stream_eof(hull_core *core, hull_stream *st, hull_error *error)
+{
+	(void)core;
+	(void)error;
+	if (!st->ended)
+		shutdown(st->socket, SHUT_WR);
+	st->ended = 1;
+	return HULL_OK;
+}
+
+/* End the command if it runs, then wait for its stream and free it. */
+static hull_status docker_stream_close(hull_core *core, hull_stream *st, hull_error *error)
+{
+	char  path[160];
+	char *answer = NULL;
+	int   status = 0;
+	long  pid    = 0;
+
+	docker_stream_eof(core, st, error);
+	snprintf(path, sizeof path, "/exec/%s/json", st->id);
+	if (call("GET", path, NULL, &status, &answer) == 0 && status == 200 &&
+	    strstr(answer, "\"Running\":true") != NULL && json_number(answer, "Pid", &pid) &&
+	    pid > 1)
+		kill((pid_t)pid, SIGKILL);
+	free(answer);
+	shutdown(st->socket, SHUT_RDWR);
+	pthread_join(st->reader, NULL);
+	close(st->socket);
+	free(st);
+	return HULL_OK;
+}
+
 /* --- the declaration ----------------------------------------------------- */
 
 static const hull_cap_entry entries[] = {
@@ -897,6 +1080,10 @@ static const hull_engine_ops ops = {
 	.start       = docker_start,
 	.stop        = docker_stop,
 	.destroy     = docker_destroy,
+	.exec         = docker_exec,
+	.stream_write = docker_stream_write,
+	.stream_eof   = docker_stream_eof,
+	.stream_close = docker_stream_close,
 };
 
 static const hull_engine engine = {

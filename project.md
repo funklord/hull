@@ -737,19 +737,51 @@ The read-only volume had first passed: while the container ran as root, a write 
 - **`keep` lasts while the core runs.** Re-adopting a machine after the core restarts is §5.0's `adopt()`, which is not written. So a chroot machine's init sets `PR_SET_PDEATHSIG` and dies with the core: nothing could manage it afterwards, and nothing is to outlive what started it. A docker container belongs to the daemon and survives; its name and label are for finding it.
 - **The tests never touch the account's own core:** each sets `XDG_RUNTIME_DIR` to a directory under `BUILD_DIR`, with `HULL_CORE_IDLE=1`, and requires the core to have left by the end.
 
+**`hull exec ID [--] CMD [ARG…]` runs a command in a running machine**, on a channel of its own.
+
+- **The frontend sends** `(exec (argv …) (ch n) (machine id))`, then its stdin as `(data … (fd 0))` and `(eof …)`. The core answers with `data` on fds 1 and 2 and `exited`, and `hull exec` exits with the command's status.
+- **The core passes the request itself as the engine's `exec_spec`,** being canonical already, and routes the stream's events by the stream pointer the engine reports them with.
+- **Pointer reuse:** that pointer is freed by `stream_close()`, and a new stream could be given the same address. So the queue is drained to its end, including what handling it queues, before any client is served again: a closed stream's last events are always seen before another can exist.
+- **What ends a command:** a frontend that goes takes its commands with it. A machine that exits takes all of its commands.
+
+In chroot:
+
+- **A forked helper joins the init's user, mount, UTS and PID namespaces** through `/proc/<init>/ns/*`, which a single-threaded child can do and the threaded core cannot. It then chroots through `/proc/<init>/root` and forks the command, which is then a process of the machine, with its pid counted from 3.
+- **The command gets the machine's environment, workdir and `no_new_privs`,** a session of its own, and `PR_SET_PDEATHSIG`, so `stream_close()` ends it by killing the helper.
+- **The helper and the init close every descriptor they inherited and do not need.** Both are forked from the core and never exec, so they held its sockets, its lock and the far end of the command's stdin pipe, which then never reached EOF. `exec … < /dev/null` hung until that was found. A machine outliving its core would also have held `core.lock`, and no new core could have started. `close_range()` over the gaps between the kept descriptors allocates nothing, which matters in a child forked from a threaded process.
+- **Reaping and signalling are ordered.** Both engines' readers wait with `WNOWAIT`, then reap under a lock and mark the process gone. `stop` and `stream_close` signal a pid only while it is unreaped, so a freed pid given to another process is never signalled.
+
+In docker, `exec` is the daemon's exec API:
+
+- **The command is created as the user,** with stdin, stdout and stderr attached, and started on a hijacked connection. stdin is written to that socket, and ended by shutting down its writing half. The exit code comes from `/exec/{id}/json`.
+- **Ending it:** docker has no call to end an exec. Since it runs as the user, `stream_close()` signals its host pid, read from that inspection while it is still running, at the moment of closing.
+
 Open:
 
-- **`exec` waits for the engines' stream operations.**
+- **No tty, window size or signal for an exec yet**, though B.3's `exec` carries `(tty …)` and the protocol could carry `winch` and `signal` as B.3 does.
+- **stdin is written by the core's one thread:** a command that does not read for five seconds has its input refused.
 - **A slow frontend is dropped after 5 seconds of a blocked write,** rather than stalling the loop. There is no flow control yet, although the protocol could carry B.2's credits.
 - **Moving onto the shared encrypted protocol**, when that is settled.
 
 **Measured:**
 
+- `test/cli_test.sh`'s exec cases: the machine's hostname, workdir and environment; a pid of the machine's own namespace, small and counted from 3; stdin passed, and ended by `/dev/null`; an exit status; a missing command; an unknown machine; a command killed with its frontend; and exec refused once the machine has exited. `test/docker_test.sh` has five: output on both streams, the status and the user's uid, stdin, a missing command, and an exec ended with its frontend.
+- **Sabotage of exec,** baseline first. Breaking each of these failed the test:
+  - the helper closing what it inherits;
+  - the init closing what it inherits;
+  - the command dying with the helper;
+  - joining the PID namespace;
+  - writing stdin;
+  - commands ending with their frontend;
+  - an exec's exit status.
+
+  The init's closing first passed. With the parent-death signal its stray descriptors die with the core, so nothing visible broke, and a case now reads the running init's `/proc/<pid>/fd` and requires no socket and no `core.lock` there. The first try at breaking the PID namespace was no sabotage at all: `setns` with a type of 0 joins whatever namespace the descriptor holds, so the namespace was still joined. And the pid check, first written `[3-9][0-9]*`, would have passed a host pid too; it now requires a small pid counted from 3.
 - `test/wire_test.c` runs 19 cases: each direction's messages let through and the other's refused, non-canonical bodies refused, and the numbers read minimal decimal. Disabling the validator fails four of them.
 - `test/cli_test.sh` runs 84 cases. Among them: `ps`, `logs` after an exit, a duplicate id refused, a kept machine surviving its frontend's SIGKILL where an unkept one is stopped, `attach` ending with a stopped machine's 143, a second core giving way and the first still answering, a machine dying with a SIGKILLed core, and the core leaving when idle.
 - **Sabotage,** in a scratch copy, with an unmodified baseline first that had to pass. Breaking each of these failed the test: honouring `keep`, stopping on disconnect, replaying logs, `attach` following, one id at a time, the idle exit, the lock, and the parent-death signal.
   - The last two first passed. The lock case only checked that a second core exited 0. Without the lock, the second core takes the socket over, then leaves and removes it, stranding the first. The case now requires the first to still answer.
-  - The parent-death case's wait could give up silently, so it now fails when the kept machine never ran. Without the signal, the probe was measured alive a second after its core died, and gone once the shell reaped the client. No cause was found: the probe has its own session, its output was written, and its alarm was 20 seconds off. So the case looks for the probe before the client is reaped, where the two behaviours differ. **That later death is unexplained, and is recorded as such.**
+  - The parent-death case's wait could give up silently, so it now fails when the kept machine never ran. Without the signal, the probe was measured alive a second after its core died, and gone once the shell reaped the client, for no cause found then. So the case looks for the probe before the client is reaped, where the two behaviours differ.
+  - **That later death went with the descriptors the init inherited**, found while writing `exec` (below). With them closed, the same experiment leaves the probe alive after the client is reaped as well. The exact path from the init's stray descriptors to the probe's death was not traced.
 
 ---
 
