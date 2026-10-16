@@ -129,7 +129,10 @@ typedef struct hull_capabilities {
 /* ---- Host callbacks ------------------------------------------------------
  * The only way an engine emits output or events. Core-owned; thread-safe;
  * callable from any engine thread. `stream` is NULL for machine-level
- * events, non-NULL for per-exec/log channels. */
+ * events, non-NULL for per-exec/log channels. on_data for a stream may
+ * wait while its frontend is behind, which is how a command's output is
+ * held back: so the engine calls it holding nothing that stream_eof or
+ * stream_close need, and the core lets it go before stream_close. */
 typedef struct hull_host_ops {
 	size_t struct_size;
 	void (*on_data)  (hull_core*, hull_stream*, int fd /*1|2*/,

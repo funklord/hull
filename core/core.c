@@ -51,6 +51,7 @@
 #define LOG_LIMIT        (1u << 20)
 #define DATA_CHUNK       65536u
 #define INPUT_WINDOW     65536u  /* an exec's stdin the core holds, at most */
+#define OUTPUT_WINDOW    65536u  /* an exec's output a frontend has unasked */
 
 /* --- the table ----------------------------------------------------------- */
 
@@ -135,12 +136,29 @@ typedef struct exec_entry {
 	int             input_ended;  /* the frontend's eof */
 	int             input_closed; /* a write failed: what comes is dropped */
 	int             stopping;
+
+	/* Its output, on B.2's credit the other way. The engine's reader
+	 * waits in on_data() while the frontend has not taken what it was
+	 * sent, so a frontend that falls behind holds its command back, as
+	 * a pipe would, rather than stalling the core. These, and `used`
+	 * and `stream`, are under flow_lock, being the reader's to read. */
+	size_t          held;         /* read, and not yet credited back */
+	int             output_open;  /* the reader may wait */
 } exec_entry;
 
 static client        clients[MAX_CLIENTS];
 static slot          machines[MAX_MACHINES];
 static exec_entry    execs[MAX_EXECS];
 static hull_registry registry;
+
+/* An engine's reader can report a stream's first output before exec()
+ * has returned it. The loop makes one exec() at a time, so a stream no
+ * entry knows is the one under way, which `adopting` is. */
+static pthread_mutex_t flow_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  flow_room = PTHREAD_COND_INITIALIZER;
+static exec_entry     *adopting;
+
+static exec_entry *exec_of(hull_stream *stream);
 
 /* --- events from engine threads ------------------------------------------ */
 
@@ -201,6 +219,21 @@ static void on_data(hull_core *core, hull_stream *stream, int fd, const uint8_t 
 	if (e == NULL || e->slot == NULL) {
 		free(e);
 		return;
+	}
+	if (stream != NULL) {
+		exec_entry *x;
+
+		pthread_mutex_lock(&flow_lock);
+		x = exec_of(stream);
+		if (x == NULL && adopting != NULL) {
+			x = adopting;
+			x->stream = stream;
+		}
+		while (x != NULL && x->output_open && x->held + n > OUTPUT_WINDOW)
+			pthread_cond_wait(&flow_room, &flow_lock);
+		if (x != NULL)
+			x->held += n;
+		pthread_mutex_unlock(&flow_lock);
 	}
 	e->stream = stream;
 	e->fd = fd;
@@ -366,6 +399,12 @@ static void close_exec(exec_entry *x)
 	if (x->closed)
 		return;
 	x->closed = 1;
+	/* A reader waiting for credit is let go: what it reads now is
+	 * dropped, and stream_close() waits for it. */
+	pthread_mutex_lock(&flow_lock);
+	x->output_open = 0;
+	pthread_cond_broadcast(&flow_room);
+	pthread_mutex_unlock(&flow_lock);
 	/* The writer first: a write under way is ended by stream_eof(), and
 	 * stream_close() comes only once none is. */
 	pthread_mutex_lock(&x->lock);
@@ -566,7 +605,9 @@ static void exec_event(const event *e)
 		if (!x->closed || x->tell)
 			send_status(x->client, x->ch, e->code, e->signal);
 		close_exec(x);
+		pthread_mutex_lock(&flow_lock);
 		x->used = 0;
+		pthread_mutex_unlock(&flow_lock);
 	}
 }
 
@@ -868,6 +909,7 @@ static void handle_exec(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	exec_entry  *x = NULL;
 	slot        *s = named(c, ch, body);
 	hull_buf     spec;
+	hull_status  status;
 
 	if (s == NULL)
 		return;
@@ -897,12 +939,24 @@ static void handle_exec(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	}
 	spec.data = body->data;
 	spec.len  = body->length;
-	if (s->engine->ops->exec(&s->core, s->handle, spec, &stream, &error) != HULL_OK) {
+	pthread_mutex_lock(&flow_lock);
+	*x = (exec_entry){ .used = 1, .client = c, .ch = ch, .machine = s };
+	adopting = x;
+	pthread_mutex_unlock(&flow_lock);
+	status = s->engine->ops->exec(&s->core, s->handle, spec, &stream, &error);
+	pthread_mutex_lock(&flow_lock);
+	adopting = NULL;
+	if (status == HULL_OK)
+		x->stream = stream;
+	else
+		*x = (exec_entry){ 0 };
+	pthread_mutex_unlock(&flow_lock);
+	if (status != HULL_OK) {
 		send_error(c, ch, error.detail != NULL ? error.detail : "exec failed");
 		return;
 	}
-	*x = (exec_entry){ .used = 1, .client = c, .ch = ch, .machine = s, .stream = stream,
-	                   .credit = INPUT_WINDOW, .input = malloc(INPUT_WINDOW) };
+	x->credit = INPUT_WINDOW;
+	x->input  = malloc(INPUT_WINDOW);
 	pthread_mutex_init(&x->lock, NULL);
 	pthread_cond_init(&x->more, NULL);
 	if (x->input == NULL || pthread_create(&x->writer, NULL, write_input, x) != 0) {
@@ -910,10 +964,15 @@ static void handle_exec(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		pthread_cond_destroy(&x->more);
 		pthread_mutex_destroy(&x->lock);
 		free(x->input);
+		pthread_mutex_lock(&flow_lock);
 		*x = (exec_entry){ 0 };
+		pthread_mutex_unlock(&flow_lock);
 		send_error(c, ch, "the core cannot take the command's input");
 		return;
 	}
+	pthread_mutex_lock(&flow_lock);
+	x->output_open = 1;
+	pthread_mutex_unlock(&flow_lock);
 	send_started(c, ch, s);
 	send_credit(c, ch, INPUT_WINDOW);
 }
@@ -958,6 +1017,33 @@ static void handle_input(client *c, uint32_t ch, const hull_sexpr_doc *body, int
 	pthread_mutex_unlock(&x->lock);
 	if (refusal != NULL)
 		send_error(c, ch, refusal);
+}
+
+/* More of an exec's output the frontend will take. Credit for a command
+ * that has ended is not news: it crossed the exit on its way. */
+static void handle_credit(client *c, uint32_t ch, const hull_sexpr_doc *body)
+{
+	hull_sexpr_form value;
+	exec_entry     *x = exec_on(c, ch);
+	long long       n = 0;
+	int             over = 0;
+
+	if (!hull_msg_find(body, "bytes", &value) || !hull_msg_long(body, &value, &n) || n <= 0) {
+		send_error(c, ch, "credit is a number of bytes");
+		return;
+	}
+	if (x == NULL)
+		return;
+	pthread_mutex_lock(&flow_lock);
+	if ((unsigned long long)n > x->held) {
+		over = 1;
+	} else {
+		x->held -= (size_t)n;
+		pthread_cond_broadcast(&flow_room);
+	}
+	pthread_mutex_unlock(&flow_lock);
+	if (over)
+		send_error(c, ch, "more credit than it was sent");
 }
 
 /* Credit for what the writers have written, and word of an input that
@@ -1141,6 +1227,8 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		handle_input(c, (uint32_t)ch, body, 0);
 	} else if (hull_msg_is(body, "eof")) {
 		handle_input(c, (uint32_t)ch, body, 1);
+	} else if (hull_msg_is(body, "credit")) {
+		handle_credit(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "winch")) {
 		handle_control(c, (uint32_t)ch, body, 1);
 	} else if (hull_msg_is(body, "signal")) {

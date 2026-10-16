@@ -165,6 +165,19 @@ out=$(seq 1 200000 | timeout 30 "$hull" exec dtest sh -c 'md5sum' 2>&1)
 cases=$((cases + 1))
 out=$(head -c 3000000 /dev/zero | timeout 30 "$hull" exec dtest sh -c 'sleep 6; wc -c' 2>&1)
 [ "$out" = 3000000 ] || fail "a command reading late got '$out' of 3000000 bytes" ""
+# Output many times the 64 KiB a frontend leaves unasked, to a reader
+# seven seconds behind, where the core once dropped its frontend after
+# five; the command is held meanwhile rather than read into the core.
+cases=$((cases + 1))
+(timeout 40 "$hull" exec dtest seq 1 3000000 | (sleep 7; md5sum) > "$root/held.out" 2>&1) &
+held=$!
+sleep 3
+left=$(timeout 10 docker top "$(timeout 10 docker ps -q --filter name=hull-dtest-)" 2>/dev/null |
+	grep -c 'seq 1 3000000')
+wait "$held"
+out=$(cat "$root/held.out")
+[ "$left" = 1 ] && [ "$out" = "$(seq 1 3000000 | md5sum)" ] ||
+	fail "output to a reader behind was not held, or did not arrive whole" "$left running; $out"
 # -t, through script for a terminal as in cli_test.sh. Docker's API 1.41
 # sizes an exec only once it has started, as its own client does, so the
 # command waits a second before it looks.

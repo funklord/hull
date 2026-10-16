@@ -390,8 +390,8 @@ expect 125 'the machine is not running' "$hull" exec execd /probe
 # command is not reading, the core goes on serving everything else. The
 # machine sleeps rather than waits, since these take longer than wait's
 # twenty seconds.
-conf flowd '(command "/probe" "sleep" "60")' '(hostname "flowd") (on_disconnect keep)'
-(cd / && exec timeout -k 2 70 "$hull_abs" run -f "$root/flowd.conf" > /dev/null 2>&1) &
+conf flowd '(command "/probe" "sleep" "90")' '(hostname "flowd") (on_disconnect keep)'
+(cd / && exec timeout -k 2 100 "$hull_abs" run -f "$root/flowd.conf" > /dev/null 2>&1) &
 flower=$!
 tries=0
 until "$hull" ps 2>/dev/null | grep -q '^flowd .*running$' || [ "$tries" -ge 40 ]; do
@@ -473,6 +473,67 @@ subprocess.run(["sh", "-c", "head -c 2000000 /dev/zero | \"$0\" exec flowd /prob
 u = resource.getrusage(resource.RUSAGE_CHILDREN)
 print("cpu=%.2f" % (u.ru_utime + u.ru_stime))
 ' "$hull_abs"
+
+# Output's flow, the other way: the frontend gives credit back as it
+# writes the output out, and the core holds a command's reader once 64 KiB
+# is unasked for. So output many times that arrives whole, as the same
+# probe on the host writes it; a reader seven seconds behind still gets
+# all of it, where the core once stalled for five and dropped its
+# frontend; meanwhile the command is held, not read into the core, and
+# the core serves everything else.
+probe=$dir/rootfs/probe
+want=$("$probe" spew 3000000 | "$probe" count)
+expect 0 "^$want\$" sh -c '"$0" exec flowd /probe spew 3000000 | "$1" count' "$hull_abs" "$probe"
+cases=$((cases + 1))
+(timeout -k 2 20 "$hull" exec flowd /probe spew 20000000 | (sleep 7; wc -c) > "$dir/held.out" 2>&1) &
+held=$!
+sleep 2
+count=$(ps -eo args= | grep -c '^/probe spew 20000000')
+started=$(date +%s)
+out=$(timeout 10 "$hull" exec flowd /probe say free 2>&1)
+took=$(($(date +%s) - started))
+[ "$count" = 1 ] && [ "$out" = free ] && [ "$took" -lt 2 ] ||
+	fail "a command whose reader is behind was not held, or the core with it" \
+		"$count running; $out after ${took}s"
+wait "$held"
+expect 0 '^20000000$' cat "$dir/held.out"
+# By hand: a frontend that gives no credit has at most the 64 KiB it
+# started with, and as much again for crediting that; credit for more
+# than it was sent is refused.
+expect 0 '^first=6[0-9]{4} second=6[0-9]{4} refused$' python3 -c "$speak"'
+import re
+say(b"(4:exec(4:argv6:/probe4:spew7:1000000)(2:ch1:1)(7:machine5:flowd)(3:tty5:false))")
+def output():
+	total = at = 0
+	while at + 4 <= len(got):
+		n = struct.unpack(">I", got[at:at + 4])[0]
+		if at + 4 + n > len(got):
+			break
+		m = re.match(rb"\(4:data\(3:buf(\d+):", got[at + 4:at + 4 + n])
+		total += int(m.group(1)) if m else 0
+		at += 4 + n
+	return total
+def soak(seconds):
+	global got
+	s.settimeout(seconds)
+	try:
+		while True:
+			chunk = s.recv(65536)
+			if not chunk:
+				break
+			got += chunk
+	except socket.timeout:
+		pass
+soak(1.5)
+first = output()
+say(b"(6:credit(5:bytes%d:%d)(2:ch1:1))" % (len(str(first)), first))
+soak(1.5)
+second = output() - first
+say(b"(6:credit(5:bytes10:1000000000)(2:ch1:1))")
+soak(0.5)
+print("first=%d second=%d %s" % (first, second,
+      "refused" if b"more credit than it was sent" in got else "taken"))
+'
 timeout 10 "$hull" stop flowd > /dev/null 2>&1
 wait "$flower" 2>/dev/null
 

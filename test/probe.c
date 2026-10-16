@@ -12,6 +12,8 @@
  *   read PATH   PATH's first line
  *   stdin       the first line of its stdin
  *   count       all of its stdin: how many bytes, and their FNV-1a hash
+ *   spew N      N bytes on stdout, from a xorshift that does not repeat
+ *               in any window a ring or a buffer would have
  *   sleep N     sleep N seconds
  *   nnp         whether no_new_privs is set
  *   session     whether it leads a session of its own
@@ -137,6 +139,32 @@ int main(int argc, char **argv)
 				for (ssize_t j = 0; j < n; j++, total++)
 					hash = (hash ^ (unsigned char)text[j]) * 16777619u;
 			printf("bytes=%llu fnv=%08x\n", total, hash);
+		} else if (strcmp(step, "spew") == 0) {
+			unsigned long long left = strtoull(arg, NULL, 10);
+			unsigned           x    = 1u;
+			unsigned char      buffer[4096];
+
+			while (left > 0u) {
+				size_t n = left < sizeof buffer ? (size_t)left : sizeof buffer;
+
+				for (size_t j = 0u; j < n; j++) {
+					x ^= x << 13;
+					x ^= x >> 17;
+					x ^= x << 5;
+					buffer[j] = (unsigned char)x;
+				}
+				for (size_t done = 0u; done < n;) {
+					ssize_t w = write(1, buffer + done, n - done);
+
+					if (w < 0 && errno == EINTR)
+						continue;
+					if (w < 0)
+						return 1;
+					done += (size_t)w;
+				}
+				left -= n;
+			}
+			i++;
 		} else if (strcmp(step, "sleep") == 0) {
 			sleep((unsigned)atoi(arg));
 			i++;

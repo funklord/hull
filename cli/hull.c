@@ -852,6 +852,7 @@ static int exec_in(const char *id, char **argv, int argc, int tty)
 		hull_sexpr_doc   body;
 		hull_wire_status status;
 		int              ended = 0;
+		size_t           taken = 0u;  /* output written out, for credit */
 
 		for (unsigned i = 0u; i < sizeof forwarded / sizeof forwarded[0]; i++) {
 			hull_msg m = { 0 };
@@ -912,9 +913,11 @@ static int exec_in(const char *id, char **argv, int argc, int tty)
 				hull_sexpr_form buf;
 				hull_sexpr_form fd;
 
-				if (hull_msg_find(&body, "buf", &buf) && hull_msg_find(&body, "fd", &fd))
+				if (hull_msg_find(&body, "buf", &buf) && hull_msg_find(&body, "fd", &fd)) {
 					write_all(hull_sexpr_is(&body, &fd, "2") ? 2 : 1, body.data + buf.content,
 					          buf.content_length);
+					taken += buf.content_length;
+				}
 			} else if (hull_msg_is(&body, "credit")) {
 				long long bytes = 0;
 
@@ -947,6 +950,17 @@ static int exec_in(const char *id, char **argv, int argc, int tty)
 		}
 		if (ended || status == HULL_WIRE_BROKEN)
 			break;
+		/* The output is written out before more is asked for, so a
+		 * reader of it that falls behind holds the command back. */
+		if (taken > 0u) {
+			hull_msg m = { 0 };
+
+			hull_msg_raw(&m, "(6:credit(5:bytes");
+			hull_msg_number(&m, (long long)taken);
+			hull_msg_raw(&m, ")(2:ch1:1))");
+			hull_wire_send(wire.fd, &m);
+			hull_msg_free(&m);
+		}
 	}
 	restore_terminal();
 	hull_wire_close(&wire);

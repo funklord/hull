@@ -718,6 +718,7 @@ The read-only volume had first passed: while the container ran as root, a write 
 | `(list (ch n))` | `(machines (ch n) (machine (class) (engine) (id) (state))…)` | what the core holds |
 | `(exec (argv w…) (ch n) (machine id) (tty false\|((cols n) (rows n))))` | `(started (ch n) (machine id))`, then `data` and `exited` | a command in a running machine |
 | `(data (buf b) (ch n) (fd 0))`, `(eof (ch n))` | `(credit (bytes n) (ch n))` | an exec's stdin, and how much more the core will take |
+| `(credit (bytes n) (ch n))` | | how much more of an exec's output the frontend will take |
 | `(winch (ch n) (cols n) (rows n))` | | its terminal resized |
 | `(signal (ch n) (signal HUP\|INT\|QUIT\|TERM\|USR1\|USR2\|KILL))` | | a signal for it |
 | | `(data (buf b) (ch n) (fd 1\|2))`, `(exited (ch n) (code n) (signal n))`, `(eof (ch n))`, `(error (ch n) (reason r))` | as B.3's |
@@ -753,6 +754,10 @@ The read-only volume had first passed: while the container ran as root, a write 
 - **Each exec's stdin is written by a thread of its own**, from that 64 KiB ring. The core's one thread used to write it, through an engine `stream_write` that waited up to five seconds for the command to read: one command not reading stopped the core for five seconds a message, every client and machine with it, and its input was refused after. A command that sleeps for six seconds now gets all of it, and another exec beside one that is not reading starts at once.
 - **Ending a write.** `stream_write` now blocks for as long as the command does not read, so closing an exec has to be able to cut a write short: the engines' writes do not block, their waits are polls of a tenth of a second, and `stream_eof` from another thread ends one. `hull_engine.h` says so. chroot closes the descriptor only once no write holds it, so no write is made to a number reused meanwhile. Making the stdin descriptor non-blocking makes a terminal's master so too, being one description, and the reader now passes over EAGAIN.
 - **Once the command's input has closed,** the frontend is told once, and what it sends after is dropped with its credit given straight back, so it never waits on input nobody will read.
+- **Output flows on credit the other way.** An exec's output starts with 64 KiB of credit, unasked, so a frontend that never gives any still sees the start of it. `hull exec` gives credit back for what it has written out, after each batch it reads from the socket. Credit for more than the core has sent is refused.
+  - **Why:** the core used to read a command's output as fast as the command wrote it, and write it to a frontend with a socket send that waited up to five seconds. A frontend whose reader fell behind, as `hull exec m cmd | (sleep 7; wc -c)` does, stopped the core for five seconds, every client and machine with it, and was then dropped, and its command killed.
+  - **How it holds the command back:** the engine's reader waits inside `on_data` while 64 KiB of the stream's output is uncredited. The command's pipe then fills and the command blocks writing, as it would writing to a slow pipe on the host. Nothing queues in the core beyond the window. `hull_engine.h` says `on_data` may wait, so an engine must call it holding nothing `stream_eof` or `stream_close` need. Closing an exec lets a waiting reader go first, and what it reads after is dropped.
+  - **A stream's first output can arrive before `exec()` has returned the stream,** so the core cannot yet know whose it is. The loop makes one `exec()` at a time, so an unknown stream is the one under way, and its output is counted against that exec. The reader does not wait until `exec()` has returned and the exec is set up, so a failed exec cannot leave a reader stuck that the engine is joining.
 
 In chroot:
 
@@ -785,7 +790,7 @@ In docker, `exec` is the daemon's exec API:
 
 Open:
 
-- **A slow frontend is dropped after 5 seconds of a blocked write,** rather than stalling the loop. Output has no flow control yet: `credit` runs from the core to the frontend only, for stdin. Credit the other way would let the core stop reading a command whose frontend is behind, for an exec; a machine's output also goes to its log and to every follower, and one slow follower holding the machine back is a question of its own.
+- **A machine's own output has no flow control.** An exec's output is held back for its one frontend. A machine's output goes to its log and to every follower that has attached, and whether one slow follower should hold the machine back is a question of its own. Until it is answered, a follower whose socket stays full for five seconds is dropped, and the core stalls for those five seconds. A frontend that takes credit for an exec's output and then stops reading its socket is dropped the same way.
 - **Moving onto the shared encrypted protocol**, when that is settled.
 
 **Measured:**
@@ -827,8 +832,23 @@ Open:
   - **The frontend's wait for credit** first passed: without it the frontend spins on a stdin it cannot read, which changes no output. The CPU case catches it.
   - **The ring's tail wrapping** first passed. The frontend reads 16 KiB at a time, which divides the ring, so no message straddled its end; the 10000-byte messages do. Even then it passed once, because the test's bytes repeated every 256, so the stale bytes read past the wrap were the right ones. They are random now, and the case says `mismatch`. With the wrap broken the core writes past its ring, and a later case also failed when the corrupted core lost a machine.
   - **docker's write refused after five seconds** first passed: the daemon's buffers took the 300 kB without the core's write ever waiting. It is 3 MB now.
+- **Output's flow,** in cli_test.sh on the same machine:
+  - 3 MB from `/probe spew`, counted by the same probe on the host;
+  - 20 MB to a reader seven seconds behind, arriving whole;
+  - meanwhile the command still running two seconds in, so held rather than read into the core, and another exec answered inside two seconds;
+  - speaking the protocol by hand, at most 64 KiB with no credit given, as much again for crediting it, and credit for more than was sent refused.
+
+  docker_test.sh sends `seq 1 3000000` to a reader seven seconds behind, compares its `md5sum`, and requires the `seq` still running three seconds in.
+- **Before and after, measured against docker:** `hull exec m seq 1 3000000 | (sleep 7; wc -c)`, with a `hull ps` two seconds in.
+
+  | Core | `ps` took | Bytes arrived (of 22,888,896) | The frontend said |
+  |---|---|---|---|
+  | Before | 3.4 s | 147,707 | "the core went away" |
+  | After | 3 ms | 22,888,896 | nothing |
+- **Sabotage of output's flow,** baseline first. Breaking each of these failed named cases: the reader's wait, counting what it read, taking credit off, waking the reader on credit, refusing over-credit, the frontend giving credit, and the schema's case for a frontend's `credit`. Not letting the reader go on close hung the core at the first frontend killed mid-output, and the suite ran out its time.
+  - **Adopting a stream's output before `exec()` returns passed, and nothing here reaches it.** chroot starts its reader as exec's last step. docker with `-t` resizes after starting, but fifteen `-t` execs of 300 kB, against a core with adoption removed, never once saw output before the return. It is kept because the engine ABI does not promise that order. Without it, such output is credited by the frontend but was never counted, so credit for it can be refused, and the window then shrinks for good.
 - `test/wire_test.c` runs 19 cases: each direction's messages let through and the other's refused, non-canonical bodies refused, and the numbers read minimal decimal. Disabling the validator fails four of them.
-- `test/cli_test.sh` runs 125 cases. Among them: `ps`, `logs` after an exit, a duplicate id refused, a kept machine surviving its frontend's SIGKILL where an unkept one is stopped, `attach` ending with a stopped machine's 143, a second core giving way and the first still answering, a machine dying with a SIGKILLed core, and the core leaving when idle.
+- `test/cli_test.sh` runs 129 cases. Among them: `ps`, `logs` after an exit, a duplicate id refused, a kept machine surviving its frontend's SIGKILL where an unkept one is stopped, `attach` ending with a stopped machine's 143, a second core giving way and the first still answering, a machine dying with a SIGKILLed core, and the core leaving when idle.
 - **Sabotage,** in a scratch copy, with an unmodified baseline first that had to pass. Breaking each of these failed the test: honouring `keep`, stopping on disconnect, replaying logs, `attach` following, one id at a time, the idle exit, the lock, and the parent-death signal.
   - The last two first passed. The lock case only checked that a second core exited 0. Without the lock, the second core takes the socket over, then leaves and removes it, stranding the first. The case now requires the first to still answer.
   - The parent-death case's wait could give up silently, so it now fails when the kept machine never ran. Without the signal, the probe was measured alive a second after its core died, and gone once the shell reaped the client, for no cause found then. So the case looks for the probe before the client is reaped, where the two behaviours differ.

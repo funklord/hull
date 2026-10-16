@@ -54,6 +54,7 @@ struct client_message {
 		case KILL:    kill          kill;
 		case DATA:    client_data   data;
 		case EOF:     eof           eof;
+		case CREDIT:  credit        credit;
 		default:      unknown       unknown;
 	}
 }
@@ -258,10 +259,13 @@ struct exited {
 	preamble u8[2] = "))";
 }
 
-// More of an exec's stdin the core will take: B.2's credit, in this
-// direction only. An exec starts with none, and the frontend sends no
-// more than it has been given; the core gives back what reached the
-// command.
+// B.2's credit, for an exec, in both directions. From the core: more of
+// the exec's stdin it will take. An exec starts with none, and the
+// frontend sends no more than it has been given; the core gives back
+// what reached the command. From the frontend: more of the command's
+// output it will take, given back as it is written out. An exec's
+// output starts with 65536 bytes of credit, so a frontend that never
+// gives any still sees the start of it.
 struct credit {
 	preamble u8[16] = "6:credit(5:bytes";
 	atom  bytes;
