@@ -36,12 +36,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -632,7 +634,14 @@ static hull_status chroot_destroy(hull_core *core, hull_machine *m, hull_error *
  * process of the machine. The helper waits for it and reports its wait
  * status through a pipe, as the init does for the workload. The command
  * has PR_SET_PDEATHSIG, so killing the helper ends it: that is
- * stream_close().
+ * stream_close(). A signal for the command goes to the helper, which
+ * forwards it as the init does, so that only its parent, which reaps it,
+ * ever signals the command's pid.
+ *
+ * With `(tty true)` the core opens a pseudo-terminal and the command's
+ * stdin, stdout and stderr are its other end, its controlling terminal.
+ * The terminal is the host's, passed in open: nothing is mounted in the
+ * machine for it.
  */
 struct hull_stream {
 	hull_machine *machine;
@@ -640,7 +649,8 @@ struct hull_stream {
 	pid_t         helper;
 	int           in;      /* the command's stdin, write end; -1 once ended */
 	int           out;
-	int           err;
+	int           err;     /* -1 on a terminal, where it is the same as out */
+	int           tty;     /* the terminal's master, else -1 */
 	int           status;  /* the helper's status pipe */
 	pthread_t     reader;
 	pthread_mutex_t lock;
@@ -652,7 +662,7 @@ static void *read_exec(void *arg)
 	hull_stream  *st = arg;
 	struct pollfd fds[2] = { { st->out, POLLIN, 0 }, { st->err, POLLIN, 0 } };
 	uint8_t       buffer[4096];
-	int           open_count = 2;
+	int           open_count = st->err < 0 ? 1 : 2;
 	int           status = 0;
 	int           seen;
 
@@ -671,7 +681,14 @@ static void *read_exec(void *arg)
 			if (n > 0) {
 				host->on_data(st->core, st, i + 1, buffer, (size_t)n);
 			} else if (n == 0 || errno != EINTR) {
+				/* A terminal's master reads EIO once nothing holds the
+				 * other end: its end, as a pipe's is 0. resize() uses
+				 * it under the lock. */
+				pthread_mutex_lock(&st->lock);
+				if (fds[i].fd == st->tty)
+					st->tty = -1;
 				close(fds[i].fd);
+				pthread_mutex_unlock(&st->lock);
 				fds[i].fd = -1;
 				open_count--;
 			}
@@ -702,14 +719,22 @@ static void *read_exec(void *arg)
 
 /* The helper: into the machine, then the command. */
 static void run_helper(const hull_machine *m, char *const *argv, const int *ns, int root,
-                       int in, int out, int err, int report, int status_pipe)
+                       int in, int out, int err, int tty, int report, int status_pipe)
 {
 	static const int kinds[] = { CLONE_NEWUSER, CLONE_NEWNS, CLONE_NEWUTS, CLONE_NEWPID };
+	static const int forwarded[] = { SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2 };
+	struct sigaction action;
 	int              status = 0;
 	pid_t            command;
 	int              keep[11] = { ns[0], ns[1], ns[2], ns[3], root, in, out, err, report,
 	                              status_pipe, -1 };
 
+	/* Held from the start: a signal before the command exists is
+	 * forwarded once it does, rather than ending the helper. */
+	memset(&action, 0, sizeof action);
+	action.sa_handler = hold;
+	for (unsigned i = 0u; i < sizeof forwarded / sizeof forwarded[0]; i++)
+		sigaction(forwarded[i], &action, NULL);
 	close_others(keep, 10u);
 	for (unsigned i = 0u; i < 4u; i++)
 		if (setns(ns[i], kinds[i]) != 0)
@@ -720,24 +745,70 @@ static void run_helper(const hull_machine *m, char *const *argv, const int *ns, 
 	if (command < 0)
 		child_fail(report, "fork");
 	if (command == 0) {
+		action.sa_handler = SIG_DFL;
+		for (unsigned i = 0u; i < sizeof forwarded / sizeof forwarded[0]; i++)
+			sigaction(forwarded[i], &action, NULL);
 		if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0L, 0L, 0L) != 0 || dup2(in, 0) < 0 ||
 		    dup2(out, 1) < 0 || dup2(err, 2) < 0 || setsid() < 0)
 			child_fail(report, "the command's stdio");
+		if (tty && ioctl(0, TIOCSCTTY, 0) != 0)
+			child_fail(report, "the command's terminal");
 		if (m->no_new_privs && prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) != 0)
 			child_fail(report, "no_new_privs");
 		execve(argv[0], argv, (char *const *)m->envp);
 		child_fail(report, argv[0]);
 	}
 	close(report);
-	while (waitpid(command, &status, 0) < 0 && errno == EINTR)
-		;
+	for (;;) {
+		if (pending != 0) {
+			kill(command, (int)pending);
+			pending = 0;
+		}
+		if (waitpid(command, &status, 0) == command || errno != EINTR)
+			break;
+	}
 	if (write(status_pipe, &status, sizeof status) != (ssize_t)sizeof status)
 		_exit(126);
 	_exit(0);
 }
 
-/* The words of `(exec (argv ...) ...)`, NULL-terminated, into `argv`. */
-static int read_argv(hull_buf spec, char **argv)
+/*
+ * A pseudo-terminal for an exec, of the size it asked for: `in` and `out`
+ * get the master, twice, so that ending the input does not hang the
+ * terminal up; all three child ends are the one other end. Returns 1, or
+ * 0 with nothing left open.
+ */
+static int open_terminal(const struct winsize *size, int *in, int *out, int *err)
+{
+	char           name[64];
+	int            master = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+	int            other  = -1;
+	int            copy   = -1;
+
+	if (master < 0)
+		return 0;
+	if (grantpt(master) != 0 || unlockpt(master) != 0 ||
+	    ptsname_r(master, name, sizeof name) != 0 ||
+	    (other = open(name, O_RDWR | O_NOCTTY | O_CLOEXEC)) < 0 ||
+	    ioctl(master, TIOCSWINSZ, size) != 0 ||
+	    (copy = fcntl(master, F_DUPFD_CLOEXEC, 0)) < 0) {
+		if (other >= 0)
+			close(other);
+		close(master);
+		return 0;
+	}
+	in[0]  = other;
+	in[1]  = copy;
+	out[0] = master;
+	out[1] = other;
+	err[0] = -1;
+	err[1] = other;
+	return 1;
+}
+
+/* The words of `(exec (argv ...) ...)`, NULL-terminated, into `argv`,
+ * and the terminal it asks for: its size, or 0 columns for none. */
+static int read_argv(hull_buf spec, char **argv, struct winsize *size)
 {
 	hull_sexpr_doc  doc;
 	hull_sexpr_form message;
@@ -749,6 +820,14 @@ static int read_argv(hull_buf spec, char **argv)
 	if (hull_sexpr_open(&doc, spec.data, spec.len, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
 	    !hull_sexpr_first(&doc, &message) || !hull_access_find(&doc, &message, "argv", &entry))
 		return 0;
+	{
+		int cols = 0;
+		int rows = 0;
+
+		hull_access_terminal(&doc, &message, &cols, &rows);
+		size->ws_col = (unsigned short)cols;
+		size->ws_row = (unsigned short)rows;
+	}
 	hull_sexpr_child(&doc, &entry, &word);
 	for (more = hull_sexpr_next(&doc, &word, &word); more && n < MAX_ARGS;
 	     more = hull_sexpr_next(&doc, &word, &word))
@@ -772,7 +851,11 @@ static hull_status chroot_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	char         path[64];
 	int          ns[4] = { -1, -1, -1, -1 };
 	int          root;
-	int          in[2], o[2], e[2], report[2], status[2];
+	int          in[2] = { -1, -1 }, o[2] = { -1, -1 }, e[2] = { -1, -1 };
+	int          report[2], status[2];
+	struct winsize size = { 0 };
+	int          tty;
+	int          opened;
 	hull_stream *st;
 	ssize_t      n;
 	int          done;
@@ -782,10 +865,11 @@ static hull_status chroot_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	pthread_mutex_unlock(&m->lock);
 	if (!m->started || done)
 		return fail(error, HULL_ERR_GONE, "the machine is not running");
-	if (!read_argv(spec, argv)) {
+	if (!read_argv(spec, argv, &size)) {
 		free_argv(argv);
 		return fail(error, HULL_ERR_UNSUPPORTED, "an exec names a command");
 	}
+	tty = size.ws_col != 0u;
 	for (unsigned i = 0u; i < 4u; i++) {
 		snprintf(path, sizeof path, "/proc/%ld/ns/%s", (long)m->pid, kinds[i]);
 		ns[i] = open(path, O_RDONLY | O_CLOEXEC);
@@ -793,17 +877,26 @@ static hull_status chroot_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	snprintf(path, sizeof path, "/proc/%ld/root", (long)m->pid);
 	root = open(path, O_PATH | O_DIRECTORY | O_CLOEXEC);
 	st = calloc(1u, sizeof *st);
+	opened = tty ? open_terminal(&size, in, o, e) : pipe2(in, O_CLOEXEC) == 0 &&
+	         pipe2(o, O_CLOEXEC) == 0 && pipe2(e, O_CLOEXEC) == 0;
 	if (ns[0] < 0 || ns[1] < 0 || ns[2] < 0 || ns[3] < 0 || root < 0 || st == NULL ||
-	    pipe2(in, O_CLOEXEC) != 0 || pipe2(o, O_CLOEXEC) != 0 || pipe2(e, O_CLOEXEC) != 0 ||
-	    pipe2(report, O_CLOEXEC) != 0 || pipe2(status, O_CLOEXEC) != 0) {
-		for (unsigned i = 0u; i < 4u; i++)
-			if (ns[i] >= 0)
-				close(ns[i]);
-		if (root >= 0)
-			close(root);
+	    !opened || pipe2(report, O_CLOEXEC) != 0 || pipe2(status, O_CLOEXEC) != 0) {
+		const int ends[] = { ns[0], ns[1], ns[2], ns[3], root, in[0], in[1], o[0], o[1],
+		                     e[0], e[1] };
+
+		/* On a terminal one descriptor stands in three places. */
+		for (unsigned i = 0u; i < sizeof ends / sizeof ends[0]; i++) {
+			int seen = 0;
+
+			for (unsigned j = 0u; j < i; j++)
+				seen |= ends[j] == ends[i];
+			if (ends[i] >= 0 && !seen)
+				close(ends[i]);
+		}
 		free(st);
 		free_argv(argv);
-		return fail(error, HULL_ERR_RUNTIME, "the machine's namespaces cannot be opened");
+		return fail(error, HULL_ERR_RUNTIME, tty ? "no terminal could be opened" :
+		            "the machine's namespaces cannot be opened");
 	}
 	st->machine = m;
 	st->core    = core;
@@ -812,20 +905,24 @@ static hull_status chroot_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	if (st->helper == 0) {
 		close(report[0]);
 		close(status[0]);
-		run_helper(m, argv, ns, root, in[0], o[1], e[1], report[1], status[1]);
+		run_helper(m, argv, ns, root, in[0], o[1], e[1], tty, report[1], status[1]);
 	}
 	for (unsigned i = 0u; i < 4u; i++)
 		close(ns[i]);
 	close(root);
+	/* On a terminal the three are the one other end, closed once. */
 	close(in[0]);
-	close(o[1]);
-	close(e[1]);
+	if (!tty) {
+		close(o[1]);
+		close(e[1]);
+	}
 	close(report[1]);
 	close(status[1]);
 	free_argv(argv);
 	st->in     = in[1];
 	st->out    = o[0];
-	st->err    = e[0];
+	st->err    = tty ? -1 : e[0];
+	st->tty    = tty ? o[0] : -1;
 	st->status = status[0];
 	n = st->helper < 0 ? -1 : read(report[0], m->detail, sizeof m->detail - 1u);
 	close(report[0]);
@@ -838,7 +935,8 @@ static hull_status chroot_exec(hull_core *core, hull_machine *m, hull_buf spec,
 			waitpid(st->helper, NULL, 0);
 		close(st->in);
 		close(st->out);
-		close(st->err);
+		if (st->err >= 0)
+			close(st->err);
 		close(st->status);
 		free(st);
 		return fail(error, HULL_ERR_RUNTIME, m->detail);
@@ -848,7 +946,8 @@ static hull_status chroot_exec(hull_core *core, hull_machine *m, hull_buf spec,
 		waitpid(st->helper, NULL, 0);
 		close(st->in);
 		close(st->out);
-		close(st->err);
+		if (st->err >= 0)
+			close(st->err);
 		close(st->status);
 		free(st);
 		return fail(error, HULL_ERR_INTERNAL, "the reader thread could not start");
@@ -888,6 +987,41 @@ static hull_status chroot_stream_eof(hull_core *core, hull_stream *st, hull_erro
 	if (st->in >= 0)
 		close(st->in);
 	st->in = -1;
+	return HULL_OK;
+}
+
+static hull_status chroot_resize(hull_core *core, hull_stream *st, int rows, int cols,
+                                 hull_error *error)
+{
+	struct winsize size = { .ws_row = (unsigned short)rows, .ws_col = (unsigned short)cols };
+	int            done;
+
+	(void)core;
+	if (st == NULL)
+		return fail(error, HULL_ERR_UNSUPPORTED, "a machine's workload has no terminal");
+	pthread_mutex_lock(&st->lock);
+	done = st->tty < 0 || ioctl(st->tty, TIOCSWINSZ, &size) != 0;
+	pthread_mutex_unlock(&st->lock);
+	if (done)
+		return fail(error, HULL_ERR_UNSUPPORTED, "the command has no terminal");
+	return HULL_OK;
+}
+
+/* A signal for the workload goes to the init, and for a command to its
+ * helper: each forwards it, and is the one that reaps what it signals. */
+static hull_status chroot_signal(hull_core *core, hull_machine *m, hull_stream *st, int signum,
+                                 hull_error *error)
+{
+	(void)core;
+	(void)error;
+	if (st == NULL) {
+		signal_init(m, signum);
+		return HULL_OK;
+	}
+	pthread_mutex_lock(&st->lock);
+	if (!st->reaped)
+		kill(st->helper, signum);
+	pthread_mutex_unlock(&st->lock);
 	return HULL_OK;
 }
 
@@ -951,6 +1085,8 @@ static const hull_engine_ops ops = {
 	.stream_write = chroot_stream_write,
 	.stream_eof   = chroot_stream_eof,
 	.stream_close = chroot_stream_close,
+	.resize       = chroot_resize,
+	.signal       = chroot_signal,
 };
 
 static const hull_engine engine = {

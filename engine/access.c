@@ -66,6 +66,28 @@ int hull_access_true(const hull_sexpr_doc *doc, const hull_sexpr_form *record, c
 	return yes;
 }
 
+int hull_access_terminal(const hull_sexpr_doc *doc, const hull_sexpr_form *exec, int *cols,
+                         int *rows)
+{
+	hull_sexpr_form tty;
+	char           *across;
+	char           *down;
+	int             yes;
+
+	if (!hull_access_find(doc, exec, "tty", &tty))
+		return 0;
+	across = hull_access_value(doc, &tty, "cols");
+	down   = hull_access_value(doc, &tty, "rows");
+	yes    = across != NULL && down != NULL;
+	if (yes) {
+		*cols = atoi(across);
+		*rows = atoi(down);
+	}
+	free(across);
+	free(down);
+	return yes;
+}
+
 char *hull_access_path(const hull_sexpr_doc *doc, const char *path)
 {
 	hull_sexpr_form top;

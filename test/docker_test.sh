@@ -155,6 +155,31 @@ timeout -s KILL 2 "$hull" exec dtest sleep 300 > /dev/null 2>&1
 sleep 1
 left=$(timeout 10 docker top "$(timeout 10 docker ps -q --filter name=hull-dtest-)" 2>/dev/null | grep -c 'sleep 300')
 [ "$left" = 0 ] || fail "an exec outlived the frontend that ran it" "$left"
+# -t, through script for a terminal as in cli_test.sh. Docker's API 1.41
+# sizes an exec only once it has started, as its own client does, so the
+# command waits a second before it looks.
+HULL=$hull SHELL=/bin/sh
+export HULL SHELL
+cases=$((cases + 1))
+out=$(timeout 30 script -qec 'stty cols 101 rows 31; "$HULL" exec -t dtest sh -c "test -t 0 &&
+	echo terminal; sleep 1; stty size"' /dev/null 2>&1 | tr -d '\r')
+printf '%s\n' "$out" | grep -q '^terminal$' && printf '%s\n' "$out" | grep -q '^31 101$' ||
+	fail "exec -t gave no terminal of the frontend's size" "$out"
+cases=$((cases + 1))
+# The resize docker makes once the exec starts is a SIGWINCH of its own,
+# so the command waits for the size rather than for a signal, ten seconds
+# at most.
+out=$(timeout 30 script -qec '"$HULL" exec -t dtest sh -c "i=0; while [ \"\$(stty size)\" != \"20 90\" ] &&
+	[ \$i -lt 100 ]; do sleep 0.1; i=\$((i + 1)); done; stty size" < /dev/tty & sleep 2;
+	stty cols 90 rows 20; kill -WINCH $!; wait $!' /dev/null 2>&1 | tr -d '\r')
+printf '%s\n' "$out" | grep -q '^20 90$' || fail "a resize did not reach the exec" "$out"
+# A signal to the frontend is the command's to handle.
+cases=$((cases + 1))
+out=$(timeout 30 sh -c '"$0" exec dtest sh -c "trap \"echo caught; exit 0\" TERM; echo ready;
+	while :; do sleep 0.1; done" & sleep 2; kill -TERM $!; wait $!' "$hull" 2>&1)
+got=$?
+[ "$got" = 0 ] && printf '%s\n' "$out" | grep -q '^caught$' ||
+	fail "a TERM to exec was not the command's: $got" "$out"
 timeout 30 "$hull" stop dtest > /dev/null 2>&1
 wait "$execer" 2>/dev/null
 

@@ -32,7 +32,7 @@ a dir source with `(backend chroot)`, the rootless reference engine in
 `ns`. Machines run in a per-user core in `core/`, which `hull run`
 starts when none is running and which leaves once idle; `hull ps`,
 `hull stop`, `hull logs`, `hull attach` and `hull exec` reach what it
-holds.
+holds; `hull exec -t` gives a command a terminal of its own.
 `hull_engine.h` is a draft of the C plugin interface that engines
 implement.
 

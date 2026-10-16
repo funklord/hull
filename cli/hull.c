@@ -35,11 +35,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -83,7 +85,7 @@ static void usage(FILE *out)
 	      "       hull check [-f FILE] --backend B[,B...] [--accept TOKEN]...\n"
 	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [NAME]\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
-	      "       hull exec ID [--] CMD [ARG...]\n"
+	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
 	      "       hull core\n"
 	      "       hull engines\n"
 	      "       hull --version\n", out);
@@ -707,14 +709,89 @@ static int list_machines(void)
 	return 0;
 }
 
-/* `hull exec ID [--] CMD [ARG...]`: the command's output written out, this
- * process's stdin its input, and its status this process's. */
-static int exec_in(const char *id, char **argv, int argc)
-{
-	hull_wire wire;
-	hull_msg  request = { 0 };
-	int       input_open = 1;
+/* --- exec -------------------------------------------------------------- */
 
+/* What `hull exec` forwards, by the names the protocol uses. */
+static const struct {
+	int         number;
+	const char *name;
+} forwarded[] = {
+	{ SIGHUP, "HUP" }, { SIGINT, "INT" }, { SIGQUIT, "QUIT" }, { SIGTERM, "TERM" },
+	{ SIGUSR1, "USR1" }, { SIGUSR2, "USR2" },
+};
+
+static volatile sig_atomic_t arrived[sizeof forwarded / sizeof forwarded[0]];
+static volatile sig_atomic_t resized;
+
+static void note_signal(int signal)
+{
+	if (signal == SIGWINCH)
+		resized = 1;
+	for (unsigned i = 0u; i < sizeof forwarded / sizeof forwarded[0]; i++)
+		if (forwarded[i].number == signal)
+			arrived[i] = 1;
+}
+
+/* The terminal as it was before raw mode, put back on every way out. */
+static struct termios saved_terminal;
+static int            terminal_raw;
+
+static void restore_terminal(void)
+{
+	if (terminal_raw)
+		tcsetattr(0, TCSAFLUSH, &saved_terminal);
+	terminal_raw = 0;
+}
+
+/* `(4:cols..)(4:rows..)`: this terminal's size, or 80 by 24 where it
+ * does not say. */
+static void add_window(hull_msg *m)
+{
+	struct winsize size;
+
+	if (ioctl(0, TIOCGWINSZ, &size) != 0 || size.ws_col == 0 || size.ws_row == 0) {
+		size.ws_col = 80;
+		size.ws_row = 24;
+	}
+	hull_msg_raw(m, "(4:cols");
+	hull_msg_number(m, size.ws_col);
+	hull_msg_raw(m, ")(4:rows");
+	hull_msg_number(m, size.ws_row);
+	hull_msg_raw(m, ")");
+}
+
+static void send_winch(int fd)
+{
+	hull_msg m = { 0 };
+
+	hull_msg_raw(&m, "(5:winch(2:ch1:1)");
+	add_window(&m);
+	hull_msg_raw(&m, ")");
+	hull_wire_send(fd, &m);
+	hull_msg_free(&m);
+}
+
+/* `hull exec [-t] ID [--] CMD [ARG...]`: the command's output written out,
+ * this process's stdin its input, and its status this process's. The
+ * signals above are the command's rather than this process's: each is
+ * forwarded, and the command decides. With -t it runs on a terminal of
+ * its own, this one is raw while it does, and its size follows this
+ * one's. */
+static int exec_in(const char *id, char **argv, int argc, int tty)
+{
+	hull_wire        wire;
+	hull_msg         request = { 0 };
+	struct sigaction action;
+	sigset_t         held;
+	sigset_t         waiting;
+	int              input_open = 1;
+	int              started = 0;
+	int              result = 125;
+
+	if (tty && !isatty(0)) {
+		fprintf(stderr, "hull: -t needs a terminal on stdin\n");
+		return 125;
+	}
 	if (!core_running()) {
 		fprintf(stderr, "hull: no core is running, so no machine is\n");
 		return 125;
@@ -728,19 +805,67 @@ static int exec_in(const char *id, char **argv, int argc)
 	hull_msg_channel(&request, 1u);
 	hull_msg_raw(&request, "(7:machine");
 	hull_msg_text(&request, id);
+	hull_msg_raw(&request, ")(3:tty");
+	if (tty)
+		add_window(&request);
+	else
+		hull_msg_raw(&request, "5:false");
 	hull_msg_raw(&request, "))");
+
+	/* Held outside ppoll(), so that none arrives between the look at
+	 * what has and the wait. */
+	sigemptyset(&held);
+	memset(&action, 0, sizeof action);
+	action.sa_handler = note_signal;
+	for (unsigned i = 0u; i < sizeof forwarded / sizeof forwarded[0]; i++) {
+		sigaddset(&held, forwarded[i].number);
+		sigaction(forwarded[i].number, &action, NULL);
+	}
+	if (tty) {
+		sigaddset(&held, SIGWINCH);
+		sigaction(SIGWINCH, &action, NULL);
+	}
+	sigprocmask(SIG_BLOCK, &held, &waiting);
+
 	if (hull_wire_send(wire.fd, &request) != 0) {
 		hull_msg_free(&request);
 		hull_wire_close(&wire);
 		return 125;
 	}
 	hull_msg_free(&request);
+	if (tty) {
+		struct termios raw;
+
+		if (tcgetattr(0, &saved_terminal) == 0) {
+			raw = saved_terminal;
+			cfmakeraw(&raw);
+			if (tcsetattr(0, TCSAFLUSH, &raw) == 0)
+				terminal_raw = 1;
+		}
+	}
 	for (;;) {
 		struct pollfd    fds[2] = { { wire.fd, POLLIN, 0 }, { 0, POLLIN, 0 } };
 		hull_sexpr_doc   body;
 		hull_wire_status status;
+		int              ended = 0;
 
-		if (poll(fds, input_open ? 2u : 1u, -1) < 0) {
+		for (unsigned i = 0u; i < sizeof forwarded / sizeof forwarded[0]; i++) {
+			hull_msg m = { 0 };
+
+			if (!arrived[i])
+				continue;
+			arrived[i] = 0;
+			hull_msg_raw(&m, "(6:signal(2:ch1:1)(6:signal");
+			hull_msg_text(&m, forwarded[i].name);
+			hull_msg_raw(&m, "))");
+			hull_wire_send(wire.fd, &m);
+			hull_msg_free(&m);
+		}
+		if (resized) {
+			resized = 0;
+			send_winch(wire.fd);
+		}
+		if (ppoll(fds, input_open ? 2u : 1u, NULL, &waiting) < 0) {
 			if (errno == EINTR)
 				continue;
 			break;
@@ -750,6 +875,8 @@ static int exec_in(const char *id, char **argv, int argc)
 			ssize_t  n = read(0, chunk, sizeof chunk);
 			hull_msg m = { 0 };
 
+			if (n < 0 && errno == EINTR)
+				continue;
 			if (n > 0) {
 				hull_msg_raw(&m, "(4:data(3:buf");
 				hull_msg_atom(&m, chunk, (size_t)n);
@@ -765,10 +892,11 @@ static int exec_in(const char *id, char **argv, int argc)
 			continue;
 		status = hull_wire_fill(&wire);
 		if (status == HULL_WIRE_CLOSED || status == HULL_WIRE_BROKEN) {
+			restore_terminal();
 			fprintf(stderr, "hull: the core went away\n");
 			break;
 		}
-		while ((status = hull_wire_next(&wire, &body)) == HULL_WIRE_OK) {
+		while (!ended && (status = hull_wire_next(&wire, &body)) == HULL_WIRE_OK) {
 			hull_sexpr_form value;
 			long long       code = 0;
 			long long       sig  = 0;
@@ -785,23 +913,31 @@ static int exec_in(const char *id, char **argv, int argc)
 					hull_msg_long(&body, &value, &code);
 				if (hull_msg_find(&body, "signal", &value))
 					hull_msg_long(&body, &value, &sig);
-				hull_wire_close(&wire);
-				return sig != 0 ? 128 + (int)sig : (int)code;
+				result = sig != 0 ? 128 + (int)sig : (int)code;
+				ended  = 1;
 			} else if (hull_msg_is(&body, "error")) {
 				char reason[512] = "an error";
 
 				if (hull_msg_find(&body, "reason", &value))
 					hull_msg_string(&body, &value, reason, sizeof reason);
-				fprintf(stderr, "hull: %s\n", reason);
-				hull_wire_close(&wire);
-				return 125;
+				/* Once it has started, what is refused is a resize or a
+				 * signal, and the command runs on. */
+				if (!started) {
+					restore_terminal();
+					ended = 1;
+				}
+				fprintf(stderr, started && terminal_raw ? "hull: %s\r\n" : "hull: %s\n",
+				        reason);
+			} else if (hull_msg_is(&body, "started")) {
+				started = 1;
 			}
 		}
-		if (status == HULL_WIRE_BROKEN)
+		if (ended || status == HULL_WIRE_BROKEN)
 			break;
 	}
+	restore_terminal();
 	hull_wire_close(&wire);
-	return 125;
+	return result;
 }
 
 /* stop, logs and attach: one request about one machine, followed to its
@@ -900,19 +1036,26 @@ int main(int argc, char **argv)
 	if (strcmp(command, "ps") == 0 && argc == 2)
 		return list_machines();
 	if (strcmp(command, "exec") == 0) {
-		int first = 3;
+		int at  = 2;
+		int tty = 0;
+		int first;
 
-		if (argc < 4 || argv[2][0] == '-') {
+		if (argc > at && strcmp(argv[at], "-t") == 0) {
+			tty = 1;
+			at++;
+		}
+		if (argc <= at + 1 || argv[at][0] == '-') {
 			usage(stderr);
 			return 125;
 		}
-		if (strcmp(argv[3], "--") == 0)
-			first = 4;
+		first = at + 1;
+		if (strcmp(argv[first], "--") == 0)
+			first++;
 		if (first >= argc) {
 			usage(stderr);
 			return 125;
 		}
-		return exec_in(argv[2], argv + first, argc - first);
+		return exec_in(argv[at], argv + first, argc - first, tty);
 	}
 	if ((strcmp(command, "stop") == 0 || strcmp(command, "attach") == 0 ||
 	     strcmp(command, "logs") == 0) && argc >= 3) {

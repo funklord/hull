@@ -110,6 +110,8 @@ struct slot {
 typedef struct exec_entry {
 	int          used;
 	int          closed;  /* stream_close() done; waiting for the exit */
+	int          tell;    /* closed by its machine's end: the exit is still the
+	                         frontend's to hear */
 	client      *client;
 	uint32_t     ch;
 	slot        *machine;
@@ -444,8 +446,10 @@ static void machine_exited(slot *s, int code, int signal)
 	/* Its commands end with it; their exits are queued, and seen before
 	 * this drain is over. */
 	for (unsigned i = 0u; i < MAX_EXECS; i++)
-		if (execs[i].used && execs[i].machine == s)
+		if (execs[i].used && execs[i].machine == s) {
+			execs[i].tell |= !execs[i].closed;
 			close_exec(&execs[i]);
+		}
 	if (s->handle != NULL) {
 		s->engine->ops->destroy(&s->core, s->handle, &error);
 		s->handle = NULL;
@@ -464,10 +468,11 @@ static void exec_event(const event *e)
 	if (e->kind == EVENT_DATA && !x->closed) {
 		send_data(x->client, x->ch, e->fd, e->bytes, e->length);
 	} else if (e->kind == EVENT_EXIT) {
-		if (!x->closed) {
+		/* A frontend that has gone hears nothing; one whose command went
+		 * with its machine hears how it ended. */
+		if (!x->closed || x->tell)
 			send_status(x->client, x->ch, e->code, e->signal);
-			close_exec(x);
-		}
+		close_exec(x);
 		x->used = 0;
 	}
 }
@@ -545,6 +550,20 @@ static int is_label(const char *id)
 		if (!(id[i] >= 'a' && id[i] <= 'z') && !(id[i] >= '0' && id[i] <= '9') && id[i] != '-')
 			return 0;
 	return 1;
+}
+
+/* A run's machine, or an exec's command, is running: what the frontend
+ * is refused after this is a resize or a signal, not the request. */
+static void send_started(client *c, uint32_t ch, const slot *s)
+{
+	hull_msg m = { 0 };
+
+	hull_msg_raw(&m, "(7:started");
+	hull_msg_channel(&m, ch);
+	hull_msg_raw(&m, "(7:machine");
+	hull_msg_text(&m, s->id);
+	hull_msg_raw(&m, "))");
+	send_to(c, &m);
 }
 
 static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
@@ -651,16 +670,7 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		s->used   = 0;
 		return;
 	}
-	{
-		hull_msg m = { 0 };
-
-		hull_msg_raw(&m, "(7:started");
-		hull_msg_channel(&m, ch);
-		hull_msg_raw(&m, "(7:machine");
-		hull_msg_text(&m, s->id);
-		hull_msg_raw(&m, "))");
-		send_to(c, &m);
-	}
+	send_started(c, ch, s);
 }
 
 static slot *named(client *c, uint32_t ch, const hull_sexpr_doc *body)
@@ -731,6 +741,31 @@ static void handle_stop(client *c, uint32_t ch, const hull_sexpr_doc *body)
 
 /* A command in a running machine; the request itself is the engine's
  * exec_spec, being canonical already. */
+/* `(key n)` of `record`, as a size: 1 to 65535, minimal decimal. */
+static int dimension(const hull_sexpr_doc *body, const hull_sexpr_form *record, const char *key,
+                     long long *out)
+{
+	hull_sexpr_form entry;
+	hull_sexpr_form name;
+	hull_sexpr_form value;
+
+	return hull_access_find(body, record, key, &entry) &&
+	       hull_sexpr_child(body, &entry, &name) && hull_sexpr_next(body, &name, &value) &&
+	       hull_msg_long(body, &value, out) && *out >= 1 && *out <= 65535;
+}
+
+/* An exec's `(tty false)`, or a terminal of a size it can be. */
+static int terminal_ok(const hull_sexpr_doc *body)
+{
+	hull_sexpr_form tty;
+	long long       n;
+
+	if (!hull_msg_find(body, "tty", &tty))
+		return 0;
+	return tty.kind == HULL_SEXPR_ATOM ||
+	       (dimension(body, &tty, "cols", &n) && dimension(body, &tty, "rows", &n));
+}
+
 static void handle_exec(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
 	hull_error   error = { .struct_size = sizeof error };
@@ -743,6 +778,10 @@ static void handle_exec(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		return;
 	if (s->exited || s->handle == NULL) {
 		send_error(c, ch, "the machine is not running");
+		return;
+	}
+	if (!terminal_ok(body)) {
+		send_error(c, ch, "a window is 1 to 65535 in each direction");
 		return;
 	}
 	if (s->engine->ops->exec == NULL || s->engine->ops->stream_write == NULL ||
@@ -767,7 +806,8 @@ static void handle_exec(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		send_error(c, ch, error.detail != NULL ? error.detail : "exec failed");
 		return;
 	}
-	*x = (exec_entry){ 1, 0, c, ch, s, stream };
+	*x = (exec_entry){ .used = 1, .client = c, .ch = ch, .machine = s, .stream = stream };
+	send_started(c, ch, s);
 }
 
 /* An exec's stdin, and its end. */
@@ -790,6 +830,66 @@ static void handle_input(client *c, uint32_t ch, const hull_sexpr_doc *body, int
 	                             buf.content_length, &error) != HULL_OK) {
 		send_error(c, ch, error.detail != NULL ? error.detail : "the input was refused");
 	}
+}
+
+/* The signals a frontend may forward, by the names B.3 uses. */
+static const struct {
+	const char *name;
+	int         number;
+} forwardable[] = {
+	{ "HUP", SIGHUP }, { "INT", SIGINT }, { "QUIT", SIGQUIT }, { "TERM", SIGTERM },
+	{ "USR1", SIGUSR1 }, { "USR2", SIGUSR2 }, { "KILL", SIGKILL },
+};
+
+/* An exec's terminal resized, or a signal for it. Neither is answered
+ * unless it is refused. */
+static void handle_control(client *c, uint32_t ch, const hull_sexpr_doc *body, int winch)
+{
+	hull_error      error = { .struct_size = sizeof error };
+	hull_sexpr_form value;
+	exec_entry     *x = exec_on(c, ch);
+	const hull_engine_ops *ops;
+	hull_status     status;
+
+	if (x == NULL) {
+		send_error(c, ch, "no command on that channel");
+		return;
+	}
+	ops = x->machine->engine->ops;
+	if (winch) {
+		long long cols = 0;
+		long long rows = 0;
+
+		if (!hull_msg_find(body, "cols", &value) || !hull_msg_long(body, &value, &cols) ||
+		    !hull_msg_find(body, "rows", &value) || !hull_msg_long(body, &value, &rows) ||
+		    cols < 1 || cols > 65535 || rows < 1 || rows > 65535) {
+			send_error(c, ch, "a window is 1 to 65535 in each direction");
+			return;
+		}
+		if (ops->resize == NULL) {
+			send_error(c, ch, "that engine cannot resize a terminal");
+			return;
+		}
+		status = ops->resize(&x->machine->core, x->stream, (int)rows, (int)cols, &error);
+	} else {
+		int number = 0;
+
+		if (hull_msg_find(body, "signal", &value))
+			for (unsigned i = 0u; i < sizeof forwardable / sizeof forwardable[0]; i++)
+				if (hull_sexpr_is(body, &value, forwardable[i].name))
+					number = forwardable[i].number;
+		if (number == 0) {
+			send_error(c, ch, "not a signal the core forwards");
+			return;
+		}
+		if (ops->signal == NULL) {
+			send_error(c, ch, "that engine cannot signal a command");
+			return;
+		}
+		status = ops->signal(&x->machine->core, x->machine->handle, x->stream, number, &error);
+	}
+	if (status != HULL_OK)
+		send_error(c, ch, error.detail != NULL ? error.detail : "refused");
 }
 
 static void handle_list(client *c, uint32_t ch)
@@ -852,6 +952,10 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		handle_input(c, (uint32_t)ch, body, 0);
 	} else if (hull_msg_is(body, "eof")) {
 		handle_input(c, (uint32_t)ch, body, 1);
+	} else if (hull_msg_is(body, "winch")) {
+		handle_control(c, (uint32_t)ch, body, 1);
+	} else if (hull_msg_is(body, "signal")) {
+		handle_control(c, (uint32_t)ch, body, 0);
 	} else {
 		send_error(c, (uint32_t)ch, "unsupported");
 	}

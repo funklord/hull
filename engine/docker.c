@@ -857,6 +857,7 @@ struct hull_stream {
 	int           socket;
 	pthread_t     reader;
 	int           ended;   /* stdin shut */
+	int           tty;     /* on a terminal: one raw stream, not frames */
 };
 
 static void *read_exec(void *arg)
@@ -869,7 +870,18 @@ static void *read_exec(void *arg)
 	long         code   = 125;
 	int          status = 0;
 
-	while (read_full(st->socket, header, sizeof header) == 0) {
+	/* A terminal's output is the bytes themselves, with nothing to say
+	 * which stream: all of it is stdout. */
+	while (st->tty) {
+		ssize_t n = read(st->socket, buffer, sizeof buffer);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;
+		host->on_data(st->core, st, 1, buffer, (size_t)n);
+	}
+	while (!st->tty && read_full(st->socket, header, sizeof header) == 0) {
 		uint32_t size = (uint32_t)header[4] << 24 | (uint32_t)header[5] << 16 |
 		                (uint32_t)header[6] << 8 | header[7];
 
@@ -890,6 +902,9 @@ static void *read_exec(void *arg)
 	return NULL;
 }
 
+static hull_status docker_resize(hull_core *core, hull_stream *st, int rows, int cols,
+                                 hull_error *error);
+
 static hull_status docker_exec(hull_core *core, hull_machine *m, hull_buf spec,
                                hull_stream **out, hull_error *error)
 {
@@ -903,11 +918,16 @@ static hull_status docker_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	char           *answer = NULL;
 	size_t          n = 0u;
 	int             status = 0;
+	int             tty;
+	int             cols = 0;
+	int             rows = 0;
 
 	if (hull_sexpr_open(&doc, spec.data, spec.len, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
 	    !hull_sexpr_first(&doc, &message) || !hull_access_find(&doc, &message, "argv", &argv))
 		return fail(error, HULL_ERR_UNSUPPORTED, "an exec names a command");
+	tty = hull_access_terminal(&doc, &message, &cols, &rows);
 	add_text(&body, "{\"AttachStdin\":true,\"AttachStdout\":true,\"AttachStderr\":true,");
+	addf(&body, "\"Tty\":%s,", tty ? "true" : "false");
 	addf(&body, "\"User\":\"%u:%u\",\"Cmd\":[", (unsigned)getuid(), (unsigned)getgid());
 	add_strings(&body, &doc, &argv);
 	add_text(&body, "]}");
@@ -920,6 +940,7 @@ static hull_status docker_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	st->machine = m;
 	st->core    = core;
 	st->socket  = -1;
+	st->tty     = tty;
 	snprintf(path, sizeof path, "/containers/%s/exec", m->id);
 	if (call("POST", path, body.data, &status, &answer) != 0 || status != 201 ||
 	    !json_string(answer, "Id", st->id, sizeof st->id)) {
@@ -935,7 +956,8 @@ static hull_status docker_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	st->socket = dial();
 	snprintf(path, sizeof path, "/exec/%s/start", st->id);
 	if (st->socket < 0 ||
-	    send_request(st->socket, "POST", path, "{\"Detach\":false,\"Tty\":false}",
+	    send_request(st->socket, "POST", path,
+	                 tty ? "{\"Detach\":false,\"Tty\":true}" : "{\"Detach\":false,\"Tty\":false}",
 	                 "Connection: Upgrade\r\nUpgrade: tcp\r\n") != 0) {
 		if (st->socket >= 0)
 			close(st->socket);
@@ -959,6 +981,11 @@ static hull_status docker_exec(hull_core *core, hull_machine *m, hull_buf spec,
 		free(st);
 		return fail(error, HULL_ERR_INTERNAL, "the reader thread could not start");
 	}
+	/* API 1.41 creates an exec with no size, and docker's own client sets
+	 * it once started, as here: a command that reads it at once may see
+	 * the daemon's default first, and the SIGWINCH after. */
+	if (tty)
+		docker_resize(core, st, rows, cols, error);
 	*out = st;
 	return HULL_OK;
 }
@@ -995,21 +1022,62 @@ static hull_status docker_stream_eof(hull_core *core, hull_stream *st, hull_erro
 	return HULL_OK;
 }
 
-/* End the command if it runs, then wait for its stream and free it. */
-static hull_status docker_stream_close(hull_core *core, hull_stream *st, hull_error *error)
+/* `signum` to an exec's command, while docker says it runs. Docker has no
+ * call to signal an exec, and the command is the user's: its host pid,
+ * read at the moment of signalling. */
+static int signal_exec(const hull_stream *st, int signum)
 {
 	char  path[160];
 	char *answer = NULL;
 	int   status = 0;
 	long  pid    = 0;
+	int   sent   = 0;
 
-	docker_stream_eof(core, st, error);
 	snprintf(path, sizeof path, "/exec/%s/json", st->id);
 	if (call("GET", path, NULL, &status, &answer) == 0 && status == 200 &&
 	    strstr(answer, "\"Running\":true") != NULL && json_number(answer, "Pid", &pid) &&
 	    pid > 1)
-		kill((pid_t)pid, SIGKILL);
+		sent = kill((pid_t)pid, signum) == 0;
 	free(answer);
+	return sent;
+}
+
+static hull_status docker_resize(hull_core *core, hull_stream *st, int rows, int cols,
+                                 hull_error *error)
+{
+	char  path[192];
+	char *answer = NULL;
+	int   status = 0;
+
+	(void)core;
+	if (st == NULL || !st->tty)
+		return fail(error, HULL_ERR_UNSUPPORTED, "the command has no terminal");
+	snprintf(path, sizeof path, "/exec/%s/resize?h=%d&w=%d", st->id, rows, cols);
+	if (call("POST", path, NULL, &status, &answer) != 0 || (status != 200 && status != 201)) {
+		daemon_says(st->machine->detail, sizeof st->machine->detail, "resize", status, answer);
+		free(answer);
+		return fail(error, HULL_ERR_RUNTIME, st->machine->detail);
+	}
+	free(answer);
+	return HULL_OK;
+}
+
+static hull_status docker_signal(hull_core *core, hull_machine *m, hull_stream *st, int signum,
+                                 hull_error *error)
+{
+	(void)core;
+	(void)m;
+	if (st == NULL)
+		return fail(error, HULL_ERR_UNSUPPORTED, "signalling a workload is not written");
+	signal_exec(st, signum);
+	return HULL_OK;
+}
+
+/* End the command if it runs, then wait for its stream and free it. */
+static hull_status docker_stream_close(hull_core *core, hull_stream *st, hull_error *error)
+{
+	docker_stream_eof(core, st, error);
+	signal_exec(st, SIGKILL);
 	shutdown(st->socket, SHUT_RDWR);
 	pthread_join(st->reader, NULL);
 	close(st->socket);
@@ -1084,6 +1152,8 @@ static const hull_engine_ops ops = {
 	.stream_write = docker_stream_write,
 	.stream_eof   = docker_stream_eof,
 	.stream_close = docker_stream_close,
+	.resize       = docker_resize,
+	.signal       = docker_signal,
 };
 
 static const hull_engine engine = {

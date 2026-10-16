@@ -32,6 +32,12 @@ char *hull_access_value(const hull_sexpr_doc *doc, const hull_sexpr_form *record
 /* Whether `(key true)` is in `record`. */
 int hull_access_true(const hull_sexpr_doc *doc, const hull_sexpr_form *record, const char *key);
 
+/* Whether an exec, `(exec ... (tty ...))`, asks for a terminal: 1 with
+ * its size from `(tty (cols n) (rows n))`, else 0. The core has checked
+ * both are 1 to 65535. */
+int hull_access_terminal(const hull_sexpr_doc *doc, const hull_sexpr_form *exec, int *cols,
+                         int *rows);
+
 /* `path` as the plan means it: relative to its `(base ...)`, if it has one
  * and the path is not absolute. The caller frees it; NULL if memory ran
  * out. */

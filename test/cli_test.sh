@@ -290,6 +290,74 @@ workload=$(ps -eo pid=,args= | awk '$2 == "/probe" && $3 == "wait" {print $1; ex
 init=$(ps -o ppid= -p "$workload" | tr -d ' ')
 held=$(ls -l "/proc/$init/fd" 2>/dev/null | grep -E 'socket:|core\.lock')
 [ -n "$init" ] && [ -z "$held" ] || fail "the machine's init holds the core's descriptors" "$held"
+# -t: a terminal of the size this one has, the command's controlling
+# terminal, with stderr on it too; a resize reaches it as SIGWINCH. script
+# gives the frontend a terminal, which the test does not have.
+HULL=$hull_abs SHELL=/bin/sh
+export HULL SHELL
+expect 0 '^size=101x31' script -qec 'stty cols 101 rows 31; "$HULL" exec -t execd /probe tty' \
+	/dev/null
+expect 0 '^controlling=yes' script -qec '"$HULL" exec -t execd /probe tty' /dev/null
+expect 0 '^merged' script -qec '"$HULL" exec -t execd /probe err merged 2> /dev/null' /dev/null
+expect 0 '^size=90x20' script -qec '"$HULL" exec -t execd /probe winch < /dev/tty & sleep 1;
+	stty cols 90 rows 20; kill -WINCH $!; wait $!' /dev/null
+# The frontend's terminal is raw while it runs: Ctrl-C and Ctrl-D are
+# bytes there, and SIGINT and the end of a read on the command's. Cooked,
+# the Ctrl-D would end the frontend's input instead, which does not end a
+# read on a terminal.
+expect 0 'signal=2' sh -c '(sleep 1; printf "\003"; sleep 1) |
+	script -qec "\"\$HULL\" exec -t execd /probe trap" /dev/null'
+expect 0 '^stdin=\(none\)' sh -c '(sleep 1; printf "\004"; sleep 1) |
+	script -qec "\"\$HULL\" exec -t execd /probe stdin" /dev/null'
+expect 125 'needs a terminal' "$hull" exec -t execd /probe tty
+# What the core refuses that no frontend of ours sends, sent as another
+# frontend might, framed by hand: a 4-byte length, then the message. The
+# reply is read until the text asked for, or the core closes.
+speak='
+import os, socket, struct, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(5)
+# Through the directory, as hull itself does, where the path would be
+# longer than a socket address holds.
+d = os.open(os.environ["XDG_RUNTIME_DIR"] + "/hull", os.O_PATH)
+s.connect("/proc/self/fd/%d/core.sock" % d)
+got = b""
+def say(m):
+	s.sendall(struct.pack(">I", len(m)) + m)
+def hear(text):
+	global got
+	while text not in got:
+		chunk = s.recv(4096)
+		if not chunk:
+			break
+		got += chunk
+	print(repr(got))
+say(b"(5:hello(2:ch1:0)(5:proto1:1))")
+'
+# A terminal's size is 1..65535, which the core holds to itself.
+expect 0 'a window is 1 to 65535' python3 -c "$speak"'
+say(b"(4:exec(4:argv6:/probe)(2:ch1:1)(7:machine5:execd)(3:tty(4:cols1:0)(4:rows2:24)))")
+hear(b"6:reason")
+'
+# An exec answers started, and what is refused after that -- here a
+# resize of a command with no terminal -- leaves it running.
+expect 0 '7:started.*the command has no terminal' python3 -c "$speak"'
+say(b"(4:exec(4:argv6:/probe4:wait)(2:ch1:1)(7:machine5:execd)(3:tty5:false))")
+hear(b"7:started")
+say(b"(5:winch(2:ch1:1)(4:cols2:80)(4:rows2:24))")
+hear(b"6:reason")
+'
+expect 0 '^tty=no' "$hull" exec execd /probe tty
+# A signal to the frontend is the command's: it caught this one and went
+# on, and its status is what it made of it. Each frontend is in the
+# background, outside expect's bound, so it has its own: timeout passes a
+# TERM or HUP on to it, and a frontend that will not end on its TERM is
+# killed two seconds after.
+expect 0 '^signal=15$' sh -c 'timeout -k 2 8 "$0" exec execd /probe trap & sleep 1; kill -TERM $!;
+	wait $!' "$hull_abs"
+expect 0 '^signal=1$' sh -c 'timeout -k 2 8 "$0" exec execd /probe trap & sleep 1; kill -HUP $!; wait $!' \
+	"$hull_abs"
+expect 143 '' sh -c 'timeout -k 2 8 "$0" exec execd /probe wait & sleep 1; kill -TERM $!; wait $!' "$hull_abs"
 expect 125 '/nope: No such file or directory' "$hull" exec execd /nope
 expect 125 'no such machine' "$hull" exec nobody /probe
 cases=$((cases + 1))
@@ -297,7 +365,21 @@ timeout -s KILL 1 "$hull" exec execd /probe say exec wait > /dev/null 2>&1
 sleep 0.5
 count=$(ps -eo args= | grep -c '^/probe ')
 [ "$count" = 1 ] || fail "a command outlived the frontend that ran it" "$(ps -eo pid=,args= | awk '$2 == "/probe"')"
+# A command ends with its machine, and its frontend hears so: 137, the
+# SIGKILL it got as the helper went. The core first said nothing, and the
+# frontend waited for good. timeout's own SIGKILL is 137 as well, ten
+# seconds on, so the frontend must have ended within five of the stop.
+cases=$((cases + 1))
+timeout -k 2 8 "$hull" exec execd /probe wait > /dev/null 2>&1 &
+ender=$!
+sleep 1
+stopped=$(date +%s)
 "$hull" stop execd > /dev/null 2>&1
+wait "$ender"
+got=$?
+took=$(($(date +%s) - stopped))
+[ "$got" = 137 ] && [ "$took" -lt 5 ] ||
+	fail "an exec in a stopped machine ended $got after ${took}s, wanted 137 at once" ""
 wait "$execer" 2>/dev/null
 expect 125 'the machine is not running' "$hull" exec execd /probe
 

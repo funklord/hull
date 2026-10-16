@@ -20,6 +20,12 @@
  *   exit N      exit with N           die         end by SIGTERM
  *   wait        wait for a signal, for 20 seconds at most, so that a
  *               test whose stop fails leaves no probe behind
+ *   trap        catch SIGHUP, SIGINT or SIGTERM, for 20 seconds at most,
+ *               and say which; the probe goes on
+ *   tty         whether stdin is a terminal, its size, and whether it is
+ *               this process's controlling terminal
+ *   winch       wait for the terminal to be resized, as trap waits, and
+ *               say its size
  */
 
 #define _GNU_SOURCE
@@ -31,9 +37,46 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
+
+static volatile sig_atomic_t caught;
+
+static void catch(int signal)
+{
+	caught = signal;
+}
+
+/* Wait for one of `signals`, for 20 seconds at most; the one caught, or 0. */
+static int await(const int *signals, unsigned n)
+{
+	struct sigaction action;
+
+	memset(&action, 0, sizeof action);
+	action.sa_handler = catch;
+	caught = 0;
+	for (unsigned i = 0u; i < n; i++)
+		sigaction(signals[i], &action, NULL);
+	printf("ready\n");
+	alarm(20);
+	while (caught == 0)
+		pause();
+	alarm(0);
+	return caught;
+}
+
+static void print_size(void)
+{
+	struct winsize size;
+
+	if (ioctl(0, TIOCGWINSZ, &size) == 0)
+		printf("size=%ux%u\n", (unsigned)size.ws_col, (unsigned)size.ws_row);
+	else
+		printf("size=%s\n", strerror(errno));
+}
 
 int main(int argc, char **argv)
 {
@@ -113,6 +156,19 @@ int main(int argc, char **argv)
 			return atoi(arg);
 		} else if (strcmp(step, "die") == 0) {
 			raise(SIGTERM);
+		} else if (strcmp(step, "trap") == 0) {
+			static const int signals[] = { SIGHUP, SIGINT, SIGTERM };
+
+			printf("signal=%d\n", await(signals, 3u));
+		} else if (strcmp(step, "tty") == 0) {
+			printf("tty=%s\n", isatty(0) ? "yes" : "no");
+			print_size();
+			printf("controlling=%s\n", tcgetpgrp(0) == getpgrp() ? "yes" : "no");
+		} else if (strcmp(step, "winch") == 0) {
+			static const int signals[] = { SIGWINCH };
+
+			await(signals, 1u);
+			print_size();
 		} else if (strcmp(step, "wait") == 0) {
 			printf("waiting\n");
 			alarm(20);

@@ -715,9 +715,13 @@ The read-only volume had first passed: while the container ran as root, a write 
 | `(logs (ch n) (follow true\|false) (machine id))` | `data` …, then `eof` unless following | what it has written, kept by the core |
 | `(stop (ch n) (machine id) (timeout_ms n))` | `(done (ch n))` | SIGTERM, then SIGKILL |
 | `(list (ch n))` | `(machines (ch n) (machine (class) (engine) (id) (state))…)` | what the core holds |
+| `(exec (argv w…) (ch n) (machine id) (tty false\|((cols n) (rows n))))` | `(started (ch n) (machine id))`, then `data` and `exited` | a command in a running machine |
+| `(data (buf b) (ch n) (fd 0))`, `(eof (ch n))` | | an exec's stdin |
+| `(winch (ch n) (cols n) (rows n))` | | its terminal resized |
+| `(signal (ch n) (signal HUP\|INT\|QUIT\|TERM\|USR1\|USR2\|KILL))` | | a signal for it |
 | | `(data (buf b) (ch n) (fd 1\|2))`, `(exited (ch n) (code n) (signal n))`, `(eof (ch n))`, `(error (ch n) (reason r))` | as B.3's |
 
-**The schema leaves three things to the core:** that a channel is not 0 and not in use, that a machine id is a DNS label, and the elements of a run. situ frames `machines`' entries and the plan inside `run` without reading them. The refused vector `machine_no_state` is refused because the run's framing falls short, not because an entry was checked, and its comment says so.
+**The schema leaves these to the core:** that a channel is not 0 and not in use, that a machine id is a DNS label, that a terminal is 1 to 65535 in each direction, that a signal is one it forwards, and the elements of a run. situ frames `machines`' entries and the plan inside `run` without reading them. The refused vector `machine_no_state` is refused because the run's framing falls short, not because an entry was checked, and its comment says so.
 
 **Every message read is validated by C situ generates from the schema**, for its direction, before anything reads it (`core/wire.c`). The generated C does not compile as situ writes it: it uses a validator of the imported `canonical.situ` before declaring it. That is situ's finding 18, and reproduces with a three-line schema at the pin and at situ's newest. `core/frontend_view.h` declares that one function ahead of the generated header, and is put in front of the generated `.c` with `-include`. Nothing situ wrote is edited, and the file and its make rule go when situ fixes it.
 
@@ -737,12 +741,13 @@ The read-only volume had first passed: while the container ran as root, a write 
 - **`keep` lasts while the core runs.** Re-adopting a machine after the core restarts is §5.0's `adopt()`, which is not written. So a chroot machine's init sets `PR_SET_PDEATHSIG` and dies with the core: nothing could manage it afterwards, and nothing is to outlive what started it. A docker container belongs to the daemon and survives; its name and label are for finding it.
 - **The tests never touch the account's own core:** each sets `XDG_RUNTIME_DIR` to a directory under `BUILD_DIR`, with `HULL_CORE_IDLE=1`, and requires the core to have left by the end.
 
-**`hull exec ID [--] CMD [ARG…]` runs a command in a running machine**, on a channel of its own.
+**`hull exec [-t] ID [--] CMD [ARG…]` runs a command in a running machine**, on a channel of its own.
 
-- **The frontend sends** `(exec (argv …) (ch n) (machine id))`, then its stdin as `(data … (fd 0))` and `(eof …)`. The core answers with `data` on fds 1 and 2 and `exited`, and `hull exec` exits with the command's status.
+- **The frontend sends** `(exec (argv …) (ch n) (machine id) (tty …))`, then its stdin as `(data … (fd 0))` and `(eof …)`. The core answers `started`, then `data` on fds 1 and 2 and `exited`, and `hull exec` exits with the command's status.
+- **`started` is what makes a later `error` harmless.** Before it, an error is the exec refused, and `hull exec` exits 125. After it, an error refuses a resize or a signal, and is printed while the command runs on.
 - **The core passes the request itself as the engine's `exec_spec`,** being canonical already, and routes the stream's events by the stream pointer the engine reports them with.
 - **Pointer reuse:** that pointer is freed by `stream_close()`, and a new stream could be given the same address. So the queue is drained to its end, including what handling it queues, before any client is served again: a closed stream's last events are always seen before another can exist.
-- **What ends a command:** a frontend that goes takes its commands with it. A machine that exits takes all of its commands.
+- **What ends a command:** a frontend that goes takes its commands with it. A machine that exits takes all of its commands, and their frontends are told how each ended, 137 for the SIGKILL. The core first told them nothing: closing an exec silenced its exit, which is right when the frontend has gone and was wrong here, so a frontend whose machine was stopped under it waited for good. No case had run an exec across a stop; the sabotage runs below left such frontends behind, 46 minutes old when found.
 
 In chroot:
 
@@ -751,21 +756,48 @@ In chroot:
 - **The helper and the init close every descriptor they inherited and do not need.** Both are forked from the core and never exec, so they held its sockets, its lock and the far end of the command's stdin pipe, which then never reached EOF. `exec … < /dev/null` hung until that was found. A machine outliving its core would also have held `core.lock`, and no new core could have started. `close_range()` over the gaps between the kept descriptors allocates nothing, which matters in a child forked from a threaded process.
 - **Reaping and signalling are ordered.** Both engines' readers wait with `WNOWAIT`, then reap under a lock and mark the process gone. `stop` and `stream_close` signal a pid only while it is unreaped, so a freed pid given to another process is never signalled.
 
+**A terminal, with `-t`.** The command runs on a pseudo-terminal of its own: its stdin, stdout and stderr, and its controlling terminal, so all its output is fd 1. The frontend's own terminal is raw meanwhile, so Ctrl-C and Ctrl-D are bytes the command's terminal acts on, and it is put back however `hull exec` ends. `-t` refuses a stdin that is not a terminal.
+
+- **The size is in the request:** `(tty (cols n) (rows n))`, or `(tty false)`. B.3 says `(tty true)` and sends the size after in a `winch`. Built that way first, a command that read its size at once read 80 by 24, before the `winch` arrived: the probe did, every time. A SIGWINCH sends `winch` afterwards.
+- **A signal to `hull exec` is the command's:** HUP, INT, QUIT, TERM, USR1 and USR2 are each sent as `signal`, and the command decides. So a command that catches TERM carries on, and `hull exec` exits with whatever status it ends with. Before, they ended `hull exec` itself and, through the disconnect, killed the command. They are blocked except inside `ppoll()`, so none can land between the look at what has arrived and the wait. SIGKILL cannot be forwarded and is still a disconnect.
+- **The core** maps the names onto the engine ABI's `resize` and `signal`, which were declared for this and had not been used.
+- **An `eof` on a terminal ends nothing.** It closes a second copy of the terminal's master, so the terminal is not hung up, and the command reads on. Only a frontend whose own stdin ends sends one, and with `-t` that stdin is a terminal.
+
+In chroot, **the terminal is the host's**, opened by the core and passed into the machine already open. Nothing is mounted for it, and the command makes it its controlling terminal with `TIOCSCTTY` after its `setsid()`. A signal goes to the helper, which forwards it to the command as the init forwards to the workload, so the only process that ever signals the command's pid is the one that reaps it. The helper holds its signals from its start, so one that arrives before the command exists is forwarded once it does.
+
 In docker, `exec` is the daemon's exec API:
 
 - **The command is created as the user,** with stdin, stdout and stderr attached, and started on a hijacked connection. stdin is written to that socket, and ended by shutting down its writing half. The exit code comes from `/exec/{id}/json`.
-- **Ending it:** docker has no call to end an exec. Since it runs as the user, `stream_close()` signals its host pid, read from that inspection while it is still running, at the moment of closing.
+- **Ending it, and signalling it:** docker has no call for either. Since it runs as the user, `stream_close()` and `signal` signal its host pid, read from that inspection while it is still running, at the moment of signalling.
+- **With a terminal** the exec is created and started with `Tty`, and its output is the bytes themselves rather than docker's frames. API 1.41 cannot size an exec when creating it, so it is resized once started, as docker's own client does. A command that reads its size at once may see the daemon's default first and the SIGWINCH after.
 
 Open:
 
-- **No tty, window size or signal for an exec yet**, though B.3's `exec` carries `(tty …)` and the protocol could carry `winch` and `signal` as B.3 does.
+- **A signal for a machine's workload**, rather than for an exec, has no command. chroot's `signal` takes one, through the init, and docker's refuses it; nothing sends it yet.
 - **stdin is written by the core's one thread:** a command that does not read for five seconds has its input refused.
 - **A slow frontend is dropped after 5 seconds of a blocked write,** rather than stalling the loop. There is no flow control yet, although the protocol could carry B.2's credits.
 - **Moving onto the shared encrypted protocol**, when that is settled.
 
 **Measured:**
 
-- `test/cli_test.sh`'s exec cases: the machine's hostname, workdir and environment; a pid of the machine's own namespace, small and counted from 3; stdin passed, and ended by `/dev/null`; an exit status; a missing command; an unknown machine; a command killed with its frontend; and exec refused once the machine has exited. `test/docker_test.sh` has five: output on both streams, the status and the user's uid, stdin, a missing command, and an exec ended with its frontend.
+- `test/cli_test.sh`'s exec cases: the machine's hostname, workdir and environment; a pid of the machine's own namespace, small and counted from 3; stdin passed, and ended by `/dev/null`; an exit status; a missing command; an unknown machine; a command killed with its frontend; a command ended with its stopped machine, its frontend told at once; and exec refused once the machine has exited. `test/docker_test.sh` has five: output on both streams, the status and the user's uid, stdin, a missing command, and an exec ended with its frontend.
+- **With `-t`,** in cli_test.sh, where `script` gives the frontend a terminal: the terminal's size, its being the controlling terminal, stderr on it, a resize reaching the command as SIGWINCH, Ctrl-C and Ctrl-D as bytes the command's terminal acts on, and `-t` refused without a terminal. Signals: a TERM and a HUP caught by the command, which then exits 0, and a TERM it does not catch, 143. Two cases speak the protocol by hand, as a frontend not ours might: a terminal of 0 columns refused, and `started` followed by a refused resize that leaves the command running. docker_test.sh has three more: a terminal of the frontend's size, a resize, and a caught TERM.
+- **Sabotage of the terminal and signals,** baseline first, each failing named cases:
+  - the controlling terminal;
+  - the size it is opened with;
+  - resizing;
+  - the helper forwarding a signal;
+  - the frontend's raw mode;
+  - the frontend forwarding a signal;
+  - the core's size check;
+  - its signal names (TERM sent as HUP);
+  - `started` for an exec;
+  - stderr on the terminal;
+  - telling a frontend its command ended with the machine.
+
+  Four needed a second try. The first stderr sabotage, `st->err = e[0]`, changed nothing, since `e[0]` is already -1 on a terminal; the child's end is what merges stderr. The TERM case first required only that the command went on, which a TERM delivered as HUP also does; it now requires `signal=15`. The two forwarding sabotages first hung the suite rather than failing it: a frontend that keeps a TERM to itself outlives the `timeout` around it. Each is now `timeout -k 2 8`. And the stopped-machine case first passed with the fault in: the hung frontend was SIGKILLed by that same `timeout`, and a SIGKILL is 137, the status the case expects. It now also requires the frontend to end within five seconds of the stop.
+  - **In docker,** breaking the exec's `Tty`, the resize once it starts and the signal by pid each failed docker_test.sh, baseline first.
+  - **One docker case was flaky**, and the race above is why: the resize docker makes once an exec starts is a SIGWINCH, and it once landed after the command's trap was set. The case now waits for the size it sets.
 - **Sabotage of exec,** baseline first. Breaking each of these failed the test:
   - the helper closing what it inherits;
   - the init closing what it inherits;
@@ -777,7 +809,7 @@ Open:
 
   The init's closing first passed. With the parent-death signal its stray descriptors die with the core, so nothing visible broke, and a case now reads the running init's `/proc/<pid>/fd` and requires no socket and no `core.lock` there. The first try at breaking the PID namespace was no sabotage at all: `setns` with a type of 0 joins whatever namespace the descriptor holds, so the namespace was still joined. And the pid check, first written `[3-9][0-9]*`, would have passed a host pid too; it now requires a small pid counted from 3.
 - `test/wire_test.c` runs 19 cases: each direction's messages let through and the other's refused, non-canonical bodies refused, and the numbers read minimal decimal. Disabling the validator fails four of them.
-- `test/cli_test.sh` runs 84 cases. Among them: `ps`, `logs` after an exit, a duplicate id refused, a kept machine surviving its frontend's SIGKILL where an unkept one is stopped, `attach` ending with a stopped machine's 143, a second core giving way and the first still answering, a machine dying with a SIGKILLed core, and the core leaving when idle.
+- `test/cli_test.sh` runs 110 cases. Among them: `ps`, `logs` after an exit, a duplicate id refused, a kept machine surviving its frontend's SIGKILL where an unkept one is stopped, `attach` ending with a stopped machine's 143, a second core giving way and the first still answering, a machine dying with a SIGKILLed core, and the core leaving when idle.
 - **Sabotage,** in a scratch copy, with an unmodified baseline first that had to pass. Breaking each of these failed the test: honouring `keep`, stopping on disconnect, replaying logs, `attach` following, one id at a time, the idle exit, the lock, and the parent-death signal.
   - The last two first passed. The lock case only checked that a second core exited 0. Without the lock, the second core takes the socket over, then leaves and removes it, stranding the first. The case now requires the first to still answer.
   - The parent-death case's wait could give up silently, so it now fails when the kept machine never ran. Without the signal, the probe was measured alive a second after its core died, and gone once the shell reaped the client, for no cause found then. So the case looks for the probe before the client is reaped, where the two behaviours differ.

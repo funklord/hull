@@ -24,6 +24,8 @@ const LOGS     = ('4' << 24) | (':' << 16) | ('l' << 8) | 'o';
 const STOP     = ('4' << 24) | (':' << 16) | ('s' << 8) | 't';
 const LIST     = ('4' << 24) | (':' << 16) | ('l' << 8) | 'i';
 const EXEC     = ('4' << 24) | (':' << 16) | ('e' << 8) | 'x';
+const WINCH    = ('5' << 24) | (':' << 16) | ('w' << 8) | 'i';
+const SIGNAL   = ('6' << 24) | (':' << 16) | ('s' << 8) | 'i';
 const STARTED  = ('7' << 24) | (':' << 16) | ('s' << 8) | 't';
 const DATA     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'a';
 const EXITED   = ('6' << 24) | (':' << 16) | ('e' << 8) | 'x';
@@ -45,6 +47,8 @@ struct client_message {
 		case STOP:    stop          stop;
 		case LIST:    listing       list;
 		case EXEC:    exec          exec;
+		case WINCH:   winch         winch;
+		case SIGNAL:  signal        signal;
 		case DATA:    client_data   data;
 		case EOF:     eof           eof;
 		default:      unknown       unknown;
@@ -111,13 +115,51 @@ struct listing {
 
 // A command in a running machine, on a channel of its own: its stdin is
 // `data` on fd 0 and `eof` from the frontend, its output `data` on 1 and 2
-// and its end `exited` from the core, as for a machine.
+// and its end `exited` from the core, as for a machine; the core answers
+// `started` once it runs. `(tty (cols n) (rows n))` runs it on a terminal
+// of its own, of that size, whose output is all fd 1; `(tty false)` on
+// pipes. B.3 says `(tty true)` and sends the size after, which a command
+// that reads its size at once would miss.
 struct exec {
 	preamble u8[6] = "4:exec";
 	argv_entry     argv;
 	channel        ch;
 	machine_entry  machine;
+	preamble u8[6] = "(3:tty";
+	peek u8  kind;
+	variant value switch (kind) {
+		case '(':  window  size;
+		case '5':  no      off;
+		default:   error;
+	}
+	preamble u8[2] = "))";
+}
+
+// An exec's terminal has this size now, as B.3's.
+struct winch {
+	preamble u8[7] = "5:winch";
+	channel  ch;
+	window   size;
 	u8  close  [must_eq = ')'];
+}
+
+// A terminal's size, in characters.
+struct window {
+	preamble u8[7] = "(4:cols";
+	atom  cols;
+	preamble u8[8] = ")(4:rows";
+	atom  rows;
+	u8  close  [must_eq = ')'];
+}
+
+// A signal for an exec, by name without its SIG: HUP, INT, QUIT, TERM,
+// USR1, USR2 or KILL, which the core checks.
+struct signal {
+	preamble u8[8] = "6:signal";
+	channel  ch;
+	preamble u8[9] = "(6:signal";
+	atom  name;
+	preamble u8[2] = "))";
 }
 
 // An exec's stdin: always fd 0.
@@ -283,7 +325,8 @@ struct machine_entry {
 //
 // - that a request's channel is not 0 and not already in use, and that
 //   `data` and `eof` from a frontend are on an exec's channel;
-// - that an exec's argv holds a word;
+// - that an exec's argv holds a word, that a window's size is in range,
+//   and that a signal is one the core forwards;
 // - that a machine id is a DNS label (section 4.10), and a plan one
 //   hull_plan_build() would write;
 // - that the numbers are minimal decimal;

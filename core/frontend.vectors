@@ -65,11 +65,20 @@ core_message error 28 35 3A 65 72 72 6F 72 28 32 3A 63 68 31 3A 31 29 28 36 3A 7
 # unknown: (5:hints(2:ch1:0)(4:more))
 core_message unknown 28 35 3A 68 69 6E 74 73 28 32 3A 63 68 31 3A 30 29 28 34 3A 6D 6F 72 65 29 29
 
-# exec: (4:exec(4:argv2:ls)(2:ch1:7)(7:machine3:web))
-client_message exec 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 6C 73 29 28 32 3A 63 68 31 3A 37 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 29
+# exec: (4:exec(4:argv2:ls)(2:ch1:7)(7:machine3:web)(3:tty5:false))
+client_message exec 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 6C 73 29 28 32 3A 63 68 31 3A 37 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 28 33 3A 74 74 79 35 3A 66 61 6C 73 65 29 29
 
-# exec_words: (4:exec(4:argv2:sh2:-c10:echo $HOME)(2:ch1:8)(7:machine3:web))
-client_message exec_words 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 73 68 32 3A 2D 63 31 30 3A 65 63 68 6F 20 24 48 4F 4D 45 29 28 32 3A 63 68 31 3A 38 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 29
+# exec_words: (4:exec(4:argv2:sh2:-c10:echo $HOME)(2:ch1:8)(7:machine3:web)(3:tty5:false))
+client_message exec_words 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 73 68 32 3A 2D 63 31 30 3A 65 63 68 6F 20 24 48 4F 4D 45 29 28 32 3A 63 68 31 3A 38 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 28 33 3A 74 74 79 35 3A 66 61 6C 73 65 29 29
+
+# exec_tty: (4:exec(4:argv2:sh)(2:ch1:9)(7:machine3:web)(3:tty(4:cols3:120)(4:rows2:40)))
+client_message exec_tty 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 73 68 29 28 32 3A 63 68 31 3A 39 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 28 33 3A 74 74 79 28 34 3A 63 6F 6C 73 33 3A 31 32 30 29 28 34 3A 72 6F 77 73 32 3A 34 30 29 29 29
+
+# winch: (5:winch(2:ch1:9)(4:cols3:120)(4:rows2:40))
+client_message winch 28 35 3A 77 69 6E 63 68 28 32 3A 63 68 31 3A 39 29 28 34 3A 63 6F 6C 73 33 3A 31 32 30 29 28 34 3A 72 6F 77 73 32 3A 34 30 29 29
+
+# signal: (6:signal(2:ch1:9)(6:signal3:INT))
+client_message signal 28 36 3A 73 69 67 6E 61 6C 28 32 3A 63 68 31 3A 39 29 28 36 3A 73 69 67 6E 61 6C 33 3A 49 4E 54 29 29
 
 # stdin: (4:data(3:buf3:#00#a#0a#)(2:ch1:7)(2:fd1:0))
 client_message stdin 28 34 3A 64 61 74 61 28 33 3A 62 75 66 33 3A 00 61 0A 29 28 32 3A 63 68 31 3A 37 29 28 32 3A 66 64 31 3A 30 29 29
