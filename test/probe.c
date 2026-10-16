@@ -11,6 +11,8 @@
  *   write PATH  whether PATH can be created
  *   read PATH   PATH's first line
  *   stdin       the first line of its stdin
+ *   count       all of its stdin: how many bytes, and their FNV-1a hash
+ *   sleep N     sleep N seconds
  *   nnp         whether no_new_privs is set
  *   session     whether it leads a session of its own
  *   pid         its pid
@@ -126,6 +128,18 @@ int main(int argc, char **argv)
 
 			text[n > 0 ? n : 0] = '\0';
 			printf("stdin=%s", n > 0 ? text : "(none)\n");
+		} else if (strcmp(step, "count") == 0) {
+			unsigned long long total = 0u;
+			unsigned           hash  = 2166136261u;
+			ssize_t            n;
+
+			while ((n = read(0, text, sizeof text)) > 0 || (n < 0 && errno == EINTR))
+				for (ssize_t j = 0; j < n; j++, total++)
+					hash = (hash ^ (unsigned char)text[j]) * 16777619u;
+			printf("bytes=%llu fnv=%08x\n", total, hash);
+		} else if (strcmp(step, "sleep") == 0) {
+			sleep((unsigned)atoi(arg));
+			i++;
 		} else if (strcmp(step, "pid") == 0) {
 			printf("pid=%d\n", (int)getpid());
 		} else if (strcmp(step, "procs") == 0) {

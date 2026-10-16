@@ -655,6 +655,8 @@ struct hull_stream {
 	pthread_t     reader;
 	pthread_mutex_t lock;
 	int           reaped;  /* the helper's pid is no longer its own */
+	int           writing; /* a stream_write() is using `in` */
+	int           ending;  /* stream_eof() has been called */
 };
 
 static void *read_exec(void *arg)
@@ -680,7 +682,7 @@ static void *read_exec(void *arg)
 			n = read(fds[i].fd, buffer, sizeof buffer);
 			if (n > 0) {
 				host->on_data(st->core, st, i + 1, buffer, (size_t)n);
-			} else if (n == 0 || errno != EINTR) {
+			} else if (n == 0 || (errno != EINTR && errno != EAGAIN)) {
 				/* A terminal's master reads EIO once nothing holds the
 				 * other end: its end, as a pipe's is 0. resize() uses
 				 * it under the lock. */
@@ -920,6 +922,10 @@ static hull_status chroot_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	close(status[1]);
 	free_argv(argv);
 	st->in     = in[1];
+	/* Never blocking, so that stream_eof() can end a write. On a
+	 * terminal it is the master's description, which the reader then
+	 * finds not blocking either. */
+	fcntl(st->in, F_SETFL, fcntl(st->in, F_GETFL) | O_NONBLOCK);
 	st->out    = o[0];
 	st->err    = tty ? -1 : e[0];
 	st->tty    = tty ? o[0] : -1;
@@ -956,37 +962,72 @@ static hull_status chroot_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	return HULL_OK;
 }
 
-/* stdin, written whole or not at all: a command that does not read it
- * for five seconds is refused more, rather than allowed to stall the
- * caller. */
+/* stdin, written whole however long the command takes to read it, on
+ * a thread of the caller's own. The descriptor does not block, so the
+ * wait is a poll that stream_eof() can end: it marks the input ending,
+ * and the write gives up within a tenth of a second. The descriptor is
+ * closed by whichever of the two is last, so that no write is ever made
+ * to a number reused for something else. */
 static hull_status chroot_stream_write(hull_core *core, hull_stream *st, const uint8_t *data,
                                        size_t length, hull_error *error)
 {
-	(void)core;
-	while (length > 0u) {
-		struct pollfd ready = { st->in, POLLOUT, 0 };
-		ssize_t       n;
+	hull_status status = HULL_OK;
+	int         fd;
 
-		if (st->in < 0 || poll(&ready, 1, 5000) <= 0 || (ready.revents & POLLOUT) == 0)
-			return fail(error, HULL_ERR_BUSY, "the command is not reading its input");
-		n = write(st->in, data, length);
-		if (n < 0 && errno == EINTR)
+	(void)core;
+	pthread_mutex_lock(&st->lock);
+	fd = st->ending ? -1 : st->in;
+	st->writing = fd >= 0;
+	pthread_mutex_unlock(&st->lock);
+	if (fd < 0)
+		return fail(error, HULL_ERR_GONE, "the command's input has closed");
+	while (length > 0u) {
+		struct pollfd ready = { fd, POLLOUT, 0 };
+		ssize_t       n;
+		int           ending;
+
+		pthread_mutex_lock(&st->lock);
+		ending = st->ending;
+		pthread_mutex_unlock(&st->lock);
+		if (ending) {
+			status = fail(error, HULL_ERR_GONE, "the command's input has closed");
+			break;
+		}
+		n = write(fd, data, length);
+		if (n < 0 && (errno == EAGAIN || errno == EINTR)) {
+			poll(&ready, 1, 100);
 			continue;
-		if (n <= 0)
-			return fail(error, HULL_ERR_GONE, "the command's input has closed");
+		}
+		if (n <= 0) {
+			status = fail(error, HULL_ERR_GONE, "the command's input has closed");
+			break;
+		}
 		data += n;
 		length -= (size_t)n;
 	}
-	return HULL_OK;
+	pthread_mutex_lock(&st->lock);
+	st->writing = 0;
+	if (st->ending && st->in >= 0) {
+		close(st->in);
+		st->in = -1;
+	}
+	pthread_mutex_unlock(&st->lock);
+	return status;
 }
 
+/* The end of stdin. May be called while a write is under way on another
+ * thread, which then gives up; the descriptor is that write's to close. */
 static hull_status chroot_stream_eof(hull_core *core, hull_stream *st, hull_error *error)
 {
 	(void)core;
 	(void)error;
-	if (st->in >= 0)
+	pthread_mutex_lock(&st->lock);
+	st->ending = 1;
+	if (!st->writing && st->in >= 0) {
 		close(st->in);
-	st->in = -1;
+		st->in = -1;
+	}
+	pthread_mutex_unlock(&st->lock);
 	return HULL_OK;
 }
 

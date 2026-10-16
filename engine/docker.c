@@ -856,7 +856,8 @@ struct hull_stream {
 	char          id[80];
 	int           socket;
 	pthread_t     reader;
-	int           ended;   /* stdin shut */
+	int           ended;   /* stdin shut, or to be: under `lock` */
+	pthread_mutex_t lock;
 	int           tty;     /* on a terminal: one raw stream, not frames */
 };
 
@@ -986,11 +987,15 @@ static hull_status docker_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	 * the daemon's default first, and the SIGWINCH after. */
 	if (tty)
 		docker_resize(core, st, rows, cols, error);
+	pthread_mutex_init(&st->lock, NULL);
 	*out = st;
 	return HULL_OK;
 }
 
-/* stdin, whole or refused after five seconds of not being read. */
+/* stdin, written whole however long the command takes to read it, on a
+ * thread of the caller's own. The sends do not block, so the wait is a
+ * poll that stream_eof() can end, within a tenth of a second. The socket
+ * stays open until stream_close(), so it is never a number reused. */
 static hull_status docker_stream_write(hull_core *core, hull_stream *st, const uint8_t *data,
                                        size_t length, hull_error *error)
 {
@@ -998,12 +1003,18 @@ static hull_status docker_stream_write(hull_core *core, hull_stream *st, const u
 	while (length > 0u) {
 		struct pollfd ready = { st->socket, POLLOUT, 0 };
 		ssize_t       n;
+		int           ended;
 
-		if (st->ended || poll(&ready, 1, 5000) <= 0 || (ready.revents & POLLOUT) == 0)
-			return fail(error, HULL_ERR_BUSY, "the command is not reading its input");
-		n = send(st->socket, data, length, MSG_NOSIGNAL);
-		if (n < 0 && errno == EINTR)
+		pthread_mutex_lock(&st->lock);
+		ended = st->ended;
+		pthread_mutex_unlock(&st->lock);
+		if (ended)
+			return fail(error, HULL_ERR_GONE, "the command's input has closed");
+		n = send(st->socket, data, length, MSG_NOSIGNAL | MSG_DONTWAIT);
+		if (n < 0 && (errno == EAGAIN || errno == EINTR)) {
+			poll(&ready, 1, 100);
 			continue;
+		}
 		if (n <= 0)
 			return fail(error, HULL_ERR_GONE, "the command's input has closed");
 		data += n;
@@ -1012,13 +1023,20 @@ static hull_status docker_stream_write(hull_core *core, hull_stream *st, const u
 	return HULL_OK;
 }
 
+/* The end of stdin. May be called while a write is under way on another
+ * thread, which then gives up. */
 static hull_status docker_stream_eof(hull_core *core, hull_stream *st, hull_error *error)
 {
+	int ended;
+
 	(void)core;
 	(void)error;
-	if (!st->ended)
-		shutdown(st->socket, SHUT_WR);
+	pthread_mutex_lock(&st->lock);
+	ended = st->ended;
 	st->ended = 1;
+	pthread_mutex_unlock(&st->lock);
+	if (!ended)
+		shutdown(st->socket, SHUT_WR);
 	return HULL_OK;
 }
 
@@ -1097,6 +1115,7 @@ static hull_status docker_stream_close(hull_core *core, hull_stream *st, hull_er
 	shutdown(st->socket, SHUT_RDWR);
 	pthread_join(st->reader, NULL);
 	close(st->socket);
+	pthread_mutex_destroy(&st->lock);
 	free(st);
 	return HULL_OK;
 }

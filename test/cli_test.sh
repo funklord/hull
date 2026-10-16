@@ -383,6 +383,99 @@ took=$(($(date +%s) - stopped))
 wait "$execer" 2>/dev/null
 expect 125 'the machine is not running' "$hull" exec execd /probe
 
+# stdin's flow: the core holds 64 KiB of an exec's input and gives credit
+# back as it reaches the command, so input many times that arrives whole
+# and in order; a command that does not read for six seconds still gets
+# all of it, where the core once refused it after five; and while one
+# command is not reading, the core goes on serving everything else. The
+# machine sleeps rather than waits, since these take longer than wait's
+# twenty seconds.
+conf flowd '(command "/probe" "sleep" "60")' '(hostname "flowd") (on_disconnect keep)'
+(cd / && exec timeout -k 2 70 "$hull_abs" run -f "$root/flowd.conf" > /dev/null 2>&1) &
+flower=$!
+tries=0
+until "$hull" ps 2>/dev/null | grep -q '^flowd .*running$' || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+want=$(seq 1 200000 | python3 -c 'import sys
+h = 2166136261
+data = sys.stdin.buffer.read()
+for b in data:
+	h = ((h ^ b) * 16777619) & 0xffffffff
+print("bytes=%d fnv=%08x" % (len(data), h))')
+expect 0 "^$want\$" sh -c 'seq 1 200000 | "$0" exec flowd /probe count' "$hull_abs"
+expect 0 '^bytes=300000 ' sh -c 'head -c 300000 /dev/zero | "$0" exec flowd /probe sleep 6 count' \
+	"$hull_abs"
+cases=$((cases + 1))
+(head -c 2000000 /dev/zero | timeout -k 2 12 "$hull" exec flowd /probe sleep 8 > /dev/null 2>&1) &
+stuck=$!
+sleep 1
+started=$(date +%s)
+out=$(timeout 10 "$hull" exec flowd /probe say free 2>&1)
+took=$(($(date +%s) - started))
+[ "$out" = free ] && [ "$took" -lt 2 ] ||
+	fail "an exec beside one not reading took ${took}s" "$out"
+wait "$stuck"
+# A frontend killed while its command is not reading: the core ends the
+# write under way, then the command, and goes on answering.
+cases=$((cases + 1))
+head -c 2000000 /dev/zero | timeout -s KILL 2 "$hull" exec flowd /probe sleep 30 > /dev/null 2>&1
+sleep 1
+out=$(timeout 3 "$hull" ps 2>&1)
+count=$(ps -eo args= | grep -c '^/probe sleep 30')
+printf '%s\n' "$out" | grep -q '^flowd ' && [ "$count" = 0 ] ||
+	fail "a frontend killed with input pending left the core stuck or its command running" \
+		"$out; $count left"
+# The credit a frontend starts with, and more than that refused.
+expect 0 '6:credit\(5:bytes5:65536\).*more input than its credit' python3 -c "$speak"'
+say(b"(4:exec(4:argv6:/probe5:count)(2:ch1:1)(7:machine5:flowd)(3:tty5:false))")
+hear(b"5:65536")
+say(b"(4:data(3:buf65537:" + b"x" * 65537 + b")(2:ch1:1)(2:fd1:0))")
+hear(b"6:reason")
+'
+# Messages of 10000 bytes, so that some straddle the end of the core's
+# 64 KiB ring, which the frontend's 16 KiB reads never do; sent within the
+# credit given, then compared with what the command counted.
+expect 0 '^match$' python3 -c "$speak"'
+import random, re
+say(b"(4:exec(4:argv6:/probe5:count)(2:ch1:1)(7:machine5:flowd)(3:tty5:false))")
+# Random, since a pattern repeating in a divisor of 64 KiB reads the same
+# from a ring whose wrap is broken.
+data = random.Random(1).randbytes(300000)
+sent = 0
+while sent < len(data):
+	credit = sum(int(n) for n in re.findall(rb"\(6:credit\(5:bytes\d+:(\d+)\)", got))
+	if credit - sent < 10000 and credit - sent < len(data) - sent:
+		got += s.recv(4096)
+		continue
+	piece = data[sent:sent + 10000]
+	say(b"(4:data(3:buf%d:" % len(piece) + piece + b")(2:ch1:1)(2:fd1:0))")
+	sent += len(piece)
+say(b"(3:eof(2:ch1:1))")
+h = 2166136261
+for b in data:
+	h = ((h ^ b) * 16777619) & 0xffffffff
+want = b"bytes=%d fnv=%08x" % (len(data), h)
+while want not in got and b"exited" not in got:
+	chunk = s.recv(4096)
+	if not chunk:
+		break
+	got += chunk
+print("match" if want in got else "mismatch")
+'
+# A frontend with no credit waits for it, rather than spinning on a stdin
+# it cannot send: three seconds held back cost well under one of CPU.
+expect 0 '^cpu=0\.' python3 -c '
+import resource, subprocess, sys
+subprocess.run(["sh", "-c", "head -c 2000000 /dev/zero | \"$0\" exec flowd /probe sleep 3 > /dev/null 2>&1",
+               sys.argv[1]])
+u = resource.getrusage(resource.RUSAGE_CHILDREN)
+print("cpu=%.2f" % (u.ru_utime + u.ru_stime))
+' "$hull_abs"
+timeout 10 "$hull" stop flowd > /dev/null 2>&1
+wait "$flower" 2>/dev/null
+
 # kill: a signal for the workload, which its init forwards. A TERM the
 # probe catches is the probe's to handle, and it goes on to exit 0; a KILL,
 # the default as in docker, ends the machine, 137. The run's output is in

@@ -788,6 +788,7 @@ static int exec_in(const char *id, char **argv, int argc, int tty)
 	sigset_t         held;
 	sigset_t         waiting;
 	int              input_open = 1;
+	size_t           credit = 0u;  /* stdin the core will take now */
 	int              started = 0;
 	int              result = 125;
 
@@ -868,19 +869,22 @@ static int exec_in(const char *id, char **argv, int argc, int tty)
 			resized = 0;
 			send_winch(wire.fd);
 		}
-		if (ppoll(fds, input_open ? 2u : 1u, NULL, &waiting) < 0) {
+		/* stdin is read only while the core will take it, so a command
+		 * that does not read holds its frontend back, as a pipe would. */
+		if (ppoll(fds, input_open && credit > 0u ? 2u : 1u, NULL, &waiting) < 0) {
 			if (errno == EINTR)
 				continue;
 			break;
 		}
-		if (input_open && fds[1].revents != 0) {
+		if (input_open && credit > 0u && fds[1].revents != 0) {
 			uint8_t  chunk[16384];
-			ssize_t  n = read(0, chunk, sizeof chunk);
+			ssize_t  n = read(0, chunk, credit < sizeof chunk ? credit : sizeof chunk);
 			hull_msg m = { 0 };
 
 			if (n < 0 && errno == EINTR)
 				continue;
 			if (n > 0) {
+				credit -= (size_t)n;
 				hull_msg_raw(&m, "(4:data(3:buf");
 				hull_msg_atom(&m, chunk, (size_t)n);
 				hull_msg_raw(&m, ")(2:ch1:1)(2:fd1:0))");
@@ -911,6 +915,12 @@ static int exec_in(const char *id, char **argv, int argc, int tty)
 				if (hull_msg_find(&body, "buf", &buf) && hull_msg_find(&body, "fd", &fd))
 					write_all(hull_sexpr_is(&body, &fd, "2") ? 2 : 1, body.data + buf.content,
 					          buf.content_length);
+			} else if (hull_msg_is(&body, "credit")) {
+				long long bytes = 0;
+
+				if (hull_msg_find(&body, "bytes", &value) && hull_msg_long(&body, &value, &bytes) &&
+				    bytes > 0)
+					credit += (size_t)bytes;
 			} else if (hull_msg_is(&body, "exited")) {
 				if (hull_msg_find(&body, "code", &value))
 					hull_msg_long(&body, &value, &code);

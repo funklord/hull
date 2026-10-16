@@ -33,6 +33,7 @@ const EXITED   = ('6' << 24) | (':' << 16) | ('e' << 8) | 'x';
 const EOF      = ('3' << 24) | (':' << 16) | ('e' << 8) | 'o';
 const MACHINES = ('8' << 24) | (':' << 16) | ('m' << 8) | 'a';
 const DONE     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'o';
+const CREDIT   = ('6' << 24) | (':' << 16) | ('c' << 8) | 'r';
 const ERROR    = ('5' << 24) | (':' << 16) | ('e' << 8) | 'r';
 
 // --- what a frontend sends ----------------------------------------------------
@@ -212,6 +213,7 @@ struct core_message {
 		case EOF:       eof         eof;
 		case MACHINES:  machines    machines;
 		case DONE:      done        done;
+		case CREDIT:    credit      credit;
 		case ERROR:     failure     error;
 		default:        unknown     unknown;
 	}
@@ -254,6 +256,18 @@ struct exited {
 	preamble u8[10] = ")(6:signal";
 	atom  signal;
 	preamble u8[2] = "))";
+}
+
+// More of an exec's stdin the core will take: B.2's credit, in this
+// direction only. An exec starts with none, and the frontend sends no
+// more than it has been given; the core gives back what reached the
+// command.
+struct credit {
+	preamble u8[16] = "6:credit(5:bytes";
+	atom  bytes;
+	u8    close_bytes  [must_eq = ')'];
+	channel  ch;
+	u8  close  [must_eq = ')'];
 }
 
 // The end of what `logs` replays, when it does not follow; from a

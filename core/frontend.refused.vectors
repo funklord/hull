@@ -99,3 +99,8 @@ client_message kill_no_signal 28 34 3A 6B 69 6C 6C 28 32 3A 63 68 31 3A 38 29 28
 # kill_no_machine: (4:kill(2:ch1:8)(6:signal4:TERM))
 # kill: the machine is required
 client_message kill_no_machine 28 34 3A 6B 69 6C 6C 28 32 3A 63 68 31 3A 38 29 28 36 3A 73 69 67 6E 61 6C 34 3A 54 45 52 4D 29 29
+
+# credit_no_bytes: (6:credit(2:ch1:1))
+# credit: the bytes are required
+core_message credit_no_bytes 28 36 3A 63 72 65 64 69 74 28 32 3A 63 68 31 3A 31 29 29
+

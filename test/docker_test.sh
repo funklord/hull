@@ -130,7 +130,7 @@ wait "$server"
 
 # exec in the running container: output and status, stdin, the user's
 # uid, and a command ended with the frontend that ran it.
-conf execd '(command "sleep" "30")' '(on_disconnect keep)'
+conf execd '(command "sleep" "60")' '(on_disconnect keep)'
 (cd / && exec "$hull" run -f "$root/execd.conf" > /dev/null 2>&1) &
 execer=$!
 tries=0
@@ -155,6 +155,16 @@ timeout -s KILL 2 "$hull" exec dtest sleep 300 > /dev/null 2>&1
 sleep 1
 left=$(timeout 10 docker top "$(timeout 10 docker ps -q --filter name=hull-dtest-)" 2>/dev/null | grep -c 'sleep 300')
 [ "$left" = 0 ] || fail "an exec outlived the frontend that ran it" "$left"
+# stdin many times the 64 KiB the core holds, whole; and to a command
+# that does not read for six seconds, where the core once refused it
+# after five. That is 3 MB, since the daemon's own buffers take 300 kB
+# without the core's write ever waiting.
+cases=$((cases + 1))
+out=$(seq 1 200000 | timeout 30 "$hull" exec dtest sh -c 'md5sum' 2>&1)
+[ "$out" = "$(seq 1 200000 | md5sum)" ] || fail "exec's stdin did not arrive whole" "$out"
+cases=$((cases + 1))
+out=$(head -c 3000000 /dev/zero | timeout 30 "$hull" exec dtest sh -c 'sleep 6; wc -c' 2>&1)
+[ "$out" = 3000000 ] || fail "a command reading late got '$out' of 3000000 bytes" ""
 # -t, through script for a terminal as in cli_test.sh. Docker's API 1.41
 # sizes an exec only once it has started, as its own client does, so the
 # command waits a second before it looks.

@@ -50,6 +50,7 @@
 #define MAX_EXECS        64u
 #define LOG_LIMIT        (1u << 20)
 #define DATA_CHUNK       65536u
+#define INPUT_WINDOW     65536u  /* an exec's stdin the core holds, at most */
 
 /* --- the table ----------------------------------------------------------- */
 
@@ -116,6 +117,24 @@ typedef struct exec_entry {
 	uint32_t     ch;
 	slot        *machine;
 	hull_stream *stream;
+
+	/* stdin. The engine's stream_write() blocks while the command does
+	 * not read, so a thread of the exec's own makes it, from a ring the
+	 * loop fills. The frontend sends only what it has credit for, and
+	 * credit is given back as bytes reach the command, so the ring never
+	 * holds more than INPUT_WINDOW. */
+	size_t          credit;       /* the frontend's: the loop's alone */
+	int             told_closed;  /* the frontend has heard its input closed */
+	pthread_t       writer;
+	pthread_mutex_t lock;         /* what follows, shared with the writer */
+	pthread_cond_t  more;
+	uint8_t        *input;
+	size_t          head;
+	size_t          queued;
+	size_t          written;      /* written, and not yet given back */
+	int             input_ended;  /* the frontend's eof */
+	int             input_closed; /* a write failed: what comes is dropped */
+	int             stopping;
 } exec_entry;
 
 static client        clients[MAX_CLIENTS];
@@ -308,6 +327,18 @@ static void send_exited(client *c, uint32_t ch, const slot *s)
 	send_status(c, ch, s->code, s->signal);
 }
 
+static void send_credit(client *c, uint32_t ch, size_t bytes)
+{
+	hull_msg m = { 0 };
+
+	hull_msg_raw(&m, "(6:credit(5:bytes");
+	hull_msg_number(&m, (long long)bytes);
+	hull_msg_raw(&m, ")");
+	hull_msg_channel(&m, ch);
+	hull_msg_raw(&m, ")");
+	send_to(c, &m);
+}
+
 /* --- execs --------------------------------------------------------------- */
 
 static exec_entry *exec_of(hull_stream *stream)
@@ -329,12 +360,73 @@ static exec_entry *exec_on(const client *c, uint32_t ch)
 /* End the command; its exit is still to come, and frees the entry. */
 static void close_exec(exec_entry *x)
 {
-	hull_error error = { .struct_size = sizeof error };
+	hull_error             error = { .struct_size = sizeof error };
+	const hull_engine_ops *ops = x->machine->engine->ops;
 
 	if (x->closed)
 		return;
 	x->closed = 1;
-	x->machine->engine->ops->stream_close(&x->machine->core, x->stream, &error);
+	/* The writer first: a write under way is ended by stream_eof(), and
+	 * stream_close() comes only once none is. */
+	pthread_mutex_lock(&x->lock);
+	x->stopping = 1;
+	pthread_cond_signal(&x->more);
+	pthread_mutex_unlock(&x->lock);
+	ops->stream_eof(&x->machine->core, x->stream, &error);
+	pthread_join(x->writer, NULL);
+	ops->stream_close(&x->machine->core, x->stream, &error);
+	pthread_cond_destroy(&x->more);
+	pthread_mutex_destroy(&x->lock);
+	free(x->input);
+	x->input = NULL;
+}
+
+/* The writer: the ring to the command, then its end. */
+static void *write_input(void *arg)
+{
+	exec_entry            *x = arg;
+	const hull_engine_ops *ops = x->machine->engine->ops;
+	hull_error             error = { .struct_size = sizeof error };
+	char                   byte = 0;
+
+	pthread_mutex_lock(&x->lock);
+	for (;;) {
+		size_t      n;
+		hull_status status;
+
+		while (!x->stopping && x->queued == 0u && !x->input_ended)
+			pthread_cond_wait(&x->more, &x->lock);
+		if (x->stopping)
+			break;
+		if (x->queued == 0u) {
+			pthread_mutex_unlock(&x->lock);
+			ops->stream_eof(&x->machine->core, x->stream, &error);
+			pthread_mutex_lock(&x->lock);
+			break;
+		}
+		/* Only this thread moves the head, and the loop writes only
+		 * past the queued bytes, so these are the writer's to read. */
+		n = x->queued < INPUT_WINDOW - x->head ? x->queued : INPUT_WINDOW - x->head;
+		pthread_mutex_unlock(&x->lock);
+		status = ops->stream_write(&x->machine->core, x->stream, x->input + x->head, n,
+		                           &error);
+		pthread_mutex_lock(&x->lock);
+		x->head = (x->head + n) % INPUT_WINDOW;
+		x->queued -= n;
+		x->written += n;
+		if (status != HULL_OK) {
+			x->input_closed = 1;
+			x->written += x->queued;
+			x->queued = 0u;
+		}
+		if (write(wake[1], &byte, 1u) < 0) {
+			/* The pipe is full, so a wakeup is already waiting. */
+		}
+		if (status != HULL_OK)
+			break;
+	}
+	pthread_mutex_unlock(&x->lock);
+	return NULL;
 }
 
 /* --- machines ------------------------------------------------------------ */
@@ -457,6 +549,7 @@ static void machine_exited(slot *s, int code, int signal)
 }
 
 static void drain_list(event *e);
+static void give_credit(void);
 
 /* An event about one of a machine's commands. */
 static void exec_event(const event *e)
@@ -491,8 +584,10 @@ static void drain_events(void)
 		e = queue_head;
 		queue_head = queue_tail = NULL;
 		pthread_mutex_unlock(&queue_lock);
-		if (e == NULL)
+		if (e == NULL) {
+			give_credit();
 			return;
+		}
 		drain_list(e);
 	}
 }
@@ -806,29 +901,89 @@ static void handle_exec(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		send_error(c, ch, error.detail != NULL ? error.detail : "exec failed");
 		return;
 	}
-	*x = (exec_entry){ .used = 1, .client = c, .ch = ch, .machine = s, .stream = stream };
+	*x = (exec_entry){ .used = 1, .client = c, .ch = ch, .machine = s, .stream = stream,
+	                   .credit = INPUT_WINDOW, .input = malloc(INPUT_WINDOW) };
+	pthread_mutex_init(&x->lock, NULL);
+	pthread_cond_init(&x->more, NULL);
+	if (x->input == NULL || pthread_create(&x->writer, NULL, write_input, x) != 0) {
+		s->engine->ops->stream_close(&s->core, stream, &error);
+		pthread_cond_destroy(&x->more);
+		pthread_mutex_destroy(&x->lock);
+		free(x->input);
+		*x = (exec_entry){ 0 };
+		send_error(c, ch, "the core cannot take the command's input");
+		return;
+	}
 	send_started(c, ch, s);
+	send_credit(c, ch, INPUT_WINDOW);
 }
 
-/* An exec's stdin, and its end. */
+/* An exec's stdin, and its end, for the writer. More than the frontend
+ * has credit for is refused; once the command's input has closed, what
+ * comes is dropped and its credit given straight back. */
 static void handle_input(client *c, uint32_t ch, const hull_sexpr_doc *body, int eof)
 {
-	hull_error      error = { .struct_size = sizeof error };
 	hull_sexpr_form buf;
 	exec_entry     *x = exec_on(c, ch);
-	const hull_engine_ops *ops;
+	const char     *refusal = NULL;
+	size_t          n;
 
 	if (x == NULL) {
 		send_error(c, ch, "no command on that channel");
 		return;
 	}
-	ops = x->machine->engine->ops;
-	if (eof) {
-		ops->stream_eof(&x->machine->core, x->stream, &error);
-	} else if (hull_msg_find(body, "buf", &buf) &&
-	           ops->stream_write(&x->machine->core, x->stream, body->data + buf.content,
-	                             buf.content_length, &error) != HULL_OK) {
-		send_error(c, ch, error.detail != NULL ? error.detail : "the input was refused");
+	if (!eof && !hull_msg_find(body, "buf", &buf))
+		return;
+	n = eof ? 0u : buf.content_length;
+	if (n > x->credit) {
+		send_error(c, ch, "more input than its credit");
+		return;
+	}
+	x->credit -= n;
+	pthread_mutex_lock(&x->lock);
+	if (x->input_ended) {
+		refusal = "input after its end";
+	} else if (eof) {
+		x->input_ended = 1;
+	} else if (x->input_closed) {
+		x->written += n;
+	} else {
+		for (size_t i = 0u, at = (x->head + x->queued) % INPUT_WINDOW; i < n; i++) {
+			x->input[at] = body->data[buf.content + i];
+			at = at + 1u == INPUT_WINDOW ? 0u : at + 1u;
+		}
+		x->queued += n;
+	}
+	pthread_cond_signal(&x->more);
+	pthread_mutex_unlock(&x->lock);
+	if (refusal != NULL)
+		send_error(c, ch, refusal);
+}
+
+/* Credit for what the writers have written, and word of an input that
+ * has closed, once. */
+static void give_credit(void)
+{
+	for (unsigned i = 0u; i < MAX_EXECS; i++) {
+		exec_entry *x = &execs[i];
+		size_t      n;
+		int         input_closed;
+
+		if (!x->used || x->closed)
+			continue;
+		pthread_mutex_lock(&x->lock);
+		n = x->written;
+		x->written = 0u;
+		input_closed = x->input_closed;
+		pthread_mutex_unlock(&x->lock);
+		if (input_closed && !x->told_closed) {
+			x->told_closed = 1;
+			send_error(x->client, x->ch, "the command's input has closed");
+		}
+		if (n > 0u) {
+			x->credit += n;
+			send_credit(x->client, x->ch, n);
+		}
 	}
 }
 

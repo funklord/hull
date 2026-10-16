@@ -88,3 +88,6 @@ client_message stdin_eof 28 33 3A 65 6F 66 28 32 3A 63 68 31 3A 37 29 29
 
 # kill: (4:kill(2:ch1:8)(7:machine3:web)(6:signal4:TERM))
 client_message kill 28 34 3A 6B 69 6C 6C 28 32 3A 63 68 31 3A 38 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 28 36 3A 73 69 67 6E 61 6C 34 3A 54 45 52 4D 29 29
+
+# credit: (6:credit(5:bytes5:65536)(2:ch1:1))
+core_message credit 28 36 3A 63 72 65 64 69 74 28 35 3A 62 79 74 65 73 35 3A 36 35 35 33 36 29 28 32 3A 63 68 31 3A 31 29 29

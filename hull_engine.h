@@ -169,7 +169,12 @@ typedef struct hull_engine_ops {
 
 	/* Exec & streams. exec() opens a stream; input flows via stream_write;
 	 * output arrives on host_ops. resize/signal act per stream or, with
-	 * stream==NULL, on the workload. */
+	 * stream==NULL, on the workload. stream_write writes all it is given,
+	 * blocking for as long as the command does not read, so the core calls
+	 * it from a thread of its own, one write at a time per stream.
+	 * stream_eof may overlap a write from another thread, and the write
+	 * then fails with GONE soon after; nothing else overlaps one, and
+	 * stream_close comes only once no write is under way. */
 	hull_status (*exec)         (hull_core*, hull_machine*, hull_buf exec_spec,
 	                             hull_stream**, hull_error*);
 	hull_status (*stream_write) (hull_core*, hull_stream*, const uint8_t*, size_t,

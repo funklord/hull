@@ -717,7 +717,7 @@ The read-only volume had first passed: while the container ran as root, a write 
 | `(kill (ch n) (machine id) (signal HUP\|INT\|QUIT\|TERM\|USR1\|USR2\|KILL))` | `(done (ch n))` | a signal for its workload |
 | `(list (ch n))` | `(machines (ch n) (machine (class) (engine) (id) (state))…)` | what the core holds |
 | `(exec (argv w…) (ch n) (machine id) (tty false\|((cols n) (rows n))))` | `(started (ch n) (machine id))`, then `data` and `exited` | a command in a running machine |
-| `(data (buf b) (ch n) (fd 0))`, `(eof (ch n))` | | an exec's stdin |
+| `(data (buf b) (ch n) (fd 0))`, `(eof (ch n))` | `(credit (bytes n) (ch n))` | an exec's stdin, and how much more the core will take |
 | `(winch (ch n) (cols n) (rows n))` | | its terminal resized |
 | `(signal (ch n) (signal HUP\|INT\|QUIT\|TERM\|USR1\|USR2\|KILL))` | | a signal for it |
 | | `(data (buf b) (ch n) (fd 1\|2))`, `(exited (ch n) (code n) (signal n))`, `(eof (ch n))`, `(error (ch n) (reason r))` | as B.3's |
@@ -749,6 +749,10 @@ The read-only volume had first passed: while the container ran as root, a write 
 - **The core passes the request itself as the engine's `exec_spec`,** being canonical already, and routes the stream's events by the stream pointer the engine reports them with.
 - **Pointer reuse:** that pointer is freed by `stream_close()`, and a new stream could be given the same address. So the queue is drained to its end, including what handling it queues, before any client is served again: a closed stream's last events are always seen before another can exist.
 - **What ends a command:** a frontend that goes takes its commands with it. A machine that exits takes all of its commands, and their frontends are told how each ended, 137 for the SIGKILL. The core first told them nothing: closing an exec silenced its exit, which is right when the frontend has gone and was wrong here, so a frontend whose machine was stopped under it waited for good. No case had run an exec across a stop; the sabotage runs below left such frontends behind, 46 minutes old when found.
+- **stdin flows on credit, B.2's.** The core answers an exec's `started` with `(credit (bytes 65536) …)`, and the frontend sends no more stdin than it has been given; the core gives credit back as bytes reach the command, and refuses more than a frontend holds. So a command that does not read holds its frontend back, as a pipe would, and the core holds at most 64 KiB of each exec's input.
+- **Each exec's stdin is written by a thread of its own**, from that 64 KiB ring. The core's one thread used to write it, through an engine `stream_write` that waited up to five seconds for the command to read: one command not reading stopped the core for five seconds a message, every client and machine with it, and its input was refused after. A command that sleeps for six seconds now gets all of it, and another exec beside one that is not reading starts at once.
+- **Ending a write.** `stream_write` now blocks for as long as the command does not read, so closing an exec has to be able to cut a write short: the engines' writes do not block, their waits are polls of a tenth of a second, and `stream_eof` from another thread ends one. `hull_engine.h` says so. chroot closes the descriptor only once no write holds it, so no write is made to a number reused meanwhile. Making the stdin descriptor non-blocking makes a terminal's master so too, being one description, and the reader now passes over EAGAIN.
+- **Once the command's input has closed,** the frontend is told once, and what it sends after is dropped with its credit given straight back, so it never waits on input nobody will read.
 
 In chroot:
 
@@ -781,8 +785,7 @@ In docker, `exec` is the daemon's exec API:
 
 Open:
 
-- **stdin is written by the core's one thread:** a command that does not read for five seconds has its input refused.
-- **A slow frontend is dropped after 5 seconds of a blocked write,** rather than stalling the loop. There is no flow control yet, although the protocol could carry B.2's credits.
+- **A slow frontend is dropped after 5 seconds of a blocked write,** rather than stalling the loop. Output has no flow control yet: `credit` runs from the core to the frontend only, for stdin. Credit the other way would let the core stop reading a command whose frontend is behind, for an exec; a machine's output also goes to its log and to every follower, and one slow follower holding the machine back is a question of its own.
 - **Moving onto the shared encrypted protocol**, when that is settled.
 
 **Measured:**
@@ -819,8 +822,13 @@ Open:
 - **Sabotage of kill,** baseline first. Breaking each of these failed a named case: the core sending it to the engine, its check of the name, the frontend's upper-casing and its dropping of `SIG`, the default of KILL, and in docker the signal given to the kill call (sent as KILL, the caught TERM became 137).
   - **Removing the core's `exited` test passed, and cannot fail:** `machine_exited()` sets `exited` and clears the engine's handle together, on the core's one thread, so the `handle == NULL` beside it refuses the same machines. It is kept for reading alike with `exec`'s.
   - **The STOP case is caught by its message, not its status:** without the name check, an exited machine is refused all the same, as not running, and exits 1.
+- **stdin's flow,** in cli_test.sh, on a machine of its own: 1.1 MB through `/probe count`, its length and FNV-1a hash against the host's; 300 kB to a command that sleeps six seconds first; an exec beside one that is not reading, answered inside two seconds; a frontend killed with input pending, its command gone and the core answering a second later; speaking the protocol by hand, the first credit and 65537 bytes refused, and 300 kB in messages of 10000 bytes, so that some straddle the end of the ring; and a frontend held back three seconds using well under one second of CPU. docker_test.sh has the first two, by `md5sum` and `wc -c`.
+- **Sabotage of the flow,** baseline first. Breaking each of these failed a named case: credit given back, the core's credit check, `stream_eof` ending a write, a write refused after five seconds as before, the descriptor not blocking, and the ring's head wrapping. Three needed a second try:
+  - **The frontend's wait for credit** first passed: without it the frontend spins on a stdin it cannot read, which changes no output. The CPU case catches it.
+  - **The ring's tail wrapping** first passed. The frontend reads 16 KiB at a time, which divides the ring, so no message straddled its end; the 10000-byte messages do. Even then it passed once, because the test's bytes repeated every 256, so the stale bytes read past the wrap were the right ones. They are random now, and the case says `mismatch`. With the wrap broken the core writes past its ring, and a later case also failed when the corrupted core lost a machine.
+  - **docker's write refused after five seconds** first passed: the daemon's buffers took the 300 kB without the core's write ever waiting. It is 3 MB now.
 - `test/wire_test.c` runs 19 cases: each direction's messages let through and the other's refused, non-canonical bodies refused, and the numbers read minimal decimal. Disabling the validator fails four of them.
-- `test/cli_test.sh` runs 118 cases. Among them: `ps`, `logs` after an exit, a duplicate id refused, a kept machine surviving its frontend's SIGKILL where an unkept one is stopped, `attach` ending with a stopped machine's 143, a second core giving way and the first still answering, a machine dying with a SIGKILLed core, and the core leaving when idle.
+- `test/cli_test.sh` runs 125 cases. Among them: `ps`, `logs` after an exit, a duplicate id refused, a kept machine surviving its frontend's SIGKILL where an unkept one is stopped, `attach` ending with a stopped machine's 143, a second core giving way and the first still answering, a machine dying with a SIGKILLed core, and the core leaving when idle.
 - **Sabotage,** in a scratch copy, with an unmodified baseline first that had to pass. Breaking each of these failed the test: honouring `keep`, stopping on disconnect, replaying logs, `attach` following, one id at a time, the idle exit, the lock, and the parent-death signal.
   - The last two first passed. The lock case only checked that a second core exited 0. Without the lock, the second core takes the socket over, then leaves and removes it, stranding the first. The case now requires the first to still answer.
   - The parent-death case's wait could give up silently, so it now fails when the kept machine never ran. Without the signal, the probe was measured alive a second after its core died, and gone once the shell reaped the client, for no cause found then. So the case looks for the probe before the client is reaped, where the two behaviours differ.
