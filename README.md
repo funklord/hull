@@ -45,8 +45,8 @@ make check-docker  # hull run on the docker adapter, against the daemon
 make hooks   # install the commit-msg hook
 ```
 
-Build with make for now: fmake finds the vendored situ, but also compiles
-situ's own examples beside hull, and their symbols collide.
+Build with make for now: fmake builds hull's own schemas, but cannot yet
+give each one the situc options the Makefile does.
 
 ## Copyright
 

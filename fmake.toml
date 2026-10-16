@@ -1,0 +1,2 @@
+[project]
+defines = ['HULL_VERSION="$file(VERSION)"']
