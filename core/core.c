@@ -841,6 +841,19 @@ static const struct {
 	{ "USR1", SIGUSR1 }, { "USR2", SIGUSR2 }, { "KILL", SIGKILL },
 };
 
+/* The `(signal NAME)` of a request as a number, or 0 for one the core
+ * does not forward. */
+static int signal_number(const hull_sexpr_doc *body)
+{
+	hull_sexpr_form value;
+
+	if (hull_msg_find(body, "signal", &value))
+		for (unsigned i = 0u; i < sizeof forwardable / sizeof forwardable[0]; i++)
+			if (hull_sexpr_is(body, &value, forwardable[i].name))
+				return forwardable[i].number;
+	return 0;
+}
+
 /* An exec's terminal resized, or a signal for it. Neither is answered
  * unless it is refused. */
 static void handle_control(client *c, uint32_t ch, const hull_sexpr_doc *body, int winch)
@@ -872,12 +885,8 @@ static void handle_control(client *c, uint32_t ch, const hull_sexpr_doc *body, i
 		}
 		status = ops->resize(&x->machine->core, x->stream, (int)rows, (int)cols, &error);
 	} else {
-		int number = 0;
+		int number = signal_number(body);
 
-		if (hull_msg_find(body, "signal", &value))
-			for (unsigned i = 0u; i < sizeof forwardable / sizeof forwardable[0]; i++)
-				if (hull_sexpr_is(body, &value, forwardable[i].name))
-					number = forwardable[i].number;
 		if (number == 0) {
 			send_error(c, ch, "not a signal the core forwards");
 			return;
@@ -890,6 +899,31 @@ static void handle_control(client *c, uint32_t ch, const hull_sexpr_doc *body, i
 	}
 	if (status != HULL_OK)
 		send_error(c, ch, error.detail != NULL ? error.detail : "refused");
+}
+
+/* A signal for a machine's workload, through its engine; `done` once it
+ * is sent. What the workload does with it is the workload's, and an exit
+ * reaches whoever follows the machine, as any exit does. */
+static void handle_kill(client *c, uint32_t ch, const hull_sexpr_doc *body)
+{
+	hull_error error = { .struct_size = sizeof error };
+	slot      *s = named(c, ch, body);
+	int        number;
+
+	if (s == NULL)
+		return;
+	number = signal_number(body);
+	if (number == 0) {
+		send_error(c, ch, "not a signal the core forwards");
+	} else if (s->exited || s->handle == NULL) {
+		send_error(c, ch, "the machine is not running");
+	} else if (s->engine->ops->signal == NULL) {
+		send_error(c, ch, "that engine cannot signal a machine");
+	} else if (s->engine->ops->signal(&s->core, s->handle, NULL, number, &error) != HULL_OK) {
+		send_error(c, ch, error.detail != NULL ? error.detail : "refused");
+	} else {
+		send_simple(c, "(4:done", ch);
+	}
 }
 
 static void handle_list(client *c, uint32_t ch)
@@ -956,6 +990,8 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		handle_control(c, (uint32_t)ch, body, 1);
 	} else if (hull_msg_is(body, "signal")) {
 		handle_control(c, (uint32_t)ch, body, 0);
+	} else if (hull_msg_is(body, "kill")) {
+		handle_kill(c, (uint32_t)ch, body);
 	} else {
 		send_error(c, (uint32_t)ch, "unsupported");
 	}

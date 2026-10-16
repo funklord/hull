@@ -383,6 +383,43 @@ took=$(($(date +%s) - stopped))
 wait "$execer" 2>/dev/null
 expect 125 'the machine is not running' "$hull" exec execd /probe
 
+# kill: a signal for the workload, which its init forwards. A TERM the
+# probe catches is the probe's to handle, and it goes on to exit 0; a KILL,
+# the default as in docker, ends the machine, 137. The run's output is in
+# a file, and each signal waits for the probe's "ready", ten seconds at
+# most, so it never lands before the probe has a handler.
+conf killd '(command "/probe" "trap" "say" "after")' '(hostname "killd")'
+await_ready() { # FILE
+	tries=0
+	until grep -q '^ready$' "$1" 2>/dev/null || [ "$tries" -ge 40 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+}
+cases=$((cases + 1))
+(cd / && exec timeout -k 2 20 "$hull_abs" run -f "$root/killd.conf" > "$root/killd.out" 2>&1) &
+killed=$!
+await_ready "$root/killd.out"
+expect 0 '' "$hull" kill -s sigterm killd
+wait "$killed"
+got=$?
+[ "$got" = 0 ] && grep -q '^signal=15$' "$root/killd.out" && grep -q '^after$' "$root/killd.out" ||
+	fail "a TERM to the workload: run exited $got, wanted 0 after it caught signal 15" \
+		"$(cat "$root/killd.out")"
+cases=$((cases + 1))
+(cd / && exec timeout -k 2 20 "$hull_abs" run -f "$root/killd.conf" > "$root/killd.out" 2>&1) &
+killed=$!
+await_ready "$root/killd.out"
+expect 0 '' "$hull" kill killd
+wait "$killed"
+got=$?
+[ "$got" = 137 ] && ! grep -q '^signal=' "$root/killd.out" ||
+	fail "a KILL to the workload: run exited $got, wanted 137" "$(cat "$root/killd.out")"
+expect 1 'the machine is not running' "$hull" kill killd
+expect 1 'no such machine' "$hull" kill nobody
+expect 1 'not a signal the core forwards' "$hull" kill -s STOP killd
+expect 2 'usage' "$hull" kill -s SIGTERMINATE killd
+
 # One core: a second gives way to the first, says nothing, and leaves the
 # first answering on its socket.
 expect 0 '' "$hull" core

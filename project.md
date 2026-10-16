@@ -714,6 +714,7 @@ The read-only volume had first passed: while the container ran as root, a write 
 | `(attach (ch n) (machine id))` | `data`, `exited` | a running machine's output from now on |
 | `(logs (ch n) (follow true\|false) (machine id))` | `data` …, then `eof` unless following | what it has written, kept by the core |
 | `(stop (ch n) (machine id) (timeout_ms n))` | `(done (ch n))` | SIGTERM, then SIGKILL |
+| `(kill (ch n) (machine id) (signal HUP\|INT\|QUIT\|TERM\|USR1\|USR2\|KILL))` | `(done (ch n))` | a signal for its workload |
 | `(list (ch n))` | `(machines (ch n) (machine (class) (engine) (id) (state))…)` | what the core holds |
 | `(exec (argv w…) (ch n) (machine id) (tty false\|((cols n) (rows n))))` | `(started (ch n) (machine id))`, then `data` and `exited` | a command in a running machine |
 | `(data (buf b) (ch n) (fd 0))`, `(eof (ch n))` | | an exec's stdin |
@@ -771,9 +772,15 @@ In docker, `exec` is the daemon's exec API:
 - **Ending it, and signalling it:** docker has no call for either. Since it runs as the user, `stream_close()` and `signal` signal its host pid, read from that inspection while it is still running, at the moment of signalling.
 - **With a terminal** the exec is created and started with `Tty`, and its output is the bytes themselves rather than docker's frames. API 1.41 cannot size an exec when creating it, so it is resized once started, as docker's own client does. A command that reads its size at once may see the daemon's default first and the SIGWINCH after.
 
+**`hull kill [-s SIGNAL] ID` signals a machine's workload**, as `docker kill` does, KILL unless `-s` names another. `-s` takes `TERM`, `SIGTERM` or `term`; which names it may be is the core's to say, the same seven an exec's `signal` takes.
+
+- **It is `kill`, not `signal` on the machine's channel,** because a frontend's channels are its requests, and a machine is not one: B.3's channel 0 means the workload, here it means control.
+- **`done` means sent, not acted on.** A TERM the workload catches leaves it running, and an exit reaches whoever follows the machine, as any exit does.
+- **Each engine sends it to the machine's init, which forwards it.** chroot's init forwards the six it handles; docker's kill call signals the container's PID 1, which is docker's init, and that forwards it as well. A KILL ends the init and, with it, the machine, 137, on both.
+- **A machine that has exited is refused**, by the core before the engine, which would otherwise say `done` for a signal it could not send: chroot's init is reaped and not signalled, and docker answers 409.
+
 Open:
 
-- **A signal for a machine's workload**, rather than for an exec, has no command. chroot's `signal` takes one, through the init, and docker's refuses it; nothing sends it yet.
 - **stdin is written by the core's one thread:** a command that does not read for five seconds has its input refused.
 - **A slow frontend is dropped after 5 seconds of a blocked write,** rather than stalling the loop. There is no flow control yet, although the protocol could carry B.2's credits.
 - **Moving onto the shared encrypted protocol**, when that is settled.
@@ -808,8 +815,12 @@ Open:
   - an exec's exit status.
 
   The init's closing first passed. With the parent-death signal its stray descriptors die with the core, so nothing visible broke, and a case now reads the running init's `/proc/<pid>/fd` and requires no socket and no `core.lock` there. The first try at breaking the PID namespace was no sabotage at all: `setns` with a type of 0 joins whatever namespace the descriptor holds, so the namespace was still joined. And the pid check, first written `[3-9][0-9]*`, would have passed a host pid too; it now requires a small pid counted from 3.
+- **`hull kill`,** in cli_test.sh: a TERM the probe catches, after which it says so and exits 0; the default KILL, 137, the probe having caught nothing; and refusals of an exited machine, an unknown one, STOP, and a name too long to be one. docker_test.sh has the first two, with a shell that traps TERM.
+- **Sabotage of kill,** baseline first. Breaking each of these failed a named case: the core sending it to the engine, its check of the name, the frontend's upper-casing and its dropping of `SIG`, the default of KILL, and in docker the signal given to the kill call (sent as KILL, the caught TERM became 137).
+  - **Removing the core's `exited` test passed, and cannot fail:** `machine_exited()` sets `exited` and clears the engine's handle together, on the core's one thread, so the `handle == NULL` beside it refuses the same machines. It is kept for reading alike with `exec`'s.
+  - **The STOP case is caught by its message, not its status:** without the name check, an exited machine is refused all the same, as not running, and exits 1.
 - `test/wire_test.c` runs 19 cases: each direction's messages let through and the other's refused, non-canonical bodies refused, and the numbers read minimal decimal. Disabling the validator fails four of them.
-- `test/cli_test.sh` runs 110 cases. Among them: `ps`, `logs` after an exit, a duplicate id refused, a kept machine surviving its frontend's SIGKILL where an unkept one is stopped, `attach` ending with a stopped machine's 143, a second core giving way and the first still answering, a machine dying with a SIGKILLed core, and the core leaving when idle.
+- `test/cli_test.sh` runs 118 cases. Among them: `ps`, `logs` after an exit, a duplicate id refused, a kept machine surviving its frontend's SIGKILL where an unkept one is stopped, `attach` ending with a stopped machine's 143, a second core giving way and the first still answering, a machine dying with a SIGKILLed core, and the core leaving when idle.
 - **Sabotage,** in a scratch copy, with an unmodified baseline first that had to pass. Breaking each of these failed the test: honouring `keep`, stopping on disconnect, replaying logs, `attach` following, one id at a time, the idle exit, the lock, and the parent-death signal.
   - The last two first passed. The lock case only checked that a second core exited 0. Without the lock, the second core takes the socket over, then leaves and removes it, stranding the first. The case now requires the first to still answer.
   - The parent-death case's wait could give up silently, so it now fails when the kept machine never ran. Without the signal, the probe was measured alive a second after its core died, and gone once the shell reaped the client, for no cause found then. So the case looks for the probe before the client is reaped, where the two behaviours differ.

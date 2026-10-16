@@ -1065,11 +1065,27 @@ static hull_status docker_resize(hull_core *core, hull_stream *st, int rows, int
 static hull_status docker_signal(hull_core *core, hull_machine *m, hull_stream *st, int signum,
                                  hull_error *error)
 {
+	char  path[160];
+	char *answer = NULL;
+	int   status = 0;
+
 	(void)core;
-	(void)m;
-	if (st == NULL)
-		return fail(error, HULL_ERR_UNSUPPORTED, "signalling a workload is not written");
-	signal_exec(st, signum);
+	if (st != NULL) {
+		signal_exec(st, signum);
+		return HULL_OK;
+	}
+	/* The workload's: docker's kill signals the container's PID 1, its
+	 * init, which forwards it as the chroot engine's does. A container
+	 * that has stopped is 409, and is not running as far as the caller
+	 * is concerned. */
+	snprintf(path, sizeof path, "/containers/%s/kill?signal=%d", m->id, signum);
+	if (call("POST", path, NULL, &status, &answer) != 0)
+		return fail(error, HULL_ERR_RUNTIME, "the docker daemon could not be reached");
+	free(answer);
+	if (status == 409)
+		return fail(error, HULL_ERR_GONE, "the machine is not running");
+	if (status != 204)
+		return fail(error, HULL_ERR_RUNTIME, "docker refused the signal");
 	return HULL_OK;
 }
 

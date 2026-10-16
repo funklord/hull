@@ -26,6 +26,7 @@
 
 #define _GNU_SOURCE
 
+#include <ctype.h>
 #include <errno.h>
 #include <libgen.h>
 #include <poll.h>
@@ -34,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -86,6 +88,7 @@ static void usage(FILE *out)
 	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [NAME]\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
+	      "       hull kill [-s SIGNAL] ID\n"
 	      "       hull core\n"
 	      "       hull engines\n"
 	      "       hull --version\n", out);
@@ -940,9 +943,11 @@ static int exec_in(const char *id, char **argv, int argc, int tty)
 	return result;
 }
 
-/* stop, logs and attach: one request about one machine, followed to its
- * end. A Ctrl-C under attach or logs only leaves. */
-static int about(const char *command, const char *id, int follow_logs, long timeout_ms)
+/* stop, kill, logs and attach: one request about one machine, followed
+ * to its end. A Ctrl-C under attach or logs only leaves. `signal_name`
+ * is kill's, a name the core checks. */
+static int about(const char *command, const char *id, int follow_logs, long timeout_ms,
+                 const char *signal_name)
 {
 	hull_wire wire;
 	char      rest[64];
@@ -958,6 +963,9 @@ static int about(const char *command, const char *id, int follow_logs, long time
 		snprintf(rest, sizeof rest, "(10:timeout_ms%zu:%ld)",
 		         (size_t)snprintf(NULL, 0, "%ld", timeout_ms), timeout_ms);
 		send_request(&wire, "(4:stop", 1u, id, rest);
+	} else if (strcmp(command, "kill") == 0) {
+		snprintf(rest, sizeof rest, "(6:signal%zu:%s)", strlen(signal_name), signal_name);
+		send_request(&wire, "(4:kill", 1u, id, rest);
 	} else if (strcmp(command, "logs") == 0) {
 		send_request(&wire, "(4:logs", 1u, id,
 		             follow_logs ? "(6:follow4:true)" : "(6:follow5:false)");
@@ -969,6 +977,24 @@ static int about(const char *command, const char *id, int follow_logs, long time
 	if (strcmp(command, "attach") == 0)
 		return status;
 	return status == 125 ? 1 : 0;
+}
+
+/* kill's -s: TERM, SIGTERM or term, as the protocol's TERM, or NULL for
+ * one too long to be a signal's name. Which signals the core forwards is
+ * the core's to say. */
+static const char *canonical_signal(const char *given)
+{
+	static char name[8];
+	size_t      n;
+
+	if (strncasecmp(given, "SIG", 3u) == 0)
+		given += 3;
+	n = strlen(given);
+	if (n == 0u || n >= sizeof name)
+		return NULL;
+	for (size_t i = 0u; i <= n; i++)
+		name[i] = (char)toupper((unsigned char)given[i]);
+	return name;
 }
 
 static void list_engines(const hull_registry *registry)
@@ -1058,10 +1084,11 @@ int main(int argc, char **argv)
 		return exec_in(argv[at], argv + first, argc - first, tty);
 	}
 	if ((strcmp(command, "stop") == 0 || strcmp(command, "attach") == 0 ||
-	     strcmp(command, "logs") == 0) && argc >= 3) {
-		const char *id      = NULL;
-		int         follow  = 0;
-		long        timeout = 10000;
+	     strcmp(command, "logs") == 0 || strcmp(command, "kill") == 0) && argc >= 3) {
+		const char *id          = NULL;
+		const char *signal_name = "KILL";
+		int         follow      = 0;
+		long        timeout     = 10000;
 
 		for (int i = 2; i < argc; i++) {
 			if (strcmp(command, "logs") == 0 && strcmp(argv[i], "-f") == 0)
@@ -1069,6 +1096,9 @@ int main(int argc, char **argv)
 			else if (strcmp(command, "stop") == 0 && strcmp(argv[i], "--timeout") == 0 &&
 			         i + 1 < argc)
 				timeout = strtol(argv[++i], NULL, 10) * 1000L;
+			else if (strcmp(command, "kill") == 0 && strcmp(argv[i], "-s") == 0 &&
+			         i + 1 < argc)
+				signal_name = canonical_signal(argv[++i]);
 			else if (argv[i][0] != '-' && id == NULL)
 				id = argv[i];
 			else {
@@ -1076,11 +1106,11 @@ int main(int argc, char **argv)
 				break;
 			}
 		}
-		if (id == NULL) {
+		if (id == NULL || signal_name == NULL) {
 			usage(stderr);
 			return 2;
 		}
-		return about(command, id, follow, timeout < 0 ? 0 : timeout);
+		return about(command, id, follow, timeout < 0 ? 0 : timeout, signal_name);
 	}
 
 	/* Planning needs the engines' declarations, not their operations,

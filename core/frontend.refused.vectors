@@ -91,3 +91,11 @@ client_message winch_no_rows 28 35 3A 77 69 6E 63 68 28 32 3A 63 68 31 3A 39 29 
 # signal_no_name: (6:signal(2:ch1:9))
 # signal: the signal is required
 client_message signal_no_name 28 36 3A 73 69 67 6E 61 6C 28 32 3A 63 68 31 3A 39 29 29
+
+# kill_no_signal: (4:kill(2:ch1:8)(7:machine3:web))
+# kill: the signal is required
+client_message kill_no_signal 28 34 3A 6B 69 6C 6C 28 32 3A 63 68 31 3A 38 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 29
+
+# kill_no_machine: (4:kill(2:ch1:8)(6:signal4:TERM))
+# kill: the machine is required
+client_message kill_no_machine 28 34 3A 6B 69 6C 6C 28 32 3A 63 68 31 3A 38 29 28 36 3A 73 69 67 6E 61 6C 34 3A 54 45 52 4D 29 29

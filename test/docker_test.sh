@@ -183,6 +183,36 @@ got=$?
 timeout 30 "$hull" stop dtest > /dev/null 2>&1
 wait "$execer" 2>/dev/null
 
+# kill: docker's kill signals the container's init, which forwards a TERM
+# to the workload, here a shell that catches it; a KILL ends the container,
+# 137. Each waits for "ready", ten seconds at most.
+conf killd '(command "sh" "-c" "trap \"echo caught; exit 0\" TERM; echo ready; while :; do sleep 0.1; done")'
+await_ready() { # FILE
+	tries=0
+	until grep -q '^ready$' "$1" 2>/dev/null || [ "$tries" -ge 40 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+}
+cases=$((cases + 1))
+(cd / && exec timeout -k 5 60 "$hull" run -f "$root/killd.conf" > "$root/killd.out" 2>&1) &
+killed=$!
+await_ready "$root/killd.out"
+out=$(timeout 30 "$hull" kill -s TERM dtest 2>&1) || fail "kill -s TERM refused" "$out"
+wait "$killed"
+got=$?
+[ "$got" = 0 ] && grep -q '^caught$' "$root/killd.out" ||
+	fail "a TERM to the workload: run exited $got, wanted 0 once caught" "$(cat "$root/killd.out")"
+cases=$((cases + 1))
+(cd / && exec timeout -k 5 60 "$hull" run -f "$root/killd.conf" > "$root/killd.out" 2>&1) &
+killed=$!
+await_ready "$root/killd.out"
+out=$(timeout 30 "$hull" kill dtest 2>&1) || fail "kill refused" "$out"
+wait "$killed"
+got=$?
+[ "$got" = 137 ] && ! grep -q '^caught$' "$root/killd.out" ||
+	fail "a KILL to the workload: run exited $got, wanted 137" "$(cat "$root/killd.out")"
+
 # What cannot be created is 125, and says why. A command that is not
 # there is docker's init failing to exec it, 127, as a shell would say.
 printf '%s\n' '(machine (source "hull-no-such-image:0") (backend docker) (hostname "dtest") (command "x"))' \
