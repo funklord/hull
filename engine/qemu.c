@@ -1,69 +1,1045 @@
 /*
- * qemu.c -- the qemu engine's declaration: the vm class with KVM and the
- * emu class with TCG, one driver (project.md sections 5.2 and 5.3).
+ * qemu.c -- the qemu engine: the vm class with KVM and the emu class with
+ * TCG, one driver (project.md sections 5.2 and 5.3), run as the user.
+ *
+ * A machine is a qemu process, booted on the host's own kernel with an
+ * initramfs the engine writes for it: the guest agent as /init
+ * (agent/agent.c, Appendix B) and the modules it needs to reach its
+ * directory and the host, which are the kernel's 9p and vsock modules and
+ * what modules.dep says they need. The machine's directory is shared over
+ * qemu's own 9p server, which needs nothing the user does not have; each
+ * volume is a share of its own. /dev/kvm and /dev/vhost-vsock are open
+ * to the user on hosts that grant them, and nothing here asks for root.
+ *
+ * The host is always the initiator (B.1): start() connects to the agent
+ * on vsock port 1, sends hello and the machine's spec, waits for ready,
+ * sends start and waits for started. A thread then reads what the agent
+ * sends -- the workload's output on channel 0, its exit, bye -- until the
+ * connection closes, waits for qemu, and reports the exit as the agent
+ * gave it. A machine whose agent never said so died: its console, kept
+ * in a file, says why.
+ *
+ * stop() asks the agent, which signals the workload and powers off; qemu
+ * is killed if that has not happened by the timeout and a margin. qemu
+ * dies with the thread that started it, PR_SET_PDEATHSIG, as a chroot
+ * machine dies with its core: nothing could manage it afterwards.
+ *
+ * The kernel is the host's, standing in for Appendix F's bundled one, so
+ * vm.kernel.bundled is declared emulated and says so.
  */
 
+#define _GNU_SOURCE
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/random.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/utsname.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <linux/vm_sockets.h>
+
+#include "access.h"
 #include "builtin.h"
+#include "wire.h"
+
+#define MAX_VOLUMES  64u
+#define MAX_MODULES  32u
+#define AGENT_PORT   1u
+#define BOOT_LIMIT   60   /* seconds for the agent to answer, TCG included */
+#define CID_TRIES    4
+
+struct hull_machine {
+	hull_core       *core;
+	int              emu;          /* TCG, else KVM */
+	char            *root;         /* the dir source, without "dir:" */
+	int              readonly_root;
+	char            *volume_host[MAX_VOLUMES];
+	int              volume_readonly[MAX_VOLUMES];
+	unsigned         volume_count;
+	unsigned long    memory_mib;
+	unsigned         cpus;
+	uint8_t         *spec;         /* the plan's (machine ...), for the agent */
+	size_t           spec_length;
+
+	char             dir[4096];    /* the machine's files: initrd, console */
+	pid_t            qemu;
+	hull_wire        wire;
+	int              connected;
+	pthread_t        reader;
+	int              started;
+	pthread_mutex_t  lock;         /* `done`, and signalling qemu */
+	pthread_mutex_t  send_lock;    /* one message at a time to the agent */
+	pthread_cond_t   done_cond;
+	int              done;         /* qemu has been reaped */
+	int              exited;       /* the agent said how the workload ended */
+	int              code;
+	int              signal;
+	char             detail[512];
+};
+
+static const hull_host_ops *host;
+
+static hull_status fail(hull_error *error, hull_status code, const char *detail)
+{
+	if (error != NULL) {
+		error->code           = code;
+		error->detail         = detail;
+		error->runtime_detail = NULL;
+	}
+	return code;
+}
+
+static void release(hull_machine *m)
+{
+	free(m->root);
+	for (unsigned i = 0u; i < m->volume_count; i++)
+		free(m->volume_host[i]);
+	free(m->spec);
+	pthread_mutex_destroy(&m->lock);
+	pthread_mutex_destroy(&m->send_lock);
+	pthread_cond_destroy(&m->done_cond);
+	free(m);
+}
+
+/* --- reading the plan ---------------------------------------------------- */
+
+/* J.1's `memory`, "2G" or "512M" or bytes, in MiB; 0 if it is not one. */
+static unsigned long mebibytes(const char *text)
+{
+	char         *end;
+	unsigned long n = strtoul(text, &end, 10);
+
+	if (end == text)
+		return 0u;
+	if (*end == 'G' || *end == 'g')
+		return n * 1024u;
+	if (*end == 'M' || *end == 'm')
+		return n;
+	if (*end == 'K' || *end == 'k')
+		return n / 1024u;
+	return *end == '\0' ? n / (1024u * 1024u) : 0u;
+}
+
+static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
+{
+	hull_sexpr_form top;
+	hull_sexpr_form machine;
+	hull_sexpr_form entry;
+	hull_sexpr_form item;
+	char           *text;
+	int             more;
+
+	if (!hull_sexpr_first(doc, &top) || !hull_access_find(doc, &top, "machine", &machine))
+		return "the plan holds no machine";
+	text = hull_access_value(doc, &top, "class");
+	m->emu = text != NULL && strcmp(text, "emu") == 0;
+	free(text);
+
+	text = hull_access_value(doc, &machine, "source");
+	if (text == NULL || strncmp(text, "dir:", 4u) != 0 || text[4] == '\0') {
+		free(text);
+		return "the qemu engine runs only a dir source so far";
+	}
+	m->root = hull_access_path(doc, text + 4);
+	free(text);
+	if (m->root == NULL)
+		return "out of memory";
+
+	if (hull_access_find(doc, &machine, "security", &entry))
+		m->readonly_root = hull_access_true(doc, &entry, "readonly_root");
+
+	m->memory_mib = 512u;
+	if ((text = hull_access_value(doc, &machine, "memory")) != NULL) {
+		m->memory_mib = mebibytes(text);
+		free(text);
+		if (m->memory_mib < 64u)
+			return "memory is not a size of 64M or more";
+	}
+	m->cpus = 1u;
+	if ((text = hull_access_value(doc, &machine, "cpus")) != NULL) {
+		m->cpus = (unsigned)strtoul(text, NULL, 10);
+		free(text);
+		if (m->cpus < 1u || m->cpus > 64u)
+			return "cpus is not 1 to 64";
+	}
+	/* emu.cores_scale over-provisions vCPUs against TCG's cost (5.3). */
+	if (m->emu && hull_access_find(doc, &machine, "tuning", &entry) &&
+	    hull_access_find(doc, &entry, "emu", &item) &&
+	    (text = hull_access_value(doc, &item, "cores_scale")) != NULL) {
+		double scale = strtod(text, NULL);
+
+		free(text);
+		if (scale <= 0.0 || scale > 16.0)
+			return "emu's cores_scale is not above 0 and at most 16";
+		m->cpus = (unsigned)((double)m->cpus * scale + 0.5);
+		if (m->cpus < 1u)
+			m->cpus = 1u;
+	}
+
+	if (hull_access_find(doc, &machine, "volumes", &entry)) {
+		hull_sexpr_child(doc, &entry, &item);
+		for (more = hull_sexpr_next(doc, &item, &item); more;
+		     more = hull_sexpr_next(doc, &item, &item)) {
+			char *host_path = hull_access_value(doc, &item, "host");
+			char *mode      = hull_access_value(doc, &item, "mode");
+
+			if (m->volume_count == MAX_VOLUMES) {
+				free(host_path);
+				free(mode);
+				return "there are too many volumes";
+			}
+			m->volume_readonly[m->volume_count] = mode != NULL && strcmp(mode, "ro") == 0;
+			m->volume_host[m->volume_count] =
+			    host_path != NULL ? hull_access_path(doc, host_path) : NULL;
+			free(host_path);
+			free(mode);
+			if (m->volume_host[m->volume_count++] == NULL)
+				return "a volume is missing its host path";
+		}
+	}
+
+	/* The spec the agent applies is the plan's own (machine ...). */
+	m->spec_length = machine.extent;
+	m->spec = malloc(m->spec_length);
+	if (m->spec == NULL)
+		return "out of memory";
+	memcpy(m->spec, doc->data + machine.offset, m->spec_length);
+	return NULL;
+}
+
+/* --- the initramfs ------------------------------------------------------- */
+
+typedef struct archive {
+	FILE    *file;
+	unsigned inode;
+	int      failed;
+} archive;
+
+static void pad4(archive *a, size_t n)
+{
+	static const char zeros[4];
+
+	if (n % 4u != 0u && fwrite(zeros, 1u, 4u - n % 4u, a->file) != 4u - n % 4u)
+		a->failed = 1;
+}
+
+/* One newc entry; the kernel's initramfs reader wants no more than this. */
+static void entry(archive *a, const char *name, unsigned mode, unsigned rdev_major,
+                  unsigned rdev_minor, const uint8_t *data, size_t length)
+{
+	size_t name_size = strlen(name) + 1u;
+
+	if (fprintf(a->file,
+	            "070701%08X%08X%08X%08X%08X%08X%08zX%08X%08X%08X%08X%08zX%08X",
+	            ++a->inode, mode, 0u, 0u, 1u, 0u, length, 0u, 0u, rdev_major, rdev_minor,
+	            name_size, 0u) < 0 ||
+	    fwrite(name, 1u, name_size, a->file) != name_size)
+		a->failed = 1;
+	pad4(a, 110u + name_size);
+	if (length > 0u && fwrite(data, 1u, length, a->file) != length)
+		a->failed = 1;
+	pad4(a, length);
+}
+
+static uint8_t *slurp(const char *path, size_t *length)
+{
+	FILE    *file = fopen(path, "rb");
+	uint8_t *data = NULL;
+	long     size;
+
+	if (file == NULL)
+		return NULL;
+	if (fseek(file, 0, SEEK_END) == 0 && (size = ftell(file)) >= 0 && fseek(file, 0, SEEK_SET) == 0 &&
+	    (data = malloc((size_t)size + 1u)) != NULL) {
+		if (fread(data, 1u, (size_t)size, file) != (size_t)size) {
+			free(data);
+			data = NULL;
+		} else {
+			*length = (size_t)size;
+		}
+	}
+	fclose(file);
+	return data;
+}
+
+/* The modules the agent needs, with what modules.dep says each needs,
+ * dependencies first: relative paths under /lib/modules/<release>. */
+typedef struct module_list {
+	char    *path[MAX_MODULES];
+	unsigned count;
+} module_list;
+
+static int listed(const module_list *list, const char *path)
+{
+	for (unsigned i = 0u; i < list->count; i++)
+		if (strcmp(list->path[i], path) == 0)
+			return 1;
+	return 0;
+}
+
+static int add_module(module_list *list, const char *path)
+{
+	if (listed(list, path))
+		return 1;
+	if (list->count == MAX_MODULES || (list->path[list->count] = strdup(path)) == NULL)
+		return 0;
+	list->count++;
+	return 1;
+}
+
+static const char *find_modules(const char *release, module_list *list)
+{
+	static const char *const wanted[] = { "9p", "9pnet_virtio", "vmw_vsock_virtio_transport" };
+	char        path[512];
+	char       *dep;
+	char       *lines[8192];
+	unsigned    count = 0u;
+	size_t      length = 0u;
+	const char *reason = NULL;
+
+	snprintf(path, sizeof path, "/lib/modules/%s/modules.dep", release);
+	dep = (char *)slurp(path, &length);
+	if (dep == NULL)
+		return "the host kernel's modules.dep cannot be read";
+	dep[length] = '\0';
+	for (char *line = strtok(dep, "\n"); line != NULL && count < 8192u; line = strtok(NULL, "\n"))
+		lines[count++] = line;
+	for (unsigned w = 0u; w < sizeof wanted / sizeof wanted[0] && reason == NULL; w++) {
+		unsigned i;
+
+		/* A line is `path: dependency...`; the module's name is the
+		 * path's last part up to ".ko". */
+		for (i = 0u; i < count; i++) {
+			const char *colon = strchr(lines[i], ':');
+			const char *name;
+			size_t      stem = strlen(wanted[w]);
+
+			if (colon == NULL)
+				continue;
+			for (name = colon; name > lines[i] && name[-1] != '/'; name--)
+				;
+			if (strncmp(name, wanted[w], stem) == 0 && strncmp(name + stem, ".ko", 3u) == 0)
+				break;
+		}
+		if (i == count) {
+			reason = "the host kernel has no 9p or vsock module for the guest";
+			break;
+		}
+		{
+			char     copy[2048];
+			char    *deps[MAX_MODULES];
+			char    *colon;
+			unsigned n = 0u;
+
+			snprintf(copy, sizeof copy, "%s", lines[i]);
+			colon = strchr(copy, ':');
+			*colon = '\0';
+			for (char *word = strtok(colon + 1, " "); word != NULL && n < MAX_MODULES;
+			     word = strtok(NULL, " "))
+				deps[n++] = word;
+			/* modprobe loads the last listed first. */
+			while (n > 0u && reason == NULL)
+				if (!add_module(list, deps[--n]))
+					reason = "too many modules";
+			if (reason == NULL && !add_module(list, copy))
+				reason = "too many modules";
+		}
+	}
+	free(dep);
+	return reason;
+}
+
+/* The agent: hull-agent beside the hull binary that is running. */
+static int agent_path(char *out, size_t cap)
+{
+	char    self[PATH_MAX];
+	ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1u);
+	char   *slash;
+
+	if (n <= 0)
+		return 0;
+	self[n] = '\0';
+	slash = strrchr(self, '/');
+	if (slash == NULL)
+		return 0;
+	*slash = '\0';
+	return snprintf(out, cap, "%s/hull-agent", self) < (int)cap;
+}
+
+static const char *write_initramfs(const char *dir, const char *release)
+{
+	char        path[4200];
+	char        agent[PATH_MAX];
+	module_list list = { { NULL }, 0u };
+	archive     a = { NULL, 0u, 0 };
+	char        names[MAX_MODULES * 64u] = "";
+	uint8_t    *data;
+	size_t      length = 0u;
+	const char *reason;
+
+	if (!agent_path(agent, sizeof agent) || (data = slurp(agent, &length)) == NULL)
+		return "the guest agent, hull-agent beside hull, cannot be read";
+	if ((reason = find_modules(release, &list)) != NULL) {
+		free(data);
+		return reason;
+	}
+	snprintf(path, sizeof path, "%s/initrd", dir);
+	a.file = fopen(path, "wb");
+	if (a.file == NULL) {
+		free(data);
+		return "the machine's initramfs cannot be written";
+	}
+	entry(&a, "dev", 040755u, 0u, 0u, NULL, 0u);
+	entry(&a, "dev/console", 020600u, 5u, 1u, NULL, 0u);
+	entry(&a, "proc", 040555u, 0u, 0u, NULL, 0u);
+	entry(&a, "sys", 040555u, 0u, 0u, NULL, 0u);
+	entry(&a, "hull", 040755u, 0u, 0u, NULL, 0u);
+	entry(&a, "hull/lib", 040755u, 0u, 0u, NULL, 0u);
+	entry(&a, "init", 0100755u, 0u, 0u, data, length);
+	free(data);
+	for (unsigned i = 0u; i < list.count; i++) {
+		const char *base = strrchr(list.path[i], '/');
+		char        name[300];
+
+		base = base != NULL ? base + 1 : list.path[i];
+		snprintf(path, sizeof path, "/lib/modules/%s/%s", release, list.path[i]);
+		data = slurp(path, &length);
+		if (data == NULL) {
+			a.failed = 1;
+			break;
+		}
+		snprintf(name, sizeof name, "hull/lib/%s", base);
+		entry(&a, name, 0100644u, 0u, 0u, data, length);
+		free(data);
+		strncat(names, base, sizeof names - strlen(names) - 2u);
+		strcat(names, "\n");
+	}
+	entry(&a, "hull/modules", 0100644u, 0u, 0u, (const uint8_t *)names, strlen(names));
+	entry(&a, "TRAILER!!!", 0u, 0u, 0u, NULL, 0u);
+	for (unsigned i = 0u; i < list.count; i++)
+		free(list.path[i]);
+	if (fclose(a.file) != 0 || a.failed)
+		return "the machine's initramfs cannot be written";
+	return NULL;
+}
+
+/* --- qemu ---------------------------------------------------------------- */
+
+/* qemu's option syntax doubles a comma inside a value. */
+static void escaped(char *out, size_t cap, const char *path)
+{
+	size_t at = 0u;
+
+	for (; *path != '\0' && at + 2u < cap; path++) {
+		out[at++] = *path;
+		if (*path == ',')
+			out[at++] = ',';
+	}
+	out[at] = '\0';
+}
+
+/* Fork qemu for `m`, with `cid` for its vsock device. Its stdout and
+ * stderr go to qemu.log. */
+static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
+{
+	char        kernel[300];
+	char        initrd[4200];
+	char        console[8600];
+	char        log[4200];
+	char        memory[32];
+	char        cpus[16];
+	char        vsock[64];
+	char        root[9000];
+	char        fsdev[MAX_VOLUMES][9000];
+	char        device[MAX_VOLUMES][96];
+	char        path[8500];
+	const char *argv[64 + 4u * MAX_VOLUMES];
+	unsigned    n = 0u;
+	pid_t       pid;
+
+	snprintf(kernel, sizeof kernel, "/boot/vmlinuz-%s", release);
+	snprintf(initrd, sizeof initrd, "%s/initrd", m->dir);
+	snprintf(log, sizeof log, "%s/qemu.log", m->dir);
+	escaped(path, sizeof path, m->dir);
+	snprintf(console, sizeof console, "file,id=console,path=%s/console.log", path);
+	snprintf(memory, sizeof memory, "%lu", m->memory_mib);
+	snprintf(cpus, sizeof cpus, "%u", m->cpus);
+	snprintf(vsock, sizeof vsock, "vhost-vsock-pci,guest-cid=%u", cid);
+	escaped(path, sizeof path, m->root);
+	snprintf(root, sizeof root, "local,id=root,path=%s,security_model=none%s", path,
+	         m->readonly_root ? ",readonly=on" : "");
+
+	argv[n++] = "qemu-system-x86_64";
+	argv[n++] = "-nodefaults";
+	argv[n++] = "-no-user-config";
+	argv[n++] = "-display";
+	argv[n++] = "none";
+	argv[n++] = "-no-reboot";
+	argv[n++] = "-M";
+	argv[n++] = "q35";
+	argv[n++] = "-accel";
+	argv[n++] = m->emu ? "tcg" : "kvm";
+	argv[n++] = "-cpu";
+	argv[n++] = m->emu ? "max" : "host";
+	argv[n++] = "-m";
+	argv[n++] = memory;
+	argv[n++] = "-smp";
+	argv[n++] = cpus;
+	argv[n++] = "-kernel";
+	argv[n++] = kernel;
+	argv[n++] = "-initrd";
+	argv[n++] = initrd;
+	argv[n++] = "-append";
+	argv[n++] = "console=hvc0 quiet panic=-1";
+	argv[n++] = "-device";
+	argv[n++] = "virtio-serial-pci";
+	argv[n++] = "-chardev";
+	argv[n++] = console;
+	argv[n++] = "-device";
+	argv[n++] = "virtconsole,chardev=console";
+	argv[n++] = "-fsdev";
+	argv[n++] = root;
+	argv[n++] = "-device";
+	argv[n++] = "virtio-9p-pci,fsdev=root,mount_tag=root";
+	for (unsigned i = 0u; i < m->volume_count; i++) {
+		escaped(path, sizeof path, m->volume_host[i]);
+		snprintf(fsdev[i], sizeof fsdev[i], "local,id=v%u,path=%s,security_model=none%s", i,
+		         path, m->volume_readonly[i] ? ",readonly=on" : "");
+		snprintf(device[i], sizeof device[i], "virtio-9p-pci,fsdev=v%u,mount_tag=v%u", i, i);
+		argv[n++] = "-fsdev";
+		argv[n++] = fsdev[i];
+		argv[n++] = "-device";
+		argv[n++] = device[i];
+	}
+	argv[n++] = "-device";
+	argv[n++] = vsock;
+	argv[n] = NULL;
+
+	pid = fork();
+	if (pid == 0) {
+		int null = open("/dev/null", O_RDWR);
+		int out  = open(log, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+		prctl(PR_SET_PDEATHSIG, SIGKILL);
+		setsid();
+		if (null < 0 || out < 0)
+			_exit(126);
+		dup2(null, 0);
+		dup2(out, 1);
+		dup2(out, 2);
+		/* Nothing of the core's goes with it: its sockets, its lock. */
+		syscall(SYS_close_range, 3u, ~0u, 0u);
+		execvp(argv[0], (char *const *)argv);
+		fprintf(stderr, "qemu-system-x86_64: %s\n", strerror(errno));
+		_exit(127);
+	}
+	return pid;
+}
+
+/* Is qemu still there? Not reaped: the reader reaps it. */
+static int qemu_gone(const hull_machine *m)
+{
+	siginfo_t info;
+
+	memset(&info, 0, sizeof info);
+	return waitid(P_PID, (id_t)m->qemu, &info, WEXITED | WNOHANG | WNOWAIT) != 0 ||
+	       info.si_pid == m->qemu;
+}
+
+/* The last line `file` in the machine's directory holds, for a reason. */
+static void last_line(const hull_machine *m, const char *file, char *out, size_t cap)
+{
+	char    path[4200];
+	size_t  length = 0u;
+	uint8_t *data;
+	char    *text;
+	char    *line;
+
+	out[0] = '\0';
+	snprintf(path, sizeof path, "%s/%s", m->dir, file);
+	if ((data = slurp(path, &length)) == NULL)
+		return;
+	text = (char *)data;
+	text[length] = '\0';
+	while (length > 0u && (text[length - 1u] == '\n' || text[length - 1u] == '\r'))
+		text[--length] = '\0';
+	line = strrchr(text, '\n');
+	snprintf(out, cap, "%s", line != NULL ? line + 1 : text);
+	free(data);
+}
+
+/* Connect to the agent, while qemu lives, for BOOT_LIMIT seconds. */
+static int dial(hull_machine *m, uint32_t cid)
+{
+	time_t deadline = time(NULL) + BOOT_LIMIT;
+
+	while (time(NULL) < deadline && !qemu_gone(m)) {
+		struct sockaddr_vm address;
+		struct timeval     patience = { 0, 200000 };
+		int                fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+		if (fd < 0)
+			return -1;
+		setsockopt(fd, AF_VSOCK, SO_VM_SOCKETS_CONNECT_TIMEOUT, &patience, sizeof patience);
+		memset(&address, 0, sizeof address);
+		address.svm_family = AF_VSOCK;
+		address.svm_cid    = cid;
+		address.svm_port   = AGENT_PORT;
+		if (connect(fd, (struct sockaddr *)&address, sizeof address) == 0)
+			return fd;
+		close(fd);
+		{
+			struct timespec pause = { 0, 20000000L };
+
+			nanosleep(&pause, NULL);
+		}
+	}
+	return -1;
+}
+
+static void send_msg(hull_machine *m, hull_msg *msg)
+{
+	pthread_mutex_lock(&m->send_lock);
+	if (m->connected && hull_wire_send(m->wire.fd, msg) != 0)
+		m->connected = 0;
+	pthread_mutex_unlock(&m->send_lock);
+	hull_msg_free(msg);
+}
+
+/* The agent's next message, within `seconds`. */
+static hull_wire_status hear(hull_machine *m, hull_sexpr_doc *body, int seconds)
+{
+	time_t deadline = time(NULL) + seconds;
+
+	for (;;) {
+		struct pollfd    fd = { m->wire.fd, POLLIN, 0 };
+		hull_wire_status status = hull_wire_next(&m->wire, body);
+		long             left = (long)(deadline - time(NULL));
+
+		if (status != HULL_WIRE_WAIT)
+			return status;
+		if (left <= 0 || poll(&fd, 1u, (int)(left * 1000)) <= 0)
+			return HULL_WIRE_BROKEN;
+		status = hull_wire_fill(&m->wire);
+		if (status != HULL_WIRE_OK && status != HULL_WIRE_WAIT)
+			return status;
+	}
+}
+
+/* Wait for a reply of `type`; an error's reason goes into m->detail. */
+static int expect(hull_machine *m, const char *type)
+{
+	hull_sexpr_doc  body;
+	hull_sexpr_form value;
+
+	if (hear(m, &body, 30) != HULL_WIRE_OK) {
+		snprintf(m->detail, sizeof m->detail, "the guest agent did not answer");
+		return 0;
+	}
+	if (hull_msg_is(&body, type))
+		return 1;
+	if (hull_msg_is(&body, "error") && hull_msg_find(&body, "reason", &value) &&
+	    hull_msg_string(&body, &value, m->detail, sizeof m->detail))
+		return 0;
+	snprintf(m->detail, sizeof m->detail, "the guest agent answered out of turn");
+	return 0;
+}
+
+static void reap(hull_machine *m)
+{
+	siginfo_t info;
+
+	while (waitid(P_PID, (id_t)m->qemu, &info, WEXITED | WNOWAIT) < 0 && errno == EINTR)
+		;
+	pthread_mutex_lock(&m->lock);
+	waitpid(m->qemu, NULL, 0);
+	m->done = 1;
+	pthread_cond_broadcast(&m->done_cond);
+	pthread_mutex_unlock(&m->lock);
+}
+
+static void *read_agent(void *arg)
+{
+	hull_machine *m = arg;
+
+	for (;;) {
+		hull_sexpr_doc   body;
+		hull_sexpr_form  value;
+		hull_wire_status status = hull_wire_read(&m->wire, &body);
+		long long        number;
+
+		if (status == HULL_WIRE_WAIT)
+			continue;
+		if (status != HULL_WIRE_OK)
+			break;
+		if (hull_msg_is(&body, "data")) {
+			hull_sexpr_form buf;
+			hull_sexpr_form fd;
+
+			if (hull_msg_find(&body, "buf", &buf) && hull_msg_find(&body, "fd", &fd))
+				host->on_data(m->core, NULL, hull_sexpr_is(&body, &fd, "2") ? 2 : 1,
+				              body.data + buf.content, buf.content_length);
+		} else if (hull_msg_is(&body, "exited")) {
+			m->exited = 1;
+			if (hull_msg_find(&body, "code", &value) && hull_msg_long(&body, &value, &number))
+				m->code = (int)number;
+			if (hull_msg_find(&body, "signal", &value) && hull_msg_long(&body, &value, &number))
+				m->signal = (int)number;
+		}
+	}
+	pthread_mutex_lock(&m->send_lock);
+	m->connected = 0;
+	pthread_mutex_unlock(&m->send_lock);
+	reap(m);
+	if (m->exited && m->signal != 0) {
+		host->on_exit(m->core, m, NULL, -1, m->signal);
+	} else if (m->exited) {
+		host->on_exit(m->core, m, NULL, m->code, 0);
+	} else {
+		char line[400];
+		char message[512];
+
+		last_line(m, "console.log", line, sizeof line);
+		snprintf(message, sizeof message, "machine died without its agent's word: %s",
+		         line[0] != '\0' ? line : "the console is empty");
+		host->log(m->core, 3, message);
+		host->on_exit(m->core, m, NULL, -1, SIGKILL);
+	}
+	host->on_state(m->core, m, "stopped");
+	return NULL;
+}
+
+/* --- operations ---------------------------------------------------------- */
+
+static hull_status qemu_create(hull_core *core, hull_buf plan, hull_machine **out,
+                               hull_error *error)
+{
+	hull_sexpr_doc doc;
+	hull_machine  *m;
+	const char    *reason;
+
+	if (hull_sexpr_open(&doc, plan.data, plan.len, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK)
+		return fail(error, HULL_ERR_UNSUPPORTED, "the plan is not canonical");
+	m = calloc(1u, sizeof *m);
+	if (m == NULL)
+		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+	m->core = core;
+	m->wire.fd = -1;
+	pthread_mutex_init(&m->lock, NULL);
+	pthread_mutex_init(&m->send_lock, NULL);
+	pthread_cond_init(&m->done_cond, NULL);
+	if ((reason = read_plan(m, &doc)) != NULL) {
+		release(m);
+		return fail(error, HULL_ERR_UNSUPPORTED, reason);
+	}
+	*out = m;
+	host->on_state(core, m, "created");
+	return HULL_OK;
+}
+
+static void remove_files(const char *dir)
+{
+	static const char *const files[] = { "initrd", "console.log", "qemu.log" };
+	char path[4200];
+
+	for (unsigned i = 0u; i < sizeof files / sizeof files[0]; i++) {
+		snprintf(path, sizeof path, "%s/%s", dir, files[i]);
+		unlink(path);
+	}
+	rmdir(dir);
+}
+
+/* A core killed outright leaves its machines' directories. One core runs
+ * per user, holding core.lock, so a directory named for a pid that is not
+ * running was a dead core's: its files are removed, by name. */
+static void sweep(const char *parent)
+{
+	DIR           *list = opendir(parent);
+	struct dirent *item;
+
+	while (list != NULL && (item = readdir(list)) != NULL) {
+		char path[4200];
+		long pid;
+		char *end;
+
+		if (strncmp(item->d_name, "qemu-", 5u) != 0)
+			continue;
+		pid = strtol(item->d_name + 5, &end, 10);
+		if (end == item->d_name + 5 || *end != '-' || pid <= 0 || pid == (long)getpid() ||
+		    kill((pid_t)pid, 0) == 0 || errno != ESRCH)
+			continue;
+		snprintf(path, sizeof path, "%s/%s", parent, item->d_name);
+		remove_files(path);
+	}
+	if (list != NULL)
+		closedir(list);
+}
+
+/* The machine's directory, under the user's runtime directory. */
+static const char *make_dir(hull_machine *m)
+{
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	static unsigned counter;
+	char        parent[3900];
+
+	if (runtime == NULL || runtime[0] != '/')
+		return "XDG_RUNTIME_DIR is not set";
+	snprintf(parent, sizeof parent, "%s/hull", runtime);
+	mkdir(parent, 0700);
+	sweep(parent);
+	snprintf(m->dir, sizeof m->dir, "%s/qemu-%ld-%u", parent, (long)getpid(),
+	         __atomic_add_fetch(&counter, 1u, __ATOMIC_RELAXED));
+	if (mkdir(m->dir, 0700) != 0) {
+		m->dir[0] = '\0';
+		return "the machine's directory cannot be made";
+	}
+	return NULL;
+}
+
+static void remove_dir(hull_machine *m)
+{
+	if (m->dir[0] != '\0')
+		remove_files(m->dir);
+	m->dir[0] = '\0';
+}
+
+/* Kill qemu, unless it has been reaped and its pid freed. */
+static void kill_qemu(hull_machine *m)
+{
+	pthread_mutex_lock(&m->lock);
+	if (!m->done && m->qemu > 0)
+		kill(m->qemu, SIGKILL);
+	pthread_mutex_unlock(&m->lock);
+}
+
+static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *error)
+{
+	struct utsname name;
+	const char    *reason;
+	int            fd = -1;
+	hull_msg       msg = { 0 };
+
+	if (m->started || m->qemu > 0)
+		return fail(error, HULL_ERR_BUSY, "the machine has been started already");
+	if (uname(&name) != 0 || strcmp(name.machine, "x86_64") != 0)
+		return fail(error, HULL_ERR_RUNTIME, "the qemu engine boots on x86_64 hosts only so far");
+	if (!m->emu && access("/dev/kvm", R_OK | W_OK) != 0)
+		return fail(error, HULL_ERR_RUNTIME, "/dev/kvm is not open to this user");
+	if (access("/dev/vhost-vsock", R_OK | W_OK) != 0)
+		return fail(error, HULL_ERR_RUNTIME, "/dev/vhost-vsock is not open to this user");
+	if ((reason = make_dir(m)) != NULL || (reason = write_initramfs(m->dir, name.release)) != NULL) {
+		snprintf(m->detail, sizeof m->detail, "%s", reason);
+		remove_dir(m);
+		return fail(error, HULL_ERR_RUNTIME, m->detail);
+	}
+
+	/* A context id is the host's to share among every VM: one taken
+	 * makes qemu refuse it, and another is tried. */
+	for (int attempt = 0; attempt < CID_TRIES && fd < 0; attempt++) {
+		uint32_t cid = 0u;
+
+		if (getrandom(&cid, sizeof cid, 0) != (ssize_t)sizeof cid)
+			cid = (uint32_t)getpid() ^ (uint32_t)time(NULL);
+		cid = 3u + cid % 0x7ffffff0u;
+		m->done = 0;
+		m->qemu = spawn(m, name.release, cid);
+		if (m->qemu < 0)
+			break;
+		fd = dial(m, cid);
+		if (fd < 0) {
+			kill_qemu(m);
+			waitpid(m->qemu, NULL, 0);
+			m->done = 1;
+			last_line(m, "qemu.log", m->detail, sizeof m->detail);
+			if (strstr(m->detail, "guest cid") == NULL &&
+			    strstr(m->detail, "Address already in use") == NULL)
+				break;
+		}
+	}
+	if (fd < 0) {
+		if (m->detail[0] == '\0')
+			snprintf(m->detail, sizeof m->detail, "the guest agent never answered");
+		remove_dir(m);
+		return fail(error, HULL_ERR_RUNTIME, m->detail);
+	}
+	if (hull_wire_open(&m->wire, fd, HULL_WIRE_FROM_AGENT) != 0) {
+		close(fd);
+		kill_qemu(m);
+		waitpid(m->qemu, NULL, 0);
+		m->done = 1;
+		remove_dir(m);
+		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+	}
+	m->connected = 1;
+
+	hull_msg_raw(&msg, "(5:hello(2:ch1:0)(8:features)(5:proto1:1))");
+	send_msg(m, &msg);
+	if (expect(m, "hello")) {
+		hull_msg_raw(&msg, "(4:spec(2:ch1:0)");
+		hull_msg_bytes(&msg, m->spec, m->spec_length);
+		hull_msg_raw(&msg, ")");
+		send_msg(m, &msg);
+		if (expect(m, "ready")) {
+			hull_msg_raw(&msg, "(5:start(2:ch1:0))");
+			send_msg(m, &msg);
+			if (expect(m, "started") &&
+			    pthread_create(&m->reader, NULL, read_agent, m) == 0) {
+				m->started = 1;
+				host->on_state(core, m, "running");
+				return HULL_OK;
+			}
+		}
+	}
+	kill_qemu(m);
+	waitpid(m->qemu, NULL, 0);
+	m->done = 1;
+	hull_wire_close(&m->wire);
+	remove_dir(m);
+	return fail(error, HULL_ERR_RUNTIME, m->detail);
+}
+
+static int wait_done(hull_machine *m, int timeout_ms)
+{
+	struct timespec deadline;
+	int             done;
+
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec  += timeout_ms / 1000;
+	deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec++;
+		deadline.tv_nsec -= 1000000000L;
+	}
+	pthread_mutex_lock(&m->lock);
+	while (!m->done && pthread_cond_timedwait(&m->done_cond, &m->lock, &deadline) == 0)
+		;
+	done = m->done;
+	pthread_mutex_unlock(&m->lock);
+	return done;
+}
+
+/* The agent signals the workload, waits `timeout_ms` and kills it, and
+ * powers off; qemu is killed if that is not done in five seconds more. */
+static hull_status qemu_stop(hull_core *core, hull_machine *m, int timeout_ms, hull_error *error)
+{
+	hull_msg msg = { 0 };
+
+	(void)error;
+	if (!m->started || wait_done(m, 0))
+		return HULL_OK;
+	host->on_state(core, m, "stopping");
+	hull_msg_raw(&msg, "(4:stop(2:ch1:0)(10:timeout_ms");
+	hull_msg_number(&msg, timeout_ms);
+	hull_msg_raw(&msg, "))");
+	send_msg(m, &msg);
+	if (!wait_done(m, timeout_ms + 5000)) {
+		kill_qemu(m);
+		wait_done(m, 60000);
+	}
+	return HULL_OK;
+}
+
+static hull_status qemu_destroy(hull_core *core, hull_machine *m, hull_error *error)
+{
+	if (m->started) {
+		qemu_stop(core, m, 0, error);
+		pthread_join(m->reader, NULL);
+		hull_wire_close(&m->wire);
+	}
+	remove_dir(m);
+	release(m);
+	return HULL_OK;
+}
+
+static const struct {
+	int         number;
+	const char *name;
+} signal_names[] = {
+	{ SIGHUP, "SIGHUP" }, { SIGINT, "SIGINT" }, { SIGQUIT, "SIGQUIT" }, { SIGTERM, "SIGTERM" },
+	{ SIGUSR1, "SIGUSR1" }, { SIGUSR2, "SIGUSR2" }, { SIGKILL, "SIGKILL" },
+};
+
+/* A signal for the workload, which the agent sends it (B.3, channel 0). */
+static hull_status qemu_signal(hull_core *core, hull_machine *m, hull_stream *stream, int signum,
+                               hull_error *error)
+{
+	hull_msg msg = { 0 };
+
+	(void)core;
+	if (stream != NULL)
+		return fail(error, HULL_ERR_UNSUPPORTED, "the qemu engine has no exec yet");
+	if (!m->started || wait_done(m, 0))
+		return fail(error, HULL_ERR_GONE, "the machine is not running");
+	for (unsigned i = 0u; i < sizeof signal_names / sizeof signal_names[0]; i++) {
+		if (signal_names[i].number == signum) {
+			hull_msg_raw(&msg, "(6:signal(2:ch1:0)(6:signal");
+			hull_msg_text(&msg, signal_names[i].name);
+			hull_msg_raw(&msg, "))");
+			send_msg(m, &msg);
+			return HULL_OK;
+		}
+	}
+	return fail(error, HULL_ERR_UNSUPPORTED, "not a signal the agent forwards");
+}
+
+/* --- the declaration ----------------------------------------------------- */
 
 static const hull_cap_entry entries[] = {
-	/* The dir over virtiofs, with upper/ on a second share for overlay
-	 * (5.2); an image ref through the store. */
+	/* The dir over 9p, written in place. */
 	{ "source.dir.direct",  HULL_SUP_NATIVE,   NULL, NULL },
-	{ "source.dir.overlay", HULL_SUP_NATIVE,   NULL, NULL },
-	{ "source.ref.overlay", HULL_SUP_NATIVE,   NULL, NULL },
 
-	/* Applied by the guest agent (5.2). */
+	/* Applied by the guest agent. */
 	{ "command",            HULL_SUP_NATIVE,   NULL, NULL },
 	{ "workdir",            HULL_SUP_NATIVE,   NULL, NULL },
 	{ "env",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "hostname",           HULL_SUP_NATIVE,   NULL, NULL },
-	{ "ports",              HULL_SUP_EMULATED, "a host-side forwarder", NULL },
-	{ "volumes",            HULL_SUP_NATIVE,   NULL, NULL },
+	{ "volumes",            HULL_SUP_NATIVE,   "a 9p share each", NULL },
 	{ "cpus",               HULL_SUP_NATIVE,   NULL, NULL },
 	{ "memory",             HULL_SUP_NATIVE,   "a hard allocation", NULL },
-	{ "ssh",                HULL_SUP_NATIVE,   NULL, NULL },
-	{ "secrets",            HULL_SUP_NATIVE,   "a tmpfs the agent mounts", NULL },
 
 	{ "security.readonly_root", HULL_SUP_NATIVE, NULL, NULL },
 	{ "security.no_new_privs",  HULL_SUP_NATIVE, "set by the agent on the workload", NULL },
-	{ "security.allow",         HULL_SUP_EMULATED, "virtio, VFIO or USB devices where permitted",
-	  NULL },
 
-	/* virtiofs misses host-side events; polling is offered (6). */
-	{ "fidelity.inotify",   HULL_SUP_REJECTED, "virtiofs does not see changes made on the host",
+	/* 9p, like virtiofs, misses changes made on the host (6). */
+	{ "fidelity.inotify",   HULL_SUP_REJECTED, "9p does not see changes made on the host",
 	  "vm:inotify-poll" },
 
 	{ "projection.passthrough", HULL_SUP_NATIVE, NULL, NULL },
 	{ "writeback.none",         HULL_SUP_NATIVE, NULL, NULL },
-	{ "media",                  HULL_SUP_NATIVE, NULL, NULL },
 
-	/* The agent's disconnect policy (B.4). */
+	/* Kept while the core runs; qemu dies with it, as a chroot machine
+	 * does, until adopt() is written. */
 	{ "on_disconnect.stop", HULL_SUP_NATIVE,   NULL, NULL },
 	{ "on_disconnect.keep", HULL_SUP_NATIVE,   NULL, NULL },
 
-	/* J.5, all of it this engine's or its classes'. */
-	{ "vm.profile.micro",       HULL_SUP_NATIVE, NULL, NULL },
-	{ "vm.profile.full",        HULL_SUP_NATIVE, "boots in seconds", NULL },
-	{ "vm.kernel.bundled",      HULL_SUP_NATIVE, NULL, NULL },
-	{ "vm.kernel.image",        HULL_SUP_NATIVE, NULL, NULL },
-	{ "vm.kernel.path",         HULL_SUP_NATIVE, NULL, NULL },
-	{ "vm.cpu_profile.host",    HULL_SUP_NATIVE, NULL, NULL },
-	{ "vm.cpu_profile.migratable", HULL_SUP_NATIVE, NULL, NULL },
-	{ "qemu.accel.auto",        HULL_SUP_NATIVE, NULL, NULL },
-	{ "qemu.accel.kvm",         HULL_SUP_NATIVE, NULL, NULL },
-	{ "qemu.accel.tcg",         HULL_SUP_NATIVE, NULL, NULL },
-	{ "emu.cores_scale",        HULL_SUP_NATIVE, NULL, NULL },
+	/* J.5. A q35 machine on the host's own kernel stands in for the
+	 * micro profile and Appendix F's bundled kernel. */
+	{ "vm.profile.micro",    HULL_SUP_EMULATED,
+	  "a q35 machine on the host's kernel, which boots in about two seconds", NULL },
+	{ "vm.kernel.bundled",   HULL_SUP_EMULATED,
+	  "the host's own kernel and modules, until Appendix F ships one", NULL },
+	{ "vm.cpu_profile.host", HULL_SUP_NATIVE,  NULL, NULL },
+	{ "qemu.accel.auto",     HULL_SUP_NATIVE,  NULL, NULL },
+	{ "emu.cores_scale",     HULL_SUP_NATIVE,  NULL, NULL },
 
 	{ NULL,                 HULL_SUP_NATIVE,   NULL, NULL },
 };
 
 static const char *const classes[] = { "vm", "emu", NULL };
-
-/* What emu boots on any host (5.3); vm takes only the host's own. */
-static const char *const arches[] = { "amd64", "arm64", "riscv64", NULL };
-
-/* J.4's examples. */
-static const char *const media_types[] = { "cdrom", "floppy", "disk", NULL };
 
 static const hull_capabilities caps = {
 	.struct_size    = sizeof (hull_capabilities),
@@ -71,13 +1047,17 @@ static const hull_capabilities caps = {
 	.engine_version = "0",
 	.classes        = classes,
 	.entries        = entries,
-	.media_types    = media_types,
 	.migration      = HULL_MIG_LIVE,  /* H.3 */
-	.arches         = arches,
+	.arches         = NULL,           /* the host's own, on the host's kernel */
 };
 
 static const hull_engine_ops ops = {
 	.struct_size = sizeof (hull_engine_ops),
+	.create      = qemu_create,
+	.start       = qemu_start,
+	.stop        = qemu_stop,
+	.destroy     = qemu_destroy,
+	.signal      = qemu_signal,
 };
 
 static const hull_engine engine = {
@@ -88,8 +1068,8 @@ static const hull_engine engine = {
 	.ops         = &ops,
 };
 
-const hull_engine *hull_engine_qemu(const hull_host_ops *host)
+const hull_engine *hull_engine_qemu(const hull_host_ops *host_ops)
 {
-	(void)host;
+	host = host_ops;
 	return &engine;
 }

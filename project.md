@@ -508,7 +508,7 @@ Open, each for the planner's next step:
 - **docker** has no `fidelity.odirect`, no `on_disconnect.keep` and no media.
 - **qemu** offers `fidelity.inotify` only with `--accept vm:inotify-poll`.
 
-Their operations are not written: every slot is NULL, which is enough for planning and nothing else. `hull --version` prints `VERSION` and the copyright line.
+Their operations were not written then: every slot was NULL, which was enough for planning and nothing else. Both run machines now (§4.9, §4.11), and each declaration shrank to what its engine does. `hull --version` prints `VERSION` and the copyright line.
 
 **The host's arch comes from `uname`**, in the spec's spelling: `x86_64` is `amd64` and `aarch64` is `arm64`.
 
@@ -604,7 +604,7 @@ Two of these had first passed: copying other tuning and copied offsets. Each was
 - **Plan reports go to stderr**, so the workload's stdout stays its own.
 - **Since §4.10, `run` goes through the core**, and the machine's output and exit come back over the frontend protocol.
 - **Exit status follows docker's convention:** the workload's status, 128 plus the signal that ended it, or 125 when hull could not plan or start it. A rejected plan therefore cannot be mistaken for a workload exiting 1.
-- **An engine whose operations are not written**, docker and qemu so far, says so and exits 125.
+- **An engine whose operations are not written** says so and exits 125. Every built-in engine has them now, so no case reaches it.
 
 Open:
 
@@ -693,7 +693,7 @@ In a scratch copy, breaking each of these failed it:
 
 The read-only volume had first passed: while the container ran as root, a write into a read-write volume was refused as well, for want of a capability. A test asking only whether the write was refused could not tell the two apart, so both read-only cases now require "Read-only file system" by name.
 
-`make check` itself needs no daemon: its case for an engine with no operations moved from docker to qemu.
+`make check` itself needs no daemon. Its case for an engine with no operations moved from docker to qemu, and went once qemu ran machines (§4.11).
 
 ### 4.10 The core: one per user, local first
 
@@ -745,7 +745,7 @@ The read-only volume had first passed: while the container ran as root, a write 
 
 - **A machine's id** is its name in `(machines …)`, else its `hostname`, else the file's directory's name, lowercased into a DNS label. Two running machines cannot share one.
 - **SIGINT or SIGTERM to `hull run` stops the machine.** A hangup, or the frontend killed outright, is a disconnect, and the machine then does what `(on_disconnect …)` says. `stop`, the default, has the core stop it. `keep` has the core keep it, for `attach`, `logs` and `stop` from another terminal.
-- **`keep` lasts while the core runs.** Re-adopting a machine after the core restarts is §5.0's `adopt()`, which is not written. So a chroot machine's init sets `PR_SET_PDEATHSIG` and dies with the core: nothing could manage it afterwards, and nothing is to outlive what started it. A docker container belongs to the daemon and survives; its name and label are for finding it.
+- **`keep` lasts while the core runs.** Re-adopting a machine after the core restarts is §5.0's `adopt()`, which is not written. So a chroot machine's init sets `PR_SET_PDEATHSIG` and dies with the core, as qemu does (§4.11): nothing could manage it afterwards, and nothing is to outlive what started it. A docker container belongs to the daemon and survives; its name and label are for finding it.
 - **The tests never touch the account's own core:** each sets `XDG_RUNTIME_DIR` to a directory under `BUILD_DIR`, with `HULL_CORE_IDLE=1`, and requires the core to have left by the end.
 
 **`hull exec [-t] ID [--] CMD [ARG…]` runs a command in a running machine**, on a channel of its own.
@@ -880,6 +880,56 @@ Open:
   - The last two first passed. The lock case only checked that a second core exited 0. Without the lock, the second core takes the socket over, then leaves and removes it, stranding the first. The case now requires the first to still answer.
   - The parent-death case's wait could give up silently, so it now fails when the kept machine never ran. Without the signal, the probe was measured alive a second after its core died, and gone once the shell reaped the client, for no cause found then. So the case looks for the probe before the client is reaped, where the two behaviours differ.
   - **That later death went with the descriptors the init inherited**, found while writing `exec` (below). With them closed, the same experiment leaves the probe alive after the client is reaped as well. The exact path from the init's stray descriptors to the probe's death was not traced.
+
+### 4.11 The qemu engine, and the guest agent
+
+**The qemu engine runs vm and emu machines as the user, on the host's own kernel: `engine/qemu.c`.** Nothing it does asks for root.
+
+- **What a user needs:** `/dev/kvm` for vm and `/dev/vhost-vsock` for both, which Debian opens to every user, and a readable `/boot/vmlinuz` of the running kernel.
+- **The machine:** a q35 machine with the host's kernel and an initramfs the engine writes for it into `$XDG_RUNTIME_DIR/hull/qemu-<pid>-<n>/`. The initramfs holds the guest agent as `/init` and the modules the agent loads to reach its directory and the host.
+- **The modules:** the kernel's 9p and vsock modules, with what `modules.dep` says they need, loaded in modprobe's order. They are xz-compressed, which the kernel decompresses itself, so the agent hands them over as they are.
+- **The directory, and each volume,** is a share of qemu's own 9p server, written in place as the user's.
+- **Classes:** vm is `-accel kvm -cpu host`. emu is `-accel tcg -cpu max`, on the host's arch only, since a foreign arch needs a foreign kernel.
+
+**9p, not virtiofs, which §3.2, §5.2 and §6 name.** virtiofs needs virtiofsd, a daemon of its own, which this host does not have. qemu's 9p runs inside qemu as the user and needs nothing else. Its fidelity is weaker: no host-side inotify, which is declared rejected as virtiofs's was, and slower metadata. This is a deviation from the design, not a change to it. Moving to virtiofs where virtiofsd is installed, and whether to require it, is the holder's decision.
+
+**The kernel is the host's, standing in for Appendix F's bundled one.** So `vm.kernel.bundled` and `vm.profile.micro`, the defaults every plan writes in, are declared emulated, and every run says so on stderr. The cost is measured: a machine boots and runs `/probe` in about 2.2 s, where §5.2's target is 100 to 300 ms. emu under TCG takes about 17 s.
+
+**The guest agent is `agent/agent.c`,** built static as `hull-agent`, beside `hull`, where the engine looks for it. It is PID 1 and follows B.1:
+- It mounts `/dev`, `/proc` and `/sys`, loads the modules `/hull/modules` lists, and listens on vsock port 1 for the one host connection.
+- On `spec` it applies the machine: the hostname, the directory's share mounted at `/machine` and read-only if asked, each volume's share at its guest path, and `/proc`, `/dev` and `/sys` inside wherever the directory has a place for them. Then it moves `/machine` onto `/` and chroots, as switch_root does.
+- On `start` it forks the workload, in a session of its own, with the spec's environment, workdir and `no_new_privs`. A command that cannot be run exits 127, as on chroot.
+- The workload's stdout and stderr come back as `data` on channel 0, which B.3 already uses for the workload in `signal`.
+- **Its end:** once the workload is reaped and its pipes read, the agent says `exited`, exactly as the workload ended, kills whatever is left, says `bye` and powers off. A pipe an orphan still holds is read for what it has, and not waited on.
+- **`stop`** is SIGTERM, then SIGKILL at its timeout. A host that goes away is `(on_disconnect stop)` with nobody to tell. `signal` forwards the seven names the frontend protocol does, spelled with or without `SIG`.
+
+**The host's side,** in the engine:
+- `start` picks a random vsock context id and boots qemu. A context id is the host's, shared by every VM, so if qemu refuses it as taken another is tried, four times in all.
+- It connects to the agent while qemu lives, for up to 60 s, then runs hello, `spec` with the plan's own `(machine …)`, `ready`, `start`, `started`.
+- A thread then reads what the agent sends until the connection closes, waits for qemu, and reports the exit as the agent gave it. A machine whose agent never said goes as SIGKILL, with the last line of its console, which is kept in a file, logged as why.
+- `stop` asks the agent and kills qemu if it has not powered off within the timeout and five seconds more. `hull kill` is the agent's `signal`.
+- **qemu has `PR_SET_PDEATHSIG`,** so it dies with the core, as a chroot machine does, and inherits none of the core's descriptors.
+- **A core killed outright leaves its machines' directories.** The next core's first machine removes them: one core runs per user, holding `core.lock`, so a directory named for a pid that is not running was a dead core's. Its files are removed by name.
+
+**What it declares** is what that does: a dir source in place, `command`, `workdir`, `env`, `hostname`, `volumes`, `cpus`, `memory`, `readonly_root`, `no_new_privs`, both `on_disconnect` values and `emu.cores_scale`, with the two emulated defaults above.
+- **What it no longer declares:** image refs, overlays, ports, ssh, secrets, media, device passthrough, the full profile and the other kernels. The draft declared all of these from §5 and §6 before any of it was written, the way docker's did.
+- **The cost:** §4's example, which has an image source, a port and `(ssh true)`, is refused on vm and emu for those three. A foreign arch is refused on emu.
+- **Not written yet:** exec, a terminal, credit on the agent's channels, logs from the guest, and stats. `hull exec` on a qemu machine says so.
+
+**Measured,** in `test/qemu_test.sh`, which `make check-qemu` runs, since `make check` needs no KVM. Its 29 cases:
+- **One boot,** and every line it prints checked: output on both streams kept apart, the exit status, env, workdir, hostname, uid 0, `no_new_privs`, a session of its own, two CPUs, 256 MiB, and the KVM clock.
+- **How a machine ends:** death by a signal, 143, and a missing command, 127 with the reason.
+- **Writes:** a write landing in the directory as the user's file, a read-only root, and volumes read-write and read-only.
+- **A running machine:** listed by `ps`, a TERM through `hull kill` caught by the workload, SIGTERM to `hull run` stopping the machine with 143, and qemu dying with a SIGKILLed core.
+- **The emu class** under TCG, without the KVM clock.
+- **Nothing left:** no qemu of the suite's and no machine directory, the dead core's included.
+
+**Sabotage,** baseline first, in a scratch copy running `make check-qemu`. Breaking each of these failed a named case:
+- **In the agent:** the hostname, the environment, the workdir, `no_new_privs`, the session, mounting volumes, reporting a signal, 127 for a command not there, stderr kept apart, a stop's SIGTERM, and forwarding a signal.
+- **In the engine:** memory, CPUs, TCG for emu, sweeping a dead core's directories, and reporting a signal's exit.
+- **Read-only, root and volume,** each broken on both sides together: qemu's `readonly=on` and the agent's read-only mount. Either alone holds.
+- **qemu's death signal** first passed. A core that dies closes its vsock connection, and the agent then stops the machine and powers off within the same second, which is `(on_disconnect stop)` doing its job. With both removed, the machine outlived its core and the case failed. Each alone holds.
+- **Untested:** retrying a vsock context id that is taken, which a test cannot make happen on purpose.
 
 ---
 
@@ -1144,7 +1194,7 @@ The framing is generated by situ from `agent/message.situ`: its frame layer turn
 
 ## B.3 Message set (v1, complete)
 
-**The messages are described in situ, decided 2026-10-09: `agent/protocol.situ` is the definition, and this table is its summary.** It closes the open item in §3.12 for the protocol. A message is a record like any other (A.1), `(type (ch n) …)` with its entries in canonical order, and the schema spells each type the way A.2 spells a manifest: required entries are fixed opening bytes, optional ones are chosen by a peek, and the type itself by the four bytes after the `(`. The two directions are two vocabularies, `host_message` and `agent_message`, since `hello` and `data` carry different entries each way. `make test` holds it to `agent/protocol.vectors`, every type in the direction that sends it, and `agent/protocol.refused.vectors`. Nothing is generated from it yet: the agent and the host's protocol code are not written.
+**The messages are described in situ, decided 2026-10-09: `agent/protocol.situ` is the definition, and this table is its summary.** It closes the open item in §3.12 for the protocol. A message is a record like any other (A.1), `(type (ch n) …)` with its entries in canonical order, and the schema spells each type the way A.2 spells a manifest: required entries are fixed opening bytes, optional ones are chosen by a peek, and the type itself by the four bytes after the `(`. The two directions are two vocabularies, `host_message` and `agent_message`, since `hello` and `data` carry different entries each way. `make test` holds it to `agent/protocol.vectors`, every type in the direction that sends it, and `agent/protocol.refused.vectors`. The agent and the qemu engine (§4.11) speak it, each validating what it reads with the C situ generates from it, for its direction.
 
 | Host → agent | Agent → host | Purpose |
 |---|---|---|

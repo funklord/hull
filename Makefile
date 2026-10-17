@@ -101,9 +101,19 @@ CLI_OBJS    = $(BUILD_DIR)/cli/hull.o
 # The per-user core, and the frontend protocol it speaks (section 4.10),
 # validated by C situ generates from core/frontend.situ.
 FRONTEND_GEN = $(GEN_DIR)/frontend.c $(GEN_DIR)/frontend.h
-CORE_OBJS    = $(BUILD_DIR)/core/core.o $(BUILD_DIR)/core/wire.o $(GEN_DIR)/frontend.o \
+# The agent protocol (Appendix B), validated in both directions by the
+# same wire: the host reads the agent's messages, the agent the host's.
+PROTOCOL_GEN = $(GEN_DIR)/protocol.c $(GEN_DIR)/protocol.h
+WIRE_OBJS    = $(BUILD_DIR)/core/wire.o $(GEN_DIR)/frontend.o $(GEN_DIR)/protocol.o \
                $(BUILD_DIR)/agent/framing.o $(GEN_DIR)/message.o
+CORE_OBJS    = $(BUILD_DIR)/core/core.o $(WIRE_OBJS)
 HULL        = $(BUILD_DIR)/hull
+
+# The guest agent, PID 1 in a qemu machine: static, since the initramfs
+# the engine writes holds nothing else, and beside hull, where the engine
+# looks for it.
+AGENT_BIN_OBJS = $(BUILD_DIR)/agent/agent.o $(WIRE_OBJS) $(BUILD_DIR)/engine/access.o
+AGENT_BIN      = $(BUILD_DIR)/hull-agent
 VERSION    := $(shell cat VERSION)
 
 TEST_SEXPR_OBJS   = $(BUILD_DIR)/test/sexpr_test.o
@@ -112,7 +122,7 @@ TEST_FRAMING_OBJS = $(BUILD_DIR)/test/framing_test.o
 CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.conf \
                  foreign.conf machines.conf build.conf bad.conf example.conf run.conf \
                  writable.conf readonly.conf die.conf wait.conf ports.conf noargs.conf nope.conf \
-                 qemu.conf pair.conf rootfs/written vol.conf volro.conf vollink.conf \
+                 pair.conf rootfs/written vol.conf volro.conf vollink.conf \
                  volmissing.conf volhost.conf pid.conf keep.conf gone.conf execd.conf attach.out \
                  killd.conf killd.out flowd.conf held.out spewd.conf behind.out lost.err \
                  data/in data/out rootfs/mnt-link) \
@@ -122,6 +132,11 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
 DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf volro.conf \
                     rootro.conf nocap.conf cap.conf die.conf wait.conf port.conf noimage.conf \
                     nocmd.conf execd.conf killd.conf killd.out held.out data/in data/out)
+
+# What test/qemu_test.sh writes.
+QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.conf write.conf \
+                  readonly.conf vol.conf volro.conf trap.conf trap.out wait.conf kept.conf \
+                  emu.conf rootfs/probe rootfs/written data/in data/out)
 
 # The reference engine's test rootfs holds one static program.
 PROBE = $(BUILD_DIR)/test/cli/rootfs/probe
@@ -140,15 +155,16 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all check check-docker test vectors style style-source style-docs contract hooks clean help
+.PHONY: all check check-docker check-qemu test vectors style style-source style-docs contract hooks clean help
 
-all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL)
+all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL) $(AGENT_BIN)
 
 help:
 	@echo 'Targets:'
 	@echo '  all       build the libraries and build/hull (the default)'
 	@echo '  check     style, the situ contracts, then the tests'
 	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
+	@echo '  check-qemu    hull run on the qemu engine, as the user, with KVM'
 	@echo '  test      build and run the reader tests, the vectors, then the gate'"'"'s'
 	@echo '  vectors   the described schemas against bytes they must accept and refuse'
 	@echo '  style     the indentation and whitespace gate'
@@ -174,6 +190,10 @@ $(FRONTEND_GEN) &: core/frontend.situ sexpr/canonical.situ $(SITU_COMPILER)
 	@mkdir -p '$(GEN_DIR)'
 	$(SITUC) build --target c --prefix hull_frontend --out '$(GEN_DIR)' core/frontend.situ
 
+$(PROTOCOL_GEN) &: agent/protocol.situ sexpr/canonical.situ $(SITU_COMPILER)
+	@mkdir -p '$(GEN_DIR)'
+	$(SITUC) build --target c --prefix hull_protocol --out '$(GEN_DIR)' agent/protocol.situ
+
 $(AGENT_GEN) &: agent/message.situ $(SITU_COMPILER)
 	@mkdir -p '$(GEN_DIR)'
 	$(SITUC) build --target c --layer frame --prefix hull_agent --out '$(GEN_DIR)' agent/message.situ
@@ -185,7 +205,7 @@ $(BUILD_DIR)/sexpr/%.o: sexpr/%.c | $(GEN_HEADERS)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/agent/%.o: agent/%.c | $(GEN_HEADERS) $(AGENT_GEN)
+$(BUILD_DIR)/agent/%.o: agent/%.c | $(GEN_HEADERS) $(AGENT_GEN) $(FRONTEND_GEN) $(PROTOCOL_GEN)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
@@ -197,11 +217,12 @@ $(BUILD_DIR)/plan/%.o: plan/%.c | $(GEN_HEADERS)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/engine/%.o: engine/%.c
+$(BUILD_DIR)/engine/%.o: engine/%.c | $(GEN_HEADERS) $(AGENT_GEN)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/core/%.o: core/%.c VERSION | $(GEN_HEADERS) $(AGENT_GEN) $(FRONTEND_GEN)
+$(BUILD_DIR)/core/%.o: core/%.c VERSION | $(GEN_HEADERS) $(AGENT_GEN) $(FRONTEND_GEN) \
+                                          $(PROTOCOL_GEN)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) -DHULL_VERSION='"$(VERSION)"' $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
@@ -217,6 +238,9 @@ $(PROBE): test/probe.c
 $(HULL): $(CLI_OBJS) $(CORE_OBJS) $(ENGINE_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
 	$(CC) $(CFLAGS) -pthread -o $@ $^
 
+$(AGENT_BIN): $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
+	$(CC) -static $(CFLAGS) -o $@ $^
+
 $(GEN_DIR)/%.o: $(GEN_DIR)/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
@@ -226,6 +250,11 @@ $(GEN_DIR)/%.o: $(GEN_DIR)/%.c
 # goes with that file.
 $(GEN_DIR)/frontend.o: $(GEN_DIR)/frontend.c core/frontend_view.h
 	$(CC) $(CPPFLAGS) -include core/frontend_view.h $(CFLAGS) $(WARNINGS) $(DEPFLAGS) \
+	      -c -o $@ $(filter %.c,$^)
+
+# The agent protocol's, the same way and for the same finding.
+$(GEN_DIR)/protocol.o: $(GEN_DIR)/protocol.c agent/protocol_view.h
+	$(CC) $(CPPFLAGS) -include agent/protocol_view.h $(CFLAGS) $(WARNINGS) $(DEPFLAGS) \
 	      -c -o $@ $(filter %.c,$^)
 
 $(BUILD_DIR)/situ/situ.o: $(SITU_DIR)/runtime/c/situ.c
@@ -254,12 +283,12 @@ $(BUILD_DIR)/test/registry_test: $(TEST_REGISTRY_OBJS) $(PLAN_OBJS) $(SPEC_OBJS)
 $(BUILD_DIR)/test/plan_test: $(TEST_PLAN_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
-$(BUILD_DIR)/test/wire_test: $(TEST_WIRE_OBJS) $(BUILD_DIR)/core/wire.o $(GEN_DIR)/frontend.o \
-                             $(BUILD_DIR)/agent/framing.o $(GEN_DIR)/message.o $(SEXPR_OBJS)
+$(BUILD_DIR)/test/wire_test: $(TEST_WIRE_OBJS) $(WIRE_OBJS) $(SEXPR_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
 -include $(SEXPR_OBJS:.o=.d) $(AGENT_OBJS:.o=.d) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS:.o=.d) \
-         $(ENGINE_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(CORE_OBJS:.o=.d) $(TEST_OBJS:.o=.d)
+         $(ENGINE_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(CORE_OBJS:.o=.d) $(TEST_OBJS:.o=.d) \
+         $(BUILD_DIR)/agent/agent.d
 
 # --- checks -----------------------------------------------------------------
 
@@ -309,6 +338,9 @@ vectors: $(SITU_MARK)
 check-docker: $(HULL)
 	BUILD_DIR='$(BUILD_DIR)' sh test/docker_test.sh '$(HULL)'
 
+check-qemu: $(HULL) $(AGENT_BIN) $(PROBE)
+	BUILD_DIR='$(BUILD_DIR)' sh test/qemu_test.sh '$(HULL)' '$(PROBE)'
+
 # The indentation and whitespace gate, shared verbatim with the sibling
 # projects; `docs` additionally holds project.md to the tree it describes.
 style: style-source style-docs
@@ -351,5 +383,6 @@ clean:
 	        $(AGENT_OBJS) $(AGENT_OBJS:.o=.d) $(AGENT_GEN) \
 	        $(SPEC_OBJS) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS) $(PLAN_OBJS:.o=.d) \
 	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) \
-	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) \
-	        $(CLI_TEST_FILES) $(PROBE) $(DOCKER_TEST_FILES)
+	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) \
+	        $(AGENT_BIN) $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d \
+	        $(CLI_TEST_FILES) $(PROBE) $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES)

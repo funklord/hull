@@ -1,5 +1,5 @@
 /*
- * wire.c -- the frontend protocol on a socket.
+ * wire.c -- the frontend protocol, or the agent's, on a socket.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "frontend_view.h"
+#include "protocol_view.h"
 #include "wire.h"
 
 int hull_wire_open(hull_wire *wire, int fd, hull_wire_from from)
@@ -64,11 +65,21 @@ static int valid(const hull_wire *wire, const hull_sexpr_doc *body)
 	situ_view_t view;
 
 	situ_msg_init(&msg, (uint8_t *)(uintptr_t)body->data, body->length);
-	if (wire->from == HULL_WIRE_FROM_CLIENT)
+	switch (wire->from) {
+	case HULL_WIRE_FROM_CLIENT:
 		return hull_frontend_client_message_view(&msg, 0u, body->length, &view) == SITU_OK &&
 		       hull_frontend_client_message_validate(view) == SITU_OK;
-	return hull_frontend_core_message_view(&msg, 0u, body->length, &view) == SITU_OK &&
-	       hull_frontend_core_message_validate(view) == SITU_OK;
+	case HULL_WIRE_FROM_CORE:
+		return hull_frontend_core_message_view(&msg, 0u, body->length, &view) == SITU_OK &&
+		       hull_frontend_core_message_validate(view) == SITU_OK;
+	case HULL_WIRE_FROM_HOST:
+		return hull_protocol_host_message_view(&msg, 0u, body->length, &view) == SITU_OK &&
+		       hull_protocol_host_message_validate(view) == SITU_OK;
+	case HULL_WIRE_FROM_AGENT:
+		return hull_protocol_agent_message_view(&msg, 0u, body->length, &view) == SITU_OK &&
+		       hull_protocol_agent_message_validate(view) == SITU_OK;
+	}
+	return 0;
 }
 
 hull_wire_status hull_wire_next(hull_wire *wire, hull_sexpr_doc *body)

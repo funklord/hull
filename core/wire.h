@@ -1,5 +1,6 @@
 /*
- * wire.h -- the frontend protocol on a socket (project.md section 4.10).
+ * wire.h -- a protocol of hull's on a socket: the frontend protocol
+ * (project.md section 4.10), or the guest agent's (Appendix B).
  *
  * Framing is the guest agent's (agent/framing.h), and every message read
  * is held to core/frontend.situ by situ's generated validator for its
@@ -26,6 +27,8 @@ extern "C" {
 typedef enum hull_wire_from {
 	HULL_WIRE_FROM_CLIENT,  /* the core reads what a frontend sends */
 	HULL_WIRE_FROM_CORE,    /* a frontend reads what the core sends */
+	HULL_WIRE_FROM_HOST,    /* the guest agent reads what the host sends */
+	HULL_WIRE_FROM_AGENT,   /* the host reads what the agent sends */
 } hull_wire_from;
 
 typedef struct hull_wire {
