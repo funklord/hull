@@ -124,7 +124,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  writable.conf readonly.conf die.conf wait.conf ports.conf noargs.conf nope.conf \
                  pair.conf rootfs/written vol.conf volro.conf vollink.conf \
                  volmissing.conf volhost.conf pid.conf keep.conf gone.conf execd.conf attach.out \
-                 killd.conf killd.out flowd.conf held.out spewd.conf behind.out lost.err \
+                 killd.conf killd.out flowd.conf held.out spewd.conf behind.out lost.err told.out \
                  data/in data/out rootfs/mnt-link) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
@@ -136,7 +136,8 @@ DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf vol
 # What test/qemu_test.sh writes.
 QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.conf write.conf \
                   readonly.conf vol.conf volro.conf trap.conf trap.out wait.conf kept.conf \
-                  emu.conf rootfs/probe rootfs/written data/in data/out)
+                  emu.conf execd.conf held.out xtrap.out xstop.out rootfs/probe \
+                  rootfs/written data/in data/out)
 
 # The reference engine's test rootfs holds one static program.
 PROBE = $(BUILD_DIR)/test/cli/rootfs/probe

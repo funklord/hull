@@ -797,6 +797,7 @@ Open:
 
 - **Whether a foreground `hull run` holds its machine back** for a reader that falls behind, as a pipe would, rather than losing what leaves the log. See *A machine's output is read from its log* above.
 - **Moving onto the shared encrypted protocol**, when that is settled.
+- **The case of a core told to go failed once, intermittently,** with the frontend's 125, "the core went away", where 143 was wanted. It passed eight times of eight alone and in every other suite run, about a dozen, and reading the shutdown path found no race. The case now keeps the frontend's output and `core.log`, so a failure says more. Unexplained.
 
 **Measured:**
 
@@ -914,13 +915,25 @@ Open:
 **What it declares** is what that does: a dir source in place, `command`, `workdir`, `env`, `hostname`, `volumes`, `cpus`, `memory`, `readonly_root`, `no_new_privs`, both `on_disconnect` values and `emu.cores_scale`, with the two emulated defaults above.
 - **What it no longer declares:** image refs, overlays, ports, ssh, secrets, media, device passthrough, the full profile and the other kernels. The draft declared all of these from §5 and §6 before any of it was written, the way docker's did.
 - **The cost:** §4's example, which has an image source, a port and `(ssh true)`, is refused on vm and emu for those three. A foreign arch is refused on emu.
-- **Not written yet:** exec, a terminal, credit on the agent's channels, logs from the guest, and stats. `hull exec` on a qemu machine says so.
+- **Not written yet:** logs and stats from the guest, and `adopt()`.
 
-**Measured,** in `test/qemu_test.sh`, which `make check-qemu` runs, since `make check` needs no KVM. Its 29 cases:
+**`hull exec` on a qemu machine is a channel of the agent's,** which the engine allocates per exec.
+- **The command** gets the machine's environment, workdir and `no_new_privs`, on pipes or on a pseudo-terminal of the machine's own. The agent mounts `devpts` for that. A terminal is the command's controlling terminal, of the size the request gives.
+- **B.3's `exec` carries the size now:** `(tty (cols n) (rows n))` or `(tty false)`. B.3 had `(tty true)` with the size sent after in a `winch`, which the frontend protocol had already found reads 80 by 24 first (§4.10). The schema was changed to the frontend's spelling, and `(tty true)` is a refused vector.
+- **Output flows on B.2's credit,** 64 KiB to start. The engine's reader queues what arrives and never waits. Each stream's own thread hands it to `on_data`, which may wait while the frontend is behind, and gives the agent credit back once it has. So a frontend that falls behind holds back its own command and nothing else: the agent does not read a channel out of credit, and the command blocks writing, as on a pipe. A stream queues at most the agent's 64 KiB.
+- **stdin flows on the agent's credit the other way.** The agent gives the host 64 KiB, writes from a ring as the command's pipe takes it, and gives credit back as it does. It says `eof` once the command's input has closed. `stream_write` waits for credit, and `stream_eof` ends the wait. An `eof` on a terminal ends nothing, as in chroot.
+- **The exit is said once the output has been read,** as for the workload, so nothing the command wrote is lost behind it.
+- **`stream_close`** has the agent SIGKILL the command and waits for its exit. Every exec the agent has not reported when the connection ends is reported as SIGKILL, 137: a machine that stops takes its commands, and their frontends hear it at once.
+- **Signals and resizes** are the agent's `signal` and `winch` on the exec's channel.
+
+**Measured,** in `test/qemu_test.sh`, which `make check-qemu` runs, since `make check` needs no KVM. Its 44 cases:
 - **One boot,** and every line it prints checked: output on both streams kept apart, the exit status, env, workdir, hostname, uid 0, `no_new_privs`, a session of its own, two CPUs, 256 MiB, and the KVM clock.
 - **How a machine ends:** death by a signal, 143, and a missing command, 127 with the reason.
 - **Writes:** a write landing in the directory as the user's file, a read-only root, and volumes read-write and read-only.
 - **A running machine:** listed by `ps`, a TERM through `hull kill` caught by the workload, SIGTERM to `hull run` stopping the machine with 143, and qemu dying with a SIGKILLed core.
+- **exec,** in a machine of its own: the machine's environment and hostname, a status, a missing command 127, stdin ended by `/dev/null`, 588,895 bytes of stdin by length and FNV-1a hash, 300 kB to a command that sleeps six seconds first, and 3 MB to one that sleeps three.
+- **exec's output:** 3 MB counted against the same probe on the host, and 20 MB to a reader seven seconds behind arriving whole. Meanwhile the command is held, the machine counting one process more two seconds in, and another exec answers within three seconds.
+- **exec's terminal and its ends:** a terminal of 100 by 30, spoken by hand, its controlling terminal, resized to 120 by 40; a TERM to `hull exec` caught by the command; a frontend SIGKILLed taking its command with it, the machine counting as many processes after; and an exec in a machine that stops ending 137 at once.
 - **The emu class** under TCG, without the KVM clock.
 - **Nothing left:** no qemu of the suite's and no machine directory, the dead core's included.
 
@@ -930,6 +943,21 @@ Open:
 - **Read-only, root and volume,** each broken on both sides together: qemu's `readonly=on` and the agent's read-only mount. Either alone holds.
 - **qemu's death signal** first passed. A core that dies closes its vsock connection, and the agent then stops the machine and powers off within the same second, which is `(on_disconnect stop)` doing its job. With both removed, the machine outlived its core and the case failed. Each alone holds.
 - **Untested:** retrying a vsock context id that is taken, which a test cannot make happen on purpose.
+
+**Sabotage of exec,** baseline first, the same way. Breaking each of these failed a named case:
+- the agent holding output to its credit, at both of its checks;
+- the host giving output credit back;
+- the agent giving stdin credit back;
+- `eof` ending the input;
+- the exit waiting for the output;
+- the terminal's first size, and the resize on either side;
+- a signal going to its own channel;
+- an exec getting the machine's environment;
+- `stream_close` killing the command.
+
+Breaking the SIGKILL reported for streams whose agent has gone hung the stopped-machine case, and the suite ran out its time. Two needed more:
+- **The host waiting for the agent's stdin credit** first passed. Its largest input to a command not reading was 300 kB, which arrived whole anyway. Tried by hand, 3 MB to a command sleeping three seconds arrived as 131,072 bytes, the rest refused as more input than the credit. That is now a case, and it fails. The same broken engine also delivered 1,174,207 bytes for `seq 1 200000`'s 588,895, about twice. No cause was found, and no path for intact code to overrun the agent's ring was found either. Unexplained, and seen only with the engine broken.
+- **`TIOCSCTTY` removed** passed and cannot fail. On Linux a session leader that opens a terminal without `O_NOCTTY` gets it as its controlling terminal, so the open already does what the ioctl says. It is kept for saying so.
 
 ---
 
@@ -1201,7 +1229,7 @@ The framing is generated by situ from `agent/message.situ`: its frame layer turn
 | `(hello (ch 0) (features name…) (proto n))` | `(hello (agent_version v) (ch 0) (features name…) (proto n))` | version/feature negotiation; lowest common `proto` wins |
 | `(spec (ch 0) (machine …))` | `(ready (ch 0))` / `(error (ch n) (reason r))` | apply the resolved `hull.conf` before start |
 | `(start (ch 0))` | `(started (ch n) (pid n))` … later `(exited (ch n) (code n) (signal n))` | run the workload |
-| `(exec (argv word…) (ch n) (cwd p)? (env (NAME v)…)? (tty true\|false) (user u)?)` | `started` / `exited` on that channel | `hull exec` |
+| `(exec (argv word…) (ch n) (cwd p)? (env (NAME v)…)? (tty false\|((cols n) (rows n))) (user u)?)` | `started` / `exited` on that channel | `hull exec` |
 | `(data (buf bytes) (ch n) (fd 0))` / `(eof (ch n))` | `(data (buf bytes) (ch n) (fd 1\|2))` / `(eof (ch n))` | stdio streaming |
 | `(winch (ch n) (cols n) (rows n))` | — | tty resize |
 | `(signal (ch n) (signal name))` | — | forward a signal: channel 0 to the workload, any other to its exec |

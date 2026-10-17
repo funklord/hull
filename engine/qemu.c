@@ -26,6 +26,15 @@
  *
  * The kernel is the host's, standing in for Appendix F's bundled one, so
  * vm.kernel.bundled is declared emulated and says so.
+ *
+ * An exec is a channel of the agent's. Its output flows on B.2's credit:
+ * the reader queues what arrives, never waiting, and a thread of the
+ * stream's own hands it to on_data, which may wait while the frontend is
+ * behind, and gives the agent credit back once it has. So one slow
+ * frontend holds back its own command and nothing else, and a stream
+ * queues at most the agent's 64 KiB. Its stdin flows on the agent's
+ * credit the other way: stream_write waits for credit, which
+ * stream_eof can end.
  */
 
 #define _GNU_SOURCE
@@ -61,6 +70,16 @@
 #define AGENT_PORT   1u
 #define BOOT_LIMIT   60   /* seconds for the agent to answer, TCG included */
 #define CID_TRIES    4
+#define MAX_STREAMS  64u
+#define WINDOW       65536u  /* what the agent gives, and is given, each way */
+
+/* A piece of an exec's output, queued for its stream's thread. */
+typedef struct piece {
+	struct piece *next;
+	int           fd;
+	size_t        length;
+	uint8_t       bytes[];
+} piece;
 
 struct hull_machine {
 	hull_core       *core;
@@ -89,6 +108,29 @@ struct hull_machine {
 	int              code;
 	int              signal;
 	char             detail[512];
+
+	hull_stream     *streams[MAX_STREAMS];  /* under `lock` */
+	uint32_t         next_ch;
+};
+
+struct hull_stream {
+	hull_machine   *machine;
+	hull_core      *core;
+	uint32_t        ch;
+	int             tty;
+	pthread_t       deliverer;
+	pthread_cond_t  changed;      /* under the machine's lock, as all of this */
+	piece          *head;
+	piece          *tail;
+	int             answered;     /* started or an error has come */
+	char            refusal[256]; /* the error, if one did */
+	int             exited;       /* the agent said how the command ended */
+	int             code;
+	int             signal;
+	int             lost;         /* the connection went first */
+	size_t          credit;       /* stdin the agent will take */
+	int             ending;       /* stream_eof() */
+	int             input_closed; /* the agent said the command's input closed */
 };
 
 static const hull_host_ops *host;
@@ -672,6 +714,72 @@ static void reap(hull_machine *m)
 	pthread_mutex_unlock(&m->lock);
 }
 
+static hull_stream *stream_on(hull_machine *m, long long ch)
+{
+	for (unsigned i = 0u; i < MAX_STREAMS; i++)
+		if (m->streams[i] != NULL && (long long)m->streams[i]->ch == ch)
+			return m->streams[i];
+	return NULL;
+}
+
+/* A message on an exec's channel, from the reader: queued or noted under
+ * the lock, never waiting. */
+static void for_stream(hull_machine *m, const hull_sexpr_doc *body, long long ch)
+{
+	hull_stream    *st;
+	hull_sexpr_form value;
+	long long       number;
+
+	pthread_mutex_lock(&m->lock);
+	st = stream_on(m, ch);
+	if (st == NULL) {
+		pthread_mutex_unlock(&m->lock);
+		return;
+	}
+	if (hull_msg_is(body, "data")) {
+		hull_sexpr_form buf;
+		hull_sexpr_form fd;
+		piece          *p;
+
+		if (hull_msg_find(body, "buf", &buf) && hull_msg_find(body, "fd", &fd) &&
+		    (p = malloc(sizeof *p + buf.content_length)) != NULL) {
+			p->next   = NULL;
+			p->fd     = hull_sexpr_is(body, &fd, "2") ? 2 : 1;
+			p->length = buf.content_length;
+			memcpy(p->bytes, body->data + buf.content, buf.content_length);
+			if (st->tail != NULL)
+				st->tail->next = p;
+			else
+				st->head = p;
+			st->tail = p;
+		}
+	} else if (hull_msg_is(body, "started")) {
+		st->answered = 1;
+	} else if (hull_msg_is(body, "error")) {
+		if (!st->answered) {
+			st->answered = 1;
+			st->lost     = 1;
+			if (!hull_msg_find(body, "reason", &value) ||
+			    !hull_msg_string(body, &value, st->refusal, sizeof st->refusal))
+				snprintf(st->refusal, sizeof st->refusal, "the agent refused the exec");
+		}
+	} else if (hull_msg_is(body, "exited")) {
+		st->exited = 1;
+		if (hull_msg_find(body, "code", &value) && hull_msg_long(body, &value, &number))
+			st->code = (int)number;
+		if (hull_msg_find(body, "signal", &value) && hull_msg_long(body, &value, &number))
+			st->signal = (int)number;
+	} else if (hull_msg_is(body, "credit")) {
+		if (hull_msg_find(body, "bytes", &value) && hull_msg_long(body, &value, &number) &&
+		    number > 0)
+			st->credit += (size_t)number;
+	} else if (hull_msg_is(body, "eof")) {
+		st->input_closed = 1;
+	}
+	pthread_cond_broadcast(&st->changed);
+	pthread_mutex_unlock(&m->lock);
+}
+
 static void *read_agent(void *arg)
 {
 	hull_machine *m = arg;
@@ -686,7 +794,10 @@ static void *read_agent(void *arg)
 			continue;
 		if (status != HULL_WIRE_OK)
 			break;
-		if (hull_msg_is(&body, "data")) {
+		if (hull_msg_find(&body, "ch", &value) && hull_msg_long(&body, &value, &number) &&
+		    number != 0) {
+			for_stream(m, &body, number);
+		} else if (hull_msg_is(&body, "data")) {
 			hull_sexpr_form buf;
 			hull_sexpr_form fd;
 
@@ -704,6 +815,16 @@ static void *read_agent(void *arg)
 	pthread_mutex_lock(&m->send_lock);
 	m->connected = 0;
 	pthread_mutex_unlock(&m->send_lock);
+	/* The agent has gone: every exec it had not reported ended with the
+	 * machine, as a SIGKILL. */
+	pthread_mutex_lock(&m->lock);
+	for (unsigned i = 0u; i < MAX_STREAMS; i++) {
+		if (m->streams[i] != NULL) {
+			m->streams[i]->lost = 1;
+			pthread_cond_broadcast(&m->streams[i]->changed);
+		}
+	}
+	pthread_mutex_unlock(&m->lock);
 	reap(m);
 	if (m->exited && m->signal != 0) {
 		host->on_exit(m->core, m, NULL, -1, m->signal);
@@ -980,13 +1101,13 @@ static hull_status qemu_signal(hull_core *core, hull_machine *m, hull_stream *st
 	hull_msg msg = { 0 };
 
 	(void)core;
-	if (stream != NULL)
-		return fail(error, HULL_ERR_UNSUPPORTED, "the qemu engine has no exec yet");
 	if (!m->started || wait_done(m, 0))
 		return fail(error, HULL_ERR_GONE, "the machine is not running");
 	for (unsigned i = 0u; i < sizeof signal_names / sizeof signal_names[0]; i++) {
 		if (signal_names[i].number == signum) {
-			hull_msg_raw(&msg, "(6:signal(2:ch1:0)(6:signal");
+			hull_msg_raw(&msg, "(6:signal");
+			hull_msg_channel(&msg, stream != NULL ? stream->ch : 0u);
+			hull_msg_raw(&msg, "(6:signal");
 			hull_msg_text(&msg, signal_names[i].name);
 			hull_msg_raw(&msg, "))");
 			send_msg(m, &msg);
@@ -994,6 +1115,261 @@ static hull_status qemu_signal(hull_core *core, hull_machine *m, hull_stream *st
 		}
 	}
 	return fail(error, HULL_ERR_UNSUPPORTED, "not a signal the agent forwards");
+}
+
+/* --- exec --------------------------------------------------------------- */
+
+static void send_credit(hull_machine *m, uint32_t ch, size_t bytes)
+{
+	hull_msg msg = { 0 };
+
+	hull_msg_raw(&msg, "(6:credit(5:bytes");
+	hull_msg_number(&msg, (long long)bytes);
+	hull_msg_raw(&msg, ")");
+	hull_msg_channel(&msg, ch);
+	hull_msg_raw(&msg, ")");
+	send_msg(m, &msg);
+}
+
+/* The stream's own thread: its output to on_data, credit back to the
+ * agent once each piece has gone, then its exit, once. */
+static void *deliver(void *arg)
+{
+	hull_stream  *st = arg;
+	hull_machine *m  = st->machine;
+
+	for (;;) {
+		piece *p;
+
+		pthread_mutex_lock(&m->lock);
+		while (st->head == NULL && !st->exited && !st->lost)
+			pthread_cond_wait(&st->changed, &m->lock);
+		p = st->head;
+		if (p != NULL) {
+			st->head = p->next;
+			if (st->head == NULL)
+				st->tail = NULL;
+		}
+		pthread_mutex_unlock(&m->lock);
+		if (p == NULL)
+			break;
+		host->on_data(st->core, st, p->fd, p->bytes, p->length);
+		send_credit(m, st->ch, p->length);
+		free(p);
+	}
+	if (st->exited && st->signal != 0)
+		host->on_exit(st->core, m, st, -1, st->signal);
+	else if (st->exited)
+		host->on_exit(st->core, m, st, st->code, 0);
+	else if (st->answered)
+		host->on_exit(st->core, m, st, -1, SIGKILL);
+	return NULL;
+}
+
+static void free_stream(hull_stream *st)
+{
+	while (st->head != NULL) {
+		piece *next = st->head->next;
+
+		free(st->head);
+		st->head = next;
+	}
+	pthread_cond_destroy(&st->changed);
+	free(st);
+}
+
+/* The core's request, `(exec (argv ...) (ch n) (machine id) (tty ...))`,
+ * as the agent's: the argv, a channel of this machine's, the terminal. */
+static hull_status qemu_exec(hull_core *core, hull_machine *m, hull_buf spec, hull_stream **out,
+                             hull_error *error)
+{
+	hull_sexpr_doc  doc;
+	hull_sexpr_form message;
+	hull_sexpr_form argv;
+	hull_stream    *st;
+	hull_msg        msg = { 0 };
+	unsigned        slot = MAX_STREAMS;
+	int             cols = 0;
+	int             rows = 0;
+	struct timespec deadline;
+
+	if (!m->started || wait_done(m, 0))
+		return fail(error, HULL_ERR_GONE, "the machine is not running");
+	if (hull_sexpr_open(&doc, spec.data, spec.len, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
+	    !hull_sexpr_first(&doc, &message) || !hull_access_find(&doc, &message, "argv", &argv))
+		return fail(error, HULL_ERR_UNSUPPORTED, "an exec names a command");
+	st = calloc(1u, sizeof *st);
+	if (st == NULL)
+		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+	st->machine = m;
+	st->core    = core;
+	st->tty     = hull_access_terminal(&doc, &message, &cols, &rows);
+	pthread_cond_init(&st->changed, NULL);
+
+	pthread_mutex_lock(&m->lock);
+	for (unsigned i = 0u; i < MAX_STREAMS && slot == MAX_STREAMS; i++)
+		if (m->streams[i] == NULL)
+			slot = i;
+	if (slot < MAX_STREAMS) {
+		st->ch = ++m->next_ch;
+		m->streams[slot] = st;
+	}
+	pthread_mutex_unlock(&m->lock);
+	if (slot == MAX_STREAMS) {
+		free_stream(st);
+		return fail(error, HULL_ERR_BUSY, "the machine runs as many commands as it can");
+	}
+
+	hull_msg_raw(&msg, "(4:exec");
+	hull_msg_bytes(&msg, doc.data + argv.offset, argv.extent);
+	hull_msg_channel(&msg, st->ch);
+	if (st->tty) {
+		hull_msg_raw(&msg, "(3:tty(4:cols");
+		hull_msg_number(&msg, cols);
+		hull_msg_raw(&msg, ")(4:rows");
+		hull_msg_number(&msg, rows);
+		hull_msg_raw(&msg, ")))");
+	} else {
+		hull_msg_raw(&msg, "(3:tty5:false))");
+	}
+	send_msg(m, &msg);
+
+	/* started, or the agent's reason not to, within ten seconds. */
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec += 10;
+	pthread_mutex_lock(&m->lock);
+	while (!st->answered && !st->lost &&
+	       pthread_cond_timedwait(&st->changed, &m->lock, &deadline) == 0)
+		;
+	if (!st->answered || st->refusal[0] != '\0') {
+		m->streams[slot] = NULL;
+		snprintf(m->detail, sizeof m->detail, "%s",
+		         st->refusal[0] != '\0' ? st->refusal : "the agent did not start the command");
+		pthread_mutex_unlock(&m->lock);
+		free_stream(st);
+		return fail(error, HULL_ERR_RUNTIME, m->detail);
+	}
+	pthread_mutex_unlock(&m->lock);
+	if (pthread_create(&st->deliverer, NULL, deliver, st) != 0) {
+		/* Nothing will deliver it: the command is ended, unseen. */
+		pthread_mutex_lock(&m->lock);
+		m->streams[slot] = NULL;
+		pthread_mutex_unlock(&m->lock);
+		hull_msg_raw(&msg, "(6:signal");
+		hull_msg_channel(&msg, st->ch);
+		hull_msg_raw(&msg, "(6:signal7:SIGKILL))");
+		send_msg(m, &msg);
+		free_stream(st);
+		return fail(error, HULL_ERR_INTERNAL, "the stream's thread could not start");
+	}
+	*out = st;
+	return HULL_OK;
+}
+
+/* stdin, written whole however long the command takes, on the agent's
+ * credit; stream_eof() from another thread ends the wait. */
+static hull_status qemu_stream_write(hull_core *core, hull_stream *st, const uint8_t *data,
+                                     size_t length, hull_error *error)
+{
+	hull_machine *m = st->machine;
+
+	(void)core;
+	while (length > 0u) {
+		hull_msg msg = { 0 };
+		size_t   n;
+
+		pthread_mutex_lock(&m->lock);
+		while (st->credit == 0u && !st->ending && !st->input_closed && !st->lost &&
+		       !st->exited)
+			pthread_cond_wait(&st->changed, &m->lock);
+		if (st->ending || st->input_closed || st->lost || st->exited) {
+			pthread_mutex_unlock(&m->lock);
+			return fail(error, HULL_ERR_GONE, "the command's input has closed");
+		}
+		n = length < st->credit ? length : st->credit;
+		st->credit -= n;
+		pthread_mutex_unlock(&m->lock);
+		hull_msg_raw(&msg, "(4:data(3:buf");
+		hull_msg_atom(&msg, data, n);
+		hull_msg_raw(&msg, ")");
+		hull_msg_channel(&msg, st->ch);
+		hull_msg_raw(&msg, "(2:fd1:0))");
+		send_msg(m, &msg);
+		data += n;
+		length -= n;
+	}
+	return HULL_OK;
+}
+
+static hull_status qemu_stream_eof(hull_core *core, hull_stream *st, hull_error *error)
+{
+	hull_machine *m = st->machine;
+	hull_msg      msg = { 0 };
+	int           first;
+
+	(void)core;
+	(void)error;
+	pthread_mutex_lock(&m->lock);
+	first = !st->ending;
+	st->ending = 1;
+	pthread_cond_broadcast(&st->changed);
+	pthread_mutex_unlock(&m->lock);
+	if (first) {
+		hull_msg_raw(&msg, "(3:eof");
+		hull_msg_channel(&msg, st->ch);
+		hull_msg_raw(&msg, ")");
+		send_msg(m, &msg);
+	}
+	return HULL_OK;
+}
+
+static hull_status qemu_resize(hull_core *core, hull_stream *st, int rows, int cols,
+                               hull_error *error)
+{
+	hull_msg msg = { 0 };
+
+	(void)core;
+	if (st == NULL)
+		return fail(error, HULL_ERR_UNSUPPORTED, "a machine's workload has no terminal");
+	if (!st->tty)
+		return fail(error, HULL_ERR_UNSUPPORTED, "the command has no terminal");
+	hull_msg_raw(&msg, "(5:winch");
+	hull_msg_channel(&msg, st->ch);
+	hull_msg_raw(&msg, "(4:cols");
+	hull_msg_number(&msg, cols);
+	hull_msg_raw(&msg, ")(4:rows");
+	hull_msg_number(&msg, rows);
+	hull_msg_raw(&msg, "))");
+	send_msg(st->machine, &msg);
+	return HULL_OK;
+}
+
+/* Ends the command, if it has not ended, and frees the stream; its exit
+ * has been reported by then. */
+static hull_status qemu_stream_close(hull_core *core, hull_stream *st, hull_error *error)
+{
+	hull_machine *m = st->machine;
+	hull_msg      msg = { 0 };
+	int           over;
+
+	qemu_stream_eof(core, st, error);
+	pthread_mutex_lock(&m->lock);
+	over = st->exited || st->lost;
+	pthread_mutex_unlock(&m->lock);
+	if (!over) {
+		hull_msg_raw(&msg, "(6:signal");
+		hull_msg_channel(&msg, st->ch);
+		hull_msg_raw(&msg, "(6:signal7:SIGKILL))");
+		send_msg(m, &msg);
+	}
+	pthread_join(st->deliverer, NULL);
+	pthread_mutex_lock(&m->lock);
+	for (unsigned i = 0u; i < MAX_STREAMS; i++)
+		if (m->streams[i] == st)
+			m->streams[i] = NULL;
+	pthread_mutex_unlock(&m->lock);
+	free_stream(st);
+	return HULL_OK;
 }
 
 /* --- the declaration ----------------------------------------------------- */
@@ -1057,7 +1433,12 @@ static const hull_engine_ops ops = {
 	.start       = qemu_start,
 	.stop        = qemu_stop,
 	.destroy     = qemu_destroy,
-	.signal      = qemu_signal,
+	.exec         = qemu_exec,
+	.stream_write = qemu_stream_write,
+	.stream_eof   = qemu_stream_eof,
+	.stream_close = qemu_stream_close,
+	.resize       = qemu_resize,
+	.signal       = qemu_signal,
 };
 
 static const hull_engine engine = {

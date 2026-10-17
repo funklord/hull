@@ -17,8 +17,8 @@ host_message start 28 35 3A 73 74 61 72 74 28 32 3A 63 68 31 3A 30 29 29
 # exec_min: (4:exec(4:argv2:ls)(2:ch1:3)(3:tty5:false))
 host_message exec_min 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 6C 73 29 28 32 3A 63 68 31 3A 33 29 28 33 3A 74 74 79 35 3A 66 61 6C 73 65 29 29
 
-# exec_full: (4:exec(4:argv2:ls2:-l)(2:ch1:3)(3:cwd4:/srv)(3:env(4:LANG1:C))(3:tty4:true)(4:user3:app))
-host_message exec_full 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 6C 73 32 3A 2D 6C 29 28 32 3A 63 68 31 3A 33 29 28 33 3A 63 77 64 34 3A 2F 73 72 76 29 28 33 3A 65 6E 76 28 34 3A 4C 41 4E 47 31 3A 43 29 29 28 33 3A 74 74 79 34 3A 74 72 75 65 29 28 34 3A 75 73 65 72 33 3A 61 70 70 29 29
+# exec_full: (4:exec(4:argv2:ls2:-l)(2:ch1:3)(3:cwd4:/srv)(3:env(4:LANG1:C))(3:tty(4:cols2:80)(4:rows2:24))(4:user3:app))
+host_message exec_full 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 6C 73 32 3A 2D 6C 29 28 32 3A 63 68 31 3A 33 29 28 33 3A 63 77 64 34 3A 2F 73 72 76 29 28 33 3A 65 6E 76 28 34 3A 4C 41 4E 47 31 3A 43 29 29 28 33 3A 74 74 79 28 34 3A 63 6F 6C 73 32 3A 38 30 29 28 34 3A 72 6F 77 73 32 3A 32 34 29 29 28 34 3A 75 73 65 72 33 3A 61 70 70 29 29
 
 # exec_user: (4:exec(4:argv2:id)(2:ch1:4)(3:tty5:false)(4:user4:root))
 host_message exec_user 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 69 64 29 28 32 3A 63 68 31 3A 34 29 28 33 3A 74 74 79 35 3A 66 61 6C 73 65 29 28 34 3A 75 73 65 72 34 3A 72 6F 6F 74 29 29

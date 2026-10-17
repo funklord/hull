@@ -697,7 +697,7 @@ fi
 # A core told to go stops its machines first, and their frontends hear
 # how each ended: the probe's 143 for the TERM, not "the core went away".
 cases=$((cases + 1))
-(cd / && exec timeout -k 2 20 "$hull_abs" run -f "$root/keep.conf" > /dev/null 2>&1) &
+(cd / && exec timeout -k 2 20 "$hull_abs" run -f "$root/keep.conf" > "$root/told.out" 2>&1) &
 keeper=$!
 tries=0
 until "$hull" ps 2>/dev/null | grep -q '^kept .*running$' || [ "$tries" -ge 40 ]; do
@@ -708,7 +708,8 @@ core=$(head -1 "$XDG_RUNTIME_DIR/hull/core.lock" 2>/dev/null)
 [ -n "$core" ] && kill -TERM "$core"
 wait "$keeper"
 got=$?
-[ "$got" = 143 ] || fail "a frontend whose core was told to go exited $got, wanted 143" ""
+[ "$got" = 143 ] || fail "a frontend whose core was told to go exited $got, wanted 143" \
+	"core $core; $(cat "$root/told.out"); core.log: $(cat "$XDG_RUNTIME_DIR/hull/core.log")"
 
 # What cannot be planned or started is 125, and says why.
 conf ports '(command "/probe") (ports (port (host 8080) (guest 80)))'

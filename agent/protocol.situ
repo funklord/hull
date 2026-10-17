@@ -124,19 +124,29 @@ struct exec {
 	u8  close  [must_eq = ')'];
 }
 
-// `(tty true)` or `(tty false)`.
+// `(tty false)`, or a terminal of a size: `(tty (cols n) (rows n))`. B.3
+// first said `(tty true)`, with the size in a `winch` after; a command
+// that reads its size at once then reads the default first, as the
+// frontend protocol found (project.md section 4.10).
 struct tty_entry {
 	preamble u8[6] = "(3:tty";
-	peek u8  length;
-	variant value switch (length) {
-		case '4':  yes  on;
-		case '5':  no   off;
+	peek u8  next;
+	variant value switch (next) {
+		case '(':  window  size;
+		case '5':  no      off;
 		default:   error;
 	}
 	u8  close  [must_eq = ')'];
 }
 
-struct yes { preamble u8[6] = "4:true"; }
+struct window {
+	preamble u8[7] = "(4:cols";
+	atom  cols;
+	preamble u8[8] = ")(4:rows";
+	atom  rows;
+	u8  close  [must_eq = ')'];
+}
+
 struct no  { preamble u8[7] = "5:false"; }
 
 // The workload's or an exec's stdin: always fd 0.

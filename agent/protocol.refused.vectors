@@ -10,14 +10,18 @@ host_message exec_no_tty 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 6C 73 2
 # exec_tty_yes: (4:exec(4:argv2:ls)(2:ch1:3)(3:tty3:yes))
 host_message exec_tty_yes 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 6C 73 29 28 32 3A 63 68 31 3A 33 29 28 33 3A 74 74 79 33 3A 79 65 73 29 29
 
-# exec_unsorted: (4:exec(2:ch1:3)(4:argv2:ls)(3:tty4:true))
-host_message exec_unsorted 28 34 3A 65 78 65 63 28 32 3A 63 68 31 3A 33 29 28 34 3A 61 72 67 76 32 3A 6C 73 29 28 33 3A 74 74 79 34 3A 74 72 75 65 29 29
+# exec_tty_true: (4:exec(4:argv2:ls)(2:ch1:3)(3:tty4:true))
+# B.3's first spelling, a terminal with no size, is refused.
+host_message exec_tty_true 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 6C 73 29 28 32 3A 63 68 31 3A 33 29 28 33 3A 74 74 79 34 3A 74 72 75 65 29 29
 
-# exec_cwx: (4:exec(4:argv2:ls)(2:ch1:3)(3:cwx1:/)(3:tty4:true))
-host_message exec_cwx 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 6C 73 29 28 32 3A 63 68 31 3A 33 29 28 33 3A 63 77 78 31 3A 2F 29 28 33 3A 74 74 79 34 3A 74 72 75 65 29 29
+# exec_unsorted: (4:exec(2:ch1:3)(4:argv2:ls)(3:tty5:false))
+host_message exec_unsorted 28 34 3A 65 78 65 63 28 32 3A 63 68 31 3A 33 29 28 34 3A 61 72 67 76 32 3A 6C 73 29 28 33 3A 74 74 79 35 3A 66 61 6C 73 65 29 29
 
-# exec_usr: (4:exec(4:argv2:ls)(2:ch1:3)(3:tty4:true)(3:usr1:x))
-host_message exec_usr 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 6C 73 29 28 32 3A 63 68 31 3A 33 29 28 33 3A 74 74 79 34 3A 74 72 75 65 29 28 33 3A 75 73 72 31 3A 78 29 29
+# exec_cwx: (4:exec(4:argv2:ls)(2:ch1:3)(3:cwx1:/)(3:tty5:false))
+host_message exec_cwx 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 6C 73 29 28 32 3A 63 68 31 3A 33 29 28 33 3A 63 77 78 31 3A 2F 29 28 33 3A 74 74 79 35 3A 66 61 6C 73 65 29 29
+
+# exec_usr: (4:exec(4:argv2:ls)(2:ch1:3)(3:tty5:false)(3:usr1:x))
+host_message exec_usr 28 34 3A 65 78 65 63 28 34 3A 61 72 67 76 32 3A 6C 73 29 28 32 3A 63 68 31 3A 33 29 28 33 3A 74 74 79 35 3A 66 61 6C 73 65 29 28 33 3A 75 73 72 31 3A 78 29 29
 
 # data_fd_1: (4:data(3:buf1:x)(2:ch1:3)(2:fd1:1))
 host_message data_fd_1 28 34 3A 64 61 74 61 28 33 3A 62 75 66 31 3A 78 29 28 32 3A 63 68 31 3A 33 29 28 32 3A 66 64 31 3A 31 29 29

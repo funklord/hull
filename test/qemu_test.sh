@@ -172,6 +172,137 @@ took=$(($(date +%s) - started))
 [ "$got" = 143 ] && [ "$took" -lt 10 ] ||
 	fail "SIGTERM to hull run ended a vm with $got after ${took}s, wanted 143" ""
 
+# exec: commands in a running machine, each on a channel of the agent's.
+# The machine sleeps rather than waits, since these take longer than
+# wait's twenty seconds.
+conf execd '(backend vm) (hostname "qexec") (env (GREETING "hi")) (command "/probe" "sleep" "120")'
+(cd / && exec timeout -k 2 140 "$hull" run -f "$root/execd.conf" > /dev/null 2>&1) &
+execer=$!
+await qexec
+xcase() { # STATUS PATTERN COMMAND...: an exec, as has() checks a boot
+	want=$1
+	pattern=$2
+	shift 2
+	name="exec $*"
+	out=$(timeout 30 "$@" 2>&1)
+	got=$?
+	has "$want" "$pattern"
+}
+xcase 4 '^hello$' "$hull" exec qexec /probe say hello env GREETING host exit 4
+xcase 4 '^GREETING=hi$' "$hull" exec qexec /probe say hello env GREETING host exit 4
+xcase 4 '^host=qexec$' "$hull" exec qexec /probe say hello env GREETING host exit 4
+xcase 127 '/nope: No such file or directory' "$hull" exec qexec /nope
+xcase 0 '^stdin=\(none\)$' sh -c '"$0" exec qexec /probe stdin < /dev/null' "$hull"
+
+# stdin on the agent's credit: whole and in order, and to a command that
+# does not read for six seconds.
+want=$(seq 1 200000 | python3 -c 'import sys
+h = 2166136261
+data = sys.stdin.buffer.read()
+for b in data:
+	h = ((h ^ b) * 16777619) & 0xffffffff
+print("bytes=%d fnv=%08x" % (len(data), h))')
+xcase 0 "^$want\$" sh -c 'seq 1 200000 | "$0" exec qexec /probe count' "$hull"
+xcase 0 '^bytes=300000 ' sh -c 'head -c 300000 /dev/zero | "$0" exec qexec /probe sleep 6 count' "$hull"
+# Many times the agent's 64 KiB, to a command not reading: held on the
+# agent's credit, none of it refused.
+xcase 0 '^bytes=3000000 ' sh -c 'head -c 3000000 /dev/zero | "$0" exec qexec /probe sleep 3 count' "$hull"
+
+# Output on the host's credit: 3 MB whole, as the same probe on the host
+# writes it; 20 MB to a reader seven seconds behind, whole, while the
+# machine goes on serving another exec.
+want=$("$probe" spew 3000000 | "$probe" count)
+xcase 0 "^$want\$" sh -c '"$0" exec qexec /probe spew 3000000 | "$1" count' "$hull" "$probe"
+# Held, not read into the host: two seconds in, the machine counts one
+# process more, the command still writing.
+cases=$((cases + 1))
+before=$(timeout 10 "$hull" exec qexec /probe procs 2>&1)
+(timeout -k 2 30 "$hull" exec qexec /probe spew 20000000 | (sleep 7; wc -c) > "$root/held.out" 2>&1) &
+held=$!
+sleep 2
+during=$(timeout 10 "$hull" exec qexec /probe procs 2>&1)
+started=$(date +%s)
+out=$(timeout 10 "$hull" exec qexec /probe say free 2>&1)
+took=$(($(date +%s) - started))
+[ "${during#procs=}" = "$((${before#procs=} + 1))" ] && [ "$out" = free ] && [ "$took" -lt 3 ] ||
+	fail "a command whose reader is behind was not held, or the machine with it" \
+		"$before, then $during; $out after ${took}s"
+wait "$held"
+name="held"
+out=$(cat "$root/held.out")
+got=0
+has 0 '^20000000$'
+
+# A terminal of the size asked, resized; spoken by hand, as a frontend not
+# ours might, so that the sizes are the test's own.
+cases=$((cases + 1))
+out=$(timeout 20 python3 -c '
+import os, socket, struct, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(15)
+d = os.open(os.environ["XDG_RUNTIME_DIR"] + "/hull", os.O_PATH)
+s.connect("/proc/self/fd/%d/core.sock" % d)
+got = b""
+def say(m):
+	s.sendall(struct.pack(">I", len(m)) + m)
+def hear(text):
+	global got
+	while text not in got:
+		chunk = s.recv(4096)
+		if not chunk:
+			break
+		got += chunk
+say(b"(5:hello(2:ch1:0)(5:proto1:1))")
+say(b"(4:exec(4:argv6:/probe3:tty5:winch)(2:ch1:1)(7:machine5:qexec)(3:tty(4:cols3:100)(4:rows2:30)))")
+hear(b"ready")
+say(b"(5:winch(2:ch1:1)(4:cols3:120)(4:rows2:40))")
+hear(b"6:exited")
+print(got.decode("latin-1"))
+' 2>&1)
+printf '%s\n' "$out" | grep -q 'tty=yes' && printf '%s\n' "$out" | grep -q 'size=100x30' &&
+	printf '%s\n' "$out" | grep -q 'controlling=yes' && printf '%s\n' "$out" | grep -q 'size=120x40' ||
+	fail "a terminal was not of the size asked, or not resized" "$out"
+
+# A TERM to hull exec is the command's, which catches it and goes on.
+cases=$((cases + 1))
+(timeout -k 2 30 "$hull" exec qexec /probe trap say after > "$root/xtrap.out" 2>&1) &
+trapper=$!
+tries=0
+until grep -q '^ready$' "$root/xtrap.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+kill -TERM "$trapper"
+wait "$trapper"
+got=$?
+[ "$got" = 0 ] && grep -q '^signal=15$' "$root/xtrap.out" && grep -q '^after$' "$root/xtrap.out" ||
+	fail "a TERM to hull exec was not the command's to catch: $got" "$(cat "$root/xtrap.out")"
+
+# A frontend killed takes its command with it: the machine counts as many
+# processes after as before.
+cases=$((cases + 1))
+before=$(timeout 10 "$hull" exec qexec /probe procs 2>&1)
+head -c 2000000 /dev/zero | timeout -s KILL 2 "$hull" exec qexec /probe sleep 30 > /dev/null 2>&1
+sleep 1
+after=$(timeout 10 "$hull" exec qexec /probe procs 2>&1)
+[ -n "$before" ] && [ "$before" = "$after" ] ||
+	fail "a command outlived its killed frontend" "before $before, after $after"
+
+# A machine that stops takes its commands, and their frontends hear it at
+# once, 137.
+cases=$((cases + 1))
+(timeout -k 2 30 "$hull" exec qexec /probe sleep 30 > /dev/null 2>&1; echo $? > "$root/xstop.out") &
+waiter=$!
+sleep 1
+started=$(date +%s)
+timeout 20 "$hull" stop qexec > /dev/null 2>&1
+wait "$waiter"
+got=$(cat "$root/xstop.out")
+took=$(($(date +%s) - started))
+[ "$got" = 137 ] && [ "$took" -lt 8 ] ||
+	fail "an exec in a stopped machine ended $got after ${took}s, wanted 137 at once" ""
+wait "$execer" 2>/dev/null
+
 # A machine dies with its core: nothing could manage it after.
 conf kept '(backend vm) (hostname "qkept") (on_disconnect keep) (command "/probe" "wait")'
 cases=$((cases + 1))
