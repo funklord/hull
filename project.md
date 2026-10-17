@@ -721,6 +721,7 @@ The read-only volume had first passed: while the container ran as root, a write 
 | `(credit (bytes n) (ch n))` | | how much more of an exec's output the frontend will take |
 | `(winch (ch n) (cols n) (rows n))` | | its terminal resized |
 | `(signal (ch n) (signal HUP\|INT\|QUIT\|TERM\|USR1\|USR2\|KILL))` | | a signal for it |
+| | `(lost (bytes n) (ch n))` | output a follower fell too far behind to read |
 | | `(data (buf b) (ch n) (fd 1\|2))`, `(exited (ch n) (code n) (signal n))`, `(eof (ch n))`, `(error (ch n) (reason r))` | as B.3's |
 
 **The schema leaves these to the core:** that a channel is not 0 and not in use, that a machine id is a DNS label, that a terminal is 1 to 65535 in each direction, that a signal is one it forwards, and the elements of a run. situ frames `machines`' entries and the plan inside `run` without reading them. The refused vector `machine_no_state` is refused because the run's framing falls short, not because an entry was checked, and its comment says so.
@@ -732,7 +733,11 @@ The read-only volume had first passed: while the container ran as root, a write 
 - **Structure:** one thread owns the machine table and polls the socket, the clients and a wake pipe. Engines report from their own threads into a queue, so the table has one writer.
 - **Each machine gets its own `hull_core` to hand its engine,** because `on_data` names a core and not a machine. Its generation is carried on every event, so a last state an engine reports after an exit cannot land on a later machine in the same slot.
 - **A stop runs on a thread of its own,** since an engine's `stop` blocks for up to its timeout.
-- **What it keeps:** the newest 1 MiB of each machine's output, for `logs`, and every machine it has run, `exited` once it has, until a new run takes the slot or the core goes.
+- **What it keeps:** the newest 1 MiB of each machine's output, for `logs` and its followers, and every machine it has run, `exited` once it has, until a new run takes the slot or the core goes.
+- **Nothing it does waits on a frontend.** Each frontend's socket is non-blocking, and what it is sent waits in a queue of its own that `poll()` drains as the socket takes it. It used to be a blocking send that gave up after five seconds, so one frontend that stopped reading stopped the core for five seconds, every client and machine with it, and was then dropped. A frontend that leaves 8 MiB of answers unread is dropped. Nothing else can fill a queue that far, because an exec's output is bounded by its credit and a machine's output by its log (below).
+- **A machine's output is read from its log, by each follower at its own pace.** `run`, `attach` and `logs` are followers, each holding its place in the log, counted in bytes the machine has written. A follower is sent more only while less than 64 KiB of its frontend's queue waits. One that falls behind holds back neither the core nor the machine. It loses only what leaves the log before it reads it, and is told how much in a `lost`, between the data before and after. `hull` prints `hull: N bytes of output lost: this reader fell behind` on stderr. A follower hears the machine's `exited` once it has read to the end of the log.
+  - **Why the machine is not held back:** it has many followers, and the log is one of them. Holding the machine for the slowest would let one `attach` left in a stopped terminal stop the machine for everyone, and the log already drops output past 1 MiB. An exec's output is held instead (below), because it has one reader, which asked for it.
+  - **What it costs:** `hull run m | slow` loses output once `slow` is more than 1 MiB behind, where the same command on the host would be held by its pipe. Holding the machine back for the frontend that ran it, and for nobody else, is the alternative. It would use the exec's mechanism, the engine's reader waiting in `on_data`. Whether a foreground run is to behave like a pipe is the holder's decision. This is the first answer, not a settled one.
 - **One core per user:** an `flock` on `core.lock`, which also holds its pid. A second core gives way to the first and exits 0.
 - **It exits once it has had no client and no running machine for `HULL_CORE_IDLE` seconds,** 30 by default. On SIGINT or SIGTERM it stops its machines and waits for them. Nothing else is left to stop it, which is why it must stop itself.
 
@@ -790,7 +795,7 @@ In docker, `exec` is the daemon's exec API:
 
 Open:
 
-- **A machine's own output has no flow control.** An exec's output is held back for its one frontend. A machine's output goes to its log and to every follower that has attached, and whether one slow follower should hold the machine back is a question of its own. Until it is answered, a follower whose socket stays full for five seconds is dropped, and the core stalls for those five seconds. A frontend that takes credit for an exec's output and then stops reading its socket is dropped the same way.
+- **Whether a foreground `hull run` holds its machine back** for a reader that falls behind, as a pipe would, rather than losing what leaves the log. See *A machine's output is read from its log* above.
 - **Moving onto the shared encrypted protocol**, when that is settled.
 
 **Measured:**
@@ -847,8 +852,30 @@ Open:
   | After | 3 ms | 22,888,896 | nothing |
 - **Sabotage of output's flow,** baseline first. Breaking each of these failed named cases: the reader's wait, counting what it read, taking credit off, waking the reader on credit, refusing over-credit, the frontend giving credit, and the schema's case for a frontend's `credit`. Not letting the reader go on close hung the core at the first frontend killed mid-output, and the suite ran out its time.
   - **Adopting a stream's output before `exec()` returns passed, and nothing here reaches it.** chroot starts its reader as exec's last step. docker with `-t` resizes after starting, but fifteen `-t` execs of 300 kB, against a core with adoption removed, never once saw output before the return. It is kept because the engine ABI does not promise that order. Without it, such output is credited by the frontend but was never counted, so credit for it can be refused, and the window then shrinks for good.
+- **A machine's output to followers,** in cli_test.sh: a machine writes 20 MB while `hull logs -f` feeds a reader seven seconds behind. The core answers `ps` within two seconds meanwhile. The follower is told it lost some, and what it read and what it lost are 20 MB exactly. What it read is under 2 MiB: the log's last MiB, and what the sockets held when it fell behind. Speaking the protocol by hand, twelve replays of the full log, all asked for before any is read, all arrive. A frontend that sends `list` and never reads an answer is dropped, and the core answers `ps` after. And a core sent TERM stops a running machine first, so its frontend exits 143 rather than 125.
+- **Before and after, a follower behind:** the same 20 MB machine, `hull logs -f` into `(sleep 7; wc -c)`, a `hull ps` three seconds in.
+
+  | Core | `ps` took | The follower read | It was told |
+  |---|---|---|---|
+  | Before | 4.7 s | 249,856 bytes | "the core went away" |
+  | After | 7 ms | 1,383,680 bytes | 18,616,320 bytes lost |
+- **Sabotage of the frontend queue and the followers,** baseline first. Breaking each of these failed named cases:
+  - the socket being non-blocking;
+  - telling a lapped follower;
+  - the log's start advancing;
+  - the queue's limit;
+  - asking `poll()` for POLLOUT;
+  - the frontend printing `lost`;
+  - the schema's `lost`.
+
+  Breaking the exit sent once the log is read hung its frontend, and the suite ran out its time. Three needed more:
+  - **Feeding only while less than 64 KiB waits** first passed. A follower that keeps up is only ever fed what arrived since the last turn, so the threshold matters only to one that starts with the log behind it, as `logs` does. The twelve replays catch it: queued whole they come to 12 MiB, and the frontend is dropped.
+  - **The two guards on a failed start,** forgetting the follower and telling only a slot in use, each passed alone, since either one fixes the bug. With both removed, the cases that found the bug fail.
+  - **The two flushes when the core goes,** each turn while machines stop and once at the end, each passed alone too, since either one delivers the exit. With both removed, the TERM case fails with 125.
+  - **The follower case first parsed one `lost` line.** One run, in a sabotage copy, was lapped twice, which can happen to the baseline, so it now sums them.
+- **A run whose start fails left its follower in the freed slot.** That was harmless while a run cleared the slot first. Once a slot taken over tells the old machine's followers it has gone, the stale follower was told instead. It pointed at a frontend since gone, so the next frontend in that client slot heard an `exited` before its own `started`, and exited 0 with no output. `pid.conf`'s case caught it, run after `volhost.conf`'s, whose start fails. A failed start now forgets its follower, and only a slot in use has followers to tell.
 - `test/wire_test.c` runs 19 cases: each direction's messages let through and the other's refused, non-canonical bodies refused, and the numbers read minimal decimal. Disabling the validator fails four of them.
-- `test/cli_test.sh` runs 129 cases. Among them: `ps`, `logs` after an exit, a duplicate id refused, a kept machine surviving its frontend's SIGKILL where an unkept one is stopped, `attach` ending with a stopped machine's 143, a second core giving way and the first still answering, a machine dying with a SIGKILLed core, and the core leaving when idle.
+- `test/cli_test.sh` runs 133 cases. Among them: `ps`, `logs` after an exit, a duplicate id refused, a kept machine surviving its frontend's SIGKILL where an unkept one is stopped, `attach` ending with a stopped machine's 143, a second core giving way and the first still answering, a machine dying with a SIGKILLed core, and the core leaving when idle.
 - **Sabotage,** in a scratch copy, with an unmodified baseline first that had to pass. Breaking each of these failed the test: honouring `keep`, stopping on disconnect, replaying logs, `attach` following, one id at a time, the idle exit, the lock, and the parent-death signal.
   - The last two first passed. The lock case only checked that a second core exited 0. Without the lock, the second core takes the socket over, then leaves and removes it, stranding the first. The case now requires the first to still answer.
   - The parent-death case's wait could give up silently, so it now fails when the kept machine never ran. Without the signal, the probe was measured alive a second after its core died, and gone once the shell reaped the client, for no cause found then. So the case looks for the probe before the client is reaped, where the two behaviours differ.

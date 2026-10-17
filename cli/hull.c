@@ -481,6 +481,14 @@ static int follow(hull_wire *wire, uint32_t ch, const char *stop_id)
 			if (hull_msg_find(&body, "buf", &buf) && hull_msg_find(&body, "fd", &fd))
 				write_all(hull_sexpr_is(&body, &fd, "2") ? 2 : 1, body.data + buf.content,
 				          buf.content_length);
+		} else if (hull_msg_is(&body, "lost")) {
+			long long bytes = 0;
+
+			/* The machine is not held back for a reader; one that falls
+			 * behind by more than the core keeps is told what it missed. */
+			if (hull_msg_find(&body, "bytes", &value))
+				hull_msg_long(&body, &value, &bytes);
+			fprintf(stderr, "hull: %lld bytes of output lost: this reader fell behind\n", bytes);
 		} else if (hull_msg_is(&body, "exited")) {
 			long long code = 0;
 			long long sig  = 0;

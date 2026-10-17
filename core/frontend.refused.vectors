@@ -108,3 +108,7 @@ client_message output_credit_no_channel 28 36 3A 63 72 65 64 69 74 28 35 3A 62 7
 # credit: the bytes are required
 core_message credit_no_bytes 28 36 3A 63 72 65 64 69 74 28 32 3A 63 68 31 3A 31 29 29
 
+
+# lost_no_bytes: (4:lost(2:ch1:3))
+# lost: the bytes are required
+core_message lost_no_bytes 28 34 3A 6C 6F 73 74 28 32 3A 63 68 31 3A 33 29 29

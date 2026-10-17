@@ -537,6 +537,86 @@ print("first=%d second=%d %s" % (first, second,
 timeout 10 "$hull" stop flowd > /dev/null 2>&1
 wait "$flower" 2>/dev/null
 
+# A machine's own output is read from its log by each follower at that
+# follower's pace, and never holds the machine back. So a follower seven
+# seconds behind a machine writing 20 MB costs the core nothing -- it once
+# stalled for five seconds and dropped the follower -- and hears how many
+# bytes left the log before it read them: those and the bytes it read are
+# all 20 MB.
+conf spewd '(command "/probe" "sleep" "2" "spew" "20000000" "sleep" "4")' '(hostname "spewd")'
+cases=$((cases + 1))
+(cd / && exec timeout -k 2 30 "$hull_abs" run -f "$root/spewd.conf" > /dev/null 2>&1) &
+spewer=$!
+tries=0
+until "$hull" ps 2>/dev/null | grep -q '^spewd .*running$' || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+(timeout -k 2 25 "$hull" logs -f spewd 2> "$dir/lost.err" | (sleep 7; wc -c) > "$dir/behind.out") &
+behind=$!
+sleep 3
+started=$(date +%s)
+out=$(timeout 10 "$hull" ps 2>&1)
+took=$(($(date +%s) - started))
+printf '%s\n' "$out" | grep -q '^spewd ' && [ "$took" -lt 2 ] ||
+	fail "the core stalled behind a follower that was not reading" "$out after ${took}s"
+# A client held open, so that the core, idle once the machine has gone,
+# does not leave before the cases below; killed after them.
+(timeout -k 2 40 python3 -c "$speak"'
+import time
+time.sleep(35)
+' > /dev/null 2>&1) &
+holder=$!
+wait "$behind"
+wait "$spewer"
+read_bytes=$(cat "$dir/behind.out")
+# Told once each time it was lapped, which can be more than once.
+lost=$(sed -n 's/^hull: \([0-9]*\) bytes of output lost: this reader fell behind$/\1/p' \
+	"$dir/lost.err" | awk '{ total += $1 } END { if (NR > 0) print total }')
+# What it read past the log's last MiB is what the sockets held when it
+# fell behind, not a second log queued in the core.
+[ -n "$lost" ] && [ "$lost" -gt 0 ] && [ $((read_bytes + lost)) = 20000000 ] &&
+	[ "$read_bytes" -lt 2097152 ] ||
+	fail "a follower behind read $read_bytes bytes and lost '$lost', of 20000000" \
+		"$(cat "$dir/lost.err")"
+# Twelve replays of the machine's full 1 MiB log, asked for before any is
+# read: each is read from the log as the socket drains, rather than queued
+# whole, which would be 12 MiB and drop the frontend.
+expect 0 '^eofs=12 bytes=12[0-9]{6}$' python3 -c "$speak"'
+import re
+for ch in range(1, 13):
+	say(b"(4:logs(2:ch%d:%d)(6:follow5:false)(7:machine5:spewd))" % (len(str(ch)), ch))
+s.settimeout(10)
+eofs = 0
+tail = b""
+while eofs < 12:
+	chunk = s.recv(1 << 20)
+	if not chunk:
+		break
+	got += chunk
+	eofs += (tail + chunk).count(b"(3:eof")
+	tail = chunk[-5:]
+total = sum(int(n) for n in re.findall(rb"\(4:data\(3:buf(\d+):", got))
+print("eofs=%d bytes=%d" % (eofs, total))
+'
+# A frontend that sends and never reads what it is answered is dropped once
+# 8 MiB of answers wait for it, and nobody else waits meanwhile.
+expect 0 '^dropped after [0-9]+ requests, and the core answers$' python3 -c "$speak"'
+import subprocess
+n = 0
+try:
+	while n < 200000:
+		say(b"(4:list(2:ch1:6))")
+		n += 1
+	print("kept after %d requests" % n)
+except (BrokenPipeError, ConnectionResetError):
+	r = subprocess.run([sys.argv[1], "ps"], capture_output=True, timeout=5)
+	print("dropped after %d requests, and the core %s" % (n,
+	      "answers" if r.returncode == 0 else "does not"))
+' "$hull_abs"
+kill "$holder" 2>/dev/null
+wait "$holder" 2>/dev/null
+
 # kill: a signal for the workload, which its init forwards. A TERM the
 # probe catches is the probe's to handle, and it goes on to exit 0; a KILL,
 # the default as in docker, ends the machine, 137. The run's output is in
@@ -604,6 +684,22 @@ else
 	[ -z "$left" ] || fail "a machine outlived its core" "$left"
 	wait "$keeper" 2>/dev/null
 fi
+
+# A core told to go stops its machines first, and their frontends hear
+# how each ended: the probe's 143 for the TERM, not "the core went away".
+cases=$((cases + 1))
+(cd / && exec timeout -k 2 20 "$hull_abs" run -f "$root/keep.conf" > /dev/null 2>&1) &
+keeper=$!
+tries=0
+until "$hull" ps 2>/dev/null | grep -q '^kept .*running$' || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+core=$(head -1 "$XDG_RUNTIME_DIR/hull/core.lock" 2>/dev/null)
+[ -n "$core" ] && kill -TERM "$core"
+wait "$keeper"
+got=$?
+[ "$got" = 143 ] || fail "a frontend whose core was told to go exited $got, wanted 143" ""
 
 # What cannot be planned or started is 125, and says why.
 conf ports '(command "/probe") (ports (port (host 8080) (guest 80)))'

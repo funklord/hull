@@ -34,6 +34,7 @@ const EOF      = ('3' << 24) | (':' << 16) | ('e' << 8) | 'o';
 const MACHINES = ('8' << 24) | (':' << 16) | ('m' << 8) | 'a';
 const DONE     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'o';
 const CREDIT   = ('6' << 24) | (':' << 16) | ('c' << 8) | 'r';
+const LOST     = ('4' << 24) | (':' << 16) | ('l' << 8) | 'o';  // LOGS's, the other way
 const ERROR    = ('5' << 24) | (':' << 16) | ('e' << 8) | 'r';
 
 // --- what a frontend sends ----------------------------------------------------
@@ -215,6 +216,7 @@ struct core_message {
 		case MACHINES:  machines    machines;
 		case DONE:      done        done;
 		case CREDIT:    credit      credit;
+		case LOST:      lost        lost;
 		case ERROR:     failure     error;
 		default:        unknown     unknown;
 	}
@@ -268,6 +270,18 @@ struct exited {
 // gives any still sees the start of it.
 struct credit {
 	preamble u8[16] = "6:credit(5:bytes";
+	atom  bytes;
+	u8    close_bytes  [must_eq = ')'];
+	channel  ch;
+	u8  close  [must_eq = ')'];
+}
+
+// What a follower of a machine's output -- `run`, `attach`, `logs` -- fell
+// so far behind that it left the core's log before it was read: so many
+// bytes, between the data before this and the data after. The machine is
+// never held back for a follower.
+struct lost {
+	preamble u8[14] = "4:lost(5:bytes";
 	atom  bytes;
 	u8    close_bytes  [must_eq = ')'];
 	channel  ch;

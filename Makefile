@@ -114,7 +114,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  writable.conf readonly.conf die.conf wait.conf ports.conf noargs.conf nope.conf \
                  qemu.conf pair.conf rootfs/written vol.conf volro.conf vollink.conf \
                  volmissing.conf volhost.conf pid.conf keep.conf gone.conf execd.conf attach.out \
-                 killd.conf killd.out flowd.conf held.out \
+                 killd.conf killd.out flowd.conf held.out spewd.conf behind.out lost.err \
                  data/in data/out rootfs/mnt-link) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 

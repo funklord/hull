@@ -15,6 +15,13 @@
  * A stop is carried out on a thread of its own, since an engine's stop()
  * blocks for up to its timeout and the loop must go on serving.
  *
+ * Nothing the loop does waits on a frontend. What is sent to one is
+ * queued, and written as its socket takes it; a machine's output is not
+ * queued at all, but read from the machine's log by each follower at the
+ * pace its socket drains, so one that falls behind holds back neither
+ * the core nor the machine. It loses only what leaves the log before it
+ * is read, and is told how much.
+ *
  * Nobody is left to stop the core: it exits once it has had no client
  * and no running machine for HULL_CORE_IDLE seconds, 30 unless the
  * environment says otherwise.
@@ -52,6 +59,9 @@
 #define DATA_CHUNK       65536u
 #define INPUT_WINDOW     65536u  /* an exec's stdin the core holds, at most */
 #define OUTPUT_WINDOW    65536u  /* an exec's output a frontend has unasked */
+#define FEED_LOW         65536u  /* a follower is fed while less than this waits */
+#define OUTBOX_LIMIT     (8u << 20)  /* answers a frontend leaves unread, at most */
+#define FOLLOW_ON        UINT64_MAX
 
 /* --- the table ----------------------------------------------------------- */
 
@@ -59,11 +69,23 @@ typedef struct client {
 	int        used;
 	hull_wire  wire;
 	int        dead;  /* a send failed: closed at the end of this turn */
+
+	/* Framed messages not yet written; the socket does not block, and
+	 * poll() says when it takes more. */
+	uint8_t   *out;
+	size_t     out_length;
+	size_t     out_cap;
+	size_t     out_sent;
 } client;
 
+/* Someone reading a machine's output, by where it is in the log: offsets
+ * count every byte the machine has written. `until` ends a `logs` that
+ * does not follow; FOLLOW_ON follows to the exit. */
 typedef struct follower {
 	client   *client;
 	uint32_t  ch;
+	uint64_t  at;
+	uint64_t  until;
 } follower;
 
 /* One record of output: which stream, and its bytes. */
@@ -102,6 +124,8 @@ struct slot {
 	record            *log;
 	record            *log_tail;
 	size_t             log_size;
+	uint64_t           log_start;   /* the offset of the log's first byte */
+	uint64_t           log_end;     /* and of the byte after its last */
 };
 
 /* A command a frontend runs in a machine, on one of its channels. The
@@ -295,10 +319,48 @@ static const hull_host_ops host_ops = {
 
 /* --- answering ----------------------------------------------------------- */
 
+/* Queue `m` for `c`. A frontend that leaves OUTBOX_LIMIT of its answers
+ * unread is dropped: what is bounded otherwise -- an exec's output by its
+ * credit, a machine's by its log -- cannot fill it. */
 static void send_to(client *c, hull_msg *m)
 {
-	if (c->used && !c->dead && hull_wire_send(c->wire.fd, m) != 0)
+	size_t   need = (size_t)m->length + HULL_AGENT_LENGTH_SIZE;
+	uint32_t wrote = 0u;
+
+	if (!c->used || c->dead) {
+		hull_msg_free(m);
+		return;
+	}
+	if (m->failed || m->data == NULL || c->out_length - c->out_sent + need > OUTBOX_LIMIT) {
 		c->dead = 1;
+		hull_msg_free(m);
+		return;
+	}
+	if (c->out_sent > 0u) {
+		memmove(c->out, c->out + c->out_sent, c->out_length - c->out_sent);
+		c->out_length -= c->out_sent;
+		c->out_sent = 0u;
+	}
+	if (c->out_length + need > c->out_cap) {
+		size_t   cap  = c->out_cap > 0u ? c->out_cap : 65536u;
+		uint8_t *grown;
+
+		while (cap < c->out_length + need)
+			cap *= 2u;
+		grown = realloc(c->out, cap);
+		if (grown == NULL) {
+			c->dead = 1;
+			hull_msg_free(m);
+			return;
+		}
+		c->out     = grown;
+		c->out_cap = cap;
+	}
+	if (hull_agent_frame(c->out + c->out_length, (uint32_t)(c->out_cap - c->out_length), m->data,
+	                     m->length, &wrote) != HULL_AGENT_OK)
+		c->dead = 1;
+	else
+		c->out_length += wrote;
 	hull_msg_free(m);
 }
 
@@ -358,6 +420,20 @@ static void send_status(client *c, uint32_t ch, int code, int signal)
 static void send_exited(client *c, uint32_t ch, const slot *s)
 {
 	send_status(c, ch, s->code, s->signal);
+}
+
+/* A follower fell so far behind that `bytes` of the machine's output left
+ * the log before it was read. */
+static void send_lost(client *c, uint32_t ch, uint64_t bytes)
+{
+	hull_msg m = { 0 };
+
+	hull_msg_raw(&m, "(4:lost(5:bytes");
+	hull_msg_number(&m, (long long)bytes);
+	hull_msg_raw(&m, ")");
+	hull_msg_channel(&m, ch);
+	hull_msg_raw(&m, ")");
+	send_to(c, &m);
 }
 
 static void send_credit(client *c, uint32_t ch, size_t bytes)
@@ -486,8 +562,9 @@ static void drop_log(slot *s)
 		free(s->log);
 		s->log = next;
 	}
-	s->log_tail = NULL;
-	s->log_size = 0u;
+	s->log_tail  = NULL;
+	s->log_size  = 0u;
+	s->log_start = s->log_end;
 }
 
 /* Keep the newest LOG_LIMIT bytes, a record at a time. */
@@ -507,19 +584,120 @@ static void keep_log(slot *s, int fd, const uint8_t *bytes, size_t length)
 		s->log = r;
 	s->log_tail = r;
 	s->log_size += length;
+	s->log_end  += length;
 	while (s->log_size > LOG_LIMIT && s->log != r) {
 		record *old = s->log;
 
 		s->log = old->next;
-		s->log_size -= old->length;
+		s->log_size  -= old->length;
+		s->log_start += old->length;
 		free(old);
 	}
 }
 
-static void add_follower(slot *s, client *c, uint32_t ch)
+static void add_follower(slot *s, client *c, uint32_t ch, uint64_t at, uint64_t until)
 {
 	if (s->follower_count < MAX_ATTACHED)
-		s->followers[s->follower_count++] = (follower){ c, ch };
+		s->followers[s->follower_count++] = (follower){ c, ch, at, until };
+	else
+		send_error(c, ch, "the machine has as many followers as it can");
+}
+
+/* Give `f` the next of what it has to hear, if anything: what it lost, a
+ * piece of the log, or its end. 1 if a message was queued; `*done` once
+ * the follower has heard all it will. */
+static int feed_one(slot *s, follower *f, int *done)
+{
+	uint64_t end = f->until < s->log_end ? f->until : s->log_end;
+
+	*done = 0;
+	if (f->at < s->log_start) {
+		send_lost(f->client, f->ch, s->log_start - f->at);
+		f->at = s->log_start;
+		return 1;
+	}
+	if (f->at < end) {
+		uint64_t base = s->log_start;
+
+		for (record *r = s->log; r != NULL; base += r->length, r = r->next) {
+			if (f->at < base + r->length) {
+				uint64_t into = f->at - base;
+				uint64_t n    = r->length - into;
+
+				if (n > end - f->at)
+					n = end - f->at;
+				if (n > DATA_CHUNK)
+					n = DATA_CHUNK;
+				send_data(f->client, f->ch, r->fd, r->bytes + into, (size_t)n);
+				f->at += n;
+				return 1;
+			}
+		}
+		f->at = end;  /* not reached: the log holds every offset in it */
+	}
+	if (f->until != FOLLOW_ON) {
+		send_simple(f->client, "(3:eof", f->ch);
+		*done = 1;
+		return 1;
+	}
+	if (s->exited) {
+		send_exited(f->client, f->ch, s);
+		*done = 1;
+		return 1;
+	}
+	return 0;
+}
+
+/* Feed `c`'s followers while little of its output waits: 1 if any was. */
+static int feed(client *c)
+{
+	int fed = 0;
+
+	for (unsigned i = 0u; i < MAX_MACHINES; i++) {
+		slot    *s = &machines[i];
+		unsigned kept = 0u;
+
+		if (!s->used)
+			continue;
+		for (unsigned f = 0u; f < s->follower_count; f++) {
+			follower *one  = &s->followers[f];
+			int       done = 0;
+
+			if (one->client == c)
+				while (!c->dead && c->out_length - c->out_sent < FEED_LOW &&
+				       feed_one(s, one, &done) && !done)
+					fed = 1;
+			fed |= done;
+			if (!done)
+				s->followers[kept++] = *one;
+		}
+		s->follower_count = kept;
+	}
+	return fed;
+}
+
+/* Write what `c` has waiting, as far as its socket takes it, feeding its
+ * followers as it empties. */
+static void flush(client *c)
+{
+	while (c->used && !c->dead) {
+		while (c->out_sent < c->out_length) {
+			ssize_t n = write(c->wire.fd, c->out + c->out_sent, c->out_length - c->out_sent);
+
+			if (n < 0 && errno == EINTR)
+				continue;
+			if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+				return;
+			if (n <= 0) {
+				c->dead = 1;
+				return;
+			}
+			c->out_sent += (size_t)n;
+		}
+		c->out_sent = c->out_length = 0u;
+		if (!feed(c))
+			return;
+	}
 }
 
 /* A stop on a thread of its own: an engine's stop() may block for its
@@ -567,11 +745,9 @@ static void machine_exited(slot *s, int code, int signal)
 	s->code   = code;
 	s->signal = signal;
 	snprintf(s->state, sizeof s->state, "exited");
-	for (unsigned i = 0u; i < s->follower_count; i++)
-		send_exited(s->followers[i].client, s->followers[i].ch, s);
+	/* Its followers hear the exit once they have read to the end. */
 	for (unsigned i = 0u; i < s->stop_count; i++)
 		send_simple(s->stops[i].client, "(4:done", s->stops[i].ch);
-	s->follower_count = 0u;
 	s->stop_count     = 0u;
 	s->owner          = NULL;
 	/* Its commands end with it; their exits are queued, and seen before
@@ -655,10 +831,7 @@ static void drain_list(event *e)
 		}
 		switch (e->kind) {
 		case EVENT_DATA:
-			keep_log(s, e->fd, e->bytes, e->length);
-			for (unsigned i = 0u; i < s->follower_count; i++)
-				send_data(s->followers[i].client, s->followers[i].ch, e->fd, e->bytes,
-				          e->length);
+			keep_log(s, e->fd, e->bytes, e->length);  /* its followers read it there */
 			break;
 		case EVENT_EXIT:
 			machine_exited(s, e->code, e->signal);
@@ -776,6 +949,18 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 			return;
 		}
 	}
+	/* Followers still reading the machine that held the slot hear what
+	 * they had not read as lost, and its exit. */
+	for (unsigned i = 0u; s->used && i < s->follower_count; i++) {
+		follower *f = &s->followers[i];
+
+		if (f->at < s->log_end)
+			send_lost(f->client, f->ch, s->log_end - f->at);
+		if (f->until != FOLLOW_ON)
+			send_simple(f->client, "(3:eof", f->ch);
+		else
+			send_exited(f->client, f->ch, s);
+	}
 	drop_log(s);
 	generation = s->generation + 1u;
 	memset(s, 0, sizeof *s);
@@ -798,12 +983,13 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		s->used = 0;
 		return;
 	}
-	add_follower(s, c, ch);
+	add_follower(s, c, ch, 0u, FOLLOW_ON);
 	if (engine->ops->start(&s->core, s->handle, &error) != HULL_OK) {
 		send_error(c, ch, error.detail != NULL ? error.detail : "start failed");
 		engine->ops->destroy(&s->core, s->handle, &error);
-		s->handle = NULL;
-		s->used   = 0;
+		s->handle         = NULL;
+		s->used           = 0;
+		s->follower_count = 0u;
 		return;
 	}
 	send_started(c, ch, s);
@@ -832,7 +1018,7 @@ static void handle_attach(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	if (s->exited)
 		send_exited(c, ch, s);
 	else
-		add_follower(s, c, ch);
+		add_follower(s, c, ch, s->log_end, FOLLOW_ON);
 }
 
 static void handle_logs(client *c, uint32_t ch, const hull_sexpr_doc *body)
@@ -844,14 +1030,9 @@ static void handle_logs(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	if (s == NULL)
 		return;
 	follow = hull_msg_find(body, "follow", &value) && hull_sexpr_is(body, &value, "true");
-	for (record *r = s->log; r != NULL; r = r->next)
-		send_data(c, ch, r->fd, r->bytes, r->length);
-	if (follow && !s->exited)
-		add_follower(s, c, ch);
-	else if (follow)
-		send_exited(c, ch, s);
-	else
-		send_simple(c, "(3:eof", ch);
+	/* What the log holds, read as a follower reads it; to its end now,
+	 * or on to the exit. */
+	add_follower(s, c, ch, s->log_start, follow ? FOLLOW_ON : s->log_end);
 }
 
 static void handle_stop(client *c, uint32_t ch, const hull_sexpr_doc *body)
@@ -871,7 +1052,7 @@ static void handle_stop(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		return;
 	}
 	if (s->stop_count < MAX_STOPS)
-		s->stops[s->stop_count++] = (follower){ c, ch };
+		s->stops[s->stop_count++] = (follower){ c, ch, 0u, 0u };
 	stop_machine(s, timeout < 0 ? 0 : timeout > 600000 ? 600000 : (int)timeout);
 }
 
@@ -1269,14 +1450,25 @@ static void disconnect(client *c)
 		}
 	}
 	hull_wire_close(&c->wire);
-	c->used = 0;
-	c->dead = 0;
+	free(c->out);
+	memset(c, 0, sizeof *c);
 	/* The closed commands' exits are queued: seen now, before any new
 	 * stream could be given a freed one's pointer. */
 	drain_events();
 }
 
 /* --- the loop ------------------------------------------------------------ */
+
+/* Write what every frontend has waiting, and let go of those that went. */
+static void flush_all(void)
+{
+	for (unsigned i = 0u; i < MAX_CLIENTS; i++)
+		if (clients[i].used)
+			flush(&clients[i]);
+	for (unsigned i = 0u; i < MAX_CLIENTS; i++)
+		if (clients[i].used && clients[i].dead)
+			disconnect(&clients[i]);
+}
 
 static volatile sig_atomic_t ending;
 
@@ -1391,8 +1583,12 @@ int hull_core_run(const char *host_arch)
 		fds[n++] = (struct pollfd){ wake[0], POLLIN, 0 };
 		for (unsigned i = 0u; i < MAX_CLIENTS; i++) {
 			if (clients[i].used) {
+				short events = POLLIN;
+
+				if (clients[i].out_sent < clients[i].out_length)
+					events |= POLLOUT;
 				owners[n] = &clients[i];
-				fds[n++]  = (struct pollfd){ clients[i].wire.fd, POLLIN, 0 };
+				fds[n++]  = (struct pollfd){ clients[i].wire.fd, events, 0 };
 			}
 		}
 		if (!any_clients() && !running_machines()) {
@@ -1412,15 +1608,12 @@ int hull_core_run(const char *host_arch)
 		if (fds[1].revents != 0)
 			drain_events();
 		if (fds[0].revents & POLLIN) {
-			int fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+			/* Non-blocking, so that a frontend that stops reading
+			 * stalls nothing: what it is sent waits in its queue. */
+			int fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
 
 			for (unsigned i = 0u; fd >= 0 && i < MAX_CLIENTS; i++) {
 				if (!clients[i].used) {
-					struct timeval patience = { 5, 0 };
-
-					/* A frontend that stops reading is dropped
-					 * rather than allowed to stall every other. */
-					setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &patience, sizeof patience);
 					if (hull_wire_open(&clients[i].wire, fd, HULL_WIRE_FROM_CLIENT) == 0) {
 						clients[i].used = 1;
 						fd = -1;
@@ -1435,7 +1628,7 @@ int hull_core_run(const char *host_arch)
 			hull_wire_status status;
 			hull_sexpr_doc   body;
 
-			if (fds[i].revents == 0 || !c->used)
+			if ((fds[i].revents & (POLLIN | POLLHUP | POLLERR)) == 0 || !c->used)
 				continue;
 			status = hull_wire_fill(&c->wire);
 			while (status == HULL_WIRE_OK &&
@@ -1444,9 +1637,7 @@ int hull_core_run(const char *host_arch)
 			if (status == HULL_WIRE_CLOSED || status == HULL_WIRE_BROKEN)
 				c->dead = 1;
 		}
-		for (unsigned i = 0u; i < MAX_CLIENTS; i++)
-			if (clients[i].used && clients[i].dead)
-				disconnect(&clients[i]);
+		flush_all();
 	}
 
 	/* Going: every machine still running is stopped, and waited for. */
@@ -1459,6 +1650,19 @@ int hull_core_run(const char *host_arch)
 		if (poll(&fd, 1u, 30000) <= 0)
 			break;
 		drain_events();
+		flush_all();
+	}
+	/* What the machines' ends left to say, given a second a frontend. */
+	for (unsigned i = 0u; i < MAX_CLIENTS; i++) {
+		struct timeval patience = { 1, 0 };
+		int            flags;
+
+		if (!clients[i].used)
+			continue;
+		flags = fcntl(clients[i].wire.fd, F_GETFL);
+		fcntl(clients[i].wire.fd, F_SETFL, flags & ~O_NONBLOCK);
+		setsockopt(clients[i].wire.fd, SOL_SOCKET, SO_SNDTIMEO, &patience, sizeof patience);
+		flush(&clients[i]);
 	}
 	unlink(path);
 	close(listener);
