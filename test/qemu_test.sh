@@ -8,7 +8,7 @@
 # command runs under `timeout`, and the one loop, waiting for a machine
 # to run, gives up after 40 tries. The files it writes are named in
 # FILES, in $BUILD_DIR/test/qemu. The last cases require that no qemu of
-# this suite's and none of its machine directories are left.
+# this suite's, no passt and none of its machine directories are left.
 
 set -u
 
@@ -20,10 +20,14 @@ XDG_RUNTIME_DIR=$(cd "${BUILD_DIR:?}" && pwd)/test/run
 export XDG_RUNTIME_DIR
 export HULL_CORE_IDLE=1
 mkdir -p "$XDG_RUNTIME_DIR" "$dir/rootfs/proc" "$dir/rootfs/dev" "$dir/rootfs/sys" \
-	"$dir/rootfs/srv" "$dir/data"
+	"$dir/rootfs/srv" "$dir/rootfs/etc" "$dir/data"
 chmod 700 "$XDG_RUNTIME_DIR"
 cp "$probe" "$dir/rootfs/probe"
+# A resolver no machine can reach, which the agent's must cover.
+printf 'nameserver 127.0.0.53\n' > "$dir/rootfs/etc/resolv.conf"
 root=$(cd "$dir" && pwd)
+# The engine's passt, by the arguments only it gives.
+passt='^passt --quiet --fd 3 --one-off --ipv4-only --address 10\.0\.2\.15 '
 cases=0
 failures=0
 
@@ -110,10 +114,15 @@ cases=$((cases + 1))
 [ -f "$root/rootfs/written" ] && [ "$(stat -c %u "$root/rootfs/written")" = "$(id -u)" ] ||
 	fail "a write in the machine did not land in its directory as the user's" \
 		"$(ls -ln "$root/rootfs" 2>&1)"
-conf readonly '(backend vm) (security (readonly_root true)) (command "/probe" "write" "/again")'
+conf readonly '(backend vm) (security (readonly_root true))' \
+	'(command "/probe" "write" "/again" "write" "/etc/resolv.conf")'
 name=readonly
 boot readonly
 has 0 '^write=Read-only file system$'
+# Its resolv.conf, the agent's, read-only too.
+cases=$((cases + 1))
+[ "$(printf '%s\n' "$out" | grep -c '^write=Read-only file system$')" = 2 ] ||
+	fail "a read-only machine's resolv.conf could be written" "$out"
 
 # Volumes, each a share of its own, read-write and read-only.
 conf vol '(backend vm) (volumes (volume (host "./data") (guest "/data")))' \
@@ -130,6 +139,70 @@ name=volro
 boot volro
 has 0 '^write=Read-only file system$'
 
+# The network, out, through passt as the user: the machine's own lo, the
+# host's DNS, and the host's address; but not the host's loopback. Two
+# listeners on the host, each taking one connection within 15 seconds,
+# say their ports first and then who came.
+hostaddr=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
+[ -n "$hostaddr" ] || hostaddr=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -m1 -E '^[0-9.]+$')
+rm -f "$root/listen.out"
+timeout 20 python3 -c '
+import socket, sys, threading
+def listen(address):
+    s = socket.socket()
+    s.bind((address, 0))
+    s.listen()
+    s.settimeout(15)
+    return s
+def take(s, greeting, name):
+    try:
+        c, _ = s.accept()
+        c.sendall(greeting)
+        c.close()
+        print(name, "came", flush=True)
+    except OSError:
+        pass
+outside = listen(sys.argv[1] or "127.0.0.1")
+inside = listen("127.0.0.1")
+print(outside.getsockname()[1], inside.getsockname()[1], flush=True)
+threads = [threading.Thread(target=take, args=(outside, b"hello from the host\n", "host")),
+           threading.Thread(target=take, args=(inside, b"the host loopback\n", "loopback"))]
+[t.start() for t in threads]
+[t.join() for t in threads]' "$hostaddr" > "$root/listen.out" 2>&1 &
+listener=$!
+tries=0
+until [ -s "$root/listen.out" ] || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.1
+done
+read -r outside inside < "$root/listen.out"
+conf net '(backend vm) (command "/probe" "read" "/etc/resolv.conf" "dial" "127.0.0.1" "9"' \
+	"\"dial\" \"10.0.2.2\" \"$inside\" \"dial\" \"${hostaddr:-127.0.0.1}\" \"$outside\"" \
+	'"resolve" "10.0.2.3" "hull-test.invalid")'
+name=net
+boot net
+has 0 '^read=nameserver 10\.0\.2\.3$'
+# lo is up: nothing listens, where with lo down the dial times out.
+has 0 '^dial 127\.0\.0\.1:9=Connection refused$'
+# Any answer: the host's resolver need not reach anything further.
+has 0 '^resolve=rcode [0-9]+ answers [0-9]+$'
+if [ -n "$hostaddr" ]; then
+	has 0 "^dial ${hostaddr}:${outside}=hello from the host\$"
+else
+	printf 'qemu: the host has no address but loopback; the dial out is not tried\n'
+fi
+cases=$((cases + 1))
+if printf '%s\n' "$out" | grep -q '=the host loopback$'; then
+	fail "a machine reached the host's loopback through its gateway" "$out"
+fi
+# The machine has ended, so nothing more can come.
+kill "$listener" 2>/dev/null
+wait "$listener" 2>/dev/null
+cases=$((cases + 1))
+if grep -q '^loopback came' "$root/listen.out"; then
+	fail "the host's loopback listener was reached" "$(cat "$root/listen.out")"
+fi
+
 # A running machine: listed, signalled through the agent, and stopped by
 # SIGTERM to its frontend.
 await() { # ID
@@ -144,6 +217,16 @@ cases=$((cases + 1))
 (cd / && exec timeout -k 2 60 "$hull" run -f "$root/trap.conf" > "$root/trap.out" 2>&1) &
 runner=$!
 await qtrap
+# A machine booted and ended under the same core, which this one keeps
+# running: its passt ends with it, and this one's is the one left.
+conf brief '(backend vm) (command "/probe" "say" "brief")'
+name=brief
+boot brief
+has 0 '^brief$'
+cases=$((cases + 1))
+left=$(pgrep -f "$passt")
+[ "$(printf '%s\n' "$left" | grep -c .)" = 1 ] ||
+	fail "a passt outlived its machine, or the running one has none" "$left"
 listed=$("$hull" ps 2>&1)
 printf '%s\n' "$listed" | grep -Eq '^qtrap +qemu +vm +running$' ||
 	fail "a running vm is not listed" "$listed"
@@ -317,6 +400,9 @@ else
 	sleep 1
 	left=$(pgrep -f "^qemu-system-x86_64 .*$XDG_RUNTIME_DIR/hull/qemu-")
 	[ -z "$left" ] || fail "a vm outlived its core" "$(ps -o pid,args -p "$left")"
+	cases=$((cases + 1))
+	left=$(pgrep -f "$passt")
+	[ -z "$left" ] || fail "a vm's passt outlived its core" "$(ps -o pid,args -p "$left")"
 fi
 wait "$runner" 2>/dev/null
 # Its directory is left, the core gone: the next core's first machine
@@ -334,10 +420,11 @@ if printf '%s\n' "$out" | grep -q 'kvm-clock'; then
 	fail "the emu class ran with KVM" "$out"
 fi
 
-# Nothing left: no qemu of this suite's, no machine directory.
+# Nothing left: no qemu of this suite's, no passt, no machine directory.
 cases=$((cases + 1))
 sleep 2
 left=$(pgrep -f "^qemu-system-x86_64 .*$XDG_RUNTIME_DIR/hull/qemu-")
+left=$left$(pgrep -f "$passt")
 dirs=$(ls -d "$XDG_RUNTIME_DIR"/hull/qemu-* 2>/dev/null)
 [ -z "$left" ] && [ -z "$dirs" ] || fail "a vm or its directory was left" "$left $dirs"
 

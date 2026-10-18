@@ -30,18 +30,31 @@
  *               this process's controlling terminal
  *   winch       wait for the terminal to be resized, as trap waits, and
  *               say its size
+ *   serve P N   listen on port N, P tcp or udp, for 20 seconds at most;
+ *               greet the one peer over tcp and say the line it sends,
+ *               or echo the one datagram over udp and say it
+ *   dial A N    connect to address A, port N, over tcp within 5 seconds,
+ *               and say, after A:N, the first line it sends or why it
+ *               could not
+ *   resolve A N ask the DNS server at address A for NAME's IPv4 address,
+ *               within 5 seconds, and say its answer's rcode and count
  */
 
 #define _GNU_SOURCE
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -80,6 +93,144 @@ static void print_size(void)
 		printf("size=%ux%u\n", (unsigned)size.ws_col, (unsigned)size.ws_row);
 	else
 		printf("size=%s\n", strerror(errno));
+}
+
+/* A line from `fd` within `seconds`, without its newline, into `out`. */
+static void read_line(int fd, char *out, size_t cap, int seconds)
+{
+	size_t        n = 0u;
+	struct pollfd p = { fd, POLLIN, 0 };
+
+	while (n + 1u < cap && poll(&p, 1u, seconds * 1000) == 1) {
+		char c;
+
+		if (read(fd, &c, 1u) != 1 || c == '\n')
+			break;
+		out[n++] = c;
+	}
+	out[n] = '\0';
+}
+
+static void serve(const char *proto, const char *port)
+{
+	int                udp = strcmp(proto, "udp") == 0;
+	int                one = 1;
+	int                fd  = socket(AF_INET, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
+	struct sockaddr_in at;
+	struct pollfd      p;
+	char               text[256];
+
+	memset(&at, 0, sizeof at);
+	at.sin_family = AF_INET;
+	at.sin_port   = htons((unsigned short)atoi(port));
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+	if (fd < 0 || bind(fd, (struct sockaddr *)&at, sizeof at) != 0 ||
+	    (!udp && listen(fd, 1) != 0)) {
+		printf("serve=%s\n", strerror(errno));
+		return;
+	}
+	printf("serving\n");
+	p.fd     = fd;
+	p.events = POLLIN;
+	if (poll(&p, 1u, 20000) != 1) {
+		printf("serve=nobody came\n");
+	} else if (udp) {
+		struct sockaddr_in from;
+		socklen_t          length = sizeof from;
+		ssize_t            n = recvfrom(fd, text, sizeof text - 1u, 0,
+		                                (struct sockaddr *)&from, &length);
+
+		if (n < 0)
+			n = 0;
+		text[n] = '\0';
+		sendto(fd, text, (size_t)n, 0, (struct sockaddr *)&from, length);
+		printf("served=%s\n", text);
+	} else {
+		int peer = accept(fd, NULL, NULL);
+
+		if (write(peer, "hello from the machine\n", 23u) != 23)
+			printf("serve=%s\n", strerror(errno));
+		read_line(peer, text, sizeof text, 5);
+		printf("served=%s\n", text);
+		close(peer);
+	}
+	close(fd);
+}
+
+static void dial(const char *address, const char *port)
+{
+	int                fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	struct sockaddr_in to;
+	struct pollfd      p;
+	int                error = 0;
+	socklen_t          length = sizeof error;
+	char               text[256];
+
+	memset(&to, 0, sizeof to);
+	to.sin_family = AF_INET;
+	to.sin_port   = htons((unsigned short)atoi(port));
+	inet_pton(AF_INET, address, &to.sin_addr);
+	if (connect(fd, (struct sockaddr *)&to, sizeof to) != 0 && errno != EINPROGRESS) {
+		printf("dial %s:%s=%s\n", address, port, strerror(errno));
+		close(fd);
+		return;
+	}
+	p.fd     = fd;
+	p.events = POLLOUT;
+	if (poll(&p, 1u, 5000) != 1) {
+		printf("dial %s:%s=timed out\n", address, port);
+	} else if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error != 0) {
+		printf("dial %s:%s=%s\n", address, port, strerror(error));
+	} else {
+		read_line(fd, text, sizeof text, 5);
+		printf("dial %s:%s=%s\n", address, port, text);
+	}
+	close(fd);
+}
+
+static void resolve(const char *server, const char *name)
+{
+	int                fd = socket(AF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in to;
+	struct pollfd      p;
+	uint8_t            query[300] = { 0x68, 0x75, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0 };
+	uint8_t            answer[1500];
+	size_t             n = 12u;
+	ssize_t            got;
+
+	/* The name as labels, then type A, class IN. */
+	for (const char *label = name; *label != '\0' && n < sizeof query - 70u;) {
+		size_t length = strcspn(label, ".");
+
+		query[n++] = (uint8_t)length;
+		memcpy(query + n, label, length);
+		n += length;
+		label += length;
+		if (*label == '.')
+			label++;
+	}
+	query[n++] = 0;
+	query[n++] = 0;
+	query[n++] = 1;
+	query[n++] = 0;
+	query[n++] = 1;
+	memset(&to, 0, sizeof to);
+	to.sin_family = AF_INET;
+	to.sin_port   = htons(53);
+	inet_pton(AF_INET, server, &to.sin_addr);
+	if (sendto(fd, query, n, 0, (struct sockaddr *)&to, sizeof to) != (ssize_t)n) {
+		printf("resolve=%s\n", strerror(errno));
+		close(fd);
+		return;
+	}
+	p.fd     = fd;
+	p.events = POLLIN;
+	if (poll(&p, 1u, 5000) != 1 || (got = recv(fd, answer, sizeof answer, 0)) < 12 ||
+	    answer[0] != 0x68 || answer[1] != 0x75)
+		printf("resolve=no answer\n");
+	else
+		printf("resolve=rcode %d answers %d\n", answer[3] & 0x0f, answer[6] << 8 | answer[7]);
+	close(fd);
 }
 
 int main(int argc, char **argv)
@@ -211,6 +362,15 @@ int main(int argc, char **argv)
 
 			await(signals, 1u);
 			print_size();
+		} else if (strcmp(step, "serve") == 0 && i + 2 < argc) {
+			serve(arg, argv[i + 2]);
+			i += 2;
+		} else if (strcmp(step, "dial") == 0 && i + 2 < argc) {
+			dial(arg, argv[i + 2]);
+			i += 2;
+		} else if (strcmp(step, "resolve") == 0 && i + 2 < argc) {
+			resolve(arg, argv[i + 2]);
+			i += 2;
 		} else if (strcmp(step, "wait") == 0) {
 			printf("waiting\n");
 			alarm(20);

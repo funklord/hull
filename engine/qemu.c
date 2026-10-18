@@ -72,6 +72,12 @@
 #define CID_TRIES    4
 #define MAX_STREAMS  64u
 #define WINDOW       65536u  /* what the agent gives, and is given, each way */
+#define NETWORK_FD   3       /* passt's socket, in qemu */
+
+/* The guest's network, which the agent sets to the same addresses. */
+#define GUEST_ADDRESS   "10.0.2.15"
+#define GATEWAY_ADDRESS "10.0.2.2"
+#define DNS_ADDRESS     "10.0.2.3"
 
 /* A piece of an exec's output, queued for its stream's thread. */
 typedef struct piece {
@@ -95,6 +101,7 @@ struct hull_machine {
 	size_t           spec_length;
 
 	char             dir[4096];    /* the machine's files: initrd, console */
+	int              network;      /* qemu's end of passt's socket, or -1 */
 	pid_t            qemu;
 	hull_wire        wire;
 	int              connected;
@@ -345,7 +352,8 @@ static int add_module(module_list *list, const char *path)
 
 static const char *find_modules(const char *release, module_list *list)
 {
-	static const char *const wanted[] = { "9p", "9pnet_virtio", "vmw_vsock_virtio_transport" };
+	static const char *const wanted[] = { "9p", "9pnet_virtio", "vmw_vsock_virtio_transport",
+	                                      "virtio_net" };
 	char        path[512];
 	char       *dep;
 	char       *lines[8192];
@@ -378,7 +386,7 @@ static const char *find_modules(const char *release, module_list *list)
 				break;
 		}
 		if (i == count) {
-			reason = "the host kernel has no 9p or vsock module for the guest";
+			reason = "the host kernel has no 9p, vsock or virtio_net module for the guest";
 			break;
 		}
 		{
@@ -494,6 +502,79 @@ static void escaped(char *out, size_t cap, const char *path)
 	out[at] = '\0';
 }
 
+/* The machine's network, out: passt, as the user, on a socket pair whose
+ * other end becomes qemu's netdev. It gives the guest the address the
+ * agent sets, GUEST_ADDRESS, and the host's DNS at DNS_ADDRESS, and it
+ * forwards nothing in. --no-map-gw: the gateway is not the host's
+ * loopback, so a machine cannot reach what listens there only for the
+ * user. passt's parent exits once it is set up, 0 or with the reason in
+ * passt.log, and the daemon it leaves ends when qemu's end closes. */
+static void last_line(const hull_machine *m, const char *file, char *out, size_t cap);
+
+static const char *start_network(hull_machine *m)
+{
+	char        log[4200];
+	const char *argv[32];
+	unsigned    n = 0u;
+	int         pair[2];
+	int         status;
+	pid_t       pid;
+
+	snprintf(log, sizeof log, "%s/passt.log", m->dir);
+	argv[n++] = "passt";
+	argv[n++] = "--quiet";
+	argv[n++] = "--fd";
+	argv[n++] = "3";
+	argv[n++] = "--one-off";
+	argv[n++] = "--ipv4-only";
+	argv[n++] = "--address";
+	argv[n++] = GUEST_ADDRESS;
+	argv[n++] = "--netmask";
+	argv[n++] = "24";
+	argv[n++] = "--gateway";
+	argv[n++] = GATEWAY_ADDRESS;
+	argv[n++] = "--no-map-gw";
+	argv[n++] = "--dns-forward";
+	argv[n++] = DNS_ADDRESS;
+	argv[n++] = "--tcp-ports";
+	argv[n++] = "none";
+	argv[n++] = "--udp-ports";
+	argv[n++] = "none";
+	argv[n] = NULL;
+
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0)
+		return "the machine's network socket cannot be made";
+	pid = fork();
+	if (pid == 0) {
+		int null = open("/dev/null", O_RDWR);
+		int out  = open(log, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+		if (null < 0 || out < 0 || dup2(null, 0) < 0 || dup2(out, 1) < 0 || dup2(out, 2) < 0 ||
+		    dup2(pair[1], 3) < 0)
+			_exit(126);
+		syscall(SYS_close_range, 4u, ~0u, 0u);
+		execvp(argv[0], (char *const *)argv);
+		fprintf(stderr, "passt, which a qemu machine's network needs: %s\n", strerror(errno));
+		_exit(127);
+	}
+	close(pair[1]);
+	if (pid < 0) {
+		close(pair[0]);
+		return "passt cannot be started";
+	}
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+		;
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		close(pair[0]);
+		last_line(m, "passt.log", m->detail, sizeof m->detail);
+		if (m->detail[0] == '\0')
+			snprintf(m->detail, sizeof m->detail, "passt could not start the network");
+		return m->detail;
+	}
+	m->network = pair[0];
+	return NULL;
+}
+
 /* Fork qemu for `m`, with `cid` for its vsock device. Its stdout and
  * stderr go to qemu.log. */
 static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
@@ -505,6 +586,7 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 	char        memory[32];
 	char        cpus[16];
 	char        vsock[64];
+	char        netdev[64];
 	char        root[9000];
 	char        fsdev[MAX_VOLUMES][9000];
 	char        device[MAX_VOLUMES][96];
@@ -521,6 +603,7 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 	snprintf(memory, sizeof memory, "%lu", m->memory_mib);
 	snprintf(cpus, sizeof cpus, "%u", m->cpus);
 	snprintf(vsock, sizeof vsock, "vhost-vsock-pci,guest-cid=%u", cid);
+	snprintf(netdev, sizeof netdev, "stream,id=net,addr.type=fd,addr.str=%d", NETWORK_FD);
 	escaped(path, sizeof path, m->root);
 	snprintf(root, sizeof root, "local,id=root,path=%s,security_model=none%s", path,
 	         m->readonly_root ? ",readonly=on" : "");
@@ -569,6 +652,10 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 	}
 	argv[n++] = "-device";
 	argv[n++] = vsock;
+	argv[n++] = "-netdev";
+	argv[n++] = netdev;
+	argv[n++] = "-device";
+	argv[n++] = "virtio-net-pci,netdev=net";
 	argv[n] = NULL;
 
 	pid = fork();
@@ -583,8 +670,13 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 		dup2(null, 0);
 		dup2(out, 1);
 		dup2(out, 2);
-		/* Nothing of the core's goes with it: its sockets, its lock. */
-		syscall(SYS_close_range, 3u, ~0u, 0u);
+		/* passt's socket at NETWORK_FD, and nothing of the core's: its
+		 * sockets, its lock. dup2() onto itself would keep CLOEXEC. */
+		if (m->network == NETWORK_FD)
+			fcntl(NETWORK_FD, F_SETFD, 0);
+		else if (dup2(m->network, NETWORK_FD) < 0)
+			_exit(126);
+		syscall(SYS_close_range, NETWORK_FD + 1u, ~0u, 0u);
 		execvp(argv[0], (char *const *)argv);
 		fprintf(stderr, "qemu-system-x86_64: %s\n", strerror(errno));
 		_exit(127);
@@ -860,6 +952,7 @@ static hull_status qemu_create(hull_core *core, hull_buf plan, hull_machine **ou
 		return fail(error, HULL_ERR_INTERNAL, "out of memory");
 	m->core = core;
 	m->wire.fd = -1;
+	m->network = -1;
 	pthread_mutex_init(&m->lock, NULL);
 	pthread_mutex_init(&m->send_lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
@@ -874,7 +967,7 @@ static hull_status qemu_create(hull_core *core, hull_buf plan, hull_machine **ou
 
 static void remove_files(const char *dir)
 {
-	static const char *const files[] = { "initrd", "console.log", "qemu.log" };
+	static const char *const files[] = { "initrd", "console.log", "qemu.log", "passt.log" };
 	char path[4200];
 
 	for (unsigned i = 0u; i < sizeof files / sizeof files[0]; i++) {
@@ -977,7 +1070,15 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 			cid = (uint32_t)getpid() ^ (uint32_t)time(NULL);
 		cid = 3u + cid % 0x7ffffff0u;
 		m->done = 0;
+		/* A passt each time: the last ended with its qemu. */
+		if ((reason = start_network(m)) != NULL) {
+			if (reason != m->detail)
+				snprintf(m->detail, sizeof m->detail, "%s", reason);
+			break;
+		}
 		m->qemu = spawn(m, name.release, cid);
+		close(m->network);
+		m->network = -1;
 		if (m->qemu < 0)
 			break;
 		fd = dial(m, cid);

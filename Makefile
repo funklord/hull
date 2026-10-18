@@ -136,8 +136,8 @@ DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf vol
 # What test/qemu_test.sh writes.
 QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.conf write.conf \
                   readonly.conf vol.conf volro.conf trap.conf trap.out wait.conf kept.conf \
-                  emu.conf execd.conf held.out xtrap.out xstop.out rootfs/probe \
-                  rootfs/written data/in data/out)
+                  emu.conf execd.conf held.out xtrap.out xstop.out net.conf listen.out brief.conf \
+                  rootfs/probe rootfs/written rootfs/etc/resolv.conf data/in data/out)
 
 # The reference engine's test rootfs holds one static program.
 PROBE = $(BUILD_DIR)/test/cli/rootfs/probe

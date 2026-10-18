@@ -4,7 +4,8 @@
  *
  * Booted as the initramfs's /init. It mounts the kernel's filesystems,
  * loads the modules the engine put beside it, in the order /hull/modules
- * names them, and listens on vsock port 1 for the one host connection
+ * names them, brings up lo and eth0 at the address the engine's passt
+ * expects, and listens on vsock port 1 for the one host connection
  * (B.1, B.2). What the host sends is held to agent/protocol.situ's
  * host_message before anything reads it, as everything the core reads is.
  *
@@ -58,6 +59,11 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <net/route.h>
+#include <netinet/in.h>
 
 #include <linux/vm_sockets.h>
 
@@ -232,6 +238,70 @@ static void load_modules(void)
 		fclose(list);
 }
 
+/* The network, as the engine's passt gives it (engine/qemu.c): lo, and
+ * eth0 at GUEST_ADDRESS/24 routed through GATEWAY_ADDRESS. A machine's
+ * resolv.conf is /hull/resolv.conf, naming passt's DNS. */
+#define GUEST_ADDRESS   "10.0.2.15"
+#define GATEWAY_ADDRESS "10.0.2.2"
+#define DNS_ADDRESS     "10.0.2.3"
+
+static void set_address(struct sockaddr *to, const char *address)
+{
+	struct sockaddr_in in;
+
+	memset(&in, 0, sizeof in);
+	in.sin_family = AF_INET;
+	inet_pton(AF_INET, address, &in.sin_addr);
+	memcpy(to, &in, sizeof in);
+}
+
+static int bring_up(int fd, const char *name)
+{
+	struct ifreq request;
+
+	memset(&request, 0, sizeof request);
+	snprintf(request.ifr_name, sizeof request.ifr_name, "%s", name);
+	if (ioctl(fd, SIOCGIFFLAGS, &request) != 0)
+		return -1;
+	request.ifr_flags |= IFF_UP | IFF_RUNNING;
+	return ioctl(fd, SIOCSIFFLAGS, &request);
+}
+
+static void network(void)
+{
+	int          fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	struct ifreq request;
+	struct rtentry route;
+	FILE        *resolv;
+
+	if (fd < 0) {
+		say("network", strerror(errno));
+		return;
+	}
+	if (bring_up(fd, "lo") != 0)
+		say("lo", strerror(errno));
+	memset(&request, 0, sizeof request);
+	snprintf(request.ifr_name, sizeof request.ifr_name, "eth0");
+	set_address(&request.ifr_addr, GUEST_ADDRESS);
+	if (ioctl(fd, SIOCSIFADDR, &request) != 0)
+		say("eth0", strerror(errno));
+	set_address(&request.ifr_netmask, "255.255.255.0");
+	if (ioctl(fd, SIOCSIFNETMASK, &request) != 0 || bring_up(fd, "eth0") != 0)
+		say("eth0", strerror(errno));
+	memset(&route, 0, sizeof route);
+	set_address(&route.rt_dst, "0.0.0.0");
+	set_address(&route.rt_genmask, "0.0.0.0");
+	set_address(&route.rt_gateway, GATEWAY_ADDRESS);
+	route.rt_flags = RTF_UP | RTF_GATEWAY;
+	if (ioctl(fd, SIOCADDRT, &route) != 0)
+		say("route", strerror(errno));
+	close(fd);
+	resolv = fopen("/hull/resolv.conf", "w");
+	if (resolv == NULL || fprintf(resolv, "nameserver %s\n", DNS_ADDRESS) < 0 ||
+	    fclose(resolv) != 0)
+		say("resolv.conf", strerror(errno));
+}
+
 /* Mount the 9p share `tag` at `at`. */
 static int share(const char *tag, const char *at, int readonly)
 {
@@ -317,6 +387,18 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	mkdir("/machine", 0755);
 	if (share("root", "/machine", readonly_root) != 0)
 		return "the machine's directory could not be mounted";
+	/* The machine's resolv.conf names passt's DNS, as docker writes
+	 * its own; only over a file, since a link would be followed here,
+	 * outside the machine. */
+	{
+		struct stat file;
+
+		if (lstat("/machine/etc/resolv.conf", &file) == 0 && S_ISREG(file.st_mode) &&
+		    (mount("/hull/resolv.conf", "/machine/etc/resolv.conf", NULL, MS_BIND, NULL) != 0 ||
+		     (readonly_root && mount(NULL, "/machine/etc/resolv.conf", NULL,
+		                             MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) != 0)))
+			say("resolv.conf", strerror(errno));
+	}
 	if (hull_access_find(doc, machine, "volumes", &entry)) {
 		hull_sexpr_child(doc, &entry, &item);
 		for (more = hull_sexpr_next(doc, &item, &item); more;
@@ -935,6 +1017,7 @@ int main(void)
 		}
 	}
 	load_modules();
+	network();
 
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGCHLD);

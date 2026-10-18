@@ -798,6 +798,7 @@ Open:
 - **Whether a foreground `hull run` holds its machine back** for a reader that falls behind, as a pipe would, rather than losing what leaves the log. See *A machine's output is read from its log* above.
 - **Moving onto the shared encrypted protocol**, when that is settled.
 - **The case of a core told to go failed once, intermittently,** with the frontend's 125, "the core went away", where 143 was wanted. It passed eight times of eight alone and in every other suite run, about a dozen, and reading the shutdown path found no race. The case now keeps the frontend's output and `core.log`, so a failure says more. Unexplained.
+- **The qemu case of a TERM to `hull exec` failed once, intermittently,** with 143 where 0 was wanted, in one of five suite runs on 2026-10-19. The command did catch the TERM: the output was `ready`, `signal=15`, `after`. Ten runs of the case alone passed. `timeout`, which wraps the frontend, exits 0 when its child does, and 137 when its `-k` fires. The probe's handler stays installed, so a second TERM cannot kill it. So either the frontend died by a TERM, or the agent reported the command killed by one, and neither route has been found. Unexplained.
 
 **Measured:**
 
@@ -886,15 +887,25 @@ Open:
 
 **The qemu engine runs vm and emu machines as the user, on the host's own kernel: `engine/qemu.c`.** Nothing it does asks for root.
 
-- **What a user needs:** `/dev/kvm` for vm and `/dev/vhost-vsock` for both, which Debian opens to every user, and a readable `/boot/vmlinuz` of the running kernel.
+- **What a user needs:** `/dev/kvm` for vm and `/dev/vhost-vsock` for both, which Debian opens to every user, a readable `/boot/vmlinuz` of the running kernel, and `passt` for the network.
 - **The machine:** a q35 machine with the host's kernel and an initramfs the engine writes for it into `$XDG_RUNTIME_DIR/hull/qemu-<pid>-<n>/`. The initramfs holds the guest agent as `/init` and the modules the agent loads to reach its directory and the host.
-- **The modules:** the kernel's 9p and vsock modules, with what `modules.dep` says they need, loaded in modprobe's order. They are xz-compressed, which the kernel decompresses itself, so the agent hands them over as they are.
+- **The modules:** the kernel's 9p, vsock and virtio_net modules, with what `modules.dep` says they need, loaded in modprobe's order. They are xz-compressed, which the kernel decompresses itself, so the agent hands them over as they are.
 - **The directory, and each volume,** is a share of qemu's own 9p server, written in place as the user's.
 - **Classes:** vm is `-accel kvm -cpu host`. emu is `-accel tcg -cpu max`, on the host's arch only, since a foreign arch needs a foreign kernel.
 
 **9p, not virtiofs, which §3.2, §5.2 and §6 name.** virtiofs needs virtiofsd, a daemon of its own, which this host does not have. qemu's 9p runs inside qemu as the user and needs nothing else. Its fidelity is weaker: no host-side inotify, which is declared rejected as virtiofs's was, and slower metadata. This is a deviation from the design, not a change to it. Moving to virtiofs where virtiofsd is installed, and whether to require it, is the holder's decision.
 
 **The kernel is the host's, standing in for Appendix F's bundled one.** So `vm.kernel.bundled` and `vm.profile.micro`, the defaults every plan writes in, are declared emulated, and every run says so on stderr. The cost is measured: a machine boots and runs `/probe` in about 2.2 s, where §5.2's target is 100 to 300 ms. emu under TCG takes about 17 s.
+
+**A machine's network is passt's, as the user: out, and nothing in yet.** §8 names user-mode networking per VM. The engine starts a passt for each machine on a socket pair, and the other end is qemu's virtio-net device.
+- **The addresses are fixed,** in both the engine and the agent: the guest is 10.0.2.15/24, its gateway 10.0.2.2, and its DNS 10.0.2.3, which passt forwards to the host's own resolver. These are slirp's well-known addresses. The agent brings up `lo` and `eth0` and adds the route itself, by ioctl, since there is no DHCP client in the guest.
+- **resolv.conf:** the machine's `/etc/resolv.conf` has the agent's file, which names 10.0.2.3, bound over it, as docker writes its own. It is read-only when the root is. The bind is only over a regular file: a link would be followed in the agent's root, outside the machine.
+- **The host's loopback is out of reach.** By default passt makes the gateway address the host's 127.0.0.1, so a guest could reach whatever listens there for the user alone. `--no-map-gw` turns that off. A vm-class machine is the boundary §8 and Appendix D put the risky machine behind, and an open path to the host's loopback would undo it.
+- **Why not qemu's own `-netdev user`:** slirp has the same mapping and no way to turn it off.
+- **Ports are not forwarded yet, and this is why.** Tried by hand with `--no-map-gw`, a connection to a port passt forwarded from 127.0.0.1 reached passt and never the guest. passt has no guest-side address to give a connection from the host's loopback. The address that would, `--map-host-loopback`, works both ways: passt(1) says packets from the guest to it go to the host's loopback, and it has no inbound-only form. So `ports` stays rejected until the engine forwards them itself, over vsock to the agent, which needs no mapping.
+- **Its life:** passt's parent exits once passt is set up, so the engine knows whether it started and, if not, why, from `passt.log`. The daemon it leaves ends when qemu's end of the pair closes (`--one-off`), so it goes with qemu, and qemu goes with the core.
+- **The cost:** a LAN host at 10.0.2.15 is out of the machine's reach, since that is the machine's own address. This host's LAN is 10.0.0.0/16, which holds it. A host without passt can run no qemu machine. That is a hard requirement, as `/dev/vhost-vsock` is, rather than a machine silently started with no network.
+- **Measured:** boot time is unchanged, about 2.2 s.
 
 **The guest agent is `agent/agent.c`,** built static as `hull-agent`, beside `hull`, where the engine looks for it. It is PID 1 and follows B.1:
 - It mounts `/dev`, `/proc` and `/sys`, loads the modules `/hull/modules` lists, and listens on vsock port 1 for the one host connection.
@@ -926,7 +937,7 @@ Open:
 - **`stream_close`** has the agent SIGKILL the command and waits for its exit. Every exec the agent has not reported when the connection ends is reported as SIGKILL, 137: a machine that stops takes its commands, and their frontends hear it at once.
 - **Signals and resizes** are the agent's `signal` and `winch` on the exec's channel.
 
-**Measured,** in `test/qemu_test.sh`, which `make check-qemu` runs, since `make check` needs no KVM. Its 44 cases:
+**Measured,** in `test/qemu_test.sh`, which `make check-qemu` runs, since `make check` needs no KVM. Its 54 cases:
 - **One boot,** and every line it prints checked: output on both streams kept apart, the exit status, env, workdir, hostname, uid 0, `no_new_privs`, a session of its own, two CPUs, 256 MiB, and the KVM clock.
 - **How a machine ends:** death by a signal, 143, and a missing command, 127 with the reason.
 - **Writes:** a write landing in the directory as the user's file, a read-only root, and volumes read-write and read-only.
@@ -934,8 +945,9 @@ Open:
 - **exec,** in a machine of its own: the machine's environment and hostname, a status, a missing command 127, stdin ended by `/dev/null`, 588,895 bytes of stdin by length and FNV-1a hash, 300 kB to a command that sleeps six seconds first, and 3 MB to one that sleeps three.
 - **exec's output:** 3 MB counted against the same probe on the host, and 20 MB to a reader seven seconds behind arriving whole. Meanwhile the command is held, the machine counting one process more two seconds in, and another exec answers within three seconds.
 - **exec's terminal and its ends:** a terminal of 100 by 30, spoken by hand, its controlling terminal, resized to 120 by 40; a TERM to `hull exec` caught by the command; a frontend SIGKILLed taking its command with it, the machine counting as many processes after; and an exec in a machine that stops ending 137 at once.
+- **The network:** the agent's resolv.conf, read-only under a read-only root. `lo` is up: a dial to a port nothing holds is refused rather than unreachable. The host's resolver answers through 10.0.2.3, and a listener on the host's own address is reached. A listener on the host's 127.0.0.1 is not reached through the gateway, checked from both sides. Two host listeners on ports of their own say who came.
 - **The emu class** under TCG, without the KVM clock.
-- **Nothing left:** no qemu of the suite's and no machine directory, the dead core's included.
+- **Nothing left:** no qemu of the suite's, no passt, and no machine directory, the dead core's included. passt is also checked gone with a SIGKILLed core, and gone with its machine while the core runs on: a machine boots and ends under the core another keeps running, and one passt is left.
 
 **Sabotage,** baseline first, in a scratch copy running `make check-qemu`. Breaking each of these failed a named case:
 - **In the agent:** the hostname, the environment, the workdir, `no_new_privs`, the session, mounting volumes, reporting a signal, 127 for a command not there, stderr kept apart, a stop's SIGTERM, and forwarding a signal.
@@ -958,6 +970,12 @@ Open:
 Breaking the SIGKILL reported for streams whose agent has gone hung the stopped-machine case, and the suite ran out its time. Two needed more:
 - **The host waiting for the agent's stdin credit** first passed. Its largest input to a command not reading was 300 kB, which arrived whole anyway. Tried by hand, 3 MB to a command sleeping three seconds arrived as 131,072 bytes, the rest refused as more input than the credit. That is now a case, and it fails. The same broken engine also delivered 1,174,207 bytes for `seq 1 200000`'s 588,895, about twice. No cause was found, and no path for intact code to overrun the agent's ring was found either. Unexplained, and seen only with the engine broken.
 - **`TIOCSCTTY` removed** passed and cannot fail. On Linux a session leader that opens a terminal without `O_NOCTTY` gets it as its controlling terminal, so the open already does what the ioctl says. It is kept for saying so.
+
+**Sabotage of the network,** baseline first, the same way. Breaking each of these failed a named case: `--no-map-gw` (both sides of the loopback case), the default route, eth0's address, the virtio_net module, qemu's netdev, passt's DNS forward, binding resolv.conf, and making it read-only. Three needed more:
+- **`lo` left down** first passed. The case wanted any dial refused, and the dial to the gateway is refused too. With `lo` down the dial to 127.0.0.1 times out, and it does not reach the host's loopback, checked by hand. Each dial now names its address in its line.
+- **Leaking qemu's end of passt's socket** first passed. passt then lived as long as the core, and every check for one left ran once the core had gone. A machine now boots and ends while another keeps the same core running, and exactly one passt must be left.
+- **`--one-off` removed** passed and cannot fail. passt given a connected socket with `--fd` exits when its peer closes, with the option or without it, tried by hand. It is kept for saying so.
+- **Untested:** passt failing to start, which a test cannot make happen on purpose.
 
 ---
 
