@@ -731,6 +731,70 @@ expect 0 '' "$hull" kill -s TERM statsd
 wait "$statsd"
 rm -f "$root/rootfs/written"
 expect 1 'the machine is not running' "$hull" stats statsd
+
+# An overlay: the directory beneath, what the machine writes in a tmpfs
+# above, in the machine's own mount namespace. / keeps the directory's
+# mode, as in place; a write and a removal are the machine's, and the
+# directory is as it was. An exec sees the machine's root, the overlay.
+# A change to a file needs it copied up, with its parents, and the
+# namespace maps only the user and the user's group, so where a group
+# is another, as /srv's is when the build tree's is, the change fails
+# as EOVERFLOW. mapped/ is the user's group's, which maps.
+mkdir -p "$root/rootfs/mapped"
+chgrp "$(id -g)" "$root/rootfs/mapped"
+chmod 755 "$root/rootfs/mapped"
+printf 'kept\n' > "$root/rootfs/mapped/kept"
+mkdir -p "$root/rootfs/mapped/d"
+printf 'f\n' > "$root/rootfs/mapped/d/f"
+printf 'kept\n' > "$root/rootfs/srv/kept"
+conf overlay '(mutable overlay)' \
+	'(command "/probe" "owner" "/" "write" "/layered" "remove" "/mapped/kept" "read" "/mapped/kept"' \
+	'"remove" "/srv/kept")'
+from_root 0 'source\.dir\.overlay: emulated: an overlayfs in the machine.s mount namespace' \
+	-f "$root/overlay.conf"
+# In place, the directory's group may be one the namespace does not map,
+# the overflow id, which an overlay's top cannot be given: root's then.
+conf ownerin '(command "/probe" "owner" "/")'
+inplace=$(cd / && timeout 10 "$hull_abs" run -f "$root/ownerin.conf" 2>&1 | grep '^owner=')
+case $inplace in
+owner=*:65534\ *) layered="owner=${inplace#owner=}"; layered="${layered%%:*}:0 ${inplace##* }" ;;
+*) layered=$inplace ;;
+esac
+from_root 0 "^$layered\$" -f "$root/overlay.conf"
+from_root 0 '^write=ok$' -f "$root/overlay.conf"
+from_root 0 '^remove=ok$' -f "$root/overlay.conf"
+from_root 0 '^read=No such file or directory$' -f "$root/overlay.conf"
+# A directory of the directory's, emptied, removed and made again, is
+# empty, which overlayfs keeps in an xattr: user.overlay.*, since the
+# namespace cannot write trusted.*, so the mount must say userxattr.
+conf opaque '(mutable overlay)' \
+	'(command "/probe" "remove" "/mapped/d/f" "rmdir" "/mapped/d" "mkdir" "/mapped/d" "list" "/mapped/d")'
+from_root 0 '^rmdir=ok$' -f "$root/opaque.conf"
+from_root 0 '^list=$' -f "$root/opaque.conf"
+if [ "$(stat -c %g "$root/rootfs/srv")" = "$(id -g)" ]; then
+	from_root 0 '^remove=ok$' -f "$root/overlay.conf"
+else
+	from_root 0 '^remove=Value too large for defined data type$' -f "$root/overlay.conf"
+fi
+cases=$((cases + 1))
+[ ! -e "$root/rootfs/layered" ] && [ "$(cat "$root/rootfs/mapped/kept" 2>&1)" = kept ] &&
+	[ -f "$root/rootfs/mapped/d/f" ] &&
+	[ "$(cat "$root/rootfs/srv/kept" 2>&1)" = kept ] ||
+	fail "an overlay's writes reached the directory" "$(ls -l "$root/rootfs" "$root/rootfs/srv" 2>&1)"
+conf overro '(mutable overlay) (security (readonly_root true))' '(command "/probe" "write" "/again")'
+from_root 0 '^write=Read-only file system$' -f "$root/overro.conf"
+conf overx '(mutable overlay) (hostname "overx")' '(command "/probe" "write" "/layered" "trap")'
+(cd / && exec timeout -k 2 20 "$hull_abs" run -f "$root/overx.conf" > "$root/overx.out" 2>&1) &
+overx=$!
+await_ready "$root/overx.out"
+expect 0 '^owner=0:0 0644$' "$hull" exec overx /probe owner /layered
+expect 0 '^read=kept$' "$hull" exec overx /probe read /mapped/kept
+expect 0 '' "$hull" kill -s TERM overx
+wait "$overx"
+cases=$((cases + 1))
+[ ! -e "$root/rootfs/layered" ] || fail "an overlay's write reached the directory through exec's machine" ""
+rm -f "$root/rootfs/srv/kept" "$root/rootfs/mapped/kept" "$root/rootfs/mapped/d/f"
+rmdir "$root/rootfs/mapped/d" "$root/rootfs/mapped"
 expect 1 'no such machine' "$hull" stats nobody
 expect 2 'usage' "$hull" stats
 

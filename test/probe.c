@@ -10,6 +10,9 @@
  *   host        the hostname          uid         the uid
  *   write PATH  whether PATH can be created
  *   remove PATH whether PATH can be removed
+ *   mkdir PATH  whether PATH can be made, as a directory
+ *   rmdir PATH  whether the directory PATH can be removed
+ *   list PATH   the names in the directory PATH, sorted
  *   owner PATH  PATH's owner, group and mode, not following a link
  *   read PATH   PATH's first line
  *   stdin       the first line of its stdin
@@ -375,6 +378,29 @@ int main(int argc, char **argv)
 			i++;
 		} else if (strcmp(step, "remove") == 0) {
 			printf("remove=%s\n", unlink(arg) == 0 ? "ok" : strerror(errno));
+			i++;
+		} else if (strcmp(step, "mkdir") == 0) {
+			printf("mkdir=%s\n", mkdir(arg, 0755) == 0 ? "ok" : strerror(errno));
+			i++;
+		} else if (strcmp(step, "rmdir") == 0) {
+			printf("rmdir=%s\n", rmdir(arg) == 0 ? "ok" : strerror(errno));
+			i++;
+		} else if (strcmp(step, "list") == 0) {
+			struct dirent **names;
+			int             n = scandir(arg, &names, NULL, alphasort);
+
+			if (n < 0) {
+				printf("list=%s\n", strerror(errno));
+			} else {
+				printf("list=");
+				for (int k = 0; k < n; k++) {
+					if (strcmp(names[k]->d_name, ".") != 0 && strcmp(names[k]->d_name, "..") != 0)
+						printf(" %s", names[k]->d_name);
+					free(names[k]);
+				}
+				free(names);
+				printf("\n");
+			}
 			i++;
 		} else if (strcmp(step, "owner") == 0) {
 			struct stat file;

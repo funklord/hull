@@ -4,7 +4,8 @@
  *
  * A machine is cloned into new user, mount, UTS and PID namespaces, with
  * the invoking user mapped to root, its directory bound onto itself and
- * chrooted into. The first process is a small init, PID 1: it forks the
+ * chrooted into, or under (mutable overlay) layered beneath a tmpfs and
+ * the overlay chrooted into. The first process is a small init, PID 1: it forks the
  * workload as PID 2, forwards it signals, reaps whatever is orphaned to
  * it, and reports the workload's wait status to the engine through a
  * pipe. PID 1 ignores a signal it has no handler for, so the workload
@@ -64,6 +65,7 @@ struct hull_machine {
 	char            *argv[MAX_ARGS + 1u];
 	char            *envp[MAX_ENV + 1u];
 	int              readonly_root;
+	int              overlay;    /* (mutable overlay), and the root not read-only */
 	int              no_new_privs;
 	char            *volume_host[MAX_VOLUMES];
 	char            *volume_guest[MAX_VOLUMES];
@@ -209,6 +211,11 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		m->readonly_root = hull_access_true(doc, &entry, "readonly_root");
 		m->no_new_privs  = hull_access_true(doc, &entry, "no_new_privs");
 	}
+	/* A read-only root has nothing for an overlay to hold, so it is the
+	 * directory itself, read-only, either way. */
+	source     = hull_access_value(doc, &machine, "mutable");
+	m->overlay = source != NULL && strcmp(source, "overlay") == 0 && !m->readonly_root;
+	free(source);
 	return NULL;
 }
 
@@ -260,6 +267,44 @@ static unsigned long locked_flags(const char *path)
 	if (st.f_flag & ST_RELATIME)
 		flags |= MS_RELATIME;
 	return flags;
+}
+
+/*
+ * The directory as an overlay, in the machine's own mount namespace: a
+ * clone of it beneath, and above it a tmpfs, which goes with the machine.
+ * The clone is taken first, then the tmpfs is mounted over the
+ * directory's own path, so the layers need no other place on the host;
+ * the overlay is mounted at merged/ there, which becomes the root. The
+ * paths given to overlayfs are relative, so a comma or a colon in the
+ * directory's path cannot change the mount's options. The upper layer's
+ * top takes the directory's mode, so / is what it is in place.
+ *
+ * A change to a file copies it up, and its parents, keeping their owners;
+ * one the namespace does not map cannot be, and the change fails with
+ * EOVERFLOW where in place it would have worked.
+ */
+static void layer(const hull_machine *m, int report)
+{
+	struct stat lower;
+	int         tree = open_tree(AT_FDCWD, m->root, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+
+	if (tree < 0 || fstat(tree, &lower) != 0)
+		child_fail(report, "the overlay's lower layer");
+	if (mount("tmpfs", m->root, "tmpfs", 0u, "mode=0700") != 0 || chdir(m->root) != 0 ||
+	    mkdir("lower", 0700) != 0 || mkdir("upper", 0700) != 0 ||
+	    mkdir("work", 0700) != 0 || mkdir("merged", 0700) != 0)
+		child_fail(report, "the overlay's tmpfs");
+	if (move_mount(tree, "", AT_FDCWD, "lower", MOVE_MOUNT_F_EMPTY_PATH) != 0)
+		child_fail(report, "the overlay's lower layer");
+	close(tree);
+	/* No chown: the namespace maps the user and the user's group, to root,
+	 * who made upper/, so the directory's owner and group are root's here
+	 * already or are not mapped and cannot be given. */
+	if (chmod("upper", lower.st_mode & 07777) != 0)
+		child_fail(report, "the overlay's upper layer");
+	if (mount("overlay", "merged", "overlay", 0u,
+	          "lowerdir=lower,upperdir=upper,workdir=work,userxattr") != 0)
+		child_fail(report, "mounting the overlay");
 }
 
 /*
@@ -343,7 +388,7 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int out, int e
 		child_fail(report, "gid_map");
 	if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
 		child_fail(report, "making mounts private");
-	if (mount(m->root, m->root, NULL, MS_BIND | MS_REC, NULL) != 0)
+	if (!m->overlay && mount(m->root, m->root, NULL, MS_BIND | MS_REC, NULL) != 0)
 		child_fail(report, "binding the root");
 	if (m->readonly_root &&
 	    mount(NULL, m->root, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | locked_flags(m->root),
@@ -364,7 +409,9 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int out, int e
 	}
 	if (m->hostname != NULL && sethostname(m->hostname, strlen(m->hostname)) != 0)
 		child_fail(report, "sethostname");
-	if (chroot(m->root) != 0)
+	if (m->overlay)
+		layer(m, report);
+	if (m->overlay ? chroot("merged") != 0 : chroot(m->root) != 0)
 		child_fail(report, "chroot");
 	for (unsigned i = 0u; i < m->volume_count; i++) {
 		snprintf(step, sizeof step, "volume %s", m->volume_guest[i]);
@@ -1120,8 +1167,13 @@ static hull_status chroot_stream_close(hull_core *core, hull_stream *st, hull_er
 /* --- the declaration ----------------------------------------------------- */
 
 static const hull_cap_entry entries[] = {
-	/* The dir itself, bound onto itself and chrooted into. */
+	/* The dir itself, bound onto itself and chrooted into; or beneath an
+	 * overlayfs in the machine's mount namespace, whose upper layer is a
+	 * tmpfs rather than section 3.7's upper/ on the host. */
 	{ "source.dir.direct",      HULL_SUP_NATIVE,   NULL, NULL },
+	{ "source.dir.overlay",     HULL_SUP_EMULATED,
+	  "an overlayfs in the machine's mount namespace; writes are held in memory and go with it",
+	  NULL },
 	{ "projection.bind",        HULL_SUP_NATIVE,   NULL, NULL },
 	{ "writeback.none",         HULL_SUP_NATIVE,   NULL, NULL },
 	{ "command",                HULL_SUP_NATIVE,   "a path: there is no PATH search", NULL },
