@@ -1498,6 +1498,7 @@ int hull_core_run(const char *host_arch)
 {
 	char               dir[4096];
 	char               path[4200];
+	char               lock_path[4200];
 	struct sockaddr_un address;
 	struct sigaction   action;
 	const char        *runtime = getenv("XDG_RUNTIME_DIR");
@@ -1517,14 +1518,28 @@ int hull_core_run(const char *host_arch)
 		fprintf(stderr, "hull core: %s: %s\n", dir, strerror(errno));
 		return 1;
 	}
-	/* One core per user: the lock is held for the core's life. */
-	snprintf(path, sizeof path, "%s/core.lock", dir);
-	lock = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-	if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB) != 0) {
-		if (lock >= 0)
+	/* One core per user: the lock is held for the core's life. A core
+	 * that is going removes its socket before anything else, so a
+	 * frontend that comes meanwhile starts this one. While the lock is
+	 * held and there is no socket, this one waits for the lock, a
+	 * minute at most, rather than leave that frontend with no core. A
+	 * core with its socket is the one wanted, and this one gives way. */
+	snprintf(path, sizeof path, "%s/core.sock", dir);
+	snprintf(lock_path, sizeof lock_path, "%s/core.lock", dir);
+	lock = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+	for (int tries = 0; lock >= 0 && flock(lock, LOCK_EX | LOCK_NB) != 0; tries++) {
+		struct timespec pause = { 0, 50000000L };
+
+		if ((errno != EWOULDBLOCK && errno != EINTR) || tries == 1200 ||
+		    access(path, F_OK) == 0) {
 			close(lock);
-		return 0;  /* another core has it, which is what was wanted */
+			lock = -1;
+			break;
+		}
+		nanosleep(&pause, NULL);
 	}
+	if (lock < 0)
+		return 0;  /* another core has it, which is what was wanted */
 	if (ftruncate(lock, 0) == 0) {
 		char pid[24];
 		int  n = snprintf(pid, sizeof pid, "%ld\n", (long)getpid());
@@ -1534,7 +1549,6 @@ int hull_core_run(const char *host_arch)
 		}
 	}
 
-	snprintf(path, sizeof path, "%s/core.sock", dir);
 	unlink(path);  /* a socket left by a core that died; the lock is ours */
 	listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	memset(&address, 0, sizeof address);
@@ -1573,6 +1587,10 @@ int hull_core_run(const char *host_arch)
 	sigaction(SIGPIPE, &action, NULL);
 	sigaction(SIGHUP, &action, NULL);
 
+	/* Idle from now, when a frontend can reach it: a core that waited
+	 * for the lock has a frontend coming, which an idle clock started
+	 * before the wait would have it leave before it could arrive. */
+	idle_since = time(NULL);
 	while (!ending) {
 		struct pollfd fds[2u + MAX_CLIENTS];
 		client       *owners[2u + MAX_CLIENTS];
@@ -1640,7 +1658,13 @@ int hull_core_run(const char *host_arch)
 		flush_all();
 	}
 
-	/* Going: every machine still running is stopped, and waited for. */
+	/* Going. A frontend that comes now must not reach a core that will
+	 * never answer it, so this one stops listening at once; one that
+	 * comes starts a core of its own, which waits for the lock. */
+	unlink(path);
+	close(listener);
+
+	/* Every machine still running is stopped, and waited for. */
 	for (unsigned i = 0u; i < MAX_MACHINES; i++)
 		if (machines[i].used && !machines[i].exited)
 			stop_machine(&machines[i], 10000);
@@ -1664,8 +1688,6 @@ int hull_core_run(const char *host_arch)
 		setsockopt(clients[i].wire.fd, SOL_SOCKET, SO_SNDTIMEO, &patience, sizeof patience);
 		flush(&clients[i]);
 	}
-	unlink(path);
-	close(listener);
 	close(lock);
 	return 0;
 }

@@ -711,6 +711,27 @@ got=$?
 [ "$got" = 143 ] || fail "a frontend whose core was told to go exited $got, wanted 143" \
 	"core $core; $(cat "$root/told.out"); core.log: $(cat "$XDG_RUNTIME_DIR/hull/core.log")"
 
+# A frontend that comes while a core is going reaches a new core: the
+# going core has stopped listening, and the new one waits for its lock.
+# The going core takes two seconds over its machine, which catches the
+# TERM it is stopped with and sleeps.
+conf slow '(command "/probe" "trap" "sleep" "2" "say" "slow")' '(hostname "slow")'
+(cd / && exec timeout -k 2 20 "$hull_abs" run -f "$root/slow.conf" > "$root/slow.out" 2>&1) &
+slow=$!
+tries=0
+until "$hull" ps 2>/dev/null | grep -q '^slow .*running$' || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+core=$(head -1 "$XDG_RUNTIME_DIR/hull/core.lock" 2>/dev/null)
+[ -n "$core" ] && kill -TERM "$core"
+sleep 0.3
+from_root 0 '^pid=2$' -f "$root/pid.conf"
+wait "$slow"
+cases=$((cases + 1))
+grep -q '^slow$' "$root/slow.out" ||
+	fail "the going core's machine did not end as it chose" "$(cat "$root/slow.out")"
+
 # What cannot be planned or started is 125, and says why.
 conf ports '(command "/probe") (ports (port (host 8080) (guest 80)))'
 from_root 125 'ports: rejected: chroot shares the host.s network' -f "$root/ports.conf"
