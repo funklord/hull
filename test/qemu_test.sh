@@ -459,6 +459,7 @@ has 125 'a udp port is not forwarded by the qemu engine yet'
 # SIGTERM to its frontend.
 conf trap '(backend vm) (hostname "qtrap") (command "/probe" "trap" "say" "after")'
 cases=$((cases + 1))
+rm -f "$root/trap.out"
 (cd / && exec timeout -k 2 60 "$hull" run -f "$root/trap.conf" > "$root/trap.out" 2>&1) &
 runner=$!
 await qtrap
@@ -604,6 +605,7 @@ printf '%s\n' "$out" | grep -q '^sh 4=xterm-hull$' && printf '%s\n' "$out" | gre
 
 # A TERM to hull exec is the command's, which catches it and goes on.
 cases=$((cases + 1))
+rm -f "$root/xtrap.out"
 (timeout -k 2 30 "$hull" exec qexec /probe trap say after > "$root/xtrap.out" 2>&1) &
 trapper=$!
 tries=0

@@ -244,6 +244,7 @@ await_ready() { # FILE
 	done
 }
 cases=$((cases + 1))
+rm -f "$root/killd.out"
 (cd / && exec timeout -k 5 60 "$hull" run -f "$root/killd.conf" > "$root/killd.out" 2>&1) &
 killed=$!
 await_ready "$root/killd.out"
@@ -253,6 +254,7 @@ got=$?
 [ "$got" = 0 ] && grep -q '^caught$' "$root/killd.out" ||
 	fail "a TERM to the workload: run exited $got, wanted 0 once caught" "$(cat "$root/killd.out")"
 cases=$((cases + 1))
+rm -f "$root/killd.out"
 (cd / && exec timeout -k 5 60 "$hull" run -f "$root/killd.conf" > "$root/killd.out" 2>&1) &
 killed=$!
 await_ready "$root/killd.out"
@@ -288,14 +290,53 @@ expect 0 '^from a dir$' dirov
 cases=$((cases + 1))
 again=$(timeout 10 docker image inspect -f '{{.Created}}' "hull-dir:$digest" 2>&1)
 [ "$again" = "$created" ] || fail "the second run imported the tree again" "$created then $again"
+# Labelled with the SHA-256 of the tree's real path, worked out here.
+cases=$((cases + 1))
+label=$(timeout 10 docker image inspect -f '{{index .Config.Labels "hull.tree"}}' "hull-dir:$digest" 2>&1)
+named=$(realpath "$root/rootfs" | tr -d '\n' | sha256sum | cut -c1-64)
+[ "$label" = "$named" ] || fail "the import's hull.tree is not its tree's" "$label, wanted $named"
+# A fresh import retires the tree's others, but not one a container
+# uses: a machine kept running on the first state holds it.
+printf '(machine (source "dir:./rootfs") (mutable overlay) (backend docker) (hostname "dtest-keep") %s)\n' \
+	'(command "/probe" "trap")' > "$root/dirkeep.conf"
+rm -f "$root/dirkeep.out"
+(cd / && exec timeout -k 2 30 "$hull" run -f "$root/dirkeep.conf" > "$root/dirkeep.out" 2>&1) &
+keeper=$!
+tries=0
+until grep -q '^ready$' "$root/dirkeep.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
 printf 'added\n' > "$root/rootfs/srv/added"
 changed=$(timeout 60 "$tree_tar" "$root/rootfs" | sha256sum | cut -c1-64)
 expect 0 '^from a dir$' dirov
 cases=$((cases + 1))
 [ "$changed" != "$digest" ] && timeout 10 docker image inspect "hull-dir:$changed" > /dev/null 2>&1 ||
 	fail "a changed tree was not imported as hull-dir:$changed" ""
-timeout 30 docker rmi "hull-dir:$digest" "hull-dir:$changed" > /dev/null 2>&1
-rm -f "$root/rootfs/srv/added"
+cases=$((cases + 1))
+timeout 10 docker image inspect "hull-dir:$digest" > /dev/null 2>&1 ||
+	fail "an import a running machine uses was retired" ""
+timeout 10 "$hull" kill -s TERM dtest-keep > /dev/null 2>&1
+wait "$keeper"
+# Once nothing uses it, the next import retires the first. The second
+# has another name as well, which only a forced removal would take, and
+# the daemon refuses an unforced one: so it stays. A running container
+# cannot tell forced from not, since the daemon refuses both.
+timeout 10 docker tag "hull-dir:$changed" "hull-dtest-named:$changed" > /dev/null 2>&1
+printf 'more\n' > "$root/rootfs/srv/more"
+third=$(timeout 60 "$tree_tar" "$root/rootfs" | sha256sum | cut -c1-64)
+expect 0 '^from a dir$' dirov
+cases=$((cases + 1))
+! timeout 10 docker image inspect "hull-dir:$digest" > /dev/null 2>&1 &&
+	timeout 10 docker image inspect "hull-dir:$third" > /dev/null 2>&1 ||
+	fail "a fresh import did not retire its tree's other" \
+		"$(timeout 10 docker images --filter "label=hull.tree=$named" 2>&1)"
+cases=$((cases + 1))
+timeout 10 docker image inspect "hull-dtest-named:$changed" > /dev/null 2>&1 ||
+	fail "an import with another name was retired with it" ""
+timeout 30 docker rmi "hull-dir:$digest" "hull-dir:$changed" "hull-dtest-named:$changed" \
+	"hull-dir:$third" > /dev/null 2>&1
+rm -f "$root/rootfs/srv/added" "$root/rootfs/srv/more"
 printf '(machine (source "dir:./rootfs") (backend docker) (hostname "dtest") (command "/probe"))\n' \
 	> "$root/dirin.conf"
 expect 125 'source\.dir\.direct: rejected' dirin

@@ -402,9 +402,53 @@ static int sent(void *context, const uint8_t *data, size_t n)
 }
 
 /*
+ * Remove the imports of the tree labelled `tree` but `keep`, each
+ * unforced: the daemon refuses one a container uses or that has another
+ * name as well, and that one stays. An import from before the label has
+ * none, and is not touched.
+ */
+static void retire_imports(const char *tree, const char *keep)
+{
+	char        path[400];
+	char        id[80];
+	char       *answer = NULL;
+	const char *at;
+	int         status = 0;
+
+	/* {"label":["hull.tree=<tree>"]}, escaped for the query. */
+	snprintf(path, sizeof path,
+	         "/images/json?filters=%%7B%%22label%%22%%3A%%5B%%22hull.tree%%3D%s%%22%%5D%%7D", tree);
+	if (call("GET", path, NULL, &status, &answer) != 0 || status != 200) {
+		free(answer);
+		return;
+	}
+	for (at = strstr(answer, "\"Id\":\""); at != NULL; at = strstr(at, "\"Id\":\"")) {
+		size_t n = 0u;
+
+		for (at += strlen("\"Id\":\""); *at != '"' && *at != '\0' && n + 1u < sizeof id;)
+			id[n++] = *at++;
+		id[n] = '\0';
+		if (n > 0u && strcmp(id, keep) != 0) {
+			char *gone = NULL;
+			int   result = 0;
+
+			snprintf(path, sizeof path, "/images/%s", id);
+			if (call("DELETE", path, NULL, &result, &gone) == 0)
+				free(gone);
+		}
+	}
+	free(answer);
+}
+
+/*
  * The image a dir source at `root` runs from, `hull-dir:<digest>`, into
  * `image`: the daemon's already, or imported now. Returns NULL, or why,
  * in `detail`.
+ *
+ * An import is labelled hull.tree, the SHA-256 of the tree's real path, which
+ * no path can make a label instruction or a query of, and a fresh one
+ * retires the tree's others: the daemon keeps one import per tree, and
+ * not one per state of it that ever ran.
  */
 static const char *import_dir(const char *root, char *image, size_t cap, char *detail,
                               size_t detail_cap)
@@ -415,6 +459,7 @@ static const char *import_dir(const char *root, char *image, size_t cap, char *d
 	uint8_t           digest[32];
 	uint8_t           again[32];
 	char              hex[65];
+	char              tree[65];
 	char              path[400];
 	char              id[80];
 	char             *answer = NULL;
@@ -431,6 +476,19 @@ static const char *import_dir(const char *root, char *image, size_t cap, char *d
 	hull_sha256_final(&first.sha, digest);
 	hull_sha256_hex(digest, hex);
 	snprintf(image, cap, "hull-dir:%s", hex);
+	{
+		/* The tree by its canonical path, so that two spellings of it,
+		 * or a link to it, are one tree. */
+		hull_sha256 named;
+		char       *canonical = realpath(root, NULL);
+		const char *name      = canonical != NULL ? canonical : root;
+
+		hull_sha256_init(&named);
+		hull_sha256_update(&named, (const uint8_t *)name, strlen(name));
+		free(canonical);
+		hull_sha256_final(&named, again);
+		hull_sha256_hex(again, tree);
+	}
 
 	snprintf(path, sizeof path, "/images/%s/json", image);
 	if (call("GET", path, NULL, &status, &answer) != 0) {
@@ -450,9 +508,9 @@ static const char *import_dir(const char *root, char *image, size_t cap, char *d
 		snprintf(detail, detail_cap, "the Docker daemon at %s cannot be reached", socket_path());
 		return detail;
 	}
-	addf(&head, "POST " API "/images/create?fromSrc=- HTTP/1.1\r\nHost: docker\r\n"
-	     "Connection: close\r\nContent-Type: application/x-tar\r\n"
-	     "Content-Length: %llu\r\n\r\n", first.length);
+	addf(&head, "POST " API "/images/create?fromSrc=-&changes=LABEL%%20hull.tree%%3D%s HTTP/1.1\r\n"
+	     "Host: docker\r\nConnection: close\r\nContent-Type: application/x-tar\r\n"
+	     "Content-Length: %llu\r\n\r\n", tree, first.length);
 	memset(&second, 0, sizeof second);
 	hull_sha256_init(&second.sha);
 	second.fd    = fd;
@@ -517,6 +575,7 @@ static const char *import_dir(const char *root, char *image, size_t cap, char *d
 		return detail;
 	}
 	free(answer);
+	retire_imports(tree, id);
 	return NULL;
 }
 

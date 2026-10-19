@@ -668,6 +668,7 @@ await_ready() { # FILE
 	done
 }
 cases=$((cases + 1))
+rm -f "$root/killd.out"
 (cd / && exec timeout -k 2 20 "$hull_abs" run -f "$root/killd.conf" > "$root/killd.out" 2>&1) &
 killed=$!
 await_ready "$root/killd.out"
@@ -678,6 +679,7 @@ got=$?
 	fail "a TERM to the workload: run exited $got, wanted 0 after it caught signal 15" \
 		"$(cat "$root/killd.out")"
 cases=$((cases + 1))
+rm -f "$root/killd.out"
 (cd / && exec timeout -k 2 20 "$hull_abs" run -f "$root/killd.conf" > "$root/killd.out" 2>&1) &
 killed=$!
 await_ready "$root/killd.out"
@@ -701,6 +703,7 @@ conf statsd '(command "/probe" "spin" "300" "reap" "300" "hold" "32" "fill" "/wr
 figure() { # NAME STATS: one figure of hull stats, the cpu in microseconds
 	printf '%s\n' "$2" | awk -v name="$1" '$1 == name { gsub(/\./, "", $2); print $2 + 0 }'
 }
+rm -f "$root/statsd.out"
 (cd / && exec timeout -k 2 20 "$hull_abs" run -f "$root/statsd.conf" > "$root/statsd.out" 2>&1) &
 statsd=$!
 await_ready "$root/statsd.out"
@@ -784,6 +787,7 @@ cases=$((cases + 1))
 conf overro '(mutable overlay) (security (readonly_root true))' '(command "/probe" "write" "/again")'
 from_root 0 '^write=Read-only file system$' -f "$root/overro.conf"
 conf overx '(mutable overlay) (hostname "overx")' '(command "/probe" "write" "/layered" "trap")'
+rm -f "$root/overx.out"
 (cd / && exec timeout -k 2 20 "$hull_abs" run -f "$root/overx.conf" > "$root/overx.out" 2>&1) &
 overx=$!
 await_ready "$root/overx.out"

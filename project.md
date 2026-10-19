@@ -685,10 +685,11 @@ Open:
 - **Images must already be local.** Nothing pulls; the OCI border (§3.5) is Phase 3.
 - **Sabotage,** baseline first, in scratch copies. Breaking each of these failed a named case: the tar's sorting, its pax names, its checksum, its mode and its mtime; a SHA-256 round constant and its padding boundary; the daemon's cache being asked, and the tag's name. Breaking the tag left images under the wrong names, removed afterwards by the ids docker's event log gave for imports in that window.
 - **Phase 1's exit is met, and `make check-flip` holds it (§12).** The file has to say `(mutable overlay)`, since docker refuses the in-place default. chroot runs an overlay too (§4.8), but it is not one of the three: it refuses the file's port.
-- **Imports accumulate.** Every state of a tree that ran leaves its `hull-dir` image, and nothing removes them. That is §10's `hull gc`.
+- **One import per tree is kept, not one per state of it.** Each import is labelled `hull.tree`, the SHA-256 of the tree's real path, so two spellings of a path or a link to it are one tree, and no path can break the label instruction or the query. A fresh import removes the tree's others, unforced, so the daemon keeps one a container uses or one with another name too. A tree that is deleted still leaves its last import, as does one imported before the label. Those are §10's `hull gc`, not written.
+  - **Sabotage:** breaking each of these failed a named case: retiring at all, the label, keeping the fresh import, and the real path. Removing with `force=true` first passed. The daemon refuses even a forced removal of an image a running container uses, so that case could not tell. An image with a second name is what force would take, and the case for it fails.
 - **Untested:** a tree that changes between the two readings, which a test cannot time on purpose.
 
-**`make check-docker`**, not part of `make check`, runs `test/docker_test.sh` against the daemon the account can reach. It uses `alpine:latest` and does not pull it. There are 43 cases:
+**`make check-docker`**, not part of `make check`, runs `test/docker_test.sh` against the daemon the account can reach. It uses `alpine:latest` and does not pull it. There are 48 cases:
 
 - output on its own stream, the exit status, env, workdir, hostname and the user's uid;
 - volumes, a write through one that lands as the user's file, and a read-only root;
@@ -696,7 +697,7 @@ Open:
 - a signal from the workload, and SIGTERM to `hull run` stopping the machine inside docker's ten seconds;
 - a port reached from the host on the machine's address, and not on 127.0.0.1;
 - `hull ssh`, alpine's login shell on a terminal with the frontend's TERM;
-- a dir source as an overlay: imported under the digest the test works out with `sha256sum`, run as the user, writing into the container and not the directory, imported once for two runs and again once changed; in place, refused;
+- a dir source as an overlay: imported under the digest the test works out with `sha256sum`, run as the user, writing into the container and not the directory, imported once for two runs and again once changed, labelled with its tree's path, an older import kept while a machine uses it and retired once nothing does, and one with a second name kept; in place, refused;
 - a missing image and a missing command;
 - no `hull-dtest-` container left at the end.
 
@@ -833,6 +834,7 @@ Open:
   - **The timeout is ruled out:** the same case, run alone at the same load, took 2.5 s of its 60, three times of three.
   - **qemu's parent-death signal is ruled out by reading:** it fires when the thread that forked qemu exits, and `handle_run` runs on the core's main thread.
   - **The core's log was gone by then,** since each core truncates it on starting and the suite's cores come and go. The case now puts `core.log` in its failure. Unexplained.
+- **Nine waits for a background machine could read a stale file, found 2026-10-20 and fixed.** Each started a run writing `X.out` in the background, then polled `X.out` for the probe's `ready`. A file left by the run before still said `ready` until the background shell truncated it, so the wait could pass before the machine existed. The docker case of an import kept for a running machine failed this way, its keeper not yet started, and its rerun failed where the first run had passed. The docker suite's second `killd` wait read the first's file, which fits a sabotage run's "kill refused" and 124 in a case the break could not reach. Each file is now removed before its run starts. The two qemu intermittents above printed `signal=15`, so the probe was running when the TERM came, and this race does not obviously explain them.
 - **Chroot cases of `make check` failed under load averages of 130 to 190,** from other work on the machine. Two runs failed. In one, `hull kill` found no machine yet and a run hit its `timeout`. In the other, `ps` had lost `box`, which an earlier core had kept, and `logs box` found no such machine. Reruns passed, one at a load of 189. A candidate, not shown: `HULL_CORE_IDLE=1` gives a core one idle second, which a starved host can spend between two cases, and a new core keeps nothing of the old.
 
 **Measured:**
