@@ -5,10 +5,11 @@
  * A machine is a qemu process, booted on the host's own kernel with an
  * initramfs the engine writes for it: the guest agent as /init
  * (agent/agent.c, Appendix B) and the modules it needs to reach its
- * directory and the host, which are the kernel's 9p and vsock modules and
- * what modules.dep says they need. The machine's directory is shared over
- * qemu's own 9p server, which needs nothing the user does not have; each
- * volume is a share of its own. /dev/kvm and /dev/vhost-vsock are open
+ * directory and the host, which are the kernel's 9p, vsock, virtio_net
+ * and overlay modules and what modules.dep says they need. The machine's
+ * directory is shared over qemu's own 9p server, which needs nothing the
+ * user does not have, and read-only under (mutable overlay), which the
+ * agent layers in the guest; each volume is a share of its own. /dev/kvm and /dev/vhost-vsock are open
  * to the user on hosts that grant them, and nothing here asks for root.
  *
  * The host is always the initiator (B.1): start() connects to the agent
@@ -98,6 +99,7 @@ struct hull_machine {
 	int              emu;          /* TCG, else KVM */
 	char            *root;         /* the dir source, without "dir:" */
 	int              readonly_root;
+	int              overlay;      /* (mutable overlay): the share is read-only */
 	char            *volume_host[MAX_VOLUMES];
 	int              volume_readonly[MAX_VOLUMES];
 	unsigned         volume_count;
@@ -238,6 +240,9 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 
 	if (hull_access_find(doc, &machine, "security", &entry))
 		m->readonly_root = hull_access_true(doc, &entry, "readonly_root");
+	text = hull_access_value(doc, &machine, "mutable");
+	m->overlay = text != NULL && strcmp(text, "overlay") == 0;
+	free(text);
 
 	m->memory_mib = 512u;
 	if ((text = hull_access_value(doc, &machine, "memory")) != NULL) {
@@ -415,7 +420,7 @@ static int add_module(module_list *list, const char *path)
 static const char *find_modules(const char *release, module_list *list)
 {
 	static const char *const wanted[] = { "9p", "9pnet_virtio", "vmw_vsock_virtio_transport",
-	                                      "virtio_net" };
+	                                      "virtio_net", "overlay" };
 	char        path[512];
 	char       *dep;
 	char       *lines[8192];
@@ -448,7 +453,7 @@ static const char *find_modules(const char *release, module_list *list)
 				break;
 		}
 		if (i == count) {
-			reason = "the host kernel has no 9p, vsock or virtio_net module for the guest";
+			reason = "the host kernel has no 9p, vsock, virtio_net or overlay module for the guest";
 			break;
 		}
 		{
@@ -684,7 +689,7 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 	snprintf(netdev, sizeof netdev, "stream,id=net,addr.type=fd,addr.str=%d", NETWORK_FD);
 	escaped(path, sizeof path, m->root);
 	snprintf(root, sizeof root, "local,id=root,path=%s,security_model=none%s", path,
-	         m->readonly_root ? ",readonly=on" : "");
+	         m->readonly_root || m->overlay ? ",readonly=on" : "");
 
 	argv[n++] = "qemu-system-x86_64";
 	argv[n++] = "-nodefaults";
@@ -1846,8 +1851,13 @@ static void *forward_ports(void *arg)
 /* --- the declaration ----------------------------------------------------- */
 
 static const hull_cap_entry entries[] = {
-	/* The dir over 9p, written in place. */
+	/* The dir over 9p, written in place; or read-only beneath an
+	 * overlayfs in the guest, whose upper layer is a tmpfs there rather
+	 * than section 3.7's upper/ on the host. */
 	{ "source.dir.direct",  HULL_SUP_NATIVE,   NULL, NULL },
+	{ "source.dir.overlay", HULL_SUP_EMULATED,
+	  "an overlayfs in the guest; writes are held in the machine's memory and go with it",
+	  NULL },
 
 	/* Applied by the guest agent. */
 	{ "command",            HULL_SUP_NATIVE,   NULL, NULL },

@@ -9,6 +9,8 @@
  *   env NAME    NAME's value          cwd         the working directory
  *   host        the hostname          uid         the uid
  *   write PATH  whether PATH can be created
+ *   remove PATH whether PATH can be removed
+ *   owner PATH  PATH's owner, group and mode, not following a link
  *   read PATH   PATH's first line
  *   stdin       the first line of its stdin
  *   count       all of its stdin: how many bytes, and their FNV-1a hash
@@ -66,6 +68,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -369,6 +372,18 @@ int main(int argc, char **argv)
 			printf("write=%s\n", fd >= 0 ? "ok" : strerror(errno));
 			if (fd >= 0)
 				close(fd);
+			i++;
+		} else if (strcmp(step, "remove") == 0) {
+			printf("remove=%s\n", unlink(arg) == 0 ? "ok" : strerror(errno));
+			i++;
+		} else if (strcmp(step, "owner") == 0) {
+			struct stat file;
+
+			if (lstat(arg, &file) != 0)
+				printf("owner=%s\n", strerror(errno));
+			else
+				printf("owner=%u:%u %04o\n", (unsigned)file.st_uid, (unsigned)file.st_gid,
+				       (unsigned)(file.st_mode & 07777));
 			i++;
 		} else if (strcmp(step, "session") == 0) {
 			printf("leader=%d\n", getsid(0) == getpid());

@@ -142,6 +142,7 @@ QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.co
                   readonly.conf vol.conf volro.conf trap.conf trap.out wait.conf kept.conf \
                   emu.conf execd.conf held.out xtrap.out xstop.out net.conf listen.out brief.conf \
                   ports.conf ports.out client.out taken.conf udp.conf keep.conf \
+                  overlay.conf overro.conf rootfs/srv/kept \
                   rootfs/probe rootfs/bin/sh rootfs/written rootfs/etc/resolv.conf data/in data/out)
 
 # The reference engine's test rootfs holds one static program.

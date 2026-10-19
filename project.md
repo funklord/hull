@@ -675,7 +675,7 @@ Open:
 - **An image that needs root inside**, an `apt-get` in a build step say, fails on docker as the user. It wants an engine that maps root to the user, as chroot and the native ns engine do, not docker's root.
 - **Images must already be local.** Nothing pulls; the OCI border (§3.5) is Phase 3.
 - **Sabotage,** baseline first, in scratch copies. Breaking each of these failed a named case: the tar's sorting, its pax names, its checksum, its mode and its mtime; a SHA-256 round constant and its padding boundary; the daemon's cache being asked, and the tag's name. Breaking the tag left images under the wrong names, removed afterwards by the ids docker's event log gave for imports in that window.
-- **Phase 1's exit is one step nearer and not reached.** A file with `(source "dir:…") (mutable overlay)` now runs on docker, but qemu and chroot run a dir in place only and refuse it for `source.dir.overlay`, while docker refuses the in-place default. So no one file flips yet. Overlay on qemu would close it; the agent could give one with overlayfs over its 9p share, and it is not written.
+- **Phase 1's exit, one file flipping between docker and qemu, can now be met and is not yet tested as one.** A file with `(source "dir:…") (mutable overlay)` runs on docker and, since the agent layers one (§4.11), on vm and emu. Docker refuses the in-place default, so the file has to say `overlay`. chroot still runs a dir in place only. No case runs one file on all three by `--backend`.
 - **Imports accumulate.** Every state of a tree that ran leaves its `hull-dir` image, and nothing removes them. That is §10's `hull gc`.
 - **Untested:** a tree that changes between the two readings, which a test cannot time on purpose.
 
@@ -820,6 +820,10 @@ Open:
 - **Moving onto the shared encrypted protocol**, when that is settled.
 - **The case of a core told to go failed once, intermittently,** with the frontend's 125, "the core went away", where 143 was wanted. It passed eight times of eight alone and in every other suite run, about a dozen, and reading the shutdown path found no race. The case now keeps the frontend's output and `core.log`, so a failure says more. Unexplained.
 - **The qemu case of a TERM to `hull exec` failed once, intermittently,** with 143 where 0 was wanted, in one of five suite runs on 2026-10-19. The command did catch the TERM: the output was `ready`, `signal=15`, `after`. Ten runs of the case alone passed. `timeout`, which wraps the frontend, exits 0 when its child does, and 137 when its `-k` fires. The probe's handler stays installed, so a second TERM cannot kill it. So either the frontend died by a TERM, or the agent reported the command killed by one, and neither route has been found. Unexplained.
+- **The qemu case of a TERM through the agent to `hull run` failed once, intermittently,** with 137 where 0 was wanted, in a sabotage baseline on 2026-10-19 at a load average near 200. The probe caught the TERM, so the output was `ready` and `signal=15`, but `after` never came. 137 is either `timeout`'s kill or the engine reporting a machine whose agent went without a word.
+  - **The timeout is ruled out:** the same case, run alone at the same load, took 2.5 s of its 60, three times of three.
+  - **qemu's parent-death signal is ruled out by reading:** it fires when the thread that forked qemu exits, and `handle_run` runs on the core's main thread.
+  - **The core's log was gone by then,** since each core truncates it on starting and the suite's cores come and go. The case now puts `core.log` in its failure. Unexplained.
 - **Chroot cases of `make check` failed under load averages of 130 to 190,** from other work on the machine. Two runs failed. In one, `hull kill` found no machine yet and a run hit its `timeout`. In the other, `ps` had lost `box`, which an earlier core had kept, and `logs box` found no such machine. Reruns passed, one at a load of 189. A candidate, not shown: `HULL_CORE_IDLE=1` gives a core one idle second, which a starved host can spend between two cases, and a new core keeps nothing of the old.
 
 **Measured:**
@@ -940,13 +944,22 @@ Open:
 
 - **What a user needs:** `/dev/kvm` for vm and `/dev/vhost-vsock` for both, which Debian opens to every user, a readable `/boot/vmlinuz` of the running kernel, and `passt` for the network.
 - **The machine:** a q35 machine with the host's kernel and an initramfs the engine writes for it into `$XDG_RUNTIME_DIR/hull/qemu-<pid>-<n>/`. The initramfs holds the guest agent as `/init` and the modules the agent loads to reach its directory and the host.
-- **The modules:** the kernel's 9p, vsock and virtio_net modules, with what `modules.dep` says they need, loaded in modprobe's order. They are xz-compressed, which the kernel decompresses itself, so the agent hands them over as they are.
+- **The modules:** the kernel's 9p, vsock, virtio_net and overlay modules, with what `modules.dep` says they need, loaded in modprobe's order. They are xz-compressed, which the kernel decompresses itself, so the agent hands them over as they are.
 - **The directory, and each volume,** is a share of qemu's own 9p server, written in place as the user's.
+- **Under `(mutable overlay)`** the directory's share is read-only, to qemu and to the guest, beneath an overlayfs the agent mounts. Its upper layer is a tmpfs in the guest.
 - **Classes:** vm is `-accel kvm -cpu host`. emu is `-accel tcg -cpu max`, on the host's arch only, since a foreign arch needs a foreign kernel.
 
 **9p, not virtiofs, which §3.2, §5.2 and §6 name.** virtiofs needs virtiofsd, a daemon of its own, which this host does not have. qemu's 9p runs inside qemu as the user and needs nothing else. Its fidelity is weaker: no host-side inotify, which is declared rejected as virtiofs's was, and slower metadata. This is a deviation from the design, not a change to it. Moving to virtiofs where virtiofsd is installed, and whether to require it, is the holder's decision.
 
 **The kernel is the host's, standing in for Appendix F's bundled one.** So `vm.kernel.bundled` and `vm.profile.micro`, the defaults every plan writes in, are declared emulated, and every run says so on stderr. The cost is measured: a machine boots and runs `/probe` in about 2.2 s, where §5.2's target is 100 to 300 ms. emu under TCG takes about 17 s.
+
+**A dir source as an overlay is an overlayfs in the guest, its upper layer a tmpfs there.** §3.7 has the directory stay pristine and the writes go to an upper layer. Here the agent mounts the 9p share read-only at `/hull/lower`, a tmpfs at `/hull/upper`, and the overlay of the two as the machine's root.
+- **The directory is read-only twice:** qemu's share is `readonly=on`, and the agent mounts it read-only. Each alone holds, as for a read-only root.
+- **`/` is what it is in place.** The tmpfs's top directory takes the directory's owner, group and mode, setgid included, so a file the machine's root writes in `/` takes the directory's group when `/` has the bit. Docker cannot do this: its `/` is root's (§4.9).
+- **A removal is a whiteout in the upper layer.** The file is gone inside and still on the host.
+- **With a read-only root** there is nothing for an overlay to hold, so the root is the share itself, read-only.
+- **The cost: writes are held in the machine's memory, and go with it,** as a docker container's writes go with the container. The tmpfs is the kernel's default, half the guest's memory. A machine of 256M, whose kernel reports 217,588 kB, took 106 MiB of a 200 MiB write, and the rest failed as a full disk. So the declaration is emulated, and says so.
+- **Why not §5.2's upper layer over a second share, on the host.** Tried with the upper layer on a 9p volume: the mount fails with EACCES. overlayfs makes its `work/work` directory with mode 000, and qemu's 9p server runs as the user, so the host enforces that mode against it. A whiteout would meet the same wall: it is a 0:0 character device, which the user cannot make. `security_model=mapped-xattr` keeps modes and devices in xattrs and might pass both, at the price of an upper layer whose files on the host are not what they are in the machine. Not tried. Writes kept on the host, past the machine's end, are what `hull commit` will want (§3.7).
 
 **A machine's network out is passt's, as the user; its ports in are the engine's.** §8 names user-mode networking per VM. The engine starts a passt for each machine on a socket pair, and the other end is qemu's virtio-net device.
 - **The addresses are fixed,** in both the engine and the agent: the guest is 10.0.2.15/24, its gateway 10.0.2.2, and its DNS 10.0.2.3, which passt forwards to the host's own resolver. These are slirp's well-known addresses. The agent brings up `lo` and `eth0` and adds the route itself, by ioctl, since there is no DHCP client in the guest.
@@ -974,8 +987,8 @@ Open:
 - **qemu has `PR_SET_PDEATHSIG`,** so it dies with the core, as a chroot machine does, and inherits none of the core's descriptors.
 - **A core killed outright leaves its machines' directories.** The next core's first machine removes them: one core runs per user, holding `core.lock`, so a directory named for a pid that is not running was a dead core's. Its files are removed by name.
 
-**What it declares** is what that does: a dir source in place, `command`, `workdir`, `env`, `hostname`, `volumes`, `cpus`, `memory`, `readonly_root`, `no_new_privs`, both `on_disconnect` values and `emu.cores_scale`, with the two emulated defaults above. `ports` is declared emulated, as §6 has it: tcp only, forwarded from the machine's address (§4.10).
-- **What it no longer declares:** image refs, overlays, ssh, secrets, media, device passthrough, the full profile and the other kernels. The draft declared all of these from §5 and §6 before any of it was written, the way docker's did.
+**What it declares** is what that does: a dir source in place or as an overlay, `command`, `workdir`, `env`, `hostname`, `volumes`, `cpus`, `memory`, `readonly_root`, `no_new_privs`, both `on_disconnect` values and `emu.cores_scale`, with the two emulated defaults above. `ports` is declared emulated, as §6 has it: tcp only, forwarded from the machine's address (§4.10).
+- **What it no longer declares:** image refs, ssh, secrets, media, device passthrough, the full profile and the other kernels. The draft declared all of these from §5 and §6 before any of it was written, the way docker's did.
 - **The cost:** §4's example, which has an image source, a port and `(ssh true)`, is refused on vm and emu for the image and ssh. A foreign arch is refused on emu.
 - **Not written yet:** `adopt()`, and the guest's own view of its stats (§4.10). A machine's output reaches the core, and so `hull logs`, as a chroot machine's does.
 
@@ -996,10 +1009,11 @@ Open:
 - **The reset was found by testing.** The agent first ended an abandoned connection with `shutdown(SHUT_RDWR)`, and a server in the machine writing to it blocked for good. Its socket sat in CLOSE_WAIT with 2.6 MB queued, and the agent's end in FIN_WAIT2. After SHUT_RD, Linux goes on taking what arrives, and the close is then a FIN, so the writer is never told. A linger of zero then a close is a reset, and the writer gets EPIPE.
 - **Not forwarded:** udp ports, which a plan with one is refused for. A connection is a stream, and a datagram has no channel shape here yet.
 
-**Measured,** in `test/qemu_test.sh`, which `make check-qemu` runs, since `make check` needs no KVM. Its 75 cases:
+**Measured,** in `test/qemu_test.sh`, which `make check-qemu` runs, since `make check` needs no KVM. Its 86 cases:
 - **One boot,** and every line it prints checked: output on both streams kept apart, the exit status, env, workdir, hostname, uid 0, `no_new_privs`, a session of its own, two CPUs, 256 MiB, and the KVM clock.
 - **How a machine ends:** death by a signal, 143, and a missing command, 127 with the reason.
 - **Writes:** a write landing in the directory as the user's file, a read-only root, and volumes read-write and read-only.
+- **An overlay:** `/` with the directory's owner, group and mode; a write and a removal inside, neither reaching the directory; a 200 MiB write stopping between 90 and 127 MiB; and a read-only overlay refusing a write.
 - **A running machine:** listed by `ps`, a TERM through `hull kill` caught by the workload, SIGTERM to `hull run` stopping the machine with 143, and qemu dying with a SIGKILLed core.
 - **exec,** in a machine of its own: the machine's environment and hostname, a status, a missing command 127, stdin ended by `/dev/null`, 588,895 bytes of stdin by length and FNV-1a hash, 300 kB to a command that sleeps six seconds first, and 3 MB to one that sleeps three.
 - **exec's output:** 3 MB counted against the same probe on the host, and 20 MB to a reader seven seconds behind arriving whole. Meanwhile the command is held, the machine counting one process more two seconds in, and another exec answers within three seconds.
@@ -1014,7 +1028,7 @@ Open:
   - a client leaving after 100 kB of 20 MB, which the machine's writer hears as a broken pipe;
   - a client holding its connection unread, through a 4 KiB window, while the machine is stopped: the listeners close within four seconds, before that client reads again, and its connection then ends.
 - **Ports, around those:** the listeners closed once the machine has gone, a port held on 127.0.0.1 leaving a machine publishing it free to start, the same port taken on the machine's address refusing it, and a udp port refused.
-- **The emu class** under TCG, without the KVM clock.
+- **The emu class** under TCG, without the KVM clock, as an overlay whose write stays in the machine.
 - **Nothing left:** no qemu of the suite's, no passt, and no machine directory, the dead core's included. passt is also checked gone with a SIGKILLed core, and gone with its machine while the core runs on: a machine boots and ends under the core another keeps running, and one passt is left.
 
 **Sabotage,** baseline first, in a scratch copy running `make check-qemu`. Breaking each of these failed a named case:
@@ -1023,6 +1037,10 @@ Open:
 - **Read-only, root and volume,** each broken on both sides together: qemu's `readonly=on` and the agent's read-only mount. Either alone holds.
 - **qemu's death signal** first passed. A core that dies closes its vsock connection, and the agent then stops the machine and powers off within the same second, which is `(on_disconnect stop)` doing its job. With both removed, the machine outlived its core and the case failed. Each alone holds.
 - **Untested:** retrying a vsock context id that is taken, which a test cannot make happen on purpose.
+
+**Sabotage of the overlay,** baseline first, the same way, after one baseline lost to an intermittent (§4.10's open items). Breaking each of these failed a named case: reading the mutability in the agent, the upper root's owner, its mode, the overlay module, and keeping a read-only root off the overlay. Two needed more:
+- **qemu's read-only share alone** passes: the agent mounts the share read-only as well. With both broken and the share bound in place of the overlay, the writes reached the directory and the case failed. Each alone holds.
+- **The tmpfs removed** passes and cannot fail here. The upper layer then lands on the initramfs's root, which the kernel also makes a tmpfs of half the memory when no `root=` is given. The mount is kept so the bound does not hang on how the kernel makes its root.
 
 **Sabotage of exec,** baseline first, the same way. Breaking each of these failed a named case:
 - the agent holding output to its credit, at both of its checks;

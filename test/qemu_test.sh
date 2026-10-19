@@ -145,6 +145,41 @@ cases=$((cases + 1))
 [ "$(printf '%s\n' "$out" | grep -c '^write=Read-only file system$')" = 2 ] ||
 	fail "a read-only machine's resolv.conf could be written" "$out"
 
+# An overlay: the directory read-only beneath, what the machine writes
+# held in its memory above. / keeps the directory's owner and mode, as
+# in place, setgid included, so a file the machine's root writes there
+# takes the directory's group when / has the bit. A file written is the
+# machine's and not the directory's, and one removed is gone inside and
+# still on the host. The upper layer is a tmpfs of half the machine's
+# memory, so 200 MiB into 256 stops short.
+printf 'kept\n' > "$root/rootfs/srv/kept"
+conf overlay '(backend vm) (mutable overlay) (memory "256M")' \
+	'(command "/probe" "owner" "/" "write" "/layered" "owner" "/layered"' \
+	'"remove" "/srv/kept" "read" "/srv/kept" "fill" "/big" "200")'
+name=overlay
+boot overlay
+has 0 'source\.dir\.overlay: emulated: an overlayfs in the guest'
+top=$(stat -c %u:%g "$root/rootfs")
+group=0
+[ -g "$root/rootfs" ] && group=$(stat -c %g "$root/rootfs")
+has 0 "^owner=$top $(printf '%04d' "$(stat -c %a "$root/rootfs")")\$"
+has 0 '^write=ok$'
+has 0 "^owner=0:$group 0644\$"
+has 0 '^remove=ok$'
+has 0 '^read=No such file or directory$'
+has 0 '^filled=(9[0-9]|1[01][0-9]|12[0-7])$'
+cases=$((cases + 1))
+[ ! -e "$root/rootfs/layered" ] && [ ! -e "$root/rootfs/big" ] &&
+	[ "$(cat "$root/rootfs/srv/kept" 2>&1)" = kept ] ||
+	fail "an overlay's writes reached the directory" "$(ls -l "$root/rootfs" "$root/rootfs/srv" 2>&1)"
+# Read-only as well, it is the share itself, read-only.
+conf overro '(backend vm) (mutable overlay) (security (readonly_root true))' \
+	'(command "/probe" "write" "/again")'
+name=overro
+boot overro
+has 0 '^write=Read-only file system$'
+rm -f "$root/rootfs/srv/kept"
+
 # Volumes, each a share of its own, read-write and read-only.
 conf vol '(backend vm) (volumes (volume (host "./data") (guest "/data")))' \
 	'(command "/probe" "read" "/data/in" "write" "/data/out")'
@@ -450,7 +485,8 @@ timeout 10 "$hull" kill -s TERM qtrap > /dev/null 2>&1
 wait "$runner"
 got=$?
 [ "$got" = 0 ] && grep -q '^signal=15$' "$root/trap.out" && grep -q '^after$' "$root/trap.out" ||
-	fail "a TERM through the agent was not the workload's to catch: $got" "$(cat "$root/trap.out")"
+	fail "a TERM through the agent was not the workload's to catch: $got" \
+		"$(cat "$root/trap.out"); core.log: $(cat "$XDG_RUNTIME_DIR/hull/core.log" 2>&1)"
 
 conf wait '(backend vm) (hostname "qwait") (command "/probe" "say" "up" "wait")'
 cases=$((cases + 1))
@@ -652,11 +688,15 @@ wait "$runner" 2>/dev/null
 # removes it, which the last case requires.
 
 # The emu class: the same machine under TCG.
-conf emu '(backend emu) (command "/probe" "say" "under tcg" "read"' \
-	'"/sys/devices/system/clocksource/clocksource0/available_clocksource")'
+conf emu '(backend emu) (mutable overlay) (command "/probe" "say" "under tcg" "read"' \
+	'"/sys/devices/system/clocksource/clocksource0/available_clocksource" "write" "/emulated")'
 name=emu
 boot emu 120
 has 0 '^under tcg$'
+# An overlay under TCG too, its write the machine's.
+has 0 '^write=ok$'
+cases=$((cases + 1))
+[ ! -e "$root/rootfs/emulated" ] || fail "an emu overlay's write reached the directory" ""
 # Emulated: no KVM clock, which the vm case above has.
 cases=$((cases + 1))
 if printf '%s\n' "$out" | grep -q 'kvm-clock'; then

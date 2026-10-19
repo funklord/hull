@@ -13,6 +13,9 @@
  * directory, shared by the host over 9p with the tag `root`, and each
  * volume, tagged v0, v1, ... in the order the spec lists them; then it
  * moves the directory onto / and chroots into it, as switch_root does.
+ * Under (mutable overlay) the share is read-only beneath an overlayfs
+ * whose upper layer is a tmpfs, so what the machine writes is held in its
+ * memory and goes with it.
  * `start` forks the workload, a session of its own, with the spec's
  * environment, workdir and no_new_privs. Its stdout and stderr come back
  * as `data` on channel 0, which is the workload's, as it is for `signal`.
@@ -316,6 +319,33 @@ static int share(const char *tag, const char *at, int readonly)
 	             "trans=virtio,version=9p2000.L,msize=262144");
 }
 
+/* The directory as an overlay at /machine: its share read-only beneath,
+ * and above it a tmpfs, whose root takes the directory's owner and mode
+ * so that / is what it is in place. A reason it cannot be, or NULL. */
+static const char *overlay(void)
+{
+	struct stat lower;
+
+	mkdir("/hull/lower", 0755);
+	mkdir("/hull/upper", 0755);
+	if (share("root", "/hull/lower", 1) != 0)
+		return "the machine's directory could not be mounted";
+	if (mount("tmpfs", "/hull/upper", "tmpfs", 0u, "mode=0755") != 0 ||
+	    mkdir("/hull/upper/data", 0755) != 0 || mkdir("/hull/upper/work", 0700) != 0 ||
+	    stat("/hull/lower", &lower) != 0 ||
+	    chown("/hull/upper/data", lower.st_uid, lower.st_gid) != 0 ||
+	    chmod("/hull/upper/data", lower.st_mode & 07777) != 0) {
+		say("overlay", strerror(errno));
+		return "the overlay's upper layer could not be made";
+	}
+	if (mount("overlay", "/machine", "overlay", 0u,
+	          "lowerdir=/hull/lower,upperdir=/hull/upper/data,workdir=/hull/upper/work") != 0) {
+		say("overlay", strerror(errno));
+		return "the machine's directory could not be mounted as an overlay";
+	}
+	return NULL;
+}
+
 /* Make `path`, and what leads to it, as directories. */
 static void make_path(char *path)
 {
@@ -337,9 +367,12 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	hull_sexpr_form item;
 	hull_sexpr_form security;
 	char           *hostname;
+	char           *mutability;
+	const char     *reason;
 	unsigned        n = 0u;
 	unsigned        volumes = 0u;
 	int             readonly_root = 0;
+	int             layered;
 	int             more;
 
 	if (!hull_access_find(doc, machine, "command", &entry))
@@ -390,10 +423,19 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 		return "the hostname could not be set";
 	}
 	free(hostname);
+	mutability = hull_access_value(doc, machine, "mutable");
+	layered    = mutability != NULL && strcmp(mutability, "overlay") == 0;
+	free(mutability);
 
+	/* A read-only root has nothing for an overlay to hold, so it is the
+	 * share itself, read-only, either way. */
 	mkdir("/machine", 0755);
-	if (share("root", "/machine", readonly_root) != 0)
+	if (layered && !readonly_root) {
+		if ((reason = overlay()) != NULL)
+			return reason;
+	} else if (share("root", "/machine", readonly_root) != 0) {
 		return "the machine's directory could not be mounted";
+	}
 	/* The machine's resolv.conf names passt's DNS, as docker writes
 	 * its own; only over a file, since a link would be followed here,
 	 * outside the machine. */
