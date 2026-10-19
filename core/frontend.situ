@@ -27,6 +27,7 @@ const EXEC     = ('4' << 24) | (':' << 16) | ('e' << 8) | 'x';
 const WINCH    = ('5' << 24) | (':' << 16) | ('w' << 8) | 'i';
 const SIGNAL   = ('6' << 24) | (':' << 16) | ('s' << 8) | 'i';
 const KILL     = ('4' << 24) | (':' << 16) | ('k' << 8) | 'i';
+const STATS    = ('5' << 24) | (':' << 16) | ('s' << 8) | 't';  // both ways
 const STARTED  = ('7' << 24) | (':' << 16) | ('s' << 8) | 't';
 const DATA     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'a';
 const EXITED   = ('6' << 24) | (':' << 16) | ('e' << 8) | 'x';
@@ -53,6 +54,7 @@ struct client_message {
 		case WINCH:   winch         winch;
 		case SIGNAL:  signal        signal;
 		case KILL:    kill          kill;
+		case STATS:   stats         stats;
 		case DATA:    client_data   data;
 		case EOF:     eof           eof;
 		case CREDIT:  credit        credit;
@@ -178,6 +180,14 @@ struct kill {
 	preamble u8[2] = "))";
 }
 
+// What the host spends on a running machine, answered `measured`.
+struct stats {
+	preamble u8[7] = "5:stats";
+	channel        ch;
+	machine_entry  machine;
+	u8  close  [must_eq = ')'];
+}
+
 // An exec's stdin: always fd 0.
 struct client_data {
 	preamble u8[12] = "4:data(3:buf";
@@ -217,6 +227,7 @@ struct core_message {
 		case DONE:      done        done;
 		case CREDIT:    credit      credit;
 		case LOST:      lost        lost;
+		case STATS:     measured    stats;
 		case ERROR:     failure     error;
 		default:        unknown     unknown;
 	}
@@ -312,6 +323,22 @@ struct listed {
 	atom  id;
 	preamble u8[9] = ")(5:state";
 	atom  state;
+	preamble u8[2] = "))";
+}
+
+// `stats`' answer, as the machine's engine measures it from the host:
+// microseconds of CPU time, bytes read from and written to storage, and
+// bytes resident by Pss, counting every process of the machine's and
+// those it has reaped.
+struct measured {
+	preamble u8[7] = "5:stats";
+	channel  ch;
+	preamble u8[6] = "(3:cpu";
+	atom  cpu;
+	preamble u8[6] = ")(2:io";
+	atom  io;
+	preamble u8[10] = ")(6:memory";
+	atom  memory;
 	preamble u8[2] = "))";
 }
 

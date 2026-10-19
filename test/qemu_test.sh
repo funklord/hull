@@ -556,6 +556,28 @@ after=$(timeout 10 "$hull" exec qexec /probe procs 2>&1)
 [ -n "$before" ] && [ "$before" = "$after" ] ||
 	fail "a command outlived its killed frontend" "before $before, after $after"
 
+# What the host spends on a vm: qemu's own CPU time, io and memory, which
+# hold the guest's. An exec's 300 ms of CPU, 300 more in a child it
+# reaps, and 4 MiB written through 9p show in qemu's figures.
+figure() { # NAME STATS: one figure of hull stats, the cpu in microseconds
+	printf '%s\n' "$2" | awk -v name="$1" '$1 == name { gsub(/\./, "", $2); print $2 + 0 }'
+}
+first=$(timeout 10 "$hull" stats qexec 2>&1)
+xcase 0 '^filled=4$' "$hull" exec qexec /probe spin 300 reap 300 fill /written 4
+second=$(timeout 10 "$hull" stats qexec 2>&1)
+rm -f "$root/rootfs/written"
+cases=$((cases + 1))
+[ "$(figure cpu "$second")" -ge $(($(figure cpu "$first") + 590000)) ] 2>/dev/null ||
+	fail "stats: a vm's cpu, wanted the exec's 0.6 s more" "$first
+$second"
+cases=$((cases + 1))
+[ "$(figure io "$second")" -ge $(($(figure io "$first") + 4194304)) ] 2>/dev/null ||
+	fail "stats: a vm's io, wanted the exec's 4 MiB more" "$first
+$second"
+cases=$((cases + 1))
+[ "$(figure memory "$second")" -ge 33554432 ] 2>/dev/null ||
+	fail "stats: a vm's memory, wanted at least 32 MiB" "$second"
+
 # A machine that stops takes its commands, and their frontends hear it at
 # once, 137.
 cases=$((cases + 1))
@@ -570,6 +592,7 @@ took=$(($(date +%s) - started))
 [ "$got" = 137 ] && [ "$took" -lt 8 ] ||
 	fail "an exec in a stopped machine ended $got after ${took}s, wanted 137 at once" ""
 wait "$execer" 2>/dev/null
+xcase 1 'the machine is not running' "$hull" stats qexec
 
 # A machine dies with its core: nothing could manage it after.
 conf kept '(backend vm) (hostname "qkept") (on_disconnect keep) (command "/probe" "wait")'

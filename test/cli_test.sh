@@ -663,6 +663,49 @@ expect 1 'no such machine' "$hull" kill nobody
 expect 1 'not a signal the core forwards' "$hull" kill -s STOP killd
 expect 2 'usage' "$hull" kill -s SIGTERMINATE killd
 
+# What the host spends on a machine, as its engine measures it: 300 ms of
+# the probe's CPU and 300 of a child it reaped, 32 MiB touched and 4 MiB
+# written, then 400 ms and 4 MiB more in an exec, whose helper reaps it
+# outside the machine's pid namespace. CPU time is the probe's own clock,
+# so a loaded host makes it slower and not smaller.
+conf statsd '(command "/probe" "spin" "300" "reap" "300" "hold" "32" "fill" "/written" "4" "trap")' \
+	'(hostname "statsd")'
+figure() { # NAME STATS: one figure of hull stats, the cpu in microseconds
+	printf '%s\n' "$2" | awk -v name="$1" '$1 == name { gsub(/\./, "", $2); print $2 + 0 }'
+}
+(cd / && exec timeout -k 2 20 "$hull_abs" run -f "$root/statsd.conf" > "$root/statsd.out" 2>&1) &
+statsd=$!
+await_ready "$root/statsd.out"
+cases=$((cases + 1))
+first=$(timeout 10 "$hull" stats statsd 2>&1)
+cpu=$(figure cpu "$first")
+[ "${cpu:-0}" -ge 590000 ] && [ "$cpu" -lt 5000000 ] ||
+	fail "stats: cpu, wanted the probe's 0.3 s and its child's" "$first"
+cases=$((cases + 1))
+memory=$(figure memory "$first")
+[ "${memory:-0}" -ge 33554432 ] && [ "$memory" -lt 268435456 ] ||
+	fail "stats: memory, wanted the 32 MiB the probe holds" "$first"
+cases=$((cases + 1))
+io=$(figure io "$first")
+[ "${io:-0}" -ge 4194304 ] && [ "$io" -lt 67108864 ] ||
+	fail "stats: io, wanted the 4 MiB the probe wrote" "$first"
+expect 0 '^filled=4$' "$hull" exec statsd /probe spin 400 fill /written 4
+cases=$((cases + 1))
+second=$(timeout 10 "$hull" stats statsd 2>&1)
+[ "$(figure cpu "$second")" -ge $((${cpu:-0} + 390000)) ] ||
+	fail "stats: an ended exec's cpu, wanted 0.4 s more than before it" "$first
+$second"
+cases=$((cases + 1))
+[ "$(figure io "$second")" -ge $((${io:-0} + 4194304)) ] ||
+	fail "stats: an ended exec's io, wanted 4 MiB more than before it" "$first
+$second"
+expect 0 '' "$hull" kill -s TERM statsd
+wait "$statsd"
+rm -f "$root/rootfs/written"
+expect 1 'the machine is not running' "$hull" stats statsd
+expect 1 'no such machine' "$hull" stats nobody
+expect 2 'usage' "$hull" stats
+
 # One core: a second gives way to the first, says nothing, and leaves the
 # first answering on its socket.
 expect 0 '' "$hull" core

@@ -65,6 +65,7 @@
 #include <linux/vm_sockets.h>
 
 #include "access.h"
+#include "usage.h"
 #include "builtin.h"
 #include "wire.h"
 
@@ -110,6 +111,7 @@ struct hull_machine {
 
 	char             dir[4096];    /* the machine's files: initrd, console */
 	int              network;      /* qemu's end of passt's socket, or -1 */
+	pid_t            passt;        /* passt's daemon, from its pid file, or 0 */
 	pid_t            qemu;
 	hull_wire        wire;
 	int              connected;
@@ -123,6 +125,7 @@ struct hull_machine {
 	int              code;
 	int              signal;
 	char             detail[512];
+	unsigned char    stats[128];   /* what stats() last gave */
 
 	hull_stream     *streams[MAX_STREAMS];  /* under `lock` */
 	uint32_t         next_ch;
@@ -562,6 +565,7 @@ static void last_line(const hull_machine *m, const char *file, char *out, size_t
 static const char *start_network(hull_machine *m)
 {
 	char        log[4200];
+	char        pid_file[4200];
 	const char *argv[32];
 	unsigned    n = 0u;
 	int         pair[2];
@@ -569,6 +573,7 @@ static const char *start_network(hull_machine *m)
 	pid_t       pid;
 
 	snprintf(log, sizeof log, "%s/passt.log", m->dir);
+	snprintf(pid_file, sizeof pid_file, "%s/passt.pid", m->dir);
 	argv[n++] = "passt";
 	argv[n++] = "--quiet";
 	argv[n++] = "--fd";
@@ -588,6 +593,8 @@ static const char *start_network(hull_machine *m)
 	argv[n++] = "none";
 	argv[n++] = "--udp-ports";
 	argv[n++] = "none";
+	argv[n++] = "--pid";
+	argv[n++] = pid_file;
 	argv[n] = NULL;
 
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0)
@@ -620,6 +627,18 @@ static const char *start_network(hull_machine *m)
 		return m->detail;
 	}
 	m->network = pair[0];
+	/* Written by passt's parent before it exits, so here by now. */
+	{
+		FILE *f = fopen(pid_file, "re");
+		long  pid = 0;
+
+		if (f != NULL) {
+			if (fscanf(f, "%ld", &pid) != 1)
+				pid = 0;
+			fclose(f);
+		}
+		m->passt = pid > 0 ? (pid_t)pid : 0;
+	}
 	return NULL;
 }
 
@@ -1025,7 +1044,8 @@ static hull_status qemu_create(hull_core *core, hull_buf plan, hull_machine **ou
 
 static void remove_files(const char *dir)
 {
-	static const char *const files[] = { "initrd", "console.log", "qemu.log", "passt.log" };
+	static const char *const files[] = { "initrd", "console.log", "qemu.log", "passt.log",
+	                                     "passt.pid" };
 	char path[4200];
 
 	for (unsigned i = 0u; i < sizeof files / sizeof files[0]; i++) {
@@ -1659,6 +1679,45 @@ typedef struct connection {
  * exec's stdin does, and the machine's come back through deliver(). The
  * client's end of writing is the agent's eof, so a client may half-close;
  * a client that goes, or that resets, ends the connection. */
+/* passt's figures, if `m->passt` is still a passt: it is not the
+ * engine's child, so its pid may have been freed and taken by another
+ * process once it has gone. */
+static void add_passt(const hull_machine *m, hull_usage *usage)
+{
+	char  path[64];
+	char  name[32] = "";
+	FILE *f;
+
+	if (m->passt <= 0)
+		return;
+	snprintf(path, sizeof path, "/proc/%ld/comm", (long)m->passt);
+	if ((f = fopen(path, "re")) == NULL)
+		return;
+	if (fgets(name, sizeof name, f) != NULL && strncmp(name, "passt", 5u) == 0)
+		hull_usage_add(m->passt, usage);
+	fclose(f);
+}
+
+/* What the host spends on the machine: qemu, which holds the guest's
+ * memory and runs its CPUs, and its passt. Read under the lock, so that
+ * qemu's pid is still qemu's. */
+static hull_status qemu_stats(hull_core *core, hull_machine *m, hull_buf *out, hull_error *error)
+{
+	hull_usage usage = { 0u, 0u, 0u };
+	int        read_all;
+
+	(void)core;
+	pthread_mutex_lock(&m->lock);
+	read_all = m->started && !m->done && hull_usage_add(m->qemu, &usage);
+	pthread_mutex_unlock(&m->lock);
+	if (!read_all)
+		return fail(error, HULL_ERR_GONE, "the machine is not running");
+	add_passt(m, &usage);
+	out->data = m->stats;
+	out->len = hull_usage_encode(&usage, m->stats, sizeof m->stats);
+	return out->len == 0u ? fail(error, HULL_ERR_INTERNAL, "stats do not fit") : HULL_OK;
+}
+
 static void *forward_one(void *arg)
 {
 	connection   *k = arg;
@@ -1843,6 +1902,7 @@ static const hull_engine_ops ops = {
 	.stream_close = qemu_stream_close,
 	.resize       = qemu_resize,
 	.signal       = qemu_signal,
+	.stats        = qemu_stats,
 };
 
 static const hull_engine engine = {

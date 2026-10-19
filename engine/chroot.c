@@ -41,6 +41,7 @@
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -49,6 +50,7 @@
 
 #include "access.h"
 #include "builtin.h"
+#include "usage.h"
 
 #define MAX_ARGS    256u
 #define MAX_ENV     256u
@@ -78,6 +80,8 @@ struct hull_machine {
 	pthread_mutex_t  lock;
 	pthread_cond_t   done_cond;
 	int              done;
+	hull_usage       spent;      /* finished execs', which their helpers reaped */
+	unsigned char    stats[128]; /* what stats() last gave */
 	char             detail[256];
 };
 
@@ -667,6 +671,7 @@ static void *read_exec(void *arg)
 	int           open_count = st->err < 0 ? 1 : 2;
 	int           status = 0;
 	int           seen;
+	struct rusage spent;
 
 	while (open_count > 0) {
 		if (poll(fds, 2, -1) < 0) {
@@ -706,9 +711,19 @@ static void *read_exec(void *arg)
 			;
 	}
 	pthread_mutex_lock(&st->lock);
-	waitpid(st->helper, &status, 0);
+	memset(&spent, 0, sizeof spent);
+	wait4(st->helper, &status, 0, &spent);
 	st->reaped = 1;
 	pthread_mutex_unlock(&st->lock);
+	/* The helper is outside the machine's pid namespace, so once it is
+	 * gone, what it and the command it reaped spent is counted here. Its
+	 * blocks are 512 bytes of storage io, as /proc's io counts them. */
+	pthread_mutex_lock(&st->machine->lock);
+	st->machine->spent.cpu += (unsigned long long)(spent.ru_utime.tv_sec + spent.ru_stime.tv_sec) *
+	                          1000000ull +
+	                          (unsigned long long)(spent.ru_utime.tv_usec + spent.ru_stime.tv_usec);
+	st->machine->spent.io += (unsigned long long)(spent.ru_inblock + spent.ru_oublock) * 512u;
+	pthread_mutex_unlock(&st->machine->lock);
 	if (read(st->status, &seen, sizeof seen) == (ssize_t)sizeof seen)
 		status = seen;
 	close(st->status);
@@ -1068,6 +1083,27 @@ static hull_status chroot_signal(hull_core *core, hull_machine *m, hull_stream *
 
 /* Ends the command, if it has not ended, and frees the stream; on_exit
  * has been or is then reported. */
+/* What the host spends on the machine: every process in its pid
+ * namespace, and the execs that have ended. Read under the lock, so that
+ * the init's pid is still the init's. */
+static hull_status chroot_stats(hull_core *core, hull_machine *m, hull_buf *out,
+                                hull_error *error)
+{
+	hull_usage usage;
+	int        read_all;
+
+	(void)core;
+	pthread_mutex_lock(&m->lock);
+	usage = m->spent;
+	read_all = m->started && !m->done && hull_usage_namespace(m->pid, &usage);
+	pthread_mutex_unlock(&m->lock);
+	if (!read_all)
+		return fail(error, HULL_ERR_GONE, "the machine is not running");
+	out->data = m->stats;
+	out->len = hull_usage_encode(&usage, m->stats, sizeof m->stats);
+	return out->len == 0u ? fail(error, HULL_ERR_INTERNAL, "stats do not fit") : HULL_OK;
+}
+
 static hull_status chroot_stream_close(hull_core *core, hull_stream *st, hull_error *error)
 {
 	chroot_stream_eof(core, st, error);
@@ -1128,6 +1164,7 @@ static const hull_engine_ops ops = {
 	.stream_close = chroot_stream_close,
 	.resize       = chroot_resize,
 	.signal       = chroot_signal,
+	.stats        = chroot_stats,
 };
 
 static const hull_engine engine = {

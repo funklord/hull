@@ -44,6 +44,10 @@
  *               does, and send it the count
  *   resolve A N ask the DNS server at address A for NAME's IPv4 address,
  *               within 5 seconds, and say its answer's rcode and count
+ *   spin MS     use MS milliseconds of CPU time, by its own clock
+ *   reap MS     spin MS in a child, and reap it
+ *   hold N      take N MiB and touch every page, held until it exits
+ *   fill PATH N write N MiB to PATH
  */
 
 #define _GNU_SOURCE
@@ -64,6 +68,7 @@
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t caught;
@@ -310,6 +315,22 @@ static void resolve(const char *server, const char *name)
 	close(fd);
 }
 
+/* Until this process has used `ms` of CPU time. */
+static void spin(long ms)
+{
+	struct timespec now;
+	long long       until;
+	volatile unsigned long turns = 0u;
+
+	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &now);
+	until = (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000 + ms;
+	do {
+		for (unsigned i = 0u; i < 100000u; i++)
+			turns++;
+		clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &now);
+	} while ((long long)now.tv_sec * 1000 + now.tv_nsec / 1000000 < until);
+}
+
 int main(int argc, char **argv)
 {
 	char text[256];
@@ -388,6 +409,41 @@ int main(int argc, char **argv)
 				close(peer);
 			}
 			i++;
+		} else if (strcmp(step, "spin") == 0) {
+			spin(atol(arg));
+			printf("spun=%s\n", arg);
+			i++;
+		} else if (strcmp(step, "reap") == 0) {
+			pid_t child = fork();
+
+			if (child == 0) {
+				spin(atol(arg));
+				_exit(0);
+			}
+			waitpid(child, NULL, 0);
+			printf("reaped=%s\n", arg);
+			i++;
+		} else if (strcmp(step, "hold") == 0) {
+			size_t         n = (size_t)atol(arg) << 20;
+			volatile char *held = malloc(n);
+
+			for (size_t at = 0u; held != NULL && at < n; at += 4096u)
+				held[at] = 1;
+			printf("held=%s\n", held != NULL ? arg : "no");
+			i++;
+		} else if (strcmp(step, "fill") == 0 && i + 2 < argc) {
+			static char block[1u << 20];
+			int         fd = open(arg, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			long        n = atol(argv[i + 2]);
+			long        done = 0;
+
+			memset(block, 'f', sizeof block);
+			while (fd >= 0 && done < n && write(fd, block, sizeof block) == (ssize_t)sizeof block)
+				done++;
+			printf("filled=%ld\n", done);
+			if (fd >= 0)
+				close(fd);
+			i += 2;
 		} else if (strcmp(step, "sleep") == 0) {
 			sleep((unsigned)atoi(arg));
 			i++;

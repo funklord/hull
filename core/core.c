@@ -1348,6 +1348,57 @@ static void handle_kill(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	}
 }
 
+/* What the host spends on a running machine, as its engine measures it:
+ * the engine's `(stats (cpu n) (io n) (memory n))`, on this channel. */
+static void handle_stats(client *c, uint32_t ch, const hull_sexpr_doc *body)
+{
+	static const char *const keys[] = { "cpu", "io", "memory" };
+	static const char *const opens[] = { "(3:cpu", ")(2:io", ")(6:memory" };
+	hull_error     error = { .struct_size = sizeof error };
+	slot          *s = named(c, ch, body);
+	hull_buf       out = { NULL, 0u };
+	hull_sexpr_doc stats;
+	hull_msg       m = { 0 };
+	long long      values[3];
+
+	if (s == NULL)
+		return;
+	if (s->exited || s->handle == NULL) {
+		send_error(c, ch, "the machine is not running");
+		return;
+	}
+	if (s->engine->ops->stats == NULL) {
+		send_error(c, ch, "that engine does not measure a machine");
+		return;
+	}
+	if (s->engine->ops->stats(&s->core, s->handle, &out, &error) != HULL_OK) {
+		send_error(c, ch, error.detail != NULL ? error.detail : "refused");
+		return;
+	}
+	if (hull_sexpr_open(&stats, out.data, out.len, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
+	    !hull_msg_is(&stats, "stats")) {
+		send_error(c, ch, "the engine's stats are not (stats ...)");
+		return;
+	}
+	for (unsigned i = 0u; i < 3u; i++) {
+		hull_sexpr_form value;
+
+		if (!hull_msg_find(&stats, keys[i], &value) ||
+		    !hull_msg_long(&stats, &value, &values[i])) {
+			send_error(c, ch, "the engine's stats lack a figure");
+			return;
+		}
+	}
+	hull_msg_raw(&m, "(5:stats");
+	hull_msg_channel(&m, ch);
+	for (unsigned i = 0u; i < 3u; i++) {
+		hull_msg_raw(&m, opens[i]);
+		hull_msg_number(&m, values[i]);
+	}
+	hull_msg_raw(&m, "))");
+	send_to(c, &m);
+}
+
 static void handle_list(client *c, uint32_t ch)
 {
 	hull_msg m = { 0 };
@@ -1416,6 +1467,8 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		handle_control(c, (uint32_t)ch, body, 0);
 	} else if (hull_msg_is(body, "kill")) {
 		handle_kill(c, (uint32_t)ch, body);
+	} else if (hull_msg_is(body, "stats")) {
+		handle_stats(c, (uint32_t)ch, body);
 	} else {
 		send_error(c, (uint32_t)ch, "unsupported");
 	}

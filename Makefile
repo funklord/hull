@@ -95,7 +95,8 @@ PLAN_OBJS = $(BUILD_DIR)/plan/matrix.o $(BUILD_DIR)/plan/registry.o \
 # command line that plans with them. VERSION is the one place the number
 # lives; `hull --version` prints it.
 ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
-              $(BUILD_DIR)/engine/chroot.o $(BUILD_DIR)/engine/access.o
+              $(BUILD_DIR)/engine/chroot.o $(BUILD_DIR)/engine/access.o \
+              $(BUILD_DIR)/engine/usage.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o
 
 # The per-user core, and the frontend protocol it speaks (section 4.10),
@@ -123,7 +124,8 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  foreign.conf machines.conf build.conf bad.conf example.conf run.conf \
                  writable.conf readonly.conf die.conf wait.conf ports.conf noargs.conf nope.conf \
                  pair.conf rootfs/written vol.conf volro.conf vollink.conf \
-                 volmissing.conf volhost.conf pid.conf keep.conf slow.conf slow.out gone.conf execd.conf attach.out \
+                 volmissing.conf volhost.conf pid.conf keep.conf slow.conf slow.out \
+                 statsd.conf statsd.out gone.conf execd.conf attach.out \
                  killd.conf killd.out flowd.conf held.out spewd.conf behind.out lost.err told.out \
                  data/in data/out rootfs/mnt-link) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)

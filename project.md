@@ -715,6 +715,7 @@ The read-only volume had first passed: while the container ran as root, a write 
 | `(logs (ch n) (follow true\|false) (machine id))` | `data` …, then `eof` unless following | what it has written, kept by the core |
 | `(stop (ch n) (machine id) (timeout_ms n))` | `(done (ch n))` | SIGTERM, then SIGKILL |
 | `(kill (ch n) (machine id) (signal HUP\|INT\|QUIT\|TERM\|USR1\|USR2\|KILL))` | `(done (ch n))` | a signal for its workload |
+| `(stats (ch n) (machine id))` | `(stats (ch n) (cpu n) (io n) (memory n))` | what the host spends on a running machine |
 | `(list (ch n))` | `(machines (ch n) (machine (class) (engine) (id) (state))…)` | what the core holds |
 | `(exec (argv w…) (ch n) (machine id) (tty false\|((cols n) (rows n))))` | `(started (ch n) (machine id))`, then `data` and `exited` | a command in a running machine |
 | `(data (buf b) (ch n) (fd 0))`, `(eof (ch n))` | `(credit (bytes n) (ch n))` | an exec's stdin, and how much more the core will take |
@@ -884,11 +885,22 @@ Open:
   - **The follower case first parsed one `lost` line.** One run, in a sabotage copy, was lapped twice, which can happen to the baseline, so it now sums them.
 - **A run whose start fails left its follower in the freed slot.** That was harmless while a run cleared the slot first. Once a slot taken over tells the old machine's followers it has gone, the stale follower was told instead. It pointed at a frontend since gone, so the next frontend in that client slot heard an `exited` before its own `started`, and exited 0 with no output. `pid.conf`'s case caught it, run after `volhost.conf`'s, whose start fails. A failed start now forgets its follower, and only a slot in use has followers to tell.
 - `test/wire_test.c` runs 19 cases: each direction's messages let through and the other's refused, non-canonical bodies refused, and the numbers read minimal decimal. Disabling the validator fails four of them.
-- `test/cli_test.sh` runs 133 cases. Among them: `ps`, `logs` after an exit, a duplicate id refused, a kept machine surviving its frontend's SIGKILL where an unkept one is stopped, `attach` ending with a stopped machine's 143, a second core giving way and the first still answering, a machine dying with a SIGKILLed core, and the core leaving when idle.
+- `test/cli_test.sh` runs 145 cases. Among them: `stats` on a chroot machine, its own CPU, its reaped child's, its memory and its writes, and an ended exec's CPU and writes; `ps`, `logs` after an exit, a duplicate id refused, a kept machine surviving its frontend's SIGKILL where an unkept one is stopped, `attach` ending with a stopped machine's 143, a second core giving way and the first still answering, a machine dying with a SIGKILLed core, and the core leaving when idle.
 - **Sabotage,** in a scratch copy, with an unmodified baseline first that had to pass. Breaking each of these failed the test: honouring `keep`, stopping on disconnect, replaying logs, `attach` following, one id at a time, the idle exit, the lock, and the parent-death signal.
   - The last two first passed. The lock case only checked that a second core exited 0. Without the lock, the second core takes the socket over, then leaves and removes it, stranding the first. The case now requires the first to still answer.
   - The parent-death case's wait could give up silently, so it now fails when the kept machine never ran. Without the signal, the probe was measured alive a second after its core died, and gone once the shell reaped the client, for no cause found then. So the case looks for the probe before the client is reaped, where the two behaviours differ.
   - **That later death went with the descriptors the init inherited**, found while writing `exec` (below). With them closed, the same experiment leaves the probe alive after the client is reaped as well. The exact path from the init's stray descriptors to the probe's death was not traced.
+
+**`hull stats ID` says what the host spends on a running machine**, as its engine measures it, from the host and never from inside:
+- **The figures:** CPU time in microseconds, user and system; bytes read from and written to storage, `/proc`'s `read_bytes` and `write_bytes`; and memory resident by Pss, so that pages two processes share are counted once. The engine's `stats()` gives them as `(stats (cpu n) (io n) (memory n))`, which the core checks and answers with on the request's channel. `hull stats` prints them, one to a line.
+- **What is summed:** the processes alive now, each counted with the children it has reaped, since the kernel adds a reaped child's CPU and io to its parent's. That counts every process that ever ran once, so long as whatever reaped it is counted too. `engine/usage.c` reads them.
+- **chroot:** every process in the machine's pid namespace, found by `/proc/<pid>/ns/pid`. An exec's helper is outside it, so what a helper and its command spent is added from `wait4()`'s rusage once the helper is reaped, its blocks as 512 bytes, which is how `/proc` counts io.
+- **qemu:** the qemu process, which holds the guest's memory and runs its CPUs, and its passt, found by the pid file passt's parent writes before it exits. passt is not the engine's child, so its pid is used only while `/proc/<pid>/comm` still names a passt. So a vm's figures are its whole cost to the host, the guest kernel's included, rather than what its processes use inside. B.3's `(sub … (what stats))` would give the guest's own view, and is not written.
+- **docker** gives none yet: `stats` is refused as an engine that does not measure a machine. `docker stats` would be its source.
+- **Not yet:** a rate. `hull stats` is one reading, and a CPU percentage needs two.
+- **Measured** in `test/cli_test.sh` on chroot and `test/qemu_test.sh` on vm (§4.11): CPU a probe uses by its own clock, so a loaded host makes it slower and not smaller, memory it holds, and bytes it writes.
+- **Sabotage,** baseline first, in scratch copies. On chroot, breaking each of these failed a named case: a reaped child's CPU, `write_bytes`, Pss in bytes, the whole namespace rather than the init, an ended exec's CPU and its io, and the core's keys. On vm: qemu counted at all, `write_bytes` and Pss. A reaped child's CPU passes on vm and cannot fail there: the guest's children are reaped inside qemu, and qemu reaps none of its own.
+- **Untested:** passt's share, which is too small beside qemu's to tell apart, and the guards against a freed pid, which a test cannot make happen on purpose.
 
 ### 4.11 The qemu engine, and the guest agent
 
@@ -933,7 +945,7 @@ Open:
 **What it declares** is what that does: a dir source in place, `command`, `workdir`, `env`, `hostname`, `volumes`, `cpus`, `memory`, `readonly_root`, `no_new_privs`, both `on_disconnect` values and `emu.cores_scale`, with the two emulated defaults above. `ports` is declared emulated, as §6 has it: tcp only, forwarded from 127.0.0.1.
 - **What it no longer declares:** image refs, overlays, ssh, secrets, media, device passthrough, the full profile and the other kernels. The draft declared all of these from §5 and §6 before any of it was written, the way docker's did.
 - **The cost:** §4's example, which has an image source, a port and `(ssh true)`, is refused on vm and emu for the image and ssh. A foreign arch is refused on emu.
-- **Not written yet:** logs and stats from the guest, and `adopt()`.
+- **Not written yet:** `adopt()`, and the guest's own view of its stats (§4.10). A machine's output reaches the core, and so `hull logs`, as a chroot machine's does.
 
 **`hull exec` on a qemu machine is a channel of the agent's,** which the engine allocates per exec.
 - **The command** gets the machine's environment, workdir and `no_new_privs`, on pipes or on a pseudo-terminal of the machine's own. The agent mounts `devpts` for that. A terminal is the command's controlling terminal, of the size the request gives.
@@ -952,13 +964,14 @@ Open:
 - **The reset was found by testing.** The agent first ended an abandoned connection with `shutdown(SHUT_RDWR)`, and a server in the machine writing to it blocked for good. Its socket sat in CLOSE_WAIT with 2.6 MB queued, and the agent's end in FIN_WAIT2. After SHUT_RD, Linux goes on taking what arrives, and the close is then a FIN, so the writer is never told. A linger of zero then a close is a reset, and the writer gets EPIPE.
 - **Not forwarded:** udp ports, which a plan with one is refused for. A connection is a stream, and a datagram has no channel shape here yet.
 
-**Measured,** in `test/qemu_test.sh`, which `make check-qemu` runs, since `make check` needs no KVM. Its 68 cases:
+**Measured,** in `test/qemu_test.sh`, which `make check-qemu` runs, since `make check` needs no KVM. Its 73 cases:
 - **One boot,** and every line it prints checked: output on both streams kept apart, the exit status, env, workdir, hostname, uid 0, `no_new_privs`, a session of its own, two CPUs, 256 MiB, and the KVM clock.
 - **How a machine ends:** death by a signal, 143, and a missing command, 127 with the reason.
 - **Writes:** a write landing in the directory as the user's file, a read-only root, and volumes read-write and read-only.
 - **A running machine:** listed by `ps`, a TERM through `hull kill` caught by the workload, SIGTERM to `hull run` stopping the machine with 143, and qemu dying with a SIGKILLed core.
 - **exec,** in a machine of its own: the machine's environment and hostname, a status, a missing command 127, stdin ended by `/dev/null`, 588,895 bytes of stdin by length and FNV-1a hash, 300 kB to a command that sleeps six seconds first, and 3 MB to one that sleeps three.
 - **exec's output:** 3 MB counted against the same probe on the host, and 20 MB to a reader seven seconds behind arriving whole. Meanwhile the command is held, the machine counting one process more two seconds in, and another exec answers within three seconds.
+- **stats:** an exec's 300 ms of CPU, 300 more in a child it reaps, and 4 MiB written through 9p, each showing in qemu's figures; at least 32 MiB resident; and a stopped machine refused.
 - **exec's terminal and its ends:** a terminal of 100 by 30, spoken by hand, its controlling terminal, resized to 120 by 40; a TERM to `hull exec` caught by the command; a frontend SIGKILLed taking its command with it, the machine counting as many processes after; and an exec in a machine that stops ending 137 at once.
 - **The network:** the agent's resolv.conf, read-only under a read-only root. `lo` is up: a dial to a port nothing holds is refused rather than unreachable. The host's resolver answers through 10.0.2.3, and a listener on the host's own address is reached. A listener on the host's 127.0.0.1 is not reached through the gateway, checked from both sides. Two host listeners on ports of their own say who came.
 - **Ports:** six, each from a free port to the probe. These cases run in order:
@@ -1288,7 +1301,7 @@ The framing is generated by situ from `agent/message.situ`: its frame layer turn
 | `(data (buf bytes) (ch n) (fd 0))` / `(eof (ch n))` | `(data (buf bytes) (ch n) (fd 1\|2))` / `(eof (ch n))` | stdio streaming |
 | `(winch (ch n) (cols n) (rows n))` | — | tty resize |
 | `(signal (ch n) (signal name))` | — | forward a signal: channel 0 to the workload, any other to its exec |
-| `(sub (ch n) (since t)? (what logs\|stats))` | `data` / `(stats (ch n) (cpu n) (io n) (mem n))` | `hull logs -f`, `hull stats` |
+| `(sub (ch n) (since t)? (what logs\|stats))` | `data` / `(stats (ch n) (cpu n) (io n) (memory n))` | the guest's own view; not written, since `hull logs` is the core's and `hull stats` is measured from the host (§4.10) |
 | `(stop (ch 0) (timeout_ms n))` | `exited`, then `(bye (ch 0))` | graceful stop: signal → wait → report; host kills the VM after `bye` or timeout |
 | `(ping (ch 0))` | `(pong (ch 0) (uptime n))` | liveness; host declares the VM wedged after N missed pongs and falls back to hypervisor kill |
 | `(credit (bytes n) (ch n))` | `(credit (bytes n) (ch n))` | per-channel flow control (B.2) |

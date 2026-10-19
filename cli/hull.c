@@ -88,7 +88,7 @@ static void usage(FILE *out)
 	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [NAME]\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
-	      "       hull kill [-s SIGNAL] ID\n"
+	      "       hull kill [-s SIGNAL] ID | hull stats ID\n"
 	      "       hull core\n"
 	      "       hull engines\n"
 	      "       hull --version\n", out);
@@ -975,6 +975,50 @@ static int exec_in(const char *id, char **argv, int argc, int tty)
 	return result;
 }
 
+/* What the host spends on a running machine, as its engine measures it:
+ * CPU time, storage io and memory resident. */
+static int stats_of(const char *id)
+{
+	static const char *const keys[] = { "cpu", "io", "memory" };
+	hull_wire       wire;
+	hull_sexpr_doc  body;
+	hull_sexpr_form value;
+	long long       values[3] = { 0, 0, 0 };
+	int             status = 0;
+
+	if (!core_running()) {
+		fprintf(stderr, "hull: no core is running, so no machine is\n");
+		return 1;
+	}
+	if (connect_core(&wire, 0) != 0)
+		return 2;
+	send_request(&wire, "(5:stats", 1u, id, NULL);
+	if (hull_wire_read(&wire, &body) != HULL_WIRE_OK) {
+		status = 2;
+	} else if (hull_msg_is(&body, "error")) {
+		char reason[512] = "an error";
+
+		if (hull_msg_find(&body, "reason", &value))
+			hull_msg_string(&body, &value, reason, sizeof reason);
+		fprintf(stderr, "hull: %s\n", reason);
+		status = 1;
+	} else if (!hull_msg_is(&body, "stats")) {
+		status = 2;
+	} else {
+		for (unsigned i = 0u; i < 3u; i++)
+			if (!hull_msg_find(&body, keys[i], &value) ||
+			    !hull_msg_long(&body, &value, &values[i]))
+				status = 2;
+	}
+	hull_wire_close(&wire);
+	if (status == 0)
+		printf("cpu     %lld.%06lld s\nio      %lld bytes\nmemory  %lld bytes\n",
+		       values[0] / 1000000, values[0] % 1000000, values[1], values[2]);
+	else if (status == 2)
+		fprintf(stderr, "hull: the core's answer to stats is not stats\n");
+	return status;
+}
+
 /* stop, kill, logs and attach: one request about one machine, followed
  * to its end. A Ctrl-C under attach or logs only leaves. `signal_name`
  * is kill's, a name the core checks. */
@@ -1144,6 +1188,9 @@ int main(int argc, char **argv)
 		}
 		return about(command, id, follow, timeout < 0 ? 0 : timeout, signal_name);
 	}
+
+	if (strcmp(command, "stats") == 0 && argc == 3 && argv[2][0] != '-')
+		return stats_of(argv[2]);
 
 	/* Planning needs the engines' declarations, not their operations,
 	 * which run in the core: nothing here reports to a core. */
