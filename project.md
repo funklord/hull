@@ -660,14 +660,26 @@ Three of these had first passed: stderr, stop and the session. Each was caught o
 - **Security:** `ReadonlyRootfs`, `no-new-privileges` and `CapDrop ALL`.
 - **`Init`, docker's own tini, as PID 1,** for the same reason §4.8's chroot engine has an init: a workload at PID 1 ignores `stop`'s SIGTERM, and nothing reaps. A command that is not there is therefore the init failing to exec it, status 127, as a shell would report it, not a failed start.
 
-**The declaration shrank to what the adapter does.** `ssh` and `secrets` left it, because nothing provisions sshd or materialises a secret yet. A dir source as an overlay is declared rejected until §5.0's "cached docker import of the tree" is written. One consequence: §4's example, which has `(ssh true)`, is refused on ns for that one field. Declaring `ssh` would run the machine without sshd and without a word, which §6's rule 1 forbids.
+**A dir source runs as an overlay, from §5.0's "cached docker import of the tree".** In place it stays rejected: docker cannot run a directory as it stands.
+- **The image is named for the tree:** `hull-dir:<SHA-256 of its tar>`. The daemon is asked for it first, so an unchanged tree is imported once. A second run of the test's tree took 0.6 s.
+- **The tar is the same bytes for the same tree** (`engine/tree.c`): ustar, with a pax header for what does not fit, entries in bytewise order, and only the mode, owner and mtime on disk. Every entry is opened from its directory's descriptor, so no symlink is followed. A hardlink is written as a file of its own, a socket is left out, and a device node is refused, since the root daemon would make the node.
+- **Read twice, tagged once.** The first reading gives the digest. The second streams into an untagged import while it is hashed again, and the image is tagged only if the two digests agree, so a tree that changed between the readings never wears a name it does not hold. Otherwise the image is deleted and the run refused.
+- **Its cost:** the files keep the user's owner, so the user writes where they own, and writes land in the container, as an overlay's do. `/` itself is root's, as docker makes every image's, and the declaration says so. A `./` entry for the root was tried, and docker ignores it.
+- **`engine/sha256.c`** is FIPS 180-4's SHA-256, which the store will want as well (§3.5). `test/sha256_test.c` holds it to FIPS's examples, the three lengths where the padding does or does not take a block of its own, and one input fed in pieces of every size.
+- **`test/tree_test.sh`** reads the tar back with Python's `tarfile` and GNU tar, neither sharing its code: every entry's kind, mode, owner, mtime, link and content, long names and a long link through pax, bytewise order, the same bytes twice and for the same tree made in the other order, a changed byte changing them, and an unreadable file named.
+
+**The declaration shrank to what the adapter does.** `ssh` and `secrets` left it, because nothing provisions sshd or materialises a secret yet. One consequence: §4's example, which has `(ssh true)`, is refused on ns for that one field. Declaring `ssh` would run the machine without sshd and without a word, which §6's rule 1 forbids.
 
 Open:
 
 - **An image that needs root inside**, an `apt-get` in a build step say, fails on docker as the user. It wants an engine that maps root to the user, as chroot and the native ns engine do, not docker's root.
 - **Images must already be local.** Nothing pulls; the OCI border (§3.5) is Phase 3.
+- **Sabotage,** baseline first, in scratch copies. Breaking each of these failed a named case: the tar's sorting, its pax names, its checksum, its mode and its mtime; a SHA-256 round constant and its padding boundary; the daemon's cache being asked, and the tag's name. Breaking the tag left images under the wrong names, removed afterwards by the ids docker's event log gave for imports in that window.
+- **Phase 1's exit is one step nearer and not reached.** A file with `(source "dir:…") (mutable overlay)` now runs on docker, but qemu and chroot run a dir in place only and refuse it for `source.dir.overlay`, while docker refuses the in-place default. So no one file flips yet. Overlay on qemu would close it; the agent could give one with overlayfs over its 9p share, and it is not written.
+- **Imports accumulate.** Every state of a tree that ran leaves its `hull-dir` image, and nothing removes them. That is §10's `hull gc`.
+- **Untested:** a tree that changes between the two readings, which a test cannot time on purpose.
 
-**`make check-docker`**, not part of `make check`, runs `test/docker_test.sh` against the daemon the account can reach. It uses `alpine:latest` and does not pull it. There are 35 cases:
+**`make check-docker`**, not part of `make check`, runs `test/docker_test.sh` against the daemon the account can reach. It uses `alpine:latest` and does not pull it. There are 43 cases:
 
 - output on its own stream, the exit status, env, workdir, hostname and the user's uid;
 - volumes, a write through one that lands as the user's file, and a read-only root;
@@ -675,6 +687,7 @@ Open:
 - a signal from the workload, and SIGTERM to `hull run` stopping the machine inside docker's ten seconds;
 - a port reached from the host on the machine's address, and not on 127.0.0.1;
 - `hull ssh`, alpine's login shell on a terminal with the frontend's TERM;
+- a dir source as an overlay: imported under the digest the test works out with `sha256sum`, run as the user, writing into the container and not the directory, imported once for two runs and again once changed; in place, refused;
 - a missing image and a missing command;
 - no `hull-dtest-` container left at the end.
 

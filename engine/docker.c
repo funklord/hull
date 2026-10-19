@@ -23,6 +23,13 @@
  * the stream, three of padding, a big-endian length, the bytes -- and
  * goes to the core through on_data, by a thread per machine that then
  * asks for the exit status and reports on_exit.
+ *
+ * A dir source runs as an overlay: the tree is imported as an image
+ * named for the SHA-256 of its tar, `hull-dir:<digest>`, which is
+ * imported only when the daemon does not have it. The tar is read twice,
+ * once for the digest and once into the import, which is tagged only
+ * when the second reading comes to the same digest, so a tree that
+ * changed between the two never wears a name it does not hold.
  */
 
 #define _GNU_SOURCE
@@ -44,6 +51,8 @@
 
 #include "access.h"
 #include "builtin.h"
+#include "sha256.h"
+#include "tree.h"
 
 #define API           "/v1.41"
 #define MAX_RESPONSE  (1u << 20)
@@ -240,27 +249,15 @@ static long dechunk(char *body, size_t length)
 	}
 }
 
-/* One request, answered and closed. `status` is the HTTP status, and
- * `answer` the body, which the caller frees. Returns 0, or -1 when the
- * daemon could not be reached or answered with nonsense. */
-static int call(const char *method, const char *path, const char *body, int *status,
-                char **answer)
+/* The daemon's answer on `fd`, which it closes, as call() gives it. */
+static int read_answer(int fd, int *status, char **answer)
 {
 	text  reply = { 0 };
 	char  buffer[4096];
 	char *head_end;
 	char *payload;
 	long  length;
-	int   fd = dial();
 
-	*answer = NULL;
-	*status = 0;
-	if (fd < 0)
-		return -1;
-	if (send_request(fd, method, path, body, "Connection: close\r\n") != 0) {
-		close(fd);
-		return -1;
-	}
 	for (;;) {
 		ssize_t n = read(fd, buffer, sizeof buffer);
 
@@ -294,6 +291,26 @@ static int call(const char *method, const char *path, const char *body, int *sta
 	*answer = reply.data;
 	return 0;
 }
+
+/* One request, answered and closed. `status` is the HTTP status, and
+ * `answer` the body, which the caller frees. Returns 0, or -1 when the
+ * daemon could not be reached or answered with nonsense. */
+static int call(const char *method, const char *path, const char *body, int *status,
+                char **answer)
+{
+	int fd = dial();
+
+	*answer = NULL;
+	*status = 0;
+	if (fd < 0)
+		return -1;
+	if (send_request(fd, method, path, body, "Connection: close\r\n") != 0) {
+		close(fd);
+		return -1;
+	}
+	return read_answer(fd, status, answer);
+}
+
 
 /* The string value of `"key":` in a flat JSON answer, copied to `out`. */
 static int json_string(const char *json, const char *key, char *out, size_t cap)
@@ -348,6 +365,159 @@ static const char *daemon_says(char *detail, size_t cap, const char *what, int s
 		snprintf(message, sizeof message, "HTTP %d", status);
 	snprintf(detail, cap, "%s: %s", what, message);
 	return detail;
+}
+
+/* --- a dir source, imported ---------------------------------------------- */
+
+/* A reading of the tree's tar: its digest and length, and, sending, where
+ * it goes and how much it may be. */
+typedef struct reading {
+	hull_sha256        sha;
+	unsigned long long length;
+	int                fd;
+	unsigned long long limit;
+	int                over;
+} reading;
+
+static int counted(void *context, const uint8_t *data, size_t n)
+{
+	reading *r = context;
+
+	hull_sha256_update(&r->sha, data, n);
+	r->length += n;
+	return 0;
+}
+
+static int sent(void *context, const uint8_t *data, size_t n)
+{
+	reading *r = context;
+
+	if (n > r->limit - r->length) {
+		r->over = 1;
+		return -1;
+	}
+	hull_sha256_update(&r->sha, data, n);
+	r->length += n;
+	return send_all(r->fd, (const char *)data, n);
+}
+
+/*
+ * The image a dir source at `root` runs from, `hull-dir:<digest>`, into
+ * `image`: the daemon's already, or imported now. Returns NULL, or why,
+ * in `detail`.
+ */
+static const char *import_dir(const char *root, char *image, size_t cap, char *detail,
+                              size_t detail_cap)
+{
+	static const char changed[] = "the directory changed while it was imported";
+	reading           first;
+	reading           second;
+	uint8_t           digest[32];
+	uint8_t           again[32];
+	char              hex[65];
+	char              path[400];
+	char              id[80];
+	char             *answer = NULL;
+	const char       *at;
+	text              head = { 0 };
+	int               status = 0;
+	int               fd;
+	size_t            n = 0u;
+
+	memset(&first, 0, sizeof first);
+	hull_sha256_init(&first.sha);
+	if (hull_tree_tar(root, counted, &first, detail, detail_cap) != 0)
+		return detail;
+	hull_sha256_final(&first.sha, digest);
+	hull_sha256_hex(digest, hex);
+	snprintf(image, cap, "hull-dir:%s", hex);
+
+	snprintf(path, sizeof path, "/images/%s/json", image);
+	if (call("GET", path, NULL, &status, &answer) != 0) {
+		snprintf(detail, detail_cap, "the Docker daemon at %s cannot be reached", socket_path());
+		return detail;
+	}
+	free(answer);
+	answer = NULL;
+	if (status == 200)
+		return NULL;
+	if (status != 404)
+		return daemon_says(detail, detail_cap, "looking for the import", status, NULL);
+
+	/* Untagged, so that nothing has the name until it is known to hold it. */
+	fd = dial();
+	if (fd < 0) {
+		snprintf(detail, detail_cap, "the Docker daemon at %s cannot be reached", socket_path());
+		return detail;
+	}
+	addf(&head, "POST " API "/images/create?fromSrc=- HTTP/1.1\r\nHost: docker\r\n"
+	     "Connection: close\r\nContent-Type: application/x-tar\r\n"
+	     "Content-Length: %llu\r\n\r\n", first.length);
+	memset(&second, 0, sizeof second);
+	hull_sha256_init(&second.sha);
+	second.fd    = fd;
+	second.limit = first.length;
+	if (head.failed || send_all(fd, head.data, head.length) != 0) {
+		free(head.data);
+		close(fd);
+		snprintf(detail, detail_cap, "the import could not be sent");
+		return detail;
+	}
+	free(head.data);
+	if (hull_tree_tar(root, sent, &second, detail, detail_cap) != 0) {
+		close(fd);
+		if (second.over)
+			snprintf(detail, detail_cap, "%s", changed);
+		return detail;
+	}
+	/* A tree that shrank is sent out to the length promised, and its
+	 * digest then differs. */
+	while (second.length < second.limit) {
+		static const char zeroes[4096];
+		size_t            take = second.limit - second.length < sizeof zeroes ?
+		                         (size_t)(second.limit - second.length) : sizeof zeroes;
+
+		second.over = 1;
+		if (send_all(fd, zeroes, take) != 0)
+			break;
+		second.length += take;
+	}
+	if (read_answer(fd, &status, &answer) != 0) {
+		snprintf(detail, detail_cap, "the import got no answer");
+		return detail;
+	}
+	if (status != 200 || json_string(answer, "error", detail, detail_cap)) {
+		if (status != 200)
+			daemon_says(detail, detail_cap, "import", status, answer);
+		free(answer);
+		return detail;
+	}
+	at = strstr(answer, "\"status\":\"sha256:");
+	if (at != NULL)
+		for (at += strlen("\"status\":\""); *at != '"' && *at != '\0' && n + 1u < sizeof id;)
+			id[n++] = *at++;
+	id[n] = '\0';
+	free(answer);
+	if (n == 0u) {
+		snprintf(detail, detail_cap, "the import named no image");
+		return detail;
+	}
+	hull_sha256_final(&second.sha, again);
+	if (second.over || memcmp(digest, again, sizeof digest) != 0) {
+		snprintf(path, sizeof path, "/images/%s?force=true", id);
+		if (call("DELETE", path, NULL, &status, &answer) == 0)
+			free(answer);
+		snprintf(detail, detail_cap, "%s", changed);
+		return detail;
+	}
+	snprintf(path, sizeof path, "/images/%s/tag?repo=hull-dir&tag=%s", id, hex);
+	if (call("POST", path, NULL, &status, &answer) != 0 || status != 201) {
+		daemon_says(detail, detail_cap, "tagging the import", status, answer);
+		free(answer);
+		return detail;
+	}
+	free(answer);
+	return NULL;
 }
 
 /* --- the plan, as a container -------------------------------------------- */
@@ -521,7 +691,7 @@ static void add_ports(text *exposed, text *bindings, const hull_sexpr_doc *doc,
 
 /* The create request's body, into `m->body`. Returns a reason, or NULL. */
 static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
-                         const hull_sexpr_form *machine)
+                         const hull_sexpr_form *machine, const char *image)
 {
 	hull_sexpr_form top;
 	struct in_addr  parsed;
@@ -533,14 +703,8 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	const char     *reason   = NULL;
 	char           *value;
 
-	value = hull_access_value(doc, machine, "source");
-	if (value == NULL || !is_ref(value)) {
-		free(value);
-		return "the docker adapter runs only an image ref";
-	}
 	add_text(&body, "{\"Image\":");
-	add_json(&body, value);
-	free(value);
+	add_json(&body, image);
 
 	if (hull_access_find(doc, machine, "command", &entry)) {
 		add_text(&body, ",\"Cmd\":[");
@@ -710,6 +874,29 @@ static void remove_container(const char *id)
  * caller can read it after the handle is gone. */
 static char create_detail[512];
 
+/* The image the machine runs: its ref, or its dir's import. A reason, or
+ * NULL. */
+static const char *source_image(const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
+                                char *image, size_t cap)
+{
+	char       *source = hull_access_value(doc, machine, "source");
+	char       *root;
+	const char *reason = NULL;
+
+	if (source != NULL && is_ref(source)) {
+		snprintf(image, cap, "%s", source);
+	} else if (source != NULL && strncmp(source, "dir:", 4u) == 0 && source[4] != '\0') {
+		root = hull_access_path(doc, source + 4);
+		reason = root == NULL ? "out of memory" :
+		         import_dir(root, image, cap, create_detail, sizeof create_detail);
+		free(root);
+	} else {
+		reason = "the docker adapter runs an image ref or a dir";
+	}
+	free(source);
+	return reason;
+}
+
 static hull_status docker_create(hull_core *core, hull_buf plan, hull_machine **out,
                                  hull_error *error)
 {
@@ -720,6 +907,7 @@ static hull_status docker_create(hull_core *core, hull_buf plan, hull_machine **
 	char           *answer = NULL;
 	char           *hostname;
 	char            path[160];
+	char            image[256];
 	int             status = 0;
 
 	if (!hull_access_machine(&doc, plan.data, plan.len, &machine))
@@ -736,9 +924,12 @@ static hull_status docker_create(hull_core *core, hull_buf plan, hull_machine **
 	         (long)getpid(), machines_made++);
 	free(hostname);
 
-	reason = build(m, &doc, &machine);
+	reason = source_image(&doc, &machine, image, sizeof image);
+	if (reason == NULL)
+		reason = build(m, &doc, &machine, image);
 	if (reason != NULL) {
-		snprintf(create_detail, sizeof create_detail, "%s", reason);
+		if (reason != create_detail)
+			snprintf(create_detail, sizeof create_detail, "%s", reason);
 		release(m);
 		return fail(error, HULL_ERR_UNSUPPORTED, create_detail);
 	}
@@ -1140,8 +1331,9 @@ static const hull_cap_entry entries[] = {
 	 * import that would run a dir as an overlay is not written yet. */
 	{ "source.dir.direct",  HULL_SUP_REJECTED,
 	  "docker cannot run a directory in place", NULL },
-	{ "source.dir.overlay", HULL_SUP_REJECTED,
-	  "the cached docker import of a dir is not written yet", NULL },
+	{ "source.dir.overlay", HULL_SUP_EMULATED,
+	  "a docker import of the tree, kept by its SHA-256; / is root's, as docker makes it",
+	  NULL },
 	{ "source.ref.overlay", HULL_SUP_NATIVE,   NULL, NULL },
 
 	/* "ports/volumes/env map directly" (5.0). */

@@ -3,7 +3,10 @@
 # Docker daemon this account can reach. Not part of `make check`, which
 # needs no daemon: `make check-docker` runs it.
 #
+# Its arguments are build/hull, the static probe and build/test/tree_tar.
 # Uses alpine:latest, which must be present already: nothing is pulled.
+# A dir source is imported as hull-dir:<digest>, and the test removes the
+# images it made by those names, which it works out itself.
 # Every machine is hostname dtest, so its container is hull-dtest-...,
 # and the last case requires none of those to be left. Each command runs
 # under `timeout`; the one loop, waiting for a port, gives up after 20
@@ -12,6 +15,8 @@
 set -u
 
 hull=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+probe=$2
+tree_tar=$3
 dir=${BUILD_DIR:?}/test/docker
 # A core of the test's own, as in cli_test.sh.
 XDG_RUNTIME_DIR=$(cd "${BUILD_DIR:?}" && pwd)/test/run
@@ -256,6 +261,44 @@ wait "$killed"
 got=$?
 [ "$got" = 137 ] && ! grep -q '^caught$' "$root/killd.out" ||
 	fail "a KILL to the workload: run exited $got, wanted 137" "$(cat "$root/killd.out")"
+
+# A dir source as an overlay: imported as hull-dir:<the SHA-256 of its
+# tar>, worked out here with sha256sum over tree_tar's stream, and run
+# from that. A write lands in the container and not in the directory;
+# / is root's, as docker makes it. A second run imports nothing, and a
+# changed tree is another image. In place, a dir is refused.
+mkdir -p "$root/rootfs/srv"
+cp "$probe" "$root/rootfs/probe"
+rm -f "$root/rootfs/srv/added" "$root/rootfs/srv/written"
+printf '(machine (source "dir:./rootfs") (mutable overlay) (backend docker) (hostname "dtest") %s)\n' \
+	'(command "/probe" "say" "from a dir" "uid" "write" "/srv/written" "write" "/written")' \
+	> "$root/dirov.conf"
+digest=$(timeout 60 "$tree_tar" "$root/rootfs" | sha256sum | cut -c1-64)
+expect 0 'source\.dir\.overlay: emulated: a docker import of the tree' dirov
+printf '%s\n' "$out" | grep -q '^from a dir$' && printf '%s\n' "$out" | grep -q "^uid=$(id -u)\$" &&
+	printf '%s\n' "$out" | grep -q '^write=ok$' &&
+	printf '%s\n' "$out" | grep -q '^write=Permission denied$' ||
+	fail "a dir's machine ran otherwise" "$out"
+cases=$((cases + 1))
+created=$(timeout 10 docker image inspect -f '{{.Created}}' "hull-dir:$digest" 2>&1) ||
+	fail "no image hull-dir:$digest" "$created"
+cases=$((cases + 1))
+[ ! -e "$root/rootfs/srv/written" ] || fail "an overlay's write landed in the directory" ""
+expect 0 '^from a dir$' dirov
+cases=$((cases + 1))
+again=$(timeout 10 docker image inspect -f '{{.Created}}' "hull-dir:$digest" 2>&1)
+[ "$again" = "$created" ] || fail "the second run imported the tree again" "$created then $again"
+printf 'added\n' > "$root/rootfs/srv/added"
+changed=$(timeout 60 "$tree_tar" "$root/rootfs" | sha256sum | cut -c1-64)
+expect 0 '^from a dir$' dirov
+cases=$((cases + 1))
+[ "$changed" != "$digest" ] && timeout 10 docker image inspect "hull-dir:$changed" > /dev/null 2>&1 ||
+	fail "a changed tree was not imported as hull-dir:$changed" ""
+timeout 30 docker rmi "hull-dir:$digest" "hull-dir:$changed" > /dev/null 2>&1
+rm -f "$root/rootfs/srv/added"
+printf '(machine (source "dir:./rootfs") (backend docker) (hostname "dtest") (command "/probe"))\n' \
+	> "$root/dirin.conf"
+expect 125 'source\.dir\.direct: rejected' dirin
 
 # What cannot be created is 125, and says why. A command that is not
 # there is docker's init failing to exec it, 127, as a shell would say.

@@ -96,7 +96,8 @@ PLAN_OBJS = $(BUILD_DIR)/plan/matrix.o $(BUILD_DIR)/plan/registry.o \
 # lives; `hull --version` prints it.
 ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/chroot.o $(BUILD_DIR)/engine/access.o \
-              $(BUILD_DIR)/engine/usage.o
+              $(BUILD_DIR)/engine/usage.o $(BUILD_DIR)/engine/sha256.o \
+              $(BUILD_DIR)/engine/tree.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o
 
 # The per-user core, and the frontend protocol it speaks (section 4.10),
@@ -133,7 +134,8 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
 # What test/docker_test.sh writes.
 DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf volro.conf \
                     rootro.conf nocap.conf cap.conf die.conf wait.conf port.conf noimage.conf \
-                    nocmd.conf execd.conf killd.conf killd.out held.out data/in data/out)
+                    nocmd.conf execd.conf killd.conf killd.out held.out data/in data/out \
+                    dirov.conf dirin.conf rootfs/probe rootfs/srv/added rootfs/srv/written)
 
 # What test/qemu_test.sh writes.
 QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.conf write.conf \
@@ -150,12 +152,16 @@ TEST_MATRIX_OBJS  = $(BUILD_DIR)/test/matrix_test.o
 TEST_REGISTRY_OBJS = $(BUILD_DIR)/test/registry_test.o
 TEST_PLAN_OBJS    = $(BUILD_DIR)/test/plan_test.o
 TEST_WIRE_OBJS    = $(BUILD_DIR)/test/wire_test.o
+TEST_SHA256_OBJS  = $(BUILD_DIR)/test/sha256_test.o
+TEST_TREE_OBJS    = $(BUILD_DIR)/test/tree_tar.o
 TEST_OBJS = $(TEST_SEXPR_OBJS) $(TEST_FRAMING_OBJS) $(TEST_SPEC_OBJS) $(TEST_MATRIX_OBJS) \
-            $(TEST_REGISTRY_OBJS) $(TEST_PLAN_OBJS) $(TEST_WIRE_OBJS)
+            $(TEST_REGISTRY_OBJS) $(TEST_PLAN_OBJS) $(TEST_WIRE_OBJS) $(TEST_SHA256_OBJS) \
+            $(TEST_TREE_OBJS)
 TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
             $(BUILD_DIR)/test/spec_test $(BUILD_DIR)/test/matrix_test \
             $(BUILD_DIR)/test/registry_test $(BUILD_DIR)/test/plan_test \
-            $(BUILD_DIR)/test/wire_test
+            $(BUILD_DIR)/test/wire_test $(BUILD_DIR)/test/sha256_test \
+            $(BUILD_DIR)/test/tree_tar
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
@@ -290,6 +296,12 @@ $(BUILD_DIR)/test/plan_test: $(TEST_PLAN_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR
 $(BUILD_DIR)/test/wire_test: $(TEST_WIRE_OBJS) $(WIRE_OBJS) $(SEXPR_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
+$(BUILD_DIR)/test/sha256_test: $(TEST_SHA256_OBJS) $(BUILD_DIR)/engine/sha256.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+$(BUILD_DIR)/test/tree_tar: $(TEST_TREE_OBJS) $(BUILD_DIR)/engine/tree.o
+	$(CC) $(CFLAGS) -o $@ $^
+
 -include $(SEXPR_OBJS:.o=.d) $(AGENT_OBJS:.o=.d) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS:.o=.d) \
          $(ENGINE_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(CORE_OBJS:.o=.d) $(TEST_OBJS:.o=.d) \
          $(BUILD_DIR)/agent/agent.d
@@ -314,6 +326,8 @@ test: $(TEST_BINS) $(HULL) $(PROBE) vectors
 	$(BUILD_DIR)/test/registry_test
 	$(BUILD_DIR)/test/plan_test
 	$(BUILD_DIR)/test/wire_test
+	$(BUILD_DIR)/test/sha256_test
+	BUILD_DIR='$(BUILD_DIR)' sh test/tree_test.sh '$(BUILD_DIR)/test/tree_tar'
 	BUILD_DIR='$(BUILD_DIR)' sh test/cli_test.sh '$(HULL)'
 	$(PYTHON) tool/test_style_gate.py
 
@@ -339,8 +353,9 @@ vectors: $(SITU_MARK)
 # The docker adapter against a real daemon. Not in `check`, which needs
 # none: this one starts containers on the daemon the account can reach,
 # from alpine:latest, which it does not pull.
-check-docker: $(HULL)
-	BUILD_DIR='$(BUILD_DIR)' sh test/docker_test.sh '$(HULL)'
+check-docker: $(HULL) $(PROBE) $(BUILD_DIR)/test/tree_tar
+	BUILD_DIR='$(BUILD_DIR)' sh test/docker_test.sh '$(HULL)' '$(PROBE)' \
+		'$(BUILD_DIR)/test/tree_tar'
 
 check-qemu: $(HULL) $(AGENT_BIN) $(PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/qemu_test.sh '$(HULL)' '$(PROBE)'
