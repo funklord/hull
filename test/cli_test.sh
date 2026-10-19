@@ -332,6 +332,15 @@ expect 0 'signal=2' sh -c '(sleep 1; printf "\003"; sleep 1) |
 expect 0 '^stdin=\(none\)' sh -c '(sleep 1; printf "\004"; sleep 1) |
 	script -qec "\"\$HULL\" exec -t execd /probe stdin" /dev/null'
 expect 125 'needs a terminal' "$hull" exec -t execd /probe tty
+# ssh: a login shell on a terminal, the frontend's TERM given as its
+# argument. The probe, as the machine's /bin/sh, says what it was given.
+mkdir -p "$root/rootfs/bin"
+cp "$root/rootfs/probe" "$root/rootfs/bin/sh"
+expect 0 '^sh 4=xterm-hull' script -qec 'TERM=xterm-hull "$HULL" ssh execd' /dev/null
+expect 0 '^sh 2=TERM="\$1" exec /bin/sh -l' script -qec 'TERM=xterm-hull "$HULL" ssh execd' /dev/null
+expect 0 '^tty=yes' script -qec 'TERM=xterm-hull "$HULL" ssh execd' /dev/null
+expect 0 '^sh 1=-l' script -qec 'unset TERM; "$HULL" ssh execd' /dev/null
+expect 125 'ssh needs a terminal' "$hull" ssh execd
 # What the core refuses that no frontend of ours sends, sent as another
 # frontend might, framed by hand: a 4-byte length, then the message. The
 # reply is read until the text asked for, or the core closes.

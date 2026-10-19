@@ -556,6 +556,16 @@ printf '%s\n' "$out" | grep -q 'tty=yes' && printf '%s\n' "$out" | grep -q 'size
 	printf '%s\n' "$out" | grep -q 'controlling=yes' && printf '%s\n' "$out" | grep -q 'size=120x40' ||
 	fail "a terminal was not of the size asked, or not resized" "$out"
 
+# ssh: the machine's /bin/sh, here the probe saying what it was given,
+# on a terminal, with the frontend's TERM as its argument.
+mkdir -p "$dir/rootfs/bin"
+cp "$probe" "$dir/rootfs/bin/sh"
+cases=$((cases + 1))
+out=$(HULL=$hull SHELL=/bin/sh timeout 30 script -qec 'TERM=xterm-hull "$HULL" ssh qexec' \
+	/dev/null 2>&1 | tr -d '\r')
+printf '%s\n' "$out" | grep -q '^sh 4=xterm-hull$' && printf '%s\n' "$out" | grep -q '^tty=yes$' ||
+	fail "ssh gave no shell on a terminal with the frontend's TERM" "$out"
+
 # A TERM to hull exec is the command's, which catches it and goes on.
 cases=$((cases + 1))
 (timeout -k 2 30 "$hull" exec qexec /probe trap say after > "$root/xtrap.out" 2>&1) &

@@ -336,6 +336,14 @@ int main(int argc, char **argv)
 	char text[256];
 
 	setvbuf(stdout, NULL, _IONBF, 0);
+	/* Run as a machine's /bin/sh, as `hull ssh` runs one: what it was
+	 * given, and whether that is on a terminal. */
+	if (strcmp(argv[0], "/bin/sh") == 0) {
+		for (int i = 1; i < argc; i++)
+			printf("sh %d=%s\n", i, argv[i]);
+		printf("tty=%s\n", isatty(0) ? "yes" : "no");
+		return 0;
+	}
 	for (int i = 1; i < argc; i++) {
 		const char *step = argv[i];
 		const char *arg  = i + 1 < argc ? argv[i + 1] : "";

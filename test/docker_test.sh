@@ -216,6 +216,14 @@ out=$(timeout 30 sh -c '"$0" exec dtest sh -c "trap \"echo caught; exit 0\" TERM
 got=$?
 [ "$got" = 0 ] && printf '%s\n' "$out" | grep -q '^caught$' ||
 	fail "a TERM to exec was not the command's: $got" "$out"
+# ssh: alpine's own login shell, on a terminal, with the frontend's TERM.
+# The line typed echoes as itself, which the pattern does not match.
+cases=$((cases + 1))
+out=$(timeout 30 sh -c '(sleep 2; printf "echo \"term=\$TERM tty=\$(tty)\"; exit\r"; sleep 2) |
+	script -qec "TERM=xterm-hull \"\$HULL\" ssh dtest" /dev/null' 2>&1 | tr -d '\r')
+got=$?
+printf '%s\n' "$out" | grep -q '^term=xterm-hull tty=/dev/pts/' ||
+	fail "ssh gave no login shell with the frontend's TERM" "$out"
 timeout 30 "$hull" stop dtest > /dev/null 2>&1
 wait "$execer" 2>/dev/null
 

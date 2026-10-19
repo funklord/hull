@@ -88,7 +88,7 @@ static void usage(FILE *out)
 	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [NAME]\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
-	      "       hull kill [-s SIGNAL] ID | hull stats ID\n"
+	      "       hull kill [-s SIGNAL] ID | hull stats ID | hull ssh ID\n"
 	      "       hull core\n"
 	      "       hull engines\n"
 	      "       hull --version\n", out);
@@ -978,6 +978,29 @@ static int exec_in(const char *id, char **argv, int argc, int tty)
 
 /* What the host spends on a running machine, as its engine measures it:
  * CPU time, storage io and memory resident. */
+/*
+ * `hull ssh ID`: section 8.1's fallback, a login shell in the machine on
+ * a terminal of its own, as `hull exec -t ID /bin/sh -l` would give. An
+ * exec carries the machine's environment and none of the frontend's, so
+ * TERM goes in as the shell's argument, which needs nothing in the
+ * machine but /bin/sh, and is never read as shell text.
+ */
+static int ssh_into(const char *id)
+{
+	const char *term = getenv("TERM");
+	char       *login[] = { "/bin/sh", "-l" };
+	char       *termed[] = { "/bin/sh", "-c", "TERM=\"$1\" exec /bin/sh -l", "sh", NULL };
+
+	if (!isatty(0)) {
+		fprintf(stderr, "hull: ssh needs a terminal on stdin\n");
+		return 125;
+	}
+	if (term == NULL || term[0] == '\0')
+		return exec_in(id, login, 2, 1);
+	termed[4] = (char *)term;
+	return exec_in(id, termed, 5, 1);
+}
+
 static int stats_of(const char *id)
 {
 	static const char *const keys[] = { "cpu", "io", "memory" };
@@ -1192,6 +1215,8 @@ int main(int argc, char **argv)
 
 	if (strcmp(command, "stats") == 0 && argc == 3 && argv[2][0] != '-')
 		return stats_of(argv[2]);
+	if (strcmp(command, "ssh") == 0 && argc == 3 && argv[2][0] != '-')
+		return ssh_into(argv[2]);
 
 	/* Planning needs the engines' declarations, not their operations,
 	 * which run in the core: nothing here reports to a core. */
