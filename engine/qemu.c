@@ -60,6 +60,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
 #include <netinet/in.h>
 
 #include <linux/vm_sockets.h>
@@ -100,7 +101,9 @@ struct hull_machine {
 	char            *volume_host[MAX_VOLUMES];
 	int              volume_readonly[MAX_VOLUMES];
 	unsigned         volume_count;
-	unsigned         port_host[MAX_PORTS];   /* on 127.0.0.1 */
+	struct in_addr   address;                /* section 8.1's, the core's */
+	char             address_text[16];
+	unsigned         port_host[MAX_PORTS];   /* on `address` */
 	unsigned         port_guest[MAX_PORTS];
 	unsigned         port_count;
 	int              listeners[MAX_PORTS];   /* -1 once closed */
@@ -286,8 +289,16 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		}
 	}
 
-	/* Ports from 127.0.0.1, until section 8.1's addresses exist. */
+	/* Ports from the machine's address, which the core gives the plan. */
 	if (hull_access_find(doc, &machine, "ports", &entry)) {
+		text = hull_access_value(doc, &top, "address");
+		if (text == NULL || strlen(text) >= sizeof m->address_text ||
+		    inet_pton(AF_INET, text, &m->address) != 1) {
+			free(text);
+			return "the plan gives its ports no address";
+		}
+		snprintf(m->address_text, sizeof m->address_text, "%s", text);
+		free(text);
 		hull_sexpr_child(doc, &entry, &item);
 		for (more = hull_sexpr_next(doc, &item, &item); more;
 		     more = hull_sexpr_next(doc, &item, &item)) {
@@ -1121,7 +1132,7 @@ static void remove_dir(hull_machine *m)
 	m->dir[0] = '\0';
 }
 
-/* Each port's listener on 127.0.0.1, bound before the machine boots, so a
+/* Each port's listener on the machine's address, bound before the machine boots, so a
  * port that is taken refuses the start. A reason, or NULL. */
 static const char *open_listeners(hull_machine *m)
 {
@@ -1133,11 +1144,11 @@ static const char *open_listeners(hull_machine *m)
 		memset(&at, 0, sizeof at);
 		at.sin_family      = AF_INET;
 		at.sin_port        = htons((uint16_t)m->port_host[i]);
-		at.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		at.sin_addr        = m->address;
 		if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0 ||
 		    bind(fd, (struct sockaddr *)&at, sizeof at) != 0 || listen(fd, 64) != 0) {
-			snprintf(m->detail, sizeof m->detail, "port %u on 127.0.0.1: %s", m->port_host[i],
-			         strerror(errno));
+			snprintf(m->detail, sizeof m->detail, "port %u on %s: %s", m->port_host[i],
+			         m->address_text, strerror(errno));
 			if (fd >= 0)
 				close(fd);
 			close_listeners(m);
@@ -1848,7 +1859,7 @@ static const hull_cap_entry entries[] = {
 	{ "memory",             HULL_SUP_NATIVE,   "a hard allocation", NULL },
 	/* Section 6's host forwarder: the engine's, over vsock to the agent. */
 	{ "ports",              HULL_SUP_EMULATED,
-	  "tcp, forwarded over vsock from 127.0.0.1 until section 8.1's addresses exist", NULL },
+	  "tcp, forwarded over vsock from the machine's address", NULL },
 
 	{ "security.readonly_root", HULL_SUP_NATIVE, NULL, NULL },
 	{ "security.no_new_privs",  HULL_SUP_NATIVE, "set by the agent on the workload", NULL },

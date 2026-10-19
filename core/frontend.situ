@@ -315,7 +315,9 @@ struct machines {
 
 // One machine of `machines`.
 struct listed {
-	preamble u8[18] = "(7:machine(5:class";
+	preamble u8[20] = "(7:machine(7:address";
+	atom  address;
+	preamble u8[9] = ")(5:class";
 	atom  class;
 	preamble u8[10] = ")(6:engine";
 	atom  engine;

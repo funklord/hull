@@ -234,7 +234,7 @@ from_root 0 '^procs=2$' -f "$root/pid.conf"
 # The core: what it holds, what it kept, who can follow a machine, and
 # what (on_disconnect ...) does when the frontend that ran it is killed.
 hull_abs="$(cd "$(dirname "$hull")" && pwd)/$(basename "$hull")"
-expect 0 '^box +chroot +ns +exited$' "$hull" ps
+expect 0 '^box +127\.107\.[0-9.]+ +chroot +ns +exited$' "$hull" ps
 expect 0 '^out$' "$hull" logs box
 expect 0 '^GREETING=hi$' "$hull" logs box
 expect 1 'no such machine' "$hull" logs nobody
@@ -257,8 +257,21 @@ expect 125 'a machine of that name is running' sh -c 'cd / && exec "$0" run -f "
 kill -KILL "$keeper" "$goner"
 wait "$keeper" "$goner" 2>/dev/null
 sleep 1
-expect 0 '^kept +chroot +ns +running$' "$hull" ps
-expect 0 '^gone +chroot +ns +exited$' "$hull" ps
+expect 0 '^kept +127\.107\.[0-9.]+ +chroot +ns +running$' "$hull" ps
+expect 0 '^gone +127\.107\.[0-9.]+ +chroot +ns +exited$' "$hull" ps
+# Section 8.1's address, from the id alone: FNV-1a of its bytes, modulo
+# 256 * 254, as x * 254 + y - 1. Worked here in Python rather than taken
+# from the core, and clash110098 is an id that comes to the same one.
+address=$(python3 -c '
+import sys
+h = 2166136261
+for b in sys.argv[1].encode():
+	h = ((h ^ b) * 16777619) & 0xffffffff
+h %= 256 * 254
+print("127.107.%d.%d" % (h // 254, h % 254 + 1))' kept)
+expect 0 "^kept +$address +chroot" "$hull" ps
+conf clash '(command "/probe" "say" "clash")' '(hostname "clash110098")'
+from_root 125 "its address, $address, is machine kept's" -f "$root/clash.conf"
 expect 0 '^kept$' "$hull" logs kept
 (timeout 30 "$hull" attach kept > "$root/attach.out" 2>&1; echo "status=$?" >> "$root/attach.out") &
 attacher=$!
@@ -268,7 +281,7 @@ wait "$attacher"
 cases=$((cases + 1))
 grep -q '^status=143$' "$root/attach.out" ||
 	fail "attach did not end with the stopped machine's 143" "$(cat "$root/attach.out")"
-expect 0 '^kept +chroot +ns +exited$' "$hull" ps
+expect 0 '^kept +127\.107\.[0-9.]+ +chroot +ns +exited$' "$hull" ps
 
 # exec: a command in the running machine, with its environment and
 # workdir, this process's stdin, and its own status; it ends with the
@@ -342,6 +355,12 @@ def hear(text):
 		got += chunk
 	print(repr(got))
 say(b"(5:hello(2:ch1:0)(5:proto1:1))")
+'
+# A machine's address is the core's, and a plan that gives one is refused.
+expect 0 "a plan's address is the core's to give" python3 -c "$speak"'
+say(b"(3:run(2:ch1:1)(7:machine4:here)(4:plan(7:address9:127.0.0.1)(5:class2:ns)"
+    b"(6:engine6:chroot)(7:machine(6:source5:dir:.))))")
+hear(b"6:reason")
 '
 # A terminal's size is 1..65535, which the core holds to itself.
 expect 0 'a window is 1 to 65535' python3 -c "$speak"'
@@ -709,7 +728,7 @@ expect 2 'usage' "$hull" stats
 # One core: a second gives way to the first, says nothing, and leaves the
 # first answering on its socket.
 expect 0 '' "$hull" core
-expect 0 '^kept +chroot +ns +exited$' "$hull" ps
+expect 0 '^kept +127\.107\.[0-9.]+ +chroot +ns +exited$' "$hull" ps
 
 # A machine dies with its core, even a kept one: nothing could manage it
 # after. The probe is found by its argv[0], which only ours carries.

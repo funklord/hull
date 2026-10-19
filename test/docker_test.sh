@@ -112,7 +112,16 @@ took=$(($(date +%s) - started))
 [ "$got" = 143 ] && [ "$took" -lt 10 ] && printf '%s\n' "$out" | grep -q '^waiting$' ||
 	fail "SIGTERM to hull run exited $got after ${took}s, wanted 143 within 10" "$out"
 
-# A port bound on the host, reached from it.
+# A port bound on the machine's address (section 8.1), reached from the
+# host there and not on 127.0.0.1. The address is worked here rather than
+# taken from the core: FNV-1a of the id, modulo 256 * 254, as x * 254 + y - 1.
+at=$(python3 -c '
+import sys
+h = 2166136261
+for b in sys.argv[1].encode():
+	h = ((h ^ b) * 16777619) & 0xffffffff
+h %= 256 * 254
+print("127.107.%d.%d" % (h // 254, h % 254 + 1))' dtest)
 conf port '(command "sh" "-c" "echo hello from the machine | nc -l -p 80")' \
 	'(ports (port (host 18080) (guest 80)))'
 cases=$((cases + 1))
@@ -122,11 +131,15 @@ got=
 tries=0
 while [ -z "$got" ] && [ "$tries" -lt 20 ]; do
 	tries=$((tries + 1))
-	got=$(timeout 2 bash -c 'cat < /dev/tcp/127.0.0.1/18080' 2>/dev/null)
+	got=$(timeout 2 bash -c 'cat < /dev/tcp/$0/18080' "$at" 2>/dev/null)
 	[ -n "$got" ] || sleep 0.5
 done
+cases=$((cases + 1))
+if timeout 2 bash -c ': < /dev/tcp/127.0.0.1/18080' 2>/dev/null; then
+	fail "port 18080 was reached on 127.0.0.1 as well as $at" ""
+fi
 wait "$server"
-[ "$got" = "hello from the machine" ] || fail "port 18080 answered '$got'" ""
+[ "$got" = "hello from the machine" ] || fail "port 18080 on $at answered '$got'" ""
 
 # exec in the running container: output and status, stdin, the user's
 # uid, and a command ended with the frontend that ran it.

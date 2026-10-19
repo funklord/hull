@@ -61,6 +61,18 @@ has() {
 	fi
 }
 
+# address_of ID: section 8.1's address, worked here rather than taken
+# from the core: FNV-1a of the id, modulo 256 * 254, as x * 254 + y - 1.
+address_of() {
+	python3 -c '
+import sys
+h = 2166136261
+for b in sys.argv[1].encode():
+	h = ((h ^ b) * 16777619) & 0xffffffff
+h %= 256 * 254
+print("127.107.%d.%d" % (h // 254, h % 254 + 1))' "$1"
+}
+
 # await ID: until the machine ID is listed running, 40 tries at most.
 await() { # ID
 	tries=0
@@ -212,7 +224,7 @@ if grep -q '^loopback came' "$root/listen.out"; then
 	fail "the host's loopback listener was reached" "$(cat "$root/listen.out")"
 fi
 
-# Ports, from 127.0.0.1, each connection an agent channel to the
+# Ports, from the machine's address, each connection an agent channel to the
 # machine's own address. Six free ports; the machine serves five in
 # turn, and nothing holds the fourth's guest port. The client takes them
 # in the same order and tries each again until the probe is listening,
@@ -220,12 +232,13 @@ fi
 # The fifth's client goes after 100 kB of 20 MB, which the machine must
 # hear; the sixth's holds its connection unread while the machine is
 # stopped, which must end it.
+at=$(address_of qports)
 set -- $(python3 -c '
-import socket
+import socket, sys
 held = [socket.socket() for _ in range(6)]
 for s in held:
-    s.bind(("127.0.0.1", 0))
-print(*[s.getsockname()[1] for s in held])')
+    s.bind((sys.argv[1], 0))
+print(*[s.getsockname()[1] for s in held])' "$at")
 greet=$1 pour=$2 drink=$3 nobody=$4 abort=$5 hold=$6
 conf ports "(backend vm) (hostname \"qports\")" \
 	"(ports (port (host $greet) (guest 80)) (port (host $pour) (guest 81))" \
@@ -245,6 +258,7 @@ runner=$!
 timeout 50 python3 -c '
 import socket, sys, time
 greet, pour, drink, nobody, abort, hold = map(int, sys.argv[1:7])
+at = sys.argv[7]
 def fnv(data):
     h = 2166136261
     for b in data:
@@ -258,7 +272,7 @@ def until_answered(port, talk, window=0):
             if window:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, window)
             s.settimeout(10)
-            s.connect(("127.0.0.1", port))
+            s.connect((at, port))
             s.settimeout(10)
             got = talk(s)
             s.close()
@@ -295,7 +309,7 @@ def drunk(s):
     reply = everything(s).decode().strip()
     return reply and "drunk " + reply + (" whole" if reply == fnv(sent) else " NOT " + fnv(sent))
 print(until_answered(greet, greeting), flush=True)
-s = socket.create_connection(("127.0.0.1", nobody), timeout=10)
+s = socket.create_connection((at, nobody), timeout=10)
 s.settimeout(10)
 print("nobody=" + ("closed" if not everything(s) else "answered"), flush=True)
 print(until_answered(pour, poured), flush=True)
@@ -324,7 +338,7 @@ def held(s):
         return "held then ended"
 # A small window, so that the engine is soon blocked writing to it.
 print(until_answered(hold, held, 4096), flush=True)
-' "$greet" "$pour" "$drink" "$nobody" "$abort" "$hold" > "$root/client.out" 2>&1 &
+' "$greet" "$pour" "$drink" "$nobody" "$abort" "$hold" "$at" > "$root/client.out" 2>&1 &
 client=$!
 tries=0
 until grep -q '^holding$' "$root/client.out" 2>/dev/null || [ "$tries" -ge 160 ]; do
@@ -341,7 +355,7 @@ cases=$((cases + 1))
 tries=0
 while python3 -c '
 import socket, sys
-socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=2)' "$greet" 2>/dev/null &&
+socket.create_connection((sys.argv[2], int(sys.argv[1])), timeout=2)' "$greet" "$at" 2>/dev/null &&
 	[ "$tries" -lt 16 ]; do
 	tries=$((tries + 1))
 	sleep 0.25
@@ -368,26 +382,37 @@ has 143 'ports: emulated: tcp, forwarded over vsock'
 cases=$((cases + 1))
 if python3 -c '
 import socket, sys
-socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)' "$greet" 2>/dev/null; then
+socket.create_connection((sys.argv[2], int(sys.argv[1])), timeout=5)' "$greet" "$at" 2>/dev/null; then
 	fail "a port was still listened on after its machine ended" ""
 fi
 timeout 30 "$hull" stop qkeep > /dev/null 2>&1
 wait "$keeper"
-# A port that is taken refuses the start, and a udp port the plan.
-timeout 30 python3 -c '
+# A port taken on another address leaves the machine its own; taken on
+# the machine's address, it refuses the start. A udp port refuses the plan.
+hold_port() { # ADDRESS PORT
+	timeout 30 python3 -c '
 import socket, sys, time
 s = socket.socket()
 # The port may be in TIME_WAIT from the case above.
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", int(sys.argv[1])))
+s.bind((sys.argv[1], int(sys.argv[2])))
 s.listen()
-time.sleep(25)' "$greet" &
-holder=$!
-sleep 0.5
-conf taken "(backend vm) (ports (port (host $greet) (guest 80))) (command \"/probe\" \"say\" \"ran\")"
+time.sleep(25)' "$1" "$2" &
+	holder=$!
+	sleep 0.5
+}
+conf taken "(backend vm) (hostname \"qtaken\") (ports (port (host $greet) (guest 80)))" \
+	'(command "/probe" "say" "ran")'
+at=$(address_of qtaken)
+hold_port 127.0.0.1 "$greet"
 name=taken
 boot taken
-has 125 "port $greet on 127\.0\.0\.1: Address already in use"
+has 0 '^ran$'
+kill "$holder" 2>/dev/null
+wait "$holder" 2>/dev/null
+hold_port "$at" "$greet"
+boot taken
+has 125 "port $greet on $(printf '%s' "$at" | sed 's/\./\\./g'): Address already in use"
 kill "$holder" 2>/dev/null
 wait "$holder" 2>/dev/null
 conf udp "(backend vm) (ports (port (host $greet) (guest 53) (proto udp))) (command \"/probe\")"
@@ -413,7 +438,7 @@ left=$(pgrep -f "$passt")
 [ "$(printf '%s\n' "$left" | grep -c .)" = 1 ] ||
 	fail "a passt outlived its machine, or the running one has none" "$left"
 listed=$("$hull" ps 2>&1)
-printf '%s\n' "$listed" | grep -Eq '^qtrap +qemu +vm +running$' ||
+printf '%s\n' "$listed" | grep -Eq "^qtrap +$(address_of qtrap | sed 's/\./\\./g') +qemu +vm +running\$" ||
 	fail "a running vm is not listed" "$listed"
 cases=$((cases + 1))
 tries=0

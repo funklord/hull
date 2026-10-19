@@ -107,6 +107,7 @@ struct slot {
 	int                used;
 	unsigned           generation;  /* counts the machines this slot has held */
 	char               id[64];
+	char               address[16]; /* section 8.1's, from the id */
 	const hull_engine *engine;
 	char               class_name[8];
 	hull_core          core;
@@ -875,6 +876,51 @@ static void send_started(client *c, uint32_t ch, const slot *s)
 	send_to(c, &m);
 }
 
+/*
+ * A machine's stable address (section 8.1): 127.107.x.y from its id
+ * alone, so it is the same on every start and every engine. FNV-1a of
+ * the id's bytes, taken modulo 256 * 254, is x * 254 + y - 1, which keeps
+ * y from 1 to 254. Changing this changes every machine's address.
+ */
+static void address_of(const char *id, char out[16])
+{
+	uint32_t h = 2166136261u;
+
+	for (const unsigned char *p = (const unsigned char *)id; *p != '\0'; p++)
+		h = (h ^ *p) * 16777619u;
+	h %= 256u * 254u;
+	snprintf(out, 16, "127.107.%u.%u", h / 254u, h % 254u + 1u);
+}
+
+/*
+ * The plan the engine gets is the frontend's with the address added. It
+ * sorts before every other entry of a plan, so it goes first. A plan that
+ * names one already is refused: the address is the core's to give.
+ */
+static uint8_t *with_address(const hull_buf *plan, const char *address, size_t *length)
+{
+	static const char opening[] = "(4:plan";
+	size_t            n = strlen(address);
+	char              entry[40];
+	int               written;
+	uint8_t          *out;
+
+	if (plan->len < sizeof opening - 1u || memcmp(plan->data, opening, sizeof opening - 1u) != 0)
+		return NULL;
+	written = snprintf(entry, sizeof entry, "(7:address%zu:%s)", n, address);
+	if (written < 0 || (size_t)written >= sizeof entry)
+		return NULL;
+	*length = plan->len + (size_t)written;
+	out = malloc(*length);
+	if (out == NULL)
+		return NULL;
+	memcpy(out, opening, sizeof opening - 1u);
+	memcpy(out + sizeof opening - 1u, entry, (size_t)written);
+	memcpy(out + sizeof opening - 1u + (size_t)written, plan->data + sizeof opening - 1u,
+	       plan->len - (sizeof opening - 1u));
+	return out;
+}
+
 static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
 	hull_sexpr_form    value;
@@ -884,12 +930,17 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	hull_error         error = { .struct_size = sizeof error };
 	const hull_engine *engine = NULL;
 	char               id[64];
+	char               address[16];
 	char              *engine_name;
 	char              *class_name;
+	char              *given;
 	char              *on_disconnect;
 	unsigned           generation;
 	slot              *s;
 	hull_buf           plan;
+	uint8_t           *addressed;
+	size_t             addressed_length;
+	hull_status        created;
 
 	if (!hull_msg_find(body, "machine", &value) || !hull_msg_string(body, &value, id, sizeof id) ||
 	    !is_label(id)) {
@@ -917,6 +968,32 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		hull_sexpr_first(&plan_doc, &top);
 		engine_name = hull_access_value(&plan_doc, &top, "engine");
 		class_name  = hull_access_value(&plan_doc, &top, "class");
+		given       = hull_access_value(&plan_doc, &top, "address");
+	}
+	if (given != NULL) {
+		free(given);
+		free(engine_name);
+		free(class_name);
+		send_error(c, ch, "a plan's address is the core's to give");
+		return;
+	}
+	/* Two ids may come to one address; the second is refused while the
+	 * first runs, rather than given another, which would not be stable. */
+	address_of(id, address);
+	for (unsigned i = 0u; i < MAX_MACHINES; i++) {
+		const slot *other = &machines[i];
+
+		if (other->used && !other->exited && strcmp(other->id, id) != 0 &&
+		    strcmp(other->address, address) == 0) {
+			char reason[128];
+
+			snprintf(reason, sizeof reason, "its address, %s, is machine %s's", address,
+			         other->id);
+			free(engine_name);
+			free(class_name);
+			send_error(c, ch, reason);
+			return;
+		}
 	}
 	for (uint32_t i = 0u; engine_name != NULL && i < registry.count; i++)
 		if (strcmp(registry.engines[i]->caps->engine_name, engine_name) == 0)
@@ -971,6 +1048,7 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	s->core.generation = generation;
 	s->owner     = c;
 	snprintf(s->id, sizeof s->id, "%s", id);
+	snprintf(s->address, sizeof s->address, "%s", address);
 	snprintf(s->class_name, sizeof s->class_name, "%s", class_name);
 	snprintf(s->state, sizeof s->state, "creating");
 	free(class_name);
@@ -978,7 +1056,17 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	s->keep = on_disconnect != NULL && strcmp(on_disconnect, "keep") == 0;
 	free(on_disconnect);
 
-	if (engine->ops->create(&s->core, plan, &s->handle, &error) != HULL_OK) {
+	addressed = with_address(&plan, address, &addressed_length);
+	if (addressed == NULL) {
+		send_error(c, ch, "the plan is not a plan");
+		s->used = 0;
+		return;
+	}
+	plan.data = addressed;
+	plan.len  = addressed_length;
+	created = engine->ops->create(&s->core, plan, &s->handle, &error);
+	free(addressed);
+	if (created != HULL_OK) {
 		send_error(c, ch, error.detail != NULL ? error.detail : "create failed");
 		s->used = 0;
 		return;
@@ -1410,7 +1498,9 @@ static void handle_list(client *c, uint32_t ch)
 
 		if (!s->used)
 			continue;
-		hull_msg_raw(&m, "(7:machine(5:class");
+		hull_msg_raw(&m, "(7:machine(7:address");
+		hull_msg_text(&m, s->address);
+		hull_msg_raw(&m, ")(5:class");
 		hull_msg_text(&m, s->class_name);
 		hull_msg_raw(&m, ")(6:engine");
 		hull_msg_text(&m, s->engine->caps->engine_name);

@@ -655,7 +655,7 @@ Three of these had first passed: stderr, stop and the session. Each was caught o
 
 - **The basics:** the image ref, `Cmd`, `WorkingDir`, `Hostname` and `Env`.
 - **Volumes:** `Binds`, with host paths made absolute, since the daemon resolves nothing relative. `hull run` stands in the file's directory.
-- **Ports:** `PortBindings` on 127.0.0.1 until §8.1's stable addresses exist.
+- **Ports:** `PortBindings` on the machine's address (§4.10).
 - **Limits:** `NanoCpus` and `Memory`.
 - **Security:** `ReadonlyRootfs`, `no-new-privileges` and `CapDrop ALL`.
 - **`Init`, docker's own tini, as PID 1,** for the same reason §4.8's chroot engine has an init: a workload at PID 1 ignores `stop`'s SIGTERM, and nothing reaps. A command that is not there is therefore the init failing to exec it, status 127, as a shell would report it, not a failed start.
@@ -667,13 +667,13 @@ Open:
 - **An image that needs root inside**, an `apt-get` in a build step say, fails on docker as the user. It wants an engine that maps root to the user, as chroot and the native ns engine do, not docker's root.
 - **Images must already be local.** Nothing pulls; the OCI border (§3.5) is Phase 3.
 
-**`make check-docker`**, not part of `make check`, runs `test/docker_test.sh` against the daemon the account can reach. It uses `alpine:latest` and does not pull it. There are 20 cases:
+**`make check-docker`**, not part of `make check`, runs `test/docker_test.sh` against the daemon the account can reach. It uses `alpine:latest` and does not pull it. There are 34 cases:
 
 - output on its own stream, the exit status, env, workdir, hostname and the user's uid;
 - volumes, a write through one that lands as the user's file, and a read-only root;
 - no capabilities, and a grant refused;
 - a signal from the workload, and SIGTERM to `hull run` stopping the machine inside docker's ten seconds;
-- a port reached from the host;
+- a port reached from the host on the machine's address, and not on 127.0.0.1;
 - a missing image and a missing command;
 - no `hull-dtest-` container left at the end.
 
@@ -716,7 +716,7 @@ The read-only volume had first passed: while the container ran as root, a write 
 | `(stop (ch n) (machine id) (timeout_ms n))` | `(done (ch n))` | SIGTERM, then SIGKILL |
 | `(kill (ch n) (machine id) (signal HUP\|INT\|QUIT\|TERM\|USR1\|USR2\|KILL))` | `(done (ch n))` | a signal for its workload |
 | `(stats (ch n) (machine id))` | `(stats (ch n) (cpu n) (io n) (memory n))` | what the host spends on a running machine |
-| `(list (ch n))` | `(machines (ch n) (machine (class) (engine) (id) (state))…)` | what the core holds |
+| `(list (ch n))` | `(machines (ch n) (machine (address) (class) (engine) (id) (state))…)` | what the core holds |
 | `(exec (argv w…) (ch n) (machine id) (tty false\|((cols n) (rows n))))` | `(started (ch n) (machine id))`, then `data` and `exited` | a command in a running machine |
 | `(data (buf b) (ch n) (fd 0))`, `(eof (ch n))` | `(credit (bytes n) (ch n))` | an exec's stdin, and how much more the core will take |
 | `(credit (bytes n) (ch n))` | | how much more of an exec's output the frontend will take |
@@ -885,7 +885,7 @@ Open:
   - **The follower case first parsed one `lost` line.** One run, in a sabotage copy, was lapped twice, which can happen to the baseline, so it now sums them.
 - **A run whose start fails left its follower in the freed slot.** That was harmless while a run cleared the slot first. Once a slot taken over tells the old machine's followers it has gone, the stale follower was told instead. It pointed at a frontend since gone, so the next frontend in that client slot heard an `exited` before its own `started`, and exited 0 with no output. `pid.conf`'s case caught it, run after `volhost.conf`'s, whose start fails. A failed start now forgets its follower, and only a slot in use has followers to tell.
 - `test/wire_test.c` runs 19 cases: each direction's messages let through and the other's refused, non-canonical bodies refused, and the numbers read minimal decimal. Disabling the validator fails four of them.
-- `test/cli_test.sh` runs 145 cases. Among them: `stats` on a chroot machine, its own CPU, its reaped child's, its memory and its writes, and an ended exec's CPU and writes; `ps`, `logs` after an exit, a duplicate id refused, a kept machine surviving its frontend's SIGKILL where an unkept one is stopped, `attach` ending with a stopped machine's 143, a second core giving way and the first still answering, a machine dying with a SIGKILLed core, and the core leaving when idle.
+- `test/cli_test.sh` runs 148 cases. Among them: a machine's address in `ps`, worked out by the test itself, an id that comes to the same address refused, and a plan that gives one refused; `stats` on a chroot machine, its own CPU, its reaped child's, its memory and its writes, and an ended exec's CPU and writes; `ps`, `logs` after an exit, a duplicate id refused, a kept machine surviving its frontend's SIGKILL where an unkept one is stopped, `attach` ending with a stopped machine's 143, a second core giving way and the first still answering, a machine dying with a SIGKILLed core, and the core leaving when idle.
 - **Sabotage,** in a scratch copy, with an unmodified baseline first that had to pass. Breaking each of these failed the test: honouring `keep`, stopping on disconnect, replaying logs, `attach` following, one id at a time, the idle exit, the lock, and the parent-death signal.
   - The last two first passed. The lock case only checked that a second core exited 0. Without the lock, the second core takes the socket over, then leaves and removes it, stranding the first. The case now requires the first to still answer.
   - The parent-death case's wait could give up silently, so it now fails when the kept machine never ran. Without the signal, the probe was measured alive a second after its core died, and gone once the shell reaped the client, for no cause found then. So the case looks for the probe before the client is reaped, where the two behaviours differ.
@@ -901,6 +901,17 @@ Open:
 - **Measured** in `test/cli_test.sh` on chroot and `test/qemu_test.sh` on vm (§4.11): CPU a probe uses by its own clock, so a loaded host makes it slower and not smaller, memory it holds, and bytes it writes.
 - **Sabotage,** baseline first, in scratch copies. On chroot, breaking each of these failed a named case: a reaped child's CPU, `write_bytes`, Pss in bytes, the whole namespace rather than the init, an ended exec's CPU and its io, and the core's keys. On vm: qemu counted at all, `write_bytes` and Pss. A reaped child's CPU passes on vm and cannot fail there: the guest's children are reaped inside qemu, and qemu reaps none of its own.
 - **Untested:** passt's share, which is too small beside qemu's to tell apart, and the guards against a freed pid, which a test cannot make happen on purpose.
+
+**Each machine has §8.1's stable address, and its ports are bound there** rather than on 127.0.0.1.
+- **The address** is 127.107.x.y, from the machine's id alone. FNV-1a of the id's bytes, modulo 256 × 254, is x × 254 + y − 1, so y runs from 1 to 254. An id has the same address on every start and every engine, and changing the formula moves every machine.
+- **The core gives it.** It adds `(address "127.107.x.y")` to the plan before `create()`, first, since it sorts before every other entry. A plan that names one already is refused: "a plan's address is the core's to give". `hull ps` shows it.
+- **Two ids can come to one address,** one pair in 65,024. The second is refused while the first runs, as in "its address, 127.107.178.190, is machine kept's", rather than given another, which would not be stable.
+- **The engines bind there:** qemu its listeners, docker its `HostIp`. A plan with ports and no address is refused by both. chroot shares the host's network and declares `ports` rejected, so it binds nothing.
+- **No root:** Linux routes all of 127.0.0.0/8 to `lo`, so a user can bind any address in it with nothing configured.
+- **What it buys:** two machines can publish the same host port. Measured on qemu: a port held on 127.0.0.1 leaves a machine publishing it free to start, and the same port held on the machine's own address refuses the start.
+- **Why the plan carries it, and not a forwarder of the core's.** `hull_engine.h`'s draft had each engine hand the core a host endpoint, through `port_endpoint()`, and the core forward from the address to it. That copies every byte once more, through the core, to reach an address the engine can bind itself. The core still owns the address; it hands it over in the plan. `port_endpoint` stays unwritten.
+- **Sabotage,** baseline first, in scratch copies. Breaking each of these failed a named case: the formula's `+ 1`, the collision check, refusing a given address, `ps` reading the address, qemu's listeners bound on 127.0.0.1 again, and docker's `HostIp` set back to 127.0.0.1.
+- **Not yet:** `web.hull`, §8.1's name for the address. It needs a resolver that the host's own lookups reach, and how to have one as the user is open.
 
 ### 4.11 The qemu engine, and the guest agent
 
@@ -942,7 +953,7 @@ Open:
 - **qemu has `PR_SET_PDEATHSIG`,** so it dies with the core, as a chroot machine does, and inherits none of the core's descriptors.
 - **A core killed outright leaves its machines' directories.** The next core's first machine removes them: one core runs per user, holding `core.lock`, so a directory named for a pid that is not running was a dead core's. Its files are removed by name.
 
-**What it declares** is what that does: a dir source in place, `command`, `workdir`, `env`, `hostname`, `volumes`, `cpus`, `memory`, `readonly_root`, `no_new_privs`, both `on_disconnect` values and `emu.cores_scale`, with the two emulated defaults above. `ports` is declared emulated, as §6 has it: tcp only, forwarded from 127.0.0.1.
+**What it declares** is what that does: a dir source in place, `command`, `workdir`, `env`, `hostname`, `volumes`, `cpus`, `memory`, `readonly_root`, `no_new_privs`, both `on_disconnect` values and `emu.cores_scale`, with the two emulated defaults above. `ports` is declared emulated, as §6 has it: tcp only, forwarded from the machine's address (§4.10).
 - **What it no longer declares:** image refs, overlays, ssh, secrets, media, device passthrough, the full profile and the other kernels. The draft declared all of these from §5 and §6 before any of it was written, the way docker's did.
 - **The cost:** §4's example, which has an image source, a port and `(ssh true)`, is refused on vm and emu for the image and ssh. A foreign arch is refused on emu.
 - **Not written yet:** `adopt()`, and the guest's own view of its stats (§4.10). A machine's output reaches the core, and so `hull logs`, as a chroot machine's does.
@@ -957,14 +968,14 @@ Open:
 - **Signals and resizes** are the agent's `signal` and `winch` on the exec's channel.
 
 **A machine's ports are forwarded by the engine, over vsock, as connections of the agent's.** passt cannot forward in without opening the host's loopback to the guest (above), and vsock needs no address on either side.
-- **The host's side:** the engine binds each port on 127.0.0.1 before the machine boots, so a port that is taken refuses the start with its reason: `port 8080 on 127.0.0.1: Address already in use`. A thread per machine accepts. Each connection gets a thread and a channel of the agent's, opened with `(connect (ch n) (port n))`, which B.3 gains for it. The listeners close when the machine ends.
+- **The host's side:** the engine binds each port on the machine's address (§4.10) before the machine boots, so a port that is taken refuses the start with its reason: `port 8080 on 127.107.178.190: Address already in use`. A thread per machine accepts. Each connection gets a thread and a channel of the agent's, opened with `(connect (ch n) (port n))`, which B.3 gains for it. The listeners close when the machine ends.
 - **The agent's side:** it connects to the machine's own address, 10.0.2.15, on the guest port, as docker's proxy connects to a container's address. So a server listening only on the guest's loopback is not reached, as on docker. The answer is `started` or `error`, and a refused connect reaches the client as a close.
 - **Bytes flow as an exec's do,** on B.2's credit both ways, with the socket in place of `on_data` and stdin. A client that does not read holds back the machine's writer, and nothing else.
 - **Its ends:** the client shutting its writing is the agent's `eof`, and the agent shuts the machine's side for writing, so a client may half-close. The machine's end, read by the agent, is `exited` with 0, and the host then shuts the client's socket. A client that goes, or resets, has the host send `signal` on the channel, and the agent then resets the machine's side. A machine that ends shuts every client's socket, so a client that does not read cannot hold `destroy`.
 - **The reset was found by testing.** The agent first ended an abandoned connection with `shutdown(SHUT_RDWR)`, and a server in the machine writing to it blocked for good. Its socket sat in CLOSE_WAIT with 2.6 MB queued, and the agent's end in FIN_WAIT2. After SHUT_RD, Linux goes on taking what arrives, and the close is then a FIN, so the writer is never told. A linger of zero then a close is a reset, and the writer gets EPIPE.
 - **Not forwarded:** udp ports, which a plan with one is refused for. A connection is a stream, and a datagram has no channel shape here yet.
 
-**Measured,** in `test/qemu_test.sh`, which `make check-qemu` runs, since `make check` needs no KVM. Its 73 cases:
+**Measured,** in `test/qemu_test.sh`, which `make check-qemu` runs, since `make check` needs no KVM. Its 74 cases:
 - **One boot,** and every line it prints checked: output on both streams kept apart, the exit status, env, workdir, hostname, uid 0, `no_new_privs`, a session of its own, two CPUs, 256 MiB, and the KVM clock.
 - **How a machine ends:** death by a signal, 143, and a missing command, 127 with the reason.
 - **Writes:** a write landing in the directory as the user's file, a read-only root, and volumes read-write and read-only.
@@ -981,7 +992,7 @@ Open:
   - 3 MB in, half-closed and counted by the machine, matching;
   - a client leaving after 100 kB of 20 MB, which the machine's writer hears as a broken pipe;
   - a client holding its connection unread, through a 4 KiB window, while the machine is stopped: the listeners close within four seconds, before that client reads again, and its connection then ends.
-- **Ports, around those:** the listeners closed once the machine has gone, a taken port refusing the start, and a udp port refused.
+- **Ports, around those:** the listeners closed once the machine has gone, a port held on 127.0.0.1 leaving a machine publishing it free to start, the same port taken on the machine's address refusing it, and a udp port refused.
 - **The emu class** under TCG, without the KVM clock.
 - **Nothing left:** no qemu of the suite's, no passt, and no machine directory, the dead core's included. passt is also checked gone with a SIGKILLed core, and gone with its machine while the core runs on: a machine boots and ends under the core another keeps running, and one passt is left.
 
@@ -1139,6 +1150,8 @@ The contract: **how you get *into* a machine never depends on its backend.** Thr
 1. **Stable per-machine address.** Every machine gets a deterministic loopback IP (`127.107.x.y`, derived from the machine name — stable across restarts, rebuilds, *and backend switches*) plus a name in Hull's per-user stub resolver: `web.hull → 127.107.x.y`. Every declared port is forwarded from that IP to the machine by whichever plumbing the backend uses (pasta, user-net forwarder) — invisible at this layer. `psql -h db.hull` and `curl web.hull:8080` are byte-identical commands on ns, vm, and emu, and they keep working mid-project when a machine changes backend.
 2. **SSH without thinking.** `hull ssh <machine>` always works: if the machine runs sshd it proxies to its port 22; if not, it falls back to an agent exec with a real PTY (ns: namespace enter; vm/emu: vsock exec) — same keystrokes either way. For native tooling — plain `ssh`, `scp`, `rsync`, IDE remote-development — `hull ssh-config` maintains a block in `~/.ssh/config`: `Host *.hull → ProxyCommand hull proxy-ssh %h`. After that, `ssh web.hull` works from anything that speaks SSH, on every backend. Critically, **host keys are machine state, not boot state**: Hull generates the host key at machine creation and injects it on every start, so switching ns → vm → emu never trips a known_hosts warning. The machine's SSH identity belongs to the machine, not to the backend.
 3. **sshd provisioning.** `(ssh true)` makes Hull inject and supervise a minimal sshd (with your authorized_keys) through the same start path on all backends — so even a bare `dir:` rootfs with nothing installed is reachable over real SSH with one line of config.
+
+**Built so far:** item 1's address, on docker and qemu (§4.10). Its name, item 2 and item 3 are not.
 
 ## 9. Integration
 

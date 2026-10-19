@@ -40,6 +40,8 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
+
 #include "access.h"
 #include "builtin.h"
 
@@ -486,9 +488,9 @@ static const char *add_binds(text *t, const hull_sexpr_doc *doc, const hull_sexp
 }
 
 /* `(ports (port ...))` as ExposedPorts into `exposed` and PortBindings
- * into `bindings`. */
+ * into `bindings`, each bound on `address`. */
 static void add_ports(text *exposed, text *bindings, const hull_sexpr_doc *doc,
-                      const hull_sexpr_form *entry)
+                      const hull_sexpr_form *entry, const char *address)
 {
 	hull_sexpr_form item;
 	int             more;
@@ -506,8 +508,8 @@ static void add_ports(text *exposed, text *bindings, const hull_sexpr_doc *doc,
 				add_text(bindings, ",");
 			}
 			addf(exposed, "\"%s/%s\":{}", guest, proto);
-			addf(bindings, "\"%s/%s\":[{\"HostIp\":\"127.0.0.1\",\"HostPort\":\"%s\"}]",
-			     guest, proto, host_port);
+			addf(bindings, "\"%s/%s\":[{\"HostIp\":\"%s\",\"HostPort\":\"%s\"}]",
+			     guest, proto, address, host_port);
 		} else {
 			exposed->failed = 1;
 		}
@@ -521,6 +523,8 @@ static void add_ports(text *exposed, text *bindings, const hull_sexpr_doc *doc,
 static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
                          const hull_sexpr_form *machine)
 {
+	hull_sexpr_form top;
+	struct in_addr  parsed;
 	text            body     = { 0 };
 	text            exposed  = { 0 };
 	text            bindings = { 0 };
@@ -558,8 +562,17 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 		add_env(&body, doc, &entry);
 		add_text(&body, "]");
 	}
+	/* Ports on the machine's address, which the core gives the plan. */
 	if (hull_access_find(doc, machine, "ports", &entry)) {
-		add_ports(&exposed, &bindings, doc, &entry);
+		hull_sexpr_first(doc, &top);
+		value = hull_access_value(doc, &top, "address");
+		if (value == NULL || inet_pton(AF_INET, value, &parsed) != 1) {
+			free(value);
+			free(body.data);
+			return "the plan gives its ports no address";
+		}
+		add_ports(&exposed, &bindings, doc, &entry, value);
+		free(value);
 		add_text(&body, ",\"ExposedPorts\":{");
 		add_all(&body, &exposed);
 		add_text(&body, "}");
@@ -1136,7 +1149,7 @@ static const hull_cap_entry entries[] = {
 	{ "workdir",            HULL_SUP_NATIVE,   NULL, NULL },
 	{ "env",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "ports",              HULL_SUP_NATIVE,
-	  "bound on 127.0.0.1 until section 8.1's addresses exist", NULL },
+	  "bound on the machine's address", NULL },
 	{ "volumes",            HULL_SUP_NATIVE,   NULL, NULL },
 	{ "hostname",           HULL_SUP_NATIVE,   NULL, NULL },
 

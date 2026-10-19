@@ -678,7 +678,7 @@ static int list_machines(void)
 	int            more;
 
 	if (!core_running()) {
-		printf("%-24s %-10s %-6s %s\n", "ID", "ENGINE", "CLASS", "STATE");
+		printf("%-24s %-15s %-10s %-6s %s\n", "ID", "ADDRESS", "ENGINE", "CLASS", "STATE");
 		return 0;
 	}
 	if (connect_core(&wire, 0) != 0)
@@ -688,19 +688,19 @@ static int list_machines(void)
 		hull_wire_close(&wire);
 		return 2;
 	}
-	printf("%-24s %-10s %-6s %s\n", "ID", "ENGINE", "CLASS", "STATE");
+	printf("%-24s %-15s %-10s %-6s %s\n", "ID", "ADDRESS", "ENGINE", "CLASS", "STATE");
 	hull_sexpr_first(&body, &message);
 	hull_sexpr_child(&body, &message, &item);
 	for (more = hull_sexpr_next(&body, &item, &item); more;
 	     more = hull_sexpr_next(&body, &item, &item)) {
-		const char *keys[] = { "id", "engine", "class", "state" };
-		char        values[4][64] = { "", "", "", "" };
+		const char *keys[] = { "id", "address", "engine", "class", "state" };
+		char        values[5][64] = { "", "", "", "", "" };
 		hull_sexpr_form head;
 
 		hull_sexpr_child(&body, &item, &head);
 		if (!hull_sexpr_is(&body, &head, "machine"))
 			continue;
-		for (unsigned k = 0u; k < 4u; k++) {
+		for (unsigned k = 0u; k < 5u; k++) {
 			hull_sexpr_form entry;
 			hull_sexpr_form name;
 			hull_sexpr_form value;
@@ -714,7 +714,8 @@ static int list_machines(void)
 				    hull_sexpr_next(&body, &name, &value))
 					hull_msg_string(&body, &value, values[k], sizeof values[k]);
 		}
-		printf("%-24s %-10s %-6s %s\n", values[0], values[1], values[2], values[3]);
+		printf("%-24s %-15s %-10s %-6s %s\n", values[0], values[1], values[2], values[3],
+		       values[4]);
 	}
 	hull_wire_close(&wire);
 	return 0;

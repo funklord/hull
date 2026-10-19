@@ -195,9 +195,11 @@ typedef struct hull_engine_ops {
 	                      hull_error*);
 	hull_status (*stats) (hull_core*, hull_machine*, hull_buf *out, hull_error*);
 
-	/* Ingress plumbing (section 8.1): engine maps one declared port to a host
-	 * endpoint the core's forwarder can dial; core owns the stable
-	 * 127.107.x.y address and DNS. */
+	/* Ingress plumbing (section 8.1). The core owns the stable 127.107.x.y
+	 * address and gives it in the plan, `(plan (address "...") ...)`, and
+	 * the engine binds each declared port there itself. This slot, for an
+	 * engine to name an endpoint for a forwarder of the core's, is unused:
+	 * that forwarder would copy every byte once more (project.md 4.10). */
 	hull_status (*port_endpoint)(hull_core*, hull_machine*, uint16_t guest_port,
 	                             /*out*/ char host[64], uint16_t *host_port,
 	                             hull_error*);
