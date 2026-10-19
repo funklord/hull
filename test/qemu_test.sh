@@ -250,11 +250,15 @@ def fnv(data):
     for b in data:
         h = ((h ^ b) * 16777619) & 0xffffffff
     return "bytes=%d fnv=%08x" % (len(data), h)
-def until_answered(port, talk):
+def until_answered(port, talk, window=0):
     deadline = time.time() + 30
     while time.time() < deadline:
         try:
-            s = socket.create_connection(("127.0.0.1", port), timeout=10)
+            s = socket.socket()
+            if window:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, window)
+            s.settimeout(10)
+            s.connect(("127.0.0.1", port))
             s.settimeout(10)
             got = talk(s)
             s.close()
@@ -309,7 +313,7 @@ def held(s):
     if not s.recv(1):
         return None
     print("holding", flush=True)
-    time.sleep(8)
+    time.sleep(16)
     s.settimeout(15)
     try:
         everything(s)
@@ -318,7 +322,8 @@ def held(s):
         return "held and still open"
     except OSError:
         return "held then ended"
-print(until_answered(hold, held), flush=True)
+# A small window, so that the engine is soon blocked writing to it.
+print(until_answered(hold, held, 4096), flush=True)
 ' "$greet" "$pour" "$drink" "$nobody" "$abort" "$hold" > "$root/client.out" 2>&1 &
 client=$!
 tries=0
@@ -326,7 +331,22 @@ until grep -q '^holding$' "$root/client.out" 2>/dev/null || [ "$tries" -ge 160 ]
 	tries=$((tries + 1))
 	sleep 0.25
 done
+# Time for what the machine pours to fill all there is to hold it.
+sleep 4
 timeout 30 "$hull" stop qports > /dev/null 2>&1
+# Its listeners close once the core has destroyed it, which a client
+# holding a connection unread must not prevent: looked at before that
+# client reads again, since its reading would free what it held.
+cases=$((cases + 1))
+tries=0
+while python3 -c '
+import socket, sys
+socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=2)' "$greet" 2>/dev/null &&
+	[ "$tries" -lt 16 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+[ "$tries" -lt 16 ] || fail "a client holding a connection unread held its stopped machine" ""
 wait "$client"
 wait "$runner"
 got=$?

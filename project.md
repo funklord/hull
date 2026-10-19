@@ -947,7 +947,7 @@ Open:
 - **The reset was found by testing.** The agent first ended an abandoned connection with `shutdown(SHUT_RDWR)`, and a server in the machine writing to it blocked for good. Its socket sat in CLOSE_WAIT with 2.6 MB queued, and the agent's end in FIN_WAIT2. After SHUT_RD, Linux goes on taking what arrives, and the close is then a FIN, so the writer is never told. A linger of zero then a close is a reset, and the writer gets EPIPE.
 - **Not forwarded:** udp ports, which a plan with one is refused for. A connection is a stream, and a datagram has no channel shape here yet.
 
-**Measured,** in `test/qemu_test.sh`, which `make check-qemu` runs, since `make check` needs no KVM. Its 67 cases:
+**Measured,** in `test/qemu_test.sh`, which `make check-qemu` runs, since `make check` needs no KVM. Its 68 cases:
 - **One boot,** and every line it prints checked: output on both streams kept apart, the exit status, env, workdir, hostname, uid 0, `no_new_privs`, a session of its own, two CPUs, 256 MiB, and the KVM clock.
 - **How a machine ends:** death by a signal, 143, and a missing command, 127 with the reason.
 - **Writes:** a write landing in the directory as the user's file, a read-only root, and volumes read-write and read-only.
@@ -962,7 +962,7 @@ Open:
   - 3 MB out to a client that reads a second late, matching the probe's own spew on the host by length and FNV-1a;
   - 3 MB in, half-closed and counted by the machine, matching;
   - a client leaving after 100 kB of 20 MB, which the machine's writer hears as a broken pipe;
-  - a client holding its connection unread while the machine is stopped, which ends it.
+  - a client holding its connection unread, through a 4 KiB window, while the machine is stopped: the listeners close within four seconds, before that client reads again, and its connection then ends.
 - **Ports, around those:** the listeners closed once the machine has gone, a taken port refusing the start, and a udp port refused.
 - **The emu class** under TCG, without the KVM clock.
 - **Nothing left:** no qemu of the suite's, no passt, and no machine directory, the dead core's included. passt is also checked gone with a SIGKILLed core, and gone with its machine while the core runs on: a machine boots and ends under the core another keeps running, and one passt is left.
@@ -1001,7 +1001,12 @@ Breaking the SIGKILL reported for streams whose agent has gone hung the stopped-
 - checking the listener's bind, and refusing a udp port.
 
 Three needed more:
-- **Shutting each socket when the machine ends,** and **closing the listeners with it,** both first passed. Once the ports machine was gone the suite's core idled out, and its exit closed every socket anyway. A second machine now keeps the core running across those cases.
+- **Closing the listeners with the machine** first passed. Once the ports machine was gone, the suite's core idled out, and its exit closed every socket anyway. A second machine now keeps the core running across those cases, and it fails.
+- **Shutting each client's socket when the machine ends still passes, and why is not known.** Its job is to free a `deliver()` blocked writing to a client that does not read, so that `destroy()` can end. The case now holds a client with a 4 KiB window, unread, for four seconds before the stop, and requires the listeners closed within four seconds after. Before the stop, the engine's socket had 1.79 MB unsent and two of the core's threads waited in `wait_woken`, one blocked in `send()` and one in `recv()`.
+  - **Under strace, the sabotage did what it should:** the main thread ended in a futex wait inside `destroy()`, with the `send()` and `recv()` still blocked. The intact build, traced the same way, shut the socket and returned to its poll.
+  - **Untraced,** the sabotaged core had both threads gone within half a second of the stop, and the listeners closed. Nothing found closes or shuts that socket on that path.
+  - So the shutdown is shown needed, under a tracer only. What frees the untraced core is open.
+- **The count:** of the eleven sabotages, nine fail a named case. `3ba0438`'s message says ten. It was written before the second machine's case was rerun, and that rerun caught only the listeners.
 - **The agent's zero linger removed** passed and cannot fail here. Closing a socket with unread data already resets it on Linux, and a writer that is still writing always leaves some. The linger covers the moment a writer has none queued, which a test cannot choose.
 
 ---
