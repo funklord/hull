@@ -35,6 +35,7 @@ const SUB     = ('3' << 24) | (':' << 16) | ('s' << 8) | 'u';
 const STOP    = ('4' << 24) | (':' << 16) | ('s' << 8) | 't';
 const PING    = ('4' << 24) | (':' << 16) | ('p' << 8) | 'i';
 const CREDIT  = ('6' << 24) | (':' << 16) | ('c' << 8) | 'r';
+const CONNECT = ('7' << 24) | (':' << 16) | ('c' << 8) | 'o';
 const READY   = ('5' << 24) | (':' << 16) | ('r' << 8) | 'e';
 const ERROR   = ('5' << 24) | (':' << 16) | ('e' << 8) | 'r';
 const STARTED = ('7' << 24) | (':' << 16) | ('s' << 8) | 't';
@@ -69,6 +70,7 @@ struct host_message {
 		case STOP:    stop        stop;
 		case PING:    ping        ping;
 		case CREDIT:  credit      credit;
+		case CONNECT: connect     connect;
 		default:      unknown     unknown;
 	}
 }
@@ -148,6 +150,18 @@ struct window {
 }
 
 struct no  { preamble u8[7] = "5:false"; }
+
+// A connection to one of the machine's ports, forwarded from the host
+// (project.md section 4.11), on a channel the host allocated for it. Its
+// bytes are `data` on fd 0 in and fd 1 out, on the same credit as an
+// exec's, and its end is `exited`.
+struct connect {
+	preamble u8[9] = "7:connect";
+	channel  ch;
+	preamble u8[7] = "(4:port";
+	atom  port;
+	preamble u8[2] = "))";
+}
 
 // The workload's or an exec's stdin: always fd 0.
 struct host_data {

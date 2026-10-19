@@ -61,6 +61,15 @@ has() {
 	fi
 }
 
+# await ID: until the machine ID is listed running, 40 tries at most.
+await() { # ID
+	tries=0
+	until "$hull" ps 2>/dev/null | grep -q "^$1 .*running\$" || [ "$tries" -ge 40 ]; do
+		tries=$((tries + 1))
+		sleep 0.5
+	done
+}
+
 if [ ! -w /dev/kvm ] || [ ! -w /dev/vhost-vsock ]; then
 	printf 'qemu: /dev/kvm or /dev/vhost-vsock is not open to this user\n'
 	exit 1
@@ -203,15 +212,171 @@ if grep -q '^loopback came' "$root/listen.out"; then
 	fail "the host's loopback listener was reached" "$(cat "$root/listen.out")"
 fi
 
+# Ports, from 127.0.0.1, each connection an agent channel to the
+# machine's own address. Six free ports; the machine serves five in
+# turn, and nothing holds the fourth's guest port. The client takes them
+# in the same order and tries each again until the probe is listening,
+# since a connection the agent is refused reaches the client as a close.
+# The fifth's client goes after 100 kB of 20 MB, which the machine must
+# hear; the sixth's holds its connection unread while the machine is
+# stopped, which must end it.
+set -- $(python3 -c '
+import socket
+held = [socket.socket() for _ in range(6)]
+for s in held:
+    s.bind(("127.0.0.1", 0))
+print(*[s.getsockname()[1] for s in held])')
+greet=$1 pour=$2 drink=$3 nobody=$4 abort=$5 hold=$6
+conf ports "(backend vm) (hostname \"qports\")" \
+	"(ports (port (host $greet) (guest 80)) (port (host $pour) (guest 81))" \
+	"(port (host $drink) (guest 82)) (port (host $nobody) (guest 9))" \
+	"(port (host $abort) (guest 83)) (port (host $hold) (guest 84)))" \
+	'(command "/probe" "serve" "tcp" "80" "pour" "81" "3000000" "drink" "82"' \
+	'"pour" "83" "20000000" "pour" "84" "20000000")'
+rm -f "$root/client.out"
+# A machine of its own keeps the core running, so that what the ports
+# machine leaves when it ends is not ended by the core's own exit.
+conf keep '(backend vm) (hostname "qkeep") (command "/probe" "sleep" "80")'
+(cd / && exec timeout -k 2 90 "$hull" run -f "$root/keep.conf" > /dev/null 2>&1) &
+keeper=$!
+await qkeep
+(cd / && exec timeout 60 "$hull" run -f "$root/ports.conf" > "$root/ports.out" 2>&1) &
+runner=$!
+timeout 50 python3 -c '
+import socket, sys, time
+greet, pour, drink, nobody, abort, hold = map(int, sys.argv[1:7])
+def fnv(data):
+    h = 2166136261
+    for b in data:
+        h = ((h ^ b) * 16777619) & 0xffffffff
+    return "bytes=%d fnv=%08x" % (len(data), h)
+def until_answered(port, talk):
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=10)
+            s.settimeout(10)
+            got = talk(s)
+            s.close()
+            if got:
+                return got
+        except OSError:
+            pass
+        time.sleep(0.2)
+    return "never answered"
+def everything(s):
+    data = b""
+    while True:
+        piece = s.recv(65536)
+        if not piece:
+            return data
+        data += piece
+def greeting(s):
+    line = s.recv(100)
+    if not line:
+        return None
+    s.sendall(b"hi from the host\n")
+    return "greeted=" + line.decode().strip() + (" then closed" if not everything(s) else " then more")
+def poured(s):
+    time.sleep(1)
+    data = everything(s)
+    return data and "poured " + fnv(data)
+sent = bytes((i * 7 + i // 251) & 0xff for i in range(3000000))
+def drunk(s):
+    try:
+        s.sendall(sent)
+        s.shutdown(socket.SHUT_WR)
+    except OSError:
+        return None
+    reply = everything(s).decode().strip()
+    return reply and "drunk " + reply + (" whole" if reply == fnv(sent) else " NOT " + fnv(sent))
+print(until_answered(greet, greeting), flush=True)
+s = socket.create_connection(("127.0.0.1", nobody), timeout=10)
+s.settimeout(10)
+print("nobody=" + ("closed" if not everything(s) else "answered"), flush=True)
+print(until_answered(pour, poured), flush=True)
+print(until_answered(drink, drunk), flush=True)
+def leave(s):
+    got = 0
+    while got < 100000:
+        piece = s.recv(65536)
+        if not piece:
+            return None
+        got += len(piece)
+    return "left"
+print(until_answered(abort, leave), flush=True)
+def held(s):
+    if not s.recv(1):
+        return None
+    print("holding", flush=True)
+    time.sleep(8)
+    s.settimeout(15)
+    try:
+        everything(s)
+        return "held then ended"
+    except socket.timeout:
+        return "held and still open"
+    except OSError:
+        return "held then ended"
+print(until_answered(hold, held), flush=True)
+' "$greet" "$pour" "$drink" "$nobody" "$abort" "$hold" > "$root/client.out" 2>&1 &
+client=$!
+tries=0
+until grep -q '^holding$' "$root/client.out" 2>/dev/null || [ "$tries" -ge 160 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+timeout 30 "$hull" stop qports > /dev/null 2>&1
+wait "$client"
+wait "$runner"
+got=$?
+out=$(cat "$root/ports.out" "$root/client.out")
+name=ports
+has 143 '^greeted=hello from the machine then closed$'
+has 143 '^served=hi from the host$'
+has 143 '^nobody=closed$'
+want=$("$probe" spew 3000000 | "$probe" count)
+has 143 "^poured $want\$"
+has 143 '^drunk bytes=3000000 fnv=[0-9a-f]{8} whole$'
+has 143 '^drank bytes=3000000 '
+# The client that left: the machine's writes then fail, short of 20 MB.
+has 143 '^left$'
+has 143 '^poured=(Broken pipe|Connection reset by peer)$'
+has 143 '^held then ended$'
+has 143 'ports: emulated: tcp, forwarded over vsock'
+# The machine gone, its listeners are closed, while the core runs on.
+cases=$((cases + 1))
+if python3 -c '
+import socket, sys
+socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)' "$greet" 2>/dev/null; then
+	fail "a port was still listened on after its machine ended" ""
+fi
+timeout 30 "$hull" stop qkeep > /dev/null 2>&1
+wait "$keeper"
+# A port that is taken refuses the start, and a udp port the plan.
+timeout 30 python3 -c '
+import socket, sys, time
+s = socket.socket()
+# The port may be in TIME_WAIT from the case above.
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen()
+time.sleep(25)' "$greet" &
+holder=$!
+sleep 0.5
+conf taken "(backend vm) (ports (port (host $greet) (guest 80))) (command \"/probe\" \"say\" \"ran\")"
+name=taken
+boot taken
+has 125 "port $greet on 127\.0\.0\.1: Address already in use"
+kill "$holder" 2>/dev/null
+wait "$holder" 2>/dev/null
+conf udp "(backend vm) (ports (port (host $greet) (guest 53) (proto udp))) (command \"/probe\")"
+name=udp
+boot udp
+has 125 'a udp port is not forwarded by the qemu engine yet'
+
 # A running machine: listed, signalled through the agent, and stopped by
 # SIGTERM to its frontend.
-await() { # ID
-	tries=0
-	until "$hull" ps 2>/dev/null | grep -q "^$1 .*running\$" || [ "$tries" -ge 40 ]; do
-		tries=$((tries + 1))
-		sleep 0.5
-	done
-}
 conf trap '(backend vm) (hostname "qtrap") (command "/probe" "trap" "say" "after")'
 cases=$((cases + 1))
 (cd / && exec timeout -k 2 60 "$hull" run -f "$root/trap.conf" > "$root/trap.out" 2>&1) &

@@ -84,9 +84,9 @@ expect 0 '^  fidelity\.inotify +rejected: .* \(--accept vm:inotify-poll\)$' "$hu
 expect 0 'ref\.conf: machine on docker \(ns\): ok$' "$hull" plan -f "$dir/ref.conf"
 refute 'native' "$hull" plan -f "$dir/ref.conf"
 expect 0 'source\.ref\.overlay: native$' "$hull" plan --explain -f "$dir/ref.conf"
-# A field the engine does not declare is refused, not ignored: qemu has no
-# port forwarder yet.
-expect 1 ':1:31: machine on qemu \(vm\): ports: rejected: the engine does not declare this field$' \
+# A field the engine does not declare is refused, not ignored: qemu runs
+# no image yet.
+expect 1 ':1:10: machine on qemu \(vm\): source\.ref\.overlay: rejected: the engine does not declare this field$' \
 	"$hull" plan -f "$dir/ref.conf" --backend vm
 expect 1 ':1:10: machine on docker \(ns\): source\.dir\.direct: rejected: docker cannot' \
 	"$hull" plan -f "$dir/dir.conf"
@@ -134,9 +134,9 @@ expect 2 'missing\.conf: No such file' "$hull" plan -f "$dir/missing.conf"
 # Section 4's example is refused on every engine that runs. On ns it is
 # refused for one field, (ssh true): no engine provisions sshd yet
 # (section 8.1), and the docker adapter says so rather than run without
-# one. On vm and emu it is three: its image source, its port and ssh,
-# none of which the qemu engine does yet.
-expect 1 'example\.conf: machine on qemu \(emu\): rejected, 3 fields$' \
+# one. On vm and emu it is two: its image source and ssh, neither of
+# which the qemu engine does yet; its port is forwarded.
+expect 1 'example\.conf: machine on qemu \(emu\): rejected, 2 fields$' \
 	"$hull" check -f "$dir/example.conf" --backend vm,emu
 expect 1 'example\.conf: machine on docker \(ns\): rejected, 1 field$' \
 	"$hull" check -f "$dir/example.conf" --backend ns

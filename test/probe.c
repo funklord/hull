@@ -36,6 +36,12 @@
  *   dial A N    connect to address A, port N, over tcp within 5 seconds,
  *               and say, after A:N, the first line it sends or why it
  *               could not
+ *   pour N B    listen on tcp port N, for 20 seconds at most, and send
+ *               the one peer B bytes of spew's, then close; a peer that
+ *               goes is said, SIGPIPE being ignored from then on
+ *   drink N     listen on tcp port N, for 20 seconds at most, count what
+ *               the one peer sends until it shuts its writing, as count
+ *               does, and send it the count
  *   resolve A N ask the DNS server at address A for NAME's IPv4 address,
  *               within 5 seconds, and say its answer's rcode and count
  */
@@ -93,6 +99,77 @@ static void print_size(void)
 		printf("size=%ux%u\n", (unsigned)size.ws_col, (unsigned)size.ws_row);
 	else
 		printf("size=%s\n", strerror(errno));
+}
+
+/* `left` bytes from a xorshift that does not repeat in any window a ring
+ * or a buffer would have, to `fd`; 0 if it would not take them. */
+static int spew_to(int fd, unsigned long long left)
+{
+	unsigned      x = 1u;
+	unsigned char buffer[4096];
+
+	while (left > 0u) {
+		size_t n = left < sizeof buffer ? (size_t)left : sizeof buffer;
+
+		for (size_t j = 0u; j < n; j++) {
+			x ^= x << 13;
+			x ^= x >> 17;
+			x ^= x << 5;
+			buffer[j] = (unsigned char)x;
+		}
+		for (size_t done = 0u; done < n;) {
+			ssize_t w = write(fd, buffer + done, n - done);
+
+			if (w < 0 && errno == EINTR)
+				continue;
+			if (w < 0)
+				return 0;
+			done += (size_t)w;
+		}
+		left -= n;
+	}
+	return 1;
+}
+
+/* All of `fd` until its end, as "bytes=N fnv=H", into `out`. */
+static void count_from(int fd, char *out, size_t cap)
+{
+	unsigned long long total = 0u;
+	unsigned           hash  = 2166136261u;
+	char               text[4096];
+	ssize_t            n;
+
+	while ((n = read(fd, text, sizeof text)) > 0 || (n < 0 && errno == EINTR))
+		for (ssize_t j = 0; j < n; j++, total++)
+			hash = (hash ^ (unsigned char)text[j]) * 16777619u;
+	snprintf(out, cap, "bytes=%llu fnv=%08x", total, hash);
+}
+
+/* The one peer of tcp port `port`, within 20 seconds, or -1, said why. */
+static int accept_one(const char *port)
+{
+	int                one = 1;
+	int                fd  = socket(AF_INET, SOCK_STREAM, 0);
+	int                peer;
+	struct sockaddr_in at;
+	struct pollfd      p;
+
+	memset(&at, 0, sizeof at);
+	at.sin_family = AF_INET;
+	at.sin_port   = htons((unsigned short)atoi(port));
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+	if (fd < 0 || bind(fd, (struct sockaddr *)&at, sizeof at) != 0 || listen(fd, 1) != 0) {
+		printf("serve=%s\n", strerror(errno));
+		return -1;
+	}
+	printf("serving\n");
+	p.fd     = fd;
+	p.events = POLLIN;
+	peer = poll(&p, 1u, 20000) == 1 ? accept(fd, NULL, NULL) : -1;
+	if (peer < 0)
+		printf("serve=nobody came\n");
+	close(fd);
+	return peer;
 }
 
 /* A line from `fd` within `seconds`, without its newline, into `out`. */
@@ -282,38 +359,33 @@ int main(int argc, char **argv)
 			text[n > 0 ? n : 0] = '\0';
 			printf("stdin=%s", n > 0 ? text : "(none)\n");
 		} else if (strcmp(step, "count") == 0) {
-			unsigned long long total = 0u;
-			unsigned           hash  = 2166136261u;
-			ssize_t            n;
-
-			while ((n = read(0, text, sizeof text)) > 0 || (n < 0 && errno == EINTR))
-				for (ssize_t j = 0; j < n; j++, total++)
-					hash = (hash ^ (unsigned char)text[j]) * 16777619u;
-			printf("bytes=%llu fnv=%08x\n", total, hash);
+			count_from(0, text, sizeof text);
+			printf("%s\n", text);
 		} else if (strcmp(step, "spew") == 0) {
-			unsigned long long left = strtoull(arg, NULL, 10);
-			unsigned           x    = 1u;
-			unsigned char      buffer[4096];
+			if (!spew_to(1, strtoull(arg, NULL, 10)))
+				return 1;
+			i++;
+		} else if (strcmp(step, "pour") == 0 && i + 2 < argc) {
+			int peer = accept_one(arg);
 
-			while (left > 0u) {
-				size_t n = left < sizeof buffer ? (size_t)left : sizeof buffer;
+			/* A peer that goes is an error to report, as a server
+			 * would, rather than the end of the probe. */
+			signal(SIGPIPE, SIG_IGN);
 
-				for (size_t j = 0u; j < n; j++) {
-					x ^= x << 13;
-					x ^= x >> 17;
-					x ^= x << 5;
-					buffer[j] = (unsigned char)x;
-				}
-				for (size_t done = 0u; done < n;) {
-					ssize_t w = write(1, buffer + done, n - done);
+			if (peer >= 0) {
+				printf("poured=%s\n", spew_to(peer, strtoull(argv[i + 2], NULL, 10)) ?
+				                      argv[i + 2] : strerror(errno));
+				close(peer);
+			}
+			i += 2;
+		} else if (strcmp(step, "drink") == 0) {
+			int peer = accept_one(arg);
 
-					if (w < 0 && errno == EINTR)
-						continue;
-					if (w < 0)
-						return 1;
-					done += (size_t)w;
-				}
-				left -= n;
+			if (peer >= 0) {
+				count_from(peer, text, sizeof text);
+				dprintf(peer, "%s\n", text);
+				printf("drank %s\n", text);
+				close(peer);
 			}
 			i++;
 		} else if (strcmp(step, "sleep") == 0) {

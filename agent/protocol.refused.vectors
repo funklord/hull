@@ -49,3 +49,9 @@ agent_message exited_no_signal 28 36 3A 65 78 69 74 65 64 28 32 3A 63 68 31 3A 3
 
 # host_start: (5:start(2:ch1:0))
 agent_message host_start 28 35 3A 73 74 61 72 74 28 32 3A 63 68 31 3A 30 29 29
+
+# connect_no_port: (7:connect(2:ch1:5))
+host_message connect_no_port 28 37 3A 63 6F 6E 6E 65 63 74 28 32 3A 63 68 31 3A 35 29 29
+
+# connect_unsorted: (7:connect(4:port2:80)(2:ch1:5))
+host_message connect_unsorted 28 37 3A 63 6F 6E 6E 65 63 74 28 34 3A 70 6F 72 74 32 3A 38 30 29 28 32 3A 63 68 31 3A 35 29 29

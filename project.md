@@ -799,6 +799,8 @@ Open:
 - **Moving onto the shared encrypted protocol**, when that is settled.
 - **The case of a core told to go failed once, intermittently,** with the frontend's 125, "the core went away", where 143 was wanted. It passed eight times of eight alone and in every other suite run, about a dozen, and reading the shutdown path found no race. The case now keeps the frontend's output and `core.log`, so a failure says more. Unexplained.
 - **The qemu case of a TERM to `hull exec` failed once, intermittently,** with 143 where 0 was wanted, in one of five suite runs on 2026-10-19. The command did catch the TERM: the output was `ready`, `signal=15`, `after`. Ten runs of the case alone passed. `timeout`, which wraps the frontend, exits 0 when its child does, and 137 when its `-k` fires. The probe's handler stays installed, so a second TERM cannot kill it. So either the frontend died by a TERM, or the agent reported the command killed by one, and neither route has been found. Unexplained.
+- **Chroot cases of `make check` failed under load averages of 130 to 190,** from other work on the machine. Two runs failed. In one, `hull kill` found no machine yet and a run hit its `timeout`. In the other, `ps` had lost `box`, which an earlier core had kept, and `logs box` found no such machine. Reruns passed, one at a load of 189. A candidate, not shown: `HULL_CORE_IDLE=1` gives a core one idle second, which a starved host can spend between two cases, and a new core keeps nothing of the old.
+- **A core in its idle exit can be met by a frontend, and the frontend then fails.** Seen once in `make check-qemu`: the emu case's `hull run` said the core did not start, and `core.log` was empty. The order of the exit allows it, read from `core/core.c`. The core leaves its loop, flushes its clients for up to a second each, unlinks its socket, and only then closes `core.lock`. A core started meanwhile finds the lock held and returns 0 without a word, and the frontend gives up after five seconds. Open, to be fixed next.
 
 **Measured:**
 
@@ -897,12 +899,12 @@ Open:
 
 **The kernel is the host's, standing in for Appendix F's bundled one.** So `vm.kernel.bundled` and `vm.profile.micro`, the defaults every plan writes in, are declared emulated, and every run says so on stderr. The cost is measured: a machine boots and runs `/probe` in about 2.2 s, where §5.2's target is 100 to 300 ms. emu under TCG takes about 17 s.
 
-**A machine's network is passt's, as the user: out, and nothing in yet.** §8 names user-mode networking per VM. The engine starts a passt for each machine on a socket pair, and the other end is qemu's virtio-net device.
+**A machine's network out is passt's, as the user; its ports in are the engine's.** §8 names user-mode networking per VM. The engine starts a passt for each machine on a socket pair, and the other end is qemu's virtio-net device.
 - **The addresses are fixed,** in both the engine and the agent: the guest is 10.0.2.15/24, its gateway 10.0.2.2, and its DNS 10.0.2.3, which passt forwards to the host's own resolver. These are slirp's well-known addresses. The agent brings up `lo` and `eth0` and adds the route itself, by ioctl, since there is no DHCP client in the guest.
 - **resolv.conf:** the machine's `/etc/resolv.conf` has the agent's file, which names 10.0.2.3, bound over it, as docker writes its own. It is read-only when the root is. The bind is only over a regular file: a link would be followed in the agent's root, outside the machine.
 - **The host's loopback is out of reach.** By default passt makes the gateway address the host's 127.0.0.1, so a guest could reach whatever listens there for the user alone. `--no-map-gw` turns that off. A vm-class machine is the boundary §8 and Appendix D put the risky machine behind, and an open path to the host's loopback would undo it.
 - **Why not qemu's own `-netdev user`:** slirp has the same mapping and no way to turn it off.
-- **Ports are not forwarded yet, and this is why.** Tried by hand with `--no-map-gw`, a connection to a port passt forwarded from 127.0.0.1 reached passt and never the guest. passt has no guest-side address to give a connection from the host's loopback. The address that would, `--map-host-loopback`, works both ways: passt(1) says packets from the guest to it go to the host's loopback, and it has no inbound-only form. So `ports` stays rejected until the engine forwards them itself, over vsock to the agent, which needs no mapping.
+- **Why passt does not forward the ports.** Tried by hand with `--no-map-gw`, a connection to a port passt forwarded from 127.0.0.1 reached passt and never the guest. passt has no guest-side address to give a connection from the host's loopback. The address that would, `--map-host-loopback`, works both ways: passt(1) says packets from the guest to it go to the host's loopback, and it has no inbound-only form.
 - **Its life:** passt's parent exits once passt is set up, so the engine knows whether it started and, if not, why, from `passt.log`. The daemon it leaves ends when qemu's end of the pair closes (`--one-off`), so it goes with qemu, and qemu goes with the core.
 - **The cost:** a LAN host at 10.0.2.15 is out of the machine's reach, since that is the machine's own address. This host's LAN is 10.0.0.0/16, which holds it. A host without passt can run no qemu machine. That is a hard requirement, as `/dev/vhost-vsock` is, rather than a machine silently started with no network.
 - **Measured:** boot time is unchanged, about 2.2 s.
@@ -923,9 +925,9 @@ Open:
 - **qemu has `PR_SET_PDEATHSIG`,** so it dies with the core, as a chroot machine does, and inherits none of the core's descriptors.
 - **A core killed outright leaves its machines' directories.** The next core's first machine removes them: one core runs per user, holding `core.lock`, so a directory named for a pid that is not running was a dead core's. Its files are removed by name.
 
-**What it declares** is what that does: a dir source in place, `command`, `workdir`, `env`, `hostname`, `volumes`, `cpus`, `memory`, `readonly_root`, `no_new_privs`, both `on_disconnect` values and `emu.cores_scale`, with the two emulated defaults above.
-- **What it no longer declares:** image refs, overlays, ports, ssh, secrets, media, device passthrough, the full profile and the other kernels. The draft declared all of these from §5 and §6 before any of it was written, the way docker's did.
-- **The cost:** §4's example, which has an image source, a port and `(ssh true)`, is refused on vm and emu for those three. A foreign arch is refused on emu.
+**What it declares** is what that does: a dir source in place, `command`, `workdir`, `env`, `hostname`, `volumes`, `cpus`, `memory`, `readonly_root`, `no_new_privs`, both `on_disconnect` values and `emu.cores_scale`, with the two emulated defaults above. `ports` is declared emulated, as §6 has it: tcp only, forwarded from 127.0.0.1.
+- **What it no longer declares:** image refs, overlays, ssh, secrets, media, device passthrough, the full profile and the other kernels. The draft declared all of these from §5 and §6 before any of it was written, the way docker's did.
+- **The cost:** §4's example, which has an image source, a port and `(ssh true)`, is refused on vm and emu for the image and ssh. A foreign arch is refused on emu.
 - **Not written yet:** logs and stats from the guest, and `adopt()`.
 
 **`hull exec` on a qemu machine is a channel of the agent's,** which the engine allocates per exec.
@@ -937,7 +939,15 @@ Open:
 - **`stream_close`** has the agent SIGKILL the command and waits for its exit. Every exec the agent has not reported when the connection ends is reported as SIGKILL, 137: a machine that stops takes its commands, and their frontends hear it at once.
 - **Signals and resizes** are the agent's `signal` and `winch` on the exec's channel.
 
-**Measured,** in `test/qemu_test.sh`, which `make check-qemu` runs, since `make check` needs no KVM. Its 54 cases:
+**A machine's ports are forwarded by the engine, over vsock, as connections of the agent's.** passt cannot forward in without opening the host's loopback to the guest (above), and vsock needs no address on either side.
+- **The host's side:** the engine binds each port on 127.0.0.1 before the machine boots, so a port that is taken refuses the start with its reason: `port 8080 on 127.0.0.1: Address already in use`. A thread per machine accepts. Each connection gets a thread and a channel of the agent's, opened with `(connect (ch n) (port n))`, which B.3 gains for it. The listeners close when the machine ends.
+- **The agent's side:** it connects to the machine's own address, 10.0.2.15, on the guest port, as docker's proxy connects to a container's address. So a server listening only on the guest's loopback is not reached, as on docker. The answer is `started` or `error`, and a refused connect reaches the client as a close.
+- **Bytes flow as an exec's do,** on B.2's credit both ways, with the socket in place of `on_data` and stdin. A client that does not read holds back the machine's writer, and nothing else.
+- **Its ends:** the client shutting its writing is the agent's `eof`, and the agent shuts the machine's side for writing, so a client may half-close. The machine's end, read by the agent, is `exited` with 0, and the host then shuts the client's socket. A client that goes, or resets, has the host send `signal` on the channel, and the agent then resets the machine's side. A machine that ends shuts every client's socket, so a client that does not read cannot hold `destroy`.
+- **The reset was found by testing.** The agent first ended an abandoned connection with `shutdown(SHUT_RDWR)`, and a server in the machine writing to it blocked for good. Its socket sat in CLOSE_WAIT with 2.6 MB queued, and the agent's end in FIN_WAIT2. After SHUT_RD, Linux goes on taking what arrives, and the close is then a FIN, so the writer is never told. A linger of zero then a close is a reset, and the writer gets EPIPE.
+- **Not forwarded:** udp ports, which a plan with one is refused for. A connection is a stream, and a datagram has no channel shape here yet.
+
+**Measured,** in `test/qemu_test.sh`, which `make check-qemu` runs, since `make check` needs no KVM. Its 67 cases:
 - **One boot,** and every line it prints checked: output on both streams kept apart, the exit status, env, workdir, hostname, uid 0, `no_new_privs`, a session of its own, two CPUs, 256 MiB, and the KVM clock.
 - **How a machine ends:** death by a signal, 143, and a missing command, 127 with the reason.
 - **Writes:** a write landing in the directory as the user's file, a read-only root, and volumes read-write and read-only.
@@ -946,6 +956,14 @@ Open:
 - **exec's output:** 3 MB counted against the same probe on the host, and 20 MB to a reader seven seconds behind arriving whole. Meanwhile the command is held, the machine counting one process more two seconds in, and another exec answers within three seconds.
 - **exec's terminal and its ends:** a terminal of 100 by 30, spoken by hand, its controlling terminal, resized to 120 by 40; a TERM to `hull exec` caught by the command; a frontend SIGKILLed taking its command with it, the machine counting as many processes after; and an exec in a machine that stops ending 137 at once.
 - **The network:** the agent's resolv.conf, read-only under a read-only root. `lo` is up: a dial to a port nothing holds is refused rather than unreachable. The host's resolver answers through 10.0.2.3, and a listener on the host's own address is reached. A listener on the host's 127.0.0.1 is not reached through the gateway, checked from both sides. Two host listeners on ports of their own say who came.
+- **Ports:** six, each from a free port to the probe. These cases run in order:
+  - a greeting and a reply, then the machine's close reaching the client;
+  - a port nothing in the machine holds, closed;
+  - 3 MB out to a client that reads a second late, matching the probe's own spew on the host by length and FNV-1a;
+  - 3 MB in, half-closed and counted by the machine, matching;
+  - a client leaving after 100 kB of 20 MB, which the machine's writer hears as a broken pipe;
+  - a client holding its connection unread while the machine is stopped, which ends it.
+- **Ports, around those:** the listeners closed once the machine has gone, a taken port refusing the start, and a udp port refused.
 - **The emu class** under TCG, without the KVM clock.
 - **Nothing left:** no qemu of the suite's, no passt, and no machine directory, the dead core's included. passt is also checked gone with a SIGKILLed core, and gone with its machine while the core runs on: a machine boots and ends under the core another keeps running, and one passt is left.
 
@@ -976,6 +994,15 @@ Breaking the SIGKILL reported for streams whose agent has gone hung the stopped-
 - **Leaking qemu's end of passt's socket** first passed. passt then lived as long as the core, and every check for one left ran once the core had gone. A machine now boots and ends while another keeps the same core running, and exactly one passt must be left.
 - **`--one-off` removed** passed and cannot fail. passt given a connected socket with `--fd` exits when its peer closes, with the option or without it, tried by hand. It is kept for saying so.
 - **Untested:** passt failing to start, which a test cannot make happen on purpose.
+
+**Sabotage of the ports,** baseline first, the same way. Breaking each of these failed a named case:
+- in the agent: settling a connection, and its half-close;
+- in the engine: shutting the client's socket at the end, the credit a connection gives back, the client's end becoming `eof`, and ending the connection once its client has gone;
+- checking the listener's bind, and refusing a udp port.
+
+Three needed more:
+- **Shutting each socket when the machine ends,** and **closing the listeners with it,** both first passed. Once the ports machine was gone the suite's core idled out, and its exit closed every socket anyway. A second machine now keeps the core running across those cases.
+- **The agent's zero linger removed** passed and cannot fail here. Closing a socket with unread data already resets it on Linux, and a writer that is still writing always leaves some. The linger covers the moment a writer has none queued, which a test cannot choose.
 
 ---
 
@@ -1255,6 +1282,7 @@ The framing is generated by situ from `agent/message.situ`: its frame layer turn
 | `(stop (ch 0) (timeout_ms n))` | `exited`, then `(bye (ch 0))` | graceful stop: signal → wait → report; host kills the VM after `bye` or timeout |
 | `(ping (ch 0))` | `(pong (ch 0) (uptime n))` | liveness; host declares the VM wedged after N missed pongs and falls back to hypervisor kill |
 | `(credit (bytes n) (ch n))` | `(credit (bytes n) (ch n))` | per-channel flow control (B.2) |
+| `(connect (ch n) (port n))` | `started` / `error`, `data` and `eof` as for `exec`, then `exited` | a forwarded port's connection to the machine's own address (§4.11) |
 
 `?` marks an optional entry. Control messages are on channel 0 and the schema says so: `hello`, `spec`, `start`, `stop`, `ping`, `ready`, `bye` and `pong` carry the fixed bytes `(2:ch1:0)`. `exited` always carries both numbers, the signal 0 when none ended the process, so that `hull run; echo $?` can be exact. What the schema leaves to the agent and the host: that a channel was allocated, that credit is not exceeded, and that numbers are minimal decimal (situ finding 13, as in A.2).
 

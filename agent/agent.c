@@ -34,6 +34,12 @@
  * and says `eof` once the command's input has closed. The workload's
  * output, on channel 0, has no credit: the host never holds it back.
  *
+ * `connect` forwards one of the machine's ports: a TCP connection to the
+ * machine's own address, on a channel the host allocated, flowing on the
+ * same credit as an exec. The host's `eof` shuts its write side, so a
+ * client may half-close; the connection's end, read from the machine, is
+ * `exited` with 0, and the host's `signal` on it ends it at once.
+ *
  * One thread, one poll(): the connection, every channel's descriptors,
  * and a signalfd for SIGCHLD.
  */
@@ -107,6 +113,7 @@ typedef struct channel {
 	int      input_ended;  /* the host's eof */
 	int      reaped;
 	int      status;
+	int      socket;       /* a connection: `out` and `in` are one socket */
 } channel;
 
 static channel channels[MAX_CHANNELS];
@@ -470,6 +477,9 @@ static void close_fd(int *fd)
 /* Close a channel's input; a terminal's master stays, being its output. */
 static void close_input(channel *c)
 {
+	/* A socket's other descriptor holds it open: its write side is shut. */
+	if (c->socket && c->in >= 0)
+		shutdown(c->in, SHUT_WR);
 	if (c->tty < 0)
 		close_fd(&c->in);
 	else
@@ -637,8 +647,22 @@ static int signal_named(const char *name)
  * process's own. */
 static void signal_channel(channel *c, int number)
 {
-	if (c != NULL && !c->reaped)
+	/* A connection has no process: any signal resets it, so the
+	 * machine's end hears, and it is done. A shutdown() would not do:
+	 * after SHUT_RD Linux goes on taking what the machine sends, and a
+	 * close then is a FIN, so a writer in the machine blocks, never told.
+	 * Its pid is 0, which kill() must never see. */
+	if (c != NULL && c->socket) {
+		struct linger now = { 1, 0 };
+
+		if (c->out >= 0)
+			setsockopt(c->out, SOL_SOCKET, SO_LINGER, &now, sizeof now);
+		close_fd(&c->in);
+		close_fd(&c->out);
+		c->queued = 0u;
+	} else if (c != NULL && !c->reaped) {
 		kill(c->pid, number);
+	}
 }
 
 /* Begin a stop: SIGTERM now, SIGKILL once `timeout_ms` has passed. */
@@ -741,7 +765,7 @@ static void finish(void);
 
 static void settle(channel *c)
 {
-	if (!c->reaped || c->out >= 0 || c->err >= 0)
+	if ((!c->reaped && !c->socket) || c->out >= 0 || c->err >= 0)
 		return;
 	if (c->ch == 0u) {
 		finish();
@@ -754,6 +778,84 @@ static void settle(channel *c)
 }
 
 /* --- the host's messages ------------------------------------------------- */
+
+/* `(connect (ch n) (port n))`: a connection to the machine's own address
+ * on `port`, as docker's proxy makes one to a container's. A connect that
+ * has not been answered in two seconds is refused. */
+static const char *connect_port(const hull_sexpr_doc *body, uint32_t ch)
+{
+	hull_sexpr_form    value;
+	long long          port = 0;
+	channel           *c = NULL;
+	struct sockaddr_in to;
+	int                fd;
+	int                error = 0;
+	socklen_t          length = sizeof error;
+
+	if (!applied)
+		return "nothing runs before the spec";
+	if (ch == 0u)
+		return "channel 0 is the workload's";
+	if (channel_of(ch) != NULL)
+		return "the channel is in use";
+	if (!hull_msg_find(body, "port", &value) || !hull_msg_long(body, &value, &port) ||
+	    port < 1 || port > 65535)
+		return "a port is 1 to 65535";
+	for (unsigned i = 0u; i < MAX_CHANNELS && c == NULL; i++)
+		if (!channels[i].used)
+			c = &channels[i];
+	if (c == NULL)
+		return "the machine runs as many commands as it can";
+	memset(&to, 0, sizeof to);
+	to.sin_family = AF_INET;
+	to.sin_port   = htons((uint16_t)port);
+	inet_pton(AF_INET, GUEST_ADDRESS, &to.sin_addr);
+	fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+	if (fd < 0)
+		return strerror(errno);
+	if (connect(fd, (struct sockaddr *)&to, sizeof to) != 0) {
+		struct pollfd wait = { fd, POLLOUT, 0 };
+
+		if (errno != EINPROGRESS)
+			error = errno;
+		else if (poll(&wait, 1u, 2000) != 1)
+			error = ETIMEDOUT;
+		else if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) != 0)
+			error = errno;
+	}
+	if (error != 0) {
+		close(fd);
+		return strerror(error);
+	}
+	memset(c, 0, sizeof *c);
+	c->input = malloc(WINDOW);
+	c->in    = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+	if (c->input == NULL || c->in < 0) {
+		free(c->input);
+		close_fd(&c->in);
+		close(fd);
+		c->input = NULL;
+		return "out of memory";
+	}
+	c->used     = 1;
+	c->ch       = ch;
+	c->out      = fd;
+	c->err      = -1;
+	c->tty      = -1;
+	c->credited = 1;
+	c->credit   = WINDOW;
+	c->socket   = 1;
+	{
+		hull_msg m = { 0 };
+
+		hull_msg_raw(&m, "(7:started");
+		hull_msg_channel(&m, ch);
+		hull_msg_raw(&m, "(3:pid1:0))");
+		send_msg(&m);
+	}
+	send_credit(ch, WINDOW);
+	return NULL;
+}
 
 /* `(exec (argv ...) (ch n) (cwd p)? (env ...)? (tty ...) (user u)?)`. */
 static const char *exec(const hull_sexpr_doc *body, const hull_sexpr_form *message, uint32_t ch)
@@ -890,6 +992,9 @@ static void handle(const hull_sexpr_doc *body)
 			signal_channel(channel_of((uint32_t)ch), number);
 	} else if (hull_msg_is(body, "exec")) {
 		if ((reason = exec(body, &message, (uint32_t)ch)) != NULL)
+			send_error((uint32_t)ch, reason);
+	} else if (hull_msg_is(body, "connect")) {
+		if ((reason = connect_port(body, (uint32_t)ch)) != NULL)
 			send_error((uint32_t)ch, reason);
 	} else if (hull_msg_is(body, "data")) {
 		channel        *c = channel_of((uint32_t)ch);
@@ -1120,6 +1225,12 @@ int main(void)
 		for (unsigned i = 0u; i < MAX_CHANNELS; i++) {
 			channel *c = &channels[i];
 
+			/* A connection is done once its end has been read; it has
+			 * no process, and its socket is not to be closed early. */
+			if (c->used && c->socket) {
+				settle(c);
+				continue;
+			}
 			if (!c->used || !c->reaped)
 				continue;
 			while (c->out >= 0 && (!c->credited || c->credit > 0u) && drain(c, &c->out, 1))

@@ -49,6 +49,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/prctl.h>
 #include <sys/random.h>
 #include <sys/socket.h>
@@ -59,6 +60,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <netinet/in.h>
+
 #include <linux/vm_sockets.h>
 
 #include "access.h"
@@ -66,6 +69,7 @@
 #include "wire.h"
 
 #define MAX_VOLUMES  64u
+#define MAX_PORTS    64u
 #define MAX_MODULES  32u
 #define AGENT_PORT   1u
 #define BOOT_LIMIT   60   /* seconds for the agent to answer, TCG included */
@@ -95,6 +99,10 @@ struct hull_machine {
 	char            *volume_host[MAX_VOLUMES];
 	int              volume_readonly[MAX_VOLUMES];
 	unsigned         volume_count;
+	unsigned         port_host[MAX_PORTS];   /* on 127.0.0.1 */
+	unsigned         port_guest[MAX_PORTS];
+	unsigned         port_count;
+	int              listeners[MAX_PORTS];   /* -1 once closed */
 	unsigned long    memory_mib;
 	unsigned         cpus;
 	uint8_t         *spec;         /* the plan's (machine ...), for the agent */
@@ -118,6 +126,12 @@ struct hull_machine {
 
 	hull_stream     *streams[MAX_STREAMS];  /* under `lock` */
 	uint32_t         next_ch;
+
+	pthread_t        forwarder;    /* accepts on the listeners */
+	int              forwarding;
+	int              wake;         /* an eventfd that ends the forwarder */
+	unsigned         connections;  /* forwarded, under `lock` */
+	pthread_cond_t   quiet;        /* `connections` fell */
 };
 
 struct hull_stream {
@@ -138,9 +152,14 @@ struct hull_stream {
 	size_t          credit;       /* stdin the agent will take */
 	int             ending;       /* stream_eof() */
 	int             input_closed; /* the agent said the command's input closed */
+	int             forwarded;    /* a port's connection, whose output goes */
+	int             sink;         /* to this socket rather than to on_data */
+	int             broken;       /* the socket would not take it */
 };
 
 static const hull_host_ops *host;
+
+static void *forward_ports(void *arg);
 
 static hull_status fail(hull_error *error, hull_status code, const char *detail)
 {
@@ -161,6 +180,9 @@ static void release(hull_machine *m)
 	pthread_mutex_destroy(&m->lock);
 	pthread_mutex_destroy(&m->send_lock);
 	pthread_cond_destroy(&m->done_cond);
+	pthread_cond_destroy(&m->quiet);
+	if (m->wake >= 0)
+		close(m->wake);
 	free(m);
 }
 
@@ -258,6 +280,32 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			free(mode);
 			if (m->volume_host[m->volume_count++] == NULL)
 				return "a volume is missing its host path";
+		}
+	}
+
+	/* Ports from 127.0.0.1, until section 8.1's addresses exist. */
+	if (hull_access_find(doc, &machine, "ports", &entry)) {
+		hull_sexpr_child(doc, &entry, &item);
+		for (more = hull_sexpr_next(doc, &item, &item); more;
+		     more = hull_sexpr_next(doc, &item, &item)) {
+			char         *host_port = hull_access_value(doc, &item, "host");
+			char         *guest     = hull_access_value(doc, &item, "guest");
+			char         *proto     = hull_access_value(doc, &item, "proto");
+			unsigned long h = host_port != NULL ? strtoul(host_port, NULL, 10) : 0u;
+			unsigned long g = guest != NULL ? strtoul(guest, NULL, 10) : 0u;
+			int           udp = proto != NULL && strcmp(proto, "udp") == 0;
+
+			free(host_port);
+			free(guest);
+			free(proto);
+			if (udp)
+				return "a udp port is not forwarded by the qemu engine yet";
+			if (m->port_count == MAX_PORTS)
+				return "there are too many ports";
+			if (h < 1u || h > 65535u || g < 1u || g > 65535u)
+				return "a port is a host and a guest port of 1 to 65535";
+			m->port_host[m->port_count]    = (unsigned)h;
+			m->port_guest[m->port_count++] = (unsigned)g;
 		}
 	}
 
@@ -908,16 +956,22 @@ static void *read_agent(void *arg)
 	m->connected = 0;
 	pthread_mutex_unlock(&m->send_lock);
 	/* The agent has gone: every exec it had not reported ended with the
-	 * machine, as a SIGKILL. */
+	 * machine, as a SIGKILL, and every connection ends. Its socket is
+	 * shut, so that a deliver() blocked on a client that does not read
+	 * ends too; it is closed only once its stream is dropped. */
 	pthread_mutex_lock(&m->lock);
 	for (unsigned i = 0u; i < MAX_STREAMS; i++) {
 		if (m->streams[i] != NULL) {
 			m->streams[i]->lost = 1;
+			if (m->streams[i]->forwarded)
+				shutdown(m->streams[i]->sink, SHUT_RDWR);
 			pthread_cond_broadcast(&m->streams[i]->changed);
 		}
 	}
 	pthread_mutex_unlock(&m->lock);
 	reap(m);
+	if (m->wake >= 0 && eventfd_write(m->wake, 1u) != 0)
+		host->log(m->core, 3, "the machine's forwarder could not be woken");
 	if (m->exited && m->signal != 0) {
 		host->on_exit(m->core, m, NULL, -1, m->signal);
 	} else if (m->exited) {
@@ -953,9 +1007,13 @@ static hull_status qemu_create(hull_core *core, hull_buf plan, hull_machine **ou
 	m->core = core;
 	m->wire.fd = -1;
 	m->network = -1;
+	m->wake = -1;
+	for (unsigned i = 0u; i < MAX_PORTS; i++)
+		m->listeners[i] = -1;
 	pthread_mutex_init(&m->lock, NULL);
 	pthread_mutex_init(&m->send_lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
+	pthread_cond_init(&m->quiet, NULL);
 	if ((reason = read_plan(m, &doc)) != NULL) {
 		release(m);
 		return fail(error, HULL_ERR_UNSUPPORTED, reason);
@@ -1024,11 +1082,50 @@ static const char *make_dir(hull_machine *m)
 	return NULL;
 }
 
+static void close_listeners(hull_machine *m)
+{
+	for (unsigned i = 0u; i < m->port_count; i++) {
+		if (m->listeners[i] >= 0)
+			close(m->listeners[i]);
+		m->listeners[i] = -1;
+	}
+}
+
+/* The machine's directory, and its listeners, which a failed start and
+ * destroy() both end with. */
 static void remove_dir(hull_machine *m)
 {
+	close_listeners(m);
 	if (m->dir[0] != '\0')
 		remove_files(m->dir);
 	m->dir[0] = '\0';
+}
+
+/* Each port's listener on 127.0.0.1, bound before the machine boots, so a
+ * port that is taken refuses the start. A reason, or NULL. */
+static const char *open_listeners(hull_machine *m)
+{
+	for (unsigned i = 0u; i < m->port_count; i++) {
+		struct sockaddr_in at;
+		int                one = 1;
+		int                fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+
+		memset(&at, 0, sizeof at);
+		at.sin_family      = AF_INET;
+		at.sin_port        = htons((uint16_t)m->port_host[i]);
+		at.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0 ||
+		    bind(fd, (struct sockaddr *)&at, sizeof at) != 0 || listen(fd, 64) != 0) {
+			snprintf(m->detail, sizeof m->detail, "port %u on 127.0.0.1: %s", m->port_host[i],
+			         strerror(errno));
+			if (fd >= 0)
+				close(fd);
+			close_listeners(m);
+			return m->detail;
+		}
+		m->listeners[i] = fd;
+	}
+	return NULL;
 }
 
 /* Kill qemu, unless it has been reaped and its pid freed. */
@@ -1055,8 +1152,10 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		return fail(error, HULL_ERR_RUNTIME, "/dev/kvm is not open to this user");
 	if (access("/dev/vhost-vsock", R_OK | W_OK) != 0)
 		return fail(error, HULL_ERR_RUNTIME, "/dev/vhost-vsock is not open to this user");
-	if ((reason = make_dir(m)) != NULL || (reason = write_initramfs(m->dir, name.release)) != NULL) {
-		snprintf(m->detail, sizeof m->detail, "%s", reason);
+	if ((reason = make_dir(m)) != NULL || (reason = write_initramfs(m->dir, name.release)) != NULL ||
+	    (reason = open_listeners(m)) != NULL) {
+		if (reason != m->detail)
+			snprintf(m->detail, sizeof m->detail, "%s", reason);
 		remove_dir(m);
 		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	}
@@ -1107,6 +1206,10 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		return fail(error, HULL_ERR_INTERNAL, "out of memory");
 	}
 	m->connected = 1;
+	/* The reader wakes the forwarder when the machine ends, which it
+	 * may do as soon as it runs, so `wake` is made before it. */
+	if (m->port_count > 0u)
+		m->wake = eventfd(0u, EFD_CLOEXEC);
 
 	hull_msg_raw(&msg, "(5:hello(2:ch1:0)(8:features)(5:proto1:1))");
 	send_msg(m, &msg);
@@ -1121,6 +1224,13 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 			if (expect(m, "started") &&
 			    pthread_create(&m->reader, NULL, read_agent, m) == 0) {
 				m->started = 1;
+				/* Without a forwarder a port's connections wait in
+				 * its backlog, unanswered; the machine runs. */
+				if (m->port_count > 0u && m->wake >= 0 &&
+				    pthread_create(&m->forwarder, NULL, forward_ports, m) == 0)
+					m->forwarding = 1;
+				else if (m->port_count > 0u)
+					host->log(core, 3, "the machine's ports cannot be forwarded");
 				host->on_state(core, m, "running");
 				return HULL_OK;
 			}
@@ -1180,6 +1290,14 @@ static hull_status qemu_destroy(hull_core *core, hull_machine *m, hull_error *er
 	if (m->started) {
 		qemu_stop(core, m, 0, error);
 		pthread_join(m->reader, NULL);
+		/* The reader has woken the forwarder, and every connection's
+		 * stream is lost: each ends, and none starts after. */
+		if (m->forwarding)
+			pthread_join(m->forwarder, NULL);
+		pthread_mutex_lock(&m->lock);
+		while (m->connections > 0u)
+			pthread_cond_wait(&m->quiet, &m->lock);
+		pthread_mutex_unlock(&m->lock);
 		hull_wire_close(&m->wire);
 	}
 	remove_dir(m);
@@ -1232,8 +1350,36 @@ static void send_credit(hull_machine *m, uint32_t ch, size_t bytes)
 	send_msg(m, &msg);
 }
 
-/* The stream's own thread: its output to on_data, credit back to the
- * agent once each piece has gone, then its exit, once. */
+/* Have the agent end the stream's command, or its connection. */
+static void kill_stream(hull_machine *m, hull_stream *st)
+{
+	hull_msg msg = { 0 };
+
+	hull_msg_raw(&msg, "(6:signal");
+	hull_msg_channel(&msg, st->ch);
+	hull_msg_raw(&msg, "(6:signal7:SIGKILL))");
+	send_msg(m, &msg);
+}
+
+/* All of `length` to a connection's socket; 0 if it will not take it. */
+static int send_all(int fd, const uint8_t *bytes, size_t length)
+{
+	while (length > 0u) {
+		ssize_t n = send(fd, bytes, length, MSG_NOSIGNAL);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			return 0;
+		bytes += n;
+		length -= (size_t)n;
+	}
+	return 1;
+}
+
+/* The stream's own thread: its output to on_data, or to a connection's
+ * socket, credit back to the agent once each piece has gone, then its
+ * exit, once. A connection's end shuts its socket, which ends its pump. */
 static void *deliver(void *arg)
 {
 	hull_stream  *st = arg;
@@ -1254,9 +1400,20 @@ static void *deliver(void *arg)
 		pthread_mutex_unlock(&m->lock);
 		if (p == NULL)
 			break;
-		host->on_data(st->core, st, p->fd, p->bytes, p->length);
+		if (!st->forwarded) {
+			host->on_data(st->core, st, p->fd, p->bytes, p->length);
+		} else if (!st->broken && !send_all(st->sink, p->bytes, p->length)) {
+			/* The client has gone: the connection ends, and what
+			 * the machine still sends is taken and dropped. */
+			st->broken = 1;
+			kill_stream(m, st);
+		}
 		send_credit(m, st->ch, p->length);
 		free(p);
+	}
+	if (st->forwarded) {
+		shutdown(st->sink, SHUT_RDWR);
+		return NULL;
 	}
 	if (st->exited && st->signal != 0)
 		host->on_exit(st->core, m, st, -1, st->signal);
@@ -1279,34 +1436,18 @@ static void free_stream(hull_stream *st)
 	free(st);
 }
 
-/* The core's request, `(exec (argv ...) (ch n) (machine id) (tty ...))`,
- * as the agent's: the argv, a channel of this machine's, the terminal. */
-static hull_status qemu_exec(hull_core *core, hull_machine *m, hull_buf spec, hull_stream **out,
-                             hull_error *error)
+/* A stream on a channel of the machine's own, or NULL with `why` set. */
+static hull_stream *new_stream(hull_machine *m, hull_core *core, hull_status *why)
 {
-	hull_sexpr_doc  doc;
-	hull_sexpr_form message;
-	hull_sexpr_form argv;
-	hull_stream    *st;
-	hull_msg        msg = { 0 };
-	unsigned        slot = MAX_STREAMS;
-	int             cols = 0;
-	int             rows = 0;
-	struct timespec deadline;
+	hull_stream *st = calloc(1u, sizeof *st);
+	unsigned     slot = MAX_STREAMS;
 
-	if (!m->started || wait_done(m, 0))
-		return fail(error, HULL_ERR_GONE, "the machine is not running");
-	if (hull_sexpr_open(&doc, spec.data, spec.len, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
-	    !hull_sexpr_first(&doc, &message) || !hull_access_find(&doc, &message, "argv", &argv))
-		return fail(error, HULL_ERR_UNSUPPORTED, "an exec names a command");
-	st = calloc(1u, sizeof *st);
+	*why = HULL_ERR_INTERNAL;
 	if (st == NULL)
-		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+		return NULL;
 	st->machine = m;
 	st->core    = core;
-	st->tty     = hull_access_terminal(&doc, &message, &cols, &rows);
 	pthread_cond_init(&st->changed, NULL);
-
 	pthread_mutex_lock(&m->lock);
 	for (unsigned i = 0u; i < MAX_STREAMS && slot == MAX_STREAMS; i++)
 		if (m->streams[i] == NULL)
@@ -1317,9 +1458,66 @@ static hull_status qemu_exec(hull_core *core, hull_machine *m, hull_buf spec, hu
 	}
 	pthread_mutex_unlock(&m->lock);
 	if (slot == MAX_STREAMS) {
+		*why = HULL_ERR_BUSY;
 		free_stream(st);
-		return fail(error, HULL_ERR_BUSY, "the machine runs as many commands as it can");
+		return NULL;
 	}
+	return st;
+}
+
+static void drop_stream(hull_machine *m, hull_stream *st)
+{
+	pthread_mutex_lock(&m->lock);
+	for (unsigned i = 0u; i < MAX_STREAMS; i++)
+		if (m->streams[i] == st)
+			m->streams[i] = NULL;
+	pthread_mutex_unlock(&m->lock);
+}
+
+/* `started`, within ten seconds; else the agent's reason, or that it did
+ * not answer, into `reason`. */
+static int answered(hull_machine *m, hull_stream *st, char *reason, size_t cap)
+{
+	struct timespec deadline;
+	int             ok;
+
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec += 10;
+	pthread_mutex_lock(&m->lock);
+	while (!st->answered && !st->lost &&
+	       pthread_cond_timedwait(&st->changed, &m->lock, &deadline) == 0)
+		;
+	ok = st->answered && st->refusal[0] == '\0';
+	if (!ok)
+		snprintf(reason, cap, "%s",
+		         st->refusal[0] != '\0' ? st->refusal : "the agent did not answer");
+	pthread_mutex_unlock(&m->lock);
+	return ok;
+}
+
+/* The core's request, `(exec (argv ...) (ch n) (machine id) (tty ...))`,
+ * as the agent's: the argv, a channel of this machine's, the terminal. */
+static hull_status qemu_exec(hull_core *core, hull_machine *m, hull_buf spec, hull_stream **out,
+                             hull_error *error)
+{
+	hull_sexpr_doc  doc;
+	hull_sexpr_form message;
+	hull_sexpr_form argv;
+	hull_stream    *st;
+	hull_msg        msg = { 0 };
+	hull_status     why;
+	int             cols = 0;
+	int             rows = 0;
+
+	if (!m->started || wait_done(m, 0))
+		return fail(error, HULL_ERR_GONE, "the machine is not running");
+	if (hull_sexpr_open(&doc, spec.data, spec.len, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
+	    !hull_sexpr_first(&doc, &message) || !hull_access_find(&doc, &message, "argv", &argv))
+		return fail(error, HULL_ERR_UNSUPPORTED, "an exec names a command");
+	if ((st = new_stream(m, core, &why)) == NULL)
+		return fail(error, why, why == HULL_ERR_BUSY ?
+		            "the machine runs as many commands as it can" : "out of memory");
+	st->tty = hull_access_terminal(&doc, &message, &cols, &rows);
 
 	hull_msg_raw(&msg, "(4:exec");
 	hull_msg_bytes(&msg, doc.data + argv.offset, argv.extent);
@@ -1335,31 +1533,15 @@ static hull_status qemu_exec(hull_core *core, hull_machine *m, hull_buf spec, hu
 	}
 	send_msg(m, &msg);
 
-	/* started, or the agent's reason not to, within ten seconds. */
-	clock_gettime(CLOCK_REALTIME, &deadline);
-	deadline.tv_sec += 10;
-	pthread_mutex_lock(&m->lock);
-	while (!st->answered && !st->lost &&
-	       pthread_cond_timedwait(&st->changed, &m->lock, &deadline) == 0)
-		;
-	if (!st->answered || st->refusal[0] != '\0') {
-		m->streams[slot] = NULL;
-		snprintf(m->detail, sizeof m->detail, "%s",
-		         st->refusal[0] != '\0' ? st->refusal : "the agent did not start the command");
-		pthread_mutex_unlock(&m->lock);
+	if (!answered(m, st, m->detail, sizeof m->detail)) {
+		drop_stream(m, st);
 		free_stream(st);
 		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	}
-	pthread_mutex_unlock(&m->lock);
 	if (pthread_create(&st->deliverer, NULL, deliver, st) != 0) {
 		/* Nothing will deliver it: the command is ended, unseen. */
-		pthread_mutex_lock(&m->lock);
-		m->streams[slot] = NULL;
-		pthread_mutex_unlock(&m->lock);
-		hull_msg_raw(&msg, "(6:signal");
-		hull_msg_channel(&msg, st->ch);
-		hull_msg_raw(&msg, "(6:signal7:SIGKILL))");
-		send_msg(m, &msg);
+		drop_stream(m, st);
+		kill_stream(m, st);
 		free_stream(st);
 		return fail(error, HULL_ERR_INTERNAL, "the stream's thread could not start");
 	}
@@ -1450,27 +1632,145 @@ static hull_status qemu_resize(hull_core *core, hull_stream *st, int rows, int c
 static hull_status qemu_stream_close(hull_core *core, hull_stream *st, hull_error *error)
 {
 	hull_machine *m = st->machine;
-	hull_msg      msg = { 0 };
 	int           over;
 
 	qemu_stream_eof(core, st, error);
 	pthread_mutex_lock(&m->lock);
 	over = st->exited || st->lost;
 	pthread_mutex_unlock(&m->lock);
-	if (!over) {
-		hull_msg_raw(&msg, "(6:signal");
-		hull_msg_channel(&msg, st->ch);
-		hull_msg_raw(&msg, "(6:signal7:SIGKILL))");
-		send_msg(m, &msg);
-	}
+	if (!over)
+		kill_stream(m, st);
 	pthread_join(st->deliverer, NULL);
-	pthread_mutex_lock(&m->lock);
-	for (unsigned i = 0u; i < MAX_STREAMS; i++)
-		if (m->streams[i] == st)
-			m->streams[i] = NULL;
-	pthread_mutex_unlock(&m->lock);
+	drop_stream(m, st);
 	free_stream(st);
 	return HULL_OK;
+}
+
+/* --- ports --------------------------------------------------------------- */
+
+typedef struct connection {
+	hull_machine *machine;
+	int           socket;
+	unsigned      port;      /* the guest's */
+} connection;
+
+/* One connection to a port: a channel of the agent's, `connect`ed to the
+ * guest's port. The client's bytes go in on the agent's credit, as an
+ * exec's stdin does, and the machine's come back through deliver(). The
+ * client's end of writing is the agent's eof, so a client may half-close;
+ * a client that goes, or that resets, ends the connection. */
+static void *forward_one(void *arg)
+{
+	connection   *k = arg;
+	hull_machine *m = k->machine;
+	hull_stream  *st;
+	hull_status   why;
+	hull_msg      msg = { 0 };
+	char          reason[300];
+
+	if ((st = new_stream(m, NULL, &why)) == NULL) {
+		host->log(m->core, 2, "a connection to a port finds the machine out of channels");
+		goto out;
+	}
+	st->forwarded = 1;
+	st->sink      = k->socket;
+	hull_msg_raw(&msg, "(7:connect");
+	hull_msg_channel(&msg, st->ch);
+	hull_msg_raw(&msg, "(4:port");
+	hull_msg_number(&msg, (long long)k->port);
+	hull_msg_raw(&msg, "))");
+	send_msg(m, &msg);
+	if (!answered(m, st, reason, sizeof reason)) {
+		char line[400];
+
+		snprintf(line, sizeof line, "a connection to port %u: %s", k->port, reason);
+		host->log(m->core, 1, line);
+		drop_stream(m, st);
+		free_stream(st);
+		goto out;
+	}
+	if (pthread_create(&st->deliverer, NULL, deliver, st) != 0) {
+		drop_stream(m, st);
+		kill_stream(m, st);
+		free_stream(st);
+		goto out;
+	}
+	for (;;) {
+		uint8_t buffer[16384];
+		ssize_t n = recv(k->socket, buffer, sizeof buffer, 0);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n > 0 && qemu_stream_write(NULL, st, buffer, (size_t)n, NULL) == HULL_OK)
+			continue;
+		if (n == 0)
+			qemu_stream_eof(NULL, st, NULL);
+		else
+			kill_stream(m, st);
+		break;
+	}
+	pthread_join(st->deliverer, NULL);
+	drop_stream(m, st);
+	free_stream(st);
+out:
+	close(k->socket);
+	pthread_mutex_lock(&m->lock);
+	m->connections--;
+	pthread_cond_broadcast(&m->quiet);
+	pthread_mutex_unlock(&m->lock);
+	free(k);
+	return NULL;
+}
+
+/* The machine's forwarder: each connection to a listener gets a thread of
+ * its own, until the machine ends and the reader wakes it. */
+static void *forward_ports(void *arg)
+{
+	hull_machine *m = arg;
+
+	for (;;) {
+		struct pollfd fds[1u + MAX_PORTS];
+
+		fds[0] = (struct pollfd){ m->wake, POLLIN, 0 };
+		for (unsigned i = 0u; i < m->port_count; i++)
+			fds[1u + i] = (struct pollfd){ m->listeners[i], POLLIN, 0 };
+		if (poll(fds, 1u + m->port_count, -1) < 0 && errno != EINTR)
+			break;
+		if (fds[0].revents != 0)
+			break;
+		for (unsigned i = 0u; i < m->port_count; i++) {
+			connection    *k;
+			pthread_t      thread;
+			pthread_attr_t detached;
+			int            fd;
+
+			if (fds[1u + i].revents == 0 ||
+			    (fd = accept4(m->listeners[i], NULL, NULL, SOCK_CLOEXEC)) < 0)
+				continue;
+			if ((k = malloc(sizeof *k)) == NULL) {
+				close(fd);
+				continue;
+			}
+			k->machine = m;
+			k->socket  = fd;
+			k->port    = m->port_guest[i];
+			pthread_mutex_lock(&m->lock);
+			m->connections++;
+			pthread_mutex_unlock(&m->lock);
+			pthread_attr_init(&detached);
+			pthread_attr_setdetachstate(&detached, PTHREAD_CREATE_DETACHED);
+			if (pthread_create(&thread, &detached, forward_one, k) != 0) {
+				close(fd);
+				free(k);
+				pthread_mutex_lock(&m->lock);
+				m->connections--;
+				pthread_cond_broadcast(&m->quiet);
+				pthread_mutex_unlock(&m->lock);
+			}
+			pthread_attr_destroy(&detached);
+		}
+	}
+	return NULL;
 }
 
 /* --- the declaration ----------------------------------------------------- */
@@ -1487,6 +1787,9 @@ static const hull_cap_entry entries[] = {
 	{ "volumes",            HULL_SUP_NATIVE,   "a 9p share each", NULL },
 	{ "cpus",               HULL_SUP_NATIVE,   NULL, NULL },
 	{ "memory",             HULL_SUP_NATIVE,   "a hard allocation", NULL },
+	/* Section 6's host forwarder: the engine's, over vsock to the agent. */
+	{ "ports",              HULL_SUP_EMULATED,
+	  "tcp, forwarded over vsock from 127.0.0.1 until section 8.1's addresses exist", NULL },
 
 	{ "security.readonly_root", HULL_SUP_NATIVE, NULL, NULL },
 	{ "security.no_new_privs",  HULL_SUP_NATIVE, "set by the agent on the workload", NULL },
