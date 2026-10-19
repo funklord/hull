@@ -145,6 +145,12 @@ QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.co
                   overlay.conf overro.conf rootfs/srv/kept \
                   rootfs/probe rootfs/bin/sh rootfs/written rootfs/etc/resolv.conf data/in data/out)
 
+# What test/flip_test.sh writes: the project, and its rsync'd copy.
+FLIP_PROJECT    = hull.conf rootfs/probe rootfs/etc/flip
+FLIP_TEST_FILES = $(addprefix $(BUILD_DIR)/test/flip/, docker.out vm.out emu.out \
+                  $(addprefix project/, $(FLIP_PROJECT)) \
+                  $(addprefix deployed/, $(FLIP_PROJECT) data/out))
+
 # The reference engine's test rootfs holds one static program.
 PROBE = $(BUILD_DIR)/test/cli/rootfs/probe
 
@@ -166,7 +172,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all check check-docker check-qemu test vectors style style-source style-docs contract hooks clean help
+.PHONY: all check check-docker check-qemu check-flip test vectors style style-source style-docs contract hooks clean help
 
 all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL) $(AGENT_BIN)
 
@@ -176,6 +182,7 @@ help:
 	@echo '  check     style, the situ contracts, then the tests'
 	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
 	@echo '  check-qemu    hull run on the qemu engine, as the user, with KVM'
+	@echo '  check-flip    one hull.conf, rsync'"'"'d, run on docker, vm and emu'
 	@echo '  test      build and run the reader tests, the vectors, then the gate'"'"'s'
 	@echo '  vectors   the described schemas against bytes they must accept and refuse'
 	@echo '  style     the indentation and whitespace gate'
@@ -358,6 +365,10 @@ check-docker: $(HULL) $(PROBE) $(BUILD_DIR)/test/tree_tar
 	BUILD_DIR='$(BUILD_DIR)' sh test/docker_test.sh '$(HULL)' '$(PROBE)' \
 		'$(BUILD_DIR)/test/tree_tar'
 
+check-flip: $(HULL) $(AGENT_BIN) $(PROBE) $(BUILD_DIR)/test/tree_tar
+	BUILD_DIR='$(BUILD_DIR)' sh test/flip_test.sh '$(HULL)' '$(PROBE)' \
+		'$(BUILD_DIR)/test/tree_tar'
+
 check-qemu: $(HULL) $(AGENT_BIN) $(PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/qemu_test.sh '$(HULL)' '$(PROBE)'
 
@@ -405,4 +416,5 @@ clean:
 	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) \
 	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) \
 	        $(AGENT_BIN) $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d \
-	        $(CLI_TEST_FILES) $(PROBE) $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES)
+	        $(CLI_TEST_FILES) $(PROBE) $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) \
+	        $(FLIP_TEST_FILES)
