@@ -45,6 +45,17 @@ make check-docker  # hull run on the docker adapter, against the daemon
 make hooks   # install the commit-msg hook
 ```
 
+`web.hull` and every other machine's name resolve, for any program on
+the host, once `build/libnss_hull.so.2` is installed. That is the one step
+that needs root:
+
+```sh
+sudo make install-nss   # into /usr/lib/<multiarch>/
+```
+
+then add `hull` to the `hosts:` line of `/etc/nsswitch.conf`, before
+`dns`, as in `hosts: files hull dns`.
+
 Build with make for now: fmake builds hull's own schemas, but cannot yet
 give each one the situc options the Makefile does.
 

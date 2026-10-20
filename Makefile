@@ -116,6 +116,11 @@ HULL        = $(BUILD_DIR)/hull
 # looks for it.
 AGENT_BIN_OBJS = $(BUILD_DIR)/agent/agent.o $(WIRE_OBJS) $(BUILD_DIR)/engine/access.o
 AGENT_BIN      = $(BUILD_DIR)/hull-agent
+
+# The hosts database for section 8.1's names, loaded by glibc into any
+# program that looks a name up: nothing of hull's but its own file.
+NSS_LIB    = $(BUILD_DIR)/libnss_hull.so.2
+NSS_LIBDIR ?= /usr/lib/$(shell $(CC) -print-multiarch)
 VERSION    := $(shell cat VERSION)
 
 TEST_SEXPR_OBJS   = $(BUILD_DIR)/test/sexpr_test.o
@@ -176,9 +181,9 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all check check-docker check-qemu check-flip test vectors style style-source style-docs contract hooks clean help
+.PHONY: all check check-docker check-qemu check-flip test vectors style style-source style-docs contract hooks clean help install-nss
 
-all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL) $(AGENT_BIN)
+all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL) $(AGENT_BIN) $(NSS_LIB)
 
 help:
 	@echo 'Targets:'
@@ -192,6 +197,7 @@ help:
 	@echo '  style     the indentation and whitespace gate'
 	@echo '  contract  the schemas'"'"' capability maps against the committed ones'
 	@echo '  hooks     install the commit-msg hook from tool/hooks/'
+	@echo '  install-nss  as root: libnss_hull.so.2 into NSS_LIBDIR, for *.hull names'
 	@echo '  clean     remove what the build made, naming each file'
 
 # Each schema generates a header and a source in one situc run, so both are
@@ -263,6 +269,18 @@ $(HULL): $(CLI_OBJS) $(CORE_OBJS) $(ENGINE_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEX
 $(AGENT_BIN): $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
 	$(CC) -static $(CFLAGS) -o $@ $^
 
+# One file, its own: only the _nss_hull_ entry points are visible.
+$(NSS_LIB): nss/nss_hull.c
+	@mkdir -p '$(@D)'
+	$(CC) $(CFLAGS) $(WARNINGS) -fPIC -fvisibility=hidden -shared -Wl,-soname,libnss_hull.so.2 \
+	      -o $@ $<
+
+# The one step of section 8.1's names that needs root, and the only target
+# that writes outside the tree: run it as root, then put `hull` on the
+# hosts line of /etc/nsswitch.conf, before `dns`.
+install-nss: $(NSS_LIB)
+	install -D -m 0644 $(NSS_LIB) '$(DESTDIR)$(NSS_LIBDIR)/libnss_hull.so.2'
+
 $(GEN_DIR)/%.o: $(GEN_DIR)/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
@@ -330,7 +348,7 @@ check: style contract test
 # The reader's tests -- the spec's against every ```scheme example in
 # project.md as well -- then the gate's own suite, which travels with the
 # gate. Tests are built here and only here: a plain `make` does not.
-test: $(TEST_BINS) $(HULL) $(PROBE) vectors
+test: $(TEST_BINS) $(HULL) $(PROBE) $(NSS_LIB) vectors
 	$(BUILD_DIR)/test/sexpr_test
 	$(BUILD_DIR)/test/framing_test
 	$(BUILD_DIR)/test/spec_test project.md
@@ -341,6 +359,7 @@ test: $(TEST_BINS) $(HULL) $(PROBE) vectors
 	$(BUILD_DIR)/test/sha256_test
 	BUILD_DIR='$(BUILD_DIR)' sh test/tree_test.sh '$(BUILD_DIR)/test/tree_tar'
 	BUILD_DIR='$(BUILD_DIR)' sh test/cli_test.sh '$(HULL)'
+	BUILD_DIR='$(BUILD_DIR)' sh test/nss_test.sh '$(HULL)' '$(NSS_LIB)'
 	$(PYTHON) tool/test_style_gate.py
 
 # Each schema accepts every vector in its .vectors and refuses every one in
@@ -421,4 +440,4 @@ clean:
 	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) \
 	        $(AGENT_BIN) $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d \
 	        $(CLI_TEST_FILES) $(PROBE) $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) \
-	        $(FLIP_TEST_FILES)
+	        $(FLIP_TEST_FILES) $(NSS_LIB)

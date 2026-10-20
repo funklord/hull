@@ -1757,6 +1757,43 @@ static int any_clients(void)
 	return 0;
 }
 
+/* hull/hosts, section 8.1's names for nss/nss_hull.c: a line per machine
+ * the core holds, `ID ADDRESS`, as `ps` lists them. Rewritten whole, by a
+ * rename, whenever the listing has changed, so a reader never sees half of
+ * one; written only by the core that holds the lock, and removed by it as
+ * it goes, before the lock is free. */
+static char hosts_path[4200];
+static char hosts_written[MAX_MACHINES * 96u];
+static int  hosts_current;
+
+static void sync_hosts(void)
+{
+	char   listing[sizeof hosts_written];
+	char   fresh[sizeof hosts_path + 8u];
+	size_t n = 0u;
+	int    fd;
+
+	listing[0] = '\0';
+	for (unsigned i = 0u; i < MAX_MACHINES; i++) {
+		const slot *s = &machines[i];
+
+		if (s->used && s->address[0] != '\0')
+			n += (size_t)snprintf(listing + n, sizeof listing - n, "%s %s\n", s->id, s->address);
+	}
+	if (hosts_path[0] == '\0' || (hosts_current && strcmp(listing, hosts_written) == 0))
+		return;
+	snprintf(fresh, sizeof fresh, "%s.new", hosts_path);
+	fd = open(fresh, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (fd < 0)
+		return;
+	if (write(fd, listing, n) != (ssize_t)n || close(fd) != 0 || rename(fresh, hosts_path) != 0) {
+		unlink(fresh);
+		return;  /* tried again the next time round */
+	}
+	snprintf(hosts_written, sizeof hosts_written, "%s", listing);
+	hosts_current = 1;
+}
+
 int hull_core_run(const char *host_arch)
 {
 	char               dir[4096];
@@ -1813,6 +1850,7 @@ int hull_core_run(const char *host_arch)
 	}
 
 	unlink(path);  /* a socket left by a core that died; the lock is ours */
+	snprintf(hosts_path, sizeof hosts_path, "%s/hosts", dir);
 	listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	memset(&address, 0, sizeof address);
 	address.sun_family = AF_UNIX;
@@ -1860,6 +1898,9 @@ int hull_core_run(const char *host_arch)
 		nfds_t        n = 0u;
 		int           timeout = -1;
 
+		/* Before each wait, so that the first, before any request, replaces
+		 * what a core that died left, which is not true. */
+		sync_hosts();
 		fds[n++] = (struct pollfd){ listener, POLLIN, 0 };
 		fds[n++] = (struct pollfd){ wake[0], POLLIN, 0 };
 		for (unsigned i = 0u; i < MAX_CLIENTS; i++) {
@@ -1952,6 +1993,7 @@ int hull_core_run(const char *host_arch)
 		setsockopt(clients[i].wire.fd, SOL_SOCKET, SO_SNDTIMEO, &patience, sizeof patience);
 		flush(&clients[i]);
 	}
+	unlink(hosts_path);
 	close(lock);
 	return 0;
 }
