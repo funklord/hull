@@ -295,6 +295,47 @@ cases=$((cases + 1))
 label=$(timeout 10 docker image inspect -f '{{index .Config.Labels "hull.tree"}}' "hull-dir:$digest" 2>&1)
 named=$(realpath "$root/rootfs" | tr -d '\n' | sha256sum | cut -c1-64)
 [ "$label" = "$named" ] || fail "the import's hull.tree is not its tree's" "$label, wanted $named"
+# A udp port, as on qemu: each client answered on its own, and each
+# datagram whole. Not, as on qemu, an empty datagram, which docker drops,
+# nor a client's address kept across a datagram refused in the machine,
+# which docker changes (project.md section 4.9). The client sends again,
+# 200 times a quarter of a second apart at most.
+printf '(machine (source "dir:./rootfs") (mutable overlay) (backend docker) (hostname "dtest") %s)\n' \
+	'(ports (port (host 18053) (guest 5353) (proto udp))) (command "/probe" "echo" "5353")' \
+	> "$root/udp.conf"
+cases=$((cases + 1))
+rm -f "$root/udp.out"
+(cd / && exec timeout -k 2 60 "$hull" run -f "$root/udp.conf" > "$root/udp.out" 2>&1) &
+runner=$!
+heard=$(timeout 120 python3 -u -c '
+import socket, sys
+at = (sys.argv[1], 18053)
+def ask(s, data):
+    for _ in range(200):
+        s.sendto(data, at)
+        s.settimeout(0.25)
+        try:
+            while True:
+                if s.recv(65536) == data:
+                    return True
+        except socket.timeout:
+            pass
+    return False
+a = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+print("a=%s b=%s" % (ask(a, b"from a"), ask(b, b"from b")))
+for n in (1, 1400, 65000):
+    print("%d=%s" % (n, ask(a, bytes((i * 7) & 0xff for i in range(n)))))
+print("end=%s" % ask(b, b"end"))' "$at" 2>&1)
+wait "$runner"
+got=$?
+[ "$got" = 0 ] && [ "$heard" = "a=True b=True
+1=True
+1400=True
+65000=True
+end=True" ] && grep -q '^echoed from 2$' "$root/udp.out" ||
+	fail "a udp port's datagrams were not each client's, whole: $got" \
+		"$heard; $(cat "$root/udp.out")"
 # A fresh import retires the tree's others, but not one a container
 # uses: a machine kept running on the first state holds it.
 printf '(machine (source "dir:./rootfs") (mutable overlay) (backend docker) (hostname "dtest-keep") %s)\n' \

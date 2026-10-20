@@ -464,7 +464,7 @@ cases=$((cases + 1))
 rm -f "$root/udp.out"
 (cd / && exec timeout -k 2 60 "$hull" run -f "$root/udp.conf" > "$root/udp.out" 2>&1) &
 runner=$!
-heard=$(timeout 120 python3 -c '
+heard=$(timeout 120 python3 -u -c '
 import socket, sys, time
 at = (sys.argv[1], int(sys.argv[2]))
 def ask(s, data):

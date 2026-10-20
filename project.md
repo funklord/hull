@@ -664,7 +664,8 @@ Three of these had first passed: stderr, stop and the session. Each was caught o
 
 - **The basics:** the image ref, `Cmd`, `WorkingDir`, `Hostname` and `Env`.
 - **Volumes:** `Binds`, with host paths made absolute, since the daemon resolves nothing relative. `hull run` stands in the file's directory.
-- **Ports:** `PortBindings` on the machine's address (§4.10).
+- **Ports:** `PortBindings` on the machine's address (§4.10), tcp or udp as the plan says.
+- **A udp port on docker is not quite qemu's,** measured 2026-10-20 on docker 26.1.5, where the daemon runs no userland proxy and the kernel's NAT carries the datagrams. It drops an empty datagram, which hull's qemu forwarder delivers. And a datagram refused in the container, sent while nothing listens, moves the client to a new port there: the probe saw 59316, then 58599 once it listened again, where qemu's flow keeps the client's port (§4.11). Both are docker's, not hull's: hull only asks for the binding. A server that keys state on the client's address loses it on docker, and not on qemu.
 - **Limits:** `NanoCpus` and `Memory`.
 - **Security:** `ReadonlyRootfs`, `no-new-privileges` and `CapDrop ALL`.
 - **`Init`, docker's own tini, as PID 1,** for the same reason §4.8's chroot engine has an init: a workload at PID 1 ignores `stop`'s SIGTERM, and nothing reaps. A command that is not there is therefore the init failing to exec it, status 127, as a shell would report it, not a failed start.
@@ -689,13 +690,13 @@ Open:
   - **Sabotage:** breaking each of these failed a named case: retiring at all, the label, keeping the fresh import, and the real path. Removing with `force=true` first passed. The daemon refuses even a forced removal of an image a running container uses, so that case could not tell. An image with a second name is what force would take, and the case for it fails.
 - **Untested:** a tree that changes between the two readings, which a test cannot time on purpose.
 
-**`make check-docker`**, not part of `make check`, runs `test/docker_test.sh` against the daemon the account can reach. It uses `alpine:latest` and does not pull it. There are 48 cases:
+**`make check-docker`**, not part of `make check`, runs `test/docker_test.sh` against the daemon the account can reach. It uses `alpine:latest` and does not pull it. There are 49 cases:
 
 - output on its own stream, the exit status, env, workdir, hostname and the user's uid;
 - volumes, a write through one that lands as the user's file, and a read-only root;
 - no capabilities, and a grant refused;
 - a signal from the workload, and SIGTERM to `hull run` stopping the machine inside docker's ten seconds;
-- a port reached from the host on the machine's address, and not on 127.0.0.1;
+- a port reached from the host on the machine's address, and not on 127.0.0.1; and a udp port, to the probe's echo, each of two clients answered on its own and datagrams of 1, 1400 and 65,000 bytes whole;
 - `hull ssh`, alpine's login shell on a terminal with the frontend's TERM;
 - a dir source as an overlay: imported under the digest the test works out with `sha256sum`, run as the user, writing into the container and not the directory, imported once for two runs and again once changed, labelled with its tree's path, an older import kept while a machine uses it and retired once nothing does, and one with a second name kept; in place, refused;
 - a missing image and a missing command;
@@ -709,7 +710,7 @@ In a scratch copy, breaking each of these failed it:
 - keeping stderr apart;
 - the read-only root;
 - the read-only volume;
-- the port bindings;
+- the port bindings, and, on 2026-10-20, binding every port as tcp;
 - the environment;
 - the workdir;
 - the exit status;
