@@ -23,7 +23,8 @@
  * The agent is the machine's init: it reaps whatever is orphaned to it,
  * and once the workload has ended and its output has been read it says
  * `exited`, exactly as the workload ended, ends what is left, says `bye`
- * and powers the machine off. A `stop` is SIGTERM, then SIGKILL at its
+ * and powers the machine off once the host has closed, which it does on
+ * hearing bye. A `stop` is SIGTERM, then SIGKILL at its
  * timeout. A host that goes away is (on_disconnect stop): the same, with
  * nobody to tell.
  *
@@ -158,6 +159,37 @@ static void send_simple(const char *type)
 	hull_msg_channel(&m, 0u);
 	hull_msg_raw(&m, ")");
 	send_msg(&m);
+}
+
+/* Say bye and power off once the host has heard it. A send is only
+ * queued when it returns: powering off at once drops what the vsock
+ * device has not yet carried, which on a loaded host was the exit and the
+ * bye, and the host then reports a machine that died without its agent's
+ * word. So the agent ends its side and waits, 3 seconds at most, for the
+ * host's close, which it makes on reading bye. */
+static void farewell(void)
+{
+	struct timespec end;
+
+	send_simple("(3:bye");
+	if (connected && shutdown(host.fd, SHUT_WR) == 0) {
+		clock_gettime(CLOCK_MONOTONIC, &end);
+		end.tv_sec += 3;
+		for (;;) {
+			struct timespec now;
+			struct pollfd   fd = { host.fd, POLLIN, 0 };
+			uint8_t         discard[512];
+			long long       left;
+
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			left = (long long)(end.tv_sec - now.tv_sec) * 1000 +
+			       (end.tv_nsec - now.tv_nsec) / 1000000L;
+			if (left <= 0 || poll(&fd, 1u, (int)left) <= 0 ||
+			    read(host.fd, discard, sizeof discard) <= 0)
+				break;
+		}
+	}
+	power_off();
 }
 
 static void send_error(uint32_t ch, const char *reason)
@@ -1090,10 +1122,8 @@ static void handle(const hull_sexpr_doc *body)
 
 		if (hull_msg_find(body, "timeout_ms", &value))
 			hull_msg_long(body, &value, &timeout);
-		if (workload() == NULL) {
-			send_simple("(3:bye");
-			power_off();
-		}
+		if (workload() == NULL)
+			farewell();
 		begin_stop(timeout < 0 ? 0 : timeout);
 	} else if (hull_msg_is(body, "ping")) {
 		struct timespec up;
@@ -1134,8 +1164,7 @@ static void finish(void)
 {
 	send_status(0u, workload()->status);
 	kill(-1, SIGKILL);
-	send_simple("(3:bye");
-	power_off();
+	farewell();
 }
 
 int main(void)

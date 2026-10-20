@@ -15,9 +15,10 @@
  * The host is always the initiator (B.1): start() connects to the agent
  * on vsock port 1, sends hello and the machine's spec, waits for ready,
  * sends start and waits for started. A thread then reads what the agent
- * sends -- the workload's output on channel 0, its exit, bye -- until the
- * connection closes, waits for qemu, and reports the exit as the agent
- * gave it. A machine whose agent never said so died: its console, kept
+ * sends -- the workload's output on channel 0, its exit, bye -- until bye
+ * or the connection's close, shuts the connection, which the agent waits
+ * for before it powers off, waits for qemu, and reports the exit as the
+ * agent gave it. A machine whose agent never said so died: its console, kept
  * in a file, says why.
  *
  * stop() asks the agent, which signals the workload and powers off; qemu
@@ -985,10 +986,15 @@ static void *read_agent(void *arg)
 				m->code = (int)number;
 			if (hull_msg_find(&body, "signal", &value) && hull_msg_long(&body, &value, &number))
 				m->signal = (int)number;
+		} else if (hull_msg_is(&body, "bye")) {
+			break;
 		}
 	}
+	/* Closed on bye, which the agent waits for before it powers off:
+	 * what it sent before bye has all been read. */
 	pthread_mutex_lock(&m->send_lock);
 	m->connected = 0;
+	shutdown(m->wire.fd, SHUT_RDWR);
 	pthread_mutex_unlock(&m->send_lock);
 	/* The agent has gone: every exec it had not reported ended with the
 	 * machine, as a SIGKILL, and every connection ends. Its socket is
