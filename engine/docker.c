@@ -43,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <poll.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -56,6 +57,7 @@
 #include "builtin.h"
 #include "sha256.h"
 #include "tree.h"
+#include "usage.h"
 
 #define API           "/v1.41"
 #define MAX_RESPONSE  (1u << 20)
@@ -1553,6 +1555,77 @@ static const hull_capabilities caps = {
 	.requires_root  = 1,              /* dockerd's root daemon (5.0) */
 };
 
+/* --- stats --------------------------------------------------------------- */
+
+/* The number after `"key":` at or after `from` in `json`, or -1. */
+static long long json_after(const char *json, const char *from, const char *key)
+{
+	char        pattern[64];
+	const char *at = json != NULL ? strstr(json, from) : NULL;
+
+	snprintf(pattern, sizeof pattern, "\"%s\":", key);
+	at = at != NULL ? strstr(at, pattern) : NULL;
+	return at != NULL ? strtoll(at + strlen(pattern), NULL, 10) : -1;
+}
+
+/* What the host spends on the container, as hull_engine.h's stats: CPU
+ * time and storage io from docker's cgroup figures, which count every
+ * process it ran, an ended exec's too, where /proc has lost one that
+ * containerd's shim reaped; and memory resident by Pss, summed over the
+ * container's pid namespace from /proc, as the chroot engine's is, since
+ * a cgroup's usage counts the page cache. The processes are the user's,
+ * so /proc is theirs to read. */
+static hull_status docker_stats(hull_core *core, hull_machine *m, hull_buf *out, hull_error *error)
+{
+	static unsigned char encoded[128];
+	hull_usage           usage = { 0 };
+	char                 path[160];
+	char                *answer = NULL;
+	const char          *at;
+	const char          *stop;
+	long                 pid = 0;
+	long long            cpu;
+	int                  status = 0;
+
+	(void)core;
+	snprintf(path, sizeof path, "/containers/%s/json", m->id);
+	if (!m->started || call("GET", path, NULL, &status, &answer) != 0 || status != 200 ||
+	    strstr(answer, "\"Running\":true") == NULL || !json_number(answer, "Pid", &pid) ||
+	    pid < 1 || !hull_usage_namespace((pid_t)pid, &usage)) {
+		free(answer);
+		return fail(error, HULL_ERR_GONE, "the machine is not running");
+	}
+	free(answer);
+	answer = NULL;
+	usage.cpu = 0u;
+	usage.io  = 0u;
+	snprintf(path, sizeof path, "/containers/%s/stats?stream=false&one-shot=true", m->id);
+	if (call("GET", path, NULL, &status, &answer) != 0 || status != 200 ||
+	    (cpu = json_after(answer, "\"cpu_stats\":", "total_usage")) < 0) {
+		free(answer);
+		return fail(error, HULL_ERR_RUNTIME, "docker gave no stats for the machine");
+	}
+	usage.cpu = (unsigned long long)cpu / 1000u;
+	/* Each device's read and write, as entries of
+	 * {"major":..,"minor":..,"op":"read","value":N}. */
+	at   = strstr(answer, "\"io_service_bytes_recursive\":[");
+	stop = at != NULL ? strchr(at, ']') : NULL;
+	while (stop != NULL && (at = strstr(at, "\"op\":\"")) != NULL && at < stop) {
+		const char *op = at + strlen("\"op\":\"");
+		const char *value = strstr(op, "\"value\":");
+
+		if (value == NULL || value > stop)
+			break;
+		if (strncasecmp(op, "read\"", 5u) == 0 || strncasecmp(op, "write\"", 6u) == 0)
+			usage.io += strtoull(value + strlen("\"value\":"), NULL, 10);
+		at = value;
+	}
+	free(answer);
+	out->data = encoded;
+	out->len  = hull_usage_encode(&usage, encoded, sizeof encoded);
+	return out->len == 0u ? fail(error, HULL_ERR_INTERNAL, "stats do not fit") : HULL_OK;
+}
+
 /* --- gc ------------------------------------------------------------------ */
 
 /* Why an import of a dir source is no longer wanted, or NULL: it has no
@@ -1669,6 +1742,7 @@ static const hull_engine_ops ops = {
 	.stream_close = docker_stream_close,
 	.resize       = docker_resize,
 	.signal       = docker_signal,
+	.stats        = docker_stats,
 	.gc           = docker_gc,
 	.dial         = docker_dial,
 };

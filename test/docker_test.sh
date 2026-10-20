@@ -367,6 +367,47 @@ wait "$runner"
 cases=$((cases + 1))
 [ "$refused_got" = 125 ] && [ "$refused" = "hull: port 22: Connection refused" ] ||
 	fail "proxy-ssh to a port nothing listens on was not refused: $refused_got" "$refused"
+# What the host spends on a container, as on chroot: 300 ms of the probe's
+# CPU and 300 of a child it reaped, 32 MiB touched and 4 MiB written and
+# synced, then 400 ms and 4 MiB more in an exec, which containerd's shim
+# reaps and only docker's cgroup figures still count.
+printf '(machine (source "dir:./rootfs") (mutable overlay) (backend docker) (hostname "dtest") %s)\n' \
+	'(command "/probe" "spin" "300" "reap" "300" "hold" "32" "fill" "/srv/filled" "4" "trap")' \
+	> "$root/statsd.conf"
+figure() { # NAME STATS: one figure of hull stats, the cpu in microseconds
+	printf '%s\n' "$2" | awk -v name="$1" '$1 == name { gsub(/\./, "", $2); print $2 + 0 }'
+}
+rm -f "$root/statsd.out"
+(cd / && exec timeout -k 2 60 "$hull" run -f "$root/statsd.conf" > "$root/statsd.out" 2>&1) &
+runner=$!
+tries=0
+until grep -q '^ready$' "$root/statsd.out" 2>/dev/null || [ "$tries" -ge 80 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+cases=$((cases + 1))
+first=$(timeout 20 "$hull" stats dtest 2>&1)
+cpu=$(figure cpu "$first")
+memory=$(figure memory "$first")
+io=$(figure io "$first")
+[ "${cpu:-0}" -ge 590000 ] && [ "$cpu" -lt 5000000 ] &&
+	[ "${memory:-0}" -ge 33554432 ] && [ "$memory" -lt 268435456 ] &&
+	[ "${io:-0}" -ge 4194304 ] && [ "$io" -lt 67108864 ] ||
+	fail "stats: wanted the probe's 0.6 s, its 32 MiB and its 4 MiB" "$first"
+out=$(timeout 30 "$hull" exec dtest /probe spin 400 fill /srv/filled 4 2>&1)
+cases=$((cases + 1))
+second=$(timeout 20 "$hull" stats dtest 2>&1)
+[ "$(figure cpu "$second")" -ge $((${cpu:-0} + 390000)) ] &&
+	[ "$(figure io "$second")" -ge $((${io:-0} + 4194304)) ] ||
+	fail "stats: an ended exec's cpu and io, wanted 0.4 s and 4 MiB more" "$out
+$first
+$second"
+timeout 10 "$hull" kill -s TERM dtest > /dev/null 2>&1
+wait "$runner"
+cases=$((cases + 1))
+out=$(timeout 20 "$hull" stats dtest 2>&1)
+[ $? = 1 ] && printf '%s\n' "$out" | grep -q 'not running\|no such machine' ||
+	fail "stats of an ended container did not say so" "$out"
 # A fresh import retires the tree's others, but not one a container
 # uses: a machine kept running on the first state holds it.
 printf '(machine (source "dir:./rootfs") (mutable overlay) (backend docker) (hostname "dtest-keep") %s)\n' \

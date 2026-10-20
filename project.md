@@ -692,7 +692,7 @@ Open:
   - **Sabotage:** breaking each of these failed a named case: retiring at all, the label, keeping the fresh import, and the real path. Removing with `force=true` first passed. The daemon refuses even a forced removal of an image a running container uses, so that case could not tell. An image with a second name is what force would take, and the case for it fails.
 - **Untested:** a tree that changes between the two readings, which a test cannot time on purpose.
 
-**`make check-docker`**, not part of `make check`, runs `test/docker_test.sh` against the daemon the account can reach. It uses `alpine:latest` and does not pull it. There are 55 cases:
+**`make check-docker`**, not part of `make check`, runs `test/docker_test.sh` against the daemon the account can reach. It uses `alpine:latest` and does not pull it. There are 58 cases:
 
 - output on its own stream, the exit status, env, workdir, hostname and the user's uid;
 - volumes, a write through one that lands as the user's file, and a read-only root;
@@ -701,6 +701,7 @@ Open:
 - a port reached from the host on the machine's address, and not on 127.0.0.1; and a udp port, to the probe's echo, each of two clients answered on its own and datagrams of 1, 1400 and 65,000 bytes whole;
 - `hull ssh`, alpine's login shell on a terminal with the frontend's TERM;
 - a dir source as an overlay: imported under the digest the test works out with `sha256sum`, run as the user, writing into the container and not the directory, imported once for two runs and again once changed, labelled with its tree's path, an older import kept while a machine uses it and retired once nothing does, and one with a second name kept; in place, refused;
+- `hull stats`: the probe's CPU, memory and synced writes, an ended exec's CPU and writes added, and an ended container refused;
 - `hull proxy-ssh` reaching the container's undeclared port 22 both ways, and refused while nothing listens;
 - `hull gc`: an import whose tree was deleted removed, one made by docker with no label removed, one a running machine uses kept with the daemon's reason and removed once it has stopped, and a live tree's left alone, each checked against what the daemon then holds;
 - a missing image and a missing command;
@@ -932,7 +933,10 @@ Open:
 - **What is summed:** the processes alive now, each counted with the children it has reaped, since the kernel adds a reaped child's CPU and io to its parent's. That counts every process that ever ran once, so long as whatever reaped it is counted too. `engine/usage.c` reads them.
 - **chroot:** every process in the machine's pid namespace, found by `/proc/<pid>/ns/pid`. An exec's helper is outside it, so what a helper and its command spent is added from `wait4()`'s rusage once the helper is reaped, its blocks as 512 bytes, which is how `/proc` counts io.
 - **qemu:** the qemu process, which holds the guest's memory and runs its CPUs, and its passt, found by the pid file passt's parent writes before it exits. passt is not the engine's child, so its pid is used only while `/proc/<pid>/comm` still names a passt. So a vm's figures are its whole cost to the host, the guest kernel's included, rather than what its processes use inside. B.3's `(sub … (what stats))` would give the guest's own view, and is not written.
-- **docker** gives none yet: `stats` is refused as an engine that does not measure a machine. `docker stats` would be its source.
+- **docker,** since 2026-10-20: CPU and storage io from docker's cgroup figures, the one-shot `stats` call's `cpu_stats` and `io_service_bytes_recursive`, which count every process the container ran. An exec is reaped by containerd's shim, outside the container, so `/proc` would lose what an ended one spent, as chroot's helper would without its `wait4()`. Memory is still Pss summed from `/proc` over the container's pid namespace, from its `State.Pid`, since a cgroup's usage counts the page cache. The container's processes are the user's (§4.9), so `/proc` is theirs to read.
+  - **A cgroup counts io when it reaches storage,** not when it is written, as `/proc`'s `write_bytes` does, and that can be half a minute later. So the probe's `fill` now syncs what it writes, and the figure is the same either way: written to storage.
+  - **Measured** in `test/docker_test.sh`, as in cli's: the probe's 0.6 s, 32 MiB and 4 MiB, then 0.4 s and 4 MiB more from an ended exec, and a container that has ended refused.
+  - **Sabotage,** baseline first: breaking each of these failed a named case: CPU from `/proc`, io from `/proc`, which both lose the ended exec, memory left at nothing, and the probe not syncing, which left docker's io short of the 4 MiB and so bore out the line above. Not caught: the io read running on into the next array, of operations rather than bytes, which adds a few dozen to a figure the case bounds loosely.
 - **Not yet:** a rate. `hull stats` is one reading, and a CPU percentage needs two.
 - **Measured** in `test/cli_test.sh` on chroot and `test/qemu_test.sh` on vm (§4.11): CPU a probe uses by its own clock, so a loaded host makes it slower and not smaller, memory it holds, and bytes it writes.
 - **Sabotage,** baseline first, in scratch copies. On chroot, breaking each of these failed a named case: a reaped child's CPU, `write_bytes`, Pss in bytes, the whole namespace rather than the init, an ended exec's CPU and its io, and the core's keys. On vm: qemu counted at all, `write_bytes` and Pss. A reaped child's CPU passes on vm and cannot fail there: the guest's children are reaped inside qemu, and qemu reaps none of its own.

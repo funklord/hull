@@ -55,7 +55,7 @@
  *   spin MS     use MS milliseconds of CPU time, by its own clock
  *   reap MS     spin MS in a child, and reap it
  *   hold N      take N MiB and touch every page, held until it exits
- *   fill PATH N write N MiB to PATH
+ *   fill PATH N write N MiB to PATH, and sync it
  */
 
 #define _GNU_SOURCE
@@ -540,6 +540,10 @@ int main(int argc, char **argv)
 			memset(block, 'f', sizeof block);
 			while (fd >= 0 && done < n && write(fd, block, sizeof block) == (ssize_t)sizeof block)
 				done++;
+			/* Synced, so that it has reached storage, which a cgroup
+			 * counts only once it has. */
+			if (fd >= 0 && fsync(fd) != 0)
+				done = -1;
 			printf("filled=%ld\n", done);
 			if (fd >= 0)
 				close(fd);
