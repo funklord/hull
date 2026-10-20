@@ -1111,6 +1111,106 @@ static hull_status docker_destroy(hull_core *core, hull_machine *m, hull_error *
 	return HULL_OK;
 }
 
+/* --- adoption ------------------------------------------------------------ */
+
+/* What a core that comes after needs to find the container again: its id. */
+static hull_status docker_persist(hull_core *core, hull_machine *m, hull_buf *out,
+                                  hull_error *error)
+{
+	(void)core;
+	(void)error;
+	out->data = (const uint8_t *)m->id;
+	out->len  = strlen(m->id);
+	return HULL_OK;
+}
+
+/*
+ * A container a core that went left running, taken back by its id: one of
+ * hull's, by its name, or it is not taken. Its output comes from its logs,
+ * followed, rather than from an attach: the logs begin at its start, so
+ * `hull logs` loses nothing the old core had, and following them ends when
+ * the container does, or at once for one that already has, where an attach
+ * to an ended container waits for good. That end is the reader's, as for
+ * a machine this core started. HTTP/1.0, so that the stream is not
+ * chunked.
+ */
+static hull_status docker_adopt(hull_core *core, hull_buf state, hull_machine **out,
+                                hull_error *error)
+{
+	hull_machine *m;
+	char          path[160];
+	char          head[512];
+	char          request[256];
+	char          name[128];
+	char         *answer = NULL;
+	size_t        n = 0u;
+	int           status = 0;
+
+	if (state.len == 0u || state.len >= sizeof m->id)
+		return fail(error, HULL_ERR_UNSUPPORTED, "the state is not a container id");
+	for (size_t i = 0u; i < state.len; i++)
+		if (!((state.data[i] >= '0' && state.data[i] <= '9') ||
+		      (state.data[i] >= 'a' && state.data[i] <= 'f')))
+			return fail(error, HULL_ERR_UNSUPPORTED, "the state is not a container id");
+	m = calloc(1u, sizeof *m);
+	if (m == NULL)
+		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+	m->core   = core;
+	m->attach = -1;
+	pthread_mutex_init(&m->lock, NULL);
+	pthread_cond_init(&m->done_cond, NULL);
+	memcpy(m->id, state.data, state.len);
+
+	snprintf(path, sizeof path, "/containers/%s/json", m->id);
+	if (call("GET", path, NULL, &status, &answer) != 0) {
+		release(m);
+		snprintf(create_detail, sizeof create_detail,
+		         "the Docker daemon at %s cannot be reached", socket_path());
+		return fail(error, HULL_ERR_RUNTIME, create_detail);
+	}
+	if (status != 200 || !json_string(answer, "Name", name, sizeof name) ||
+	    strncmp(name, "/hull-", 6u) != 0) {
+		free(answer);
+		release(m);
+		return fail(error, HULL_ERR_GONE, status == 200 ? "the container is not hull's" :
+		                                                   "the container is gone");
+	}
+	free(answer);
+	snprintf(m->name, sizeof m->name, "%.95s", name + 1);
+
+	m->attach = dial();
+	snprintf(request, sizeof request,
+	         "GET " API "/containers/%s/logs?follow=1&stdout=1&stderr=1 HTTP/1.0\r\n"
+	         "Host: docker\r\n\r\n", m->id);
+	if (m->attach < 0 || send_all(m->attach, request, strlen(request)) != 0) {
+		if (m->attach >= 0)
+			close(m->attach);
+		release(m);
+		return fail(error, HULL_ERR_RUNTIME, "the logs request failed");
+	}
+	while (n + 1u < sizeof head && read(m->attach, head + n, 1u) == 1) {
+		n++;
+		if (n >= 4u && memcmp(head + n - 4u, "\r\n\r\n", 4u) == 0)
+			break;
+	}
+	head[n] = '\0';
+	if (sscanf(head, "HTTP/1.%*d %d", &status) != 1 || status != 200) {
+		close(m->attach);
+		release(m);
+		snprintf(create_detail, sizeof create_detail, "logs: HTTP %d", status);
+		return fail(error, HULL_ERR_RUNTIME, create_detail);
+	}
+	if (pthread_create(&m->reader, NULL, read_workload, m) != 0) {
+		close(m->attach);
+		release(m);
+		return fail(error, HULL_ERR_INTERNAL, "the reader thread could not start");
+	}
+	m->started = 1;
+	*out = m;
+	host->on_state(core, m, "running");
+	return HULL_OK;
+}
+
 /* --- exec --------------------------------------------------------------- */
 
 /*
@@ -1538,7 +1638,7 @@ static const hull_cap_entry entries[] = {
 	{ "writeback.none",     HULL_SUP_NATIVE,   NULL, NULL },
 	{ "on_disconnect.stop", HULL_SUP_NATIVE,   NULL, NULL },
 	{ "on_disconnect.keep", HULL_SUP_NATIVE,
-	  "kept while the core runs; adopting it after the core restarts is not written", NULL },
+	  "kept, and taken back by a core that comes after one that went", NULL },
 
 	{ NULL,                 HULL_SUP_NATIVE,   NULL, NULL },
 };
@@ -1736,6 +1836,8 @@ static const hull_engine_ops ops = {
 	.start       = docker_start,
 	.stop        = docker_stop,
 	.destroy     = docker_destroy,
+	.adopt       = docker_adopt,
+	.persist     = docker_persist,
 	.exec         = docker_exec,
 	.stream_write = docker_stream_write,
 	.stream_eof   = docker_stream_eof,

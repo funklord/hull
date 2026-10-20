@@ -27,6 +27,7 @@
 #define _GNU_SOURCE
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <libgen.h>
 #include <poll.h>
@@ -373,14 +374,35 @@ static void start_core(void)
 		waitpid(child, NULL, 0);
 }
 
-/* A connection to the core, said hello on. With `start`, a core is started
- * when none answers. Returns 0, or -1 having said why. */
+/* Whether a core that went left machines for the next to take back:
+ * hull/machines/ holds one. Then a command that starts no core of its own
+ * starts one, as they are the core's to hold, not this command's. */
+static int kept_machines(void)
+{
+	char           dir[4096];
+	DIR           *kept;
+	struct dirent *entry;
+	int            found = 0;
+
+	if (!runtime_path(dir, sizeof dir, "machines") || (kept = opendir(dir)) == NULL)
+		return 0;
+	/* An id has no dot, as neither `.`, `..` nor a half-written ID.new. */
+	while (!found && (entry = readdir(kept)) != NULL)
+		found = strchr(entry->d_name, '.') == NULL;
+	closedir(kept);
+	return found;
+}
+
+/* A connection to the core, said hello on. With `start`, or with machines
+ * kept for one, a core is started when none answers. Returns 0, or -1
+ * having said why. */
 static int connect_core(hull_wire *wire, int start)
 {
 	hull_msg       hello = { 0 };
 	hull_sexpr_doc body;
 	int            fd = dial_core();
 
+	start = start || kept_machines();
 	if (fd < 0 && start && getenv("XDG_RUNTIME_DIR") != NULL) {
 		start_core();
 		for (int tries = 0; fd < 0 && tries < 100; tries++) {
@@ -660,13 +682,14 @@ static int run(options *o, const hull_registry *registry, const char *name)
 
 /* --- the other commands -------------------------------------------------- */
 
-/* Whether a core answers, without starting one. */
+/* Whether a core answers, without starting one; or would, holding the
+ * machines a core that went kept for it. */
 static int core_running(void)
 {
 	int fd = dial_core();
 
 	if (fd < 0)
-		return 0;
+		return kept_machines();
 	close(fd);
 	return 1;
 }

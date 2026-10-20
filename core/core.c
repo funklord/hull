@@ -29,6 +29,7 @@
 
 #define _GNU_SOURCE
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -114,6 +115,7 @@ struct slot {
 	hull_machine      *handle;
 	char               state[16];
 	int                keep;        /* (on_disconnect keep) */
+	int                kept;        /* hull/machines/ID is written for it */
 	client            *owner;       /* the frontend that ran it */
 	int                exited;
 	int                code;
@@ -743,11 +745,14 @@ static void stop_machine(slot *s, int timeout_ms)
 	pthread_detach(thread);
 }
 
+static void forget_machine(slot *s);
+
 /* The machine has ended: tell whoever is waiting, and let the engine go. */
 static void machine_exited(slot *s, int code, int signal)
 {
 	hull_error error = { .struct_size = sizeof error };
 
+	forget_machine(s);
 	s->exited = 1;
 	s->code   = code;
 	s->signal = signal;
@@ -943,6 +948,185 @@ static uint8_t *with_address(const hull_buf *plan, const char *address, size_t *
 	return out;
 }
 
+/* --- machines that outlive the core -------------------------------------- */
+
+/*
+ * hull/machines/ID, for each machine under (on_disconnect keep) whose
+ * engine can take one back: what a core that comes after this one needs,
+ * should this one go without stopping it, killed or crashed.
+ *
+ *     (4:kept (7:machine ID) (6:engine NAME) (5:class CLASS) (5:state S))
+ *
+ * canonical, S the engine's persist(). It is written whole, by a rename,
+ * once the machine has started, and removed once it has exited. A core
+ * reads them all as it starts, holding the lock, and adopts each machine;
+ * one its engine says is gone, or is not one, is forgotten, and one it
+ * could not reach for now is left for the next core.
+ */
+#define KEPT_LIMIT 65536u
+
+static char kept_dir[4200];
+
+static int kept_path(const char *id, char *out, size_t cap, const char *suffix)
+{
+	int n = snprintf(out, cap, "%s/%s%s", kept_dir, id, suffix);
+
+	return kept_dir[0] != '\0' && n > 0 && (size_t)n < cap;
+}
+
+static void keep_machine(slot *s)
+{
+	hull_msg   m = { 0 };
+	hull_buf   state = { 0 };
+	hull_error error = { .struct_size = sizeof error };
+	char       path[4300];
+	char       fresh[4300];
+	int        fd;
+
+	if (!s->keep || s->engine->ops->adopt == NULL || s->engine->ops->persist == NULL ||
+	    !kept_path(s->id, path, sizeof path, "") || !kept_path(s->id, fresh, sizeof fresh, ".new") ||
+	    s->engine->ops->persist(&s->core, s->handle, &state, &error) != HULL_OK)
+		return;
+	hull_msg_raw(&m, "(4:kept(7:machine");
+	hull_msg_text(&m, s->id);
+	hull_msg_raw(&m, ")(6:engine");
+	hull_msg_text(&m, s->engine->caps->engine_name);
+	hull_msg_raw(&m, ")(5:class");
+	hull_msg_text(&m, s->class_name);
+	hull_msg_raw(&m, ")(5:state");
+	hull_msg_atom(&m, state.data, state.len);
+	hull_msg_raw(&m, "))");
+	fd = m.failed ? -1 : open(fresh, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+	if (fd >= 0 && write(fd, m.data, m.length) == (ssize_t)m.length && close(fd) == 0 &&
+	    rename(fresh, path) == 0) {
+		s->kept = 1;
+	} else {
+		if (fd >= 0)
+			close(fd);
+		unlink(fresh);
+		fprintf(stderr, "hull core: %s cannot be kept for the next core\n", path);
+	}
+	hull_msg_free(&m);
+}
+
+static void forget_machine(slot *s)
+{
+	char path[4300];
+
+	if (s->kept && kept_path(s->id, path, sizeof path, ""))
+		unlink(path);
+	s->kept = 0;
+}
+
+/* The engine named, if this core has it and it can adopt. */
+static const hull_engine *adopter(const char *name)
+{
+	for (uint32_t i = 0u; i < registry.count; i++)
+		if (strcmp(registry.engines[i]->caps->engine_name, name) == 0)
+			return registry.engines[i]->ops->adopt != NULL ? registry.engines[i] : NULL;
+	return NULL;
+}
+
+/* Take back the machine kept as `id`: 1 if it is held now. */
+static int adopt_one(const char *id)
+{
+	static uint8_t     data[KEPT_LIMIT];
+	char               path[4300];
+	char               engine_name[32];
+	char               class_name[sizeof machines[0].class_name];
+	char               named[64];
+	const char        *why = NULL;
+	const hull_engine *engine = NULL;
+	hull_sexpr_doc     doc;
+	hull_sexpr_form    value;
+	hull_error         error = { .struct_size = sizeof error };
+	hull_buf           state;
+	hull_status        status;
+	slot              *s = NULL;
+	ssize_t            n;
+	int                fd;
+
+	if (!kept_path(id, path, sizeof path, ""))
+		return 0;
+	fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	n  = fd >= 0 ? read(fd, data, sizeof data) : -1;
+	if (fd >= 0)
+		close(fd);
+	if (n <= 0 || (size_t)n == sizeof data ||
+	    hull_sexpr_open(&doc, data, (size_t)n, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
+	    !hull_msg_is(&doc, "kept") || !hull_msg_find(&doc, "machine", &value) ||
+	    !hull_msg_string(&doc, &value, named, sizeof named) || strcmp(named, id) != 0 ||
+	    !hull_msg_find(&doc, "engine", &value) ||
+	    !hull_msg_string(&doc, &value, engine_name, sizeof engine_name) ||
+	    !hull_msg_find(&doc, "class", &value) ||
+	    !hull_msg_string(&doc, &value, class_name, sizeof class_name) ||
+	    !hull_msg_find(&doc, "state", &value) || value.kind != HULL_SEXPR_ATOM)
+		why = "it is not what a core writes";
+	else if ((engine = adopter(engine_name)) == NULL)
+		why = "its engine cannot take it back";
+	for (unsigned i = 0u; why == NULL && i < MAX_MACHINES && s == NULL; i++)
+		if (!machines[i].used)
+			s = &machines[i];
+	if (why == NULL && s == NULL) {
+		fprintf(stderr, "hull core: %s: the core holds as many machines as it can\n", id);
+		return 0;
+	}
+	if (why != NULL) {
+		fprintf(stderr, "hull core: machine %s is forgotten: %s\n", id, why);
+		unlink(path);
+		return 0;
+	}
+	state.data = data + value.content;
+	state.len  = value.content_length;
+	s->used            = 1;
+	s->generation++;
+	s->engine          = engine;
+	s->core.slot       = s;
+	s->core.generation = s->generation;
+	s->keep            = 1;
+	s->kept            = 1;
+	snprintf(s->id, sizeof s->id, "%.63s", id);  /* a label, so whole */
+	address_of(id, s->address);
+	snprintf(s->class_name, sizeof s->class_name, "%s", class_name);
+	snprintf(s->state, sizeof s->state, "adopting");
+	status = engine->ops->adopt(&s->core, state, &s->handle, &error);
+	if (status == HULL_OK) {
+		fprintf(stderr, "hull core: machine %s is taken back\n", id);
+		return 1;
+	}
+	why = error.detail != NULL ? error.detail : "adopt failed";
+	s->used = 0;
+	s->kept = 0;
+	s->handle = NULL;
+	if (status == HULL_ERR_GONE || status == HULL_ERR_UNSUPPORTED) {
+		fprintf(stderr, "hull core: machine %s is forgotten: %s\n", id, why);
+		unlink(path);
+	} else {
+		fprintf(stderr, "hull core: machine %s is left for the next core: %s\n", id, why);
+	}
+	return 0;
+}
+
+static void adopt_kept(void)
+{
+	DIR           *dir = opendir(kept_dir);
+	struct dirent *entry;
+
+	/* An id is a label, which neither `.`, `..` nor a half-written
+	 * ID.new is; that is a core's that went while writing, and this one
+	 * holds the lock, so it is removed. */
+	while (dir != NULL && (entry = readdir(dir)) != NULL) {
+		size_t n = strlen(entry->d_name);
+
+		if (is_label(entry->d_name))
+			adopt_one(entry->d_name);
+		else if (n > 4u && strcmp(entry->d_name + n - 4u, ".new") == 0)
+			unlinkat(dirfd(dir), entry->d_name, 0);
+	}
+	if (dir != NULL)
+		closedir(dir);
+}
+
 static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
 	hull_sexpr_form    value;
@@ -1102,6 +1286,7 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		s->follower_count = 0u;
 		return;
 	}
+	keep_machine(s);
 	send_started(c, ch, s);
 }
 
@@ -1879,6 +2064,11 @@ int hull_core_run(const char *host_arch)
 		fprintf(stderr, "hull core: a built-in engine is refused: %s\n", reason);
 		return 1;
 	}
+	snprintf(kept_dir, sizeof kept_dir, "%s/machines", dir);
+	if (mkdir(kept_dir, 0700) != 0 && errno != EEXIST)
+		kept_dir[0] = '\0';  /* nothing is kept, and nothing taken back */
+	else
+		adopt_kept();
 
 	memset(&action, 0, sizeof action);
 	action.sa_handler = end;

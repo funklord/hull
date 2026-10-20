@@ -900,6 +900,10 @@ else
 	[ -z "$left" ] || fail "a machine outlived its core" "$left"
 	wait "$keeper" 2>/dev/null
 fi
+# Nor is it kept for the next core, chroot having no adopt().
+cases=$((cases + 1))
+[ ! -e "$XDG_RUNTIME_DIR/hull/machines/kept" ] ||
+	fail "a chroot machine was kept for the next core" "$(cat "$XDG_RUNTIME_DIR/hull/machines/kept")"
 
 # A core told to go stops its machines first, and their frontends hear
 # how each ended: the probe's 143 for the TERM, not "the core went away".
@@ -960,6 +964,33 @@ while [ -S "$XDG_RUNTIME_DIR/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
 	sleep 0.25
 done
 [ ! -S "$XDG_RUNTIME_DIR/hull/core.sock" ] || fail "the core did not leave when idle" ""
+
+# What a core that went kept for the next, which `hull ps` starts, though
+# it starts none otherwise. No daemon answers here, so a docker machine is
+# left for a later core; a file no core wrote, one whose name is not its
+# machine's, and a machine of an engine that cannot adopt are forgotten.
+# core.log says which.
+kept=$XDG_RUNTIME_DIR/hull/machines
+printf 'not a kept machine' > "$kept/junk"
+printf '(4:kept(7:machine5:other)(6:engine6:docker)(5:class2:ns)(5:state2:ab))' > "$kept/named"
+printf '(4:kept(7:machine6:chroot)(6:engine6:chroot)(5:class2:ns)(5:state1:x))' > "$kept/chroot"
+printf '(4:kept(7:machine6:docker)(6:engine6:docker)(5:class2:ns)(5:state4:abcd))' > "$kept/docker"
+printf '(4:kept' > "$kept/half.new"
+expect 0 '^ID ' "$hull" ps
+cases=$((cases + 1))
+said=$(cat "$XDG_RUNTIME_DIR/hull/core.log")
+printf '%s\n' "$said" | grep -q '^hull core: machine junk is forgotten: it is not what a core writes$' &&
+	printf '%s\n' "$said" | grep -q '^hull core: machine named is forgotten: it is not what a core writes$' &&
+	printf '%s\n' "$said" | grep -q '^hull core: machine chroot is forgotten: its engine cannot take it back$' &&
+	printf '%s\n' "$said" | grep -q '^hull core: machine docker is left for the next core: the Docker daemon at .* cannot be reached$' &&
+	[ "$(ls "$kept")" = docker ] ||
+	fail "the kept machines were not read as they are" "$(ls "$kept"); core.log: $said"
+rm -f "$kept/docker"
+tries=0
+while [ -S "$XDG_RUNTIME_DIR/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
 
 printf 'cli: %u cases, %u failed\n' "$cases" "$failures"
 [ "$failures" -eq 0 ]

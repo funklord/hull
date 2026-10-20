@@ -502,6 +502,93 @@ printf '(machine (source "dir:./rootfs") (backend docker) (hostname "dtest") (co
 	> "$root/dirin.conf"
 expect 125 'source\.dir\.direct: rejected' dirin
 
+# A machine kept, under a core killed outright, is the next core's: one
+# that `hull ps` starts, though it starts none otherwise, as the kept
+# machine is a core's to hold. It has the log from the machine's start,
+# runs a command, and has its exit; then the file and the container go.
+# The workload waits for the file that command makes, 30 s at most.
+kept=$XDG_RUNTIME_DIR/hull/machines
+printf '(machine (source "alpine:latest") (backend docker) (hostname "dtest-adopt") %s %s)\n' \
+	'(command "sh" "-c" "echo before; i=0; while [ ! -e /tmp/go ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done; echo after; exit 5")' \
+	'(on_disconnect keep)' > "$root/adopt.conf"
+# keep_until_kept CONF OUT: run CONF in the background, its frontend's
+# pid in $runner, until OUT says `before`, 10 s at most.
+keep_until_kept() {
+	rm -f "$2"
+	(cd / && exec timeout -k 2 60 "$hull" run -f "$1" > "$2" 2>&1) &
+	runner=$!
+	tries=0
+	until grep -q '^before$' "$2" 2>/dev/null || [ "$tries" -ge 40 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+}
+# kill_core: SIGKILL to the core that holds the lock, and its frontend
+# gone with it.
+kill_core() {
+	kill -KILL "$(head -n 1 "$XDG_RUNTIME_DIR/hull/core.lock")" 2> /dev/null
+	wait "$runner"
+}
+keep_until_kept "$root/adopt.conf" "$root/adopt.out"
+cases=$((cases + 1))
+[ -f "$kept/dtest-adopt" ] || fail "a kept machine has no file for the next core" "$(ls -la "$kept")"
+kill_core
+cases=$((cases + 1))
+out=$(timeout 30 "$hull" ps 2>&1)
+printf '%s\n' "$out" | grep -q '^dtest-adopt .*running$' &&
+	grep -q '^hull core: machine dtest-adopt is taken back$' "$XDG_RUNTIME_DIR/hull/core.log" ||
+	fail "the next core did not take the kept machine back" "$out
+$(cat "$XDG_RUNTIME_DIR/hull/core.log")"
+cases=$((cases + 1))
+out=$(timeout 30 "$hull" exec dtest-adopt touch /tmp/go 2>&1)
+got=$?
+logs=$(timeout 30 "$hull" logs -f dtest-adopt 2>&1)
+[ "$got" = 0 ] && [ "$logs" = "before
+after" ] || fail "a taken-back machine's exec exited $got, its log '$logs'" "$out"
+cases=$((cases + 1))
+out=$(timeout 30 "$hull" attach dtest-adopt 2>&1)
+got=$?
+[ "$got" = 5 ] || fail "a taken-back machine's exit was $got, wanted 5" "$out"
+cases=$((cases + 1))
+left=$(timeout 10 docker ps -a --filter name=hull-dtest-adopt- --format '{{.Names}}')
+[ ! -e "$kept/dtest-adopt" ] && [ -z "$left" ] ||
+	fail "a taken-back machine's file or container is left" "$(ls "$kept") $left"
+# One whose container went while no core held it is forgotten, and said
+# to be; one stopped is no longer kept.
+keep_until_kept "$root/adopt.conf" "$root/adopt.out"
+kill_core
+timeout 10 docker rm -f "$(timeout 10 docker ps -aq --filter name=hull-dtest-adopt-)" > /dev/null 2>&1
+cases=$((cases + 1))
+out=$(timeout 30 "$hull" ps 2>&1)
+! printf '%s\n' "$out" | grep -q '^dtest-adopt ' && [ ! -e "$kept/dtest-adopt" ] &&
+	grep -q '^hull core: machine dtest-adopt is forgotten: the container is gone$' \
+		"$XDG_RUNTIME_DIR/hull/core.log" ||
+	fail "a kept machine whose container went was not forgotten" "$out
+$(cat "$XDG_RUNTIME_DIR/hull/core.log")"
+# Nor is a container that is not hull's taken, whatever a file says: read
+# by a core that starts once the last has left, 10 s at most.
+tries=0
+while [ -S "$XDG_RUNTIME_DIR/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+notours=$(timeout 10 docker create --name dtestx-notours alpine:latest true 2>&1)
+printf '(4:kept(7:machine7:notours)(6:engine6:docker)(5:class2:ns)(5:state%d:%s))' \
+	"${#notours}" "$notours" > "$kept/notours"
+cases=$((cases + 1))
+out=$(timeout 30 "$hull" ps 2>&1)
+! printf '%s\n' "$out" | grep -q '^notours ' && [ ! -e "$kept/notours" ] &&
+	grep -q '^hull core: machine notours is forgotten: the container is not hull.s$' \
+		"$XDG_RUNTIME_DIR/hull/core.log" ||
+	fail "a container not hull's was taken back" "$notours; $out
+$(cat "$XDG_RUNTIME_DIR/hull/core.log")"
+timeout 10 docker rm -f dtestx-notours > /dev/null 2>&1
+keep_until_kept "$root/adopt.conf" "$root/adopt.out"
+timeout 30 "$hull" stop --timeout 1 dtest-adopt > /dev/null 2>&1
+wait "$runner"
+cases=$((cases + 1))
+[ ! -e "$kept/dtest-adopt" ] || fail "a kept machine stopped is still kept" "$(cat "$kept/dtest-adopt")"
+
 # What cannot be created is 125, and says why. A command that is not
 # there is docker's init failing to exec it, 127, as a shell would say.
 printf '%s\n' '(machine (source "hull-no-such-image:0") (backend docker) (hostname "dtest") (command "x"))' \
