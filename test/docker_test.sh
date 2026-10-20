@@ -589,6 +589,33 @@ wait "$runner"
 cases=$((cases + 1))
 [ ! -e "$kept/dtest-adopt" ] || fail "a kept machine stopped is still kept" "$(cat "$kept/dtest-adopt")"
 
+# Secrets (J.3): read-only at /run/hull/secrets, as the user the container
+# runs as, and one in the environment. The core that writes them needs a
+# tmpfs, so it is one of their own in a runtime directory under /dev/shm,
+# removed at the end once that core has left.
+shm=$(mktemp -d /dev/shm/hull-docker-test.XXXXXX)
+printf 'from a file\n' > "$root/pw.txt"
+printf '(machine (source "alpine:latest") (backend docker) (hostname "dtest-secret") %s %s)\n' \
+	'(command "sh" "-c" "cat /run/hull/secrets/pw; echo env=$made; stat -c %a /run/hull/secrets/pw; touch /run/hull/secrets/new 2>&1 || echo refused")' \
+	'(secrets (pw (source "file:pw.txt")) (made (source "exec:printf made")  (expose env)))' \
+	> "$root/secret.conf"
+cases=$((cases + 1))
+out=$(cd / && XDG_RUNTIME_DIR=$shm timeout 60 "$hull" run -f "$root/secret.conf" 2>&1)
+got=$?
+[ "$got" = 0 ] && printf '%s\n' "$out" | grep -q '^from a file$' &&
+	printf '%s\n' "$out" | grep -q '^env=made$' && printf '%s\n' "$out" | grep -q '^400$' &&
+	printf '%s\n' "$out" | grep -q '^refused$' ||
+	fail "a docker machine's secrets exited $got" "$out"
+tries=0
+while [ -S "$shm/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+cases=$((cases + 1))
+left=$(ls -A "$shm/hull/secrets" 2>&1)
+[ -z "$left" ] || fail "a docker machine's secrets were left" "$left"
+rm -rf "${shm:?}"
+
 # What cannot be created is 125, and says why. A command that is not
 # there is docker's init failing to exec it, 127, as a shell would say.
 printf '%s\n' '(machine (source "hull-no-such-image:0") (backend docker) (hostname "dtest") (command "x"))' \

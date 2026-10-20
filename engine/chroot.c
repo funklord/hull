@@ -71,6 +71,8 @@ struct hull_machine {
 	char            *volume_guest[MAX_VOLUMES];
 	int              volume_readonly[MAX_VOLUMES];
 	unsigned         volume_count;
+	char            *secrets;    /* the core's directory of them, or NULL */
+	unsigned         env_count;  /* envp's, while secrets are added to it */
 
 	pid_t            pid;        /* the machine's init */
 	int              out;        /* the workload's stdout and stderr, read ends */
@@ -96,6 +98,7 @@ static void release(hull_machine *m)
 	free(m->root);
 	free(m->workdir);
 	free(m->hostname);
+	free(m->secrets);
 	for (unsigned i = 0u; m->argv[i] != NULL; i++)
 		free(m->argv[i]);
 	for (unsigned i = 0u; m->envp[i] != NULL; i++)
@@ -117,6 +120,16 @@ static hull_status fail(hull_error *error, hull_status code, const char *detail)
 		error->runtime_detail = NULL;
 	}
 	return code;
+}
+
+/* An exposed secret's `NAME=VALUE`, after the env's own. */
+static void add_exposed(void *context, const char *pair)
+{
+	hull_machine *m = context;
+
+	if (m->env_count < MAX_ENV && (m->envp[m->env_count] = strdup(pair)) == NULL)
+		m->env_count = MAX_ENV;  /* refused as one too many, which is near enough */
+	m->env_count++;
 }
 
 /* The plan's machine, read into `m`. Returns a reason, or NULL. */
@@ -216,6 +229,21 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	source     = hull_access_value(doc, &machine, "mutable");
 	m->overlay = source != NULL && strcmp(source, "overlay") == 0 && !m->readonly_root;
 	free(source);
+
+	/* The secrets the core wrote (J.3), and those to be in the env. */
+	if (hull_access_find(doc, &machine, "secrets", &entry)) {
+		hull_sexpr_form top;
+
+		hull_sexpr_first(doc, &top);
+		m->secrets = hull_access_value(doc, &top, "secrets");
+		if (m->secrets == NULL)
+			return "the plan's secrets were given no directory";
+		while (m->envp[n] != NULL)
+			n++;
+		m->env_count = n;
+		if (hull_access_exposed(doc, &machine, add_exposed, m) != 0 || m->env_count > MAX_ENV)
+			return "a secret to expose cannot be read, holds a NUL, or is one env name too many";
+	}
 	return NULL;
 }
 
@@ -359,6 +387,7 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int out, int e
 	char             map[64];
 	char             step[320];
 	int              volumes[MAX_VOLUMES];
+	int              secrets = -1;
 	int              null = open("/dev/null", O_RDONLY | O_CLOEXEC);
 	int              status = 0;
 	pid_t            workload;
@@ -407,6 +436,16 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int out, int e
 		                  sizeof readonly) != 0)
 			child_fail(report, step);
 	}
+	if (m->secrets != NULL) {
+		struct mount_attr readonly = { .attr_set = MOUNT_ATTR_RDONLY |
+		                                           MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV |
+		                                           MOUNT_ATTR_NOEXEC };
+
+		secrets = open_tree(AT_FDCWD, m->secrets, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+		if (secrets < 0 ||
+		    mount_setattr(secrets, "", AT_EMPTY_PATH, &readonly, sizeof readonly) != 0)
+			child_fail(report, "the secrets");
+	}
 	if (m->hostname != NULL && sethostname(m->hostname, strlen(m->hostname)) != 0)
 		child_fail(report, "sethostname");
 	if (m->overlay)
@@ -419,6 +458,17 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int out, int e
 		if (move_mount(volumes[i], "", AT_FDCWD, m->volume_guest[i],
 		               MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_SYMLINKS) != 0)
 			child_fail(report, step);
+	}
+	/* The secrets at /run/hull/secrets, J.3's place, on a tmpfs at /run:
+	 * the dir's /run, which FHS has emptied at every boot, is hidden, and
+	 * nothing is created in the user's dir. A dir with no /run cannot
+	 * have them. */
+	if (secrets >= 0) {
+		if (mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755,size=1m") != 0)
+			child_fail(report, "the secrets: a tmpfs at /run, which the dir must have");
+		if (mkdir("/run/hull", 0755) != 0 || mkdir("/run/hull/secrets", 0700) != 0 ||
+		    move_mount(secrets, "", AT_FDCWD, "/run/hull/secrets", MOVE_MOUNT_F_EMPTY_PATH) != 0)
+			child_fail(report, "the secrets");
 	}
 	/* This namespace's processes, where the dir has room for them: nothing
 	 * is created in the user's dir. */
@@ -1183,6 +1233,9 @@ static const hull_cap_entry entries[] = {
 	{ "hostname",               HULL_SUP_NATIVE,   NULL, NULL },
 	{ "volumes",                HULL_SUP_NATIVE,
 	  "the guest path must exist in the dir; it is not created", NULL },
+	{ "secrets",                HULL_SUP_NATIVE,
+	  "on a tmpfs the machine mounts at /run, which the dir must have; one exposed is "
+	  "in the env of the workload and of every exec", NULL },
 	{ "security.readonly_root", HULL_SUP_NATIVE,   NULL, NULL },
 	{ "security.no_new_privs",  HULL_SUP_NATIVE,   NULL, NULL },
 	{ "on_disconnect.stop",     HULL_SUP_NATIVE,   NULL, NULL },

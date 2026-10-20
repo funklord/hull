@@ -79,13 +79,32 @@ struct client_hello {
 // 4.7), `(plan (base ...)? (class ...) (machine ...))`, whole. The core
 // answers `started` or `error`, then the machine's output and its exit on
 // this channel for as long as the frontend stays.
+//
+// A machine with `(secrets ...)` (J.3) has their values after the plan,
+// `(secrets (NAME VALUE) ...)`: the frontend resolves them, as the user
+// and on the user's terminal, where a command asked for one may prompt,
+// and the core materialises them; the core checks that they are the ones
+// the plan names.
 struct run {
 	preamble u8[5] = "3:run";
 	channel        ch;
 	machine_entry  machine;
 	preamble u8[7] = "(4:plan";
 	form  entries[]  until ")";
+	peek u8  after_plan;
+	variant extra switch (after_plan) {
+		case '(':  secrets_entry  has_secrets;
+		default:   absent         no_secrets;
+	}
 	u8  close  [must_eq = ')'];
+}
+
+struct secrets_entry {
+	preamble u8[10] = "(7:secrets";
+	form  values[]  until ")";
+}
+
+struct absent {
 }
 
 // A running machine's output and exit, from now on, on this channel.

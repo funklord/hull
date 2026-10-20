@@ -41,9 +41,12 @@
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <linux/magic.h>
 
 #include "access.h"
 #include "builtin.h"
@@ -116,6 +119,7 @@ struct slot {
 	char               state[16];
 	int                keep;        /* (on_disconnect keep) */
 	int                kept;        /* hull/machines/ID is written for it */
+	int                secrets;     /* hull/secrets/ID is written for it */
 	client            *owner;       /* the frontend that ran it */
 	int                exited;
 	int                code;
@@ -746,6 +750,7 @@ static void stop_machine(slot *s, int timeout_ms)
 }
 
 static void forget_machine(slot *s);
+static void forget_secrets(slot *s);
 
 /* The machine has ended: tell whoever is waiting, and let the engine go. */
 static void machine_exited(slot *s, int code, int signal)
@@ -773,6 +778,7 @@ static void machine_exited(slot *s, int code, int signal)
 		s->engine->ops->destroy(&s->core, s->handle, &error);
 		s->handle = NULL;
 	}
+	forget_secrets(s);
 }
 
 static void drain_list(event *e);
@@ -948,6 +954,157 @@ static uint8_t *with_address(const hull_buf *plan, const char *address, size_t *
 	return out;
 }
 
+/* --- secrets ------------------------------------------------------------- */
+
+/*
+ * J.3's secrets, as the frontend resolved them: a file each, mode 0400,
+ * in hull/secrets/ID beside the socket, whose path the engine is given as
+ * the plan's `(secrets DIR)` and binds read-only at /run/hull/secrets.
+ * They are kept in memory only, so that directory must be on a tmpfs or a
+ * ramfs, or the run is refused. They go with the machine's exit, and a
+ * core that starts removes those of every machine it does not hold.
+ */
+static char secrets_root[4200];
+
+static int secrets_path(const char *id, char *out, size_t cap)
+{
+	int n = snprintf(out, cap, "%s/%s", secrets_root, id);
+
+	return secrets_root[0] != '\0' && n > 0 && (size_t)n < cap;
+}
+
+/* The directory of `id`'s secrets, and each file in it: the core made it,
+ * so what is in it is the core's. */
+static void remove_secrets(const char *id)
+{
+	char           path[4300];
+	DIR           *dir;
+	struct dirent *entry;
+
+	if (!secrets_path(id, path, sizeof path) || (dir = opendir(path)) == NULL)
+		return;
+	while ((entry = readdir(dir)) != NULL)
+		if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0)
+			unlinkat(dirfd(dir), entry->d_name, 0);
+	closedir(dir);
+	rmdir(path);
+}
+
+/* The secrets the plan's machine names, from the values in the run: each
+ * one given, once, and no other. Written to a fresh directory, whose path
+ * is put in `dir`. NULL, or why not. */
+static const char *write_secrets(const char *id, const hull_sexpr_doc *plan_doc,
+                                 const hull_sexpr_form *wanted, const hull_sexpr_doc *body,
+                                 char *dir, size_t cap)
+{
+	hull_sexpr_form given;
+	hull_sexpr_form item;
+	hull_sexpr_form name;
+	hull_sexpr_form value;
+	struct statfs   where;
+	unsigned        named = 0u;
+	unsigned        sent  = 0u;
+	int             more;
+	int             at;
+
+	/* The entry, `(secrets (NAME VALUE) ...)`, and its first pair. */
+	if (!hull_msg_find(body, "secrets", &given) || !hull_sexpr_child(body, &given, &item) ||
+	    !hull_sexpr_next(body, &item, &given))
+		return "the run has none of its secrets' values";
+	item = given;
+	for (more = 1; more; more = hull_sexpr_next(body, &item, &item))
+		sent++;
+	if (statfs(secrets_root, &where) != 0 ||
+	    (where.f_type != TMPFS_MAGIC && where.f_type != RAMFS_MAGIC))
+		return "secrets are kept in memory only, and the runtime directory is not a tmpfs";
+	if (!secrets_path(id, dir, cap))
+		return "the secrets' directory's path is too long";
+	remove_secrets(id);
+	if (mkdir(dir, 0700) != 0 || (at = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC)) < 0)
+		return "the secrets' directory cannot be made";
+	hull_sexpr_child(plan_doc, wanted, &item);
+	for (more = hull_sexpr_next(plan_doc, &item, &item); more;
+	     more = hull_sexpr_next(plan_doc, &item, &item)) {
+		hull_sexpr_form candidate = given;
+		hull_sexpr_form key;
+		const char     *why = "a secret the plan names has no value";
+		char            file[256];
+		int             found = 0;
+		int             fd;
+
+		named++;
+		if (!hull_sexpr_child(plan_doc, &item, &name) || name.kind != HULL_SEXPR_ATOM ||
+		    name.content_length >= sizeof file) {
+			why = "the plan's secrets are not a plan's";
+			found = -1;
+		}
+		do {
+			if (found >= 0 && candidate.kind == HULL_SEXPR_LIST &&
+			    hull_sexpr_child(body, &candidate, &key) && key.kind == HULL_SEXPR_ATOM &&
+			    key.content_length == name.content_length &&
+			    memcmp(body->data + key.content, plan_doc->data + name.content,
+			           name.content_length) == 0 &&
+			    hull_sexpr_next(body, &key, &value) && value.kind == HULL_SEXPR_ATOM)
+				found++;
+		} while (hull_sexpr_next(body, &candidate, &candidate));
+		if (found == 1) {
+			/* The name passed the spec's check: letters, digits, `_` and
+			 * `-`, at most 255, so it is one file in the directory. */
+			memcpy(file, plan_doc->data + name.content, name.content_length);
+			file[name.content_length] = '\0';
+			fd = openat(at, file, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0400);
+			if (fd >= 0 && write(fd, body->data + value.content, value.content_length) ==
+			                   (ssize_t)value.content_length)
+				why = NULL;
+			else
+				why = "a secret cannot be written";
+			if (fd >= 0 && close(fd) != 0)
+				why = "a secret cannot be written";
+		} else if (found > 1) {
+			why = "a secret's value is given twice";
+		}
+		if (why != NULL) {
+			close(at);
+			remove_secrets(id);
+			return why;
+		}
+	}
+	close(at);
+	if (named != sent) {
+		remove_secrets(id);
+		return "the run gives a secret the plan does not name";
+	}
+	return NULL;
+}
+
+/* The plan with `(secrets DIR)` added: "secrets" sorts after every key a
+ * plan has, so it goes last. */
+static uint8_t *with_secrets(const hull_buf *plan, const char *dir, size_t *length)
+{
+	char     entry[4400];
+	int      written = snprintf(entry, sizeof entry, "(7:secrets%zu:%s)", strlen(dir), dir);
+	uint8_t *out;
+
+	if (written < 0 || (size_t)written >= sizeof entry || plan->len == 0u ||
+	    plan->data[plan->len - 1u] != ')')
+		return NULL;
+	*length = plan->len + (size_t)written;
+	out = malloc(*length);
+	if (out == NULL)
+		return NULL;
+	memcpy(out, plan->data, plan->len - 1u);
+	memcpy(out + plan->len - 1u, entry, (size_t)written);
+	out[*length - 1u] = ')';
+	return out;
+}
+
+static void forget_secrets(slot *s)
+{
+	if (s->secrets)
+		remove_secrets(s->id);
+	s->secrets = 0;
+}
+
 /* --- machines that outlive the core -------------------------------------- */
 
 /*
@@ -1091,6 +1248,10 @@ static int adopt_one(const char *id)
 	snprintf(s->state, sizeof s->state, "adopting");
 	status = engine->ops->adopt(&s->core, state, &s->handle, &error);
 	if (status == HULL_OK) {
+		char dir[4300];
+
+		/* Its secrets are still bound, and go with it as they would have. */
+		s->secrets = secrets_path(id, dir, sizeof dir) && access(dir, F_OK) == 0;
 		fprintf(stderr, "hull core: machine %s is taken back\n", id);
 		return 1;
 	}
@@ -1105,6 +1266,20 @@ static int adopt_one(const char *id)
 		fprintf(stderr, "hull core: machine %s is left for the next core: %s\n", id, why);
 	}
 	return 0;
+}
+
+/* The secrets of machines a core that went held and this one does not:
+ * one that died with it, or one not taken back. */
+static void remove_stale_secrets(void)
+{
+	DIR           *dir = opendir(secrets_root);
+	struct dirent *entry;
+
+	while (dir != NULL && (entry = readdir(dir)) != NULL)
+		if (is_label(entry->d_name) && find_machine(entry->d_name) == NULL)
+			remove_secrets(entry->d_name);
+	if (dir != NULL)
+		closedir(dir);
 }
 
 static void adopt_kept(void)
@@ -1140,10 +1315,12 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	char              *engine_name;
 	char              *class_name;
 	char              *given;
+	char              *dir_given;
 	char              *on_disconnect;
 	unsigned           generation;
 	slot              *s;
 	hull_buf           plan;
+	hull_sexpr_form    secrets;
 	uint8_t           *addressed;
 	size_t             addressed_length;
 	hull_status        created;
@@ -1175,12 +1352,15 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		engine_name = hull_access_value(&plan_doc, &top, "engine");
 		class_name  = hull_access_value(&plan_doc, &top, "class");
 		given       = hull_access_value(&plan_doc, &top, "address");
+		dir_given   = hull_access_value(&plan_doc, &top, "secrets");
 	}
-	if (given != NULL) {
+	if (given != NULL || dir_given != NULL) {
+		send_error(c, ch, given != NULL ? "a plan's address is the core's to give" :
+		                                  "a plan's secrets' directory is the core's to give");
 		free(given);
+		free(dir_given);
 		free(engine_name);
 		free(class_name);
-		send_error(c, ch, "a plan's address is the core's to give");
 		return;
 	}
 	/* Two ids may come to one address; the second is refused while the
@@ -1270,10 +1450,36 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	}
 	plan.data = addressed;
 	plan.len  = addressed_length;
+	if (hull_access_find(&plan_doc, &machine, "secrets", &secrets)) {
+		char        dir[4300];
+		const char *why = write_secrets(id, &plan_doc, &secrets, body, dir, sizeof dir);
+		uint8_t    *with = why == NULL ? with_secrets(&plan, dir, &addressed_length) : NULL;
+
+		if (why == NULL && with == NULL) {
+			why = "the plan is not a plan";
+			remove_secrets(id);
+		}
+		free(addressed);
+		if (why != NULL) {
+			send_error(c, ch, why);
+			s->used = 0;
+			return;
+		}
+		s->secrets = 1;
+		addressed = with;
+		plan.data = with;
+		plan.len  = addressed_length;
+	} else if (hull_msg_find(body, "secrets", &value)) {
+		free(addressed);
+		send_error(c, ch, "the run gives a secret the plan does not name");
+		s->used = 0;
+		return;
+	}
 	created = engine->ops->create(&s->core, plan, &s->handle, &error);
 	free(addressed);
 	if (created != HULL_OK) {
 		send_error(c, ch, error.detail != NULL ? error.detail : "create failed");
+		forget_secrets(s);
 		s->used = 0;
 		return;
 	}
@@ -1281,6 +1487,7 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	if (engine->ops->start(&s->core, s->handle, &error) != HULL_OK) {
 		send_error(c, ch, error.detail != NULL ? error.detail : "start failed");
 		engine->ops->destroy(&s->core, s->handle, &error);
+		forget_secrets(s);
 		s->handle         = NULL;
 		s->used           = 0;
 		s->follower_count = 0u;
@@ -2069,6 +2276,11 @@ int hull_core_run(const char *host_arch)
 		kept_dir[0] = '\0';  /* nothing is kept, and nothing taken back */
 	else
 		adopt_kept();
+	snprintf(secrets_root, sizeof secrets_root, "%s/secrets", dir);
+	if (mkdir(secrets_root, 0700) != 0 && errno != EEXIST)
+		secrets_root[0] = '\0';  /* no machine with secrets can run */
+	else
+		remove_stale_secrets();
 
 	memset(&action, 0, sizeof action);
 	action.sa_handler = end;

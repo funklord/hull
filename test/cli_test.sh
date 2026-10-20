@@ -4,7 +4,9 @@
 #
 # Each command runs once, under `timeout 10`. The files it writes are the
 # ones named in FILES, all in $BUILD_DIR/test/cli, which `make clean`
-# removes by name. The first argument is the hull binary.
+# removes by name, but for the secrets cases' runtime directory, which
+# must be a tmpfs: one mktemp makes under /dev/shm, removed at the exit.
+# The first argument is the hull binary.
 
 set -u
 
@@ -988,6 +990,71 @@ printf '%s\n' "$said" | grep -q '^hull core: machine junk is forgotten: it is no
 rm -f "$kept/docker"
 tries=0
 while [ -S "$XDG_RUNTIME_DIR/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+
+# Secrets (J.3), resolved by the frontend and written by the core, on a
+# tmpfs: so a core of their own, in a runtime directory under /dev/shm,
+# removed at the end. In this suite's runtime directory, which is not a
+# tmpfs, the run is refused.
+conf nosecret '(command "/probe" "say" "ran")' '(secrets (pw (source "file:pw.txt")))'
+printf 'from a file\n' > "$root/pw.txt"
+from_root 125 'secrets are kept in memory only' -f "$root/nosecret.conf"
+shm=$(mktemp -d /dev/shm/hull-cli-test.XXXXXX)
+trap 'rm -rf "${shm:?}"' EXIT
+mkdir -p "$root/secret/run" "$root/secret/proc"
+cp "$root/rootfs/probe" "$root/secret/probe"
+head -c 70000 /dev/zero > "$root/big.bin"
+secret_conf() { # NAME COMMAND SECRETS: a machine of the secret dir
+	printf '(machine (source "dir:./secret") (backend chroot) (hostname "sec") (command %s) (secrets %s))\n' \
+		"$2" "$3" > "$root/$1.conf"
+}
+secret_run() { # STATUS PATTERN CONF: hull run of CONF in the shm core
+	expect "$1" "$2" env XDG_RUNTIME_DIR="$shm" sh -c 'cd / && exec "$0" run -f "$1"' \
+		"$hull_abs" "$root/$3.conf"
+}
+if [ "$(findmnt -no FSTYPE --target "$shm")" != tmpfs ]; then
+	cases=$((cases + 1))
+	fail "/dev/shm is not a tmpfs, so secrets cannot be tried" "$(findmnt --target "$shm")"
+fi
+# A stale directory, as a core that died leaves, is gone once a core
+# starts.
+mkdir -p "$shm/hull/secrets/ghost"
+printf 'old\n' > "$shm/hull/secrets/ghost/key"
+secret_conf shown '"/probe" "list" "/run/hull/secrets" "read" "/run/hull/secrets/pw" "read" "/run/hull/secrets/made" "owner" "/run/hull/secrets/pw" "env" "made" "write" "/run/hull/secrets/new"' \
+	'(pw (source "file:pw.txt")) (made (source "exec:printf made; echo to the terminal >&2") (expose env))'
+secret_run 0 '^list= made pw$' shown
+secret_run 0 '^read=from a file$' shown
+# made has no newline, so the read runs into the owner's line.
+secret_run 0 '^read=madeowner=0:0 0400$' shown
+secret_run 0 '^made=made$' shown
+secret_run 0 '^write=Read-only file system$' shown
+secret_run 0 '^to the terminal$' shown
+secret_run 0 '^hull: warning: secret made is in the machine.s environment' shown
+cases=$((cases + 1))
+left=$(ls -A "$shm/hull/secrets")
+[ -z "$left" ] || fail "secrets were left after their machine, or a stale one kept" "$left"
+# What cannot be had is the run refused, before anything runs.
+secret_conf failing '"/probe" "say" "ran"' '(bad (source "exec:exit 3"))'
+secret_run 125 'secret bad: /bin/sh exited 3' failing
+refute '^ran$' env XDG_RUNTIME_DIR="$shm" sh -c 'cd / && exec "$0" run -f "$1"' "$hull_abs" "$root/failing.conf"
+secret_conf nofile '"/probe" "say" "ran"' '(gone (source "file:nope.txt"))'
+secret_run 125 'secret gone: .*nope.txt: No such file' nofile
+secret_conf big '"/probe" "say" "ran"' '(big (source "file:big.bin"))'
+secret_run 125 'secret big: .*more than 65536 bytes' big
+secret_conf sealed '"/probe" "say" "ran"' '(sealed (source "age:nope.age"))'
+secret_run 125 'secret sealed: age' sealed
+# A dir with no /run has nowhere for them.
+printf '(machine (source "dir:./rootfs") (backend chroot) (command "/probe" "say" "ran") %s)\n' \
+	'(secrets (pw (source "file:pw.txt")))' > "$root/norun.conf"
+secret_run 125 'a tmpfs at /run, which the dir must have' norun
+cases=$((cases + 1))
+left=$(ls -A "$shm/hull/secrets")
+[ -z "$left" ] || fail "a refused run left its secrets" "$left"
+# Its core leaves, as this suite's did, before its directory is removed.
+tries=0
+while [ -S "$shm/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
 	tries=$((tries + 1))
 	sleep 0.25
 done

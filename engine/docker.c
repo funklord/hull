@@ -682,6 +682,16 @@ static void add_env(text *t, const hull_sexpr_doc *doc, const hull_sexpr_form *e
 	}
 }
 
+/* One more of Env's strings, after any before it. */
+static void add_pair(void *context, const char *pair)
+{
+	text *t = context;
+
+	if (t->length != 0u)
+		add_text(t, ",");
+	add_json(t, pair);
+}
+
 /* `(volumes (volume ...))` as Binds, each host path made absolute against
  * the plan's base: the daemon resolves nothing relative. Returns a
  * reason, or NULL. */
@@ -770,6 +780,7 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	text            exposed  = { 0 };
 	text            bindings = { 0 };
 	text            binds    = { 0 };
+	text            env      = { 0 };
 	hull_sexpr_form entry;
 	const char     *reason   = NULL;
 	char           *value;
@@ -792,11 +803,23 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 		add_json(&body, value);
 		free(value);
 	}
-	if (hull_access_find(doc, machine, "env", &entry)) {
+	/* The env, then the secrets it is to hold (J.3's `(expose env)`), which
+	 * the daemon then keeps in the container's configuration: that is
+	 * what the frontend's warning says. */
+	if (hull_access_find(doc, machine, "env", &entry))
+		add_env(&env, doc, &entry);
+	if (hull_access_exposed(doc, machine, add_pair, &env) != 0) {
+		free(env.data);
+		free(body.data);
+		return "a secret to expose cannot be read, or holds a NUL";
+	}
+	if (env.length != 0u) {
 		add_text(&body, ",\"Env\":[");
-		add_env(&body, doc, &entry);
+		add_all(&body, &env);
 		add_text(&body, "]");
 	}
+	body.failed |= env.failed;
+	free(env.data);
 	/* Ports on the machine's address, which the core gives the plan. */
 	if (hull_access_find(doc, machine, "ports", &entry)) {
 		hull_sexpr_first(doc, &top);
@@ -823,12 +846,29 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	 * own: PID 1 ignores a signal it has no handler for, so a workload
 	 * there would sit through stop's SIGTERM, and nothing would reap. */
 	add_text(&body, ",\"HostConfig\":{\"Init\":true,\"CapDrop\":[\"ALL\"]");
-	if (hull_access_find(doc, machine, "volumes", &entry)) {
+	if (hull_access_find(doc, machine, "volumes", &entry))
 		reason = add_binds(&binds, doc, &entry, m->detail, sizeof m->detail);
+	/* The secrets the core wrote, read-only where J.3 puts them; the
+	 * daemon makes the mount point. */
+	hull_sexpr_first(doc, &top);
+	if ((value = hull_access_value(doc, &top, "secrets")) != NULL) {
+		text bind = { 0 };
+
+		add_text(&bind, value);
+		add_text(&bind, ":/run/hull/secrets:ro");
+		if (binds.length != 0u)
+			add_text(&binds, ",");
+		add_json(&binds, bind.data != NULL ? bind.data : "");
+		binds.failed |= bind.failed;
+		free(bind.data);
+		free(value);
+	}
+	if (binds.length != 0u) {
 		add_text(&body, ",\"Binds\":[");
 		add_all(&body, &binds);
 		add_text(&body, "]");
 	}
+	body.failed |= binds.failed;
 	if (bindings.data != NULL) {
 		add_text(&body, ",\"PortBindings\":{");
 		add_all(&body, &bindings);
@@ -1616,6 +1656,9 @@ static const hull_cap_entry entries[] = {
 	{ "ports",              HULL_SUP_NATIVE,
 	  "bound on the machine's address", NULL },
 	{ "volumes",            HULL_SUP_NATIVE,   NULL, NULL },
+	{ "secrets",            HULL_SUP_NATIVE,
+	  "bound read-only from the core's tmpfs; one exposed is in the container's "
+	  "configuration too, where docker inspect shows it", NULL },
 	{ "hostname",           HULL_SUP_NATIVE,   NULL, NULL },
 
 	/* ns: cgroups, memory a ceiling (6). */

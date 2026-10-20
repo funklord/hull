@@ -48,6 +48,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "access.h"
 #include "builtin.h"
 #include "core.h"
 #include "matrix.h"
@@ -581,6 +582,182 @@ static int machine_id(const hull_spec *spec, const hull_sexpr_form *machine, con
 
 /* --- run ---------------------------------------------------------------- */
 
+/* --- secrets ------------------------------------------------------------- */
+
+/*
+ * J.3's sources, resolved here, as the user, before the run is sent: this
+ * process has the user's terminal, where `exec:` and `age:` may prompt.
+ *
+ * - `file:PATH` is the file, PATH relative to the spec's directory;
+ * - `exec:COMMAND` is what COMMAND writes to stdout, run by /bin/sh -c in
+ *   the spec's directory, with this process's stdin and stderr;
+ * - `age:PATH` is `age --decrypt` of the file, with `-i` and the file
+ *   $HULL_AGE_IDENTITY names, if it names one; else age asks for the
+ *   file's passphrase.
+ *
+ * A command that fails, by its status or a signal, fails the run. Each
+ * value is at most SECRET_LIMIT, and they and the plan are one message.
+ */
+#define SECRET_LIMIT 65536u
+
+/* What `fd` holds, to its end, into `out`: its length, or -1 when it is
+ * more than SECRET_LIMIT or cannot be read. */
+static long read_secret(int fd, uint8_t *out)
+{
+	size_t n = 0u;
+
+	for (;;) {
+		ssize_t got = read(fd, out + n, SECRET_LIMIT + 1u - n);
+
+		if (got < 0 && errno == EINTR)
+			continue;
+		if (got < 0)
+			return -1;
+		if (got == 0)
+			return (long)n;
+		n += (size_t)got;
+		if (n > SECRET_LIMIT)
+			return -1;
+	}
+}
+
+/* `argv`'s stdout, run in `dir`. Its length, or -1 having said why. */
+static long secret_from(char *const argv[], const char *dir, const char *name, uint8_t *out)
+{
+	int   pipe_fds[2];
+	int   status;
+	long  n;
+	pid_t child;
+
+	if (pipe2(pipe_fds, O_CLOEXEC) != 0)
+		return -1;
+	child = fork();
+	if (child == 0) {
+		dup2(pipe_fds[1], 1);
+		if (dir != NULL && chdir(dir) != 0) {
+			fprintf(stderr, "hull: secret %s: %s: %s\n", name, dir, strerror(errno));
+			_exit(126);
+		}
+		execvp(argv[0], argv);
+		fprintf(stderr, "hull: secret %s: %s: %s\n", name, argv[0], strerror(errno));
+		_exit(127);
+	}
+	close(pipe_fds[1]);
+	n = child > 0 ? read_secret(pipe_fds[0], out) : -1;
+	close(pipe_fds[0]);
+	if (child > 0)
+		while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+		}
+	if (child < 0) {
+		fprintf(stderr, "hull: secret %s: %s cannot be run\n", name, argv[0]);
+		return -1;
+	}
+	if (n < 0) {
+		fprintf(stderr, "hull: secret %s: more than %u bytes\n", name, SECRET_LIMIT);
+		return -1;
+	}
+	if (WIFSIGNALED(status) || WEXITSTATUS(status) != 0) {
+		fprintf(stderr, "hull: secret %s: %s %s %d\n", name, argv[0],
+		        WIFSIGNALED(status) ? "was killed by signal" : "exited",
+		        WIFSIGNALED(status) ? WTERMSIG(status) : WEXITSTATUS(status));
+		return -1;
+	}
+	return n;
+}
+
+/* One secret's value from its source. Its length, or -1 having said why. */
+static long resolve_secret(const hull_sexpr_doc *doc, const char *name, const char *source,
+                           const char *dir, uint8_t *out)
+{
+	const char *identity = getenv("HULL_AGE_IDENTITY");
+	char       *path;
+	long        n;
+
+	if (strncmp(source, "exec:", 5u) == 0) {
+		char *argv[] = { "/bin/sh", "-c", (char *)source + 5, NULL };
+
+		return secret_from(argv, dir, name, out);
+	}
+	if (strncmp(source, "file:", 5u) != 0 && strncmp(source, "age:", 4u) != 0) {
+		fprintf(stderr, "hull: secret %s: %s is not a source\n", name, source);
+		return -1;
+	}
+	path = hull_access_path(doc, strchr(source, ':') + 1);
+	if (path == NULL)
+		return -1;
+	if (source[0] == 'a') {
+		char *with[]    = { "age", "--decrypt", "-i", (char *)identity, "--", path, NULL };
+		char *without[] = { "age", "--decrypt", "--", path, NULL };
+
+		n = secret_from(identity != NULL && identity[0] != '\0' ? with : without, dir, name,
+		                out);
+	} else {
+		int fd = open(path, O_RDONLY | O_CLOEXEC);
+
+		n = fd >= 0 ? read_secret(fd, out) : -1;
+		if (fd < 0)
+			fprintf(stderr, "hull: secret %s: %s: %s\n", name, path, strerror(errno));
+		else if (n < 0)
+			fprintf(stderr, "hull: secret %s: %s: more than %u bytes, or unreadable\n", name,
+			        path, SECRET_LIMIT);
+		if (fd >= 0)
+			close(fd);
+	}
+	free(path);
+	return n;
+}
+
+/* `(secrets (NAME VALUE) ...)` for the plan's machine, onto `m`: 0, or -1
+ * having said why. A machine with none adds nothing. */
+static int add_secrets(hull_msg *m, const uint8_t *plan, size_t length)
+{
+	static uint8_t  value[SECRET_LIMIT + 1u];
+	hull_sexpr_doc  doc;
+	hull_sexpr_form machine;
+	hull_sexpr_form top;
+	hull_sexpr_form secrets;
+	hull_sexpr_form item;
+	hull_sexpr_form name_form;
+	char           *dir;
+	int             more;
+	int             result = 0;
+
+	if (!hull_access_machine(&doc, plan, length, &machine) ||
+	    !hull_access_find(&doc, &machine, "secrets", &secrets))
+		return 0;
+	hull_sexpr_first(&doc, &top);
+	dir = hull_access_value(&doc, &top, "base");
+	hull_msg_raw(m, "(7:secrets");
+	hull_sexpr_child(&doc, &secrets, &item);
+	for (more = hull_sexpr_next(&doc, &item, &item); more && result == 0;
+	     more = hull_sexpr_next(&doc, &item, &item)) {
+		char *name   = hull_sexpr_child(&doc, &item, &name_form) ?
+		               hull_access_text(&doc, &name_form) : NULL;
+		char *source = hull_access_value(&doc, &item, "source");
+		char *expose = hull_access_value(&doc, &item, "expose");
+		long  n      = name != NULL && source != NULL ?
+		               resolve_secret(&doc, name, source, dir, value) : -1;
+
+		if (n < 0) {
+			result = -1;
+		} else {
+			if (expose != NULL && strcmp(expose, "env") == 0)
+				fprintf(stderr, "hull: warning: secret %s is in the machine's environment, "
+				        "where every process of it can read it\n", name);
+			hull_msg_raw(m, "(");
+			hull_msg_text(m, name);
+			hull_msg_atom(m, value, (size_t)n);
+			hull_msg_raw(m, ")");
+		}
+		free(name);
+		free(source);
+		free(expose);
+	}
+	hull_msg_raw(m, ")");
+	free(dir);
+	return result;
+}
+
 static int run(options *o, const hull_registry *registry, const char *name)
 {
 	static hull_plan     plan;
@@ -655,19 +832,29 @@ static int run(options *o, const hull_registry *registry, const char *name)
 		}
 	}
 
+	/* Before the core is reached, and before SIGINT would stop a machine:
+	 * a command asked for a secret may prompt, and ^C there ends this. */
+	hull_msg_raw(&request, "(3:run(2:ch1:1)(7:machine");
+	hull_msg_text(&request, id);
+	hull_msg_raw(&request, ")");
+	hull_msg_bytes(&request, plan.canonical, plan.canonical_length);
+	if (add_secrets(&request, plan.canonical, plan.canonical_length) != 0) {
+		fprintf(stderr, "%s: %s: not run: a secret could not be had\n", o->file, shown);
+		hull_msg_free(&request);
+		return 125;
+	}
+	hull_msg_raw(&request, ")");
+
 	/* SIGINT and SIGTERM stop the machine; a hangup only leaves it, to
 	 * whatever (on_disconnect ...) says. */
 	memset(&action, 0, sizeof action);
 	action.sa_handler = interrupt;
 	sigaction(SIGINT, &action, NULL);
 	sigaction(SIGTERM, &action, NULL);
-	if (connect_core(&wire, 1) != 0)
+	if (connect_core(&wire, 1) != 0) {
+		hull_msg_free(&request);
 		return 125;
-	hull_msg_raw(&request, "(3:run(2:ch1:1)(7:machine");
-	hull_msg_text(&request, id);
-	hull_msg_raw(&request, ")");
-	hull_msg_bytes(&request, plan.canonical, plan.canonical_length);
-	hull_msg_raw(&request, ")");
+	}
 	if (request.failed || hull_wire_send(wire.fd, &request) != 0) {
 		fprintf(stderr, "hull: the run could not be sent\n");
 		hull_msg_free(&request);

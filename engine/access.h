@@ -43,6 +43,13 @@ int hull_access_terminal(const hull_sexpr_doc *doc, const hull_sexpr_form *exec,
  * out. */
 char *hull_access_path(const hull_sexpr_doc *doc, const char *path);
 
+/* The secrets the plan's machine puts in its environment, `(expose env)`
+ * (J.3), each as `NAME=VALUE`, VALUE read from the file the core wrote in
+ * the plan's `(secrets DIR)`: `each` is called with one, which it does
+ * not keep. Returns 0, or -1 when one cannot be read or holds a NUL. */
+int hull_access_exposed(const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
+                        void (*each)(void *context, const char *pair), void *context);
+
 /* Open `plan` and find its machine. Returns 0 if it is not a plan. */
 int hull_access_machine(hull_sexpr_doc *doc, const uint8_t *plan, size_t length,
                         hull_sexpr_form *machine);
