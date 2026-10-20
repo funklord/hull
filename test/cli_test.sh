@@ -776,6 +776,28 @@ cases=$((cases + 1))
 [ "$(figure io "$second")" -ge $((${io:-0} + 4194304)) ] ||
 	fail "stats: an ended exec's io, wanted 4 MiB more than before it" "$first
 $second"
+# A rate, over two readings: the probe waiting is idle, under 5 % of a
+# CPU, and an exec spinning is one CPU's worth at most and, however loaded
+# the host, much of one.
+percent() { # STATS: the cpu line's percentage, as a whole number
+	printf '%s\n' "$1" | awk '$1 == "cpu" && $3 == "%" { printf "%d\n", $2 }'
+}
+cases=$((cases + 1))
+idle=$(timeout 10 "$hull" stats --over 1 statsd 2>&1)
+[ -n "$(percent "$idle")" ] && [ "$(percent "$idle")" -lt 5 ] &&
+	printf '%s\n' "$idle" | grep -Eq '^io +[0-9]+ bytes/s$' &&
+	printf '%s\n' "$idle" | grep -Eq '^memory +[0-9]+ bytes$' ||
+	fail "stats --over: a waiting probe, wanted under 5 % of a CPU" "$idle"
+(timeout 20 "$hull" exec statsd /probe spin 3000 > /dev/null 2>&1) &
+spinner=$!
+sleep 0.5
+cases=$((cases + 1))
+busy=$(timeout 10 "$hull" stats --over 2 statsd 2>&1)
+[ -n "$(percent "$busy")" ] && [ "$(percent "$busy")" -ge 30 ] && [ "$(percent "$busy")" -le 110 ] ||
+	fail "stats --over: a spinning exec, wanted 30 to 110 % of a CPU" "$busy"
+wait "$spinner"
+expect 2 '^hull: stats --over takes 1 to 3600 seconds$' "$hull" stats --over 0 statsd
+expect 2 '^hull: stats --over takes 1 to 3600 seconds$' "$hull" stats --over 2s statsd
 expect 0 '' "$hull" kill -s TERM statsd
 wait "$statsd"
 rm -f "$root/rootfs/written"

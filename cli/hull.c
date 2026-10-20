@@ -88,7 +88,8 @@ static void usage(FILE *out)
 	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [NAME]\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
-	      "       hull kill [-s SIGNAL] ID | hull stats ID | hull ssh ID | hull proxy-ssh HOST\n"
+	      "       hull kill [-s SIGNAL] ID | hull stats [--over S] ID\n"
+	      "       hull ssh ID | hull proxy-ssh HOST\n"
 	      "       hull ssh-config [--remove] | hull gc\n"
 	      "       hull core\n"
 	      "       hull engines\n"
@@ -1192,19 +1193,16 @@ static int ssh_config(int remove)
 	return 0;
 }
 
-static int stats_of(const char *id)
+/* One reading of `id`'s figures, cpu, io and memory, into `values`: 0, 1
+ * for the core's refusal, said, or 2 for an answer that is not one. */
+static int read_stats(const char *id, long long values[3])
 {
 	static const char *const keys[] = { "cpu", "io", "memory" };
 	hull_wire       wire;
 	hull_sexpr_doc  body;
 	hull_sexpr_form value;
-	long long       values[3] = { 0, 0, 0 };
 	int             status = 0;
 
-	if (!core_running()) {
-		fprintf(stderr, "hull: no core is running, so no machine is\n");
-		return 1;
-	}
 	if (connect_core(&wire, 0) != 0)
 		return 2;
 	send_request(&wire, "(5:stats", 1u, id, NULL);
@@ -1226,12 +1224,49 @@ static int stats_of(const char *id)
 				status = 2;
 	}
 	hull_wire_close(&wire);
-	if (status == 0)
-		printf("cpu     %lld.%06lld s\nio      %lld bytes\nmemory  %lld bytes\n",
-		       values[0] / 1000000, values[0] % 1000000, values[1], values[2]);
-	else if (status == 2)
+	if (status == 2)
 		fprintf(stderr, "hull: the core's answer to stats is not stats\n");
 	return status;
+}
+
+/* `hull stats ID`: one reading. With `--over S`, two, S seconds apart on
+ * the monotonic clock, and the rates between them: CPU as a percentage of
+ * one CPU, so that a machine using four whole CPUs is 400 %, as top
+ * counts; io in bytes a second; and memory as the second reading has it,
+ * being what is resident and not a flow. */
+static int stats_of(const char *id, long over)
+{
+	long long       first[3] = { 0, 0, 0 };
+	long long       second[3] = { 0, 0, 0 };
+	struct timespec before;
+	struct timespec after;
+	struct timespec pause = { over, 0 };
+	double          elapsed;
+	int             status;
+
+	if (!core_running()) {
+		fprintf(stderr, "hull: no core is running, so no machine is\n");
+		return 1;
+	}
+	if ((status = read_stats(id, first)) != 0)
+		return status;
+	if (over == 0) {
+		printf("cpu     %lld.%06lld s\nio      %lld bytes\nmemory  %lld bytes\n",
+		       first[0] / 1000000, first[0] % 1000000, first[1], first[2]);
+		return 0;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &before);
+	while (nanosleep(&pause, &pause) != 0 && errno == EINTR)
+		;
+	if ((status = read_stats(id, second)) != 0)
+		return status;
+	clock_gettime(CLOCK_MONOTONIC, &after);
+	elapsed = (double)(after.tv_sec - before.tv_sec) +
+	          (double)(after.tv_nsec - before.tv_nsec) / 1e9;
+	printf("cpu     %.1f %%\nio      %.0f bytes/s\nmemory  %lld bytes\n",
+	       (double)(second[0] - first[0]) / 1e4 / elapsed,
+	       (double)(second[1] - first[1]) / elapsed, second[2]);
+	return 0;
 }
 
 /* stop, kill, logs and attach: one request about one machine, followed
@@ -1413,7 +1448,18 @@ int main(int argc, char **argv)
 	}
 
 	if (strcmp(command, "stats") == 0 && argc == 3 && argv[2][0] != '-')
-		return stats_of(argv[2]);
+		return stats_of(argv[2], 0);
+	if (strcmp(command, "stats") == 0 && argc == 5 && strcmp(argv[2], "--over") == 0 &&
+	    argv[4][0] != '-') {
+		char *end = NULL;
+		long  over = strtol(argv[3], &end, 10);
+
+		if (end == argv[3] || *end != '\0' || over < 1 || over > 3600) {
+			fprintf(stderr, "hull: stats --over takes 1 to 3600 seconds\n");
+			return 2;
+		}
+		return stats_of(argv[4], over);
+	}
 	if (strcmp(command, "ssh") == 0 && argc == 3 && argv[2][0] != '-')
 		return ssh_into(argv[2]);
 
