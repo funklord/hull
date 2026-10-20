@@ -38,6 +38,9 @@
  *   serve P N   listen on port N, P tcp or udp, for 20 seconds at most;
  *               greet the one peer over tcp and say the line it sends,
  *               or echo the one datagram over udp and say it
+ *   echo N      echo each datagram on udp port N to its sender, until
+ *               one says `end`, for 20 seconds at most, naming each
+ *               sender's port as it first comes, and say how many came
  *   dial A N    connect to address A, port N, over tcp within 5 seconds,
  *               and say, after A:N, the first line it sends or why it
  *               could not
@@ -197,6 +200,54 @@ static void read_line(int fd, char *out, size_t cap, int seconds)
 		out[n++] = c;
 	}
 	out[n] = '\0';
+}
+
+static void echo(const char *port)
+{
+	static char        datagram[65536];
+	struct sockaddr_in senders[16];
+	unsigned           count = 0u;
+	int                fd = socket(AF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in at;
+	time_t             end = time(NULL) + 20;
+
+	memset(&at, 0, sizeof at);
+	at.sin_family = AF_INET;
+	at.sin_port   = htons((unsigned short)atoi(port));
+	if (fd < 0 || bind(fd, (struct sockaddr *)&at, sizeof at) != 0) {
+		printf("echo=%s\n", strerror(errno));
+		return;
+	}
+	printf("echoing\n");
+	fflush(stdout);
+	for (;;) {
+		struct pollfd      p = { fd, POLLIN, 0 };
+		struct sockaddr_in from;
+		socklen_t          length = sizeof from;
+		ssize_t            n;
+		unsigned           i;
+
+		if (time(NULL) >= end || poll(&p, 1u, 1000) < 0)
+			break;
+		if (p.revents == 0)
+			continue;
+		n = recvfrom(fd, datagram, sizeof datagram, 0, (struct sockaddr *)&from, &length);
+		if (n < 0)
+			continue;
+		sendto(fd, datagram, (size_t)n, 0, (struct sockaddr *)&from, length);
+		for (i = 0u; i < count; i++)
+			if (senders[i].sin_port == from.sin_port &&
+			    senders[i].sin_addr.s_addr == from.sin_addr.s_addr)
+				break;
+		if (i == count && count < 16u) {
+			senders[count++] = from;
+			printf("from %u\n", (unsigned)ntohs(from.sin_port));
+		}
+		if (n == 3 && memcmp(datagram, "end", 3u) == 0)
+			break;
+	}
+	printf("echoed from %u\n", count);
+	close(fd);
 }
 
 static void serve(const char *proto, const char *port)
@@ -542,6 +593,9 @@ int main(int argc, char **argv)
 		} else if (strcmp(step, "serve") == 0 && i + 2 < argc) {
 			serve(arg, argv[i + 2]);
 			i += 2;
+		} else if (strcmp(step, "echo") == 0) {
+			echo(arg);
+			i++;
 		} else if (strcmp(step, "dial") == 0 && i + 2 < argc) {
 			dial(arg, argv[i + 2]);
 			i += 2;

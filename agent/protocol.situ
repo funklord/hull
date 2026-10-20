@@ -154,13 +154,25 @@ struct no  { preamble u8[7] = "5:false"; }
 // A connection to one of the machine's ports, forwarded from the host
 // (project.md section 4.11), on a channel the host allocated for it. Its
 // bytes are `data` on fd 0 in and fd 1 out, on the same credit as an
-// exec's, and its end is `exited`.
+// exec's, and its end is `exited`. With `(proto udp)` it is one client's
+// datagrams instead, a `data` each, on no credit; tcp is the absence.
 struct connect {
 	preamble u8[9] = "7:connect";
 	channel  ch;
 	preamble u8[7] = "(4:port";
 	atom  port;
-	preamble u8[2] = "))";
+	u8    close_port  [must_eq = ')'];
+	peek u8  after_port;
+	variant proto switch (after_port) {
+		case '(':  udp     has_proto;
+		default:   absent  no_proto;
+	}
+	u8  close  [must_eq = ')'];
+}
+
+struct udp {
+	preamble u8[13] = "(5:proto3:udp";
+	u8  close  [must_eq = ')'];
 }
 
 // The workload's or an exec's stdin: always fd 0.

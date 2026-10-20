@@ -81,6 +81,7 @@
 #define MAX_STREAMS  64u
 #define WINDOW       65536u  /* what the agent gives, and is given, each way */
 #define NETWORK_FD   3       /* passt's socket, in qemu */
+#define FLOW_IDLE    90      /* seconds a udp client's flow is kept unused */
 
 /* The guest's network, which the agent sets to the same addresses. */
 #define GUEST_ADDRESS   "10.0.2.15"
@@ -108,6 +109,7 @@ struct hull_machine {
 	char             address_text[16];
 	unsigned         port_host[MAX_PORTS];   /* on `address` */
 	unsigned         port_guest[MAX_PORTS];
+	int              port_udp[MAX_PORTS];
 	unsigned         port_count;
 	int              listeners[MAX_PORTS];   /* -1 once closed */
 	unsigned long    memory_mib;
@@ -164,6 +166,10 @@ struct hull_stream {
 	int             forwarded;    /* a port's connection, whose output goes */
 	int             sink;         /* to this socket rather than to on_data */
 	int             broken;       /* the socket would not take it */
+	int             datagram;     /* a udp client's flow, the forwarder's */
+	int             listener;     /* the port's socket, which replies leave by */
+	struct sockaddr_in peer;      /* the client */
+	time_t          last;         /* when a datagram last passed, monotonic */
 };
 
 static const hull_host_ops *host;
@@ -318,12 +324,11 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			free(host_port);
 			free(guest);
 			free(proto);
-			if (udp)
-				return "a udp port is not forwarded by the qemu engine yet";
 			if (m->port_count == MAX_PORTS)
 				return "there are too many ports";
 			if (h < 1u || h > 65535u || g < 1u || g > 65535u)
 				return "a port is a host and a guest port of 1 to 65535";
+			m->port_udp[m->port_count]     = udp;
 			m->port_host[m->port_count]    = (unsigned)h;
 			m->port_guest[m->port_count++] = (unsigned)g;
 		}
@@ -912,7 +917,18 @@ static void for_stream(hull_machine *m, const hull_sexpr_doc *body, long long ch
 		pthread_mutex_unlock(&m->lock);
 		return;
 	}
-	if (hull_msg_is(body, "data")) {
+	if (hull_msg_is(body, "data") && st->datagram) {
+		hull_sexpr_form buf;
+		struct timespec now;
+
+		/* A reply, to the client, whole or not at all, as udp is. */
+		if (hull_msg_find(body, "buf", &buf)) {
+			sendto(st->listener, body->data + buf.content, buf.content_length,
+			       MSG_DONTWAIT | MSG_NOSIGNAL, (struct sockaddr *)&st->peer, sizeof st->peer);
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			st->last = now.tv_sec;
+		}
+	} else if (hull_msg_is(body, "data")) {
 		hull_sexpr_form buf;
 		hull_sexpr_form fd;
 		piece          *p;
@@ -1150,14 +1166,16 @@ static const char *open_listeners(hull_machine *m)
 	for (unsigned i = 0u; i < m->port_count; i++) {
 		struct sockaddr_in at;
 		int                one = 1;
-		int                fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+		int                fd = socket(AF_INET, (m->port_udp[i] ? SOCK_DGRAM : SOCK_STREAM) |
+		                               SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
 
 		memset(&at, 0, sizeof at);
 		at.sin_family      = AF_INET;
 		at.sin_port        = htons((uint16_t)m->port_host[i]);
 		at.sin_addr        = m->address;
 		if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0 ||
-		    bind(fd, (struct sockaddr *)&at, sizeof at) != 0 || listen(fd, 64) != 0) {
+		    bind(fd, (struct sockaddr *)&at, sizeof at) != 0 ||
+		    (!m->port_udp[i] && listen(fd, 64) != 0)) {
 			snprintf(m->detail, sizeof m->detail, "port %u on %s: %s", m->port_host[i],
 			         m->address_text, strerror(errno));
 			if (fd >= 0)
@@ -1803,11 +1821,102 @@ out:
 	return NULL;
 }
 
+/* A client's datagram to a udp port: on its flow, a channel of the
+ * agent's opened for its address, or on a new one. Sent without credit,
+ * and dropped, as udp is, where the machine has no channel left. */
+static void forward_datagram(hull_machine *m, unsigned port)
+{
+	static uint8_t     datagram[65536];
+	struct sockaddr_in from;
+	socklen_t          length = sizeof from;
+	ssize_t            n = recvfrom(m->listeners[port], datagram, sizeof datagram, MSG_DONTWAIT,
+	                                (struct sockaddr *)&from, &length);
+	hull_stream       *st = NULL;
+	hull_msg           msg = { 0 };
+	struct timespec    now;
+	hull_status        why;
+
+	if (n < 0 || length != sizeof from || from.sin_family != AF_INET)
+		return;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	pthread_mutex_lock(&m->lock);
+	for (unsigned i = 0u; i < MAX_STREAMS && st == NULL; i++)
+		if (m->streams[i] != NULL && m->streams[i]->datagram && !m->streams[i]->lost &&
+		    m->streams[i]->listener == m->listeners[port] &&
+		    m->streams[i]->peer.sin_port == from.sin_port &&
+		    m->streams[i]->peer.sin_addr.s_addr == from.sin_addr.s_addr)
+			st = m->streams[i];
+	if (st != NULL)
+		st->last = now.tv_sec;
+	pthread_mutex_unlock(&m->lock);
+	if (st == NULL) {
+		if ((st = new_stream(m, NULL, &why)) == NULL) {
+			host->log(m->core, 2, "a datagram to a port finds the machine out of channels");
+			return;
+		}
+		pthread_mutex_lock(&m->lock);
+		st->datagram = 1;
+		st->listener = m->listeners[port];
+		st->peer     = from;
+		st->last     = now.tv_sec;
+		pthread_mutex_unlock(&m->lock);
+		hull_msg_raw(&msg, "(7:connect");
+		hull_msg_channel(&msg, st->ch);
+		hull_msg_raw(&msg, "(4:port");
+		hull_msg_number(&msg, (long long)m->port_guest[port]);
+		hull_msg_raw(&msg, ")(5:proto3:udp))");
+		send_msg(m, &msg);
+		msg = (hull_msg){ 0 };
+	}
+	hull_msg_raw(&msg, "(4:data(3:buf");
+	hull_msg_atom(&msg, datagram, (size_t)n);
+	hull_msg_raw(&msg, ")");
+	hull_msg_channel(&msg, st->ch);
+	hull_msg_raw(&msg, "(2:fd1:0))");
+	send_msg(m, &msg);
+}
+
+/* The flows that have ended, been refused, or gone FLOW_IDLE seconds
+ * unused, or every flow once the machine has ended: dropped, and the
+ * agent told to close those it holds. Whether any is left. */
+static int sweep_flows(hull_machine *m, int all)
+{
+	hull_stream    *ended[MAX_STREAMS];
+	unsigned        count = 0u;
+	int             left = 0;
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	pthread_mutex_lock(&m->lock);
+	for (unsigned i = 0u; i < MAX_STREAMS; i++) {
+		hull_stream *st = m->streams[i];
+
+		if (st == NULL || !st->datagram)
+			continue;
+		if (all || st->lost || st->exited || now.tv_sec - st->last >= FLOW_IDLE) {
+			ended[count++] = st;
+			m->streams[i] = NULL;
+		} else {
+			left = 1;
+		}
+	}
+	pthread_mutex_unlock(&m->lock);
+	for (unsigned i = 0u; i < count; i++) {
+		if (!ended[i]->lost && !ended[i]->exited)
+			kill_stream(m, ended[i]);
+		free_stream(ended[i]);
+	}
+	return left;
+}
+
 /* The machine's forwarder: each connection to a listener gets a thread of
- * its own, until the machine ends and the reader wakes it. */
+ * its own, and each datagram goes on its client's flow, until the machine
+ * ends and the reader wakes it. Flows are swept each second there are
+ * any. */
 static void *forward_ports(void *arg)
 {
 	hull_machine *m = arg;
+	int           flows = 0;
 
 	for (;;) {
 		struct pollfd fds[1u + MAX_PORTS];
@@ -1815,7 +1924,7 @@ static void *forward_ports(void *arg)
 		fds[0] = (struct pollfd){ m->wake, POLLIN, 0 };
 		for (unsigned i = 0u; i < m->port_count; i++)
 			fds[1u + i] = (struct pollfd){ m->listeners[i], POLLIN, 0 };
-		if (poll(fds, 1u + m->port_count, -1) < 0 && errno != EINTR)
+		if (poll(fds, 1u + m->port_count, flows ? 1000 : -1) < 0 && errno != EINTR)
 			break;
 		if (fds[0].revents != 0)
 			break;
@@ -1825,6 +1934,10 @@ static void *forward_ports(void *arg)
 			pthread_attr_t detached;
 			int            fd;
 
+			if (fds[1u + i].revents != 0 && m->port_udp[i]) {
+				forward_datagram(m, i);
+				continue;
+			}
 			if (fds[1u + i].revents == 0 ||
 			    (fd = accept4(m->listeners[i], NULL, NULL, SOCK_CLOEXEC)) < 0)
 				continue;
@@ -1850,7 +1963,9 @@ static void *forward_ports(void *arg)
 			}
 			pthread_attr_destroy(&detached);
 		}
+		flows = sweep_flows(m, 0);
 	}
+	sweep_flows(m, 1);
 	return NULL;
 }
 
@@ -1875,7 +1990,7 @@ static const hull_cap_entry entries[] = {
 	{ "memory",             HULL_SUP_NATIVE,   "a hard allocation", NULL },
 	/* Section 6's host forwarder: the engine's, over vsock to the agent. */
 	{ "ports",              HULL_SUP_EMULATED,
-	  "tcp, forwarded over vsock from the machine's address", NULL },
+	  "tcp and udp, forwarded over vsock from the machine's address", NULL },
 
 	{ "security.readonly_root", HULL_SUP_NATIVE, NULL, NULL },
 	{ "security.no_new_privs",  HULL_SUP_NATIVE, "set by the agent on the workload", NULL },

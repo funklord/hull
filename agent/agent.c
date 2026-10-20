@@ -42,7 +42,10 @@
  * machine's own address, on a channel the host allocated, flowing on the
  * same credit as an exec. The host's `eof` shuts its write side, so a
  * client may half-close; the connection's end, read from the machine, is
- * `exited` with 0, and the host's `signal` on it ends it at once.
+ * `exited` with 0, and the host's `signal` on it ends it at once. With
+ * `(proto udp)` it is one client's datagrams, on a udp socket connected
+ * there: each `data` is one datagram, sent whole or dropped, as udp is,
+ * and neither way waits for credit. Only the host's `signal` ends it.
  *
  * One thread, one poll(): the connection, every channel's descriptors,
  * and a signalfd for SIGCHLD.
@@ -118,6 +121,7 @@ typedef struct channel {
 	int      reaped;
 	int      status;
 	int      socket;       /* a connection: `out` and `in` are one socket */
+	int      datagram;     /* a udp client's: a datagram a message, no credit */
 } channel;
 
 static channel channels[MAX_CHANNELS];
@@ -783,6 +787,18 @@ static int drain(channel *c, int *fd, int number)
 	size_t  want = sizeof buffer;
 	ssize_t n;
 
+	/* A datagram whole, an empty one too, on no credit. A refusal is the
+	 * ICMP of one sent before, and the client may send again. */
+	if (c->datagram) {
+		static uint8_t datagram[65536];
+
+		n = recv(*fd, datagram, sizeof datagram, 0);
+		if (n >= 0)
+			send_data(c->ch, number, datagram, (size_t)n);
+		else if (errno != EAGAIN && errno != EINTR && errno != ECONNREFUSED)
+			close_fd(fd);
+		return n >= 0;
+	}
 	if (c->credited && c->credit < want)
 		want = c->credit;
 	if (want == 0u)
@@ -855,7 +871,8 @@ static void settle(channel *c)
 
 /* `(connect (ch n) (port n))`: a connection to the machine's own address
  * on `port`, as docker's proxy makes one to a container's. A connect that
- * has not been answered in two seconds is refused. */
+ * has not been answered in two seconds is refused. With `(proto udp)` it
+ * is a udp socket connected there, one client's datagrams. */
 static const char *connect_port(const hull_sexpr_doc *body, uint32_t ch)
 {
 	hull_sexpr_form    value;
@@ -864,6 +881,7 @@ static const char *connect_port(const hull_sexpr_doc *body, uint32_t ch)
 	struct sockaddr_in to;
 	int                fd;
 	int                error = 0;
+	int                udp;
 	socklen_t          length = sizeof error;
 
 	if (!applied)
@@ -875,6 +893,7 @@ static const char *connect_port(const hull_sexpr_doc *body, uint32_t ch)
 	if (!hull_msg_find(body, "port", &value) || !hull_msg_long(body, &value, &port) ||
 	    port < 1 || port > 65535)
 		return "a port is 1 to 65535";
+	udp = hull_msg_find(body, "proto", &value);
 	for (unsigned i = 0u; i < MAX_CHANNELS && c == NULL; i++)
 		if (!channels[i].used)
 			c = &channels[i];
@@ -884,10 +903,12 @@ static const char *connect_port(const hull_sexpr_doc *body, uint32_t ch)
 	to.sin_family = AF_INET;
 	to.sin_port   = htons((uint16_t)port);
 	inet_pton(AF_INET, GUEST_ADDRESS, &to.sin_addr);
-	fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+	fd = socket(AF_INET, (udp ? SOCK_DGRAM : SOCK_STREAM) | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
 	if (fd < 0)
 		return strerror(errno);
-	if (connect(fd, (struct sockaddr *)&to, sizeof to) != 0) {
+	if (udp && connect(fd, (struct sockaddr *)&to, sizeof to) != 0)
+		error = errno;
+	else if (!udp && connect(fd, (struct sockaddr *)&to, sizeof to) != 0) {
 		struct pollfd wait = { fd, POLLOUT, 0 };
 
 		if (errno != EINPROGRESS)
@@ -902,9 +923,9 @@ static const char *connect_port(const hull_sexpr_doc *body, uint32_t ch)
 		return strerror(error);
 	}
 	memset(c, 0, sizeof *c);
-	c->input = malloc(WINDOW);
+	c->input = udp ? NULL : malloc(WINDOW);
 	c->in    = fcntl(fd, F_DUPFD_CLOEXEC, 0);
-	if (c->input == NULL || c->in < 0) {
+	if ((!udp && c->input == NULL) || c->in < 0) {
 		free(c->input);
 		close_fd(&c->in);
 		close(fd);
@@ -916,9 +937,10 @@ static const char *connect_port(const hull_sexpr_doc *body, uint32_t ch)
 	c->out      = fd;
 	c->err      = -1;
 	c->tty      = -1;
-	c->credited = 1;
+	c->credited = !udp;
 	c->credit   = WINDOW;
 	c->socket   = 1;
+	c->datagram = udp;
 	{
 		hull_msg m = { 0 };
 
@@ -1077,6 +1099,11 @@ static void handle(const hull_sexpr_doc *body)
 		hull_msg_find(body, "buf", &buf);
 		if (c == NULL || ch == 0) {
 			send_error((uint32_t)ch, "no such channel");
+		} else if (c->datagram) {
+			/* Sent whole or dropped, as udp is. */
+			if (c->in >= 0)
+				send(c->in, body->data + buf.content, buf.content_length,
+				     MSG_DONTWAIT | MSG_NOSIGNAL);
 		} else if (c->in < 0 || c->input_ended) {
 			send_credit(c->ch, buf.content_length);
 		} else if (c->queued + buf.content_length > WINDOW) {
@@ -1090,7 +1117,7 @@ static void handle(const hull_sexpr_doc *body)
 	} else if (hull_msg_is(body, "eof")) {
 		channel *c = channel_of((uint32_t)ch);
 
-		if (c != NULL && ch != 0) {
+		if (c != NULL && ch != 0 && !c->datagram) {
 			c->input_ended = 1;
 			feed(c);
 		}

@@ -91,3 +91,6 @@ agent_message credit 28 36 3A 63 72 65 64 69 74 28 35 3A 62 79 74 65 73 31 3A 31
 
 # connect: (7:connect(2:ch1:5)(4:port2:80))
 host_message connect 28 37 3A 63 6F 6E 6E 65 63 74 28 32 3A 63 68 31 3A 35 29 28 34 3A 70 6F 72 74 32 3A 38 30 29 29
+
+# connect_udp: (7:connect(2:ch1:5)(4:port2:53)(5:proto3:udp))
+host_message connect_udp 28 37 3A 63 6F 6E 6E 65 63 74 28 32 3A 63 68 31 3A 35 29 28 34 3A 70 6F 72 74 32 3A 35 33 29 28 35 3A 70 72 6F 74 6F 33 3A 75 64 70 29 29

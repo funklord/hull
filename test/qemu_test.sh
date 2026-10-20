@@ -412,7 +412,7 @@ has 143 '^drank bytes=3000000 '
 has 143 '^left$'
 has 143 '^poured=(Broken pipe|Connection reset by peer)$'
 has 143 '^held then ended$'
-has 143 'ports: emulated: tcp, forwarded over vsock'
+has 143 'ports: emulated: tcp and udp, forwarded over vsock'
 # The machine gone, its listeners are closed, while the core runs on.
 cases=$((cases + 1))
 if python3 -c '
@@ -423,7 +423,7 @@ fi
 timeout 30 "$hull" stop qkeep > /dev/null 2>&1
 wait "$keeper"
 # A port taken on another address leaves the machine its own; taken on
-# the machine's address, it refuses the start. A udp port refuses the plan.
+# the machine's address, it refuses the start.
 hold_port() { # ADDRESS PORT
 	timeout 30 python3 -c '
 import socket, sys, time
@@ -450,10 +450,64 @@ boot taken
 has 125 "port $greet on $(printf '%s' "$at" | sed 's/\./\\./g'): Address already in use"
 kill "$holder" 2>/dev/null
 wait "$holder" 2>/dev/null
-conf udp "(backend vm) (ports (port (host $greet) (guest 53) (proto udp))) (command \"/probe\")"
-name=udp
-boot udp
-has 125 'a udp port is not forwarded by the qemu engine yet'
+
+# A udp port: each client its own flow, each datagram whole, an empty one
+# too, and the machine's replies to the client that sent. A datagram the
+# machine is not yet listening for is dropped, as udp's are, and the
+# client sends again, 360 times a quarter of a second apart at most. The
+# refusal that datagram meets in the machine does not end its flow: once
+# the probe listens again, the client comes from the port it came from.
+conf udp "(backend vm) (hostname \"qudp\") (ports (port (host $greet) (guest 53) (proto udp)))" \
+	'(command "/probe" "echo" "53" "sleep" "2" "echo" "53")'
+at=$(address_of qudp)
+cases=$((cases + 1))
+rm -f "$root/udp.out"
+(cd / && exec timeout -k 2 60 "$hull" run -f "$root/udp.conf" > "$root/udp.out" 2>&1) &
+runner=$!
+heard=$(timeout 120 python3 -c '
+import socket, sys, time
+at = (sys.argv[1], int(sys.argv[2]))
+def ask(s, data):
+    for _ in range(360):
+        s.sendto(data, at)
+        s.settimeout(0.25)
+        try:
+            while True:
+                reply = s.recv(65536)
+                if reply == data:
+                    return True
+        except socket.timeout:
+            pass
+    return False
+a = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+print("a=%s b=%s" % (ask(a, b"from a"), ask(b, b"from b")))
+for n in (0, 1, 1400, 65000):
+    print("%d=%s" % (n, ask(a, bytes((i * 7) & 0xff for i in range(n)))))
+print("end=%s" % ask(b, b"end"))
+# Into the gap, then until the second echo answers.
+time.sleep(0.5)
+a.sendto(b"refused", at)
+time.sleep(0.5)
+print("again=%s" % ask(a, b"again"))
+print("end=%s" % ask(a, b"end"))' "$at" "$greet" 2>&1)
+wait "$runner"
+got=$?
+[ "$got" = 0 ] && [ "$heard" = "a=True b=True
+0=True
+1=True
+1400=True
+65000=True
+end=True
+again=True
+end=True" ] && [ "$(grep -c '^echoed from' "$root/udp.out")" = 2 ] &&
+	grep -q '^echoed from 2$' "$root/udp.out" && grep -q '^echoed from 1$' "$root/udp.out" &&
+	[ "$(grep '^from ' "$root/udp.out" | sed -n 1p)" = "$(grep '^from ' "$root/udp.out" | sed -n 3p)" ] ||
+	fail "a udp port's datagrams were not each client's, whole: $got" \
+		"$heard; $(cat "$root/udp.out")"
+cases=$((cases + 1))
+grep -q 'ports: emulated: tcp and udp, forwarded over vsock' "$root/udp.out" ||
+	fail "the udp machine did not say how its ports are forwarded" "$(cat "$root/udp.out")"
 
 # A running machine: listed, signalled through the agent, and stopped by
 # SIGTERM to its frontend.
