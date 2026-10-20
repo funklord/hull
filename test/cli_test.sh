@@ -18,6 +18,10 @@ mkdir -p "$dir"
 XDG_RUNTIME_DIR=$(cd "${BUILD_DIR:?}" && pwd)/test/run
 export XDG_RUNTIME_DIR
 export HULL_CORE_IDLE=1
+# No daemon: the core this suite starts reaches no docker, so that its gc
+# looks at nothing of the account's.
+DOCKER_HOST=unix://$XDG_RUNTIME_DIR/no-docker.sock
+export DOCKER_HOST
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 cases=0
@@ -79,6 +83,9 @@ expect 2 '^usage: hull plan' "$hull"
 expect 2 '^usage: hull plan' "$hull" frobnicate
 expect 0 '^docker: ns \(runs as root\)$' "$hull" engines
 expect 0 '^qemu: vm emu$' "$hull" engines
+# gc starts a core for itself, which asks each engine that keeps anything:
+# docker, which says it cannot look, and that is not gc failing.
+expect 0 '^docker: the Docker daemon at .*/no-docker\.sock cannot be reached$' "$hull" gc
 expect 0 '^  fidelity\.inotify +rejected: .* \(--accept vm:inotify-poll\)$' "$hull" engines
 
 # plan: the spec's own backend, J.1's ns where it names none.

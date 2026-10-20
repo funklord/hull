@@ -375,8 +375,56 @@ cases=$((cases + 1))
 cases=$((cases + 1))
 timeout 10 docker image inspect "hull-dtest-named:$changed" > /dev/null 2>&1 ||
 	fail "an import with another name was retired with it" ""
+
+# gc removes an import whose tree is gone, keeps one a running machine
+# uses until it has stopped, and leaves a live tree's alone. An import
+# from before the labels, made here by docker with none, goes too.
+mkdir -p "$root/gone" "$root/inuse/srv" "$root/empty"
+cp "$probe" "$root/gone/probe"
+cp "$probe" "$root/inuse/probe"
+printf 'in use\n' > "$root/inuse/srv/which"
+printf '(machine (source "dir:./gone") (mutable overlay) (backend docker) (hostname "dtest") %s)\n' \
+	'(command "/probe" "say" "gone")' > "$root/gone.conf"
+printf '(machine (source "dir:./inuse") (mutable overlay) (backend docker) (hostname "dtest-inuse") %s)\n' \
+	'(command "/probe" "wait")' > "$root/inuse.conf"
+gone=$(timeout 60 "$tree_tar" "$root/gone" | sha256sum | cut -c1-64)
+inuse=$(timeout 60 "$tree_tar" "$root/inuse" | sha256sum | cut -c1-64)
+unlabelled=0000000000000000000000000000000000000000000000000000000000000000
+expect 0 '^gone$' gone
+rm -f "$root/inuse.out"
+(cd / && exec timeout -k 2 60 "$hull" run -f "$root/inuse.conf" > "$root/inuse.out" 2>&1) &
+holder=$!
+tries=0
+until grep -q '^waiting$' "$root/inuse.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+timeout 30 tar -C "$root/empty" -cf - . | timeout 60 docker import - "hull-dir:$unlabelled" > /dev/null 2>&1
+rm -rf -- "${root:?}/gone" "${root:?}/inuse"
+cases=$((cases + 1))
+out=$(cd / && timeout 60 "$hull" gc 2>&1)
+got=$?
+[ "$got" = 0 ] && printf '%s\n' "$out" | grep -qx "docker: removed hull-dir:$gone, its tree is gone" &&
+	printf '%s\n' "$out" | grep -qx "docker: removed hull-dir:$unlabelled, imported before hull.tree labelled its tree" &&
+	printf '%s\n' "$out" | grep -q "^docker: kept: .* hull-dir:$inuse, its tree is gone\$" &&
+	! printf '%s\n' "$out" | grep -q "hull-dir:$third" ||
+	fail "gc did not remove the imports nothing wants, and only those: $got" "$out"
+cases=$((cases + 1))
+! timeout 10 docker image inspect "hull-dir:$gone" > /dev/null 2>&1 &&
+	! timeout 10 docker image inspect "hull-dir:$unlabelled" > /dev/null 2>&1 &&
+	timeout 10 docker image inspect "hull-dir:$inuse" > /dev/null 2>&1 &&
+	timeout 10 docker image inspect "hull-dir:$third" > /dev/null 2>&1 ||
+	fail "gc's report is not what the daemon holds" \
+		"$(timeout 10 docker images --filter reference=hull-dir 2>&1)"
+timeout 10 "$hull" kill -s TERM dtest-inuse > /dev/null 2>&1
+wait "$holder"
+cases=$((cases + 1))
+out=$(cd / && timeout 60 "$hull" gc 2>&1)
+printf '%s\n' "$out" | grep -qx "docker: removed hull-dir:$inuse, its tree is gone" &&
+	! timeout 10 docker image inspect "hull-dir:$inuse" > /dev/null 2>&1 ||
+	fail "gc kept an import once nothing used it" "$out"
 timeout 30 docker rmi "hull-dir:$digest" "hull-dir:$changed" "hull-dtest-named:$changed" \
-	"hull-dir:$third" > /dev/null 2>&1
+	"hull-dir:$third" "hull-dir:$gone" "hull-dir:$inuse" "hull-dir:$unlabelled" > /dev/null 2>&1
 rm -f "$root/rootfs/srv/added" "$root/rootfs/srv/more"
 printf '(machine (source "dir:./rootfs") (backend docker) (hostname "dtest") (command "/probe"))\n' \
 	> "$root/dirin.conf"

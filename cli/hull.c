@@ -89,6 +89,7 @@ static void usage(FILE *out)
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
 	      "       hull kill [-s SIGNAL] ID | hull stats ID | hull ssh ID\n"
+	      "       hull gc\n"
 	      "       hull core\n"
 	      "       hull engines\n"
 	      "       hull --version\n", out);
@@ -721,6 +722,23 @@ static int list_machines(void)
 	return 0;
 }
 
+/* `hull gc`: what the engines keep that nothing wants, reclaimed by the
+ * core, which is started for it, and each engine's report written out. An
+ * engine that could not look says so on stderr, and is not a failure of
+ * gc's: a host without docker has nothing of docker's to reclaim. */
+static int collect(void)
+{
+	hull_wire wire;
+	int       status;
+
+	if (connect_core(&wire, 1) != 0)
+		return 2;
+	send_request(&wire, "(2:gc", 1u, NULL, NULL);
+	status = follow(&wire, 1u, NULL);
+	hull_wire_close(&wire);
+	return status == 125 ? 1 : 0;
+}
+
 /* --- exec -------------------------------------------------------------- */
 
 /* What `hull exec` forwards, by the names the protocol uses. */
@@ -1161,6 +1179,8 @@ int main(int argc, char **argv)
 		return hull_core_run(host_arch());
 	if (strcmp(command, "ps") == 0 && argc == 2)
 		return list_machines();
+	if (strcmp(command, "gc") == 0 && argc == 2)
+		return collect();
 	if (strcmp(command, "exec") == 0) {
 		int at  = 2;
 		int tty = 0;

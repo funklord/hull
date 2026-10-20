@@ -277,6 +277,15 @@ struct client_message size=5.. access=Sequential mutate=Shifting address=Unstabl
   client_message.body.stats.machine.id.bytes offset=Scanned size=Bounded(0, 4294967295) align=Unaligned repr=MemoryIdentical atomic=AtomicWord access=Sequential mutate=Shifting address=Unstable
   client_message.body.stats.machine.close offset=Dynamic size=Fixed(1) align=Unaligned repr=MemoryIdentical atomic=AtomicWord address=Unstable
   client_message.body.stats.close        offset=Dynamic size=Fixed(1) align=Unaligned repr=MemoryIdentical atomic=AtomicWord address=Unstable
+  client_message.body.gc                 offset=AbsoluteStatic(0x01) size=Bounded(12, 4294967316) align=Aligned(1) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
+  client_message.body.gc.<reserved0>     offset=AbsoluteStatic(0x01) size=Fixed(4) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
+  client_message.body.gc.ch              offset=AbsoluteStatic(0x05) size=Bounded(7, 4294967311) align=Aligned(1) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
+  client_message.body.gc.ch.<reserved0>  offset=AbsoluteStatic(0x05) size=Fixed(5) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
+  client_message.body.gc.ch.id           offset=AbsoluteStatic(0x0A) size=Bounded(1, 4294967305) align=Aligned(2) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
+  client_message.body.gc.ch.id.length    offset=AbsoluteStatic(0x0A) size=Bounded(1, 10) align=Aligned(2) repr=TextConverted atomic=NonAtomic mutate=Shifting
+  client_message.body.gc.ch.id.bytes     offset=Scanned size=Bounded(0, 4294967295) align=Unaligned repr=MemoryIdentical atomic=AtomicWord access=Sequential mutate=Shifting address=Unstable
+  client_message.body.gc.ch.close        offset=Dynamic size=Fixed(1) align=Unaligned repr=MemoryIdentical atomic=AtomicWord address=Unstable
+  client_message.body.gc.close           offset=Dynamic size=Fixed(1) align=Unaligned repr=MemoryIdentical atomic=AtomicWord address=Unstable
   client_message.body.data               offset=AbsoluteStatic(0x01) size=Bounded(31, 8589934639) align=Aligned(1) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
   client_message.body.data.<reserved0>   offset=AbsoluteStatic(0x01) size=Fixed(12) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
   client_message.body.data.bytes         offset=AbsoluteStatic(0x0D) size=Bounded(1, 4294967305) align=Aligned(1) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
@@ -670,6 +679,16 @@ struct form size=1.. access=Sequential mutate=Shifting address=Unstable repr=Tex
   form.body.as_atom                      offset=AbsoluteStatic(0x00) size=Bounded(1, 4294967305) align=Aligned(8) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
   form.body.as_atom.length               offset=AbsoluteStatic(0x00) size=Bounded(1, 10) align=Aligned(8) repr=TextConverted atomic=AtomicWord mutate=Shifting
   form.body.as_atom.bytes                offset=Scanned size=Bounded(0, 4294967295) align=Unaligned repr=MemoryIdentical atomic=AtomicWord access=Sequential mutate=Shifting address=Unstable
+
+struct gc size=12..4294967316 access=Sequential mutate=Shifting address=Unstable repr=TextConverted atomic=NonAtomic
+  gc.<reserved0>                         offset=AbsoluteStatic(0x00) size=Fixed(4) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic
+  gc.ch                                  offset=AbsoluteStatic(0x04) size=Bounded(7, 4294967311) align=Aligned(4) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
+  gc.ch.<reserved0>                      offset=AbsoluteStatic(0x04) size=Fixed(5) align=Aligned(4) repr=MemoryIdentical atomic=NonAtomic
+  gc.ch.id                               offset=AbsoluteStatic(0x09) size=Bounded(1, 4294967305) align=Aligned(1) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
+  gc.ch.id.length                        offset=AbsoluteStatic(0x09) size=Bounded(1, 10) align=Aligned(1) repr=TextConverted atomic=NonAtomic mutate=Shifting
+  gc.ch.id.bytes                         offset=Scanned size=Bounded(0, 4294967295) align=Unaligned repr=MemoryIdentical atomic=AtomicWord access=Sequential mutate=Shifting address=Unstable
+  gc.ch.close                            offset=Dynamic size=Fixed(1) align=Unaligned repr=MemoryIdentical atomic=AtomicWord address=Unstable
+  gc.close                               offset=Dynamic size=Fixed(1) align=Unaligned repr=MemoryIdentical atomic=AtomicWord address=Unstable
 
 struct kill size=37..12884901949 access=Sequential mutate=Shifting address=Unstable repr=TextConverted atomic=NonAtomic
   kill.<reserved0>                       offset=AbsoluteStatic(0x00) size=Fixed(6) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic

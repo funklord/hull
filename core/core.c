@@ -172,6 +172,9 @@ typedef struct exec_entry {
 } exec_entry;
 
 static client        clients[MAX_CLIENTS];
+/* Bumped as each client takes its place, which a disconnect clears: an
+ * answer made off the loop, gc's, reaches only the client that asked. */
+static unsigned      client_generation[MAX_CLIENTS];
 static slot          machines[MAX_MACHINES];
 static exec_entry    execs[MAX_EXECS];
 static hull_registry registry;
@@ -187,7 +190,7 @@ static exec_entry *exec_of(hull_stream *stream);
 
 /* --- events from engine threads ------------------------------------------ */
 
-typedef enum event_kind { EVENT_DATA, EVENT_EXIT, EVENT_STATE } event_kind;
+typedef enum event_kind { EVENT_DATA, EVENT_EXIT, EVENT_STATE, EVENT_GC, EVENT_GC_DONE } event_kind;
 
 typedef struct event {
 	event_kind     kind;
@@ -198,6 +201,9 @@ typedef struct event {
 	int            code;
 	int            signal;
 	char           state[16];
+	unsigned       client;     /* gc's: the client's place, its generation, */
+	unsigned       client_generation;
+	uint32_t       ch;         /* and the channel it asked on */
 	size_t         length;
 	struct event  *next;
 	uint8_t        bytes[];
@@ -816,6 +822,19 @@ static void drain_list(event *e)
 		event *next = e->next;
 		slot  *s    = e->slot;
 
+		if (e->kind == EVENT_GC || e->kind == EVENT_GC_DONE) {
+			client *c = &clients[e->client];
+
+			if (c->used && client_generation[e->client] == e->client_generation) {
+				if (e->kind == EVENT_GC)
+					send_data(c, e->ch, e->fd, e->bytes, e->length);
+				else
+					send_simple(c, "(4:done", e->ch);
+			}
+			free(e);
+			e = next;
+			continue;
+		}
 		if (e->stream != NULL) {
 			exec_event(e);
 			free(e);
@@ -841,6 +860,9 @@ static void drain_list(event *e)
 			if (!s->exited)
 				snprintf(s->state, sizeof s->state, "%s", e->state);
 			break;
+		case EVENT_GC:
+		case EVENT_GC_DONE:
+			break;  /* answered above */
 		}
 		free(e);
 		e = next;
@@ -1514,6 +1536,81 @@ static void handle_list(client *c, uint32_t ch)
 	send_to(c, &m);
 }
 
+/* gc, on a thread of its own, since an engine's may take a while: each
+ * engine that keeps anything is asked in turn, its report sent as data and
+ * its failure on fd 2, then done. One at a time, an engine's report being
+ * its own until it is next asked. */
+typedef struct gc_job {
+	unsigned client;
+	unsigned generation;
+	uint32_t ch;
+} gc_job;
+
+static pthread_mutex_t gc_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void gc_said(const gc_job *job, event_kind kind, int fd, const void *bytes, size_t n)
+{
+	event *e = new_event(kind, NULL, n);
+
+	if (e == NULL)
+		return;
+	e->client            = job->client;
+	e->client_generation = job->generation;
+	e->ch                = job->ch;
+	e->fd                = fd;
+	if (n > 0u)
+		memcpy(e->bytes, bytes, n);
+	enqueue(e);
+}
+
+static void *run_gc(void *arg)
+{
+	gc_job *job = arg;
+
+	pthread_mutex_lock(&gc_lock);
+	for (uint32_t i = 0u; i < registry.count; i++) {
+		const hull_engine_ops *ops = registry.engines[i]->ops;
+		hull_error             error = { .struct_size = sizeof error };
+		hull_buf               report = { NULL, 0u };
+		char                   line[600];
+
+		if (ops->struct_size < offsetof(hull_engine_ops, gc) + sizeof ops->gc || ops->gc == NULL)
+			continue;
+		if (ops->gc(NULL, &report, &error) == HULL_OK) {
+			if (report.len > 0u)
+				gc_said(job, EVENT_GC, 1, report.data, report.len);
+		} else {
+			snprintf(line, sizeof line, "%s: %s\n", registry.engines[i]->caps->engine_name,
+			         error.detail != NULL ? error.detail : "refused");
+			gc_said(job, EVENT_GC, 2, line, strlen(line));
+		}
+	}
+	pthread_mutex_unlock(&gc_lock);
+	gc_said(job, EVENT_GC_DONE, 0, NULL, 0u);
+	free(job);
+	return NULL;
+}
+
+static void handle_gc(client *c, uint32_t ch)
+{
+	gc_job   *job = malloc(sizeof *job);
+	pthread_t thread;
+
+	if (job == NULL) {
+		send_error(c, ch, "out of memory");
+		return;
+	}
+	job->client     = (unsigned)(c - clients);
+	job->generation = client_generation[job->client];
+	job->ch         = ch;
+	if (pthread_create(&thread, NULL, run_gc, job) != 0) {
+		free(job);
+		send_error(c, ch, "no thread for gc");
+		return;
+	}
+	pthread_detach(thread);
+}
+
 static void handle(client *c, const hull_sexpr_doc *body)
 {
 	hull_sexpr_form value;
@@ -1559,6 +1656,8 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		handle_kill(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "stats")) {
 		handle_stats(c, (uint32_t)ch, body);
+	} else if (hull_msg_is(body, "gc")) {
+		handle_gc(c, (uint32_t)ch);
 	} else {
 		send_error(c, (uint32_t)ch, "unsupported");
 	}
@@ -1777,6 +1876,7 @@ int hull_core_run(const char *host_arch)
 				if (!clients[i].used) {
 					if (hull_wire_open(&clients[i].wire, fd, HULL_WIRE_FROM_CLIENT) == 0) {
 						clients[i].used = 1;
+						client_generation[i]++;
 						fd = -1;
 					}
 				}

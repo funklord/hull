@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <poll.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -448,7 +449,8 @@ static void retire_imports(const char *tree, const char *keep)
  * An import is labelled hull.tree, the SHA-256 of the tree's real path, which
  * no path can make a label instruction or a query of, and a fresh one
  * retires the tree's others: the daemon keeps one import per tree, and
- * not one per state of it that ever ran.
+ * not one per state of it that ever ran. hull.path is that path in hex,
+ * for gc to ask whether the tree is still there.
  */
 static const char *import_dir(const char *root, char *image, size_t cap, char *detail,
                               size_t detail_cap)
@@ -460,6 +462,7 @@ static const char *import_dir(const char *root, char *image, size_t cap, char *d
 	uint8_t           again[32];
 	char              hex[65];
 	char              tree[65];
+	char              where[2u * PATH_MAX + 1u];
 	char              path[400];
 	char              id[80];
 	char             *answer = NULL;
@@ -485,6 +488,10 @@ static const char *import_dir(const char *root, char *image, size_t cap, char *d
 
 		hull_sha256_init(&named);
 		hull_sha256_update(&named, (const uint8_t *)name, strlen(name));
+		/* And the path itself, in hex, which gc reads back. */
+		where[0] = '\0';
+		for (size_t i = 0u; name[i] != '\0' && 2u * i + 2u < sizeof where; i++)
+			snprintf(where + 2u * i, 3u, "%02x", (unsigned char)name[i]);
 		free(canonical);
 		hull_sha256_final(&named, again);
 		hull_sha256_hex(again, tree);
@@ -508,9 +515,10 @@ static const char *import_dir(const char *root, char *image, size_t cap, char *d
 		snprintf(detail, detail_cap, "the Docker daemon at %s cannot be reached", socket_path());
 		return detail;
 	}
-	addf(&head, "POST " API "/images/create?fromSrc=-&changes=LABEL%%20hull.tree%%3D%s HTTP/1.1\r\n"
+	addf(&head, "POST " API "/images/create?fromSrc=-&changes=LABEL%%20hull.tree%%3D%s"
+	     "&changes=LABEL%%20hull.path%%3D%s HTTP/1.1\r\n"
 	     "Host: docker\r\nConnection: close\r\nContent-Type: application/x-tar\r\n"
-	     "Content-Length: %llu\r\n\r\n", tree, first.length);
+	     "Content-Length: %llu\r\n\r\n", tree, where, first.length);
 	memset(&second, 0, sizeof second);
 	hull_sha256_init(&second.sha);
 	second.fd    = fd;
@@ -1441,6 +1449,110 @@ static const hull_capabilities caps = {
 	.requires_root  = 1,              /* dockerd's root daemon (5.0) */
 };
 
+/* --- gc ------------------------------------------------------------------ */
+
+/* Why an import of a dir source is no longer wanted, or NULL: it has no
+ * label naming its tree, being older than the label, or its tree is not
+ * a directory now. `inspected` is the daemon's answer for the image. */
+static const char *unwanted(const char *inspected, char *tree_path, size_t cap)
+{
+	char        tree[80];
+	char        where[2u * PATH_MAX + 1u];
+	struct stat st;
+	size_t      n = 0u;
+
+	if (!json_string(inspected, "hull.tree", tree, sizeof tree))
+		return "imported before hull.tree labelled its tree";
+	if (!json_string(inspected, "hull.path", where, sizeof where))
+		return "imported before hull.path named its tree";
+	for (size_t i = 0u; where[i] != '\0' && where[i + 1u] != '\0' && n + 1u < cap; i += 2u) {
+		unsigned byte = 0u;
+
+		if (sscanf(where + i, "%2x", &byte) != 1)
+			return "its hull.path is not hex";
+		tree_path[n++] = (char)byte;
+	}
+	tree_path[n] = '\0';
+	if (stat(tree_path, &st) != 0 || !S_ISDIR(st.st_mode))
+		return "its tree is gone";
+	return NULL;
+}
+
+/* Each hull-dir import nothing wants, removed unforced, so that the
+ * daemon keeps one a container uses or one with another name; a line
+ * each, of what was removed and what was kept. */
+static hull_status docker_gc(hull_core *core, hull_buf *report, hull_error *error)
+{
+	static text said;
+	static char detail[512];
+	char       *answer = NULL;
+	const char *at;
+	int         status = 0;
+
+	(void)core;
+	free(said.data);
+	said = (text){ 0 };
+	/* {"reference":["hull-dir"]}, escaped for the query. */
+	if (call("GET", "/images/json?filters=%7B%22reference%22%3A%5B%22hull-dir%22%5D%7D", NULL,
+	         &status, &answer) != 0) {
+		snprintf(detail, sizeof detail, "the Docker daemon at %s cannot be reached",
+		         socket_path());
+		return fail(error, HULL_ERR_RUNTIME, detail);
+	}
+	if (status != 200) {
+		daemon_says(detail, sizeof detail, "listing the imports", status, answer);
+		free(answer);
+		return fail(error, HULL_ERR_RUNTIME, detail);
+	}
+	for (at = strstr(answer, "\"Id\":\""); at != NULL; at = strstr(at, "\"Id\":\"")) {
+		char        id[80];
+		char        name[160] = "";
+		char        path[200];
+		char        tree_path[PATH_MAX];
+		char       *inspected = NULL;
+		char       *gone = NULL;
+		const char *why;
+		const char *tags;
+		size_t      n = 0u;
+		int         result = 0;
+
+		for (at += strlen("\"Id\":\""); *at != '"' && *at != '\0' && n + 1u < sizeof id;)
+			id[n++] = *at++;
+		id[n] = '\0';
+		snprintf(path, sizeof path, "/images/%s/json", id);
+		if (n == 0u || call("GET", path, NULL, &result, &inspected) != 0 || result != 200) {
+			free(inspected);
+			continue;
+		}
+		/* Its first name, which is the one hull gave it. */
+		tags = strstr(inspected, "\"RepoTags\":[\"");
+		n = 0u;
+		if (tags != NULL)
+			for (tags += strlen("\"RepoTags\":[\""); *tags != '"' && *tags != '\0' &&
+			     n + 1u < sizeof name;)
+				name[n++] = *tags++;
+		name[n] = '\0';
+		why = unwanted(inspected, tree_path, sizeof tree_path);
+		if (why == NULL) {
+			free(inspected);
+			continue;
+		}
+		snprintf(path, sizeof path, "/images/%s", id);
+		if (call("DELETE", path, NULL, &result, &gone) == 0 && result == 200) {
+			addf(&said, "docker: removed %s, %s\n", name[0] != '\0' ? name : id, why);
+		} else {
+			daemon_says(detail, sizeof detail, "kept", result, gone);
+			addf(&said, "docker: %s %s, %s\n", detail, name[0] != '\0' ? name : id, why);
+		}
+		free(gone);
+		free(inspected);
+	}
+	free(answer);
+	report->data = (const uint8_t *)said.data;
+	report->len  = said.length;
+	return HULL_OK;
+}
+
 static const hull_engine_ops ops = {
 	.struct_size = sizeof (hull_engine_ops),
 	.create      = docker_create,
@@ -1453,6 +1565,7 @@ static const hull_engine_ops ops = {
 	.stream_close = docker_stream_close,
 	.resize       = docker_resize,
 	.signal       = docker_signal,
+	.gc           = docker_gc,
 };
 
 static const hull_engine engine = {

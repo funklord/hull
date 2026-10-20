@@ -207,6 +207,14 @@ typedef struct hull_engine_ops {
 	/* Reserved for Appendix H; NULL in v1 engines. */
 	hull_status (*migrate_out)(void); /* placeholder slot -- signature TBD   */
 	hull_status (*migrate_in) (void); /* placeholder slot -- signature TBD   */
+
+	/* What the engine keeps between machines and nothing needs any more --
+	 * docker's imports of trees that are gone -- reclaimed, and said as
+	 * lines of text in `report`, an engine-owned buffer valid until the
+	 * next call. It may block: the core calls it off its loop, with no
+	 * machine, so `core` is NULL. NULL where an engine keeps nothing.
+	 * Appended (rule 4): read it only where struct_size reaches it. */
+	hull_status (*gc)(hull_core*, hull_buf *report, hull_error*);
 } hull_engine_ops;
 
 /* ---- Registration --------------------------------------------------------

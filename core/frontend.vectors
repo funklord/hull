@@ -26,6 +26,9 @@ client_message stop 28 34 3A 73 74 6F 70 28 32 3A 63 68 31 3A 35 29 28 37 3A 6D 
 # list: (4:list(2:ch1:6))
 client_message list 28 34 3A 6C 69 73 74 28 32 3A 63 68 31 3A 36 29 29
 
+# gc: (2:gc(2:ch1:7))
+client_message gc 28 32 3A 67 63 28 32 3A 63 68 31 3A 37 29 29
+
 # unknown: (4:ping(2:ch1:0))
 client_message unknown 28 34 3A 70 69 6E 67 28 32 3A 63 68 31 3A 30 29 29
 

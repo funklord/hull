@@ -28,6 +28,7 @@ const WINCH    = ('5' << 24) | (':' << 16) | ('w' << 8) | 'i';
 const SIGNAL   = ('6' << 24) | (':' << 16) | ('s' << 8) | 'i';
 const KILL     = ('4' << 24) | (':' << 16) | ('k' << 8) | 'i';
 const STATS    = ('5' << 24) | (':' << 16) | ('s' << 8) | 't';  // both ways
+const GC       = ('2' << 24) | (':' << 16) | ('g' << 8) | 'c';
 const STARTED  = ('7' << 24) | (':' << 16) | ('s' << 8) | 't';
 const DATA     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'a';
 const EXITED   = ('6' << 24) | (':' << 16) | ('e' << 8) | 'x';
@@ -55,6 +56,7 @@ struct client_message {
 		case SIGNAL:  signal        signal;
 		case KILL:    kill          kill;
 		case STATS:   stats         stats;
+		case GC:      gc            gc;
 		case DATA:    client_data   data;
 		case EOF:     eof           eof;
 		case CREDIT:  credit        credit;
@@ -116,6 +118,15 @@ struct stop {
 // The machines the core holds, answered `machines`.
 struct listing {
 	preamble u8[6] = "4:list";
+	channel  ch;
+	u8  close  [must_eq = ')'];
+}
+
+// Reclaim what the engines keep that nothing wants (project.md section
+// 4.10): each engine's report as `data`, its failure on fd 2, then
+// `done`.
+struct gc {
+	preamble u8[4] = "2:gc";
 	channel  ch;
 	u8  close  [must_eq = ')'];
 }
