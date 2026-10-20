@@ -88,7 +88,7 @@ static void usage(FILE *out)
 	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [NAME]\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
-	      "       hull kill [-s SIGNAL] ID | hull stats ID | hull ssh ID\n"
+	      "       hull kill [-s SIGNAL] ID | hull stats ID | hull ssh ID | hull proxy-ssh HOST\n"
 	      "       hull gc\n"
 	      "       hull core\n"
 	      "       hull engines\n"
@@ -807,7 +807,7 @@ static void send_winch(int fd)
  * forwarded, and the command decides. With -t it runs on a terminal of
  * its own, this one is raw while it does, and its size follows this
  * one's. */
-static int exec_in(const char *id, char **argv, int argc, int tty)
+static int exec_in(const char *id, char **argv, int argc, int tty, unsigned port)
 {
 	hull_wire        wire;
 	hull_msg         request = { 0 };
@@ -829,19 +829,29 @@ static int exec_in(const char *id, char **argv, int argc, int tty)
 	}
 	if (connect_core(&wire, 0) != 0)
 		return 125;
-	hull_msg_raw(&request, "(4:exec(4:argv");
-	for (int i = 0; i < argc; i++)
-		hull_msg_text(&request, argv[i]);
-	hull_msg_raw(&request, ")");
-	hull_msg_channel(&request, 1u);
-	hull_msg_raw(&request, "(7:machine");
-	hull_msg_text(&request, id);
-	hull_msg_raw(&request, ")(3:tty");
-	if (tty)
-		add_window(&request);
-	else
-		hull_msg_raw(&request, "5:false");
-	hull_msg_raw(&request, "))");
+	if (port > 0u) {
+		hull_msg_raw(&request, "(4:dial");
+		hull_msg_channel(&request, 1u);
+		hull_msg_raw(&request, "(7:machine");
+		hull_msg_text(&request, id);
+		hull_msg_raw(&request, ")(4:port");
+		hull_msg_number(&request, (long long)port);
+		hull_msg_raw(&request, "))");
+	} else {
+		hull_msg_raw(&request, "(4:exec(4:argv");
+		for (int i = 0; i < argc; i++)
+			hull_msg_text(&request, argv[i]);
+		hull_msg_raw(&request, ")");
+		hull_msg_channel(&request, 1u);
+		hull_msg_raw(&request, "(7:machine");
+		hull_msg_text(&request, id);
+		hull_msg_raw(&request, ")(3:tty");
+		if (tty)
+			add_window(&request);
+		else
+			hull_msg_raw(&request, "5:false");
+		hull_msg_raw(&request, "))");
+	}
 
 	/* Held outside ppoll(), so that none arrives between the look at
 	 * what has and the wait. */
@@ -1014,9 +1024,34 @@ static int ssh_into(const char *id)
 		return 125;
 	}
 	if (term == NULL || term[0] == '\0')
-		return exec_in(id, login, 2, 1);
+		return exec_in(id, login, 2, 1, 0u);
 	termed[4] = (char *)term;
-	return exec_in(id, termed, 5, 1);
+	return exec_in(id, termed, 5, 1, 0u);
+}
+
+/*
+ * `hull proxy-ssh HOST`: section 8.1's ProxyCommand, so that `ssh web.hull`
+ * reaches the machine's sshd, its port 22, declared or not, on every
+ * engine that gives a machine ports of its own. HOST is the machine's
+ * name, with or without `.hull`; stdin and stdout are the connection, as
+ * ssh expects of a ProxyCommand.
+ */
+static int proxy_ssh(const char *host)
+{
+	char   id[64];
+	size_t n = strlen(host);
+
+	if (n > 0u && host[n - 1u] == '.')
+		n--;
+	if (n >= 5u && strncmp(host + n - 5u, ".hull", 5u) == 0)
+		n -= 5u;
+	if (n == 0u || n >= sizeof id) {
+		fprintf(stderr, "hull: %s names no machine\n", host);
+		return 125;
+	}
+	memcpy(id, host, n);
+	id[n] = '\0';
+	return exec_in(id, NULL, 0, 0, 22u);
 }
 
 static int stats_of(const char *id)
@@ -1181,6 +1216,8 @@ int main(int argc, char **argv)
 		return list_machines();
 	if (strcmp(command, "gc") == 0 && argc == 2)
 		return collect();
+	if (strcmp(command, "proxy-ssh") == 0 && argc == 3)
+		return proxy_ssh(argv[2]);
 	if (strcmp(command, "exec") == 0) {
 		int at  = 2;
 		int tty = 0;
@@ -1201,7 +1238,7 @@ int main(int argc, char **argv)
 			usage(stderr);
 			return 125;
 		}
-		return exec_in(argv[at], argv + first, argc - first, tty);
+		return exec_in(argv[at], argv + first, argc - first, tty, 0u);
 	}
 	if ((strcmp(command, "stop") == 0 || strcmp(command, "attach") == 0 ||
 	     strcmp(command, "logs") == 0 || strcmp(command, "kill") == 0) && argc >= 3) {

@@ -215,6 +215,14 @@ typedef struct hull_engine_ops {
 	 * machine, so `core` is NULL. NULL where an engine keeps nothing.
 	 * Appended (rule 4): read it only where struct_size reaches it. */
 	hull_status (*gc)(hull_core*, hull_buf *report, hull_error*);
+
+	/* A connection to one of the machine's own ports, declared or not --
+	 * its sshd's, for `hull proxy-ssh` (section 8.1) -- as a stream: its
+	 * bytes are output on fd 1, its input is stream_write, the client's
+	 * half-close stream_eof, and the machine's close an exit of 0. A
+	 * signal on it resets it. NULL where a machine has no port of its
+	 * own, as chroot's, sharing the host's network. Appended (rule 4). */
+	hull_status (*dial)(hull_core*, hull_machine*, uint16_t port, hull_stream**, hull_error*);
 } hull_engine_ops;
 
 /* ---- Registration --------------------------------------------------------

@@ -38,6 +38,14 @@ client_message list_with_more 28 34 3A 6C 69 73 74 28 32 3A 63 68 31 3A 36 29 28
 # gc: nothing after the channel
 client_message gc_with_more 28 32 3A 67 63 28 32 3A 63 68 31 3A 37 29 28 34 3A 77 68 61 74 36 3A 64 6F 63 6B 65 72 29 29
 
+# dial_no_port: (4:dial(2:ch1:7)(7:machine3:web))
+# dial: the port is required
+client_message dial_no_port 28 34 3A 64 69 61 6C 28 32 3A 63 68 31 3A 37 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 29
+
+# dial_unsorted: (4:dial(2:ch1:7)(4:port2:22)(7:machine3:web))
+# dial: entries in canonical order
+client_message dial_unsorted 28 34 3A 64 69 61 6C 28 32 3A 63 68 31 3A 37 29 28 34 3A 70 6F 72 74 32 3A 32 32 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 29
+
 # data_fd_0: (4:data(3:buf2:hi)(2:ch1:1)(2:fd1:0))
 # data: the core sends only 1 and 2
 core_message data_fd_0 28 34 3A 64 61 74 61 28 33 3A 62 75 66 32 3A 68 69 29 28 32 3A 63 68 31 3A 31 29 28 32 3A 66 64 31 3A 30 29 29

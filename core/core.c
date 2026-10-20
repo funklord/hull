@@ -1193,27 +1193,43 @@ static int terminal_ok(const hull_sexpr_doc *body)
 	       (dimension(body, &tty, "cols", &n) && dimension(body, &tty, "rows", &n));
 }
 
-static void handle_exec(client *c, uint32_t ch, const hull_sexpr_doc *body)
+/* An exec, or with `dial` a connection to one of the machine's ports,
+ * which is a stream as an exec is: from here on the two are one. */
+static void handle_exec(client *c, uint32_t ch, const hull_sexpr_doc *body, int dial)
 {
-	hull_error   error = { .struct_size = sizeof error };
-	hull_stream *stream = NULL;
-	exec_entry  *x = NULL;
-	slot        *s = named(c, ch, body);
-	hull_buf     spec;
-	hull_status  status;
+	hull_error             error = { .struct_size = sizeof error };
+	hull_stream           *stream = NULL;
+	exec_entry            *x = NULL;
+	slot                  *s = named(c, ch, body);
+	const hull_engine_ops *ops;
+	hull_sexpr_form        value;
+	long long              port = 0;
+	hull_buf               spec;
+	hull_status            status;
 
 	if (s == NULL)
 		return;
+	ops = s->engine->ops;
 	if (s->exited || s->handle == NULL) {
 		send_error(c, ch, "the machine is not running");
 		return;
 	}
-	if (!terminal_ok(body)) {
+	if (!dial && !terminal_ok(body)) {
 		send_error(c, ch, "a window is 1 to 65535 in each direction");
 		return;
 	}
-	if (s->engine->ops->exec == NULL || s->engine->ops->stream_write == NULL ||
-	    s->engine->ops->stream_eof == NULL || s->engine->ops->stream_close == NULL) {
+	if (dial && (!hull_msg_find(body, "port", &value) || !hull_msg_long(body, &value, &port) ||
+	             port < 1 || port > 65535)) {
+		send_error(c, ch, "a port is 1 to 65535");
+		return;
+	}
+	if (dial && (ops->struct_size < offsetof(hull_engine_ops, dial) + sizeof ops->dial ||
+	             ops->dial == NULL)) {
+		send_error(c, ch, "that engine's machines have no ports of their own");
+		return;
+	}
+	if ((!dial && ops->exec == NULL) || ops->stream_write == NULL || ops->stream_eof == NULL ||
+	    ops->stream_close == NULL) {
 		send_error(c, ch, "that engine cannot exec yet");
 		return;
 	}
@@ -1234,7 +1250,10 @@ static void handle_exec(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	*x = (exec_entry){ .used = 1, .client = c, .ch = ch, .machine = s };
 	adopting = x;
 	pthread_mutex_unlock(&flow_lock);
-	status = s->engine->ops->exec(&s->core, s->handle, spec, &stream, &error);
+	if (dial)
+		status = ops->dial(&s->core, s->handle, (uint16_t)port, &stream, &error);
+	else
+		status = ops->exec(&s->core, s->handle, spec, &stream, &error);
 	pthread_mutex_lock(&flow_lock);
 	adopting = NULL;
 	if (status == HULL_OK)
@@ -1641,7 +1660,9 @@ static void handle(client *c, const hull_sexpr_doc *body)
 	} else if (hull_msg_is(body, "list")) {
 		handle_list(c, (uint32_t)ch);
 	} else if (hull_msg_is(body, "exec")) {
-		handle_exec(c, (uint32_t)ch, body);
+		handle_exec(c, (uint32_t)ch, body, 0);
+	} else if (hull_msg_is(body, "dial")) {
+		handle_exec(c, (uint32_t)ch, body, 1);
 	} else if (hull_msg_is(body, "data")) {
 		handle_input(c, (uint32_t)ch, body, 0);
 	} else if (hull_msg_is(body, "eof")) {

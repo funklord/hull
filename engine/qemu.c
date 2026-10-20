@@ -1609,6 +1609,44 @@ static hull_status qemu_exec(hull_core *core, hull_machine *m, hull_buf spec, hu
 	return HULL_OK;
 }
 
+/* One of the machine's ports, declared or not, as a stream: the agent's
+ * connect, as a forwarded port's connection is, but with its bytes for
+ * on_data rather than a socket of the engine's. */
+static hull_status qemu_dial(hull_core *core, hull_machine *m, uint16_t port, hull_stream **out,
+                             hull_error *error)
+{
+	hull_stream *st;
+	hull_msg     msg = { 0 };
+	hull_status  why;
+	char         reason[300];
+
+	if (!m->started || wait_done(m, 0))
+		return fail(error, HULL_ERR_GONE, "the machine is not running");
+	if ((st = new_stream(m, core, &why)) == NULL)
+		return fail(error, why, why == HULL_ERR_BUSY ?
+		            "the machine runs as many commands as it can" : "out of memory");
+	hull_msg_raw(&msg, "(7:connect");
+	hull_msg_channel(&msg, st->ch);
+	hull_msg_raw(&msg, "(4:port");
+	hull_msg_number(&msg, (long long)port);
+	hull_msg_raw(&msg, "))");
+	send_msg(m, &msg);
+	if (!answered(m, st, reason, sizeof reason)) {
+		drop_stream(m, st);
+		free_stream(st);
+		snprintf(m->detail, sizeof m->detail, "port %u: %s", (unsigned)port, reason);
+		return fail(error, HULL_ERR_RUNTIME, m->detail);
+	}
+	if (pthread_create(&st->deliverer, NULL, deliver, st) != 0) {
+		drop_stream(m, st);
+		kill_stream(m, st);
+		free_stream(st);
+		return fail(error, HULL_ERR_INTERNAL, "the stream's thread could not start");
+	}
+	*out = st;
+	return HULL_OK;
+}
+
 /* stdin, written whole however long the command takes, on the agent's
  * credit; stream_eof() from another thread ends the wait. */
 static hull_status qemu_stream_write(hull_core *core, hull_stream *st, const uint8_t *data,
@@ -2045,6 +2083,7 @@ static const hull_engine_ops ops = {
 	.resize       = qemu_resize,
 	.signal       = qemu_signal,
 	.stats        = qemu_stats,
+	.dial         = qemu_dial,
 };
 
 static const hull_engine engine = {

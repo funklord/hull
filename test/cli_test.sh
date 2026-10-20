@@ -305,6 +305,10 @@ until "$hull" ps 2>/dev/null | grep -q '^execd .*running$' || [ "$tries" -ge 40 
 done
 expect 0 '^host=execd$' "$hull" exec execd -- /probe host cwd env GREETING pid
 expect 0 '^cwd=/srv$' "$hull" exec execd -- /probe cwd
+# A chroot machine shares the host's network, so it has no port 22 of its
+# own for proxy-ssh; and a name that is only the suffix names none.
+expect 125 "^hull: that engine's machines have no ports of their own$" "$hull" proxy-ssh execd.hull
+expect 125 '^hull: \.hull names no machine$' "$hull" proxy-ssh .hull
 expect 0 '^GREETING=hi$' "$hull" exec execd /probe env GREETING
 # Small, and counted from 3 in the machine's own PID namespace, where a
 # host pid would be neither.

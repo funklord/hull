@@ -451,6 +451,37 @@ has 125 "port $greet on $(printf '%s' "$at" | sed 's/\./\\./g'): Address already
 kill "$holder" 2>/dev/null
 wait "$holder" 2>/dev/null
 
+# hull proxy-ssh: the machine's own port 22, declared nowhere, reached as
+# ssh's ProxyCommand would, by name with or without .hull. Nothing on a
+# port is a refusal, 125 with its reason: dialled in the three seconds
+# before the probe listens.
+conf dial '(backend vm) (hostname "qdial") (command "/probe" "say" "up" "sleep" "3" "serve" "tcp" "22")'
+cases=$((cases + 1))
+rm -f "$root/dial.out"
+(cd / && exec timeout -k 2 60 "$hull" run -f "$root/dial.conf" > "$root/dial.out" 2>&1) &
+runner=$!
+tries=0
+until grep -q '^up$' "$root/dial.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+refused=$(cd / && timeout 20 "$hull" proxy-ssh qdial < /dev/null 2>&1)
+refused_got=$?
+tries=0
+until grep -q '^serving$' "$root/dial.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+heard=$(printf 'hi from ssh\n' | (cd / && timeout 20 "$hull" proxy-ssh qdial.hull. 2>&1))
+got=$?
+wait "$runner"
+[ "$got" = 0 ] && [ "$heard" = "hello from the machine" ] &&
+	grep -q '^served=hi from ssh$' "$root/dial.out" ||
+	fail "proxy-ssh did not carry the machine's port 22 both ways: $got" \
+		"$heard; $(cat "$root/dial.out")"
+cases=$((cases + 1))
+[ "$refused_got" = 125 ] && [ "$refused" = "hull: port 22: Connection refused" ] ||
+	fail "proxy-ssh to a port nothing listens on was not refused: $refused_got" "$refused"
 # A udp port: each client its own flow, each datagram whole, an empty one
 # too, and the machine's replies to the client that sent. A datagram the
 # machine is not yet listening for is dropped, as udp's are, and the

@@ -29,6 +29,9 @@ client_message list 28 34 3A 6C 69 73 74 28 32 3A 63 68 31 3A 36 29 29
 # gc: (2:gc(2:ch1:7))
 client_message gc 28 32 3A 67 63 28 32 3A 63 68 31 3A 37 29 29
 
+# dial: (4:dial(2:ch1:7)(7:machine3:web)(4:port2:22))
+client_message dial 28 34 3A 64 69 61 6C 28 32 3A 63 68 31 3A 37 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 28 34 3A 70 6F 72 74 32 3A 32 32 29 29
+
 # unknown: (4:ping(2:ch1:0))
 client_message unknown 28 34 3A 70 69 6E 67 28 32 3A 63 68 31 3A 30 29 29
 

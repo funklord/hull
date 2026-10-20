@@ -34,6 +34,7 @@
 
 #define _GNU_SOURCE
 
+#include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
 #include <limits.h>
@@ -49,6 +50,7 @@
 #include <unistd.h>
 
 #include <arpa/inet.h>
+#include <netinet/in.h>
 
 #include "access.h"
 #include "builtin.h"
@@ -1130,6 +1132,7 @@ struct hull_stream {
 	int           ended;   /* stdin shut, or to be: under `lock` */
 	pthread_mutex_t lock;
 	int           tty;     /* on a terminal: one raw stream, not frames */
+	int           dialed;  /* a connection to a port of the container's: raw */
 };
 
 static void *read_exec(void *arg)
@@ -1165,6 +1168,11 @@ static void *read_exec(void *arg)
 			host->on_data(st->core, st, header[0] == 2 ? 2 : 1, buffer, n);
 			size -= (uint32_t)n;
 		}
+	}
+	/* A connection's end is the machine's close, which is 0. */
+	if (st->dialed) {
+		host->on_exit(st->core, st->machine, st, 0, 0);
+		return NULL;
 	}
 	snprintf(path, sizeof path, "/exec/%s/json", st->id);
 	if (call("GET", path, NULL, &status, &answer) == 0 && status == 200)
@@ -1259,6 +1267,93 @@ static hull_status docker_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	if (tty)
 		docker_resize(core, st, rows, cols, error);
 	pthread_mutex_init(&st->lock, NULL);
+	*out = st;
+	return HULL_OK;
+}
+
+/* The container's address on its network, from docker's inspection: the
+ * first IPAddress that is not empty, the bridge's or a network's. */
+static int container_address(const hull_machine *m, struct in_addr *address)
+{
+	char        path[160];
+	char       *answer = NULL;
+	const char *at;
+	int         status = 0;
+	int         found = 0;
+
+	snprintf(path, sizeof path, "/containers/%s/json", m->id);
+	if (call("GET", path, NULL, &status, &answer) != 0 || status != 200) {
+		free(answer);
+		return 0;
+	}
+	for (at = strstr(answer, "\"IPAddress\":\""); at != NULL && !found;
+	     at = strstr(at, "\"IPAddress\":\"")) {
+		char   text[16];
+		size_t n = 0u;
+
+		for (at += strlen("\"IPAddress\":\""); *at != '"' && *at != '\0' && n + 1u < sizeof text;)
+			text[n++] = *at++;
+		text[n] = '\0';
+		found = n > 0u && inet_pton(AF_INET, text, address) == 1;
+	}
+	free(answer);
+	return found;
+}
+
+/* One of the container's ports, declared or not, as a stream: a TCP
+ * connection from the host to the container's address, as docker's own
+ * proxy makes one. A connect not answered in two seconds is refused. */
+static hull_status docker_dial(hull_core *core, hull_machine *m, uint16_t port,
+                               hull_stream **out, hull_error *error)
+{
+	struct sockaddr_in to;
+	struct pollfd      wait;
+	hull_stream       *st;
+	int                fd;
+	int                failed = 0;
+	socklen_t          length = sizeof failed;
+
+	memset(&to, 0, sizeof to);
+	to.sin_family = AF_INET;
+	to.sin_port   = htons(port);
+	if (!m->started || !container_address(m, &to.sin_addr))
+		return fail(error, HULL_ERR_GONE, "the machine has no address to dial");
+	fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+	if (fd < 0)
+		return fail(error, HULL_ERR_INTERNAL, "no socket to dial with");
+	if (connect(fd, (struct sockaddr *)&to, sizeof to) != 0) {
+		wait = (struct pollfd){ fd, POLLOUT, 0 };
+		if (errno != EINPROGRESS)
+			failed = errno;
+		else if (poll(&wait, 1u, 2000) != 1)
+			failed = ETIMEDOUT;
+		else if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &failed, &length) != 0)
+			failed = errno;
+	}
+	if (failed != 0) {
+		close(fd);
+		snprintf(m->detail, sizeof m->detail, "port %u: %s", (unsigned)port, strerror(failed));
+		return fail(error, HULL_ERR_RUNTIME, m->detail);
+	}
+	/* Blocking from here: the reader waits on it, and the writes do
+	 * not, sending with MSG_DONTWAIT. */
+	if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK) != 0 ||
+	    (st = calloc(1u, sizeof *st)) == NULL) {
+		close(fd);
+		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+	}
+	st->machine = m;
+	st->core    = core;
+	st->socket  = fd;
+	st->tty     = 1;
+	st->dialed  = 1;
+	pthread_mutex_init(&st->lock, NULL);
+	if (pthread_create(&st->reader, NULL, read_exec, st) != 0) {
+		pthread_mutex_destroy(&st->lock);
+		close(fd);
+		free(st);
+		return fail(error, HULL_ERR_INTERNAL, "the reader thread could not start");
+	}
 	*out = st;
 	return HULL_OK;
 }
@@ -1359,6 +1454,14 @@ static hull_status docker_signal(hull_core *core, hull_machine *m, hull_stream *
 	int   status = 0;
 
 	(void)core;
+	if (st != NULL && st->dialed) {
+		/* A connection has no process: any signal resets it. */
+		struct linger now = { 1, 0 };
+
+		setsockopt(st->socket, SOL_SOCKET, SO_LINGER, &now, sizeof now);
+		shutdown(st->socket, SHUT_RDWR);
+		return HULL_OK;
+	}
 	if (st != NULL) {
 		signal_exec(st, signum);
 		return HULL_OK;
@@ -1382,7 +1485,8 @@ static hull_status docker_signal(hull_core *core, hull_machine *m, hull_stream *
 static hull_status docker_stream_close(hull_core *core, hull_stream *st, hull_error *error)
 {
 	docker_stream_eof(core, st, error);
-	signal_exec(st, SIGKILL);
+	if (!st->dialed)
+		signal_exec(st, SIGKILL);
 	shutdown(st->socket, SHUT_RDWR);
 	pthread_join(st->reader, NULL);
 	close(st->socket);
@@ -1566,6 +1670,7 @@ static const hull_engine_ops ops = {
 	.resize       = docker_resize,
 	.signal       = docker_signal,
 	.gc           = docker_gc,
+	.dial         = docker_dial,
 };
 
 static const hull_engine engine = {

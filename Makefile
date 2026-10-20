@@ -138,14 +138,14 @@ DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf vol
                     rootro.conf nocap.conf cap.conf die.conf wait.conf port.conf noimage.conf \
                     nocmd.conf execd.conf killd.conf killd.out held.out data/in data/out \
                     dirov.conf dirin.conf dirkeep.conf dirkeep.out rootfs/probe rootfs/srv/added \
-                    rootfs/srv/more rootfs/srv/written udp.conf udp.out gone.conf inuse.conf inuse.out \
+                    rootfs/srv/more rootfs/srv/written udp.conf udp.out dial.conf dial.out gone.conf inuse.conf inuse.out \
                     gone/probe inuse/probe inuse/srv/which)
 
 # What test/qemu_test.sh writes.
 QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.conf write.conf \
                   readonly.conf vol.conf volro.conf trap.conf trap.out wait.conf kept.conf \
                   emu.conf execd.conf held.out xtrap.out xstop.out net.conf listen.out brief.conf \
-                  ports.conf ports.out client.out taken.conf udp.conf udp.out keep.conf \
+                  ports.conf ports.out client.out taken.conf udp.conf udp.out dial.conf dial.out keep.conf \
                   overlay.conf overro.conf rootfs/srv/kept \
                   rootfs/probe rootfs/bin/sh rootfs/written rootfs/etc/resolv.conf data/in data/out)
 

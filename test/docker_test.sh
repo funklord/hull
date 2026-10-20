@@ -336,6 +336,37 @@ got=$?
 end=True" ] && grep -q '^echoed from 2$' "$root/udp.out" ||
 	fail "a udp port's datagrams were not each client's, whole: $got" \
 		"$heard; $(cat "$root/udp.out")"
+# hull proxy-ssh, as on qemu: the container's own port 22, declared
+# nowhere, reached at its address as ssh's ProxyCommand would; and a
+# refusal, dialled in the three seconds before the probe listens.
+printf '(machine (source "dir:./rootfs") (mutable overlay) (backend docker) (hostname "dtest") %s)\n' \
+	'(command "/probe" "say" "up" "sleep" "3" "serve" "tcp" "22")' > "$root/dial.conf"
+cases=$((cases + 1))
+rm -f "$root/dial.out"
+(cd / && exec timeout -k 2 60 "$hull" run -f "$root/dial.conf" > "$root/dial.out" 2>&1) &
+runner=$!
+tries=0
+until grep -q '^up$' "$root/dial.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+refused=$(cd / && timeout 20 "$hull" proxy-ssh dtest.hull < /dev/null 2>&1)
+refused_got=$?
+tries=0
+until grep -q '^serving$' "$root/dial.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+heard=$(printf 'hi from ssh\n' | (cd / && timeout 20 "$hull" proxy-ssh dtest 2>&1))
+got=$?
+wait "$runner"
+[ "$got" = 0 ] && [ "$heard" = "hello from the machine" ] &&
+	grep -q '^served=hi from ssh$' "$root/dial.out" ||
+	fail "proxy-ssh did not carry the container's port 22 both ways: $got" \
+		"$heard; $(cat "$root/dial.out")"
+cases=$((cases + 1))
+[ "$refused_got" = 125 ] && [ "$refused" = "hull: port 22: Connection refused" ] ||
+	fail "proxy-ssh to a port nothing listens on was not refused: $refused_got" "$refused"
 # A fresh import retires the tree's others, but not one a container
 # uses: a machine kept running on the first state holds it.
 printf '(machine (source "dir:./rootfs") (mutable overlay) (backend docker) (hostname "dtest-keep") %s)\n' \
