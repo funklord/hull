@@ -89,7 +89,7 @@ static void usage(FILE *out)
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
 	      "       hull kill [-s SIGNAL] ID | hull stats ID | hull ssh ID | hull proxy-ssh HOST\n"
-	      "       hull gc\n"
+	      "       hull ssh-config [--remove] | hull gc\n"
 	      "       hull core\n"
 	      "       hull engines\n"
 	      "       hull --version\n", out);
@@ -1054,6 +1054,144 @@ static int proxy_ssh(const char *host)
 	return exec_in(id, NULL, 0, 0, 22u);
 }
 
+/*
+ * `hull ssh-config [--remove]`: section 8.1's block in ~/.ssh/config, so
+ * that `ssh web.hull`, scp, rsync and an IDE's remote development reach a
+ * machine's sshd through `hull proxy-ssh`, this hull's, by its full path.
+ *
+ * ssh applies what comes before the first Host or Match to every host, so
+ * the block goes just before that line: ahead of the user's blocks, where
+ * a `Host *` of theirs cannot take the ProxyCommand first, and after their
+ * global lines, which it must not take into its own Host. With neither,
+ * at the end. It is marked, so that running again replaces it and
+ * --remove takes exactly it out. The file is written whole and renamed
+ * into place, keeping its mode; one that does not exist is made 0600, in
+ * a ~/.ssh made 0700.
+ */
+#define SSH_BEGIN "# hull ssh-config: begin -- hull keeps these lines; `hull ssh-config --remove` drops them\n"
+#define SSH_END   "# hull ssh-config: end\n"
+#define SSH_LIMIT (1024 * 1024)
+
+/* Whether `line` opens a Host or a Match block, in either case, after any
+ * blanks, with the keyword ended by a blank or `=`. */
+static int opens_block(const char *line)
+{
+	while (*line == ' ' || *line == '\t')
+		line++;
+	return (strncasecmp(line, "Host", 4u) == 0 &&
+	        (line[4] == ' ' || line[4] == '\t' || line[4] == '=')) ||
+	       (strncasecmp(line, "Match", 5u) == 0 &&
+	        (line[5] == ' ' || line[5] == '\t' || line[5] == '='));
+}
+
+static int ssh_config(int remove)
+{
+	const char *home = getenv("HOME");
+	char        dir[4096];
+	char        path[4200];
+	char        fresh[4300];
+	char        self[4096];
+	char        block[4500];
+	char       *old = NULL;
+	char       *out = NULL;
+	size_t      old_len = 0u;
+	size_t      out_len = 0u;
+	size_t      at = 0u;
+	mode_t      mode = 0600;
+	struct stat st;
+	ssize_t     n;
+	int         fd;
+	int         placed = 0;
+
+	if (home == NULL || home[0] != '/') {
+		fprintf(stderr, "hull: ssh-config: HOME is not set\n");
+		return 1;
+	}
+	snprintf(dir, sizeof dir, "%s/.ssh", home);
+	snprintf(path, sizeof path, "%s/config", dir);
+	snprintf(fresh, sizeof fresh, "%s/config.hull-new", dir);
+	n = readlink("/proc/self/exe", self, sizeof self - 1u);
+	if (n <= 0 || (size_t)n >= sizeof self - 1u) {
+		fprintf(stderr, "hull: ssh-config: where this hull is cannot be read\n");
+		return 1;
+	}
+	self[n] = '\0';
+	if (strpbrk(self, "\"%\\\n") != NULL) {
+		fprintf(stderr, "hull: ssh-config: %s is not a path ssh can be given\n", self);
+		return 1;
+	}
+	snprintf(block, sizeof block, SSH_BEGIN "Host *.hull\n\tProxyCommand \"%s\" proxy-ssh %%h\n" SSH_END,
+	         self);
+
+	if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+		fprintf(stderr, "hull: ssh-config: %s: %s\n", dir, strerror(errno));
+		return 1;
+	}
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		if (fstat(fd, &st) == 0)
+			mode = st.st_mode & 07777;
+		old = malloc(SSH_LIMIT + 1u);
+		while (old != NULL && (n = read(fd, old + old_len, SSH_LIMIT - old_len)) > 0)
+			old_len += (size_t)n;
+		close(fd);
+		if (old == NULL || old_len == SSH_LIMIT) {
+			fprintf(stderr, "hull: ssh-config: %s is larger than a MiB\n", path);
+			free(old);
+			return 1;
+		}
+		old[old_len] = '\0';
+	} else if (errno != ENOENT) {
+		fprintf(stderr, "hull: ssh-config: %s: %s\n", path, strerror(errno));
+		return 1;
+	}
+	out = malloc(old_len + sizeof block + 2u);
+	if (out == NULL) {
+		free(old);
+		return 1;
+	}
+	/* Line by line: the block as it was dropped, and as it is put in
+	 * before the first Host or Match. */
+	while (at < old_len) {
+		char  *end = memchr(old + at, '\n', old_len - at);
+		size_t len = end != NULL ? (size_t)(end - (old + at)) + 1u : old_len - at;
+
+		if (strncmp(old + at, SSH_BEGIN, len) == 0 && len == strlen(SSH_BEGIN)) {
+			char *close_mark = strstr(old + at, SSH_END);
+
+			at = close_mark != NULL ? (size_t)(close_mark - old) + strlen(SSH_END) : old_len;
+			continue;
+		}
+		if (!remove && !placed && opens_block(old + at)) {
+			memcpy(out + out_len, block, strlen(block));
+			out_len += strlen(block);
+			placed = 1;
+		}
+		memcpy(out + out_len, old + at, len);
+		out_len += len;
+		at += len;
+	}
+	if (!remove && !placed) {
+		if (out_len > 0u && out[out_len - 1u] != '\n')
+			out[out_len++] = '\n';
+		memcpy(out + out_len, block, strlen(block));
+		out_len += strlen(block);
+	}
+	free(old);
+	fd = open(fresh, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (fd < 0 || fchmod(fd, mode) != 0 || write(fd, out, out_len) != (ssize_t)out_len ||
+	    close(fd) != 0 || rename(fresh, path) != 0) {
+		fprintf(stderr, "hull: ssh-config: %s: %s\n", path, strerror(errno));
+		unlink(fresh);
+		free(out);
+		return 1;
+	}
+	free(out);
+	printf(remove ? "hull: ssh-config: took Host *.hull out of %s\n" :
+	       "hull: ssh-config: Host *.hull in %s, through %s\n", path, self);
+	return 0;
+}
+
 static int stats_of(const char *id)
 {
 	static const char *const keys[] = { "cpu", "io", "memory" };
@@ -1218,6 +1356,10 @@ int main(int argc, char **argv)
 		return collect();
 	if (strcmp(command, "proxy-ssh") == 0 && argc == 3)
 		return proxy_ssh(argv[2]);
+	if (strcmp(command, "ssh-config") == 0 && argc == 2)
+		return ssh_config(0);
+	if (strcmp(command, "ssh-config") == 0 && argc == 3 && strcmp(argv[2], "--remove") == 0)
+		return ssh_config(1);
 	if (strcmp(command, "exec") == 0) {
 		int at  = 2;
 		int tty = 0;

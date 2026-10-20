@@ -127,7 +127,7 @@ TEST_SEXPR_OBJS   = $(BUILD_DIR)/test/sexpr_test.o
 TEST_FRAMING_OBJS = $(BUILD_DIR)/test/framing_test.o
 # What test/cli_test.sh writes, so that clean can name it.
 CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.conf \
-                 foreign.conf machines.conf build.conf bad.conf example.conf run.conf \
+                 home/.ssh/config ssh-config.before foreign.conf machines.conf build.conf bad.conf example.conf run.conf \
                  writable.conf readonly.conf die.conf wait.conf ports.conf noargs.conf nope.conf \
                  pair.conf rootfs/written rootfs/bin/sh vol.conf volro.conf vollink.conf \
                  volmissing.conf volhost.conf pid.conf keep.conf slow.conf slow.out \
@@ -150,7 +150,7 @@ DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf vol
 QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.conf write.conf \
                   readonly.conf vol.conf volro.conf trap.conf trap.out wait.conf kept.conf \
                   emu.conf execd.conf held.out xtrap.out xstop.out net.conf listen.out brief.conf \
-                  ports.conf ports.out client.out taken.conf udp.conf udp.out dial.conf dial.out keep.conf \
+                  ports.conf ports.out client.out taken.conf udp.conf udp.out dial.conf dial.out sshed.conf sshed.out home/.ssh/config keep.conf \
                   overlay.conf overro.conf rootfs/srv/kept \
                   rootfs/probe rootfs/bin/sh rootfs/written rootfs/etc/resolv.conf data/in data/out)
 

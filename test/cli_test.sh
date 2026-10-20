@@ -305,6 +305,37 @@ until "$hull" ps 2>/dev/null | grep -q '^execd .*running$' || [ "$tries" -ge 40 
 done
 expect 0 '^host=execd$' "$hull" exec execd -- /probe host cwd env GREETING pid
 expect 0 '^cwd=/srv$' "$hull" exec execd -- /probe cwd
+# ssh-config: the block before the first Host or Match, after the global
+# lines, so that ssh itself, asked with -G, gives *.hull this hull's
+# ProxyCommand over a Host * of the user's and nothing else changes; once
+# however often it runs, the file's mode kept, and taken out to the byte.
+mkdir -p "$root/home/.ssh"
+printf 'ServerAliveInterval 30\n\nHost *\n\tProxyCommand /bin/false\n\nmatch host x\n\tPort 2\n' \
+	> "$root/home/.ssh/config"
+chmod 644 "$root/home/.ssh/config"
+cp "$root/home/.ssh/config" "$root/ssh-config.before"
+expect 0 '^hull: ssh-config: Host \*\.hull in ' env HOME="$root/home" "$hull" ssh-config
+expect 0 '^hull: ssh-config: Host \*\.hull in ' env HOME="$root/home" "$hull" ssh-config
+cases=$((cases + 1))
+[ "$(grep -c '^Host \*\.hull$' "$root/home/.ssh/config")" = 1 ] &&
+	[ "$(sed -n 3p "$root/home/.ssh/config" | cut -c1-24)" = "# hull ssh-config: begin" ] &&
+	[ "$(stat -c %a "$root/home/.ssh/config")" = 644 ] ||
+	fail "ssh-config's block is not once, in its place, in a file of the same mode" \
+		"$(cat "$root/home/.ssh/config")"
+cases=$((cases + 1))
+said=$(timeout 10 ssh -G -F "$root/home/.ssh/config" web.hull < /dev/null 2>/dev/null)
+other=$(timeout 10 ssh -G -F "$root/home/.ssh/config" example.org < /dev/null 2>/dev/null)
+printf '%s\n' "$said" | grep -qx "proxycommand \"$(realpath "$hull")\" proxy-ssh %h" &&
+	printf '%s\n' "$said" | grep -qx 'serveraliveinterval 30' &&
+	printf '%s\n' "$other" | grep -qx 'proxycommand /bin/false' &&
+	printf '%s\n' "$other" | grep -qx 'serveraliveinterval 30' ||
+	fail "ssh does not read ssh-config's block as given" "$said"
+expect 0 '^hull: ssh-config: took Host \*\.hull out of ' env HOME="$root/home" "$hull" ssh-config --remove
+cases=$((cases + 1))
+cmp -s "$root/ssh-config.before" "$root/home/.ssh/config" ||
+	fail "ssh-config --remove did not give back the file as it was" "$(cat "$root/home/.ssh/config")"
+expect 1 '^hull: ssh-config: HOME is not set$' env -u HOME "$hull" ssh-config
+
 # A chroot machine shares the host's network, so it has no port 22 of its
 # own for proxy-ssh; and a name that is only the suffix names none.
 expect 125 "^hull: that engine's machines have no ports of their own$" "$hull" proxy-ssh execd.hull

@@ -482,6 +482,28 @@ wait "$runner"
 cases=$((cases + 1))
 [ "$refused_got" = 125 ] && [ "$refused" = "hull: port 22: Connection refused" ] ||
 	fail "proxy-ssh to a port nothing listens on was not refused: $refused_got" "$refused"
+# And ssh itself, through the block ssh-config writes: the probe on port
+# 22 speaks no SSH, so the login fails, but the line it reads is ssh's own
+# identification, which came by ssh, hull proxy-ssh and the agent.
+conf sshed '(backend vm) (hostname "qsshed") (command "/probe" "serve" "tcp" "22")'
+mkdir -p "$root/home"
+rm -f "$root/home/.ssh/config"
+HOME="$root/home" timeout 10 "$hull" ssh-config > /dev/null 2>&1
+cases=$((cases + 1))
+rm -f "$root/sshed.out"
+(cd / && exec timeout -k 2 60 "$hull" run -f "$root/sshed.conf" > "$root/sshed.out" 2>&1) &
+runner=$!
+tries=0
+until grep -q '^serving$' "$root/sshed.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+said=$(timeout 30 ssh -F "$root/home/.ssh/config" -o BatchMode=yes -o ConnectTimeout=10 \
+	-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null qsshed.hull true < /dev/null 2>&1)
+wait "$runner"
+grep -q '^served=SSH-2\.0-' "$root/sshed.out" ||
+	fail "ssh through ssh-config's block did not reach the machine's port 22" \
+		"$said; $(cat "$root/sshed.out")"
 # A udp port: each client its own flow, each datagram whole, an empty one
 # too, and the machine's replies to the client that sent. A datagram the
 # machine is not yet listening for is dropped, as udp's are, and the
