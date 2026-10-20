@@ -36,8 +36,9 @@ expect() {
 	pattern=$2
 	shift 2
 	cases=$((cases + 1))
-	out=$(timeout 10 "$@" 2>&1)
+	out=$(timeout "${limit:-10}" "$@" 2>&1)
 	got=$?
+	limit=10
 	if [ "$got" != "$want" ]; then
 		fail "$* exited $got, wanted $want" "$out"
 	elif ! printf '%s\n' "$out" | grep -Eq -- "$pattern"; then
@@ -637,7 +638,10 @@ total = sum(int(n) for n in re.findall(rb"\(4:data\(3:buf(\d+):", got))
 print("eofs=%d bytes=%d" % (eofs, total))
 '
 # A frontend that sends and never reads what it is answered is dropped once
-# 8 MiB of answers wait for it, and nobody else waits meanwhile.
+# 8 MiB of answers wait for it, and nobody else waits meanwhile. Queueing
+# them took 10 seconds and more with the host's CPUs oversubscribed, so
+# this case's ceiling is 60.
+limit=60
 expect 0 '^dropped after [0-9]+ requests, and the core answers$' python3 -c "$speak"'
 import subprocess
 n = 0
