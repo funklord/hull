@@ -723,7 +723,7 @@ wait "$killed"
 got=$?
 [ "$got" = 0 ] && grep -q '^signal=15$' "$root/killd.out" && grep -q '^after$' "$root/killd.out" ||
 	fail "a TERM to the workload: run exited $got, wanted 0 after it caught signal 15" \
-		"$(cat "$root/killd.out")"
+		"$(cat "$root/killd.out"); core.log: $(tail -20 "$XDG_RUNTIME_DIR/hull/core.log" 2>&1)"
 cases=$((cases + 1))
 rm -f "$root/killd.out"
 (cd / && exec timeout -k 2 20 "$hull_abs" run -f "$root/killd.conf" > "$root/killd.out" 2>&1) &
