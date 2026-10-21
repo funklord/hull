@@ -1,2 +1,7 @@
 __pycache__/
 build/
+# What fmake writes beside the sources.
+/.fmake/
+/gen/
+/hull
+/hull-agent

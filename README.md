@@ -40,6 +40,7 @@ implement.
 
 ```sh
 make         # build/hull; fetches vendor/situ the first time
+fmake        # ./hull and ./hull-agent, as fmake.toml describes; no libnss_hull
 make check   # the style gate, the situ contracts, then the tests
 make check-docker  # hull run on the docker adapter, against the daemon
 make hooks   # install the commit-msg hook
@@ -55,9 +56,6 @@ sudo make install-nss   # into /usr/lib/<multiarch>/
 
 then add `hull` to the `hosts:` line of `/etc/nsswitch.conf`, before
 `dns`, as in `hosts: files hull dns`.
-
-Build with make for now: fmake builds hull's own schemas, but cannot yet
-give each one the situc options the Makefile does.
 
 ## Copyright
 

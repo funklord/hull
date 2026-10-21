@@ -1,2 +1,44 @@
 [project]
 defines = ['HULL_VERSION="$file(VERSION)"']
+include-dirs = ["gen"]
+
+# The guest agent, named and linked as the Makefile does it: its own
+# name, agent, is a directory beside it, and it is a vm's init in an
+# initrd with no libc to load.
+[target.agent]
+name = "hull-agent"
+root = "agent/agent.c"
+ldflags = ["-static"]
+
+# One rule per schema, with the options the Makefile gives situc: fmake's
+# own schema pass gives every schema the same ones, and these differ in
+# prefix and layer. Where a schema has one, it stands down for the rule.
+
+[generate.readable]
+command = "mkdir -p gen && vendor/situ/bin/situc build --target c --prefix hull_sexpr_r --out gen sexpr/readable.situ"
+inputs = ["sexpr/readable.situ"]
+outputs = ["gen/readable.c", "gen/readable.h"]
+
+# The edit layer, whose build header the writer appends with.
+[generate.canonical]
+command = "mkdir -p gen && vendor/situ/bin/situc build --target c --layer edit --prefix hull_sexpr_c --out gen sexpr/canonical.situ"
+inputs = ["sexpr/canonical.situ"]
+outputs = ["gen/canonical.c", "gen/canonical.h", "gen/canonical_build.h", "gen/canonical_edit.h"]
+
+[generate.agent]
+command = "mkdir -p gen && vendor/situ/bin/situc build --target c --layer frame --prefix hull_agent --out gen agent/message.situ"
+inputs = ["agent/message.situ"]
+outputs = ["gen/message.c", "gen/message.h", "gen/message_frame.h", "gen/message_build.h", "gen/message_edit.h"]
+
+# The view header comes first in the generated source, as the Makefile's
+# -include puts it (situ finding 18); each schema has its own, so no
+# tree-wide flag can say it, and the rule writes the line instead.
+[generate.frontend]
+command = "mkdir -p gen && vendor/situ/bin/situc build --target c --prefix hull_frontend --out gen core/frontend.situ && sed -i '1i #include \"core/frontend_view.h\"' gen/frontend.c"
+inputs = ["core/frontend.situ", "sexpr/canonical.situ", "core/frontend_view.h"]
+outputs = ["gen/frontend.c", "gen/frontend.h"]
+
+[generate.protocol]
+command = "mkdir -p gen && vendor/situ/bin/situc build --target c --prefix hull_protocol --out gen agent/protocol.situ && sed -i '1i #include \"agent/protocol_view.h\"' gen/protocol.c"
+inputs = ["agent/protocol.situ", "sexpr/canonical.situ", "agent/protocol_view.h"]
+outputs = ["gen/protocol.c", "gen/protocol.h"]
