@@ -517,6 +517,7 @@ expect 0 '^signal=1$' sh -c 'timeout -k 2 8 "$0" exec execd /probe trap & sleep 
 	"$hull_abs"
 expect 143 '' sh -c 'timeout -k 2 8 "$0" exec execd /probe wait & sleep 1; kill -TERM $!; wait $!' "$hull_abs"
 expect 125 '/nope: No such file or directory' "$hull" exec execd /nope
+expect 125 '^.*nope: No such file or directory' "$hull" exec execd nope
 expect 125 'no such machine' "$hull" exec nobody /probe
 cases=$((cases + 1))
 timeout -s KILL 1 "$hull" exec execd /probe say exec wait > /dev/null 2>&1
@@ -1120,6 +1121,19 @@ conf noargs '(workdir "/srv")'
 from_root 125 'needs \(command \.\.\.\)' -f "$root/noargs.conf"
 conf nope '(command "/nope")'
 from_root 125 '/nope: No such file or directory' -f "$root/nope.conf"
+# A bare command is searched for in the machine's PATH, as docker does:
+# past a directory not there and a file of its name that will not run, to
+# the one that will; a file that will not run, alone, is EACCES, and a name
+# found nowhere, docker's default PATH searched, ENOENT. exec searches so.
+printf 'not a program\n' > "$root/rootfs/srv/searchme"
+chmod 644 "$root/rootfs/srv/searchme"
+cp "$root/rootfs/probe" "$root/rootfs/bin/searchme"
+conf searched '(command "searchme" "say" "found") (env (PATH "/nowhere:/srv:/bin"))'
+from_root 0 '^found$' -f "$root/searched.conf"
+conf denied '(command "searchme") (env (PATH "/srv"))'
+from_root 125 'searchme: Permission denied' -f "$root/denied.conf"
+conf unfound '(command "nowhere-at-all")'
+from_root 125 'nowhere-at-all: No such file or directory' -f "$root/unfound.conf"
 printf '%s\n' '(machines (alpha (source "dir:./rootfs") (backend chroot) (command "/probe" "host")))' \
 	> "$root/pair.conf"
 from_root 0 '^host=alpha$' -f "$root/pair.conf" alpha

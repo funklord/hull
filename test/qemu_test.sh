@@ -125,6 +125,11 @@ conf nope '(backend vm) (command "/nope")'
 name=nope
 boot nope
 has 127 '/nope: No such file or directory'
+# A bare command is searched for in the machine's PATH, as docker does.
+conf searched '(backend vm) (command "probe" "say" "searched") (env (PATH "/nowhere:/"))'
+name=searched
+boot searched
+has 0 '^searched$'
 
 # The directory in place, as the user's, and read-only when asked.
 conf write '(backend vm) (command "/probe" "write" "/written")'

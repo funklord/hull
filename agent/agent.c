@@ -802,7 +802,7 @@ static const char *spawn(uint32_t ch, char *const *argv, const char *cwd, char *
 		}
 		if (no_new_privs)
 			prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-		execve(argv[0], argv, envp);
+		hull_access_execute(argv, envp);
 		fprintf(stderr, "hull agent: %s: %s\n", argv[0], strerror(errno));
 		_exit(127);
 	}

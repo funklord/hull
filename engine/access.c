@@ -4,7 +4,9 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -192,4 +194,47 @@ int hull_access_machine(hull_sexpr_doc *doc, const uint8_t *plan, size_t length,
 
 	return hull_sexpr_open(doc, plan, length, HULL_SEXPR_CANONICAL, NULL) == HULL_SEXPR_OK &&
 	       hull_sexpr_first(doc, &top) && hull_access_find(doc, &top, "machine", machine);
+}
+
+int hull_access_execute(char *const argv[], char *const envp[])
+{
+	static const char fallback[] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+	const char       *search = fallback;
+	const char       *file = argv[0];
+	size_t            file_length = strlen(file);
+	int               denied = 0;
+	int               last = ENOENT;
+
+	if (file[0] == '\0') {
+		errno = ENOENT;
+		return -1;
+	}
+	if (strchr(file, '/') != NULL)
+		return execve(file, argv, envp);
+	for (char *const *e = envp; e != NULL && *e != NULL; e++)
+		if (strncmp(*e, "PATH=", 5u) == 0)
+			search = *e + 5;
+	for (const char *at = search;; ) {
+		const char *end = strchr(at, ':');
+		size_t      n = end != NULL ? (size_t)(end - at) : strlen(at);
+		char        path[PATH_MAX];
+
+		/* An empty part is the working directory, as POSIX has it. */
+		if (n + 1u + file_length < sizeof path) {
+			memcpy(path, n > 0u ? at : ".", n > 0u ? n : 1u);
+			path[n > 0u ? n : 1u] = '/';
+			memcpy(path + (n > 0u ? n : 1u) + 1u, file, file_length + 1u);
+			execve(path, argv, envp);
+			if (errno == EACCES)
+				denied = 1;
+			else if (errno != ENOENT && errno != ENOTDIR && errno != ELOOP &&
+			         errno != ENAMETOOLONG)
+				last = errno;
+		}
+		if (end == NULL)
+			break;
+		at = end + 1;
+	}
+	errno = denied ? EACCES : last;
+	return -1;
 }

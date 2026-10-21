@@ -188,7 +188,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		return "the plan is missing its source or workdir";
 
 	if (!hull_access_find(doc, &machine, "command", &entry))
-		return "chroot has no manifest to supply a command, so the spec needs (command ...)";
+		return "the machine names no command, and no stored tree's runtime gives one, so it needs (command ...)";
 	hull_sexpr_child(doc, &entry, &item);
 	n = 0u;
 	for (more = hull_sexpr_next(doc, &item, &item); more;
@@ -704,7 +704,7 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		sigaction(SIGPIPE, &action, NULL);
 		if (setsid() < 0 || dup2(out[1], 1) < 0 || dup2(err[1], 2) < 0)
 			child_fail(report, "the workload's stdio");
-		execve(m->argv[0], (char *const *)m->argv, (char *const *)m->envp);
+		hull_access_execute((char *const *)m->argv, (char *const *)m->envp);
 		child_fail(report, m->argv[0]);
 	}
 	/* The engine reads `report` to its end: this copy, and the workload's
@@ -1305,7 +1305,7 @@ static void run_helper(const hull_machine *m, char *const *argv, const int *ns, 
 			child_fail(report, "the command's terminal");
 		if (m->no_new_privs && prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) != 0)
 			child_fail(report, "no_new_privs");
-		execve(argv[0], argv, (char *const *)m->envp);
+		hull_access_execute(argv, (char *const *)m->envp);
 		child_fail(report, argv[0]);
 	}
 	close(report);
@@ -1662,7 +1662,7 @@ static const hull_cap_entry entries[] = {
 	  NULL },
 	{ "projection.bind",        HULL_SUP_NATIVE,   NULL, NULL },
 	{ "writeback.none",         HULL_SUP_NATIVE,   NULL, NULL },
-	{ "command",                HULL_SUP_NATIVE,   "a path: there is no PATH search", NULL },
+	{ "command",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "workdir",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "env",                    HULL_SUP_NATIVE,   "the environment is only what env names",
 	  NULL },
