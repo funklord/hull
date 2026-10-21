@@ -24,6 +24,9 @@ export HULL_CORE_IDLE=1
 # looks at nothing of the account's.
 DOCKER_HOST=unix://$XDG_RUNTIME_DIR/no-docker.sock
 export DOCKER_HOST
+# And a store of its own, which gc would otherwise look in: none, here.
+XDG_DATA_HOME=$(cd "${BUILD_DIR:?}" && pwd)/test/cli-data
+export XDG_DATA_HOME
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 cases=0

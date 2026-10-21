@@ -55,6 +55,7 @@
 #include "plan.h"
 #include "registry.h"
 #include "spec.h"
+#include "store.h"
 #include "wire.h"
 
 #define MAX_FILE      (16u << 20)
@@ -93,6 +94,7 @@ static void usage(FILE *out)
 	      "       hull kill [-s SIGNAL] ID | hull stats [--over S] ID\n"
 	      "       hull ssh ID | hull proxy-ssh HOST\n"
 	      "       hull ssh-config [--remove] | hull gc\n"
+	      "       hull commit [--arch A] DIR REF | hull materialize REF DIR | hull images\n"
 	      "       hull core\n"
 	      "       hull engines\n"
 	      "       hull --version\n", out);
@@ -937,17 +939,117 @@ static int list_machines(void)
  * core, which is started for it, and each engine's report written out. An
  * engine that could not look says so on stderr, and is not a failure of
  * gc's: a host without docker has nothing of docker's to reclaim. */
+/* --- the store ---------------------------------------------------------- */
+
+/* Section 3's store, made if `create`: 0, or 2 having said why, or 1 when
+ * there is none and none was to be made. */
+static int open_store(hull_store *store, int create)
+{
+	char why[4400] = "";
+	int  opened = hull_store_open(store, create, why, sizeof why);
+
+	if (opened < 0)
+		fprintf(stderr, "hull: the store: %s\n", why);
+	return opened < 0 ? 2 : opened;
+}
+
+static int commit(const char *dir, const char *ref, const char *arch)
+{
+	hull_store  store;
+	hull_commit made;
+	char        why[4400] = "";
+	int         status;
+
+	if ((status = open_store(&store, 1)) != 0)
+		return status;
+	status = hull_store_commit(&store, dir, arch, ref, &made, why, sizeof why);
+	hull_store_close(&store);
+	if (status != 0) {
+		fprintf(stderr, "hull: commit: %s\n", why);
+		return 1;
+	}
+	printf("%s sha256:%s\n", ref, made.manifest);
+	fprintf(stderr, "hull: %llu entries, %llu objects, %llu new, %llu bytes%s\n",
+	        (unsigned long long)made.entries, (unsigned long long)made.objects,
+	        (unsigned long long)made.new_objects, (unsigned long long)made.total_size,
+	        made.skipped != 0u ? "; some were left out, as said" : "");
+	return 0;
+}
+
+static int materialize(const char *ref, const char *dir)
+{
+	hull_store store;
+	uint64_t   skipped = 0u;
+	char       why[4400] = "";
+	int        status;
+
+	if ((status = open_store(&store, 0)) != 0) {
+		if (status == 1)
+			fprintf(stderr, "hull: materialize: there is no store, so no %s\n", ref);
+		return 1;
+	}
+	status = hull_store_materialize(&store, ref, dir, &skipped, why, sizeof why);
+	hull_store_close(&store);
+	if (status != 0) {
+		fprintf(stderr, "hull: materialize: %s\n", why);
+		return 1;
+	}
+	if (skipped != 0u)
+		fprintf(stderr, "hull: materialize: %llu kept as the user could, as said\n",
+		        (unsigned long long)skipped);
+	return 0;
+}
+
+static void print_ref(void *context, const char *ref, const char *manifest)
+{
+	(void)context;
+	printf("%-40s sha256:%s\n", ref, manifest);
+}
+
+static int images(void)
+{
+	hull_store store;
+	char       why[256] = "";
+	int        status;
+
+	printf("%-40s %s\n", "REF", "MANIFEST");
+	if ((status = open_store(&store, 0)) != 0)
+		return status == 1 ? 0 : status;
+	status = hull_store_list(&store, print_ref, NULL, why, sizeof why);
+	hull_store_close(&store);
+	return status == 0 ? 0 : 2;
+}
+
+/* What the engines keep that nothing wants, through the core, and what
+ * no ref reaches in the store, if there is one. */
 static int collect(void)
 {
-	hull_wire wire;
-	int       status;
+	hull_store store;
+	hull_wire  wire;
+	uint64_t   manifests = 0u;
+	uint64_t   objects = 0u;
+	char       why[4400] = "";
+	int        status;
+	int        result = 0;
 
+	if ((status = open_store(&store, 0)) == 2) {
+		result = 1;
+	} else if (status == 0) {
+		if (hull_store_gc(&store, &manifests, &objects, why, sizeof why) != 0) {
+			fprintf(stderr, "hull: gc: the store: %s\n", why);
+			result = 1;
+		} else {
+			printf("store: removed %llu manifests and %llu objects no ref reaches\n",
+			       (unsigned long long)manifests, (unsigned long long)objects);
+		}
+		hull_store_close(&store);
+	}
 	if (connect_core(&wire, 1) != 0)
 		return 2;
 	send_request(&wire, "(2:gc", 1u, NULL, NULL);
 	status = follow(&wire, 1u, NULL);
 	hull_wire_close(&wire);
-	return status == 125 ? 1 : 0;
+	return status == 125 || result != 0 ? 1 : 0;
 }
 
 /* --- exec -------------------------------------------------------------- */
@@ -1599,6 +1701,14 @@ int main(int argc, char **argv)
 		return list_machines();
 	if (strcmp(command, "gc") == 0 && argc == 2)
 		return collect();
+	if (strcmp(command, "commit") == 0 && argc == 4)
+		return commit(argv[2], argv[3], host_arch());
+	if (strcmp(command, "commit") == 0 && argc == 6 && strcmp(argv[2], "--arch") == 0)
+		return commit(argv[4], argv[5], argv[3]);
+	if (strcmp(command, "materialize") == 0 && argc == 4)
+		return materialize(argv[2], argv[3]);
+	if (strcmp(command, "images") == 0 && argc == 2)
+		return images();
 	if (strcmp(command, "proxy-ssh") == 0 && argc == 3)
 		return proxy_ssh(argv[2]);
 	if (strcmp(command, "ssh-config") == 0 && argc == 2)

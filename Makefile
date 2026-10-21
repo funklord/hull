@@ -99,6 +99,8 @@ ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/usage.o $(BUILD_DIR)/engine/sha256.o \
               $(BUILD_DIR)/engine/tree.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o
+# Section 3's optional store, which only the commands that name it use.
+STORE_OBJS  = $(BUILD_DIR)/store/store.o
 
 # The per-user core, and the frontend protocol it speaks (section 4.10),
 # validated by C situ generates from core/frontend.situ.
@@ -180,7 +182,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
             $(BUILD_DIR)/test/wire_test $(BUILD_DIR)/test/sha256_test \
             $(BUILD_DIR)/test/tree_tar
 
-CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
+CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: all check check-docker check-qemu check-flip test vectors style style-source style-docs contract hooks clean help install-nss
 
@@ -250,6 +252,10 @@ $(BUILD_DIR)/engine/%.o: engine/%.c | $(GEN_HEADERS) $(AGENT_GEN)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
+$(BUILD_DIR)/store/%.o: store/%.c | $(GEN_HEADERS)
+	@mkdir -p '$(@D)'
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+
 $(BUILD_DIR)/core/%.o: core/%.c VERSION | $(GEN_HEADERS) $(AGENT_GEN) $(FRONTEND_GEN) \
                                           $(PROTOCOL_GEN)
 	@mkdir -p '$(@D)'
@@ -264,7 +270,8 @@ $(PROBE): test/probe.c
 	@mkdir -p '$(@D)'
 	$(CC) -static $(CFLAGS) -o $@ $<
 
-$(HULL): $(CLI_OBJS) $(CORE_OBJS) $(ENGINE_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
+$(HULL): $(CLI_OBJS) $(CORE_OBJS) $(ENGINE_OBJS) $(STORE_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) \
+         $(SEXPR_OBJS)
 	$(CC) $(CFLAGS) -pthread -o $@ $^
 
 $(AGENT_BIN): $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
@@ -334,7 +341,7 @@ $(BUILD_DIR)/test/tree_tar: $(TEST_TREE_OBJS) $(BUILD_DIR)/engine/tree.o
 	$(CC) $(CFLAGS) -o $@ $^
 
 -include $(SEXPR_OBJS:.o=.d) $(AGENT_OBJS:.o=.d) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS:.o=.d) \
-         $(ENGINE_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(CORE_OBJS:.o=.d) $(TEST_OBJS:.o=.d) \
+         $(ENGINE_OBJS:.o=.d) $(STORE_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(CORE_OBJS:.o=.d) $(TEST_OBJS:.o=.d) \
          $(BUILD_DIR)/agent/agent.d
 
 # --- checks -----------------------------------------------------------------
@@ -361,6 +368,7 @@ test: $(TEST_BINS) $(HULL) $(PROBE) $(NSS_LIB) vectors
 	BUILD_DIR='$(BUILD_DIR)' sh test/tree_test.sh '$(BUILD_DIR)/test/tree_tar'
 	BUILD_DIR='$(BUILD_DIR)' sh test/cli_test.sh '$(HULL)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/nss_test.sh '$(HULL)' '$(NSS_LIB)'
+	BUILD_DIR='$(BUILD_DIR)' sh test/store_test.sh '$(HULL)' '$(SITU_MARK)'
 	$(PYTHON) tool/test_style_gate.py
 
 # Each schema accepts every vector in its .vectors and refuses every one in
@@ -437,7 +445,7 @@ clean:
 	        $(SEXPR_OBJS) $(SEXPR_OBJS:.o=.d) $(GEN_SOURCES) $(GEN_HEADERS) \
 	        $(AGENT_OBJS) $(AGENT_OBJS:.o=.d) $(AGENT_GEN) \
 	        $(SPEC_OBJS) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS) $(PLAN_OBJS:.o=.d) \
-	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) \
+	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(STORE_OBJS) $(STORE_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) \
 	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) \
 	        $(AGENT_BIN) $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d \
 	        $(CLI_TEST_FILES) $(PROBE) $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) \
