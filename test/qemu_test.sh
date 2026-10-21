@@ -812,6 +812,41 @@ if printf '%s\n' "$out" | grep -q 'kvm-clock'; then
 	fail "the emu class ran with KVM" "$out"
 fi
 
+# Secrets (J.3), placed by the agent: the core that writes them on the
+# host needs a tmpfs, so they run in a runtime directory of their own,
+# made under /dev/shm and removed once that core has left. A dir of their
+# own too, as the agent needs /run, which rootfs/ has not, for that case.
+shm=$(mktemp -d /dev/shm/hull-qemu-test.XXXXXX)
+mkdir -p "$root/secret/run" "$root/secret/proc" "$root/secret/dev" "$root/secret/sys"
+cp "$probe" "$root/secret/probe"
+printf 'from a file\n' > "$root/pw.txt"
+printf '(machine (source "dir:./secret") (backend vm) (command %s) (secrets %s))\n' \
+	'"/probe" "list" "/run/hull/secrets" "read" "/run/hull/secrets/pw" "owner" "/run/hull/secrets/pw" "env" "made" "write" "/run/hull/secrets/new"' \
+	'(pw (source "file:pw.txt")) (made (source "exec:printf made") (expose env))' > "$root/secret.conf"
+name=secret
+out=$(cd / && XDG_RUNTIME_DIR=$shm timeout 60 "$hull" run -f "$root/secret.conf" 2>&1)
+got=$?
+has 0 '^list= made pw$'
+has 0 '^read=from a file$'
+has 0 '^owner=0:0 0400$'
+has 0 '^made=made$'
+has 0 '^write=Read-only file system$'
+printf '(machine (source "dir:./rootfs") (backend vm) (command "/probe" "say" "ran") %s)\n' \
+	'(secrets (pw (source "file:pw.txt")))' > "$root/norun.conf"
+name=norun
+out=$(cd / && XDG_RUNTIME_DIR=$shm timeout 60 "$hull" run -f "$root/norun.conf" 2>&1)
+got=$?
+has 125 'no /run for its secrets'
+tries=0
+while [ -S "$shm/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+cases=$((cases + 1))
+left=$(ls -A "$shm/hull/secrets" 2>&1; ls -d "$shm"/hull/qemu-* 2>/dev/null)
+[ -z "$left" ] || fail "a vm's secrets or its directory were left" "$left"
+rm -rf "${shm:?}"
+
 # Nothing left: no qemu of this suite's, no passt, no machine directory.
 cases=$((cases + 1))
 sleep 2

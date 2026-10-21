@@ -116,6 +116,7 @@ struct hull_machine {
 	unsigned         cpus;
 	uint8_t         *spec;         /* the plan's (machine ...), for the agent */
 	size_t           spec_length;
+	hull_msg         secrets;      /* `(secrets (NAME VALUE) ...)` for it, or empty */
 
 	char             dir[4096];    /* the machine's files: initrd, console */
 	int              network;      /* qemu's end of passt's socket, or -1 */
@@ -186,12 +187,81 @@ static hull_status fail(hull_error *error, hull_status code, const char *detail)
 	return code;
 }
 
+/* The secrets' values, once they are in the spec, or the machine goes:
+ * zeroed first, as the spec that held them is once sent. The wire's own
+ * frame and the allocator's earlier copies are not. */
+static void forget_secrets(hull_machine *m)
+{
+	if (m->secrets.data != NULL)
+		explicit_bzero(m->secrets.data, m->secrets.cap);
+	hull_msg_free(&m->secrets);
+}
+
+/*
+ * J.3's secrets, for the agent to place in the guest: read from the files
+ * the core wrote in the plan's `(secrets DIR)`, by the names the plan's
+ * machine gives, into `(secrets (NAME VALUE) ...)`, which goes after the
+ * machine in the spec. Returns a reason, or NULL.
+ */
+static const char *read_secrets(hull_machine *m, const hull_sexpr_doc *doc,
+                                const hull_sexpr_form *machine)
+{
+	static uint8_t  value[65537];
+	hull_sexpr_form top;
+	hull_sexpr_form entry;
+	hull_sexpr_form item;
+	hull_sexpr_form name_form;
+	char           *dir;
+	int             more;
+	const char     *reason = NULL;
+
+	if (!hull_access_find(doc, machine, "secrets", &entry))
+		return NULL;
+	hull_sexpr_first(doc, &top);
+	if ((dir = hull_access_value(doc, &top, "secrets")) == NULL)
+		return "the plan's secrets were given no directory";
+	hull_msg_raw(&m->secrets, "(7:secrets");
+	hull_sexpr_child(doc, &entry, &item);
+	for (more = hull_sexpr_next(doc, &item, &item); more && reason == NULL;
+	     more = hull_sexpr_next(doc, &item, &item)) {
+		char    path[4400];
+		char   *name = hull_sexpr_child(doc, &item, &name_form) ?
+		               hull_access_text(doc, &name_form) : NULL;
+		size_t  n = 0u;
+		ssize_t got = 0;
+		int     fd = -1;
+
+		if (name != NULL && (size_t)snprintf(path, sizeof path, "%s/%s", dir, name) < sizeof path)
+			fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+		while (fd >= 0 && n < sizeof value && (got = read(fd, value + n, sizeof value - n)) > 0)
+			n += (size_t)got;
+		if (fd < 0 || got < 0 || n == sizeof value) {
+			reason = "a secret cannot be read";
+		} else {
+			hull_msg_raw(&m->secrets, "(");
+			hull_msg_text(&m->secrets, name);
+			hull_msg_atom(&m->secrets, value, n);
+			hull_msg_raw(&m->secrets, ")");
+		}
+		explicit_bzero(value, n);
+		if (fd >= 0)
+			close(fd);
+		free(name);
+	}
+	hull_msg_raw(&m->secrets, ")");
+	free(dir);
+	if (reason == NULL && m->secrets.failed)
+		reason = "out of memory";
+	return reason;
+}
+
 static void release(hull_machine *m)
 {
 	free(m->root);
 	for (unsigned i = 0u; i < m->volume_count; i++)
 		free(m->volume_host[i]);
 	free(m->spec);
+	forget_secrets(m);
 	pthread_mutex_destroy(&m->lock);
 	pthread_mutex_destroy(&m->send_lock);
 	pthread_cond_destroy(&m->done_cond);
@@ -340,7 +410,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	if (m->spec == NULL)
 		return "out of memory";
 	memcpy(m->spec, doc->data + machine.offset, m->spec_length);
-	return NULL;
+	return read_secrets(m, doc, &machine);
 }
 
 /* --- the initramfs ------------------------------------------------------- */
@@ -1300,8 +1370,17 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	if (expect(m, "hello")) {
 		hull_msg_raw(&msg, "(4:spec(2:ch1:0)");
 		hull_msg_bytes(&msg, m->spec, m->spec_length);
+		if (m->secrets.data != NULL)
+			hull_msg_bytes(&msg, m->secrets.data, m->secrets.length);
 		hull_msg_raw(&msg, ")");
-		send_msg(m, &msg);
+		forget_secrets(m);
+		pthread_mutex_lock(&m->send_lock);
+		if (m->connected && hull_wire_send(m->wire.fd, &msg) != 0)
+			m->connected = 0;
+		pthread_mutex_unlock(&m->send_lock);
+		if (msg.data != NULL)
+			explicit_bzero(msg.data, msg.cap);
+		hull_msg_free(&msg);
 		if (expect(m, "ready")) {
 			hull_msg_raw(&msg, "(5:start(2:ch1:0))");
 			send_msg(m, &msg);
@@ -2048,6 +2127,9 @@ static const hull_cap_entry entries[] = {
 	{ "env",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "hostname",           HULL_SUP_NATIVE,   NULL, NULL },
 	{ "volumes",            HULL_SUP_NATIVE,   "a 9p share each", NULL },
+	{ "secrets",            HULL_SUP_NATIVE,
+	  "placed by the agent on a tmpfs under one at the machine's /run, which it must "
+	  "have", NULL },
 	{ "cpus",               HULL_SUP_NATIVE,   NULL, NULL },
 	{ "memory",             HULL_SUP_NATIVE,   "a hard allocation", NULL },
 	/* Section 6's host forwarder: the engine's, over vsock to the agent. */

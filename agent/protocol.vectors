@@ -94,3 +94,6 @@ host_message connect 28 37 3A 63 6F 6E 6E 65 63 74 28 32 3A 63 68 31 3A 35 29 28
 
 # connect_udp: (7:connect(2:ch1:5)(4:port2:53)(5:proto3:udp))
 host_message connect_udp 28 37 3A 63 6F 6E 6E 65 63 74 28 32 3A 63 68 31 3A 35 29 28 34 3A 70 6F 72 74 32 3A 35 33 29 28 35 3A 70 72 6F 74 6F 33 3A 75 64 70 29 29
+
+# spec_secrets: (4:spec(2:ch1:0)(7:machine(7:backend2:vm))(7:secrets(2:db6:hunter)))
+host_message spec_secrets 28 34 3A 73 70 65 63 28 32 3A 63 68 31 3A 30 29 28 37 3A 6D 61 63 68 69 6E 65 28 37 3A 62 61 63 6B 65 6E 64 32 3A 76 6D 29 29 28 37 3A 73 65 63 72 65 74 73 28 32 3A 64 62 36 3A 68 75 6E 74 65 72 29 29 29

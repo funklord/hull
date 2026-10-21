@@ -86,13 +86,25 @@ struct host_hello {
 }
 
 // The resolved machine spec, `(machine ...)` as in hull.conf (section 4),
-// applied before `start`.
+// applied before `start`. A machine with `(secrets ...)` (J.3) has their
+// values after it, `(secrets (NAME VALUE) ...)`, which the agent places
+// at /run/hull/secrets.
 struct spec {
 	preamble u8[6] = "4:spec";
 	control  ch;
 	preamble u8[10] = "(7:machine";
 	form  entries[]  until ")";
+	peek u8  after_machine;
+	variant extra switch (after_machine) {
+		case '(':  secrets_entry  has_secrets;
+		default:   absent         no_secrets;
+	}
 	u8  close  [must_eq = ')'];
+}
+
+struct secrets_entry {
+	preamble u8[10] = "(7:secrets";
+	form  values[]  until ")";
 }
 
 struct start {

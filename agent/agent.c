@@ -53,6 +53,7 @@
 
 #define _GNU_SOURCE
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -397,7 +398,97 @@ static void make_path(char *path)
 
 /* Apply `machine`: what the workload is, its root and its volumes. A
  * reason it cannot be, or NULL. */
-static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machine)
+/*
+ * J.3's secrets, from the spec's `(secrets (NAME VALUE) ...)`: a file each,
+ * 0400, in /run/hull/secrets, on a tmpfs of its own made read-only once
+ * they are written, under a tmpfs at the machine's /run, which it must
+ * have; nothing is made in the machine's directory, whose /run FHS has
+ * emptied at every boot. Those with `(expose env)` join envp_ from
+ * `*count`. Returns a reason, or NULL.
+ */
+static const char *place_secrets(const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
+                                 const hull_sexpr_form *given, unsigned *count)
+{
+	hull_sexpr_form pair;
+	hull_sexpr_form name;
+	hull_sexpr_form value;
+	hull_sexpr_form wanted;
+	int             more;
+
+	if (mount("tmpfs", "/machine/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755,size=1m") != 0)
+		return "the machine has no /run for its secrets";
+	if (mkdir("/machine/run/hull", 0755) != 0 || mkdir("/machine/run/hull/secrets", 0700) != 0 ||
+	    mount("tmpfs", "/machine/run/hull/secrets", "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+	          "mode=0700,size=16m") != 0)
+		return "the secrets' tmpfs could not be made";
+	hull_sexpr_child(doc, given, &pair);
+	for (more = hull_sexpr_next(doc, &pair, &pair); more; more = hull_sexpr_next(doc, &pair, &pair)) {
+		char path[300];
+		int  fd;
+
+		if (!hull_sexpr_child(doc, &pair, &name) || !hull_sexpr_next(doc, &name, &value) ||
+		    name.kind != HULL_SEXPR_ATOM || value.kind != HULL_SEXPR_ATOM ||
+		    name.content_length == 0u || name.content_length > 255u)
+			return "a secret is not a name and a value";
+		/* The spec's rule for a name: letters, digits, `_` and `-`. */
+		for (uint32_t i = 0u; i < name.content_length; i++) {
+			char c = (char)doc->data[name.content + i];
+
+			if (!isalnum((unsigned char)c) && c != '_' && c != '-')
+				return "a secret's name is not one";
+		}
+		snprintf(path, sizeof path, "/machine/run/hull/secrets/%.*s", (int)name.content_length,
+		         (const char *)doc->data + name.content);
+		fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0400);
+		if (fd < 0 || write(fd, doc->data + value.content, value.content_length) !=
+		                  (ssize_t)value.content_length) {
+			if (fd >= 0)
+				close(fd);
+			return "a secret could not be written";
+		}
+		close(fd);
+	}
+	if (mount(NULL, "/machine/run/hull/secrets", NULL,
+	          MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) != 0)
+		return "the secrets could not be made read-only";
+
+	/* The ones the machine puts in its environment. */
+	if (!hull_access_find(doc, machine, "secrets", &wanted))
+		return NULL;
+	hull_sexpr_child(doc, &wanted, &pair);
+	for (more = hull_sexpr_next(doc, &pair, &pair); more; more = hull_sexpr_next(doc, &pair, &pair)) {
+		char           *expose = hull_access_value(doc, &pair, "expose");
+		hull_sexpr_form other;
+		int             exposed = expose != NULL && strcmp(expose, "env") == 0;
+		int             found = 0;
+
+		free(expose);
+		if (!exposed || !hull_sexpr_child(doc, &pair, &name))
+			continue;
+		hull_sexpr_child(doc, given, &other);
+		while (!found && hull_sexpr_next(doc, &other, &other)) {
+			hull_sexpr_form key;
+
+			if (hull_sexpr_child(doc, &other, &key) &&
+			    key.content_length == name.content_length &&
+			    memcmp(doc->data + key.content, doc->data + name.content,
+			           name.content_length) == 0 &&
+			    hull_sexpr_next(doc, &key, &value))
+				found = 1;
+		}
+		if (!found || *count == MAX_ENV ||
+		    memchr(doc->data + value.content, '\0', value.content_length) != NULL ||
+		    (envp_[*count] = malloc(name.content_length + value.content_length + 2u)) == NULL)
+			return "a secret to expose has no value, holds a NUL, or is one env name too many";
+		sprintf(envp_[(*count)++], "%.*s=%.*s", (int)name.content_length,
+		        (const char *)doc->data + name.content, (int)value.content_length,
+		        (const char *)doc->data + value.content);
+	}
+	return NULL;
+}
+
+static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
+                         const hull_sexpr_form *secrets)
 {
 	hull_sexpr_form entry;
 	hull_sexpr_form item;
@@ -510,6 +601,8 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 				return "a volume could not be mounted";
 		}
 	}
+	if (secrets != NULL && (reason = place_secrets(doc, machine, secrets, &n)) != NULL)
+		return reason;
 	/* The kernel's filesystems inside, where the machine has a place for
 	 * them; then the directory becomes /. */
 	if (mount("proc", "/machine/proc", "proc", 0u, NULL) != 0 && errno != ENOENT)
@@ -1060,13 +1153,15 @@ static void handle(const hull_sexpr_doc *body)
 		send_msg(&m);
 	} else if (hull_msg_is(body, "spec")) {
 		hull_sexpr_form machine;
+		hull_sexpr_form secrets;
 
 		if (applied)
 			reason = "the spec has been applied already";
 		else if (!hull_access_find(body, &message, "machine", &machine))
 			reason = "the spec holds no machine";
 		else
-			reason = apply(body, &machine);
+			reason = apply(body, &machine,
+			               hull_access_find(body, &message, "secrets", &secrets) ? &secrets : NULL);
 		if (reason != NULL)
 			send_error(0u, reason);
 		else
