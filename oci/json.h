@@ -43,6 +43,11 @@ int hull_json_member(const hull_json *doc, const hull_json_value *object, const 
 int hull_json_element(const hull_json *doc, const hull_json_value *array, int first,
                       hull_json_value *item);
 
+/* An object's members in turn, as hull_json_element() walks an array:
+ * `*key` the name, a string, and `*value` its value. */
+int hull_json_next_member(const hull_json *doc, const hull_json_value *object, int first,
+                          hull_json_value *key, hull_json_value *value);
+
 /* A string, its escapes decoded, \u ones to UTF-8: its length, or -1 when
  * it is not a string, does not fit `cap` with its NUL, or holds a NUL. */
 long hull_json_string(const hull_json *doc, const hull_json_value *value, char *out, size_t cap);

@@ -383,7 +383,7 @@ test: $(TEST_BINS) $(HULL) $(PROBE) $(NSS_LIB) vectors
 	BUILD_DIR='$(BUILD_DIR)' sh test/cli_test.sh '$(HULL)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/nss_test.sh '$(HULL)' '$(NSS_LIB)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/store_test.sh '$(HULL)' '$(SITU_MARK)'
-	BUILD_DIR='$(BUILD_DIR)' sh test/pull_test.sh '$(HULL)' '$(PROBE)'
+	BUILD_DIR='$(BUILD_DIR)' sh test/pull_test.sh '$(HULL)' '$(PROBE)' '$(SITU_MARK)'
 	$(PYTHON) tool/test_style_gate.py
 
 # Each schema accepts every vector in its .vectors and refuses every one in

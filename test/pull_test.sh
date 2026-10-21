@@ -6,7 +6,8 @@
 # a symlinked one, a hardlink, a long name, an xattr, a device, a layer not
 # compressed, and what a pull refuses. The pulled image is then run.
 #
-# Its arguments are build/hull and the probe, which the image carries.
+# Its arguments are build/hull, the probe, which the image carries, and the
+# situc a pulled manifest is verified with, against manifest/manifest.situ.
 # Everything is under $BUILD_DIR/test/pull, removed at its start and its
 # end; the registries serve 300 seconds at most and are stopped at the end,
 # and every command runs under `timeout`.
@@ -15,6 +16,7 @@ set -u
 
 hull=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 probe=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
+situc=$3
 here=$(cd "$(dirname "$0")" && pwd)
 dir=${BUILD_DIR:?}/test/pull
 case $dir in
@@ -159,16 +161,62 @@ print(os.getxattr(sys.argv[1], "user.note").decode())' "$root/out/etc/noted" 2>&
 check "an uncompressed layer" [ "$(cat "$root/out/srv/plain")" = plain ]
 check "a device made" [ ! -e "$root/out/dev/null" ]
 
+# The config's defaults are A.4's runtime, in canonical order, and A.5's
+# provenance says who made it and from where: the six digests fetched,
+# index, manifest, config and three layers, and the registry as named. The
+# manifest is the schema's, verified apart from the code that wrote it.
+expect 0 '^  \(runtime \(cmd from-config cwd env GREETING\) \(entrypoint /probe say\) \(env \(GREETING hi\) \(PATH /bin\)\) \(ports 53/udp 80/tcp\) \(stop_signal SIGTERM\) \(user 1000\) \(volumes /data\) \(workdir /etc\)\)$' \
+	"$hull" manifest show "$image"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -Eq "^  \(provenance \(builder \"hull [^\"]+\"\) \(oci \(digests( sha256:[0-9a-f]{64}){6}\) \(registry 127\.0\.0\.1:$port/test/image\)\)\)\$" ||
+	fail "the provenance is not the builder, six digests and the registry" "$out"
+cases=$((cases + 1))
+tree_hex=$(printf '%s\n' "$pulled" | sed -n 's/^.* sha256:\([0-9a-f]\{64\}\)$/\1/p' | tail -1)
+printf 'manifest pulled %s\n' "$(od -An -v -tx1 "$store/manifests/sha256/$tree_hex" | tr -s ' \n' '  ' | sed 's/^ //; s/ $//' | tr a-f A-F)" \
+	> "$root/pulled.vectors"
+verified=$(timeout 300 python3 "$situc" verify "$here/../manifest/manifest.situ" "$root/pulled.vectors" 2>&1)
+printf '%s\n' "$verified" | grep -q '^situc: 1 vectors conform to' ||
+	fail "the pulled manifest is not the schema's" "$verified"
+# A config that names no workdir: `/`, which the schema requires one of.
+expect 0 '' "$hull" pull "127.0.0.1:$port/test/bad:real" plain/1
+expect 0 '^  \(runtime \(cmd /probe\) \(workdir /\)\)$' "$hull" manifest show plain/1
+# A machine that names no command runs the image's, entrypoint and then
+# command, in its workdir, with its env; its user is said and not taken.
+printf '(machine (source "%s") (backend chroot) (hostname "defaults"))\n' "$image" \
+	> "$root/defaults.conf"
+expect 0 '^cwd=/etc$' sh -c 'cd / && exec "$0" run -f "$1"' "$hull" "$root/defaults.conf"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -qx 'from-config' && printf '%s\n' "$out" | grep -qx 'GREETING=hi' &&
+	printf '%s\n' "$out" | grep -q 'the image runs as 1000, which is not taken' ||
+	fail "the image's command, env or user was not as its config says" "$out"
+# And what the machine says is its own.
+printf '(machine (source "%s") (backend chroot) (hostname "own") %s)\n' "$image" \
+	'(workdir "/") (env (GREETING "mine"))' > "$root/own.conf"
+expect 0 '^GREETING=mine$' sh -c 'cd / && exec "$0" run -f "$1"' "$hull" "$root/own.conf"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -qx 'cwd=/' || fail "the machine's own workdir did not win" "$out"
+# A diff says the runtime and the provenance, against the same tree
+# committed again, which has neither, and nothing of its entries.
+expect 0 '' "$hull" commit "$root/out" again/1
+expect 1 '' "$hull" diff "$image" again/1
+cases=$((cases + 1))
+[ "$out" = "$(printf 'runtime removed\nprovenance')" ] ||
+	fail "diff did not say the runtime and the provenance alone" "$out"
+
 # The image runs, its name its source, as J.1's image ref in the store.
 printf '(machine (source "%s") (backend chroot) (hostname "pulled") %s)\n' "$image" \
 	'(command "/probe" "read" "/etc/greeting")' > "$root/pulled.conf"
 expect 0 '^read=replaced$' sh -c 'cd / && exec "$0" run -f "$1"' "$hull" "$root/pulled.conf"
 
-# Pulled again, nothing is new; by the manifest's digest, the same tree.
+# Pulled again, nothing is new. By the manifest's digest, the same tree
+# and defaults, its provenance alone another, having no index to name.
 expect 0 ', 0 new,' "$hull" pull "$image"
 manifest_digest=$(printf '%s\n' "$pulled" | sed -n 's/^hull: pull: .* is \(sha256:[0-9a-f]*\)$/\1/p')
-tree=$(printf '%s\n' "$pulled" | sed -n 's/^.* \(sha256:[0-9a-f]\{64\}\)$/\1/p' | tail -1)
-expect 0 "^by/digest $tree\$" "$hull" pull "127.0.0.1:$port/test/image@$manifest_digest" by/digest
+expect 0 '^by/digest sha256:[0-9a-f]{64}$' "$hull" pull "127.0.0.1:$port/test/image@$manifest_digest" \
+	by/digest
+expect 1 '' "$hull" diff "$image" by/digest
+cases=$((cases + 1))
+[ "$out" = provenance ] || fail "a pull by digest is another tree than by tag" "$out"
 
 # What a pull refuses, each before anything is committed: a layer not
 # its digest; a symlink out of the tree written through, nothing written

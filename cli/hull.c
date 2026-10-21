@@ -185,31 +185,296 @@ static uint8_t *read_file(const char *path, size_t *length)
 
 /* --- a source the store holds --------------------------------------------- */
 
-/* One source rewritten: the bytes from `at`, `cut` of them, become `text`. */
+/* One rewrite of the file's text: the bytes from `at`, `cut` of them,
+ * become `text`, which is malloc'd. */
 typedef struct rewrite {
 	uint32_t at;
 	uint32_t cut;
-	char     text[4600];
+	char    *text;
 } rewrite;
 
-#define MAX_REWRITES 64u
+#define MAX_REWRITES 256u
+
+/* Text built up; `failed` once memory ran out. */
+typedef struct text_buf {
+	char  *data;
+	size_t length;
+	size_t cap;
+	int    failed;
+} text_buf;
+
+static void add_bytes(text_buf *t, const void *bytes, size_t n)
+{
+	if (t->failed)
+		return;
+	if (t->length + n + 1u > t->cap) {
+		size_t want = (t->length + n + 1u) * 2u + 64u;
+		char  *grown = realloc(t->data, want);
+
+		if (grown == NULL) {
+			t->failed = 1;
+			return;
+		}
+		t->data = grown;
+		t->cap = want;
+	}
+	memcpy(t->data + t->length, bytes, n);
+	t->length += n;
+	t->data[t->length] = '\0';
+}
+
+static void add_text(text_buf *t, const char *text)
+{
+	add_bytes(t, text, strlen(text));
+}
+
+/* Back to `length`, as it was before what is taken back. */
+static void cut_text(text_buf *t, size_t length)
+{
+	t->length = length;
+	if (t->data != NULL)
+		t->data[length] = '\0';
+}
+
+/* `bytes` as a hull.conf string: 0, or -1 for bytes a string cannot hold,
+ * a control byte other than a newline or a tab. */
+static int add_quoted(text_buf *t, const uint8_t *bytes, size_t n)
+{
+	add_text(t, "\"");
+	for (size_t i = 0u; i < n; i++) {
+		if (bytes[i] == '"' || bytes[i] == '\\') {
+			char escaped[2] = { '\\', (char)bytes[i] };
+
+			add_bytes(t, escaped, 2u);
+		} else if (bytes[i] == '\n') {
+			add_text(t, "\\n");
+		} else if (bytes[i] == '\t') {
+			add_text(t, "\\t");
+		} else if (bytes[i] < 0x20u || bytes[i] == 0x7fu) {
+			return -1;
+		} else {
+			add_bytes(t, bytes + i, 1u);
+		}
+	}
+	add_text(t, "\"");
+	return 0;
+}
+
+/* A name a hull.conf key can be as it stands. */
+static int is_key(const uint8_t *bytes, size_t n)
+{
+	if (n == 0u)
+		return 0;
+	for (size_t i = 0u; i < n; i++)
+		if (!((bytes[i] >= 'a' && bytes[i] <= 'z') || (bytes[i] >= 'A' && bytes[i] <= 'Z') ||
+		      (bytes[i] >= '0' && bytes[i] <= '9') || bytes[i] == '_' || bytes[i] == '.' ||
+		      bytes[i] == '-'))
+			return 0;
+	return 1;
+}
+
+/* `(key ...)` in a canonical record. */
+static int record_find(const hull_sexpr_doc *doc, const hull_sexpr_form *record, const char *key,
+                       hull_sexpr_form *found)
+{
+	hull_sexpr_form item;
+	hull_sexpr_form name;
+	int             more;
+
+	hull_sexpr_child(doc, record, &item);
+	for (more = hull_sexpr_next(doc, &item, &item); more; more = hull_sexpr_next(doc, &item, &item))
+		if (item.kind == HULL_SEXPR_LIST && hull_sexpr_child(doc, &item, &name) &&
+		    hull_sexpr_is(doc, &name, key)) {
+			*found = item;
+			return 1;
+		}
+	return 0;
+}
+
+/* Each word of `(key word ...)` in the runtime, quoted onto `t`. */
+static int add_words(text_buf *t, const hull_sexpr_doc *doc, const hull_sexpr_form *runtime,
+                     const char *key, int *any)
+{
+	hull_sexpr_form list;
+	hull_sexpr_form word;
+	int             more;
+
+	if (!record_find(doc, runtime, key, &list))
+		return 0;
+	hull_sexpr_child(doc, &list, &word);
+	for (more = hull_sexpr_next(doc, &word, &word); more; more = hull_sexpr_next(doc, &word, &word)) {
+		add_text(t, " ");
+		if (add_quoted(t, doc->data + word.content, word.content_length) != 0)
+			return -1;
+		*any = 1;
+	}
+	return 0;
+}
+
+static int add_rewrite(rewrite *rewrites, unsigned *count, uint32_t at, uint32_t cut, text_buf *t)
+{
+	if (*count >= MAX_REWRITES || t->failed) {
+		free(t->data);
+		return -1;
+	}
+	rewrites[*count] = (rewrite){ at, cut, t->data };
+	(*count)++;
+	*t = (text_buf){ 0 };
+	return 0;
+}
+
+/*
+ * A.4's defaults, from a stored tree's manifest, written where the machine
+ * says nothing of its own: its command, the entrypoint and then the
+ * command, as docker runs them; its workdir; and each env name it does not
+ * set, so that its own win, as J.1 says the machine's env is merged over
+ * the manifest's. The image's user is said and not taken, since J.1 has
+ * no key to take it into; its ports and volumes are advisory.
+ */
+static int runtime_defaults(const char *file, const char *name, const hull_spec *spec,
+                            const hull_sexpr_form *machine, const uint8_t *runtime_bytes,
+                            size_t runtime_length, rewrite *rewrites, unsigned *count)
+{
+	hull_sexpr_doc  doc;
+	hull_sexpr_form runtime;
+	hull_sexpr_form found;
+	hull_sexpr_form env;
+	text_buf        at_end = { 0 };
+	text_buf        into_env = { 0 };
+	int             has_env = hull_spec_find(spec, machine, "env", &env);
+	int             any = 0;
+
+	if (hull_sexpr_open(&doc, runtime_bytes, runtime_length, HULL_SEXPR_CANONICAL, NULL) !=
+	        HULL_SEXPR_OK ||
+	    !hull_sexpr_first(&doc, &runtime))
+		return 0;
+	if (!hull_spec_find(spec, machine, "command", &found)) {
+		text_buf words = { 0 };
+
+		if (add_words(&words, &doc, &runtime, "entrypoint", &any) != 0 ||
+		    add_words(&words, &doc, &runtime, "cmd", &any) != 0) {
+			fprintf(stderr, "%s: %s: its command holds what a hull.conf string cannot\n", file,
+			        name);
+			free(words.data);
+			return -1;
+		}
+		if (any) {
+			add_text(&at_end, " (command");
+			add_bytes(&at_end, words.data, words.length);
+			add_text(&at_end, ")");
+		}
+		free(words.data);
+	}
+	if (!hull_spec_find(spec, machine, "workdir", &found) &&
+	    record_find(&doc, &runtime, "workdir", &found)) {
+		hull_sexpr_form head;
+		hull_sexpr_form path;
+
+		hull_sexpr_child(&doc, &found, &head);
+		hull_sexpr_next(&doc, &head, &path);
+		add_text(&at_end, " (workdir ");
+		if (add_quoted(&at_end, doc.data + path.content, path.content_length) != 0) {
+			free(at_end.data);
+			return -1;
+		}
+		add_text(&at_end, ")");
+	}
+	if (record_find(&doc, &runtime, "env", &found)) {
+		hull_sexpr_form pair;
+		text_buf       *to = has_env ? &into_env : &at_end;
+		size_t          before_env = at_end.length;
+		int             more;
+		int             added = 0;
+
+		if (!has_env)
+			add_text(&at_end, " (env");
+		hull_sexpr_child(&doc, &found, &pair);
+		for (more = hull_sexpr_next(&doc, &pair, &pair); more;
+		     more = hull_sexpr_next(&doc, &pair, &pair)) {
+			hull_sexpr_form key;
+			hull_sexpr_form value;
+			hull_sexpr_form mine;
+			char            text[256];
+			size_t          before = to->length;
+
+			hull_sexpr_child(&doc, &pair, &key);
+			hull_sexpr_next(&doc, &key, &value);
+			if (!is_key(doc.data + key.content, key.content_length) ||
+			    key.content_length >= sizeof text) {
+				fprintf(stderr, "%s: %s: its env %.*s is not a name hull.conf takes, left out\n",
+				        file, name, (int)key.content_length,
+				        (const char *)doc.data + key.content);
+				continue;
+			}
+			memcpy(text, doc.data + key.content, key.content_length);
+			text[key.content_length] = '\0';
+			if (has_env && hull_spec_find(spec, &env, text, &mine))
+				continue;  /* the machine's own */
+			add_text(to, " (");
+			add_text(to, text);
+			add_text(to, " ");
+			if (add_quoted(to, doc.data + value.content, value.content_length) != 0) {
+				fprintf(stderr, "%s: %s: its env %s holds what a hull.conf string cannot, "
+				        "left out\n", file, name, text);
+				cut_text(to, before);
+				continue;
+			}
+			add_text(to, ")");
+			added = 1;
+		}
+		if (!has_env && !added)
+			cut_text(&at_end, before_env);
+		else if (!has_env)
+			add_text(&at_end, ")");
+	}
+	if (record_find(&doc, &runtime, "user", &found)) {
+		hull_sexpr_form head;
+		hull_sexpr_form user;
+
+		hull_sexpr_child(&doc, &found, &head);
+		hull_sexpr_next(&doc, &head, &user);
+		if (!hull_sexpr_is(&doc, &user, "root") && !hull_sexpr_is(&doc, &user, "0") &&
+		    !hull_sexpr_is(&doc, &user, "0:0"))
+			fprintf(stderr, "%s: %s: the image runs as %.*s, which is not taken: the "
+			        "machine runs as its root\n", file, name, (int)user.content_length,
+			        (const char *)doc.data + user.content);
+	}
+	if (into_env.length > 0u &&
+	    add_rewrite(rewrites, count, env.offset + env.extent - 1u, 0u, &into_env) != 0)
+		return -1;
+	free(into_env.data);
+	if (at_end.length > 0u &&
+	    add_rewrite(rewrites, count, machine->offset + machine->extent - 1u, 0u, &at_end) != 0)
+		return -1;
+	free(at_end.data);
+	return 0;
+}
+
+static int rewrite_order(const void *a, const void *b)
+{
+	uint32_t at = ((const rewrite *)a)->at;
+	uint32_t bt = ((const rewrite *)b)->at;
+
+	return at < bt ? 1 : at > bt ? -1 : 0;
+}
 
 /*
  * A machine whose source is a bare ref the store holds runs that tree, as
  * J.1 says a bare string is an image ref in the store or a registry: its
  * source becomes a dir source on the tree's checkout, under an overlay
  * where it says no (mutable ...), so that every engine taking a dir source
- * runs it and none writes the checkout. It is written into the
- * file's text, which `data` holds in MAX_FILE bytes, before anything reads
- * it as a spec, so the registry, the matrix and the plan all judge the dir
- * source the engine is given. A ref the store does not hold is left alone,
+ * runs it and none writes the checkout, and the tree's A.4 defaults fill
+ * what the machine leaves out. It is written into the file's text, which
+ * `data` holds in MAX_FILE bytes, before anything reads it as a spec, so
+ * the registry, the matrix and the plan all judge what the engine is
+ * given, and a plan shows it. A ref the store does not hold is left alone,
  * an image ref for docker. With `create` the checkout is made, as a run
  * needs; a plan only names it. Returns 0, or -1 having said why.
  */
 static int store_sources(const char *file, uint8_t *data, size_t *length, int create)
 {
 	static rewrite  rewrites[MAX_REWRITES];
-	hull_sexpr_form machines[MAX_REWRITES];
+	hull_sexpr_form machines[64];
 	unsigned        machine_count = 0u;
 	unsigned        count = 0u;
 	hull_spec       spec;
@@ -227,7 +492,7 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 		int             more;
 
 		hull_sexpr_child(&spec.doc, &spec.machines, &entry);
-		for (more = hull_sexpr_next(&spec.doc, &entry, &entry); more && machine_count < MAX_REWRITES;
+		for (more = hull_sexpr_next(&spec.doc, &entry, &entry); more && machine_count < 64u;
 		     more = hull_sexpr_next(&spec.doc, &entry, &entry))
 			machines[machine_count++] = entry;
 	}
@@ -241,6 +506,9 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 		char                     path[4400];
 		char                     why[4400] = "";
 		uint64_t                 skipped = 0u;
+		uint8_t                 *runtime = NULL;
+		size_t                   runtime_length = 0u;
+		text_buf                 source = { 0 };
 		int                      has_mutable;
 		int                      schemed = 0;
 
@@ -301,27 +569,47 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 			break;
 		/* From the value to the end of the entry, so that the overlay is
 		 * an entry of the machine's own, after the source. */
-		rewrites[count].at  = value.offset;
-		rewrites[count].cut = entry.offset + entry.extent - value.offset;
-		snprintf(rewrites[count].text, sizeof rewrites[count].text, "\"dir:%s\")%s", path,
-		         has_mutable ? "" : " (mutable overlay)");
-		count++;
+		add_text(&source, "\"dir:");
+		add_text(&source, path);
+		add_text(&source, "\")");
+		if (!has_mutable)
+			add_text(&source, " (mutable overlay)");
+		if (add_rewrite(rewrites, &count, value.offset, entry.offset + entry.extent - value.offset,
+		                &source) != 0) {
+			fprintf(stderr, "%s: too many machines on stored trees\n", file);
+			result = -1;
+			break;
+		}
+		if (hull_store_runtime(&store, name, &runtime, &runtime_length, why, sizeof why) != 0) {
+			fprintf(stderr, "%s: %s: %s\n", file, name, why);
+			result = -1;
+			break;
+		}
+		if (runtime != NULL &&
+		    runtime_defaults(file, name, &spec, &machines[i], runtime, runtime_length, rewrites,
+		                     &count) != 0)
+			result = -1;
+		free(runtime);
 	}
 	if (opened == 0)
 		hull_store_close(&store);
 	/* Last first, so that each rewrite's offset is still the file's. */
-	for (unsigned i = count; result == 0 && i-- > 0u;) {
+	qsort(rewrites, count, sizeof rewrites[0], rewrite_order);
+	for (unsigned i = 0u; i < count; i++) {
 		size_t added = strlen(rewrites[i].text);
 		size_t tail  = *length - rewrites[i].at - rewrites[i].cut;
 
-		if (*length - rewrites[i].cut + added > MAX_FILE) {
+		if (result == 0 && *length - rewrites[i].cut + added > MAX_FILE) {
 			fprintf(stderr, "%s: larger than %u bytes once its stored sources are named\n",
 			        file, MAX_FILE);
-			return -1;
+			result = -1;
 		}
-		memmove(data + rewrites[i].at + added, data + rewrites[i].at + rewrites[i].cut, tail);
-		memcpy(data + rewrites[i].at, rewrites[i].text, added);
-		*length = *length - rewrites[i].cut + added;
+		if (result == 0) {
+			memmove(data + rewrites[i].at + added, data + rewrites[i].at + rewrites[i].cut, tail);
+			memcpy(data + rewrites[i].at, rewrites[i].text, added);
+			*length = *length - rewrites[i].cut + added;
+		}
+		free(rewrites[i].text);
 	}
 	return result;
 }
@@ -1111,7 +1399,7 @@ static int commit(const char *dir, const char *ref, const char *arch)
 
 	if ((status = open_store(&store, 1)) != 0)
 		return status;
-	status = hull_store_commit(&store, dir, arch, ref, &made, why, sizeof why);
+	status = hull_store_commit(&store, dir, arch, ref, NULL, &made, why, sizeof why);
 	hull_store_close(&store);
 	if (status != 0) {
 		fprintf(stderr, "hull: commit: %s\n", why);
@@ -1185,7 +1473,7 @@ static int pull(const char *name, const char *ref)
 	}
 	if ((status = open_store(&store, 1)) != 0)
 		return status;
-	status = hull_pull(&store, name, ref, arch, &made, why, sizeof why);
+	status = hull_pull(&store, name, ref, arch, "hull " HULL_VERSION, &made, why, sizeof why);
 	hull_store_close(&store);
 	if (status != 0) {
 		fprintf(stderr, "hull: pull: %s\n", why);

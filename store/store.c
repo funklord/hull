@@ -536,7 +536,7 @@ static int set_ref(hull_store *store, const char *ref, const char *hex, char *wh
 }
 
 int hull_store_commit(hull_store *store, const char *dir, const char *arch, const char *ref,
-                      hull_commit *out, char *why, size_t cap)
+                      const hull_commit_extra *extra, hull_commit *out, char *why, size_t cap)
 {
 	walk     w = { .why = why, .why_cap = cap };
 	buf      manifest = { 0 };
@@ -582,7 +582,13 @@ int hull_store_commit(hull_store *store, const char *dir, const char *arch, cons
 	put_text(&manifest, ")(7:entries");
 	for (size_t i = 0u; i < w.count; i++)
 		put_entry(&manifest, &w.items[i]);
-	put_text(&manifest, ")(6:schema1:1)(5:stats(10:file_count");
+	put_text(&manifest, ")");
+	/* In A.2's order, after the entries and before the schema. */
+	if (extra != NULL && extra->provenance != NULL)
+		put(&manifest, extra->provenance, extra->provenance_length);
+	if (extra != NULL && extra->runtime != NULL)
+		put(&manifest, extra->runtime, extra->runtime_length);
+	put_text(&manifest, "(6:schema1:1)(5:stats(10:file_count");
 	put_number(&manifest, out->entries);
 	put_text(&manifest, ")(12:object_count");
 	put_number(&manifest, out->objects);
@@ -1305,6 +1311,29 @@ int hull_store_diff(hull_store *store, const char *from, const char *to,
 		each(context, '~', NULL, what);
 		differ = 1;
 	}
+	/* A.4's defaults, said by the keys that differ, and A.5's record of
+	 * where a tree came from, said whole. */
+	if (!same_field(&a.doc, &a.top, &b.doc, &b.top, "runtime")) {
+		static const char *const keys[] = { "cmd", "entrypoint", "env", "ports",
+		                                    "stop_signal", "user", "volumes", "workdir" };
+		hull_sexpr_form ra = { 0 };
+		hull_sexpr_form rb = { 0 };
+		size_t          at;
+		int             in_a = find(&a.doc, &a.top, "runtime", &ra);
+		int             in_b = find(&b.doc, &b.top, "runtime", &rb);
+
+		at = (size_t)snprintf(what, sizeof what, "runtime %s",
+		                      !in_a ? "added" : !in_b ? "removed" : "changed:");
+		for (unsigned i = 0u; in_a && in_b && i < sizeof keys / sizeof keys[0]; i++)
+			if (!same_field(&a.doc, &ra, &b.doc, &rb, keys[i]) && at < sizeof what)
+				at += (size_t)snprintf(what + at, sizeof what - at, " %s", keys[i]);
+		each(context, '~', NULL, what);
+		differ = 1;
+	}
+	if (!same_field(&a.doc, &a.top, &b.doc, &b.top, "provenance")) {
+		each(context, '~', NULL, "provenance");
+		differ = 1;
+	}
 	for (;;) {
 		int in_a = side_path(&a);
 		int in_b = side_path(&b);
@@ -1484,6 +1513,41 @@ static void show_form(FILE *out, const hull_sexpr_doc *doc, const hull_sexpr_for
 			          string && item.offset != head.offset);
 	}
 	fputc(')', out);
+}
+
+int hull_store_runtime(hull_store *store, const char *name, uint8_t **out, size_t *length,
+                       char *why, size_t cap)
+{
+	char            hex[65];
+	uint8_t        *data;
+	size_t          size;
+	hull_sexpr_doc  doc;
+	hull_sexpr_form top;
+	hull_sexpr_form runtime;
+
+	*out = NULL;
+	*length = 0u;
+	flock(store->lock, LOCK_SH);
+	data = name_manifest(store, name, hex, why, cap) == 0 ?
+	       read_manifest(store, hex, &size, why, cap) : NULL;
+	flock(store->lock, LOCK_UN);
+	if (data == NULL)
+		return -1;
+	if (hull_sexpr_open(&doc, data, size, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
+	    !hull_sexpr_first(&doc, &top)) {
+		free(data);
+		return say(why, cap, name, "its manifest is not one");
+	}
+	if (find(&doc, &top, "runtime", &runtime)) {
+		if ((*out = malloc(runtime.extent)) == NULL) {
+			free(data);
+			return say(why, cap, "out of memory", NULL);
+		}
+		memcpy(*out, data + runtime.offset, runtime.extent);
+		*length = runtime.extent;
+	}
+	free(data);
+	return 0;
 }
 
 int hull_store_show(hull_store *store, const char *name, FILE *out, char *why, size_t cap)

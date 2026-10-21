@@ -359,6 +359,28 @@ int hull_json_element(const hull_json *doc, const hull_json_value *array, int fi
 	return 1;
 }
 
+int hull_json_next_member(const hull_json *doc, const hull_json_value *object, int first,
+                          hull_json_value *key, hull_json_value *value)
+{
+	size_t at;
+
+	if (object->kind != '{')
+		return 0;
+	if (first) {
+		at = blank(doc, object->at + 1u);
+	} else {
+		at = blank(doc, value->end);
+		if (doc->text[at] != ',')
+			return 0;
+		at = blank(doc, at + 1u);
+	}
+	if (doc->text[at] != '"')
+		return 0;
+	value_at(doc, at, key);
+	value_at(doc, blank(doc, blank(doc, key->end) + 1u), value);
+	return 1;
+}
+
 long hull_json_string(const hull_json *doc, const hull_json_value *value, char *out, size_t cap)
 {
 	if (value->kind != '"' || cap == 0u)

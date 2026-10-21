@@ -98,6 +98,21 @@ int main(void)
 		                            sizeof text) < 0 ||
 		    strcmp(text, "tab\there \"q\" \\ /") != 0)
 			fail("the escapes", text);
+		/* The members in order, each name and value. */
+		{
+			hull_json_value key;
+			char            names[256] = "";
+
+			for (int more = hull_json_next_member(&doc, &root, 1, &key, &value); more;
+			     more = hull_json_next_member(&doc, &root, 0, &key, &value)) {
+				hull_json_string(&doc, &key, text, sizeof text);
+				strcat(names, text);
+				strcat(names, value.kind == '0' ? "=0 " : value.kind == '"' ? "=s " : "=c ");
+			}
+			cases++;
+			if (strcmp(names, "schemaVersion=0 mediaType=s manifests=c annotations=c ") != 0)
+				fail("the members in order", names);
+		}
 		cases++;
 		if (hull_json_member(&doc, &root, "absent", &value))
 			fail("a member absent", "found");

@@ -67,9 +67,9 @@ def build(root, probe, arch):
 			f.write(data)
 		return name
 
-	def manifest(repo, tag, layers, config_arch=arch, index=None, include=True):
+	def manifest(repo, tag, layers, config_arch=arch, index=None, include=True, defaults=None):
 		config = json.dumps({"architecture": config_arch, "os": "linux",
-		                     "config": {"Cmd": ["/probe"]},
+		                     "config": defaults or {"Cmd": ["/probe"]},
 		                     "rootfs": {"type": "layers", "diff_ids": []}}).encode()
 		body = json.dumps({
 			"schemaVersion": 2,
@@ -139,7 +139,13 @@ def build(root, probe, arch):
 	manifest("test/image", "1", [(gz, gzip.compress(first, mtime=0)),
 	                             (gz, gzip.compress(second, mtime=0)),
 	                             (plain, third)],
-	         index=["arm64" if arch != "arm64" else "amd64"])
+	         index=["arm64" if arch != "arm64" else "amd64"],
+	         # A.4's defaults, each in OCI's spelling: a name given twice
+	         # its last value, and the maps' keys in no order.
+	         defaults={"Entrypoint": ["/probe", "say"], "Cmd": ["from-config", "cwd", "env", "GREETING"],
+	                   "Env": ["GREETING=first", "PATH=/bin", "GREETING=hi"], "WorkingDir": "/etc",
+	                   "ExposedPorts": {"80/tcp": {}, "53/udp": {}}, "Volumes": {"/data": {}},
+	                   "StopSignal": "SIGTERM", "User": "1000"})
 	# What a pull refuses.
 	good = gzip.compress(tar_of([(node("probe", mode=0o755), probe_bytes)]), mtime=0)
 	# Its own layer: one shared with a later image would be written again

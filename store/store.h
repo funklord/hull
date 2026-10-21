@@ -43,11 +43,26 @@ typedef struct hull_commit {
 int hull_store_open(hull_store *store, int create, char *why, size_t cap);
 void hull_store_close(hull_store *store);
 
-/* `dir` as a manifest of `arch`, its files into the objects, named `ref`.
- * 0, or -1 with `why`. A file this cannot hold is said on stderr and
- * left out, counted in `skipped`. */
+/* What a manifest may carry beside its tree, each a canonical form or
+ * NULL: A.5's `(10:provenance ...)` and A.4's `(7:runtime ...)`. */
+typedef struct hull_commit_extra {
+	const uint8_t *provenance;
+	size_t         provenance_length;
+	const uint8_t *runtime;
+	size_t         runtime_length;
+} hull_commit_extra;
+
+/* `dir` as a manifest of `arch`, its files into the objects, named `ref`,
+ * with `extra` where it is not NULL. 0, or -1 with `why`. A file this
+ * cannot hold is said on stderr and left out, counted in `skipped`. */
 int hull_store_commit(hull_store *store, const char *dir, const char *arch, const char *ref,
-                      hull_commit *out, char *why, size_t cap);
+                      const hull_commit_extra *extra, hull_commit *out, char *why, size_t cap);
+
+/* A.4's runtime defaults of the manifest `name` names, a ref or
+ * sha256:HEX, as their canonical form, malloc'd into `*out`; `*out` is
+ * NULL where it has none. 0, or -1 with `why`. */
+int hull_store_runtime(hull_store *store, const char *name, uint8_t **out, size_t *length,
+                       char *why, size_t cap);
 
 /* The tree `ref` names, a ref or sha256:HEX, made at `dir`, which must not
  * exist or be empty.
