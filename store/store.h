@@ -81,6 +81,27 @@ int hull_store_untag(hull_store *store, const char *ref, char *why, size_t cap);
  * with `why`. */
 int hull_store_show(hull_store *store, const char *name, FILE *out, char *why, size_t cap);
 
+/* Section 3.5's layers, applied in order into a tree to be committed: a
+ * tar each, gzip-compressed or not. Each path is made beneath the tree,
+ * its parents resolved in it, so that a symlink in a layer leads nowhere
+ * outside, and a path with `..` is refused; a whiteout removes what a
+ * lower layer made, an opaque one empties its directory of it. What the
+ * user cannot make rootless, a device, an owner, an xattr outside user.*,
+ * is said on stderr and counted in `*skipped`; every path is the user's.
+ * Directories are kept writable until hull_unpack_end() gives them their
+ * modes. */
+typedef struct hull_unpack hull_unpack;
+
+/* Into `dir`, which must exist and be empty: NULL, with `why`, if not. */
+hull_unpack *hull_unpack_begin(const char *dir, char *why, size_t cap);
+
+/* The layer `fd` reads, from its start: 0, or -1 with `why`. */
+int hull_unpack_layer(hull_unpack *u, int fd, uint64_t *skipped, char *why, size_t cap);
+
+/* The directories given their modes, and `u` freed, whatever came before:
+ * 0, or -1 with `why`. */
+int hull_unpack_end(hull_unpack *u, char *why, size_t cap);
+
 /* Each ref and the manifest it names, sorted by ref. */
 int hull_store_list(hull_store *store, void (*each)(void *context, const char *ref,
                                                     const char *manifest),

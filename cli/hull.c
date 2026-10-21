@@ -55,6 +55,7 @@
 #include "plan.h"
 #include "registry.h"
 #include "spec.h"
+#include "pull.h"
 #include "store.h"
 #include "wire.h"
 
@@ -96,7 +97,7 @@ static void usage(FILE *out)
 	      "       hull ssh-config [--remove] | hull gc\n"
 	      "       hull commit [--arch A] DIR REF | hull materialize REF DIR | hull images\n"
 	      "       hull diff REF REF | hull tag REF NEW | hull tag -d REF\n"
-	      "       hull manifest show REF\n"
+	      "       hull manifest show REF | hull pull IMAGE [REF]\n"
 	      "       hull core\n"
 	      "       hull engines\n"
 	      "       hull --version\n", out);
@@ -1168,6 +1169,36 @@ static int images(void)
 	return status == 0 ? 0 : 2;
 }
 
+/* An image from its registry into the store, as `ref`, or as the image's
+ * own name, so that a machine whose source is that name runs it. */
+static int pull(const char *name, const char *ref)
+{
+	hull_store  store;
+	hull_commit made;
+	char        why[4400] = "";
+	const char *arch = host_arch();
+	int         status;
+
+	if (arch == NULL) {
+		fprintf(stderr, "hull: pull: the host's arch could not be read\n");
+		return 1;
+	}
+	if ((status = open_store(&store, 1)) != 0)
+		return status;
+	status = hull_pull(&store, name, ref, arch, &made, why, sizeof why);
+	hull_store_close(&store);
+	if (status != 0) {
+		fprintf(stderr, "hull: pull: %s\n", why);
+		return 1;
+	}
+	printf("%s sha256:%s\n", ref, made.manifest);
+	fprintf(stderr, "hull: %llu entries, %llu objects, %llu new, %llu bytes%s\n",
+	        (unsigned long long)made.entries, (unsigned long long)made.objects,
+	        (unsigned long long)made.new_objects, (unsigned long long)made.total_size,
+	        made.skipped != 0u ? "; some were left out, as said" : "");
+	return 0;
+}
+
 static int tag(const char *from, const char *ref)
 {
 	hull_store store;
@@ -1972,6 +2003,8 @@ int main(int argc, char **argv)
 		return untag(argv[3]);
 	if (strcmp(command, "tag") == 0 && argc == 4)
 		return tag(argv[2], argv[3]);
+	if (strcmp(command, "pull") == 0 && (argc == 3 || argc == 4))
+		return pull(argv[2], argc == 4 ? argv[3] : argv[2]);
 	if (strcmp(command, "manifest") == 0 && argc == 4 && strcmp(argv[2], "show") == 0)
 		return show_manifest(argv[3]);
 	if (strcmp(command, "proxy-ssh") == 0 && argc == 3)

@@ -17,26 +17,25 @@ each of them.
 
 ## Status
 
-Mostly design. `project.md` is the design, including the `hull.conf`
-schema reference. The first code is the s-expression reader and the
-canonical writer in `sexpr/` and the guest agent protocol's framing in
-`agent/`, both generated in part by [situ](https://github.com/funklord/situ)
-from schemas; the `hull.conf` check in `spec/`; and in `plan/`, the
-engine registry that picks what `(backend ...)` names, the planner that
-writes every default into a machine, and the capability matrix that
-judges it against that engine's declaration. `build/hull plan` and
-`build/hull check --backend ns,vm,emu` run them against a `hull.conf`,
-with docker and qemu declared but not yet driven. `build/hull run` runs
-a dir source with `(backend chroot)`, the rootless reference engine in
-`engine/`, and an image ref through the docker adapter, the default for
-`ns`. Machines run in a per-user core in `core/`, which `hull run`
-starts when none is running and which leaves once idle; `hull ps`,
-`hull stop`, `hull kill`, `hull logs`, `hull attach` and `hull exec`
-reach what it holds; `hull exec -t` gives a command a terminal of its own.
+`project.md` is the design, including the `hull.conf` schema reference,
+and the record of what is built. Phase 1 is met: one `hull.conf` with a
+dir source runs unchanged on docker, on qemu with KVM, and on qemu's TCG
+emulation, and on chroot, the rootless reference engine. `hull plan` and
+`hull check` judge a file against an engine's declared capabilities,
+`hull run` runs it in a per-user core that starts when needed and leaves
+once idle, and `hull ps`, `stop`, `kill`, `logs`, `attach`, `exec` and
+`stats` reach what it holds; `hull ssh` and the `*.hull` names reach a
+machine by its stable address. The optional store keeps trees by content:
+`hull commit`, `materialize`, `diff`, `tag`, `images`, `manifest show`,
+`gc`, and `hull pull`, which brings an image from an OCI registry, so
+that a machine whose source names it runs it.
 `hull_engine.h` is a draft of the C plugin interface that engines
 implement.
 
 ## Building
+
+A C11 compiler, Python 3, and OpenSSL's and zlib's development files,
+`libssl-dev` and `zlib1g-dev` on Debian, which `hull pull` links.
 
 ```sh
 make         # build/hull; fetches vendor/situ the first time

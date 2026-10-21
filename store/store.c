@@ -44,6 +44,7 @@
 #include "sexpr.h"
 #include "sha256.h"
 #include "store.h"
+#include "store_private.h"
 
 /* --- a growing buffer ------------------------------------------------------ */
 
@@ -1028,10 +1029,8 @@ int hull_store_materialize(hull_store *store, const char *ref, const char *dir,
 
 /* --- checkouts ------------------------------------------------------------ */
 
-/* `name` in `parent`, and all beneath it: each directory made the user's
- * to empty first, since a tree's modes may not let it be, and no symlink
- * followed, since one is removed as itself. */
-static int remove_tree(int parent, const char *name)
+/* See store_private.h. */
+int hull_store_remove_tree(int parent, const char *name)
 {
 	int            fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 	DIR           *dir;
@@ -1047,7 +1046,7 @@ static int remove_tree(int parent, const char *name)
 	}
 	while ((entry = readdir(dir)) != NULL)
 		if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0 &&
-		    remove_tree(dirfd(dir), entry->d_name) != 0)
+		    hull_store_remove_tree(dirfd(dir), entry->d_name) != 0)
 			result = -1;
 	closedir(dir);
 	return unlinkat(parent, name, AT_REMOVEDIR) == 0 ? result : -1;
@@ -1088,7 +1087,7 @@ int hull_store_checkout(hull_store *store, const char *name, int create, char *p
 	}
 	snprintf(named, sizeof named, "sha256:%s", hex);
 	if (materialize_locked(store, named, made, skipped, why, cap) != 0) {
-		remove_tree(AT_FDCWD, made);
+		hull_store_remove_tree(AT_FDCWD, made);
 		goto done;
 	}
 	/* A machine's / is a directory anyone may enter, as a dir source's is. */
@@ -1098,7 +1097,7 @@ int hull_store_checkout(hull_store *store, const char *name, int create, char *p
 
 		if (!taken)
 			say(why, cap, path, strerror(errno));
-		remove_tree(AT_FDCWD, made);
+		hull_store_remove_tree(AT_FDCWD, made);
 		if (!taken)
 			goto done;
 	}
@@ -1693,7 +1692,7 @@ int hull_store_gc(hull_store *store, uint64_t *manifests, uint64_t *objects,
 	if ((dir = opendir(path)) != NULL) {
 		while ((entry = readdir(dir)) != NULL)
 			if (strlen(entry->d_name) == 64u && !set_has(&kept_manifests, entry->d_name) &&
-			    remove_tree(dirfd(dir), entry->d_name) == 0)
+			    hull_store_remove_tree(dirfd(dir), entry->d_name) == 0)
 				(*checkouts)++;
 		closedir(dir);
 	}
@@ -1703,7 +1702,7 @@ int hull_store_gc(hull_store *store, uint64_t *manifests, uint64_t *objects,
 	if ((dir = opendir(path)) != NULL) {
 		while ((entry = readdir(dir)) != NULL)
 			if (entry->d_name[0] != '.')
-				remove_tree(dirfd(dir), entry->d_name);
+				hull_store_remove_tree(dirfd(dir), entry->d_name);
 		closedir(dir);
 	}
 	result = 0;

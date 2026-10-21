@@ -100,7 +100,11 @@ ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/tree.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o
 # Section 3's optional store, which only the commands that name it use.
-STORE_OBJS  = $(BUILD_DIR)/store/store.o
+STORE_OBJS  = $(BUILD_DIR)/store/store.o $(BUILD_DIR)/store/unpack.o
+# Section 3.5's border: what `hull pull` reads a registry with.
+OCI_OBJS    = $(BUILD_DIR)/oci/json.o $(BUILD_DIR)/oci/https.o $(BUILD_DIR)/oci/pull.o
+# The holder's choice, 2026-10-21 (section 3.5): TLS by OpenSSL, layers by zlib.
+PULL_LIBS   = -lssl -lcrypto -lz
 
 # The per-user core, and the frontend protocol it speaks (section 4.10),
 # validated by C situ generates from core/frontend.situ.
@@ -138,7 +142,8 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  rootfs/mapped/d/f opaque.conf gone.conf clash.conf execd.conf attach.out \
                  killd.conf killd.out flowd.conf held.out spewd.conf behind.out lost.err told.out \
                  data/in data/out rootfs/mnt-link lone.conf adopt.conf kbrief.conf cended.conf nosecret.conf pw.txt big.bin secret/probe \
-                 shown.conf failing.conf nofile.conf big.conf sealed.conf norun.conf) \
+                 shown.conf failing.conf nofile.conf big.conf sealed.conf norun.conf \
+                 stored.conf stored-direct.conf unstored.conf idle/hull/core.log idle/hull/core.lock) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
 # What test/docker_test.sh writes.
@@ -173,16 +178,17 @@ TEST_PLAN_OBJS    = $(BUILD_DIR)/test/plan_test.o
 TEST_WIRE_OBJS    = $(BUILD_DIR)/test/wire_test.o
 TEST_SHA256_OBJS  = $(BUILD_DIR)/test/sha256_test.o
 TEST_TREE_OBJS    = $(BUILD_DIR)/test/tree_tar.o
+TEST_JSON_OBJS    = $(BUILD_DIR)/test/json_test.o
 TEST_OBJS = $(TEST_SEXPR_OBJS) $(TEST_FRAMING_OBJS) $(TEST_SPEC_OBJS) $(TEST_MATRIX_OBJS) \
             $(TEST_REGISTRY_OBJS) $(TEST_PLAN_OBJS) $(TEST_WIRE_OBJS) $(TEST_SHA256_OBJS) \
-            $(TEST_TREE_OBJS)
+            $(TEST_TREE_OBJS) $(TEST_JSON_OBJS)
 TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
             $(BUILD_DIR)/test/spec_test $(BUILD_DIR)/test/matrix_test \
             $(BUILD_DIR)/test/registry_test $(BUILD_DIR)/test/plan_test \
             $(BUILD_DIR)/test/wire_test $(BUILD_DIR)/test/sha256_test \
-            $(BUILD_DIR)/test/tree_tar
+            $(BUILD_DIR)/test/tree_tar $(BUILD_DIR)/test/json_test
 
-CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
+CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: all check check-docker check-qemu check-flip test vectors style style-source style-docs contract hooks clean help install-nss
 
@@ -256,6 +262,10 @@ $(BUILD_DIR)/store/%.o: store/%.c | $(GEN_HEADERS)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
+$(BUILD_DIR)/oci/%.o: oci/%.c
+	@mkdir -p '$(@D)'
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+
 $(BUILD_DIR)/core/%.o: core/%.c VERSION | $(GEN_HEADERS) $(AGENT_GEN) $(FRONTEND_GEN) \
                                           $(PROTOCOL_GEN)
 	@mkdir -p '$(@D)'
@@ -270,9 +280,9 @@ $(PROBE): test/probe.c
 	@mkdir -p '$(@D)'
 	$(CC) -static $(CFLAGS) -o $@ $<
 
-$(HULL): $(CLI_OBJS) $(CORE_OBJS) $(ENGINE_OBJS) $(STORE_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) \
-         $(SEXPR_OBJS)
-	$(CC) $(CFLAGS) -pthread -o $@ $^
+$(HULL): $(CLI_OBJS) $(CORE_OBJS) $(ENGINE_OBJS) $(STORE_OBJS) $(OCI_OBJS) $(PLAN_OBJS) \
+         $(SPEC_OBJS) $(SEXPR_OBJS)
+	$(CC) $(CFLAGS) -pthread -o $@ $^ $(PULL_LIBS)
 
 $(AGENT_BIN): $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
 	$(CC) -static $(CFLAGS) -o $@ $^
@@ -340,9 +350,12 @@ $(BUILD_DIR)/test/sha256_test: $(TEST_SHA256_OBJS) $(BUILD_DIR)/engine/sha256.o
 $(BUILD_DIR)/test/tree_tar: $(TEST_TREE_OBJS) $(BUILD_DIR)/engine/tree.o
 	$(CC) $(CFLAGS) -o $@ $^
 
+$(BUILD_DIR)/test/json_test: $(TEST_JSON_OBJS) $(BUILD_DIR)/oci/json.o
+	$(CC) $(CFLAGS) -o $@ $^
+
 -include $(SEXPR_OBJS:.o=.d) $(AGENT_OBJS:.o=.d) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS:.o=.d) \
-         $(ENGINE_OBJS:.o=.d) $(STORE_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(CORE_OBJS:.o=.d) $(TEST_OBJS:.o=.d) \
-         $(BUILD_DIR)/agent/agent.d
+         $(ENGINE_OBJS:.o=.d) $(STORE_OBJS:.o=.d) $(OCI_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(CORE_OBJS:.o=.d) \
+         $(TEST_OBJS:.o=.d) $(BUILD_DIR)/agent/agent.d
 
 # --- checks -----------------------------------------------------------------
 
@@ -365,10 +378,12 @@ test: $(TEST_BINS) $(HULL) $(PROBE) $(NSS_LIB) vectors
 	$(BUILD_DIR)/test/plan_test
 	$(BUILD_DIR)/test/wire_test
 	$(BUILD_DIR)/test/sha256_test
+	$(BUILD_DIR)/test/json_test
 	BUILD_DIR='$(BUILD_DIR)' sh test/tree_test.sh '$(BUILD_DIR)/test/tree_tar'
 	BUILD_DIR='$(BUILD_DIR)' sh test/cli_test.sh '$(HULL)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/nss_test.sh '$(HULL)' '$(NSS_LIB)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/store_test.sh '$(HULL)' '$(SITU_MARK)'
+	BUILD_DIR='$(BUILD_DIR)' sh test/pull_test.sh '$(HULL)' '$(PROBE)'
 	$(PYTHON) tool/test_style_gate.py
 
 # Each schema accepts every vector in its .vectors and refuses every one in
@@ -445,7 +460,7 @@ clean:
 	        $(SEXPR_OBJS) $(SEXPR_OBJS:.o=.d) $(GEN_SOURCES) $(GEN_HEADERS) \
 	        $(AGENT_OBJS) $(AGENT_OBJS:.o=.d) $(AGENT_GEN) \
 	        $(SPEC_OBJS) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS) $(PLAN_OBJS:.o=.d) \
-	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(STORE_OBJS) $(STORE_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) \
+	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(STORE_OBJS) $(STORE_OBJS:.o=.d) $(OCI_OBJS) $(OCI_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) \
 	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) \
 	        $(AGENT_BIN) $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d \
 	        $(CLI_TEST_FILES) $(PROBE) $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) \
