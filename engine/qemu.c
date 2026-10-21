@@ -122,6 +122,12 @@ struct hull_machine {
 	int              network;      /* qemu's end of passt's socket, or -1 */
 	pid_t            passt;        /* passt's daemon, by the socket it holds, or 0 */
 	pid_t            qemu;
+	int              keep;         /* (on_disconnect keep): qemu outlives the core */
+	int              adopted;      /* taken back: qemu is not this process's child */
+	int              pidfd;        /* qemu's, when adopted, else -1 */
+	uint32_t         cid;          /* its vsock context id */
+	uint8_t          token[32];    /* what a host after this one resumes with */
+	char             persisted[4800];  /* what persist() last gave */
 	hull_wire        wire;
 	int              connected;
 	pthread_t        reader;
@@ -262,6 +268,8 @@ static void release(hull_machine *m)
 		free(m->volume_host[i]);
 	free(m->spec);
 	forget_secrets(m);
+	if (m->pidfd >= 0)
+		close(m->pidfd);
 	pthread_mutex_destroy(&m->lock);
 	pthread_mutex_destroy(&m->send_lock);
 	pthread_cond_destroy(&m->done_cond);
@@ -402,6 +410,13 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			m->port_host[m->port_count]    = (unsigned)h;
 			m->port_guest[m->port_count++] = (unsigned)g;
 		}
+	}
+
+	{
+		char *disconnect = hull_access_value(doc, &machine, "on_disconnect");
+
+		m->keep = disconnect != NULL && strcmp(disconnect, "keep") == 0;
+		free(disconnect);
 	}
 
 	/* The spec the agent applies is the plan's own (machine ...). */
@@ -846,7 +861,9 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 		int null = open("/dev/null", O_RDWR);
 		int out  = open(log, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 
-		prctl(PR_SET_PDEATHSIG, SIGKILL);
+		/* Dead with the core, unless kept for the next (adopt()). */
+		if (!m->keep)
+			prctl(PR_SET_PDEATHSIG, SIGKILL);
 		setsid();
 		if (null < 0 || out < 0)
 			_exit(126);
@@ -872,6 +889,11 @@ static int qemu_gone(const hull_machine *m)
 {
 	siginfo_t info;
 
+	if (m->adopted) {
+		struct pollfd fd = { m->pidfd, POLLIN, 0 };
+
+		return poll(&fd, 1u, 0) != 0;
+	}
 	memset(&info, 0, sizeof info);
 	return waitid(P_PID, (id_t)m->qemu, &info, WEXITED | WNOHANG | WNOWAIT) != 0 ||
 	       info.si_pid == m->qemu;
@@ -980,6 +1002,18 @@ static void reap(hull_machine *m)
 {
 	siginfo_t info;
 
+	/* An adopted qemu is init's child, to reap; its end is the pidfd's. */
+	if (m->adopted) {
+		struct pollfd fd = { m->pidfd, POLLIN, 0 };
+
+		while (poll(&fd, 1u, -1) < 0 && errno == EINTR)
+			;
+		pthread_mutex_lock(&m->lock);
+		m->done = 1;
+		pthread_cond_broadcast(&m->done_cond);
+		pthread_mutex_unlock(&m->lock);
+		return;
+	}
 	while (waitid(P_PID, (id_t)m->qemu, &info, WEXITED | WNOWAIT) < 0 && errno == EINTR)
 		;
 	pthread_mutex_lock(&m->lock);
@@ -1159,6 +1193,7 @@ static hull_status qemu_create(hull_core *core, hull_buf plan, hull_machine **ou
 	m->wire.fd = -1;
 	m->network = -1;
 	m->wake = -1;
+	m->pidfd = -1;
 	for (unsigned i = 0u; i < MAX_PORTS; i++)
 		m->listeners[i] = -1;
 	pthread_mutex_init(&m->lock, NULL);
@@ -1172,6 +1207,35 @@ static hull_status qemu_create(hull_core *core, hull_buf plan, hull_machine **ou
 	*out = m;
 	host->on_state(core, m, "created");
 	return HULL_OK;
+}
+
+/* The directories of machines taken back, which adoption below explains. */
+static pthread_mutex_t adopted_lock = PTHREAD_MUTEX_INITIALIZER;
+static char            adopted_dirs[16][4096];
+
+static int is_adopted_dir(const char *dir)
+{
+	int found = 0;
+
+	pthread_mutex_lock(&adopted_lock);
+	for (unsigned i = 0u; i < 16u && !found; i++)
+		found = strcmp(adopted_dirs[i], dir) == 0;
+	pthread_mutex_unlock(&adopted_lock);
+	return found;
+}
+
+static void mark_adopted_dir(const char *dir, int on)
+{
+	pthread_mutex_lock(&adopted_lock);
+	for (unsigned i = 0u; i < 16u; i++) {
+		if (on && adopted_dirs[i][0] == '\0') {
+			snprintf(adopted_dirs[i], sizeof adopted_dirs[i], "%s", dir);
+			break;
+		}
+		if (!on && strcmp(adopted_dirs[i], dir) == 0)
+			adopted_dirs[i][0] = '\0';
+	}
+	pthread_mutex_unlock(&adopted_lock);
 }
 
 static void remove_files(const char *dir)
@@ -1207,7 +1271,8 @@ static void sweep(const char *parent)
 		    kill((pid_t)pid, 0) == 0 || errno != ESRCH)
 			continue;
 		snprintf(path, sizeof path, "%s/%s", parent, item->d_name);
-		remove_files(path);
+		if (!is_adopted_dir(path))
+			remove_files(path);
 	}
 	if (list != NULL)
 		closedir(list);
@@ -1248,8 +1313,10 @@ static void close_listeners(hull_machine *m)
 static void remove_dir(hull_machine *m)
 {
 	close_listeners(m);
-	if (m->dir[0] != '\0')
+	if (m->dir[0] != '\0') {
+		mark_adopted_dir(m->dir, 0);
 		remove_files(m->dir);
+	}
 	m->dir[0] = '\0';
 }
 
@@ -1286,7 +1353,9 @@ static const char *open_listeners(hull_machine *m)
 static void kill_qemu(hull_machine *m)
 {
 	pthread_mutex_lock(&m->lock);
-	if (!m->done && m->qemu > 0)
+	if (!m->done && m->adopted)
+		syscall(SYS_pidfd_send_signal, m->pidfd, SIGKILL, NULL, 0u);
+	else if (!m->done && m->qemu > 0)
 		kill(m->qemu, SIGKILL);
 	pthread_mutex_unlock(&m->lock);
 }
@@ -1335,6 +1404,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		if (m->qemu < 0)
 			break;
 		fd = dial(m, cid);
+		m->cid = cid;
 		if (fd < 0) {
 			kill_qemu(m);
 			waitpid(m->qemu, NULL, 0);
@@ -1382,7 +1452,13 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 			explicit_bzero(msg.data, msg.cap);
 		hull_msg_free(&msg);
 		if (expect(m, "ready")) {
-			hull_msg_raw(&msg, "(5:start(2:ch1:0))");
+			if (getrandom(m->token, sizeof m->token, 0) != (ssize_t)sizeof m->token) {
+				snprintf(m->detail, sizeof m->detail, "no randomness for the token");
+				goto refused;
+			}
+			hull_msg_raw(&msg, "(5:start(2:ch1:0)(5:token");
+			hull_msg_atom(&msg, m->token, sizeof m->token);
+			hull_msg_raw(&msg, "))");
 			send_msg(m, &msg);
 			if (expect(m, "started") &&
 			    pthread_create(&m->reader, NULL, read_agent, m) == 0) {
@@ -1399,12 +1475,226 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 			}
 		}
 	}
+refused:
 	kill_qemu(m);
 	waitpid(m->qemu, NULL, 0);
 	m->done = 1;
 	hull_wire_close(&m->wire);
 	remove_dir(m);
 	return fail(error, HULL_ERR_RUNTIME, m->detail);
+}
+
+/* --- adoption ------------------------------------------------------------ */
+
+/*
+ * A kept machine's qemu outlives the core, its parent-death signal not
+ * set; a core that comes after takes it back from what persist() gave:
+ * qemu's pid, its context id, its directory, the token the agent was
+ * started with, passt's pid, the address and the ports. Text, a line
+ * each, this engine's own.
+ *
+ * Taking it back: the pid must still be a qemu whose command line names
+ * the directory, checked through a pidfd, which then stands for it, since
+ * it is init's child now and not this process's; the agent is dialled
+ * and told `resume` with the token, and answers `started` and what the
+ * workload wrote meanwhile; the ports are bound again on the address, as
+ * the old core's listeners went with it. The directory is kept from the
+ * sweep of a dead core's directories, which its name would otherwise
+ * fall to.
+ */
+static hull_status qemu_persist(hull_core *core, hull_machine *m, hull_buf *out,
+                                hull_error *error)
+{
+	size_t n;
+	int    wrote;
+
+	(void)core;
+	/* The address only where the plan gave one, which it does for ports. */
+	wrote = snprintf(m->persisted, sizeof m->persisted,
+	                 "pid %ld\ncid %u\npasst %ld\n%s%s%sdir %s\ntoken ", (long)m->qemu, m->cid,
+	                 (long)m->passt, m->address_text[0] != '\0' ? "address " : "",
+	                 m->address_text, m->address_text[0] != '\0' ? "\n" : "", m->dir);
+	if (wrote < 0 || (size_t)wrote >= sizeof m->persisted - 2u * sizeof m->token - 1u -
+	                                   (size_t)m->port_count * 24u)
+		return fail(error, HULL_ERR_INTERNAL, "the state does not fit");
+	n = (size_t)wrote;
+	for (size_t i = 0u; i < sizeof m->token; i++)
+		n += (size_t)snprintf(m->persisted + n, sizeof m->persisted - n, "%02x", m->token[i]);
+	n += (size_t)snprintf(m->persisted + n, sizeof m->persisted - n, "\n");
+	for (unsigned i = 0u; i < m->port_count; i++)
+		n += (size_t)snprintf(m->persisted + n, sizeof m->persisted - n, "port %u %u %d\n",
+		                      m->port_host[i], m->port_guest[i], m->port_udp[i]);
+	out->data = (const uint8_t *)m->persisted;
+	out->len  = n;
+	return HULL_OK;
+}
+
+/* The persisted text into `m`. A reason, or NULL. */
+static const char *read_state(hull_machine *m, hull_buf state)
+{
+	char  text[4800];
+	char *line;
+	char *rest;
+	int   seen = 0;
+
+	if (state.len == 0u || state.len >= sizeof text || memchr(state.data, '\0', state.len))
+		return "the state is not this engine's";
+	memcpy(text, state.data, state.len);
+	text[state.len] = '\0';
+	for (line = strtok_r(text, "\n", &rest); line != NULL; line = strtok_r(NULL, "\n", &rest)) {
+		long          number;
+		unsigned      a;
+		unsigned      b;
+		int           c;
+		char          hex[2u * sizeof m->token + 1u];
+
+		if (sscanf(line, "pid %ld", &number) == 1 && number > 0) {
+			m->qemu = (pid_t)number;
+			seen |= 1;
+		} else if (sscanf(line, "cid %u", &a) == 1 && a >= 3u) {
+			m->cid = a;
+			seen |= 2;
+		} else if (sscanf(line, "passt %ld", &number) == 1) {
+			m->passt = number > 0 ? (pid_t)number : 0;
+		} else if (strncmp(line, "address ", 8u) == 0 &&
+		           inet_pton(AF_INET, line + 8, &m->address) == 1) {
+			snprintf(m->address_text, sizeof m->address_text, "%s", line + 8);
+			seen |= 4;
+		} else if (strncmp(line, "dir /", 5u) == 0 && strlen(line + 4) < sizeof m->dir) {
+			snprintf(m->dir, sizeof m->dir, "%s", line + 4);
+			seen |= 8;
+		} else if (sscanf(line, "token %64s", hex) == 1 && strlen(hex) == 2u * sizeof m->token) {
+			for (size_t i = 0u; i < sizeof m->token; i++) {
+				unsigned byte;
+
+				if (sscanf(hex + 2u * i, "%2x", &byte) != 1)
+					return "the state is not this engine's";
+				m->token[i] = (uint8_t)byte;
+			}
+			seen |= 16;
+		} else if (sscanf(line, "port %u %u %d", &a, &b, &c) == 3 && m->port_count < MAX_PORTS &&
+		           a >= 1u && a <= 65535u && b >= 1u && b <= 65535u) {
+			m->port_host[m->port_count]  = a;
+			m->port_guest[m->port_count] = b;
+			m->port_udp[m->port_count++] = c != 0;
+		} else {
+			return "the state is not this engine's";
+		}
+	}
+	if (m->port_count > 0u && !(seen & 4))
+		return "the state's ports have no address";
+	return (seen | 4) == 31 ? NULL : "the state is not this engine's";
+}
+
+/* Whether `pid` is a qemu whose command line names `dir`. */
+static int qemu_of(pid_t pid, const char *dir)
+{
+	char    path[64];
+	char    line[16384];
+	ssize_t n;
+	int     fd;
+	int     found = 0;
+
+	snprintf(path, sizeof path, "/proc/%ld/cmdline", (long)pid);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	n  = fd >= 0 ? read(fd, line, sizeof line - 1u) : -1;
+	if (fd >= 0)
+		close(fd);
+	if (n <= 0)
+		return 0;
+	line[n] = '\0';
+	if (strncmp(line, "qemu-system-", 12u) != 0)
+		return 0;
+	for (ssize_t i = 0; i < n && !found; i += (ssize_t)strlen(line + i) + 1)
+		found = strstr(line + i, dir) != NULL;
+	return found;
+}
+
+static hull_status qemu_adopt(hull_core *core, hull_buf state, hull_machine **out,
+                              hull_error *error)
+{
+	static char    detail[512];
+	hull_machine  *m;
+	hull_msg       msg = { 0 };
+	hull_sexpr_doc body;
+	const char    *reason;
+	int            fd;
+
+	m = calloc(1u, sizeof *m);
+	if (m == NULL)
+		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+	m->core    = core;
+	m->wire.fd = -1;
+	m->network = -1;
+	m->wake    = -1;
+	m->pidfd   = -1;
+	m->keep    = 1;
+	for (unsigned i = 0u; i < MAX_PORTS; i++)
+		m->listeners[i] = -1;
+	pthread_mutex_init(&m->lock, NULL);
+	pthread_mutex_init(&m->send_lock, NULL);
+	pthread_cond_init(&m->done_cond, NULL);
+	pthread_cond_init(&m->quiet, NULL);
+	if ((reason = read_state(m, state)) != NULL) {
+		m->dir[0] = '\0';
+		release(m);
+		return fail(error, HULL_ERR_UNSUPPORTED, reason);
+	}
+	/* The pidfd first, then the check, so that the pid it stands for is
+	 * the one checked. */
+	m->pidfd = (int)syscall(SYS_pidfd_open, m->qemu, 0u);
+	if (m->pidfd < 0 || !qemu_of(m->qemu, m->dir)) {
+		m->dir[0] = '\0';
+		release(m);
+		return fail(error, HULL_ERR_GONE, "its qemu is gone");
+	}
+	m->adopted = 1;
+	mark_adopted_dir(m->dir, 1);
+	fd = dial(m, m->cid);
+	if (fd >= 0 && hull_wire_open(&m->wire, fd, HULL_WIRE_FROM_AGENT) != 0) {
+		close(fd);
+		fd = -1;
+	}
+	reason = "the guest agent did not answer";
+	if (fd >= 0) {
+		m->connected = 1;
+		hull_msg_raw(&msg, "(5:hello(2:ch1:0)(8:features)(5:proto1:1))");
+		send_msg(m, &msg);
+		if (expect(m, "hello")) {
+			hull_msg_raw(&msg, "(6:resume(2:ch1:0)(5:token");
+			hull_msg_atom(&msg, m->token, sizeof m->token);
+			hull_msg_raw(&msg, "))");
+			send_msg(m, &msg);
+			reason = expect(m, "started") ? NULL : "the guest agent would not resume";
+		}
+	}
+	if (reason == NULL && m->port_count > 0u) {
+		m->wake = eventfd(0u, EFD_CLOEXEC);
+		reason = open_listeners(m);
+	}
+	if (reason == NULL && pthread_create(&m->reader, NULL, read_agent, m) != 0)
+		reason = "the reader thread could not start";
+	if (reason != NULL) {
+		/* The machine is left as it is, for another core to try: it is
+		 * not this one's to stop. */
+		snprintf(detail, sizeof detail, "%s", reason);
+		hull_wire_close(&m->wire);
+		close_listeners(m);
+		mark_adopted_dir(m->dir, 0);
+		m->dir[0] = '\0';
+		release(m);
+		return fail(error, HULL_ERR_RUNTIME, detail);
+	}
+	(void)body;
+	m->started = 1;
+	if (m->port_count > 0u && m->wake >= 0 &&
+	    pthread_create(&m->forwarder, NULL, forward_ports, m) == 0)
+		m->forwarding = 1;
+	else if (m->port_count > 0u)
+		host->log(core, 3, "the machine's ports cannot be forwarded");
+	*out = m;
+	host->on_state(core, m, "running");
+	return HULL_OK;
 }
 
 static int wait_done(hull_machine *m, int timeout_ms)
@@ -2149,7 +2439,8 @@ static const hull_cap_entry entries[] = {
 	/* Kept while the core runs; qemu dies with it, as a chroot machine
 	 * does, until adopt() is written. */
 	{ "on_disconnect.stop", HULL_SUP_NATIVE,   NULL, NULL },
-	{ "on_disconnect.keep", HULL_SUP_NATIVE,   NULL, NULL },
+	{ "on_disconnect.keep", HULL_SUP_NATIVE,
+	  "kept, and taken back by a core that comes after one that went", NULL },
 
 	/* J.5. A q35 machine on the host's own kernel stands in for the
 	 * micro profile and Appendix F's bundled kernel. */
@@ -2182,6 +2473,8 @@ static const hull_engine_ops ops = {
 	.start       = qemu_start,
 	.stop        = qemu_stop,
 	.destroy     = qemu_destroy,
+	.adopt        = qemu_adopt,
+	.persist      = qemu_persist,
 	.exec         = qemu_exec,
 	.stream_write = qemu_stream_write,
 	.stream_eof   = qemu_stream_eof,

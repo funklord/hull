@@ -69,3 +69,15 @@ host_message spec_after_machine 28 34 3A 73 70 65 63 28 32 3A 63 68 31 3A 30 29 
 # spec_secrets_unclosed: (4:spec(2:ch1:0)(7:machine(7:backend2:vm))(7:secrets(2:db6:hunter))
 # spec: the secrets entry is closed, then the spec
 host_message spec_secrets_unclosed 28 34 3A 73 70 65 63 28 32 3A 63 68 31 3A 30 29 28 37 3A 6D 61 63 68 69 6E 65 28 37 3A 62 61 63 6B 65 6E 64 32 3A 76 6D 29 29 28 37 3A 73 65 63 72 65 74 73 28 32 3A 64 62 36 3A 68 75 6E 74 65 72 29 29
+
+# start_no_token: (5:start(2:ch1:0))
+# start: the token is required
+host_message start_no_token 28 35 3A 73 74 61 72 74 28 32 3A 63 68 31 3A 30 29 29
+
+# resume_no_token: (6:resume(2:ch1:0))
+# resume: the token is required
+host_message resume_no_token 28 36 3A 72 65 73 75 6D 65 28 32 3A 63 68 31 3A 30 29 29
+
+# resume_on_1: (6:resume(2:ch1:1)(5:token4:abcd))
+# control: resume is on channel 0
+host_message resume_on_1 28 36 3A 72 65 73 75 6D 65 28 32 3A 63 68 31 3A 31 29 28 35 3A 74 6F 6B 65 6E 34 3A 61 62 63 64 29 29

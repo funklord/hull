@@ -774,8 +774,8 @@ took=$(($(date +%s) - started))
 wait "$execer" 2>/dev/null
 xcase 1 'the machine is not running' "$hull" stats qexec
 
-# A machine dies with its core: nothing could manage it after.
-conf kept '(backend vm) (hostname "qkept") (on_disconnect keep) (command "/probe" "wait")'
+# A machine not kept dies with its core: nothing could manage it after.
+conf kept '(backend vm) (hostname "qkept") (command "/probe" "wait")'
 cases=$((cases + 1))
 (cd / && exec timeout -k 2 60 "$hull" run -f "$root/kept.conf" > /dev/null 2>&1) &
 runner=$!
@@ -795,6 +795,153 @@ fi
 wait "$runner" 2>/dev/null
 # Its directory is left, the core gone: the next core's first machine
 # removes it, which the last case requires.
+
+# A kept one outlives a core killed outright, and the core `hull ps`
+# starts takes it back: what the workload wrote while no core held it, an
+# exec, its port forwarded again, and its exit; then nothing left. Before
+# that, a host that cannot give the token is not believed, and the agent
+# listens on for the real one. The workload writes `during` two seconds
+# in, while no core holds it, as the test waits four after the kill; it
+# then waits up to 20 s to be served on its port, and 12 s more, for an
+# exec and a second machine's boot.
+conf adopt '(backend vm) (hostname "qadopt") (on_disconnect keep)' \
+	'(ports (port (host 18097) (guest 97)))' \
+	'(command "/probe" "say" "before" "sleep" "2" "say" "during" "serve" "tcp" "97" "say" "after" "sleep" "12" "exit" "5")'
+(cd / && exec timeout -k 2 90 "$hull" run -f "$root/adopt.conf" > /dev/null 2>&1) &
+runner=$!
+await qadopt
+cases=$((cases + 1))
+kept_file=$XDG_RUNTIME_DIR/hull/machines/qadopt
+[ -f "$kept_file" ] || fail "a kept vm has no file for the next core" "$(ls "$XDG_RUNTIME_DIR/hull")"
+kill -KILL "$(head -1 "$XDG_RUNTIME_DIR/hull/core.lock")" 2> /dev/null
+wait "$runner" 2>/dev/null
+sleep 4
+cases=$((cases + 1))
+left=$(pgrep -f "^qemu-system-x86_64 .*$XDG_RUNTIME_DIR/hull/qemu-")
+[ -n "$left" ] || fail "a kept vm died with its core" ""
+cid=$(grep -ao 'cid [0-9]*' "$kept_file" | cut -d' ' -f2)
+cases=$((cases + 1))
+out=$(timeout 20 python3 -c '
+import socket, struct, sys
+s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+s.settimeout(10)
+s.connect((int(sys.argv[1]), 1))
+def say(m):
+	s.sendall(struct.pack(">I", len(m)) + m)
+say(b"(5:hello(2:ch1:0)(8:features)(5:proto1:1))")
+say(b"(6:resume(2:ch1:0)(5:token32:" + b"x" * 32 + b"))")
+say(b"(4:exec(4:argv6:/probe)(2:ch1:7)(3:tty5:false))")
+got = b""
+while True:
+	piece = s.recv(4096)
+	if not piece:
+		break
+	got += piece
+# Told nothing but hello: not started, nothing the workload wrote, no exit.
+leaked = any(word in got for word in (b"started", b"data", b"exited"))
+print("believed" if leaked else "closed", repr(got[:200]))
+' "$cid" 2>&1)
+printf '%s\n' "$out" | grep -q '^closed ' || fail "a host without the token was believed" "$out"
+cases=$((cases + 1))
+out=$(timeout 60 "$hull" ps 2>&1)
+printf '%s\n' "$out" | grep -q '^qadopt .*running$' &&
+	grep -q '^hull core: machine qadopt is taken back$' "$XDG_RUNTIME_DIR/hull/core.log" ||
+	fail "the next core did not take the kept vm back" "$out
+$(cat "$XDG_RUNTIME_DIR/hull/core.log")"
+at=$(address_of qadopt)
+out=$(timeout 30 python3 -c '
+import socket, sys, time
+deadline = time.time() + 20
+while time.time() < deadline:
+	# Until the machine greets: before its serve listens, the forwarded
+	# connection is refused inside, and the host side just closes.
+	try:
+		s = socket.create_connection((sys.argv[1], 18097), timeout=5)
+		if s.recv(100).startswith(b"hello from the machine"):
+			s.sendall(b"hi again\n")
+			s.close()
+			print("sent")
+			break
+		s.close()
+	except OSError:
+		pass
+	time.sleep(0.2)
+' "$at" 2>&1)
+sent=$out
+cases=$((cases + 1))
+out=$(timeout 30 "$hull" exec qadopt /probe say "in it" 2>&1)
+[ "$out" = "in it" ] || fail "an exec in a taken-back vm said '$out'" ""
+# A machine started meanwhile sweeps dead cores' directories, and the
+# one the taken-back machine uses, named for the core that went, is not
+# one of them.
+conf brief2 '(backend vm) (command "/probe" "say" "brief")'
+name=brief2
+boot brief2
+has 0 '^brief$'
+cases=$((cases + 1))
+adopted_dir=$(grep -a '^dir ' "$kept_file" | cut -d' ' -f2-)
+[ -f "$adopted_dir/console.log" ] ||
+	fail "a taken-back vm's directory was swept" "$adopted_dir: $(ls "$adopted_dir" 2>&1)"
+cases=$((cases + 1))
+logs=$(timeout 30 "$hull" logs -f qadopt 2>&1)
+[ "$sent" = sent ] && printf '%s\n' "$logs" | grep -q '^during$' &&
+	printf '%s\n' "$logs" | grep -q '^served=hi again$' && printf '%s\n' "$logs" | grep -q '^after$' ||
+	fail "a taken-back vm's port or what it wrote meanwhile was lost" "$sent; $logs"
+cases=$((cases + 1))
+out=$(timeout 30 "$hull" attach qadopt 2>&1)
+got=$?
+[ "$got" = 5 ] || fail "a taken-back vm's exit was $got, wanted 5" "$out"
+cases=$((cases + 1))
+sleep 2
+left=$(pgrep -f "^qemu-system-x86_64 .*$XDG_RUNTIME_DIR/hull/qemu-")
+[ ! -e "$kept_file" ] && [ -z "$left" ] ||
+	fail "a taken-back vm's file or qemu is left" "$(ls "$XDG_RUNTIME_DIR/hull/machines") $left"
+# A kept vm whose workload ends while no core holds it waits for the next
+# core, and its exit is that core's to report: 7 here, a second after its
+# core is killed.
+conf ended '(backend vm) (hostname "qended") (on_disconnect keep)' \
+	'(command "/probe" "say" "up" "sleep" "2" "exit" "7")'
+(cd / && exec timeout -k 2 60 "$hull" run -f "$root/ended.conf" > /dev/null 2>&1) &
+runner=$!
+await qended
+kill -KILL "$(head -1 "$XDG_RUNTIME_DIR/hull/core.lock")" 2> /dev/null
+wait "$runner" 2>/dev/null
+sleep 4
+cases=$((cases + 1))
+out=$(timeout 60 "$hull" attach qended 2>&1)
+got=$?
+[ "$got" = 7 ] || fail "a kept vm that ended with no core exited $got, wanted 7" "$out
+$(cat "$XDG_RUNTIME_DIR/hull/core.log")"
+cases=$((cases + 1))
+sleep 2
+left=$(pgrep -f "^qemu-system-x86_64 .*$XDG_RUNTIME_DIR/hull/qemu-")
+[ -z "$left" ] && [ ! -e "$XDG_RUNTIME_DIR/hull/machines/qended" ] ||
+	fail "a kept vm that ended with no core was left" "$left"
+
+# A kept file whose pid is not its machine's qemu, as after the pid has
+# been given to another process, is forgotten, and that process is let
+# be: here a sleep of the test's own, read by a core that starts once the
+# last has left, 10 s at most.
+tries=0
+while [ -S "$XDG_RUNTIME_DIR/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+sleep 30 &
+stranger=$!
+state=$(printf 'pid %s\ncid 3\npasst 0\ndir %s/hull/qemu-1-1\ntoken %064d\n' \
+	"$stranger" "$XDG_RUNTIME_DIR" 0)
+printf '(4:kept(7:machine6:qfaked)(6:engine4:qemu)(5:class2:vm)(5:state%d:%s))' \
+	"${#state}" "$state" > "$XDG_RUNTIME_DIR/hull/machines/qfaked"
+cases=$((cases + 1))
+out=$(timeout 30 "$hull" ps 2>&1)
+! printf '%s\n' "$out" | grep -q '^qfaked ' &&
+	grep -q '^hull core: machine qfaked is forgotten: its qemu is gone$' "$XDG_RUNTIME_DIR/hull/core.log" &&
+	kill -0 "$stranger" 2> /dev/null ||
+	fail "a kept file naming another process was believed, or it was harmed" "$out
+$(cat "$XDG_RUNTIME_DIR/hull/core.log")"
+kill "$stranger" 2> /dev/null
+wait "$stranger" 2> /dev/null
 
 # The emu class: the same machine under TCG.
 conf emu '(backend emu) (mutable overlay) (command "/probe" "say" "under tcg" "read"' \

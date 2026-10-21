@@ -132,6 +132,29 @@ static struct timespec kill_at;
 static hull_wire host;
 static int       connected;
 
+/*
+ * (on_disconnect keep): a host that goes leaves the workload running, and
+ * the agent listens for the next, which a core that comes after the one
+ * that went makes when it takes the machine back. Any local user can
+ * reach a guest's vsock port, so a host after the first is believed only
+ * once it says `resume` with the token the first gave with `start`, and
+ * until then it is answered only `hello`. Meanwhile the workload's output
+ * is held, its last HELD_LIMIT bytes, for the host that resumes; execs
+ * and forwarded connections, whose frontends went with that host, end.
+ * A workload that ends meanwhile is reported to that host, and the machine
+ * powers off once it has been.
+ */
+#define HELD_LIMIT (256u * 1024u)
+#define TOKEN_MAX  64u
+
+static int      keep_;
+static uint8_t  token_[TOKEN_MAX];
+static size_t   token_length;
+static int      believed = 1;    /* the host may do more than hello and resume */
+static int      awaiting;        /* the workload ended with no host to tell */
+static uint8_t *held;            /* records: fd, a u32 length, the bytes */
+static size_t   held_length;
+
 /* Diagnostics go to the console, which the engine keeps in a file. */
 static void say(const char *what, const char *detail)
 {
@@ -209,9 +232,39 @@ static void send_error(uint32_t ch, const char *reason)
 	send_msg(&m);
 }
 
+/* The workload's output while no host is there to read it: appended, and
+ * the oldest records dropped while more than HELD_LIMIT is held. */
+static void hold(int fd, const uint8_t *bytes, size_t n)
+{
+	size_t record = 5u + n;
+	size_t at = 0u;
+
+	if (record > HELD_LIMIT)
+		return;
+	if (held == NULL && (held = malloc(HELD_LIMIT)) == NULL)
+		return;
+	while (held_length - at + record > HELD_LIMIT) {
+		uint32_t length;
+
+		memcpy(&length, held + at + 1u, sizeof length);
+		at += 5u + length;
+	}
+	memmove(held, held + at, held_length - at);
+	held_length -= at;
+	held[held_length] = (uint8_t)fd;
+	memcpy(held + held_length + 1u, &(uint32_t){ (uint32_t)n }, 4u);
+	memcpy(held + held_length + 5u, bytes, n);
+	held_length += record;
+}
+
 static void send_data(uint32_t ch, int fd, const uint8_t *bytes, size_t n)
 {
 	hull_msg m = { 0 };
+
+	if (!connected && keep_ && ch == 0u) {
+		hold(fd, bytes, n);
+		return;
+	}
 
 	hull_msg_raw(&m, "(4:data(3:buf");
 	hull_msg_atom(&m, bytes, n);
@@ -540,6 +593,12 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 		}
 	}
 	workdir = hull_access_value(doc, machine, "workdir");
+	{
+		char *disconnect = hull_access_value(doc, machine, "on_disconnect");
+
+		keep_ = disconnect != NULL && strcmp(disconnect, "keep") == 0;
+		free(disconnect);
+	}
 	if (hull_access_find(doc, machine, "security", &security)) {
 		readonly_root = hull_access_true(doc, &security, "readonly_root");
 		no_new_privs  = hull_access_true(doc, &security, "no_new_privs");
@@ -962,6 +1021,54 @@ static void settle(channel *c)
 
 /* --- the host's messages ------------------------------------------------- */
 
+/* A believed host back: the workload's start as it was said, what it wrote
+ * meanwhile, and its end if it has ended. */
+static void finish(void);
+
+static void resume(void)
+{
+	channel *w = workload();
+	hull_msg m = { 0 };
+	size_t   at = 0u;
+
+	believed = 1;
+	hull_msg_raw(&m, "(7:started");
+	hull_msg_channel(&m, 0u);
+	hull_msg_raw(&m, "(3:pid");
+	hull_msg_number(&m, w->pid);
+	hull_msg_raw(&m, "))");
+	send_msg(&m);
+	while (at < held_length) {
+		uint32_t length;
+
+		memcpy(&length, held + at + 1u, sizeof length);
+		send_data(0u, held[at], held + at + 5u, length);
+		at += 5u + length;
+	}
+	held_length = 0u;
+	if (awaiting) {
+		awaiting = 0;
+		finish();
+	}
+}
+
+/* The host has gone under keep: what its frontends ran ends with them. */
+static void drop_channels(void)
+{
+	for (unsigned i = 0u; i < MAX_CHANNELS; i++) {
+		channel *c = &channels[i];
+
+		if (!c->used || c->ch == 0u)
+			continue;
+		if (c->socket) {
+			close_fd(&c->out);
+			c->in = -1;
+		} else if (!c->reaped) {
+			kill(c->pid, SIGKILL);
+		}
+	}
+}
+
 /* `(connect (ch n) (port n))`: a connection to the machine's own address
  * on `port`, as docker's proxy makes one to a container's. A connect that
  * has not been answered in two seconds is refused. With `(proto udp)` it
@@ -1151,6 +1258,10 @@ static void handle(const hull_sexpr_doc *body)
 		hull_msg_channel(&m, 0u);
 		hull_msg_raw(&m, "(8:features)(5:proto1:1))");
 		send_msg(&m);
+	} else if (!believed && !hull_msg_is(body, "resume")) {
+		/* A host after the first, not yet believed: nothing but hello and
+		 * resume, and the connection dropped, as for a second one. */
+		connected = 0;
 	} else if (hull_msg_is(body, "spec")) {
 		hull_sexpr_form machine;
 		hull_sexpr_form secrets;
@@ -1167,8 +1278,28 @@ static void handle(const hull_sexpr_doc *body)
 		else
 			send_simple("(5:ready");
 	} else if (hull_msg_is(body, "start")) {
+		if (hull_msg_find(body, "token", &value) && value.content_length > 0u &&
+		    value.content_length <= TOKEN_MAX) {
+			memcpy(token_, body->data + value.content, value.content_length);
+			token_length = value.content_length;
+		}
 		if ((reason = start()) != NULL)
 			send_error(0u, reason);
+	} else if (hull_msg_is(body, "resume")) {
+		uint8_t differ = 1u;
+
+		if (keep_ && workload() != NULL && token_length > 0u &&
+		    hull_msg_find(body, "token", &value) && value.content_length == token_length) {
+			differ = 0u;
+			for (size_t i = 0u; i < token_length; i++)
+				differ |= (uint8_t)(token_[i] ^ body->data[value.content + i]);
+		}
+		if (differ || believed) {
+			say("resume", "refused");
+			connected = 0;
+		} else {
+			resume();
+		}
 	} else if (hull_msg_is(body, "signal")) {
 		char name[16];
 		int  number;
@@ -1284,6 +1415,12 @@ static int listen_host(void)
  * left, and power off. */
 static void finish(void)
 {
+	/* Under keep, only to a host that is there and believed: a host just
+	 * connected is not yet, and is told nothing until it resumes. */
+	if (keep_ && (!connected || !believed)) {
+		awaiting = 1;
+		return;
+	}
 	send_status(0u, workload()->status);
 	kill(-1, SIGKILL);
 	farewell();
@@ -1332,6 +1469,7 @@ int main(void)
 		int fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
 
 		close(listener);
+		listener = -1;
 		if (fd < 0 || hull_wire_open(&host, fd, HULL_WIRE_FROM_HOST) != 0)
 			power_off();
 		connected = 1;
@@ -1344,12 +1482,21 @@ int main(void)
 		nfds_t        n = 0u;
 		int           timeout;
 
-		/* The host gone is (on_disconnect stop), with nobody to tell. */
+		/* The host gone is (on_disconnect stop), with nobody to tell; or,
+		 * under keep, the next host is listened for. */
 		if (!connected && workload() == NULL)
 			power_off();
-		if (!connected && !stopping)
+		if (!connected && !keep_ && !stopping)
 			begin_stop(0);
-		fds[n++] = (struct pollfd){ connected ? host.fd : -1, POLLIN, 0 };
+		if (!connected && keep_ && listener < 0) {
+			if (host.fd >= 0)
+				hull_wire_close(&host);
+			drop_channels();
+			listener = listen_host();
+			if (listener < 0)
+				say("vsock", strerror(errno));
+		}
+		fds[n++] = (struct pollfd){ connected ? host.fd : listener, POLLIN, 0 };
 		fds[n++] = (struct pollfd){ children, POLLIN, 0 };
 		for (unsigned i = 0u; i < MAX_CHANNELS; i++) {
 			channel *c = &channels[i];
@@ -1436,11 +1583,23 @@ int main(void)
 				close_fd(&c->err);
 			settle(c);
 		}
-		if (connected && fds[0].revents != 0) {
+		if (!connected && listener >= 0 && fds[0].revents != 0) {
+			int fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+
+			if (fd >= 0 && hull_wire_open(&host, fd, HULL_WIRE_FROM_HOST) == 0) {
+				close(listener);
+				listener = -1;
+				connected = 1;
+				believed  = 0;
+			} else if (fd >= 0) {
+				close(fd);
+			}
+		} else if (connected && fds[0].revents != 0) {
 			hull_sexpr_doc body;
 
 			wire_status = hull_wire_fill(&host);
-			while (wire_status == HULL_WIRE_OK &&
+			/* Read no further once a message has dropped the host. */
+			while (connected && wire_status == HULL_WIRE_OK &&
 			       (wire_status = hull_wire_next(&host, &body)) == HULL_WIRE_OK)
 				handle(&body);
 			if (wire_status == HULL_WIRE_CLOSED || wire_status == HULL_WIRE_BROKEN)

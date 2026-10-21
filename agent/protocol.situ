@@ -36,6 +36,7 @@ const STOP    = ('4' << 24) | (':' << 16) | ('s' << 8) | 't';
 const PING    = ('4' << 24) | (':' << 16) | ('p' << 8) | 'i';
 const CREDIT  = ('6' << 24) | (':' << 16) | ('c' << 8) | 'r';
 const CONNECT = ('7' << 24) | (':' << 16) | ('c' << 8) | 'o';
+const RESUME  = ('6' << 24) | (':' << 16) | ('r' << 8) | 'e';
 const READY   = ('5' << 24) | (':' << 16) | ('r' << 8) | 'e';
 const ERROR   = ('5' << 24) | (':' << 16) | ('e' << 8) | 'r';
 const STARTED = ('7' << 24) | (':' << 16) | ('s' << 8) | 't';
@@ -71,6 +72,7 @@ struct host_message {
 		case PING:    ping        ping;
 		case CREDIT:  credit      credit;
 		case CONNECT: connect     connect;
+		case RESUME:  resume      resume;
 		default:      unknown     unknown;
 	}
 }
@@ -107,10 +109,27 @@ struct secrets_entry {
 	form  values[]  until ")";
 }
 
+// Run the workload. The token is what a host after this one resumes with,
+// under (on_disconnect keep): any local user can reach a guest's vsock
+// port, so the agent believes only a host that has it (project.md
+// section 4.11). At most 64 bytes, which the agent checks.
 struct start {
 	preamble u8[7] = "5:start";
 	control  ch;
-	u8  close  [must_eq = ')'];
+	preamble u8[8] = "(5:token";
+	atom  token;
+	preamble u8[2] = "))";
+}
+
+// A host after the one that went, under (on_disconnect keep), taking the
+// machine back with the token `start` gave: answered `started` and the
+// workload's output since that host went, or the connection is dropped.
+struct resume {
+	preamble u8[8] = "6:resume";
+	control  ch;
+	preamble u8[8] = "(5:token";
+	atom  token;
+	preamble u8[2] = "))";
 }
 
 // `hull exec`, on a channel the host allocated for it.
