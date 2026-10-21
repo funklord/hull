@@ -36,6 +36,9 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+/* Only what is marked EXPORT leaves the library: the Makefile compiles it
+ * with hidden visibility, and the directive below says so to fmake. */
+/*! @cflags -fvisibility=hidden */
 #define EXPORT __attribute__((visibility("default")))
 
 #define MAX_LINES 4096  /* far more machines than a core holds */

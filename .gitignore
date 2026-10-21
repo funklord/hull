@@ -5,3 +5,5 @@ build/
 /gen/
 /hull
 /hull-agent
+/libnss_hull.so
+/nss_hull.pc

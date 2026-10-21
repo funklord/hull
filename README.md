@@ -40,7 +40,7 @@ implement.
 
 ```sh
 make         # build/hull; fetches vendor/situ the first time
-fmake        # ./hull and ./hull-agent, as fmake.toml describes; no libnss_hull
+fmake        # ./hull, ./hull-agent and ./libnss_hull.so, as fmake.toml describes
 make check   # the style gate, the situ contracts, then the tests
 make check-docker  # hull run on the docker adapter, against the daemon
 make hooks   # install the commit-msg hook
