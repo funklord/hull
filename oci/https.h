@@ -1,10 +1,11 @@
 /*
- * https.h -- one HTTP/1.1 GET over TLS, as `hull pull` asks a registry
- * (section 3.5). OpenSSL verifies the peer against the host's trust
- * store, which SSL_CERT_FILE and SSL_CERT_DIR may name instead, and its
- * name against the URL's host; TLS 1.2 is the least taken. Each request is
- * its own connection, closed after it. A redirect is the caller's to
- * follow, since only it knows whether its credentials go with it.
+ * https.h -- one HTTP/1.1 request over TLS, as `hull pull` and `hull push`
+ * ask a registry (section 3.5). OpenSSL verifies the peer against the
+ * host's trust store, which SSL_CERT_FILE and SSL_CERT_DIR may name
+ * instead, and its name against the URL's host; TLS 1.2 is the least
+ * taken. Each request is its own connection, closed after it. A redirect
+ * is the caller's to follow, since only it knows whether its credentials
+ * go with it.
  */
 
 #ifndef HULL_HTTPS_H
@@ -31,10 +32,24 @@ typedef struct hull_https_response {
 typedef int (*hull_https_body)(void *context, const uint8_t *data, size_t n, char *why,
                                size_t cap);
 
-/* GET `url`, which must be https://, sending `headers`, each "Name: value"
- * and the list NULL-ended. The status and the headers above go into
- * `out`; the body, whole and checked against its framing, to `body`.
- * 0, or -1 with `why`. */
+/* What a request sends: `length` bytes, from `data`, or where it is NULL
+ * from `fd` at its start. */
+typedef struct hull_https_upload {
+	const uint8_t *data;
+	int            fd;
+	long long      length;
+} hull_https_upload;
+
+/* `method`, GET, HEAD, POST or PUT, to `url`, which must be https://,
+ * sending `headers`, each "Name: value" and the list NULL-ended, and
+ * `upload` where it is not NULL, with its Content-Length. The status and
+ * the headers above go into `out`; the body, whole and checked against its
+ * framing, to `body`, which a HEAD has none of. 0, or -1 with `why`. */
+int hull_https_request(const char *method, const char *url, const char *const *headers,
+                       const hull_https_upload *upload, hull_https_response *out,
+                       hull_https_body body, void *context, char *why, size_t cap);
+
+/* hull_https_request() with GET and nothing to send. */
 int hull_https_get(const char *url, const char *const *headers, hull_https_response *out,
                    hull_https_body body, void *context, char *why, size_t cap);
 

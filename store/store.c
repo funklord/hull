@@ -45,6 +45,7 @@
 #include "sha256.h"
 #include "store.h"
 #include "store_private.h"
+#include "tree.h"
 
 /* --- a growing buffer ------------------------------------------------------ */
 
@@ -1573,6 +1574,198 @@ int hull_store_show(hull_store *store, const char *name, FILE *out, char *why, s
 	fputc('\n', out);
 	free(data);
 	return 0;
+}
+
+/* --- a layer ------------------------------------------------------------- */
+
+static unsigned long long id_of(const hull_sexpr_doc *doc, const hull_sexpr_form *owner,
+                                const char *key)
+{
+	hull_sexpr_form value;
+
+	return field(doc, owner, key, &value) ? number(doc, &value) : 0u;
+}
+
+int hull_store_layer(hull_store *store, const char *name,
+                     int (*sink)(void *context, const uint8_t *data, size_t n), void *context,
+                     char arch[64], char *why, size_t cap)
+{
+	static uint8_t  chunk[1 << 16];
+	char            hex[65];
+	uint8_t        *data;
+	size_t          length;
+	hull_sexpr_doc  doc;
+	hull_sexpr_form top;
+	hull_sexpr_form entries;
+	hull_sexpr_form entry;
+	hull_sexpr_form value;
+	int             more;
+	int             result = -1;
+
+	flock(store->lock, LOCK_SH);
+	if (name_manifest(store, name, hex, why, cap) != 0 ||
+	    (data = read_manifest(store, hex, &length, why, cap)) == NULL) {
+		flock(store->lock, LOCK_UN);
+		return -1;
+	}
+	if (!open_entries(&doc, data, length, &entries) || !hull_sexpr_first(&doc, &top)) {
+		say(why, cap, name, "its manifest is not one");
+		goto done;
+	}
+	arch[0] = '\0';
+	if (field(&doc, &top, "arch", &value) && value.content_length < 64u) {
+		memcpy(arch, doc.data + value.content, value.content_length);
+		arch[value.content_length] = '\0';
+	}
+	more = hull_sexpr_child(&doc, &entries, &entry);
+	for (more = more && hull_sexpr_next(&doc, &entry, &entry); more;
+	     more = hull_sexpr_next(&doc, &entry, &entry)) {
+		hull_tar_entry  e = { 0 };
+		hull_sexpr_form owner;
+		hull_sexpr_form xattrs;
+		char            path[PATH_MAX + 2];
+		char            kind[16] = "";
+		char            target[PATH_MAX];
+		const char     *names[64];
+		const uint8_t  *values[64];
+		size_t          lengths[64];
+		char            name_text[64][256];
+		size_t          count = 0u;
+
+		if (!field(&doc, &entry, "path", &value) || value.content_length >= PATH_MAX)
+			goto bad;
+		memcpy(path, doc.data + value.content, value.content_length);
+		path[value.content_length] = '\0';
+		if (!field(&doc, &entry, "kind", &value) || value.content_length >= sizeof kind)
+			goto bad;
+		memcpy(kind, doc.data + value.content, value.content_length);
+		e.mode = field(&doc, &entry, "mode", &value) ? (unsigned)(number(&doc, &value) & 07777) : 0644u;
+		if (find(&doc, &entry, "owner", &owner)) {
+			hull_sexpr_form head;
+			hull_sexpr_form class;
+
+			hull_sexpr_child(&doc, &owner, &head);
+			hull_sexpr_next(&doc, &head, &class);
+			if (class.kind == HULL_SEXPR_LIST) {
+				e.uid = id_of(&doc, &class, "uid");
+				e.gid = id_of(&doc, &class, "gid");
+			} else if (!hull_sexpr_is(&doc, &class, "root")) {
+				say(why, cap, path, "an owner of class user, which has no number in an image");
+				goto done;
+			}
+		}
+		if (find(&doc, &entry, "xattrs", &xattrs)) {
+			hull_sexpr_form pair;
+			int             go;
+
+			hull_sexpr_child(&doc, &xattrs, &pair);
+			for (go = hull_sexpr_next(&doc, &pair, &pair); go;
+			     go = hull_sexpr_next(&doc, &pair, &pair)) {
+				hull_sexpr_form key;
+				hull_sexpr_form bytes;
+
+				if (count == 64u) {
+					say(why, cap, path, "more than 64 xattrs, which a layer is not written with here");
+					goto done;
+				}
+
+				if (!hull_sexpr_child(&doc, &pair, &key) || !hull_sexpr_next(&doc, &key, &bytes) ||
+				    key.content_length >= sizeof name_text[0])
+					goto bad;
+				memcpy(name_text[count], doc.data + key.content, key.content_length);
+				name_text[count][key.content_length] = '\0';
+				names[count] = name_text[count];
+				values[count] = doc.data + bytes.content;
+				lengths[count++] = bytes.content_length;
+			}
+			e.xattr_names = names;
+			e.xattr_values = values;
+			e.xattr_lengths = lengths;
+			e.xattr_count = count;
+		}
+		e.name = path;
+		if (strcmp(kind, "dir") == 0) {
+			strcat(path, "/");
+			e.type = '5';
+		} else if (strcmp(kind, "symlink") == 0) {
+			if (!field(&doc, &entry, "target", &value) || value.content_length >= sizeof target)
+				goto bad;
+			memcpy(target, doc.data + value.content, value.content_length);
+			target[value.content_length] = '\0';
+			e.type = '2';
+			e.link = target;
+		} else if (strcmp(kind, "fifo") == 0) {
+			e.type = '6';
+		} else if (strcmp(kind, "dev") == 0) {
+			hull_sexpr_form dev;
+
+			if (!find(&doc, &entry, "dev", &dev))
+				goto bad;
+			e.major = (unsigned)id_of(&doc, &dev, "major");
+			e.minor = (unsigned)id_of(&doc, &dev, "minor");
+			e.type = field(&doc, &dev, "type", &value) && hull_sexpr_is(&doc, &value, "b") ? '4' : '3';
+		} else if (strcmp(kind, "reg") == 0) {
+			char        object[4300];
+			char        found_hex[65];
+			uint8_t     found[32];
+			hull_sha256 h;
+			struct stat st;
+			ssize_t     n;
+			int         in;
+
+			if (!field(&doc, &entry, "object", &value) || value.content_length != 32u)
+				goto bad;
+			hex_of(doc.data + value.content, found_hex);
+			snprintf(object, sizeof object, "%s/objects/sha256/%.2s/%s", store->root, found_hex,
+			         found_hex);
+			if ((in = open(object, O_RDONLY | O_CLOEXEC)) < 0 || fstat(in, &st) != 0) {
+				say(why, cap, object, strerror(errno));
+				if (in >= 0)
+					close(in);
+				goto done;
+			}
+			e.type = '0';
+			e.size = (unsigned long long)st.st_size;
+			if (hull_tar_header(sink, context, &e, why, cap) != 0) {
+				close(in);
+				goto done;
+			}
+			hull_sha256_init(&h);
+			while ((n = read(in, chunk, sizeof chunk)) > 0) {
+				hull_sha256_update(&h, chunk, (size_t)n);
+				if (sink(context, chunk, (size_t)n) != 0) {
+					n = -1;
+					break;
+				}
+			}
+			close(in);
+			hull_sha256_final(&h, found);
+			if (n < 0) {
+				say(why, cap, path, "it could not be read, or was refused");
+				goto done;
+			}
+			if (memcmp(found, doc.data + value.content, 32u) != 0) {
+				say(why, cap, object, "its content is not the object its name says");
+				goto done;
+			}
+			if (hull_tar_pad(sink, context, e.size, why, cap) != 0)
+				goto done;
+			continue;
+		} else {
+			say(why, cap, path, "a kind an image's layer is not written with here");
+			goto done;
+		}
+		if (hull_tar_header(sink, context, &e, why, cap) != 0)
+			goto done;
+	}
+	result = hull_tar_end(sink, context, why, cap);
+	goto done;
+bad:
+	say(why, cap, name, "its manifest has an entry that is not one");
+done:
+	flock(store->lock, LOCK_UN);
+	free(data);
+	return result;
 }
 
 /* --- refs and gc ------------------------------------------------------- */

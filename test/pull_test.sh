@@ -1,6 +1,7 @@
 #!/bin/sh
-# pull_test.sh -- section 3.5's `hull pull` against a registry of the
-# test's own, test/registry.py, over TLS with a certificate the test makes,
+# pull_test.sh -- section 3.5's `hull pull` and `hull push` against a
+# registry of the test's own, test/registry.py, over TLS with a certificate
+# the test makes,
 # so that nothing reaches the network: the token, the redirect to another
 # host, chunks, an index, whiteouts, an opaque directory, a read-only one,
 # a symlinked one, a hardlink, a long name, an xattr, a device, a layer not
@@ -202,6 +203,68 @@ expect 1 '' "$hull" diff "$image" again/1
 cases=$((cases + 1))
 [ "$out" = "$(printf 'runtime removed\nprovenance')" ] ||
 	fail "diff did not say the runtime and the provenance alone" "$out"
+
+# push: the tree as one layer, its runtime as the config, put under a tag;
+# pulled back, it is the tree it was, its provenance alone another. Pushed
+# again, the same digest, and no blob sent, the registry having each.
+pushed=127.0.0.1:$port/test/pushed:1
+expect 0 "^127\\.0\\.0\\.1:$port/test/pushed:1 sha256:[0-9a-f]{64}\$" "$hull" push "$image" "$pushed"
+push_digest=$(printf '%s\n' "$out" | sed -n 's/^.* \(sha256:[0-9a-f]\{64\}\)$/\1/p')
+uploads=$(wc -l < "$root/registry/uploads")
+# The layer as a reader apart from hull's sees it, Python's gzip and
+# tarfile: every member root's at time 0, directories as `name/`, the
+# xattr there, and the config's diff_id the tar's own hash.
+cases=$((cases + 1))
+seen=$(timeout 30 python3 -c '
+import gzip, hashlib, io, json, os, sys, tarfile
+blobs = sys.argv[1]
+manifest = json.load(open(os.path.join(blobs, sys.argv[2])))
+config = json.load(open(os.path.join(blobs, manifest["config"]["digest"])))
+raw = gzip.decompress(open(os.path.join(blobs, manifest["layers"][0]["digest"]), "rb").read())
+problems = []
+if config["rootfs"]["diff_ids"] != ["sha256:" + hashlib.sha256(raw).hexdigest()]:
+	problems.append("diff_id")
+names = []
+for m in tarfile.open(fileobj=io.BytesIO(raw)):
+	names.append(m.name)
+	if m.uid or m.gid or m.mtime:
+		problems.append("owner or time of " + m.name)
+	if m.name == "etc/noted" and m.pax_headers.get("SCHILY.xattr.user.note") != "a note":
+		problems.append("xattr")
+if "etc/noted" not in names or "ro" not in names:
+	problems.append("names " + " ".join(names[:5]))
+print(" ".join(problems) or "ok")
+' "$root/registry/blobs" "$push_digest" 2>&1)
+[ "$seen" = ok ] || fail "the pushed layer, read apart from hull, is not the tree" "$seen"
+expect 0 '' "$hull" pull "$pushed" back/1
+expect 1 '' "$hull" diff "$image" back/1
+cases=$((cases + 1))
+[ "$out" = provenance ] || fail "an image pushed and pulled back is another tree" "$out"
+expect 0 'the registry has the layer already' "$hull" push "$image" "$pushed"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q " $push_digest\$" && [ "$(wc -l < "$root/registry/uploads")" = "$uploads" ] ||
+	fail "a second push was another image, or sent a blob again" "$out; $uploads then $(wc -l < "$root/registry/uploads")"
+# A tree with no runtime pushes with an empty config, and comes back with
+# the workdir a pull gives.
+expect 0 '' "$hull" push again/1 "127.0.0.1:$port/test/plain:1"
+expect 0 '' "$hull" pull "127.0.0.1:$port/test/plain:1" plain/back
+expect 1 '' "$hull" diff again/1 plain/back
+cases=$((cases + 1))
+[ "$out" = "$(printf 'runtime added\nprovenance')" ] ||
+	fail "a tree with no runtime did not come back as it went" "$out"
+# An object not its name is not pushed: the layer is checked as it is read.
+mkdir -p "$root/tiny"
+printf 'tiny\n' > "$root/tiny/file"
+expect 0 '' "$hull" commit "$root/tiny" tiny/1
+tiny=$(sha256sum < "$root/tiny/file" | cut -d' ' -f1)
+tiny_object=$store/objects/sha256/$(printf '%.2s' "$tiny")/$tiny
+chmod u+w "$tiny_object"
+printf 'TINY\n' > "$tiny_object"
+expect 1 'its content is not the object its name says' "$hull" push tiny/1 \
+	"127.0.0.1:$port/test/tiny:1"
+expect 1 'a push names a tag' "$hull" push "$image" "127.0.0.1:$port/test/pushed@$push_digest"
+expect 1 'no such ref' "$hull" push nobody/1 "$pushed"
+expect 1 'certificate' env SSL_CERT_FILE="$root/other.pem" "$hull" push "$image" "$pushed"
 
 # The image runs, its name its source, as J.1's image ref in the store.
 printf '(machine (source "%s") (backend chroot) (hostname "pulled") %s)\n' "$image" \

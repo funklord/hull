@@ -56,6 +56,7 @@
 #include "registry.h"
 #include "spec.h"
 #include "pull.h"
+#include "push.h"
 #include "store.h"
 #include "wire.h"
 
@@ -97,7 +98,7 @@ static void usage(FILE *out)
 	      "       hull ssh-config [--remove] | hull gc\n"
 	      "       hull commit [--arch A] DIR REF | hull materialize REF DIR | hull images\n"
 	      "       hull diff REF REF | hull tag REF NEW | hull tag -d REF\n"
-	      "       hull manifest show REF | hull pull IMAGE [REF]\n"
+	      "       hull manifest show REF | hull pull IMAGE [REF] | hull push REF IMAGE\n"
 	      "       hull core\n"
 	      "       hull engines\n"
 	      "       hull --version\n", out);
@@ -1487,6 +1488,29 @@ static int pull(const char *name, const char *ref)
 	return 0;
 }
 
+/* A stored tree to its registry, as a single-layer image. */
+static int push(const char *name, const char *image)
+{
+	hull_store store;
+	char       digest[80];
+	char       why[4400] = "";
+	int        status;
+
+	if ((status = open_store(&store, 0)) != 0) {
+		if (status == 1)
+			fprintf(stderr, "hull: push: there is no store, so no %s\n", name);
+		return 1;
+	}
+	status = hull_push(&store, name, image, digest, why, sizeof why);
+	hull_store_close(&store);
+	if (status != 0) {
+		fprintf(stderr, "hull: push: %s\n", why);
+		return 1;
+	}
+	printf("%s %s\n", image, digest);
+	return 0;
+}
+
 static int tag(const char *from, const char *ref)
 {
 	hull_store store;
@@ -2291,6 +2315,8 @@ int main(int argc, char **argv)
 		return untag(argv[3]);
 	if (strcmp(command, "tag") == 0 && argc == 4)
 		return tag(argv[2], argv[3]);
+	if (strcmp(command, "push") == 0 && argc == 4)
+		return push(argv[2], argv[3]);
 	if (strcmp(command, "pull") == 0 && (argc == 3 || argc == 4))
 		return pull(argv[2], argc == 4 ? argv[3] : argv[2]);
 	if (strcmp(command, "manifest") == 0 && argc == 4 && strcmp(argv[2], "show") == 0)

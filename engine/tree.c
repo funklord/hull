@@ -52,20 +52,30 @@ static int pad(writer *w, unsigned long long n)
 	return rest == 0u ? 0 : put(w, zeroes, BLOCK - rest);
 }
 
-/* One pax record, "<length> <key>=<value>\n", the length counting itself. */
-static size_t record(char *out, size_t cap, size_t at, const char *key, const char *value)
+/* One pax record, "<length> <key>=<value>\n", the length counting itself;
+ * the value's bytes as they are, so that an xattr's need not be text. */
+static size_t record(char *out, size_t cap, size_t at, const char *key, const void *value,
+                     size_t value_length)
 {
-	size_t body = strlen(key) + strlen(value) + 3u;  /* " ", "=" and "\n" */
+	size_t body = strlen(key) + value_length + 3u;  /* " ", "=" and "\n" */
 	size_t length = body + 1u;
 	char   digits[24];
+	int    n;
 
 	/* The length's own digits, until it stops growing. */
 	while ((size_t)snprintf(digits, sizeof digits, "%zu", length) + body != length)
 		length = (size_t)snprintf(digits, sizeof digits, "%zu", length) + body;
 	if (at + length >= cap)
 		return cap;
-	snprintf(out + at, cap - at, "%zu %s=%s\n", length, key, value);
+	n = snprintf(out + at, cap - at, "%zu %s=", length, key);
+	memcpy(out + at + (size_t)n, value, value_length);
+	out[at + (size_t)n + value_length] = '\n';
 	return at + length;
+}
+
+static size_t text_record(char *out, size_t cap, size_t at, const char *key, const char *value)
+{
+	return record(out, cap, at, key, value, strlen(value));
 }
 
 static void octal(uint8_t *field, size_t width, unsigned long long value)
@@ -73,63 +83,91 @@ static void octal(uint8_t *field, size_t width, unsigned long long value)
 	snprintf((char *)field, width, "%0*llo", (int)(width - 1u), value);
 }
 
-static int header(writer *w, const char *name, char type, const struct stat *st,
-                  unsigned long long size, const char *link)
+static int write_header(writer *w, const hull_tar_entry *e)
 {
-	uint8_t            block[BLOCK];
-	char               records[3u * MAX_PATH];
-	size_t             at = 0u;
-	unsigned long long mtime = st->st_mtime > 0 ? (unsigned long long)st->st_mtime : 0u;
-	unsigned           sum = 0u;
-	char               number[24];
+	uint8_t  block[BLOCK];
+	char    *records;
+	size_t   cap = 3u * MAX_PATH + 64u;
+	size_t   at = 0u;
+	unsigned sum = 0u;
+	char     number[24];
 
-	if (strlen(name) > 100u)
-		at = record(records, sizeof records, at, "path", name);
-	if (link != NULL && strlen(link) > 100u)
-		at = record(records, sizeof records, at, "linkpath", link);
-	if ((unsigned long long)st->st_uid > 07777777u) {
-		snprintf(number, sizeof number, "%u", (unsigned)st->st_uid);
-		at = record(records, sizeof records, at, "uid", number);
+	for (size_t i = 0u; i < e->xattr_count; i++)
+		cap += strlen(e->xattr_names[i]) + e->xattr_lengths[i] + 64u;
+	if ((records = malloc(cap)) == NULL)
+		return fail(w, "out of memory");
+	if (strlen(e->name) > 100u)
+		at = text_record(records, cap, at, "path", e->name);
+	if (e->link != NULL && strlen(e->link) > 100u)
+		at = text_record(records, cap, at, "linkpath", e->link);
+	if (e->uid > 07777777u) {
+		snprintf(number, sizeof number, "%llu", e->uid);
+		at = text_record(records, cap, at, "uid", number);
 	}
-	if ((unsigned long long)st->st_gid > 07777777u) {
-		snprintf(number, sizeof number, "%u", (unsigned)st->st_gid);
-		at = record(records, sizeof records, at, "gid", number);
+	if (e->gid > 07777777u) {
+		snprintf(number, sizeof number, "%llu", e->gid);
+		at = text_record(records, cap, at, "gid", number);
 	}
-	if (size > 077777777777ull) {
-		snprintf(number, sizeof number, "%llu", size);
-		at = record(records, sizeof records, at, "size", number);
+	if (e->size > 077777777777ull) {
+		snprintf(number, sizeof number, "%llu", e->size);
+		at = text_record(records, cap, at, "size", number);
 	}
-	if (at == sizeof records)
+	for (size_t i = 0u; i < e->xattr_count && at < cap; i++) {
+		char key[300];
+
+		snprintf(key, sizeof key, "SCHILY.xattr.%s", e->xattr_names[i]);
+		at = record(records, cap, at, key, e->xattr_values[i], e->xattr_lengths[i]);
+	}
+	if (at >= cap) {
+		free(records);
 		return fail(w, "its name is too long");
-	if (at != 0u) {
-		struct stat pax = *st;
-
-		pax.st_mode = 0644;
-		pax.st_uid  = 0;
-		pax.st_gid  = 0;
-		if (header(w, "././@PaxHeader", 'x', &pax, at, NULL) != 0 ||
-		    put(w, records, at) != 0 || pad(w, at) != 0)
-			return -1;
 	}
+	if (at != 0u) {
+		hull_tar_entry pax = { .name = "././@PaxHeader", .type = 'x', .mode = 0644,
+		                       .mtime = e->mtime, .size = at };
+
+		if (write_header(w, &pax) != 0 || put(w, records, at) != 0 || pad(w, at) != 0) {
+			free(records);
+			return -1;
+		}
+	}
+	free(records);
 
 	memset(block, 0, sizeof block);
-	memcpy(block, name, strlen(name) > 100u ? 100u : strlen(name));
-	octal(block + 100, 8u, (unsigned long long)(st->st_mode & 07777));
-	octal(block + 108, 8u, (unsigned long long)st->st_uid & 07777777u);
-	octal(block + 116, 8u, (unsigned long long)st->st_gid & 07777777u);
-	octal(block + 124, 12u, size > 077777777777ull ? 0u : size);
-	octal(block + 136, 12u, mtime > 077777777777ull ? 077777777777ull : mtime);
-	block[156] = (uint8_t)type;
-	if (link != NULL)
-		memcpy(block + 157, link, strlen(link) > 100u ? 100u : strlen(link));
+	memcpy(block, e->name, strlen(e->name) > 100u ? 100u : strlen(e->name));
+	octal(block + 100, 8u, (unsigned long long)(e->mode & 07777));
+	octal(block + 108, 8u, e->uid & 07777777u);
+	octal(block + 116, 8u, e->gid & 07777777u);
+	octal(block + 124, 12u, e->size > 077777777777ull ? 0u : e->size);
+	octal(block + 136, 12u, e->mtime > 077777777777ull ? 077777777777ull : e->mtime);
+	block[156] = (uint8_t)e->type;
+	if (e->link != NULL)
+		memcpy(block + 157, e->link, strlen(e->link) > 100u ? 100u : strlen(e->link));
 	memcpy(block + 257, "ustar", 6u);
 	memcpy(block + 263, "00", 2u);
+	if (e->type == '3' || e->type == '4') {
+		octal(block + 329, 8u, e->major & 07777777u);
+		octal(block + 337, 8u, e->minor & 07777777u);
+	}
 	memset(block + 148, ' ', 8u);
 	for (unsigned i = 0u; i < BLOCK; i++)
 		sum += block[i];
 	snprintf((char *)block + 148, 8u, "%06o", sum);
 	block[155] = ' ';
 	return put(w, block, sizeof block);
+}
+
+/* An entry of the tree on disk: its mode, owner and mtime as they are. */
+static int header(writer *w, const char *name, char type, const struct stat *st,
+                  unsigned long long size, const char *link)
+{
+	hull_tar_entry e = { .name = name, .type = type, .mode = (unsigned)(st->st_mode & 07777),
+	                     .uid = (unsigned long long)st->st_uid,
+	                     .gid = (unsigned long long)st->st_gid,
+	                     .mtime = st->st_mtime > 0 ? (unsigned long long)st->st_mtime : 0u,
+	                     .size = size, .link = link };
+
+	return write_header(w, &e);
 }
 
 /* A regular file's content, exactly the size its header gave. */
@@ -293,4 +331,46 @@ int hull_tree_tar(const char *root, hull_tree_sink sink, void *context, char *de
 	close(dir);
 	free(w);
 	return status;
+}
+
+/* --- an entry at a time ---------------------------------------------------- */
+
+/* A writer over `sink` for one call, `w->path` empty: what fails names the
+ * entry itself. */
+static void bare_writer(writer *w, hull_tree_sink sink, void *context, char *detail,
+                        size_t detail_cap)
+{
+	w->sink       = sink;
+	w->context    = context;
+	w->detail     = detail;
+	w->detail_cap = detail_cap;
+	w->path[0]    = '\0';
+}
+
+int hull_tar_header(hull_tree_sink sink, void *context, const hull_tar_entry *e, char *detail,
+                    size_t detail_cap)
+{
+	static writer w;
+
+	bare_writer(&w, sink, context, detail, detail_cap);
+	snprintf(w.path, sizeof w.path, "%s", e->name);
+	return write_header(&w, e);
+}
+
+int hull_tar_pad(hull_tree_sink sink, void *context, unsigned long long n, char *detail,
+                 size_t detail_cap)
+{
+	static writer w;
+
+	bare_writer(&w, sink, context, detail, detail_cap);
+	return pad(&w, n);
+}
+
+int hull_tar_end(hull_tree_sink sink, void *context, char *detail, size_t detail_cap)
+{
+	static const uint8_t end[2u * BLOCK];
+	static writer        w;
+
+	bare_writer(&w, sink, context, detail, detail_cap);
+	return put(&w, end, sizeof end);
 }

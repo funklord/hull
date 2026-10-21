@@ -362,9 +362,44 @@ static void header_value(const char *line, const char *name, char *out, size_t c
 	snprintf(out, cap, "%s", line);
 }
 
+/* The upload's bytes after the request's head. */
+static int send_upload(conn *c, const hull_https_upload *upload, const char *host, char *why,
+                       size_t cap)
+{
+	uint8_t   buffer[65536];
+	long long left = upload->length;
+
+	if (upload->data != NULL)
+		return send_all(c, (const char *)upload->data, (size_t)upload->length) == 0 ? 0 :
+		       say(why, cap, host, "the request's body could not be sent");
+	if (lseek(upload->fd, 0, SEEK_SET) != 0)
+		return say(why, cap, "the body to send", strerror(errno));
+	while (left > 0) {
+		size_t  want = left > (long long)sizeof buffer ? sizeof buffer : (size_t)left;
+		ssize_t got = read(upload->fd, buffer, want);
+
+		if (got < 0 && errno == EINTR)
+			continue;
+		if (got <= 0)
+			return say(why, cap, "the body to send", got < 0 ? strerror(errno) : "it ended short");
+		if (send_all(c, (const char *)buffer, (size_t)got) != 0)
+			return say(why, cap, host, "the request's body could not be sent");
+		left -= got;
+	}
+	return 0;
+}
+
 int hull_https_get(const char *text, const char *const *headers, hull_https_response *out,
                    hull_https_body body, void *context, char *why, size_t cap)
 {
+	return hull_https_request("GET", text, headers, NULL, out, body, context, why, cap);
+}
+
+int hull_https_request(const char *method, const char *text, const char *const *headers,
+                       const hull_https_upload *upload, hull_https_response *out,
+                       hull_https_body body, void *context, char *why, size_t cap)
+{
+	int    sends = strcmp(method, "POST") == 0 || strcmp(method, "PUT") == 0;
 	url    u;
 	conn   c;
 	char  *request;
@@ -388,12 +423,20 @@ int hull_https_get(const char *text, const char *const *headers, hull_https_resp
 	}
 	if ((request = malloc(room)) == NULL)
 		return say(why, cap, "out of memory", NULL);
+	if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0 && !sends) {
+		free(request);
+		return say(why, cap, method, "not a method this sends");
+	}
 	length = (size_t)snprintf(request, room,
-	                          "GET %s HTTP/1.1\r\nHost: %s%s%s\r\nUser-Agent: hull\r\n"
+	                          "%s %s HTTP/1.1\r\nHost: %s%s%s\r\nUser-Agent: hull\r\n"
 	                          "Accept-Encoding: identity\r\nConnection: close\r\n",
-	                          u.path, u.host, u.port_given ? ":" : "", u.port_given ? u.port : "");
+	                          method, u.path, u.host, u.port_given ? ":" : "",
+	                          u.port_given ? u.port : "");
 	for (const char *const *h = headers; h != NULL && *h != NULL; h++)
 		length += (size_t)snprintf(request + length, room - length, "%s\r\n", *h);
+	if (sends)
+		length += (size_t)snprintf(request + length, room - length, "Content-Length: %lld\r\n",
+		                           upload != NULL ? upload->length : 0);
 	length += (size_t)snprintf(request + length, room - length, "\r\n");
 	if (open_conn(&c, &u, why, cap) != 0)
 		goto done;
@@ -401,6 +444,9 @@ int hull_https_get(const char *text, const char *const *headers, hull_https_resp
 		say(why, cap, u.host, "the request could not be sent");
 		goto done;
 	}
+	if (sends && upload != NULL && upload->length > 0 &&
+	    send_upload(&c, upload, u.host, why, cap) != 0)
+		goto done;
 	if (read_line(&c, line, sizeof line) < 0 || strncmp(line, "HTTP/1.", 7u) != 0 ||
 	    strlen(line) < 12u || line[8] != ' ' || strspn(line + 9, "0123456789") < 3u) {
 		say(why, cap, u.host, "it did not answer with an HTTP status");
@@ -433,8 +479,9 @@ int hull_https_get(const char *text, const char *const *headers, hull_https_resp
 			goto done;
 		}
 	}
-	/* A redirect's body is nobody's; the connection goes with it. */
-	if (out->status == 301 || out->status == 302 || out->status == 303 || out->status == 307 ||
+	/* A redirect's body is nobody's, nor a HEAD's, which has none; the
+	 * connection goes with it. */
+	if (strcmp(method, "HEAD") == 0 || out->status == 301 || out->status == 302 || out->status == 303 || out->status == 307 ||
 	    out->status == 308 || out->status == 204 || out->status == 304) {
 		result = 0;
 		goto done;

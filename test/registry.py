@@ -236,11 +236,7 @@ class handler(BaseHTTPRequestHandler):
 		if len(parts) < 5 or parts[1] != "v2":
 			self.send(404)
 			return
-		if self.headers.get("Authorization") != "Bearer " + TOKEN:
-			repo = "/".join(parts[2:-2])
-			self.send(401, b"", [("WWW-Authenticate",
-			                      'Bearer realm="https://127.0.0.1:%d/token",service="test",'
-			                      'scope="repository:%s:pull"' % (port, repo))])
+		if not self.authorized(parts):
 			return
 		repo, kind, reference = "/".join(parts[2:-2]), parts[-2], parts[-1]
 		if kind == "blobs":
@@ -261,10 +257,90 @@ class handler(BaseHTTPRequestHandler):
 		media = json.loads(data).get("mediaType", "")
 		self.send(200, data, [("Content-Type", media), ("Docker-Content-Digest", digest(data))])
 
+	def authorized(self, parts):
+		"""A request with the token, or a 401 asking for one, for push too
+		where the request writes."""
+		if self.headers.get("Authorization") == "Bearer " + TOKEN:
+			return True
+		repo = "/".join(parts[2:-2]) if parts[-3] != "blobs" else "/".join(parts[2:-3])
+		scope = "pull,push" if self.command in ("POST", "PUT") else "pull"
+		self.send(401, b"", [("WWW-Authenticate",
+		                      'Bearer realm="https://127.0.0.1:%d/token",service="test",'
+		                      'scope="repository:%s:%s"' % (self.server.server_address[1], repo, scope))])
+		return False
+
+	def body(self):
+		return self.rfile.read(int(self.headers.get("Content-Length", "0")))
+
+	def do_HEAD(self):
+		parts = self.path.split("?")[0].split("/")
+		if len(parts) < 5 or parts[1] != "v2" or parts[-2] != "blobs":
+			self.send(404)
+			return
+		if not self.authorized(parts):
+			return
+		name = os.path.join(self.server.root, "blobs", parts[-1])
+		self.send_response(200 if os.path.exists(name) else 404)
+		self.send_header("Content-Length", str(os.path.getsize(name)) if os.path.exists(name) else "0")
+		self.send_header("Connection", "close")
+		self.end_headers()
+		self.close_connection = True
+
+	def do_POST(self):
+		parts = self.path.split("?")[0].split("/")
+		self.body()
+		if len(parts) < 6 or parts[1] != "v2" or parts[-3:] != ["blobs", "uploads", ""]:
+			self.send(404)
+			return
+		if not self.authorized(parts[:-1]):
+			return
+		repo = "/".join(parts[2:-3])
+		self.server.uploads += 1
+		self.send(202, b"", [("Location", "/v2/%s/blobs/uploads/u%d" % (repo, self.server.uploads))])
+
+	def do_PUT(self):
+		path, _, query = self.path.partition("?")
+		parts = path.split("/")
+		data = self.body()
+		if len(parts) < 5 or parts[1] != "v2":
+			self.send(404)
+			return
+		if parts[-3:-1] == ["blobs", "uploads"]:
+			if not self.authorized(parts[:-1]):
+				return
+			given = dict(p.split("=", 1) for p in query.split("&") if "=" in p).get("digest", "")
+			given = given.replace("%3A", ":").replace("%3a", ":")
+			if given != digest(data):
+				self.send(400, b"a blob that is not its digest")
+				return
+			with open(os.path.join(self.server.root, "blobs", given), "wb") as f:
+				f.write(data)
+			with open(os.path.join(self.server.root, "uploads"), "a") as f:
+				f.write(given + "\n")
+			self.send(201, b"", [("Location", "/v2/%s/blobs/%s" % ("/".join(parts[2:-3]), given))])
+			return
+		if parts[-2] != "manifests" or not self.authorized(parts):
+			if parts[-2] != "manifests":
+				self.send(404)
+			return
+		repo, tag = "/".join(parts[2:-2]), parts[-1]
+		manifest = json.loads(data)
+		for blob in [manifest["config"]] + manifest["layers"]:
+			if not os.path.exists(os.path.join(self.server.root, "blobs", blob["digest"])):
+				self.send(400, b"a manifest naming a blob not uploaded")
+				return
+		with open(os.path.join(self.server.root, "blobs", digest(data)), "wb") as f:
+			f.write(data)
+		os.makedirs(os.path.join(self.server.root, "repos", repo, "tags"), exist_ok=True)
+		with open(os.path.join(self.server.root, "repos", repo, "tags", tag), "wb") as f:
+			f.write(data)
+		self.send(201, b"", [("Docker-Content-Digest", digest(data))])
+
 
 def serve(root, cert, key):
 	server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
 	server.root = root
+	server.uploads = 0
 	context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 	context.load_cert_chain(cert, key)
 	server.socket = context.wrap_socket(server.socket, server_side=True)

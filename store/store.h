@@ -117,6 +117,18 @@ int hull_unpack_layer(hull_unpack *u, int fd, uint64_t *skipped, char *why, size
  * 0, or -1 with `why`. */
 int hull_unpack_end(hull_unpack *u, char *why, size_t cap);
 
+/* The tree `name` names, a ref or sha256:HEX, as one OCI layer, an
+ * uncompressed tar, to `sink`, which takes it a piece at a time and
+ * returns 0 to go on: the manifest's entries in its order, each directory
+ * before what it holds, every mtime 0, an owner `root` as 0 and an explicit
+ * one as its ids, xattrs as pax records, and each object checked against
+ * its name as it goes. The manifest's arch into `arch`. 0, or -1 with
+ * `why`, an owner of class `user`, which has no number in an image, among
+ * the refusals. */
+int hull_store_layer(hull_store *store, const char *name,
+                     int (*sink)(void *context, const uint8_t *data, size_t n), void *context,
+                     char arch[64], char *why, size_t cap);
+
 /* Each ref and the manifest it names, sorted by ref. */
 int hull_store_list(hull_store *store, void (*each)(void *context, const char *ref,
                                                     const char *manifest),

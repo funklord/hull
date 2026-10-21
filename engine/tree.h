@@ -37,6 +37,41 @@ typedef int (*hull_tree_sink)(void *context, const uint8_t *data, size_t n);
 int hull_tree_tar(const char *root, hull_tree_sink sink, void *context, char *detail,
                   size_t detail_cap);
 
+/* One entry of such a stream, for a writer that has no directory to walk,
+ * as `hull push` writes a layer from a manifest: its name as the stream
+ * holds it, a directory's ending in `/`; its type, '0' a file, '2' a
+ * symlink, '3' and '4' a character and a block device, '5' a directory,
+ * '6' a fifo; and its xattrs, as pax's SCHILY.xattr records. */
+typedef struct hull_tar_entry {
+	const char            *name;
+	char                   type;
+	unsigned               mode;
+	unsigned long long     uid;
+	unsigned long long     gid;
+	unsigned long long     mtime;
+	unsigned long long     size;
+	const char            *link;
+	unsigned               major;
+	unsigned               minor;
+	const char *const     *xattr_names;
+	const uint8_t *const  *xattr_values;
+	const size_t          *xattr_lengths;
+	size_t                 xattr_count;
+} hull_tar_entry;
+
+/* The entry's header, a pax one before it where a field does not fit
+ * ustar's or an xattr is given. A file's `size` bytes follow, then
+ * hull_tar_pad(). 0, or -1 with `detail`. */
+int hull_tar_header(hull_tree_sink sink, void *context, const hull_tar_entry *e, char *detail,
+                    size_t detail_cap);
+
+/* The zeroes after `n` bytes of a file, to the end of its block. */
+int hull_tar_pad(hull_tree_sink sink, void *context, unsigned long long n, char *detail,
+                 size_t detail_cap);
+
+/* The stream's end, two blocks of zeroes. */
+int hull_tar_end(hull_tree_sink sink, void *context, char *detail, size_t detail_cap);
+
 #ifdef __cplusplus
 }
 #endif

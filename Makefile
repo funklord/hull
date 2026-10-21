@@ -102,7 +102,8 @@ CLI_OBJS    = $(BUILD_DIR)/cli/hull.o
 # Section 3's optional store, which only the commands that name it use.
 STORE_OBJS  = $(BUILD_DIR)/store/store.o $(BUILD_DIR)/store/unpack.o
 # Section 3.5's border: what `hull pull` reads a registry with.
-OCI_OBJS    = $(BUILD_DIR)/oci/json.o $(BUILD_DIR)/oci/https.o $(BUILD_DIR)/oci/pull.o
+OCI_OBJS    = $(BUILD_DIR)/oci/json.o $(BUILD_DIR)/oci/https.o $(BUILD_DIR)/oci/remote.o \
+              $(BUILD_DIR)/oci/pull.o $(BUILD_DIR)/oci/push.o
 # The holder's choice, 2026-10-21 (section 3.5): TLS by OpenSSL, layers by zlib.
 PULL_LIBS   = -lssl -lcrypto -lz
 
