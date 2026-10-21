@@ -1049,6 +1049,30 @@ secret_run 125 'secret sealed: age' sealed
 printf '(machine (source "dir:./rootfs") (backend chroot) (command "/probe" "say" "ran") %s)\n' \
 	'(secrets (pw (source "file:pw.txt")))' > "$root/norun.conf"
 secret_run 125 'a tmpfs at /run, which the dir must have' norun
+# What the core refuses that our frontend never sends, said by hand to a
+# core of the tmpfs's own, held five idle seconds: a value twice, one the
+# plan does not name, one missing, values for a plan with no secrets, and
+# a plan that brings its own directory.
+(env XDG_RUNTIME_DIR="$shm" HULL_CORE_IDLE=5 "$hull_abs" core > /dev/null 2>&1 &)
+tries=0
+until [ -S "$shm/hull/core.sock" ] || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+plan_with='(4:plan(5:class2:ns)(6:engine6:chroot)(7:machine(7:command6:/probe)(7:secrets(2:pw(6:source10:file:x.txt)))(6:source12:dir:./secret)))'
+plan_without='(4:plan(5:class2:ns)(6:engine6:chroot)(7:machine(7:command6:/probe)(6:source12:dir:./secret)))'
+raw() { # PATTERN PLAN SECRETS: a run of PLAN with SECRETS after it
+	expect 0 "$1" env XDG_RUNTIME_DIR="$shm" python3 -c "$speak
+say(b'(3:run(2:ch1:1)(7:machine3:raw)$2$3)')
+hear(b'6:reason')
+"
+}
+raw "a secret's value is given twice" "$plan_with" '(7:secrets(2:pw1:a)(2:pw1:b))'
+raw 'the run gives a secret the plan does not name' "$plan_with" '(7:secrets(2:pw1:a)(5:other1:b))'
+raw 'a secret the plan names has no value' "$plan_with" '(7:secrets(5:other1:b))'
+raw 'the run gives a secret the plan does not name' "$plan_without" '(7:secrets(2:pw1:a))'
+raw "a plan's secrets' directory is the core's to give" \
+	'(4:plan(5:class2:ns)(6:engine6:chroot)(7:machine(6:source12:dir:./secret))(7:secrets4:/tmp))' ''
 cases=$((cases + 1))
 left=$(ls -A "$shm/hull/secrets")
 [ -z "$left" ] || fail "a refused run left its secrets" "$left"
