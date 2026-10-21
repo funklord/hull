@@ -17,6 +17,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -65,6 +66,20 @@ int hull_store_materialize(hull_store *store, const char *ref, const char *dir,
 int hull_store_diff(hull_store *store, const char *from, const char *to,
                     void (*each)(void *context, char change, const char *path, const char *what),
                     void *context, char *why, size_t cap);
+
+/* `ref` named the manifest `from` names, a ref or sha256:HEX, which the
+ * store must hold; a ref already there is replaced. Its hex into `hex`.
+ * 0, or -1 with `why`. */
+int hull_store_tag(hull_store *store, const char *from, const char *ref, char hex[65], char *why,
+                   size_t cap);
+
+/* `ref` removed; what it named stays, for gc. 0, or -1 with `why`. */
+int hull_store_untag(hull_store *store, const char *ref, char *why, size_t cap);
+
+/* A.1's readable view of the manifest `name` names, to `out`: lossless, so
+ * that it reads back as the same canonical bytes, an entry a line. 0, or -1
+ * with `why`. */
+int hull_store_show(hull_store *store, const char *name, FILE *out, char *why, size_t cap);
 
 /* Each ref and the manifest it names, sorted by ref. */
 int hull_store_list(hull_store *store, void (*each)(void *context, const char *ref,

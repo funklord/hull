@@ -1359,6 +1359,159 @@ done:
 	return result;
 }
 
+/* --- tags and the readable view ------------------------------------------- */
+
+int hull_store_tag(hull_store *store, const char *from, const char *ref, char hex[65], char *why,
+                   size_t cap)
+{
+	uint8_t *data;
+	size_t   length;
+	int      result = -1;
+
+	if (!is_ref(ref))
+		return say(why, cap, "a ref is names of letters, digits and ._-:@, joined by /", NULL);
+	/* Shared, so that gc cannot take the manifest between its read here
+	 * and the ref that then reaches it. */
+	flock(store->lock, LOCK_SH);
+	if (name_manifest(store, from, hex, why, cap) == 0 &&
+	    (data = read_manifest(store, hex, &length, why, cap)) != NULL) {
+		free(data);
+		result = set_ref(store, ref, hex, why, cap);
+	}
+	flock(store->lock, LOCK_UN);
+	return result;
+}
+
+int hull_store_untag(hull_store *store, const char *ref, char *why, size_t cap)
+{
+	char        path[4400];
+	struct stat st;
+
+	if (!is_ref(ref))
+		return say(why, cap, "a ref is names of letters, digits and ._-:@, joined by /", NULL);
+	snprintf(path, sizeof path, "%s/refs/%s", store->root, ref);
+	if (lstat(path, &st) != 0 || !S_ISLNK(st.st_mode))
+		return say(why, cap, ref, "no such ref");
+	if (unlink(path) != 0)
+		return say(why, cap, ref, strerror(errno));
+	return 0;
+}
+
+/* A bare token the reader takes back as these bytes: a symbol, or a number,
+ * which is a symbol's digits. */
+static int is_token(const uint8_t *bytes, size_t n)
+{
+	if (n == 0u)
+		return 0;
+	for (size_t i = 0u; i < n; i++)
+		if (!((bytes[i] >= 'a' && bytes[i] <= 'z') || (bytes[i] >= 'A' && bytes[i] <= 'Z') ||
+		      (bytes[i] >= '0' && bytes[i] <= '9') || strchr("_-.:/+@", bytes[i]) != NULL))
+			return 0;
+	return 1;
+}
+
+/* Text a string can hold: UTF-8 with no control byte but a newline or a
+ * tab, which are escaped. */
+static int is_text(const uint8_t *bytes, size_t n)
+{
+	char copy[4096];
+
+	if (n >= sizeof copy)
+		return 0;
+	for (size_t i = 0u; i < n; i++)
+		if ((bytes[i] < 0x20u && bytes[i] != '\n' && bytes[i] != '\t') || bytes[i] == 0x7fu)
+			return 0;
+	memcpy(copy, bytes, n);
+	copy[n] = '\0';
+	return is_utf8(copy);
+}
+
+/* One atom: a string where A.2 makes the field a string, a token where it
+ * can be one, else a string where it is text, else #hex#; each parses back
+ * to the same bytes. */
+static void show_atom(FILE *out, const uint8_t *bytes, size_t n, int string)
+{
+	if (!string && is_token(bytes, n)) {
+		fwrite(bytes, 1u, n, out);
+	} else if (is_text(bytes, n)) {
+		fputc('"', out);
+		for (size_t i = 0u; i < n; i++) {
+			if (bytes[i] == '"' || bytes[i] == '\\')
+				fprintf(out, "\\%c", bytes[i]);
+			else if (bytes[i] == '\n')
+				fputs("\\n", out);
+			else if (bytes[i] == '\t')
+				fputs("\\t", out);
+			else
+				fputc(bytes[i], out);
+		}
+		fputc('"', out);
+	} else {
+		fputc('#', out);
+		for (size_t i = 0u; i < n; i++)
+			fprintf(out, "%02x", bytes[i]);
+		fputc('#', out);
+	}
+}
+
+/* A list on one line, or with its elements each on a line of their own
+ * where it is the manifest or its entries, so that a diff of two views is
+ * a line per entry. */
+static void show_form(FILE *out, const hull_sexpr_doc *doc, const hull_sexpr_form *form, int depth)
+{
+	hull_sexpr_form item;
+	hull_sexpr_form head;
+	int             more;
+	int             broken;
+	int             string;
+
+	if (form->kind != HULL_SEXPR_LIST) {
+		show_atom(out, doc->data + form->content, form->content_length, 0);
+		return;
+	}
+	more = hull_sexpr_child(doc, form, &head);
+	broken = more && (hull_sexpr_is(doc, &head, "manifest") || hull_sexpr_is(doc, &head, "entries"));
+	string = more && (hull_sexpr_is(doc, &head, "path") || hull_sexpr_is(doc, &head, "target"));
+	fputc('(', out);
+	for (item = head; more; more = hull_sexpr_next(doc, &item, &item)) {
+		if (item.offset != head.offset && broken)
+			fprintf(out, "\n%*s", 2 * (depth + 1), "");
+		else if (item.offset != head.offset)
+			fputc(' ', out);
+		if (item.kind == HULL_SEXPR_LIST)
+			show_form(out, doc, &item, depth + 1);
+		else
+			show_atom(out, doc->data + item.content, item.content_length,
+			          string && item.offset != head.offset);
+	}
+	fputc(')', out);
+}
+
+int hull_store_show(hull_store *store, const char *name, FILE *out, char *why, size_t cap)
+{
+	char            hex[65];
+	uint8_t        *data;
+	size_t          length;
+	hull_sexpr_doc  doc;
+	hull_sexpr_form top;
+
+	flock(store->lock, LOCK_SH);
+	data = name_manifest(store, name, hex, why, cap) == 0 ?
+	       read_manifest(store, hex, &length, why, cap) : NULL;
+	flock(store->lock, LOCK_UN);
+	if (data == NULL)
+		return -1;
+	if (hull_sexpr_open(&doc, data, length, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
+	    !hull_sexpr_first(&doc, &top)) {
+		free(data);
+		return say(why, cap, name, "its manifest is not one");
+	}
+	show_form(out, &doc, &top, 0);
+	fputc('\n', out);
+	free(data);
+	return 0;
+}
+
 /* --- refs and gc ------------------------------------------------------- */
 
 typedef struct found_ref {

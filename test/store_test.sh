@@ -307,14 +307,16 @@ got=$?
 [ "$got" = 0 ] && [ -z "$out" ] || fail "a manifest named by its hash differs from its copy: $got" "$out"
 expect 0 '' "$hull" materialize "sha256:$first" "$root/byhash"
 # Each kind of change, said once for its path, in path order: a kind, a
-# mode, a content, a path gone and two come, one with a newline in its
-# name, an xattr, and a symlink's target.
+# mode, a content, a path gone and three come, one with a newline in its
+# name and one with a quote and a backslash, an xattr, and a symlink's
+# target.
 cp -a "$root/after" "$root/more"
 rm "$root/more/empty" "$root/more/srv/deep/er/file" "$root/more/usr/link"
 mkdir "$root/more/empty"
 chmod 600 "$root/more/etc/again"
 printf 'other\n' > "$root/more/etc/greeting"
 printf 'new\n' > "$root/more/srv/new"
+printf 'quoted\n' > "$root/more/srv/q\"b\\s"
 printf 'two\n' > "$root/more/srv/two
 lines"
 ln -s ../etc/again "$root/more/usr/link"
@@ -333,6 +335,7 @@ wanted=$(printf '%s\n' \
 	'~ etc/greeting: content' \
 	'- srv/deep/er/file' \
 	'+ srv/new' \
+	'+ srv/q"b\134s' \
 	'+ srv/two\012lines' \
 	'~ usr/bin/hi: xattrs' \
 	'~ usr/link: target ../etc/greeting -> ../etc/again')
@@ -358,6 +361,87 @@ expect 1 'a ref is names of' "$hull" commit "$tree" sha256:mine
 crafted evil/unsorted unsorted
 expect 2 'an entry with no path, or out of order' "$hull" diff one/copy evil/unsorted
 rm -f "$store/refs/evil/unsorted"
+
+# manifest show: A.1's readable view, read back by a reader of the test's
+# own, apart from hull's, as the canonical bytes the manifest's name is the
+# hash of; one/more has a name with a newline and an xattr that is not
+# text. The view is text, printable, and an entry a line, so that two views
+# diff by entry.
+cases=$((cases + 1))
+timeout 60 "$hull" manifest show one/more > "$root/view" 2>&1
+read_back=$(timeout 30 python3 -c '
+import hashlib, sys
+t = open(sys.argv[1], "rb").read()
+at = 0
+def blank():
+	global at
+	while at < len(t) and t[at:at + 1] in (b" ", b"\n", b"\t"):
+		at += 1
+def form():
+	global at
+	blank()
+	c = t[at:at + 1]
+	if c == b"(":
+		at += 1
+		out = b"("
+		blank()
+		while t[at:at + 1] != b")":
+			out += form()
+			blank()
+		at += 1
+		return out + b")"
+	if c == b"\"":
+		at += 1
+		value = b""
+		while t[at:at + 1] != b"\"":
+			if t[at:at + 1] == b"\\":
+				value += {b"n": b"\n", b"t": b"\t"}.get(t[at + 1:at + 2], t[at + 1:at + 2])
+				at += 2
+			else:
+				value += t[at:at + 1]
+				at += 1
+		at += 1
+	elif c == b"#":
+		end = t.index(b"#", at + 1)
+		value = bytes.fromhex(t[at + 1:end].decode())
+		at = end + 1
+	else:
+		start = at
+		while at < len(t) and t[at:at + 1] not in b" \n\t()\";":
+			at += 1
+		value = t[start:at]
+	return str(len(value)).encode() + b":" + value
+# Text to be read: UTF-8, and no control byte but the line breaks.
+text = t.decode("utf-8", "replace")
+printable = "\ufffd" not in text and all(c == "\n" or ord(c) >= 0x20 and c != "\x7f" for c in text)
+print(hashlib.sha256(form()).hexdigest() if printable else "unprintable")
+' "$root/view" 2>&1)
+[ "$read_back" = "$(hash_of one/more)" ] &&
+	[ "$(grep -c '^    (entry ' "$root/view")" = "$(find "$root/more" -mindepth 1 -printf x | wc -c)" ] ||
+	fail "the view does not read back as its manifest, or is not an entry a line" \
+		"$read_back $(hash_of one/more); $(head -5 "$root/view")"
+# A path is a string, as A.2 has it, though a token would read back too.
+cases=$((cases + 1))
+grep -q '(path "etc")' "$root/view" || fail "the view gives a path other than as a string" ""
+# tag: a second ref to a manifest, by its ref or its hash, replacing what
+# the ref named; -d removes a ref and leaves its manifest, for gc.
+expect 0 '^one/tagged sha256:[0-9a-f]{64}$' "$hull" tag one/more one/tagged
+cases=$((cases + 1))
+[ "$(hash_of one/tagged)" = "$(hash_of one/more)" ] || fail "a tag names another manifest" ""
+expect 0 '' "$hull" tag "sha256:$first" one/tagged
+cases=$((cases + 1))
+[ "$(hash_of one/tagged)" = "$first" ] || fail "a tag by hash, over a ref, did not replace it" ""
+expect 0 '' "$hull" tag -d one/tagged
+cases=$((cases + 1))
+[ -z "$(hash_of one/tagged)" ] && [ -e "$store/manifests/sha256/$first" ] ||
+	fail "tag -d left the ref, or took its manifest" "$(hash_of one/tagged)"
+expect 1 'no such ref' "$hull" tag -d one/tagged
+expect 1 'no such ref' "$hull" tag one/nope one/tagged
+expect 1 'a ref is names of' "$hull" tag one/more ../out
+expect 1 'a ref is names of' "$hull" tag one/more sha256:mine
+expect 1 'No such file' "$hull" tag \
+	sha256:0000000000000000000000000000000000000000000000000000000000000000 one/tagged
+expect 1 'no such ref' "$hull" manifest show one/nope
 
 # The test's core leaves once idle, before its directory goes.
 tries=0
