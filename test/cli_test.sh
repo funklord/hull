@@ -350,13 +350,21 @@ expect 0 '^stdin=from the frontend$' sh -c 'echo from the frontend | "$0" exec e
 	"$hull_abs"
 expect 0 '^stdin=\(none\)$' sh -c '"$0" exec execd /probe stdin < /dev/null' "$hull_abs"
 expect 7 '' "$hull" exec execd /probe exit 7
-# The machine's init holds nothing of the core's: no socket, and not its
-# lock, which a machine outliving its core would otherwise keep held.
+# The machine's init holds nothing of the core's: none of its sockets,
+# and not its lock, which a machine outliving its core would otherwise
+# keep held. Its own sockets, its end of the pair it relays the workload
+# on and a kept machine's init.sock, are in the core's hands nowhere.
 cases=$((cases + 1))
 workload=$(ps -eo pid=,args= | awk '$2 == "/probe" && $3 == "wait" {print $1; exit}')
 init=$(ps -o ppid= -p "$workload" | tr -d ' ')
-held=$(ls -l "/proc/$init/fd" 2>/dev/null | grep -E 'socket:|core\.lock')
-[ -n "$init" ] && [ -z "$held" ] || fail "the machine's init holds the core's descriptors" "$held"
+core=$(head -1 "$XDG_RUNTIME_DIR/hull/core.lock" 2>/dev/null)
+core_sockets=$(ls -l "/proc/$core/fd" 2>/dev/null | grep -o 'socket:\[[0-9]*\]')
+held=$(ls -l "/proc/$init/fd" 2>/dev/null | grep 'core\.lock')
+for socket in $(ls -l "/proc/$init/fd" 2>/dev/null | grep -o 'socket:\[[0-9]*\]'); do
+	printf '%s\n' "$core_sockets" | grep -qxF "$socket" && held="$held $socket"
+done
+[ -n "$init" ] && [ -n "$core_sockets" ] && [ -z "$held" ] ||
+	fail "the machine's init holds the core's descriptors" "$held"
 # -t: a terminal of the size this one has, the command's controlling
 # terminal, with stderr on it too; a resize reaches it as SIGWINCH. script
 # gives the frontend a terminal, which the test does not have.
@@ -877,19 +885,20 @@ expect 2 'usage' "$hull" stats
 expect 0 '' "$hull" core
 expect 0 '^kept +127\.107\.[0-9.]+ +chroot +ns +exited$' "$hull" ps
 
-# A machine dies with its core, even a kept one: nothing could manage it
-# after. The probe is found by its argv[0], which only ours carries.
-(cd / && exec "$hull_abs" run -f "$root/keep.conf" > /dev/null 2>&1) &
+# A machine not kept dies with its core: nothing could manage it after.
+# The probe is found by its arguments, which only this one has.
+conf lone '(command "/probe" "say" "lone" "wait")' '(hostname "lone")'
+(cd / && exec timeout -k 2 30 "$hull_abs" run -f "$root/lone.conf" > /dev/null 2>&1) &
 keeper=$!
 tries=0
-until "$hull" ps 2>/dev/null | grep -q '^kept .*running$' || [ "$tries" -ge 40 ]; do
+until "$hull" ps 2>/dev/null | grep -q '^lone .*running$' || [ "$tries" -ge 40 ]; do
 	tries=$((tries + 1))
 	sleep 0.25
 done
 cases=$((cases + 1))
 core=$(head -1 "$XDG_RUNTIME_DIR/hull/core.lock" 2>/dev/null)
-if ! "$hull" ps 2>/dev/null | grep -q '^kept .*running$' || [ -z "$core" ]; then
-	fail "the kept machine never ran, so its core's death could not be tried" \
+if ! "$hull" ps 2>/dev/null | grep -q '^lone .*running$' || [ -z "$core" ]; then
+	fail "the machine never ran, so its core's death could not be tried" \
 		"$("$hull" ps 2>&1)"
 else
 	# Looked for before the client is reaped: without the parent-death
@@ -898,14 +907,103 @@ else
 	# (project.md section 4.10).
 	kill -KILL "$core"
 	sleep 0.5
-	left=$(ps -eo pid=,args= | awk '$2 == "/probe"')
-	[ -z "$left" ] || fail "a machine outlived its core" "$left"
+	left=$(ps -eo pid=,args= | awk '$2 == "/probe" && $4 == "lone"')
+	[ -z "$left" ] || fail "a machine not kept outlived its core" "$left"
 	wait "$keeper" 2>/dev/null
 fi
-# Nor is it kept for the next core, chroot having no adopt().
+
+# A kept one outlives a core killed outright, and the core `hull ps`
+# starts takes it back: what the workload wrote while no core held it,
+# an exec, and its exit; then its file and directory gone. It writes
+# `during` two seconds in, while no core holds it, as the test waits
+# three after the kill, and ends four seconds after that.
+conf adopt '(command "/probe" "say" "before" "sleep" "2" "say" "during" "sleep" "4" "say" "after" "exit" "6")' \
+	'(hostname "cadopt") (on_disconnect keep)'
+(cd / && exec timeout -k 2 30 "$hull_abs" run -f "$root/adopt.conf" > /dev/null 2>&1) &
+keeper=$!
+tries=0
+until "$hull" ps 2>/dev/null | grep -q '^cadopt .*running$' || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+kept_file=$XDG_RUNTIME_DIR/hull/machines/cadopt
 cases=$((cases + 1))
-[ ! -e "$XDG_RUNTIME_DIR/hull/machines/kept" ] ||
-	fail "a chroot machine was kept for the next core" "$(cat "$XDG_RUNTIME_DIR/hull/machines/kept")"
+[ -f "$kept_file" ] || fail "a kept machine has no file for the next core" "$(ls "$XDG_RUNTIME_DIR/hull")"
+kill -KILL "$(head -1 "$XDG_RUNTIME_DIR/hull/core.lock")" 2> /dev/null
+wait "$keeper" 2>/dev/null
+sleep 3
+cases=$((cases + 1))
+left=$(ps -eo pid=,args= | awk '$2 == "/probe" && $4 == "before"')
+[ -n "$left" ] || fail "a kept machine died with its core" ""
+cases=$((cases + 1))
+out=$(timeout 10 "$hull" ps 2>&1)
+printf '%s\n' "$out" | grep -q '^cadopt .*running$' &&
+	grep -q '^hull core: machine cadopt is taken back$' "$XDG_RUNTIME_DIR/hull/core.log" ||
+	fail "the next core did not take the kept machine back" "$out
+$(cat "$XDG_RUNTIME_DIR/hull/core.log")"
+expect 0 '^in it$' "$hull" exec cadopt /probe say "in it"
+# Another kept machine started meanwhile sweeps dead cores' directories,
+# and the one the taken-back machine uses, named for the core that went,
+# is not one of them.
+conf kbrief '(command "/probe" "say" "brief")' '(hostname "kbrief") (on_disconnect keep)'
+from_root 0 '^brief$' -f "$root/kbrief.conf"
+cases=$((cases + 1))
+adopted_dir=$(grep -a '^dir ' "$kept_file" | cut -d' ' -f2-)
+[ -S "$adopted_dir/init.sock" ] ||
+	fail "a taken-back machine's directory was swept" "$adopted_dir: $(ls "$adopted_dir" 2>&1)"
+cases=$((cases + 1))
+logs=$(timeout 20 "$hull" logs -f cadopt 2>&1)
+printf '%s\n' "$logs" | grep -q '^during$' && printf '%s\n' "$logs" | grep -q '^after$' ||
+	fail "what a kept machine wrote while no core held it was lost" "$logs"
+expect 6 '' "$hull" attach cadopt
+cases=$((cases + 1))
+sleep 1
+dirs=$(ls -d "$XDG_RUNTIME_DIR"/hull/chroot-* 2>/dev/null)
+[ ! -e "$kept_file" ] && [ -z "$dirs" ] ||
+	fail "a taken-back machine's file or directory is left" "$(ls "$XDG_RUNTIME_DIR/hull/machines") $dirs"
+# A kept machine whose workload ends while no core holds it waits for the
+# next, and its exit, 7, is that core's to tell.
+conf cended '(command "/probe" "say" "up" "sleep" "2" "exit" "7")' \
+	'(hostname "cended") (on_disconnect keep)'
+(cd / && exec timeout -k 2 30 "$hull_abs" run -f "$root/cended.conf" > /dev/null 2>&1) &
+keeper=$!
+tries=0
+until "$hull" ps 2>/dev/null | grep -q '^cended .*running$' || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+kill -KILL "$(head -1 "$XDG_RUNTIME_DIR/hull/core.lock")" 2> /dev/null
+wait "$keeper" 2>/dev/null
+sleep 3
+expect 7 '' "$hull" attach cended
+cases=$((cases + 1))
+sleep 1
+[ ! -e "$XDG_RUNTIME_DIR/hull/machines/cended" ] && [ -z "$(ls -d "$XDG_RUNTIME_DIR"/hull/chroot-* 2>/dev/null)" ] ||
+	fail "a kept machine that ended with no core was left" "$(ls "$XDG_RUNTIME_DIR/hull")"
+# A kept file whose pid is not its machine's init, as once the pid has
+# gone to another process, is forgotten, and that process let be: a
+# sleep of the test's own, read by a core that starts once the last has
+# left, 10 s at most.
+tries=0
+while [ -S "$XDG_RUNTIME_DIR/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+sleep 30 &
+stranger=$!
+state=$(printf 'pid %s\ndir %s/hull/chroot-1-1\nplan\n%s' "$stranger" "$XDG_RUNTIME_DIR" \
+	'(4:plan(5:class2:ns)(6:engine6:chroot)(7:machine(7:command6:/probe)(6:source12:dir:./rootfs)(7:workdir1:/)))')
+printf '(4:kept(7:machine6:cfaked)(6:engine6:chroot)(5:class2:ns)(5:state%d:%s))' \
+	"${#state}" "$state" > "$XDG_RUNTIME_DIR/hull/machines/cfaked"
+cases=$((cases + 1))
+out=$(timeout 10 "$hull" ps 2>&1)
+! printf '%s\n' "$out" | grep -q '^cfaked ' &&
+	grep -q '^hull core: machine cfaked is forgotten: its init is gone$' "$XDG_RUNTIME_DIR/hull/core.log" &&
+	kill -0 "$stranger" 2> /dev/null ||
+	fail "a kept file naming another process was believed, or it was harmed" "$out
+$(cat "$XDG_RUNTIME_DIR/hull/core.log")"
+kill "$stranger" 2> /dev/null
+wait "$stranger" 2> /dev/null
 
 # A core told to go stops its machines first, and their frontends hear
 # how each ended: the probe's 143 for the TERM, not "the core went away".
@@ -970,7 +1068,7 @@ done
 # What a core that went kept for the next, which `hull ps` starts, though
 # it starts none otherwise. No daemon answers here, so a docker machine is
 # left for a later core; a file no core wrote, one whose name is not its
-# machine's, and a machine of an engine that cannot adopt are forgotten.
+# machine's, and one whose state is not its engine's are forgotten.
 # core.log says which.
 kept=$XDG_RUNTIME_DIR/hull/machines
 printf 'not a kept machine' > "$kept/junk"
@@ -983,7 +1081,7 @@ cases=$((cases + 1))
 said=$(cat "$XDG_RUNTIME_DIR/hull/core.log")
 printf '%s\n' "$said" | grep -q '^hull core: machine junk is forgotten: it is not what a core writes$' &&
 	printf '%s\n' "$said" | grep -q '^hull core: machine named is forgotten: it is not what a core writes$' &&
-	printf '%s\n' "$said" | grep -q '^hull core: machine chroot is forgotten: its engine cannot take it back$' &&
+	printf '%s\n' "$said" | grep -q '^hull core: machine chroot is forgotten: the state is not this engine.s$' &&
 	printf '%s\n' "$said" | grep -q '^hull core: machine docker is left for the next core: the Docker daemon at .* cannot be reached$' &&
 	[ "$(ls "$kept")" = docker ] ||
 	fail "the kept machines were not read as they are" "$(ls "$kept"); core.log: $said"

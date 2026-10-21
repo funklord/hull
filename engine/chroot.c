@@ -20,30 +20,40 @@
  * inside the machine. Mounted before the chroot, a symlink in the rootfs
  * would be followed on the host, and the volume land wherever it led.
  *
- * The workload's output goes to the core through on_data (hull_engine.h,
- * rule 3), read by one thread per machine that also waits for it and
- * reports on_exit. Every engine-owned allocation is the machine handle's,
- * freed by destroy().
+ * The workload's output reaches the core through the init, which holds
+ * the workload's pipes and relays what they carry, and the workload's
+ * end, over a socket pair to the engine: a frame each, `kind fd length`
+ * and the bytes. One thread per machine reads them into on_data
+ * (hull_engine.h, rule 3) and reports on_exit. Under (on_disconnect keep)
+ * that is what lets the machine outlive the core: the init has no
+ * parent-death signal, holds the workload's last bytes while no core
+ * reads them, and listens on init.sock in the machine's directory for the
+ * core that takes the machine back (adopt()). Every engine-owned
+ * allocation is the machine handle's, freed by destroy().
  */
 
 #define _GNU_SOURCE
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -56,6 +66,16 @@
 #define MAX_ARGS    256u
 #define MAX_ENV     256u
 #define MAX_VOLUMES 64u
+#define HELD_LIMIT  (256u * 1024u)  /* output an init holds for no core */
+
+/* A frame from the init: data on fd 1 or 2, or the workload's end, whose
+ * wait status is the four bytes after. */
+typedef struct frame {
+	uint8_t  kind;    /* 'd' data, 'x' the end */
+	uint8_t  fd;
+	uint8_t  unused[2];
+	uint32_t length;
+} frame;
 
 struct hull_machine {
 	hull_core       *core;       /* what create() was given, for the callbacks */
@@ -75,10 +95,14 @@ struct hull_machine {
 	unsigned         env_count;  /* envp's, while secrets are added to it */
 
 	pid_t            pid;        /* the machine's init */
-	int              out;        /* the workload's stdout and stderr, read ends */
-	int              err;
-	int              status;     /* the read end of the init's status pipe */
-	int              status_seen;
+	int              conn;       /* the init's frames, or -1 */
+	int              keep;       /* (on_disconnect keep) */
+	int              adopted;    /* taken back: the init is not this process's child */
+	int              pidfd;      /* the init's, when adopted, else -1 */
+	char             dir[4096];  /* the machine's directory, for init.sock, or "" */
+	uint8_t         *plan;       /* the plan, for persist() */
+	size_t           plan_length;
+	char            *persisted;  /* what persist() last gave */
 	pthread_t        reader;
 	int              started;
 	pthread_mutex_t  lock;
@@ -99,6 +123,12 @@ static void release(hull_machine *m)
 	free(m->workdir);
 	free(m->hostname);
 	free(m->secrets);
+	free(m->plan);
+	free(m->persisted);
+	if (m->pidfd >= 0)
+		close(m->pidfd);
+	if (m->conn >= 0)
+		close(m->conn);
 	for (unsigned i = 0u; m->argv[i] != NULL; i++)
 		free(m->argv[i]);
 	for (unsigned i = 0u; m->envp[i] != NULL; i++)
@@ -228,6 +258,10 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	 * directory itself, read-only, either way. */
 	source     = hull_access_value(doc, &machine, "mutable");
 	m->overlay = source != NULL && strcmp(source, "overlay") == 0 && !m->readonly_root;
+	free(source);
+
+	source  = hull_access_value(doc, &machine, "on_disconnect");
+	m->keep = source != NULL && strcmp(source, "keep") == 0;
 	free(source);
 
 	/* The secrets the core wrote (J.3), and those to be in the env. */
@@ -378,8 +412,162 @@ static void hold(int signal)
  * interrupted one: one that lands just before a wait blocks is forwarded
  * at the next wakeup, and stop's SIGKILL is the backstop either way.
  */
-static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int out, int err, int report,
-                     int status_pipe)
+/* The init's relaying, past the workload's start. Static, since the init
+ * is forked from a threaded process and must not allocate. */
+static volatile sig_atomic_t child_ended;
+static uint8_t               relay_held[HELD_LIMIT];
+static size_t                relay_length;
+
+static void note_child(int signal)
+{
+	(void)signal;
+	child_ended = 1;
+}
+
+/* All of `n` bytes to `fd`, through EINTR, forwarding a pending signal
+ * meanwhile. 0, or -1 once the core has gone. */
+static int relay_write(int fd, const void *bytes, size_t n, pid_t workload)
+{
+	const uint8_t *at = bytes;
+
+	while (n > 0u) {
+		ssize_t wrote = write(fd, at, n);
+
+		if (pending != 0) {
+			kill(workload, (int)pending);
+			pending = 0;
+		}
+		if (wrote < 0 && errno == EINTR)
+			continue;
+		if (wrote <= 0)
+			return -1;
+		at += wrote;
+		n -= (size_t)wrote;
+	}
+	return 0;
+}
+
+static int send_frame(int fd, int kind, int which, const void *bytes, size_t n, pid_t workload)
+{
+	frame f = { (uint8_t)kind, (uint8_t)which, { 0u, 0u }, (uint32_t)n };
+
+	return relay_write(fd, &f, sizeof f, workload) != 0 ||
+	       relay_write(fd, bytes, n, workload) != 0 ? -1 : 0;
+}
+
+/* Held for a core to come: whole frames, the oldest dropped first. */
+static void relay_hold(int which, const uint8_t *bytes, size_t n)
+{
+	frame  f = { 'd', (uint8_t)which, { 0u, 0u }, (uint32_t)n };
+	size_t record = sizeof f + n;
+	size_t at = 0u;
+
+	if (record > HELD_LIMIT)
+		return;
+	while (relay_length - at + record > HELD_LIMIT) {
+		frame old;
+
+		memcpy(&old, relay_held + at, sizeof old);
+		at += sizeof old + old.length;
+	}
+	memmove(relay_held, relay_held + at, relay_length - at);
+	relay_length -= at;
+	memcpy(relay_held + relay_length, &f, sizeof f);
+	memcpy(relay_held + relay_length + sizeof f, bytes, n);
+	relay_length += record;
+}
+
+/*
+ * The init once the workload runs: the workload's pipes read into frames
+ * to the core, until the workload is reaped and its pipes have nothing
+ * more to give; then its end, and the init leaves, which ends the
+ * namespace. With no core, as under keep after the core has gone, what
+ * the pipes carry is held, and the end waits for a core: the listener's
+ * next connection is the core taking the machine back, and is given what
+ * was held first.
+ */
+static void relay(int conn, int listener, int out, int err, pid_t workload)
+{
+	uint8_t buffer[16384];
+	int     status = 0;
+	int     ended = 0;
+
+	for (;;) {
+		struct pollfd fds[4] = { { out, POLLIN, 0 }, { err, POLLIN, 0 },
+		                         { conn, POLLIN, 0 }, { conn < 0 ? listener : -1, POLLIN, 0 } };
+		int           which;
+		pid_t         reaped;
+		int           s;
+
+		if (pending != 0) {
+			kill(workload, (int)pending);
+			pending = 0;
+		}
+		child_ended = 0;
+		while ((reaped = waitpid(-1, &s, WNOHANG)) > 0)
+			if (reaped == workload) {
+				status = s;
+				ended = 1;
+			}
+		/* Ended, and its pipes drained or held open only by an orphan,
+		 * which the namespace's end takes: the end is said. */
+		if (ended) {
+			int idle = poll(fds, 2u, 0) == 0 || (out < 0 && err < 0);
+
+			if (idle && conn >= 0 &&
+			    send_frame(conn, 'x', 0, &status, sizeof status, workload) == 0)
+				_exit(0);
+			if (idle && listener < 0)
+				_exit(0);
+		}
+		if (poll(fds, 4u, ended ? 200 : -1) < 0) {
+			if (errno == EINTR)
+				continue;
+			_exit(126);
+		}
+		for (which = 1; which <= 2; which++) {
+			struct pollfd *f = &fds[which - 1];
+			int           *fd = which == 1 ? &out : &err;
+			ssize_t        n;
+
+			if (*fd < 0 || f->revents == 0)
+				continue;
+			n = read(*fd, buffer, sizeof buffer);
+			if (n < 0 && errno == EINTR)
+				continue;
+			if (n <= 0) {
+				close(*fd);
+				*fd = -1;
+				continue;
+			}
+			if (conn >= 0 && send_frame(conn, 'd', which, buffer, (size_t)n, workload) != 0) {
+				close(conn);
+				conn = -1;
+			}
+			if (conn < 0 && listener >= 0)
+				relay_hold(which, buffer, (size_t)n);
+		}
+		/* The core says nothing on this socket: readable is its end. */
+		if (conn >= 0 && fds[2].revents != 0 && read(conn, buffer, sizeof buffer) <= 0) {
+			close(conn);
+			conn = -1;
+		}
+		if (conn < 0 && listener >= 0 && fds[3].revents != 0) {
+			conn = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+			if (conn >= 0 && relay_write(conn, relay_held, relay_length, workload) != 0) {
+				close(conn);
+				conn = -1;
+			} else if (conn >= 0) {
+				relay_length = 0u;
+			}
+		}
+		if (conn < 0 && listener < 0 && out < 0 && err < 0 && !ended)
+			continue;  /* the core went and nothing is kept: the death signal comes */
+	}
+}
+
+static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int dir_fd,
+                     int report)
 {
 	static const int forwarded[] = { SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2 };
 	struct sigaction action;
@@ -388,22 +576,39 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int out, int e
 	char             step[320];
 	int              volumes[MAX_VOLUMES];
 	int              secrets = -1;
-	int              null = open("/dev/null", O_RDONLY | O_CLOEXEC);
-	int              status = 0;
+	int              null = open("/dev/null", O_RDWR | O_CLOEXEC);
+	int              out[2];
+	int              err[2];
+	int              listener = -1;
 	pid_t            workload;
 
-	if (null < 0 || dup2(null, 0) < 0 || dup2(out, 1) < 0 || dup2(err, 2) < 0)
+	/* The init's own stdio is nothing; the workload's are pipes of its. */
+	if (null < 0 || dup2(null, 0) < 0 || dup2(null, 1) < 0 || dup2(null, 2) < 0)
 		child_fail(report, "stdio");
 	{
-		int keep[2] = { report, status_pipe };
+		int keep[3] = { report, conn, dir_fd };
 
-		close_others(keep, 2u);
+		close_others(keep, dir_fd >= 0 ? 3u : 2u);
 	}
-	/* The machine dies with the process that runs its engine, the core:
-	 * nothing could manage it after, since adopt() is not written, and
-	 * nothing is to outlive what started it. */
-	if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0L, 0L, 0L) != 0)
+	if (pipe2(out, O_CLOEXEC) != 0 || pipe2(err, O_CLOEXEC) != 0)
+		child_fail(report, "the workload's pipes");
+	/* The machine dies with the process that runs its engine, the core,
+	 * unless kept: then it listens, on init.sock in its directory, for
+	 * the core that takes it back. The init binds it, so that the peer a
+	 * connection names is the init. The directory is the user's, 0700,
+	 * so no one else can connect. */
+	if (!m->keep && prctl(PR_SET_PDEATHSIG, SIGKILL, 0L, 0L, 0L) != 0)
 		child_fail(report, "the parent-death signal");
+	if (m->keep) {
+		struct sockaddr_un at = { .sun_family = AF_UNIX };
+
+		snprintf(at.sun_path, sizeof at.sun_path, "/proc/self/fd/%d/init.sock", dir_fd);
+		listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+		if (listener < 0 || bind(listener, (struct sockaddr *)&at, sizeof at) != 0 ||
+		    listen(listener, 1) != 0)
+			child_fail(report, "init.sock");
+		close(dir_fd);
+	}
 	/* A session of its own, so a terminal's Ctrl-C reaches hull and not the
 	 * machine behind its back: only stop() signals a machine. */
 	if (setsid() < 0)
@@ -484,6 +689,10 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int out, int e
 	action.sa_handler = hold;
 	for (unsigned i = 0u; i < sizeof forwarded / sizeof forwarded[0]; i++)
 		sigaction(forwarded[i], &action, NULL);
+	action.sa_handler = note_child;
+	sigaction(SIGCHLD, &action, NULL);
+	action.sa_handler = SIG_IGN;
+	sigaction(SIGPIPE, &action, NULL);
 	workload = fork();
 	if (workload < 0)
 		child_fail(report, "fork");
@@ -491,92 +700,191 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int out, int e
 		action.sa_handler = SIG_DFL;
 		for (unsigned i = 0u; i < sizeof forwarded / sizeof forwarded[0]; i++)
 			sigaction(forwarded[i], &action, NULL);
-		if (setsid() < 0)
-			child_fail(report, "setsid");
+		sigaction(SIGCHLD, &action, NULL);
+		sigaction(SIGPIPE, &action, NULL);
+		if (setsid() < 0 || dup2(out[1], 1) < 0 || dup2(err[1], 2) < 0)
+			child_fail(report, "the workload's stdio");
 		execve(m->argv[0], (char *const *)m->argv, (char *const *)m->envp);
 		child_fail(report, m->argv[0]);
 	}
 	/* The engine reads `report` to its end: this copy, and the workload's
 	 * once it execs. */
 	close(report);
-	for (;;) {
-		int   s;
-		pid_t reaped;
-
-		if (pending != 0) {
-			kill(workload, (int)pending);
-			pending = 0;
-		}
-		reaped = waitpid(-1, &s, 0);
-		if (reaped < 0 && errno == EINTR)
-			continue;
-		if (reaped < 0)
-			break;
-		if (reaped == workload) {
-			status = s;
-			break;
-		}
-	}
-	if (write(status_pipe, &status, sizeof status) != (ssize_t)sizeof status)
-		_exit(126);
-	_exit(0);
+	close(out[1]);
+	close(err[1]);
+	relay(conn, listener, out[0], err[0], workload);
 }
 
 /* --- the reader ---------------------------------------------------------- */
 
+static int read_full(int fd, void *bytes, size_t n)
+{
+	uint8_t *at = bytes;
+
+	while (n > 0u) {
+		ssize_t got = read(fd, at, n);
+
+		if (got < 0 && errno == EINTR)
+			continue;
+		if (got <= 0)
+			return -1;
+		at += got;
+		n -= (size_t)got;
+	}
+	return 0;
+}
+
 static void *read_workload(void *arg)
 {
-	hull_machine *m = arg;
-	struct pollfd fds[2] = { { m->out, POLLIN, 0 }, { m->err, POLLIN, 0 } };
-	uint8_t       buffer[4096];
-	int           open_count = 2;
-	int           status;
+	static uint8_t buffer[65536];
+	hull_machine  *m = arg;
+	frame          f;
+	int            status = 0;
+	int            said = 0;
 
-	while (open_count > 0) {
-		if (poll(fds, 2, -1) < 0) {
-			if (errno == EINTR)
-				continue;
+	/* The init's frames, to the end it says or to the socket's end. */
+	while (read_full(m->conn, &f, sizeof f) == 0) {
+		uint32_t left = f.length;
+
+		if (f.kind == 'x' && f.length == sizeof status &&
+		    read_full(m->conn, &status, sizeof status) == 0) {
+			said = 1;
 			break;
 		}
-		for (int i = 0; i < 2; i++) {
-			ssize_t n;
+		while (left > 0u) {
+			size_t n = left < sizeof buffer ? left : sizeof buffer;
 
-			if (fds[i].fd < 0 || fds[i].revents == 0)
-				continue;
-			n = read(fds[i].fd, buffer, sizeof buffer);
-			if (n > 0) {
-				host->on_data(m->core, NULL, i + 1, buffer, (size_t)n);
-			} else if (n == 0 || errno != EINTR) {
-				close(fds[i].fd);
-				fds[i].fd = -1;
-				open_count--;
-			}
+			if (read_full(m->conn, buffer, n) != 0)
+				break;
+			if (f.kind == 'd')
+				host->on_data(m->core, NULL, f.fd == 2 ? 2 : 1, buffer, n);
+			left -= (uint32_t)n;
 		}
+		if (left > 0u)
+			break;
 	}
 	/* Waited for without reaping, then reaped and marked done under the
 	 * lock, so that stop() signals the init's pid only while it is the
-	 * init's or its zombie's. */
-	{
+	 * init's or its zombie's. An adopted init is init's to reap; its end
+	 * is its pidfd's. */
+	if (m->adopted) {
+		struct pollfd fd = { m->pidfd, POLLIN, 0 };
+
+		while (poll(&fd, 1u, -1) < 0 && errno == EINTR)
+			;
+		pthread_mutex_lock(&m->lock);
+	} else {
 		siginfo_t info;
+		int       own;
 
 		while (waitid(P_PID, (id_t)m->pid, &info, WEXITED | WNOWAIT) < 0 && errno == EINTR)
 			;
+		pthread_mutex_lock(&m->lock);
+		waitpid(m->pid, &own, 0);
+		/* The init's own, as when stop killed it, if it said nothing. */
+		if (!said)
+			status = own;
 	}
-	pthread_mutex_lock(&m->lock);
-	waitpid(m->pid, &status, 0);
 	m->done = 1;
 	pthread_cond_broadcast(&m->done_cond);
 	pthread_mutex_unlock(&m->lock);
-	/* The workload's status, as its init reported it; if the init could
-	 * not, as when stop killed it, the init's own. */
-	if (read(m->status, &m->status_seen, sizeof m->status_seen) == (ssize_t)sizeof m->status_seen)
-		status = m->status_seen;
-	close(m->status);
+	if (!said && m->adopted)
+		status = SIGKILL;  /* a wait status: killed by it */
 	if (WIFSIGNALED(status))
 		host->on_exit(m->core, m, NULL, -1, WTERMSIG(status));
 	else
 		host->on_exit(m->core, m, NULL, WEXITSTATUS(status), 0);
 	host->on_state(m->core, m, "stopped");
+	return NULL;
+}
+
+/* --- the machine's directory ------------------------------------------------ */
+
+/*
+ * hull/chroot-PID-N under the runtime directory, PID the core's: where a
+ * kept machine's init.sock is. A core killed outright leaves those of
+ * machines not kept; one core runs per user, holding core.lock, so one
+ * named for a pid that is not running was a dead core's, and it is
+ * removed, init.sock by name, unless a machine taken back uses it.
+ */
+static pthread_mutex_t adopted_lock = PTHREAD_MUTEX_INITIALIZER;
+static char            adopted_dirs[16][4096];
+
+static void mark_adopted(const char *dir, int on)
+{
+	pthread_mutex_lock(&adopted_lock);
+	for (unsigned i = 0u; i < 16u; i++) {
+		if (on && adopted_dirs[i][0] == '\0') {
+			snprintf(adopted_dirs[i], sizeof adopted_dirs[i], "%s", dir);
+			break;
+		}
+		if (!on && strcmp(adopted_dirs[i], dir) == 0)
+			adopted_dirs[i][0] = '\0';
+	}
+	pthread_mutex_unlock(&adopted_lock);
+}
+
+static int is_adopted(const char *dir)
+{
+	int found = 0;
+
+	pthread_mutex_lock(&adopted_lock);
+	for (unsigned i = 0u; i < 16u && !found; i++)
+		found = strcmp(adopted_dirs[i], dir) == 0;
+	pthread_mutex_unlock(&adopted_lock);
+	return found;
+}
+
+static void remove_dir(const char *dir)
+{
+	char path[4200];
+
+	snprintf(path, sizeof path, "%s/init.sock", dir);
+	unlink(path);
+	rmdir(dir);
+}
+
+static void sweep(const char *parent)
+{
+	DIR           *list = opendir(parent);
+	struct dirent *item;
+
+	while (list != NULL && (item = readdir(list)) != NULL) {
+		char  path[4200];
+		long  pid;
+		char *end;
+
+		if (strncmp(item->d_name, "chroot-", 7u) != 0)
+			continue;
+		pid = strtol(item->d_name + 7, &end, 10);
+		if (end == item->d_name + 7 || *end != '-' || pid <= 0 || pid == (long)getpid() ||
+		    kill((pid_t)pid, 0) == 0 || errno != ESRCH)
+			continue;
+		snprintf(path, sizeof path, "%s/%s", parent, item->d_name);
+		if (!is_adopted(path))
+			remove_dir(path);
+	}
+	if (list != NULL)
+		closedir(list);
+}
+
+static const char *make_dir(hull_machine *m)
+{
+	static unsigned counter;
+	const char     *runtime = getenv("XDG_RUNTIME_DIR");
+	char            parent[3900];
+
+	if (runtime == NULL || runtime[0] != '/')
+		return "XDG_RUNTIME_DIR is not set";
+	snprintf(parent, sizeof parent, "%s/hull", runtime);
+	mkdir(parent, 0700);
+	sweep(parent);
+	snprintf(m->dir, sizeof m->dir, "%s/chroot-%ld-%u", parent, (long)getpid(),
+	         __atomic_add_fetch(&counter, 1u, __ATOMIC_RELAXED));
+	if (mkdir(m->dir, 0700) != 0) {
+		m->dir[0] = '\0';
+		return "the machine's directory cannot be made";
+	}
 	return NULL;
 }
 
@@ -595,10 +903,19 @@ static hull_status chroot_create(hull_core *core, hull_buf plan, hull_machine **
 	m = calloc(1u, sizeof *m);
 	if (m == NULL)
 		return fail(error, HULL_ERR_INTERNAL, "out of memory");
-	m->core = core;
+	m->core  = core;
+	m->conn  = -1;
+	m->pidfd = -1;
 	pthread_mutex_init(&m->lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
 	reason = read_plan(m, &doc);
+	if (reason == NULL && m->keep) {
+		m->plan_length = plan.len;
+		if ((m->plan = malloc(plan.len)) == NULL)
+			reason = "out of memory";
+		else
+			memcpy(m->plan, plan.data, plan.len);
+	}
 	if (reason != NULL) {
 		release(m);
 		return fail(error, HULL_ERR_UNSUPPORTED, reason);
@@ -610,19 +927,32 @@ static hull_status chroot_create(hull_core *core, hull_buf plan, hull_machine **
 
 static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *error)
 {
-	int     out[2];
-	int     err[2];
-	int     report[2];
-	int     status[2];
-	uid_t   uid = getuid();
-	gid_t   gid = getgid();
-	ssize_t n;
+	int         pair[2];
+	int         report[2];
+	int         dir_fd = -1;
+	uid_t       uid = getuid();
+	gid_t       gid = getgid();
+	ssize_t     n;
+	const char *reason;
 
 	if (m->started)
 		return fail(error, HULL_ERR_BUSY, "the machine has been started already");
-	if (pipe2(out, O_CLOEXEC) != 0 || pipe2(err, O_CLOEXEC) != 0 ||
-	    pipe2(report, O_CLOEXEC) != 0 || pipe2(status, O_CLOEXEC) != 0)
+	/* A kept machine's directory, for its init.sock. */
+	if (m->keep && ((reason = make_dir(m)) != NULL ||
+	                (dir_fd = open(m->dir, O_PATH | O_DIRECTORY | O_CLOEXEC)) < 0)) {
+		snprintf(m->detail, sizeof m->detail, "%s",
+		         reason != NULL ? reason : "the machine's directory cannot be opened");
+		if (m->dir[0] != '\0')
+			remove_dir(m->dir);
+		m->dir[0] = '\0';
+		return fail(error, HULL_ERR_RUNTIME, m->detail);
+	}
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0 ||
+	    pipe2(report, O_CLOEXEC) != 0) {
+		if (dir_fd >= 0)
+			close(dir_fd);
 		return fail(error, HULL_ERR_RUNTIME, "pipe");
+	}
 	/* clone with no stack is fork into new namespaces: the child is PID 1
 	 * of its own. The ids are read first, since in the child's new user
 	 * namespace they are unmapped until it maps them. */
@@ -632,14 +962,14 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 		return fail(error, HULL_ERR_RUNTIME, "clone");
 	if (m->pid == 0) {
 		close(report[0]);
-		close(status[0]);
-		run_init(m, uid, gid, out[1], err[1], report[1], status[1]);
+		close(pair[0]);
+		run_init(m, uid, gid, pair[1], dir_fd, report[1]);
 	}
-	close(out[1]);
-	close(err[1]);
+	close(pair[1]);
 	close(report[1]);
-	close(status[1]);
-	m->status = status[0];
+	if (dir_fd >= 0)
+		close(dir_fd);
+	m->conn = pair[0];
 
 	/* The report pipe closes on exec; anything written on it is why the
 	 * child could not get that far. */
@@ -648,18 +978,17 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	if (n > 0) {
 		m->detail[n] = '\0';
 		waitpid(m->pid, NULL, 0);
-		close(out[0]);
-		close(err[0]);
-		close(m->status);
+		close(m->conn);
+		m->conn = -1;
 		m->done = 1;
+		if (m->dir[0] != '\0')
+			remove_dir(m->dir);
+		m->dir[0] = '\0';
 		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	}
-	m->out = out[0];
-	m->err = err[0];
 	if (pthread_create(&m->reader, NULL, read_workload, m) != 0) {
 		kill(m->pid, SIGKILL);
 		waitpid(m->pid, NULL, 0);
-		close(m->status);
 		m->done = 1;
 		return fail(error, HULL_ERR_INTERNAL, "the reader thread could not start");
 	}
@@ -693,7 +1022,9 @@ static int wait_done(hull_machine *m, int timeout_ms)
 static void signal_init(hull_machine *m, int signal)
 {
 	pthread_mutex_lock(&m->lock);
-	if (!m->done)
+	if (!m->done && m->adopted)
+		syscall(SYS_pidfd_send_signal, m->pidfd, signal, NULL, 0u);
+	else if (!m->done)
 		kill(m->pid, signal);
 	pthread_mutex_unlock(&m->lock);
 }
@@ -721,7 +1052,112 @@ static hull_status chroot_destroy(hull_core *core, hull_machine *m, hull_error *
 		chroot_stop(core, m, 0, error);
 		pthread_join(m->reader, NULL);
 	}
+	if (m->dir[0] != '\0') {
+		mark_adopted(m->dir, 0);
+		remove_dir(m->dir);
+	}
 	release(m);
+	return HULL_OK;
+}
+
+/* --- adoption ------------------------------------------------------------ */
+
+/*
+ * A kept machine is taken back from what persist() gave: the init's pid,
+ * the machine's directory, and the plan, which gives the exec helper the
+ * machine's env, workdir and no_new_privs again. The init is checked by
+ * the pid its own socket names, connected to through the directory, the
+ * pid then stood for by a pidfd; it gives what it held, then the frames
+ * go on as before.
+ */
+static hull_status chroot_persist(hull_core *core, hull_machine *m, hull_buf *out,
+                                  hull_error *error)
+{
+	char   head[4200];
+	int    n;
+
+	(void)core;
+	n = snprintf(head, sizeof head, "pid %ld\ndir %s\nplan\n", (long)m->pid, m->dir);
+	if (m->plan == NULL || n < 0 || (size_t)n >= sizeof head)
+		return fail(error, HULL_ERR_INTERNAL, "the state does not fit");
+	free(m->persisted);
+	m->persisted = malloc((size_t)n + m->plan_length);
+	if (m->persisted == NULL)
+		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+	memcpy(m->persisted, head, (size_t)n);
+	memcpy(m->persisted + n, m->plan, m->plan_length);
+	out->data = (const uint8_t *)m->persisted;
+	out->len  = (size_t)n + m->plan_length;
+	return HULL_OK;
+}
+
+static hull_status chroot_adopt(hull_core *core, hull_buf state, hull_machine **out,
+                                hull_error *error)
+{
+	static char        detail[300];
+	const char        *text = (const char *)state.data;
+	const char        *plan_at;
+	hull_sexpr_doc     doc;
+	hull_machine      *m;
+	struct ucred       peer;
+	socklen_t          length = sizeof peer;
+	struct sockaddr_un at = { .sun_family = AF_UNIX };
+	long               pid = 0;
+	int                dir_fd;
+	const char        *reason = NULL;
+	char               dir[4096];
+
+	plan_at = state.len > 0u ? memmem(text, state.len, "\nplan\n", 6u) : NULL;
+	if (plan_at == NULL || sscanf(text, "pid %ld\ndir %4095[^\n]\n", &pid, dir) != 2 ||
+	    pid <= 1 || dir[0] != '/')
+		return fail(error, HULL_ERR_UNSUPPORTED, "the state is not this engine's");
+	plan_at += 6;
+	m = calloc(1u, sizeof *m);
+	if (m == NULL)
+		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+	m->core  = core;
+	m->conn  = -1;
+	m->pid   = (pid_t)pid;
+	m->keep  = 1;
+	pthread_mutex_init(&m->lock, NULL);
+	pthread_cond_init(&m->done_cond, NULL);
+	m->plan_length = state.len - (size_t)(plan_at - text);
+	m->plan = malloc(m->plan_length);
+	if (m->plan == NULL ||
+	    hull_sexpr_open(&doc, memcpy(m->plan, plan_at, m->plan_length), m->plan_length,
+	                    HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
+	    (reason = read_plan(m, &doc)) != NULL) {
+		release(m);
+		return fail(error, HULL_ERR_UNSUPPORTED, reason != NULL ? reason : "the plan is not one");
+	}
+	/* The pidfd first, then the socket's peer checked against it. */
+	m->pidfd = (int)syscall(SYS_pidfd_open, m->pid, 0u);
+	dir_fd = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+	snprintf(at.sun_path, sizeof at.sun_path, "/proc/self/fd/%d/init.sock", dir_fd);
+	m->conn = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (m->pidfd < 0 || dir_fd < 0 || m->conn < 0 ||
+	    connect(m->conn, (struct sockaddr *)&at, sizeof at) != 0 ||
+	    getsockopt(m->conn, SOL_SOCKET, SO_PEERCRED, &peer, &length) != 0 ||
+	    (long)peer.pid != pid) {
+		snprintf(detail, sizeof detail, "its init is gone");
+		if (dir_fd >= 0)
+			close(dir_fd);
+		release(m);
+		return fail(error, HULL_ERR_GONE, detail);
+	}
+	close(dir_fd);
+	snprintf(m->dir, sizeof m->dir, "%s", dir);
+	m->adopted = 1;
+	mark_adopted(m->dir, 1);
+	if (pthread_create(&m->reader, NULL, read_workload, m) != 0) {
+		mark_adopted(m->dir, 0);
+		m->dir[0] = '\0';
+		release(m);
+		return fail(error, HULL_ERR_RUNTIME, "the reader thread could not start");
+	}
+	m->started = 1;
+	*out = m;
+	host->on_state(core, m, "running");
 	return HULL_OK;
 }
 
@@ -1240,7 +1676,8 @@ static const hull_cap_entry entries[] = {
 	{ "security.no_new_privs",  HULL_SUP_NATIVE,   NULL, NULL },
 	{ "on_disconnect.stop",     HULL_SUP_NATIVE,   NULL, NULL },
 	{ "on_disconnect.keep",     HULL_SUP_NATIVE,
-	  "kept while the core runs; the machine dies with the core", NULL },
+	  "kept, and taken back by a core that comes after one that went; its init holds "
+	  "the workload's last 256 KiB meanwhile", NULL },
 	{ "ports",                  HULL_SUP_REJECTED,
 	  "chroot shares the host's network, so a port is the host's own", NULL },
 	{ NULL,                     HULL_SUP_NATIVE,   NULL, NULL },
@@ -1263,6 +1700,8 @@ static const hull_engine_ops ops = {
 	.start       = chroot_start,
 	.stop        = chroot_stop,
 	.destroy     = chroot_destroy,
+	.adopt        = chroot_adopt,
+	.persist      = chroot_persist,
 	.exec         = chroot_exec,
 	.stream_write = chroot_stream_write,
 	.stream_eof   = chroot_stream_eof,

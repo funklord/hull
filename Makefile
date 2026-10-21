@@ -135,7 +135,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  rootfs/srv/kept rootfs/mapped/kept \
                  rootfs/mapped/d/f opaque.conf gone.conf clash.conf execd.conf attach.out \
                  killd.conf killd.out flowd.conf held.out spewd.conf behind.out lost.err told.out \
-                 data/in data/out rootfs/mnt-link nosecret.conf pw.txt big.bin secret/probe \
+                 data/in data/out rootfs/mnt-link lone.conf adopt.conf kbrief.conf cended.conf nosecret.conf pw.txt big.bin secret/probe \
                  shown.conf failing.conf nofile.conf big.conf sealed.conf norun.conf) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
