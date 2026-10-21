@@ -151,7 +151,8 @@ static int is_ref(const char *ref)
 {
 	const char *start = ref;
 
-	if (ref[0] == '\0' || strlen(ref) > 255u)
+	/* A manifest is named sha256:HEX where a ref is, so no ref is. */
+	if (ref[0] == '\0' || strlen(ref) > 255u || strncmp(ref, "sha256:", 7u) == 0)
 		return 0;
 	for (const char *p = ref;; p++) {
 		if (*p == '/' || *p == '\0') {
@@ -671,6 +672,20 @@ static int ref_manifest(hull_store *store, const char *ref, char hex[65], char *
 	return 0;
 }
 
+/* What names a manifest: a ref, or sha256:HEX for the manifest itself. */
+static int name_manifest(hull_store *store, const char *name, char hex[65], char *why,
+                         size_t cap)
+{
+	const char *given = name + 7;
+
+	if (strncmp(name, "sha256:", 7u) != 0)
+		return ref_manifest(store, name, hex, why, cap);
+	if (strlen(given) != 64u || strspn(given, "0123456789abcdef") != 64u)
+		return say(why, cap, name, "a manifest is sha256: and 64 lowercase hex digits");
+	memcpy(hex, given, 65u);
+	return 0;
+}
+
 /* `(key ...)` in a record: the list. */
 static int find(const hull_sexpr_doc *doc, const hull_sexpr_form *record, const char *key,
                 hull_sexpr_form *found)
@@ -823,7 +838,7 @@ int hull_store_materialize(hull_store *store, const char *ref, const char *dir,
 	int             result = -1;
 
 	*skipped = 0u;
-	if (ref_manifest(store, ref, hex, why, cap) != 0 ||
+	if (name_manifest(store, ref, hex, why, cap) != 0 ||
 	    (data = read_manifest(store, hex, &length, why, cap)) == NULL)
 		return -1;
 	if (!open_entries(&doc, data, length, &entries)) {
@@ -980,6 +995,257 @@ done:
 	free(dir_modes);
 	close(root);
 	free(data);
+	return result;
+}
+
+/* --- diffing -------------------------------------------------------------- */
+
+/* One side of a diff: its manifest, opened, and where its walk is. */
+typedef struct side {
+	uint8_t        *data;
+	hull_sexpr_doc  doc;
+	hull_sexpr_form top;
+	hull_sexpr_form entry;
+	int             more;
+	const uint8_t  *path;          /* the entry's */
+	size_t          path_length;
+	const uint8_t  *last;          /* the entry's before it, or NULL */
+	size_t          last_length;
+} side;
+
+static int open_side(hull_store *store, const char *name, side *s, char *why, size_t cap)
+{
+	char            hex[65];
+	size_t          length;
+	hull_sexpr_form entries;
+
+	memset(s, 0, sizeof *s);
+	if (name_manifest(store, name, hex, why, cap) != 0 ||
+	    (s->data = read_manifest(store, hex, &length, why, cap)) == NULL)
+		return -1;
+	if (!open_entries(&s->doc, s->data, length, &entries) || !hull_sexpr_first(&s->doc, &s->top)) {
+		free(s->data);
+		s->data = NULL;
+		return say(why, cap, name, "its manifest is not one");
+	}
+	s->more = hull_sexpr_child(&s->doc, &entries, &s->entry) &&
+	          hull_sexpr_next(&s->doc, &s->entry, &s->entry);
+	return 0;
+}
+
+/* The side's next entry's path, or 0 at its end; -1 for an entry with
+ * none, or one out of order, which no manifest of ours holds. */
+static int side_path(side *s)
+{
+	hull_sexpr_form value;
+
+	if (!s->more)
+		return 0;
+	if (!field(&s->doc, &s->entry, "path", &value) || value.kind != HULL_SEXPR_ATOM)
+		return -1;
+	s->path = s->doc.data + value.content;
+	s->path_length = value.content_length;
+	if (s->last != NULL) {
+		size_t n = s->last_length < s->path_length ? s->last_length : s->path_length;
+		int    order = memcmp(s->last, s->path, n);
+
+		if (order > 0 || (order == 0 && s->last_length >= s->path_length))
+			return -1;
+	}
+	return 1;
+}
+
+static void side_next(side *s)
+{
+	s->last = s->path;
+	s->last_length = s->path_length;
+	s->more = hull_sexpr_next(&s->doc, &s->entry, &s->entry);
+}
+
+/* `key`'s whole form in each record, the same bytes or both absent. */
+static int same_field(const hull_sexpr_doc *a, const hull_sexpr_form *ra, const hull_sexpr_doc *b,
+                      const hull_sexpr_form *rb, const char *key)
+{
+	hull_sexpr_form fa;
+	hull_sexpr_form fb;
+	int             in_a = find(a, ra, key, &fa);
+	int             in_b = find(b, rb, key, &fb);
+
+	if (in_a != in_b)
+		return 0;
+	return !in_a || (fa.extent == fb.extent &&
+	                 memcmp(a->data + fa.offset, b->data + fb.offset, fa.extent) == 0);
+}
+
+/* A field's value as text: an atom's bytes, or for an owner given by ids,
+ * uid:gid. */
+static void field_text(const hull_sexpr_doc *doc, const hull_sexpr_form *record, const char *key,
+                       char *out, size_t cap)
+{
+	hull_sexpr_form value;
+
+	snprintf(out, cap, "none");
+	if (!field(doc, record, key, &value))
+		return;
+	if (value.kind == HULL_SEXPR_ATOM) {
+		snprintf(out, cap, "%.*s", (int)value.content_length, doc->data + value.content);
+	} else if (strcmp(key, "owner") == 0) {
+		hull_sexpr_form owner;
+		hull_sexpr_form id;
+
+		if (find(doc, record, "owner", &owner)) {
+			unsigned long long uid = 0u;
+			unsigned long long gid = 0u;
+
+			if (field(doc, &owner, "uid", &id))
+				uid = number(doc, &id);
+			if (field(doc, &owner, "gid", &id))
+				gid = number(doc, &id);
+			snprintf(out, cap, "%llu:%llu", uid, gid);
+		}
+	}
+}
+
+/* What differs between two entries of one path, said as `kind reg -> dir,
+ * mode 0644 -> 0755, content`. A kind that changed is said alone with the
+ * mode and owner, since its other fields belong to the kinds. */
+static void entry_changes(const side *a, const side *b, char *out, size_t cap)
+{
+	char   from[300];
+	char   to[300];
+	size_t at = 0u;
+	int    kind = !same_field(&a->doc, &a->entry, &b->doc, &b->entry, "kind");
+
+	out[0] = '\0';
+#define SAY(...) do { \
+		int n_ = snprintf(out + at, cap - at, "%s", at > 0u ? ", " : ""); \
+		if (n_ > 0 && (size_t)n_ < cap - at) at += (size_t)n_; \
+		n_ = snprintf(out + at, cap - at, __VA_ARGS__); \
+		if (n_ > 0 && (size_t)n_ < cap - at) at += (size_t)n_; \
+	} while (0)
+	if (kind) {
+		field_text(&a->doc, &a->entry, "kind", from, sizeof from);
+		field_text(&b->doc, &b->entry, "kind", to, sizeof to);
+		SAY("kind %s -> %s", from, to);
+	}
+	if (!same_field(&a->doc, &a->entry, &b->doc, &b->entry, "mode")) {
+		hull_sexpr_form value;
+		unsigned long long old_mode = 0u;
+		unsigned long long new_mode = 0u;
+
+		if (field(&a->doc, &a->entry, "mode", &value))
+			old_mode = number(&a->doc, &value);
+		if (field(&b->doc, &b->entry, "mode", &value))
+			new_mode = number(&b->doc, &value);
+		SAY("mode %04llo -> %04llo", old_mode, new_mode);
+	}
+	if (!same_field(&a->doc, &a->entry, &b->doc, &b->entry, "owner")) {
+		field_text(&a->doc, &a->entry, "owner", from, sizeof from);
+		field_text(&b->doc, &b->entry, "owner", to, sizeof to);
+		SAY("owner %s -> %s", from, to);
+	}
+	if (!kind) {
+		if (!same_field(&a->doc, &a->entry, &b->doc, &b->entry, "object") ||
+		    !same_field(&a->doc, &a->entry, &b->doc, &b->entry, "size"))
+			SAY("content");
+		if (!same_field(&a->doc, &a->entry, &b->doc, &b->entry, "target")) {
+			field_text(&a->doc, &a->entry, "target", from, sizeof from);
+			field_text(&b->doc, &b->entry, "target", to, sizeof to);
+			SAY("target %s -> %s", from, to);
+		}
+		if (!same_field(&a->doc, &a->entry, &b->doc, &b->entry, "dev"))
+			SAY("device");
+	}
+	if (!same_field(&a->doc, &a->entry, &b->doc, &b->entry, "xattrs"))
+		SAY("xattrs");
+	/* A field no manifest of this version writes, which differs. */
+	if (at == 0u)
+		SAY("other");
+#undef SAY
+}
+
+int hull_store_diff(hull_store *store, const char *from, const char *to,
+                    void (*each)(void *context, char change, const char *path, const char *what),
+                    void *context, char *why, size_t cap)
+{
+	side  a;
+	side  b;
+	int   result = -1;
+	int   differ = 0;
+	char  path[PATH_MAX];
+	char  what[2048];
+
+	flock(store->lock, LOCK_SH);
+	if (open_side(store, from, &a, why, cap) != 0) {
+		flock(store->lock, LOCK_UN);
+		return -1;
+	}
+	if (open_side(store, to, &b, why, cap) != 0) {
+		flock(store->lock, LOCK_UN);
+		free(a.data);
+		return -1;
+	}
+	flock(store->lock, LOCK_UN);
+	if (!same_field(&a.doc, &a.top, &b.doc, &b.top, "arch")) {
+		char old_arch[64];
+		char new_arch[64];
+
+		field_text(&a.doc, &a.top, "arch", old_arch, sizeof old_arch);
+		field_text(&b.doc, &b.top, "arch", new_arch, sizeof new_arch);
+		snprintf(what, sizeof what, "arch %s -> %s", old_arch, new_arch);
+		each(context, '~', NULL, what);
+		differ = 1;
+	}
+	for (;;) {
+		int in_a = side_path(&a);
+		int in_b = side_path(&b);
+		int order;
+
+		if (in_a < 0 || in_b < 0) {
+			say(why, cap, in_a < 0 ? from : to,
+			    "its manifest has an entry with no path, or out of order");
+			goto done;
+		}
+		if (!in_a && !in_b)
+			break;
+		if (!in_a) {
+			order = 1;
+		} else if (!in_b) {
+			order = -1;
+		} else {
+			size_t n = a.path_length < b.path_length ? a.path_length : b.path_length;
+
+			order = memcmp(a.path, b.path, n);
+			if (order == 0)
+				order = a.path_length < b.path_length ? -1 : a.path_length > b.path_length;
+		}
+		if (order < 0) {
+			snprintf(path, sizeof path, "%.*s", (int)a.path_length, a.path);
+			each(context, '-', path, "");
+			differ = 1;
+			side_next(&a);
+		} else if (order > 0) {
+			snprintf(path, sizeof path, "%.*s", (int)b.path_length, b.path);
+			each(context, '+', path, "");
+			differ = 1;
+			side_next(&b);
+		} else {
+			if (a.entry.extent != b.entry.extent ||
+			    memcmp(a.doc.data + a.entry.offset, b.doc.data + b.entry.offset,
+			           a.entry.extent) != 0) {
+				snprintf(path, sizeof path, "%.*s", (int)a.path_length, a.path);
+				entry_changes(&a, &b, what, sizeof what);
+				each(context, '~', path, what);
+				differ = 1;
+			}
+			side_next(&a);
+			side_next(&b);
+		}
+	}
+	result = differ;
+done:
+	free(a.data);
+	free(b.data);
 	return result;
 }
 

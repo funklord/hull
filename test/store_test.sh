@@ -1,5 +1,5 @@
 #!/bin/sh
-# store_test.sh -- section 3's store through build/hull: commit, materialize,
+# store_test.sh -- section 3's store through build/hull: commit, materialize, diff,
 # images and the store's part of gc, against a store of the test's own, in
 # $BUILD_DIR/test/store, which it removes at its start and its end.
 #
@@ -229,6 +229,8 @@ reg = lambda path: (b"(5:entry(4:kind3:reg)(4:mode3:420)(6:object" + obj +
 if case == "link":
 	entries = (b"(5:entry(4:kind7:symlink)(4:mode3:511)(5:owner4:root)(4:path1:a)(6:target" +
 	           atom(outside.encode()) + b"))" + reg(b"a/f"))
+elif case == "unsorted":
+	entries = reg(b"b") + reg(b"a")
 else:
 	entries = reg(b"../f")
 body = (b"(8:manifest(4:arch5:amd64)(7:entries" + entries +
@@ -266,6 +268,73 @@ cases=$((cases + 1))
 got=$(listing "$root/after")
 [ "$got" = "$committed" ] || fail "a tree materialized after gc is not the tree" \
 	"$(printf '%s\n' "$committed" > "$root/want"; printf '%s\n' "$got" > "$root/got"; diff "$root/want" "$root/got")"
+
+# diff: nothing between a tree and its copy, nor between a tree and the
+# tree materialized from it, committed again; a manifest named by its hash
+# as a ref is.
+expect 0 '' "$hull" commit "$root/after" one/after
+cases=$((cases + 1))
+out=$(timeout 60 "$hull" diff one/tree:1 one/after 2>&1)
+got=$?
+[ "$got" = 0 ] && [ -z "$out" ] ||
+	fail "a materialized tree, committed again, differs from its own: $got" "$out"
+cases=$((cases + 1))
+out=$(timeout 60 "$hull" diff "sha256:$first" one/copy 2>&1)
+got=$?
+[ "$got" = 0 ] && [ -z "$out" ] || fail "a manifest named by its hash differs from its copy: $got" "$out"
+expect 0 '' "$hull" materialize "sha256:$first" "$root/byhash"
+# Each kind of change, said once for its path, in path order: a kind, a
+# mode, a content, a path gone and two come, one with a newline in its
+# name, an xattr, and a symlink's target.
+cp -a "$root/after" "$root/more"
+rm "$root/more/empty" "$root/more/srv/deep/er/file" "$root/more/usr/link"
+mkdir "$root/more/empty"
+chmod 600 "$root/more/etc/again"
+printf 'other\n' > "$root/more/etc/greeting"
+printf 'new\n' > "$root/more/srv/new"
+printf 'two\n' > "$root/more/srv/two
+lines"
+ln -s ../etc/again "$root/more/usr/link"
+timeout 10 python3 -c '
+import os, sys
+os.setxattr(sys.argv[1], "user.note", b"another")
+' "$root/more/usr/bin/hi"
+expect 0 '' "$hull" commit "$root/more" one/more
+cases=$((cases + 1))
+out=$(timeout 60 "$hull" diff one/after one/more 2>&1)
+got=$?
+mode() { printf '%04o' "0$(stat -c %a "$1")"; }
+wanted=$(printf '%s\n' \
+	"~ empty: kind reg -> dir, mode $(mode "$root/after/empty") -> $(mode "$root/more/empty")" \
+	"~ etc/again: mode $(mode "$root/after/etc/again") -> 0600" \
+	'~ etc/greeting: content' \
+	'- srv/deep/er/file' \
+	'+ srv/new' \
+	'+ srv/two\012lines' \
+	'~ usr/bin/hi: xattrs' \
+	'~ usr/link: target ../etc/greeting -> ../etc/again')
+[ "$got" = 1 ] && [ "$out" = "$wanted" ] ||
+	fail "diff said other than each change, or did not exit 1: $got" \
+		"$(printf '%s\n' "$wanted" > "$root/want"; printf '%s\n' "$out" > "$root/got"; diff "$root/want" "$root/got")"
+# The tree's own arch, said on a line of its own.
+expect 0 '' "$hull" commit --arch armhf "$root/after" one/arm
+cases=$((cases + 1))
+out=$(timeout 60 "$hull" diff one/after one/arm 2>&1)
+got=$?
+[ "$got" = 1 ] && printf '%s\n' "$out" | grep -Eqx 'arch [a-z0-9_]+ -> armhf' &&
+	[ "$(printf '%s\n' "$out" | wc -l)" = 1 ] || fail "diff did not say the arch alone: $got" "$out"
+# What diff refuses, with 2: a ref that is not, a hash that is not one, and
+# one the store has no manifest of; and no ref is named as a hash is.
+expect 2 'no such ref' "$hull" diff one/nope one/copy
+expect 2 'a manifest is sha256: and 64 lowercase hex digits' "$hull" diff sha256:abc one/copy
+expect 2 'No such file' "$hull" diff \
+	sha256:0000000000000000000000000000000000000000000000000000000000000000 one/copy
+expect 1 'a ref is names of' "$hull" commit "$tree" sha256:mine
+# Nor does it take a manifest whose entries are not in path order, which
+# is not one of ours, rather than say a change it could not have.
+crafted evil/unsorted unsorted
+expect 2 'an entry with no path, or out of order' "$hull" diff one/copy evil/unsorted
+rm -f "$store/refs/evil/unsorted"
 
 # The test's core leaves once idle, before its directory goes.
 tries=0

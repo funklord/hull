@@ -95,6 +95,7 @@ static void usage(FILE *out)
 	      "       hull ssh ID | hull proxy-ssh HOST\n"
 	      "       hull ssh-config [--remove] | hull gc\n"
 	      "       hull commit [--arch A] DIR REF | hull materialize REF DIR | hull images\n"
+	      "       hull diff REF REF\n"
 	      "       hull core\n"
 	      "       hull engines\n"
 	      "       hull --version\n", out);
@@ -1015,6 +1016,52 @@ static int images(void)
 	return status == 0 ? 0 : 2;
 }
 
+/* A path on a line of its own: a backslash, and a byte below a space or
+ * DEL, as \ and three octal digits, so a newline in a name cannot start
+ * a line of its own. */
+static void put_path(const char *path)
+{
+	for (const unsigned char *p = (const unsigned char *)path; *p != '\0'; p++) {
+		if (*p == '\\' || *p < 0x20u || *p == 0x7fu)
+			printf("\\%03o", *p);
+		else
+			putchar(*p);
+	}
+}
+
+static void print_change(void *context, char change, const char *path, const char *what)
+{
+	(void)context;
+	if (path == NULL) {
+		printf("%s\n", what);
+		return;
+	}
+	printf("%c ", change);
+	put_path(path);
+	printf("%s%s\n", what[0] != '\0' ? ": " : "", what);
+}
+
+/* diff(1)'s statuses: 0 the same, 1 different, 2 trouble. */
+static int diff(const char *from, const char *to)
+{
+	hull_store store;
+	char       why[4400] = "";
+	int        status;
+
+	if ((status = open_store(&store, 0)) != 0) {
+		if (status == 1)
+			fprintf(stderr, "hull: diff: there is no store, so no %s\n", from);
+		return 2;
+	}
+	status = hull_store_diff(&store, from, to, print_change, NULL, why, sizeof why);
+	hull_store_close(&store);
+	if (status < 0) {
+		fprintf(stderr, "hull: diff: %s\n", why);
+		return 2;
+	}
+	return status;
+}
+
 /* What the engines keep that nothing wants, through the core, and what
  * no ref reaches in the store, if there is one. */
 static int collect(void)
@@ -1703,6 +1750,8 @@ int main(int argc, char **argv)
 		return materialize(argv[2], argv[3]);
 	if (strcmp(command, "images") == 0 && argc == 2)
 		return images();
+	if (strcmp(command, "diff") == 0 && argc == 4)
+		return diff(argv[2], argv[3]);
 	if (strcmp(command, "proxy-ssh") == 0 && argc == 3)
 		return proxy_ssh(argv[2]);
 	if (strcmp(command, "ssh-config") == 0 && argc == 2)

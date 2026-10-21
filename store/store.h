@@ -46,12 +46,23 @@ void hull_store_close(hull_store *store);
 int hull_store_commit(hull_store *store, const char *dir, const char *arch, const char *ref,
                       hull_commit *out, char *why, size_t cap);
 
-/* The tree `ref` names, made at `dir`, which must not exist or be empty.
+/* The tree `ref` names, a ref or sha256:HEX, made at `dir`, which must not
+ * exist or be empty.
  * What the user cannot make rootless -- a device, another owner, a
  * security.* xattr -- is said on stderr, counted in `*skipped`, and left
  * as the user can. 0, or -1 with `why`. */
 int hull_store_materialize(hull_store *store, const char *ref, const char *dir,
                            uint64_t *skipped, char *why, size_t cap);
+
+/* What differs from the tree `from` names to the tree `to` names, each a
+ * ref or sha256:HEX: each path added, '+', removed, '-', or changed, '~',
+ * in path order, through `each`, whose `what` says what changed in a
+ * path, as "mode 0644 -> 0755, content". A NULL path is the tree's own,
+ * its arch. 0 when nothing differs, 1 when something does, or -1 with
+ * `why`. */
+int hull_store_diff(hull_store *store, const char *from, const char *to,
+                    void (*each)(void *context, char change, const char *path, const char *what),
+                    void *context, char *why, size_t cap);
 
 /* Each ref and the manifest it names, sorted by ref. */
 int hull_store_list(hull_store *store, void (*each)(void *context, const char *ref,
