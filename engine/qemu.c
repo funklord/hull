@@ -119,7 +119,7 @@ struct hull_machine {
 
 	char             dir[4096];    /* the machine's files: initrd, console */
 	int              network;      /* qemu's end of passt's socket, or -1 */
-	pid_t            passt;        /* passt's daemon, from its pid file, or 0 */
+	pid_t            passt;        /* passt's daemon, by the socket it holds, or 0 */
 	pid_t            qemu;
 	hull_wire        wire;
 	int              connected;
@@ -584,18 +584,53 @@ static void escaped(char *out, size_t cap, const char *path)
  * passt.log, and the daemon it leaves ends when qemu's end closes. */
 static void last_line(const hull_machine *m, const char *file, char *out, size_t cap);
 
+/*
+ * passt's daemon: the process holding the socket's other end as its fd 3,
+ * which it was given and keeps. Found in /proc, not from a pid file,
+ * which passt cannot write in the runtime directory: its AppArmor profile,
+ * Debian's, lets it write only under /tmp and the home directory, so with
+ * $XDG_RUNTIME_DIR at /run/user/UID no machine started. 0 if none is
+ * seen, which costs only its share of `hull stats`.
+ */
+static pid_t holder_of(ino_t inode)
+{
+	char           want[48];
+	DIR           *proc = opendir("/proc");
+	struct dirent *entry;
+	pid_t          found = 0;
+
+	snprintf(want, sizeof want, "socket:[%lu]", (unsigned long)inode);
+	while (proc != NULL && found == 0 && (entry = readdir(proc)) != NULL) {
+		char    path[64];
+		char    link[48];
+		ssize_t n;
+
+		if (entry->d_name[0] < '1' || entry->d_name[0] > '9')
+			continue;
+		snprintf(path, sizeof path, "/proc/%.20s/fd/3", entry->d_name);
+		n = readlink(path, link, sizeof link - 1u);
+		if (n > 0) {
+			link[n] = '\0';
+			if (strcmp(link, want) == 0)
+				found = (pid_t)strtol(entry->d_name, NULL, 10);
+		}
+	}
+	if (proc != NULL)
+		closedir(proc);
+	return found;
+}
+
 static const char *start_network(hull_machine *m)
 {
 	char        log[4200];
-	char        pid_file[4200];
 	const char *argv[32];
+	struct stat socket_end;
 	unsigned    n = 0u;
 	int         pair[2];
 	int         status;
 	pid_t       pid;
 
 	snprintf(log, sizeof log, "%s/passt.log", m->dir);
-	snprintf(pid_file, sizeof pid_file, "%s/passt.pid", m->dir);
 	argv[n++] = "passt";
 	argv[n++] = "--quiet";
 	argv[n++] = "--fd";
@@ -615,8 +650,6 @@ static const char *start_network(hull_machine *m)
 	argv[n++] = "none";
 	argv[n++] = "--udp-ports";
 	argv[n++] = "none";
-	argv[n++] = "--pid";
-	argv[n++] = pid_file;
 	argv[n] = NULL;
 
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0)
@@ -634,6 +667,8 @@ static const char *start_network(hull_machine *m)
 		fprintf(stderr, "passt, which a qemu machine's network needs: %s\n", strerror(errno));
 		_exit(127);
 	}
+	if (fstat(pair[1], &socket_end) != 0)
+		socket_end.st_ino = 0;
 	close(pair[1]);
 	if (pid < 0) {
 		close(pair[0]);
@@ -649,18 +684,7 @@ static const char *start_network(hull_machine *m)
 		return m->detail;
 	}
 	m->network = pair[0];
-	/* Written by passt's parent before it exits, so here by now. */
-	{
-		FILE *f = fopen(pid_file, "re");
-		long  pid = 0;
-
-		if (f != NULL) {
-			if (fscanf(f, "%ld", &pid) != 1)
-				pid = 0;
-			fclose(f);
-		}
-		m->passt = pid > 0 ? (pid_t)pid : 0;
-	}
+	m->passt   = socket_end.st_ino != 0 ? holder_of(socket_end.st_ino) : 0;
 	return NULL;
 }
 
@@ -1083,7 +1107,7 @@ static hull_status qemu_create(hull_core *core, hull_buf plan, hull_machine **ou
 static void remove_files(const char *dir)
 {
 	static const char *const files[] = { "initrd", "console.log", "qemu.log", "passt.log",
-	                                     "passt.pid" };
+	                                     "passt.pid" /* written by a core before 2026-10-21 */ };
 	char path[4200];
 
 	for (unsigned i = 0u; i < sizeof files / sizeof files[0]; i++) {
