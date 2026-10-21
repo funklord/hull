@@ -31,6 +31,13 @@ chmod 700 "$dir/run"
 root=$(cd "$dir" && pwd)
 XDG_DATA_HOME=$root/data
 XDG_RUNTIME_DIR=$root/run
+# The account's own credentials are not read: a home of the test's own,
+# and no auth file but those a case names.
+HOME=$root/home
+XDG_CONFIG_HOME=$root/home/.config
+mkdir -p "$HOME"
+export HOME XDG_CONFIG_HOME
+unset DOCKER_CONFIG REGISTRY_AUTH_FILE
 DOCKER_HOST=unix://$root/run/no-docker.sock
 HULL_CORE_IDLE=1
 export XDG_DATA_HOME XDG_RUNTIME_DIR DOCKER_HOST HULL_CORE_IDLE
@@ -265,6 +272,55 @@ expect 1 'its content is not the object its name says' "$hull" push tiny/1 \
 expect 1 'a push names a tag' "$hull" push "$image" "127.0.0.1:$port/test/pushed@$push_digest"
 expect 1 'no such ref' "$hull" push nobody/1 "$pushed"
 expect 1 'certificate' env SSL_CERT_FILE="$root/other.pem" "$hull" push "$image" "$pushed"
+
+# Credentials, from the auth files podman and docker keep: none, and a
+# registry that wants them is told so; the right ones, by host and by a
+# URL of it, for a token and for Basic; wrong ones, refused; and a helper,
+# which hull does not run, named. podman's file is read before docker's.
+# Neither the password nor its base64 is ever printed, and the blob host,
+# which refuses any Authorization, is sent none.
+private=127.0.0.1:$port/test/private:1
+basic=127.0.0.1:$port/test/basic:1
+auth_file() { # FILE KEY AUTH
+	mkdir -p "$(dirname "$1")"
+	printf '{"auths": {"%s": {"auth": "%s"}}}\n' "$2" "$3" > "$1"
+}
+expect 1 'the auth files hull reads hold none for it' "$hull" pull "$private" private/none
+spoken=$out
+auth_file "$root/docker/config.json" "127.0.0.1:$port" dGVzdGVyOnNlY3JldA==
+expect 0 '' env DOCKER_CONFIG="$root/docker" "$hull" pull "$private" private/1
+spoken="$spoken$out"
+expect 0 '' env DOCKER_CONFIG="$root/docker" "$hull" pull "$basic" basic/1
+# A realm redirected to another host is not sent the credentials there.
+expect 0 '' env DOCKER_CONFIG="$root/docker" "$hull" pull "127.0.0.1:$port/test/hopped:1" hopped/1
+spoken="$spoken$out"
+expect 1 'the auth files hull reads hold none for it' "$hull" pull "$basic" basic/none
+auth_file "$root/url/config.json" "https://127.0.0.1:$port/v2/" dGVzdGVyOnNlY3JldA==
+expect 0 '' env DOCKER_CONFIG="$root/url" "$hull" pull "$private" private/url
+auth_file "$root/wrong/config.json" "127.0.0.1:$port" dGVzdGVyOndyb25n
+expect 1 'it refused the credentials the auth files hold for it' \
+	env DOCKER_CONFIG="$root/wrong" "$hull" pull "$private" private/wrong
+spoken="$spoken$out"
+auth_file "$root/podman.json" "127.0.0.1:$port" dGVzdGVyOnNlY3JldA==
+expect 0 '' env REGISTRY_AUTH_FILE="$root/podman.json" DOCKER_CONFIG="$root/wrong" \
+	"$hull" pull "$private" private/podman
+mkdir -p "$root/helper"
+printf '{"credHelpers": {"127.0.0.1:%s": "pass"}}\n' "$port" > "$root/helper/config.json"
+expect 1 'docker-credential-pass, which hull does not run' \
+	env DOCKER_CONFIG="$root/helper" "$hull" pull "$private" private/helper
+expect 0 '' env DOCKER_CONFIG="$root/docker" "$hull" push "$image" "127.0.0.1:$port/test/private-pushed:1"
+spoken="$spoken$out"
+cases=$((cases + 1))
+printf '%s\n' "$spoken" | grep -q 'secret\|dGVzdGVy' && fail "a credential was printed" "$spoken" || :
+cases=$((cases + 1))
+grep -q 'a token sent where it was not given' "$root/registry.log" &&
+	fail "a credential or token went to the blob host" "" || :
+expect 1 '' "$hull" diff private/1 basic/1
+cases=$((cases + 1))
+[ "$out" = provenance ] || fail "the image by token and by Basic are other trees" "$out"
+for ref in private/none basic/none private/wrong private/helper; do
+	[ ! -e "$store/refs/$ref" ] || fail "a pull refused for its credentials left a ref, $ref" ""
+done
 
 # The image runs, its name its source, as J.1's image ref in the store.
 printf '(machine (source "%s") (backend chroot) (hostname "pulled") %s)\n' "$image" \

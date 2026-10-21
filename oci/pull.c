@@ -6,11 +6,8 @@
  * then committed. See pull.h.
  *
  * Every body is hashed as it arrives and refused unless it is the digest
- * that named it. A registry that wants a token says so with a 401 and a
- * Bearer challenge, and an anonymous one is asked for at its realm; one
- * that wants credentials is refused, since hull reads none yet. A
- * redirect is followed five deep, and the token goes only to the
- * registry's own host, not to wherever its blobs are served from.
+ * that named it. The registry's session, its token, the user's
+ * credentials and its redirects, is remote.c's.
  */
 
 #define _GNU_SOURCE

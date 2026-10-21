@@ -183,6 +183,150 @@ static void url_encode(const char *text, char *out, size_t cap)
 
 
 /* An anonymous token from the challenge's realm, for the pull's scope. */
+/* --- credentials ---------------------------------------------------------- */
+
+/* Whether an auth file's key names `host`: a host, a host and port, or a
+ * URL of one, and for Docker Hub, any of the names it is filed under. */
+static int names_host(const char *key, const char *host)
+{
+	static const char *const hub[] = { "docker.io", "index.docker.io", "registry-1.docker.io",
+	                                   "registry.hub.docker.com" };
+	char                     name[512];
+	size_t                   n;
+	int                      key_hub = 0;
+	int                      host_hub = 0;
+
+	if (strncmp(key, "https://", 8u) == 0)
+		key += 8;
+	else if (strncmp(key, "http://", 7u) == 0)
+		key += 7;
+	n = strcspn(key, "/");
+	if (n >= sizeof name)
+		return 0;
+	memcpy(name, key, n);
+	name[n] = '\0';
+	for (unsigned i = 0u; i < sizeof hub / sizeof hub[0]; i++) {
+		key_hub |= strcmp(name, hub[i]) == 0;
+		host_hub |= strcmp(host, hub[i]) == 0;
+	}
+	return key_hub && host_hub ? 1 : strcmp(name, host) == 0;
+}
+
+/* The credentials one auth file holds for the session's host: 1 found, 0
+ * not, a helper named instead noted in `helper`. */
+static int credentials_in(hull_remote *s, const char *path)
+{
+	FILE           *file = fopen(path, "rb");
+	char           *text;
+	size_t          n;
+	hull_json       doc;
+	hull_json_value root;
+	hull_json_value auths;
+	hull_json_value key;
+	hull_json_value value;
+	const char     *bad;
+	int             found = 0;
+
+	if (file == NULL)
+		return 0;
+	text = malloc(1u << 20);
+	n = text != NULL ? fread(text, 1u, 1u << 20, file) : 0u;
+	fclose(file);
+	if (text == NULL || n == 0u || n == 1u << 20 || hull_json_open(&doc, text, n, &root, &bad) != 0) {
+		if (text != NULL)
+			fprintf(stderr, "hull: %s: not an auth file hull reads, passed over\n", path);
+		free(text);
+		return 0;
+	}
+	if (hull_json_member(&doc, &root, "auths", &auths))
+		for (int more = hull_json_next_member(&doc, &auths, 1, &key, &value); more && !found;
+		     more = hull_json_next_member(&doc, &auths, 0, &key, &value)) {
+			char name[512];
+			long length;
+
+			if (hull_json_string(&doc, &key, name, sizeof name) < 0 || !names_host(name, s->img.host))
+				continue;
+			length = hull_json_member_string(&doc, &value, "auth", s->basic, sizeof s->basic);
+			if (length > 0 && (size_t)length == strspn(s->basic, "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+			                                                     "abcdefghijklmnopqrstuvwxyz"
+			                                                     "0123456789+/="))
+				found = 1;
+			else
+				s->basic[0] = '\0';
+		}
+	/* A helper is a program hull would have to run, and does not yet. */
+	if (!found && s->helper[0] == '\0') {
+		hull_json_value helpers;
+
+		if (hull_json_member(&doc, &root, "credHelpers", &helpers))
+			for (int more = hull_json_next_member(&doc, &helpers, 1, &key, &value); more;
+			     more = hull_json_next_member(&doc, &helpers, 0, &key, &value)) {
+				char name[512];
+
+				if (hull_json_string(&doc, &key, name, sizeof name) >= 0 &&
+				    names_host(name, s->img.host))
+					hull_json_string(&doc, &value, s->helper, sizeof s->helper);
+			}
+		if (s->helper[0] == '\0')
+			hull_json_member_string(&doc, &root, "credsStore", s->helper, sizeof s->helper);
+	}
+	memset(text, 0, n);
+	free(text);
+	return found;
+}
+
+/* The user's credentials for the registry, from podman's auth files and
+ * then docker's, the first that has them. */
+static void read_credentials(hull_remote *s)
+{
+	const char *home = getenv("HOME");
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	const char *config = getenv("XDG_CONFIG_HOME");
+	const char *docker = getenv("DOCKER_CONFIG");
+	const char *given = getenv("REGISTRY_AUTH_FILE");
+	char        path[4096];
+
+	if (s->credentials_read)
+		return;
+	s->credentials_read = 1;
+	if (given != NULL && given[0] != '\0' && credentials_in(s, given))
+		return;
+	if (runtime != NULL && runtime[0] != '\0') {
+		snprintf(path, sizeof path, "%s/containers/auth.json", runtime);
+		if (credentials_in(s, path))
+			return;
+	}
+	if (config != NULL && config[0] != '\0')
+		snprintf(path, sizeof path, "%s/containers/auth.json", config);
+	else if (home != NULL)
+		snprintf(path, sizeof path, "%s/.config/containers/auth.json", home);
+	else
+		path[0] = '\0';
+	if (path[0] != '\0' && credentials_in(s, path))
+		return;
+	if (docker != NULL && docker[0] != '\0')
+		snprintf(path, sizeof path, "%s/config.json", docker);
+	else if (home != NULL)
+		snprintf(path, sizeof path, "%s/.docker/config.json", home);
+	else
+		return;
+	credentials_in(s, path);
+}
+
+/* Why no credentials could be given. */
+static int no_credentials(hull_remote *s, char *why, size_t cap)
+{
+	char text[256];
+
+	if (s->helper[0] != '\0')
+		snprintf(text, sizeof text, "it asks for credentials, which are with the helper "
+		         "docker-credential-%s, which hull does not run", s->helper);
+	else
+		snprintf(text, sizeof text, "it asks for credentials, and the auth files hull reads "
+		         "hold none for it");
+	return say(why, cap, s->img.host, text);
+}
+
 static int authenticate(hull_remote *s, const char *text, char *why, size_t cap)
 {
 	char            realm[2048];
@@ -200,11 +344,18 @@ static int authenticate(hull_remote *s, const char *text, char *why, size_t cap)
 
 	if (data == NULL)
 		return say(why, cap, "out of memory", NULL);
+	read_credentials(s);
+	if (strncasecmp(text, "Basic", 5u) == 0) {
+		/* The registry's own Basic: the credentials go to it alone. */
+		free(data);
+		if (s->basic[0] == '\0')
+			return no_credentials(s, why, cap);
+		s->basic_mode = 1;
+		return 0;
+	}
 	if (challenge(text, realm, service, scope, sizeof realm) != 0) {
 		free(data);
-		return say(why, cap, s->img.host, strncasecmp(text, "Basic", 5u) == 0 ?
-		           "it asks for credentials, which hull does not yet read" :
-		           "it asks for authentication hull cannot give");
+		return say(why, cap, s->img.host, "it asks for authentication hull cannot give");
 	}
 	if (scope[0] == '\0')
 		snprintf(scope, sizeof scope, "repository:%s:pull", s->img.repository);
@@ -215,13 +366,34 @@ static int authenticate(hull_remote *s, const char *text, char *why, size_t cap)
 	hull_sha256_init(&body.hash);
 	s->token[0] = '\0';
 	s->authenticating = 1;
-	if (hull_remote_fetch(s, url, NULL, &body, why, cap) == 0) {
+	/* The token asked for with the credentials where there are any, as
+	 * docker asks: the realm is the registry's to name. */
+	if (s->basic[0] != '\0') {
+		char authorization[1100];
+
+		snprintf(authorization, sizeof authorization, "Authorization: Basic %s", s->basic);
+		result = hull_remote_fetch(s, url, authorization, &body, why, cap);
+		memset(authorization, 0, sizeof authorization);
+	} else {
+		result = hull_remote_fetch(s, url, NULL, &body, why, cap);
+	}
+	if (result != 0 && strstr(why, "answered 401") != NULL) {
+		s->authenticating = 0;
+		free(data);
+		return s->basic[0] != '\0' ? say(why, cap, s->img.host, "it refused the credentials "
+		                                  "the auth files hold for it") :
+		       no_credentials(s, why, cap);
+	}
+	if (result == 0) {
+		result = -1;
 		if (hull_json_open(&doc, (const char *)data, body.length, &root, &bad) != 0 ||
 		    (hull_json_member_string(&doc, &root, "token", s->token, sizeof s->token) <= 0 &&
 		     hull_json_member_string(&doc, &root, "access_token", s->token, sizeof s->token) <= 0))
 			say(why, cap, realm, "its answer holds no token");
 		else
 			result = 0;
+	} else {
+		result = -1;
 	}
 	s->authenticating = 0;
 	free(data);
@@ -233,9 +405,12 @@ int hull_remote_request(hull_remote *s, const char *method, const char *url,
                         hull_remote_sink *into, hull_https_response *out, char *why, size_t cap)
 {
 	char here[8192];
+	char first[300];
 	int  tried_token = 0;
 
 	snprintf(here, sizeof here, "%s", url);
+	if (hull_https_host(url, first, sizeof first) != 0)
+		first[0] = '\0';
 	for (int hops = 0; hops <= MAX_REDIRECTS; hops++) {
 		char        host[300];
 		char        authorization[8300];
@@ -244,9 +419,15 @@ int hull_remote_request(hull_remote *s, const char *method, const char *url,
 
 		if (hull_https_host(here, host, sizeof host) != 0)
 			return say(why, cap, here, "not an https:// URL; hull reaches registries by TLS only");
+		/* A caller's credentials go to the host it asked, not to one a
+		 * redirect names. */
 		for (const char *const *h = extra; h != NULL && *h != NULL && n < 6u; h++)
-			headers[n++] = *h;
-		if (s->token[0] != '\0' && strcmp(host, s->img.host) == 0) {
+			if (strcmp(host, first) == 0 || strncasecmp(*h, "Authorization:", 14u) != 0)
+				headers[n++] = *h;
+		if (s->basic_mode && strcmp(host, s->img.host) == 0) {
+			snprintf(authorization, sizeof authorization, "Authorization: Basic %s", s->basic);
+			headers[n++] = authorization;
+		} else if (s->token[0] != '\0' && strcmp(host, s->img.host) == 0) {
 			snprintf(authorization, sizeof authorization, "Authorization: Bearer %s", s->token);
 			headers[n++] = authorization;
 		}
@@ -288,13 +469,13 @@ int hull_remote_request(hull_remote *s, const char *method, const char *url,
 	return say(why, cap, url, "redirected more than five times");
 }
 
-int hull_remote_fetch(hull_remote *s, const char *url, const char *accept, hull_remote_sink *into,
+int hull_remote_fetch(hull_remote *s, const char *url, const char *header, hull_remote_sink *into,
                       char *why, size_t cap)
 {
 	hull_https_response response;
-	const char         *headers[2] = { accept, NULL };
+	const char         *headers[2] = { header, NULL };
 
-	if (hull_remote_request(s, "GET", url, accept != NULL ? headers : NULL, NULL, into, &response,
+	if (hull_remote_request(s, "GET", url, header != NULL ? headers : NULL, NULL, into, &response,
 	                        why, cap) != 0)
 		return -1;
 	if (response.status != 200) {

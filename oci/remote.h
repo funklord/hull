@@ -40,11 +40,17 @@ typedef struct hull_remote_sink {
 	hull_sha256 hash;
 } hull_remote_sink;
 
-/* One registry's session: its image, and the token it gave, if it has. */
+/* One registry's session: its image, the token it gave, if it has, and
+ * the user's credentials for it, read from the auth files podman and
+ * docker keep, once, the first time the registry asks for any. */
 typedef struct hull_remote {
 	hull_remote_image img;
 	char              token[8192];
 	int               authenticating;  /* a token's own GET asks for none */
+	int               credentials_read;
+	char              basic[1024];     /* base64 of user:password, or empty */
+	char              helper[64];      /* a credential helper named instead */
+	int               basic_mode;      /* the registry asked for Basic itself */
 } hull_remote;
 
 /* Whether `text` is sha256: and 64 lowercase hex digits. */
@@ -66,9 +72,9 @@ int hull_remote_request(hull_remote *r, const char *method, const char *url,
                         const char *const *headers, const hull_https_upload *upload,
                         hull_remote_sink *into, hull_https_response *out, char *why, size_t cap);
 
-/* A GET of `url` into `into` that must answer 200, `accept` sent where it
+/* A GET of `url` into `into` that must answer 200, `header` sent where it
  * is not NULL. 0, or -1 with `why`. */
-int hull_remote_fetch(hull_remote *r, const char *url, const char *accept, hull_remote_sink *into,
+int hull_remote_fetch(hull_remote *r, const char *url, const char *header, hull_remote_sink *into,
                       char *why, size_t cap);
 
 /* A body's digest, as `into` hashed it, against `digest`. 0, or -1. */

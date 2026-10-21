@@ -24,6 +24,10 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TOKEN = "test-token"
+# test/private's token is given only for these credentials; test/basic
+# asks for them itself, by Basic.
+PRIVATE_TOKEN = "private-token"
+CREDENTIALS = "Basic dGVzdGVyOnNlY3JldA=="  # tester:secret
 
 
 def digest(data):
@@ -169,6 +173,13 @@ def build(root, probe, arch):
 	                                                   mtime=0))])
 	manifest("test/bad", "zstd", [("application/vnd.oci.image.layer.v1.tar+zstd", b"not read")])
 	manifest("test/bad", "elsewhere", [(gz, good)], index=["s390x", "ppc64le"], include=False)
+	# The image again, where credentials are wanted.
+	for repo in ("test/private", "test/basic", "test/hopped"):
+		os.makedirs(os.path.join(repos, repo, "tags"), exist_ok=True)
+		with open(os.path.join(repos, "test/image", "tags", "1"), "rb") as f:
+			image = f.read()
+		with open(os.path.join(repos, repo, "tags", "1"), "wb") as f:
+			f.write(image)
 	manifest("test/bad", "foreign", [(gz, good)], config_arch="s390x")
 	# A layer longer than its manifest says.
 	manifest("test/bad", "short", [(gz, good, len(good) - 1)])
@@ -215,8 +226,23 @@ class handler(BaseHTTPRequestHandler):
 		root = self.server.root
 		path, _, query = self.path.partition("?")
 		port = self.server.server_address[1]
+		if path == "/hop":
+			# A realm that sends its asker on to another host.
+			self.send(307, b"", [("Location", "https://localhost:%d/token?%s" % (port, query))])
+			return
+		if path == "/token" and self.headers.get("Host", "").startswith("localhost") and \
+		   self.headers.get("Authorization") is not None:
+			sys.stderr.write("registry: a token sent where it was not given\n")
+			self.send(403, b"credentials sent to a host they were not for")
+			return
 		if path == "/token":
 			ok = "scope=repository%3Atest%2F" in query and "service=test" in query
+			if ok and "repository%3Atest%2Fprivate" in query:
+				if self.headers.get("Authorization") != CREDENTIALS:
+					self.send(401, b"")
+					return
+				self.send(200, json.dumps({"token": PRIVATE_TOKEN}).encode())
+				return
 			self.send(200 if ok else 400, json.dumps({"token": TOKEN}).encode() if ok else b"")
 			return
 		if path.startswith("/cdn/"):
@@ -260,13 +286,21 @@ class handler(BaseHTTPRequestHandler):
 	def authorized(self, parts):
 		"""A request with the token, or a 401 asking for one, for push too
 		where the request writes."""
-		if self.headers.get("Authorization") == "Bearer " + TOKEN:
-			return True
 		repo = "/".join(parts[2:-2]) if parts[-3] != "blobs" else "/".join(parts[2:-3])
+		given = self.headers.get("Authorization")
+		if repo == "test/basic":
+			if given == CREDENTIALS:
+				return True
+			self.send(401, b"", [("WWW-Authenticate", 'Basic realm="test"')])
+			return False
+		if given == "Bearer " + (PRIVATE_TOKEN if repo.startswith("test/private") else TOKEN):
+			return True
 		scope = "pull,push" if self.command in ("POST", "PUT") else "pull"
+		realm = "hop" if repo == "test/hopped" else "token"
 		self.send(401, b"", [("WWW-Authenticate",
-		                      'Bearer realm="https://127.0.0.1:%d/token",service="test",'
-		                      'scope="repository:%s:%s"' % (self.server.server_address[1], repo, scope))])
+		                      'Bearer realm="https://127.0.0.1:%d/%s",service="test",'
+		                      'scope="repository:%s:%s"' % (self.server.server_address[1], realm,
+		                                                    repo, scope))])
 		return False
 
 	def body(self):
