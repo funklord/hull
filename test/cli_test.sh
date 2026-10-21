@@ -996,11 +996,18 @@ done
 
 # Secrets (J.3), resolved by the frontend and written by the core, on a
 # tmpfs: so a core of their own, in a runtime directory under /dev/shm,
-# removed at the end. In this suite's runtime directory, which is not a
-# tmpfs, the run is refused.
+# removed at the end. In this suite's runtime directory, when it is not a
+# tmpfs, the run is refused; where $BUILD_DIR is one, that is said rather
+# than tried.
 conf nosecret '(command "/probe" "say" "ran")' '(secrets (pw (source "file:pw.txt")))'
 printf 'from a file\n' > "$root/pw.txt"
-from_root 125 'secrets are kept in memory only' -f "$root/nosecret.conf"
+case $(findmnt -no FSTYPE --target "$XDG_RUNTIME_DIR") in
+tmpfs | ramfs)
+	printf 'cli: not tried, as %s is in memory: a runtime directory that is not refuses secrets\n' \
+		"$XDG_RUNTIME_DIR" ;;
+*)
+	from_root 125 'secrets are kept in memory only' -f "$root/nosecret.conf" ;;
+esac
 shm=$(mktemp -d /dev/shm/hull-cli-test.XXXXXX)
 trap 'rm -rf "${shm:?}"' EXIT
 mkdir -p "$root/secret/run" "$root/secret/proc"
