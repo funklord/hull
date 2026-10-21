@@ -176,6 +176,27 @@ from_root() { # STATUS PATTERN ARGS...: hull run from /, so nothing is relative 
 
 conf run '(command "/probe" "say" "out" "err" "to stderr" "env" "GREETING" "cwd" "host" "uid" "nnp" "session" "exit" "3")' \
 	'(workdir "/srv") (hostname "box") (env (GREETING "hi"))'
+# A client held open from the first run's core until the core is killed
+# below, which ends it: the cases between read what that one core holds,
+# an exited `box` and `kept` among it, and with no machine running a core
+# leaves a second after its last client, which a loaded host can spend
+# between two commands. It waits for the run's core to answer.
+(timeout -k 2 900 python3 -c '
+import os, socket, struct, time
+for _ in range(200):
+	try:
+		s = socket.socket(socket.AF_UNIX)
+		d = os.open(os.environ["XDG_RUNTIME_DIR"] + "/hull", os.O_PATH)
+		s.connect("/proc/self/fd/%d/core.sock" % d)
+		break
+	except OSError:
+		time.sleep(0.05)
+m = b"(5:hello(2:ch1:0)(5:proto1:1))"
+s.sendall(struct.pack(">I", len(m)) + m)
+while s.recv(4096):
+	pass
+' > /dev/null 2>&1) &
+core_holder=$!
 from_root 3 '^out$' -f "$root/run.conf"
 from_root 3 '^to stderr$' -f "$root/run.conf"
 from_root 3 '^GREETING=hi$' -f "$root/run.conf"
@@ -914,6 +935,8 @@ else
 	[ -z "$left" ] || fail "a machine not kept outlived its core" "$left"
 	wait "$keeper" 2>/dev/null
 fi
+kill "$core_holder" 2>/dev/null
+wait "$core_holder" 2>/dev/null
 
 # A kept one outlives a core killed outright, and the core `hull ps`
 # starts takes it back: what the workload wrote while no core held it,
@@ -1067,6 +1090,40 @@ while [ -S "$XDG_RUNTIME_DIR/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
 	sleep 0.25
 done
 [ ! -S "$XDG_RUNTIME_DIR/hull/core.sock" ] || fail "the core did not leave when idle" ""
+# And not before its second after its last client: five cores of a
+# directory of their own, each left by a client 0.7 s after its hello. An
+# idle clock of whole seconds starts at the second of the hello, so once a
+# tick falls before the client leaves, the core leaves with it.
+cases=$((cases + 1))
+mkdir -p "$root/idle"
+chmod 700 "$root/idle"
+lived=$(timeout 60 python3 -c '
+import os, socket, struct, subprocess, sys, time
+run = sys.argv[2]
+env = dict(os.environ, XDG_RUNTIME_DIR=run, HULL_CORE_IDLE="1")
+for _ in range(5):
+	core = subprocess.Popen([sys.argv[1], "core"], env=env, cwd="/",
+	                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+	s = socket.socket(socket.AF_UNIX)
+	s.settimeout(5)
+	for _ in range(100):
+		try:
+			d = os.open(run + "/hull", os.O_PATH)
+			s.connect("/proc/self/fd/%d/core.sock" % d)
+			break
+		except OSError:
+			time.sleep(0.05)
+	m = b"(5:hello(2:ch1:0)(5:proto1:1))"
+	s.sendall(struct.pack(">I", len(m)) + m)
+	s.recv(4096)
+	time.sleep(0.7)
+	s.close()
+	left = time.monotonic()
+	core.wait(timeout=10)
+	print("%d" % ((time.monotonic() - left) * 1000))
+' "$hull_abs" "$root/idle" 2>&1)
+[ "$(printf '%s\n' "$lived" | awk '$1 >= 900 && $1 < 5000' | wc -l)" = 5 ] ||
+	fail "an idle core did not live its second after its last client, or lived past it" "$lived"
 
 # What a core that went kept for the next, which `hull ps` starts, though
 # it starts none otherwise. No daemon answers here, so a docker machine is

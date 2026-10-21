@@ -397,8 +397,10 @@ static int kept_machines(void)
 }
 
 /* A connection to the core, said hello on. With `start`, or with machines
- * kept for one, a core is started when none answers. Returns 0, or -1
- * having said why. */
+ * kept for one, a core is started when none answers. Returns 0; 1, saying
+ * nothing, when no core answers and none was to be started; or -1 having
+ * said why. One dial answers both whether a core runs and the connection,
+ * since an idle core can leave between two. */
 static int connect_core(hull_wire *wire, int start)
 {
 	hull_msg       hello = { 0 };
@@ -415,6 +417,8 @@ static int connect_core(hull_wire *wire, int start)
 			fd = dial_core();
 		}
 	}
+	if (fd < 0 && !start)
+		return 1;
 	if (fd < 0) {
 		if (getenv("XDG_RUNTIME_DIR") == NULL)
 			fprintf(stderr, "hull: XDG_RUNTIME_DIR is not set, so there is no core\n");
@@ -873,16 +877,6 @@ static int run(options *o, const hull_registry *registry, const char *name)
 
 /* Whether a core answers, without starting one; or would, holding the
  * machines a core that went kept for it. */
-static int core_running(void)
-{
-	int fd = dial_core();
-
-	if (fd < 0)
-		return kept_machines();
-	close(fd);
-	return 1;
-}
-
 static int list_machines(void)
 {
 	hull_wire      wire;
@@ -890,12 +884,13 @@ static int list_machines(void)
 	hull_sexpr_form message;
 	hull_sexpr_form item;
 	int            more;
+	int            status = connect_core(&wire, 0);
 
-	if (!core_running()) {
+	if (status == 1) {
 		printf("%-24s %-15s %-10s %-6s %s\n", "ID", "ADDRESS", "ENGINE", "CLASS", "STATE");
 		return 0;
 	}
-	if (connect_core(&wire, 0) != 0)
+	if (status != 0)
 		return 2;
 	send_request(&wire, "(4:list", 1u, NULL, NULL);
 	if (hull_wire_read(&wire, &body) != HULL_WIRE_OK || !hull_msg_is(&body, "machines")) {
@@ -1131,17 +1126,17 @@ static int exec_in(const char *id, char **argv, int argc, int tty, unsigned port
 	size_t           credit = 0u;  /* stdin the core will take now */
 	int              started = 0;
 	int              result = 125;
+	int              status;
 
 	if (tty && !isatty(0)) {
 		fprintf(stderr, "hull: -t needs a terminal on stdin\n");
 		return 125;
 	}
-	if (!core_running()) {
-		fprintf(stderr, "hull: no core is running, so no machine is\n");
+	if ((status = connect_core(&wire, 0)) != 0) {
+		if (status == 1)
+			fprintf(stderr, "hull: no core is running, so no machine is\n");
 		return 125;
 	}
-	if (connect_core(&wire, 0) != 0)
-		return 125;
 	if (port > 0u) {
 		hull_msg_raw(&request, "(4:dial");
 		hull_msg_channel(&request, 1u);
@@ -1513,9 +1508,13 @@ static int read_stats(const char *id, long long values[3])
 	hull_wire       wire;
 	hull_sexpr_doc  body;
 	hull_sexpr_form value;
-	int             status = 0;
+	int             status = connect_core(&wire, 0);
 
-	if (connect_core(&wire, 0) != 0)
+	if (status == 1) {
+		fprintf(stderr, "hull: no core is running, so no machine is\n");
+		return 1;
+	}
+	if (status != 0)
 		return 2;
 	send_request(&wire, "(5:stats", 1u, id, NULL);
 	if (hull_wire_read(&wire, &body) != HULL_WIRE_OK) {
@@ -1556,10 +1555,6 @@ static int stats_of(const char *id, long over)
 	double          elapsed;
 	int             status;
 
-	if (!core_running()) {
-		fprintf(stderr, "hull: no core is running, so no machine is\n");
-		return 1;
-	}
 	if ((status = read_stats(id, first)) != 0)
 		return status;
 	if (over == 0) {
@@ -1591,12 +1586,11 @@ static int about(const char *command, const char *id, int follow_logs, long time
 	char      rest[64];
 	int       status;
 
-	if (!core_running()) {
-		fprintf(stderr, "hull: no core is running, so no machine is\n");
-		return 1;
+	if ((status = connect_core(&wire, 0)) != 0) {
+		if (status == 1)
+			fprintf(stderr, "hull: no core is running, so no machine is\n");
+		return status == 1 ? 1 : 2;
 	}
-	if (connect_core(&wire, 0) != 0)
-		return 2;
 	if (strcmp(command, "stop") == 0) {
 		snprintf(rest, sizeof rest, "(10:timeout_ms%zu:%ld)",
 		         (size_t)snprintf(NULL, 0, "%ld", timeout_ms), timeout_ms);

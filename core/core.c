@@ -2186,6 +2186,16 @@ static void sync_hosts(void)
 	hosts_current = 1;
 }
 
+/* The idle clock's: in whole seconds, an idle time begun at x.999 would be
+ * over at the next tick, a millisecond later. */
+static long long monotonic_ms(void)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
+}
+
 int hull_core_run(const char *host_arch)
 {
 	char               dir[4096];
@@ -2195,8 +2205,8 @@ int hull_core_run(const char *host_arch)
 	struct sigaction   action;
 	const char        *runtime = getenv("XDG_RUNTIME_DIR");
 	const char        *idle_text = getenv("HULL_CORE_IDLE");
-	long               idle = idle_text != NULL ? strtol(idle_text, NULL, 10) : 30;
-	time_t             idle_since = time(NULL);
+	long long          idle = (idle_text != NULL ? strtol(idle_text, NULL, 10) : 30) * 1000LL;
+	long long          idle_since = monotonic_ms();
 	const char        *reason = NULL;
 	int                lock;
 	int                listener;
@@ -2293,12 +2303,13 @@ int hull_core_run(const char *host_arch)
 	/* Idle from now, when a frontend can reach it: a core that waited
 	 * for the lock has a frontend coming, which an idle clock started
 	 * before the wait would have it leave before it could arrive. */
-	idle_since = time(NULL);
+	idle_since = monotonic_ms();
 	while (!ending) {
 		struct pollfd fds[2u + MAX_CLIENTS];
 		client       *owners[2u + MAX_CLIENTS];
 		nfds_t        n = 0u;
 		int           timeout = -1;
+		int           busy;
 
 		/* Before each wait, so that the first, before any request, replaces
 		 * what a core that died left, which is not true. */
@@ -2315,20 +2326,24 @@ int hull_core_run(const char *host_arch)
 				fds[n++]  = (struct pollfd){ clients[i].wire.fd, events, 0 };
 			}
 		}
-		if (!any_clients() && !running_machines()) {
-			long waited = (long)(time(NULL) - idle_since);
+		busy = any_clients() || running_machines();
+		if (!busy) {
+			long long waited = monotonic_ms() - idle_since;
 
 			if (waited >= idle)
 				break;
-			timeout = (int)((idle - waited) * 1000);
-		} else {
-			idle_since = time(NULL);
+			timeout = (int)(idle - waited);
 		}
 		if (poll(fds, n, timeout) < 0) {
 			if (errno == EINTR)
 				continue;
 			break;
 		}
+		/* Idle from the end of the wait that was busy, not its start: a
+		 * client quiet before it left, or a machine before it ended, is
+		 * not idle time. */
+		if (busy)
+			idle_since = monotonic_ms();
 		if (fds[1].revents != 0)
 			drain_events();
 		if (fds[0].revents & POLLIN) {
