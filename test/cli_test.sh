@@ -24,9 +24,16 @@ export HULL_CORE_IDLE=1
 # looks at nothing of the account's.
 DOCKER_HOST=unix://$XDG_RUNTIME_DIR/no-docker.sock
 export DOCKER_HOST
-# And a store of its own, which gc would otherwise look in: none, here.
+# And a store of its own, which gc would otherwise look in, empty at the
+# start: what a run that went left would change what gc says it removed.
 XDG_DATA_HOME=$(cd "${BUILD_DIR:?}" && pwd)/test/cli-data
 export XDG_DATA_HOME
+case $XDG_DATA_HOME in
+*/test/cli-data) ;;
+*) echo "cli_test: $XDG_DATA_HOME is not a test/cli-data directory" >&2; exit 2 ;;
+esac
+[ ! -e "$XDG_DATA_HOME" ] || chmod -R u+w "${XDG_DATA_HOME:?}"
+rm -rf "${XDG_DATA_HOME:?}"
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 cases=0
@@ -264,6 +271,43 @@ mkdir -p "$root/rootfs/proc"
 conf pid '(command "/probe" "pid" "orphan" "procs")'
 from_root 0 '^pid=2$' -f "$root/pid.conf"
 from_root 0 '^procs=2$' -f "$root/pid.conf"
+
+# A bare ref the store holds runs that tree, J.1's image ref in the store:
+# a dir source on its checkout, made once in the store under an overlay,
+# so that a write reaches neither the checkout nor the tree committed. A
+# plan names the checkout and makes none.
+expect 0 '^stored/root:1 sha256:[0-9a-f]{64}$' "$hull" commit "$root/rootfs" stored/root:1
+stored_hex=$(printf '%s\n' "$out" | sed -n 's/^stored\/root:1 sha256://p')
+checkout=$XDG_DATA_HOME/hull/store/checkouts/sha256/$stored_hex
+printf '(machine (source "stored/root:1") (backend chroot) (hostname "stored") %s)\n' \
+	'(command "/probe" "write" "/srv/stored" "cwd")' > "$root/stored.conf"
+expect 0 "\\(source \"dir:$checkout\"\\) \\(mutable overlay\\)" \
+	"$hull" plan --resolved -f "$root/stored.conf"
+cases=$((cases + 1))
+[ ! -e "$checkout" ] || fail "a plan made the checkout it names" ""
+from_root 0 '^write=ok$' -f "$root/stored.conf"
+cases=$((cases + 1))
+[ -d "$checkout/srv" ] && [ ! -e "$checkout/srv/stored" ] && [ ! -e "$root/rootfs/srv/stored" ] ||
+	fail "a machine on a stored tree wrote its checkout or the tree" "$(ls "$checkout/srv" 2>&1)"
+inode=$(stat -c %i "$checkout")
+from_root 0 '^cwd=/$' -f "$root/stored.conf"
+cases=$((cases + 1))
+[ "$(stat -c %i "$checkout")" = "$inode" ] || fail "a second run checked the tree out again" ""
+printf '(machine (source "stored/root:1") (backend chroot) (mutable direct) %s)\n' \
+	'(hostname "stored") (command "/probe")' > "$root/stored-direct.conf"
+from_root 125 'stored/root:1 is a stored tree, which nothing writes' -f "$root/stored-direct.conf"
+# A ref the store does not hold is an image ref still, docker's.
+printf '(machine (source "stored/none:1") (hostname "unstored"))\n' > "$root/unstored.conf"
+expect 0 'machine on docker \(ns\): ok' "$hull" plan -f "$root/unstored.conf"
+# And gc keeps the checkout while a ref reaches its manifest, and takes
+# it once none does.
+expect 0 '^store: removed 0 manifests, 0 objects and 0 checkouts no ref reaches$' "$hull" gc
+cases=$((cases + 1))
+[ -d "$checkout" ] || fail "gc took a checkout a ref reaches" ""
+rm "$XDG_DATA_HOME/hull/store/refs/stored/root:1"
+expect 0 '^store: removed 1 manifests, [0-9]+ objects and 1 checkouts no ref reaches$' "$hull" gc
+cases=$((cases + 1))
+[ ! -e "$checkout" ] || fail "gc left a checkout no ref reaches" ""
 
 # The core: what it holds, what it kept, who can follow a machine, and
 # what (on_disconnect ...) does when the frontend that ran it is killed.

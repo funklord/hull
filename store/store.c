@@ -821,8 +821,9 @@ static int copy_object(hull_store *store, const uint8_t digest[32], int dir, con
 	return 0;
 }
 
-int hull_store_materialize(hull_store *store, const char *ref, const char *dir,
-                           uint64_t *skipped, char *why, size_t cap)
+/* As hull_store_materialize(), under a lock the caller holds. */
+static int materialize_locked(hull_store *store, const char *ref, const char *dir,
+                              uint64_t *skipped, char *why, size_t cap)
 {
 	char            hex[65];
 	uint8_t        *data;
@@ -868,7 +869,6 @@ int hull_store_materialize(hull_store *store, const char *ref, const char *dir,
 			return say(why, cap, dir, "it is not empty");
 		}
 	}
-	flock(store->lock, LOCK_SH);
 	more = hull_sexpr_child(&doc, &entries, &entry);
 	for (more = more && hull_sexpr_next(&doc, &entry, &entry); more;
 	     more = hull_sexpr_next(&doc, &entry, &entry)) {
@@ -943,6 +943,22 @@ int hull_store_materialize(hull_store *store, const char *ref, const char *dir,
 			close(parent);
 			goto done;
 		}
+		/* The user's, group too: what is made in a setgid directory takes
+		 * the directory's group, which a machine's user namespace, mapping
+		 * the user's own alone, cannot write under. A chown may clear a
+		 * file's setuid and setgid bits, so its mode is given again;
+		 * directories are given theirs last. */
+		if (fchownat(parent, leaf, (uid_t)-1, getgid(), AT_SYMLINK_NOFOLLOW) != 0) {
+			say(why, cap, path, strerror(errno));
+			close(parent);
+			goto done;
+		}
+		if ((strcmp(kind, "reg") == 0 || strcmp(kind, "fifo") == 0) &&
+		    fchmodat(parent, leaf, mode, 0) != 0) {
+			say(why, cap, path, strerror(errno));
+			close(parent);
+			goto done;
+		}
 		/* An owner other than root and the user cannot be given rootless:
 		 * the user's file stands for both. */
 		if (field(&doc, &entry, "owner", &value) && value.kind == HULL_SEXPR_LIST) {
@@ -988,13 +1004,107 @@ int hull_store_materialize(hull_store *store, const char *ref, const char *dir,
 bad:
 	say(why, cap, ref, "its manifest has an entry that is not one");
 done:
-	flock(store->lock, LOCK_UN);
 	for (size_t i = 0u; i < dir_count; i++)
 		free(dirs[i]);
 	free(dirs);
 	free(dir_modes);
 	close(root);
 	free(data);
+	return result;
+}
+
+/* Shared, so that gc, which takes the lock alone, cannot take an object
+ * between the manifest's read and its copy. */
+int hull_store_materialize(hull_store *store, const char *ref, const char *dir,
+                           uint64_t *skipped, char *why, size_t cap)
+{
+	int result;
+
+	flock(store->lock, LOCK_SH);
+	result = materialize_locked(store, ref, dir, skipped, why, cap);
+	flock(store->lock, LOCK_UN);
+	return result;
+}
+
+/* --- checkouts ------------------------------------------------------------ */
+
+/* `name` in `parent`, and all beneath it: each directory made the user's
+ * to empty first, since a tree's modes may not let it be, and no symlink
+ * followed, since one is removed as itself. */
+static int remove_tree(int parent, const char *name)
+{
+	int            fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	DIR           *dir;
+	struct dirent *entry;
+	int            result = 0;
+
+	if (fd < 0)
+		return unlinkat(parent, name, 0) == 0 || errno == ENOENT ? 0 : -1;
+	fchmod(fd, 0700);
+	if ((dir = fdopendir(fd)) == NULL) {
+		close(fd);
+		return -1;
+	}
+	while ((entry = readdir(dir)) != NULL)
+		if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0 &&
+		    remove_tree(dirfd(dir), entry->d_name) != 0)
+			result = -1;
+	closedir(dir);
+	return unlinkat(parent, name, AT_REMOVEDIR) == 0 ? result : -1;
+}
+
+int hull_store_checkout(hull_store *store, const char *name, int create, char *path,
+                        size_t path_cap, uint64_t *skipped, char *why, size_t cap)
+{
+	char        hex[65];
+	char        named[72];
+	char        made[4400];
+	struct stat st;
+	int         result = -1;
+
+	*skipped = 0u;
+	if (name_manifest(store, name, hex, why, cap) != 0)
+		return -1;
+	if ((size_t)snprintf(path, path_cap, "%s/checkouts/sha256/%s", store->root, hex) >= path_cap)
+		return say(why, cap, store->root, "a checkout's path would be too long");
+	if (!create)
+		return 0;
+	flock(store->lock, LOCK_SH);
+	if (lstat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+		flock(store->lock, LOCK_UN);
+		return 0;
+	}
+	/* Made whole under tmp/ and renamed in, so that a checkout is the tree
+	 * or absent; tmp/ is gc's to empty only under the lock alone. */
+	snprintf(made, sizeof made, "%s/checkouts/sha256", store->root);
+	if (make_dirs(made) != 0) {
+		say(why, cap, made, strerror(errno));
+		goto done;
+	}
+	snprintf(made, sizeof made, "%s/tmp/checkout-XXXXXX", store->root);
+	if (mkdtemp(made) == NULL) {
+		say(why, cap, made, strerror(errno));
+		goto done;
+	}
+	snprintf(named, sizeof named, "sha256:%s", hex);
+	if (materialize_locked(store, named, made, skipped, why, cap) != 0) {
+		remove_tree(AT_FDCWD, made);
+		goto done;
+	}
+	/* A machine's / is a directory anyone may enter, as a dir source's is. */
+	chmod(made, 0755);
+	if (rename(made, path) != 0) {
+		int taken = errno == EEXIST || errno == ENOTEMPTY;
+
+		if (!taken)
+			say(why, cap, path, strerror(errno));
+		remove_tree(AT_FDCWD, made);
+		if (!taken)
+			goto done;
+	}
+	result = 0;
+done:
+	flock(store->lock, LOCK_UN);
 	return result;
 }
 
@@ -1351,8 +1461,8 @@ static int set_has(const hex_set *set, const char *hex)
 	return bsearch(hex, set->items, set->count, sizeof set->items[0], hex_order) != NULL;
 }
 
-int hull_store_gc(hull_store *store, uint64_t *manifests, uint64_t *objects, char *why,
-                  size_t cap)
+int hull_store_gc(hull_store *store, uint64_t *manifests, uint64_t *objects,
+                  uint64_t *checkouts, char *why, size_t cap)
 {
 	ref_list       list = { 0 };
 	hex_set        kept_manifests = { 0 };
@@ -1362,7 +1472,7 @@ int hull_store_gc(hull_store *store, uint64_t *manifests, uint64_t *objects, cha
 	struct dirent *entry;
 	int            result = -1;
 
-	*manifests = *objects = 0u;
+	*manifests = *objects = *checkouts = 0u;
 	if (flock(store->lock, LOCK_EX) != 0)
 		return say(why, cap, "the store's lock", strerror(errno));
 	find_refs(store, "", &list);
@@ -1424,13 +1534,23 @@ int hull_store_gc(hull_store *store, uint64_t *manifests, uint64_t *objects, cha
 		closedir(dir);
 		rmdir(sub);
 	}
-	/* What a commit that went left in tmp/: none is under way, the lock
-	 * being this one's alone. */
+	/* A checkout of a manifest no ref reaches. One a machine still runs
+	 * on goes too: the store does not know its machines. */
+	snprintf(path, sizeof path, "%s/checkouts/sha256", store->root);
+	if ((dir = opendir(path)) != NULL) {
+		while ((entry = readdir(dir)) != NULL)
+			if (strlen(entry->d_name) == 64u && !set_has(&kept_manifests, entry->d_name) &&
+			    remove_tree(dirfd(dir), entry->d_name) == 0)
+				(*checkouts)++;
+		closedir(dir);
+	}
+	/* What a commit or a checkout that went left in tmp/: none is under
+	 * way, the lock being this one's alone. */
 	snprintf(path, sizeof path, "%s/tmp", store->root);
 	if ((dir = opendir(path)) != NULL) {
 		while ((entry = readdir(dir)) != NULL)
 			if (entry->d_name[0] != '.')
-				unlinkat(dirfd(dir), entry->d_name, 0);
+				remove_tree(dirfd(dir), entry->d_name);
 		closedir(dir);
 	}
 	result = 0;

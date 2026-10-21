@@ -6,6 +6,8 @@
  *     store/objects/sha256/ab/abcdef...   content, 0444, or 0555 if executable
  *     store/manifests/sha256/abcdef...    a manifest's canonical bytes, 0444
  *     store/refs/NAME                     a symlink to ../manifests/sha256/...
+ *     store/checkouts/sha256/abcdef...    a manifest's tree, made once, for a
+ *                                         machine whose source is a ref
  *
  * Nothing else in hull needs it: dir sources are the primary mode (3.7).
  */
@@ -69,9 +71,19 @@ int hull_store_list(hull_store *store, void (*each)(void *context, const char *r
                                                     const char *manifest),
                     void *context, char *why, size_t cap);
 
-/* Section 3.4: what no ref reaches, removed. */
-int hull_store_gc(hull_store *store, uint64_t *manifests, uint64_t *objects, char *why,
-                  size_t cap);
+/* The tree `name`, a ref or sha256:HEX, checked out whole once per
+ * manifest, at checkouts/sha256/HEX, its path into `path`: what a machine
+ * whose source is a ref runs, as a dir source under an overlay, so that
+ * nothing writes it. Without `create`, only the path, made or not. What
+ * the user cannot make rootless is said, as by materializing, and counted
+ * in `*skipped`. 0, or -1 with `why`. */
+int hull_store_checkout(hull_store *store, const char *name, int create, char *path,
+                        size_t path_cap, uint64_t *skipped, char *why, size_t cap);
+
+/* Section 3.4: what no ref reaches, removed: manifests, objects, and the
+ * checkouts of those manifests. */
+int hull_store_gc(hull_store *store, uint64_t *manifests, uint64_t *objects,
+                  uint64_t *checkouts, char *why, size_t cap);
 
 #ifdef __cplusplus
 }

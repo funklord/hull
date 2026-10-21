@@ -1,7 +1,8 @@
 #!/bin/sh
-# store_test.sh -- section 3's store through build/hull: commit, materialize, diff,
-# images and the store's part of gc, against a store of the test's own, in
-# $BUILD_DIR/test/store, which it removes at its start and its end.
+# store_test.sh -- section 3's store through build/hull: commit,
+# materialize, diff, images and the store's part of gc, against a store of
+# the test's own, in $BUILD_DIR/test/store, which it removes at its start
+# and its end.
 #
 # Its arguments are build/hull and the situc to verify manifests with,
 # against manifest/manifest.situ. Every command runs under `timeout`, and
@@ -16,6 +17,9 @@ case $dir in
 */test/store) ;;
 *) echo "store_test: $dir is not a test/store directory" >&2; exit 2 ;;
 esac
+# Writable first: a checkout's or a materialized tree's directories may
+# not be, and rm cannot empty one that is not.
+[ ! -e "$dir" ] || chmod -R u+w "${dir:?}"
 rm -rf "${dir:?}"
 mkdir -p "$dir/data"
 root=$(cd "$dir" && pwd)
@@ -84,6 +88,9 @@ mkdir -p "$tree/usr/bin" "$tree/etc" "$tree/srv/deep/er"
 printf 'hello\n' > "$tree/etc/greeting"
 printf '#!/bin/sh\necho hi\n' > "$tree/usr/bin/hi"
 chmod 755 "$tree/usr/bin/hi"
+# setuid and setgid, which a chown of the user's own file clears.
+printf '#!/bin/sh\necho id\n' > "$tree/usr/bin/setid"
+chmod 6755 "$tree/usr/bin/setid"
 : > "$tree/empty"
 ln -s ../etc/greeting "$tree/usr/link"
 ln "$tree/etc/greeting" "$tree/etc/again"
@@ -149,7 +156,7 @@ sys.exit(0 if paths == sorted(set(paths)) else 1)
 entries=$(grep -c '^entry ' "$root/manifest.vectors")
 verified=$(timeout 300 python3 "$situc" verify manifest/manifest.situ "$root/manifest.vectors" 2>&1)
 printf '%s\n' "$verified" | grep -q "^situc: $((entries + 1)) vectors conform to manifest/manifest.situ" &&
-	[ "$entries" = 14 ] ||
+	[ "$entries" = 15 ] ||
 	fail "the manifest, or one of its $entries entries, is not the schema's" "$verified"
 
 # Its identity is the tree's: the same for a copy, and for one whose
@@ -185,6 +192,16 @@ got=$(listing "$root/out")
 cases=$((cases + 1))
 [ "$(stat -c %i "$root/out/etc/greeting")" != "$(stat -c %i "$root/out/etc/again")" ] ||
 	fail "a hardlink came back as one" ""
+# Every path is the user's, group too, where a setgid directory above
+# would give its own: a machine's namespace maps the user's group alone.
+mkdir -p "$root/sgid"
+chmod 2775 "$root/sgid"
+other=$(id -G | tr ' ' '\n' | grep -vx "$(id -g)" | head -1)
+[ -n "$other" ] && chgrp "$other" "$root/sgid"
+expect 0 '' "$hull" materialize one/tree:1 "$root/sgid/out"
+cases=$((cases + 1))
+groups=$(find "$root/sgid/out" -mindepth 1 ! -group "$(id -g)" | head -3)
+[ -z "$groups" ] || fail "a materialized path kept a group other than the user's" "$groups"
 
 # What is refused: a target that is not empty, a ref that is not, and a
 # name that is not one.
@@ -257,8 +274,14 @@ rm -f "$store/refs/evil/link" "$store/refs/evil/up"
 expect 0 '^REF ' "$hull" images
 expect 0 'one/changed' "$hull" images
 rm -f "$store/refs/one/changed"
+# And what a checkout that went left in tmp/, its directories read-only.
+mkdir -p "$store/tmp/checkout-left/d"
+printf 'x\n' > "$store/tmp/checkout-left/d/f"
+chmod 555 "$store/tmp/checkout-left/d" "$store/tmp/checkout-left"
 changed=$(sha256sum < "$root/copy/etc/greeting" | cut -d' ' -f1)
-expect 0 '^store: removed 3 manifests and 1 objects no ref reaches$' "$hull" gc
+expect 0 '^store: removed 3 manifests, 1 objects and 0 checkouts no ref reaches$' "$hull" gc
+cases=$((cases + 1))
+[ ! -e "$store/tmp/checkout-left" ] || fail "gc left a read-only tree in tmp/" ""
 cases=$((cases + 1))
 [ ! -e "$store/objects/sha256/$(printf '%.2s' "$changed")/$changed" ] && [ -e "$object" ] &&
 	[ -e "$manifest" ] ||
@@ -342,6 +365,9 @@ while [ -S "$XDG_RUNTIME_DIR/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
 	tries=$((tries + 1))
 	sleep 0.25
 done
+chmod -R u+w "${dir:?}"
 rm -rf "${dir:?}"
+cases=$((cases + 1))
+[ ! -e "$dir" ] || fail "the test's own directory could not be removed" "$(ls -R "$dir" | head)"
 printf 'store: %d cases, %d failed\n' "$cases" "$failures"
 [ "$failures" = 0 ]

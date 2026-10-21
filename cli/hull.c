@@ -181,6 +181,149 @@ static uint8_t *read_file(const char *path, size_t *length)
 	return data;
 }
 
+/* --- a source the store holds --------------------------------------------- */
+
+/* One source rewritten: the bytes from `at`, `cut` of them, become `text`. */
+typedef struct rewrite {
+	uint32_t at;
+	uint32_t cut;
+	char     text[4600];
+} rewrite;
+
+#define MAX_REWRITES 64u
+
+/*
+ * A machine whose source is a bare ref the store holds runs that tree, as
+ * J.1 says a bare string is an image ref in the store or a registry: its
+ * source becomes a dir source on the tree's checkout, under an overlay
+ * where it says no (mutable ...), so that every engine taking a dir source
+ * runs it and none writes the checkout. It is written into the
+ * file's text, which `data` holds in MAX_FILE bytes, before anything reads
+ * it as a spec, so the registry, the matrix and the plan all judge the dir
+ * source the engine is given. A ref the store does not hold is left alone,
+ * an image ref for docker. With `create` the checkout is made, as a run
+ * needs; a plan only names it. Returns 0, or -1 having said why.
+ */
+static int store_sources(const char *file, uint8_t *data, size_t *length, int create)
+{
+	static rewrite  rewrites[MAX_REWRITES];
+	hull_sexpr_form machines[MAX_REWRITES];
+	unsigned        machine_count = 0u;
+	unsigned        count = 0u;
+	hull_spec       spec;
+	hull_store      store;
+	int             opened = -2;  /* not yet tried */
+	int             result = 0;
+
+	/* A file that does not read is said by the caller, which reads it. */
+	if (hull_spec_open(&spec, data, *length, NULL) != HULL_SPEC_OK)
+		return 0;
+	if (spec.has_machine) {
+		machines[machine_count++] = spec.machine;
+	} else if (spec.has_machines) {
+		hull_sexpr_form entry;
+		int             more;
+
+		hull_sexpr_child(&spec.doc, &spec.machines, &entry);
+		for (more = hull_sexpr_next(&spec.doc, &entry, &entry); more && machine_count < MAX_REWRITES;
+		     more = hull_sexpr_next(&spec.doc, &entry, &entry))
+			machines[machine_count++] = entry;
+	}
+	for (unsigned i = 0u; i < machine_count && result == 0; i++) {
+		static const char *const schemes[] = { "dir:", "tar:", "pack:", "image:" };
+		hull_sexpr_form          entry;
+		hull_sexpr_form          head;
+		hull_sexpr_form          value;
+		hull_sexpr_form          mutable_entry;
+		char                     name[300];
+		char                     path[4400];
+		char                     why[4400] = "";
+		uint64_t                 skipped = 0u;
+		int                      has_mutable;
+		int                      schemed = 0;
+
+		if (!hull_spec_find(&spec, &machines[i], "source", &entry) ||
+		    !hull_sexpr_child(&spec.doc, &entry, &head) ||
+		    !hull_sexpr_next(&spec.doc, &head, &value) || value.content_length >= sizeof name)
+			continue;
+		memcpy(name, spec.doc.data + value.content, value.content_length);
+		name[value.content_length] = '\0';
+		for (unsigned k = 0u; k < sizeof schemes / sizeof schemes[0]; k++)
+			schemed |= strncmp(name, schemes[k], strlen(schemes[k])) == 0;
+		if (schemed)
+			continue;
+		if (opened == -2) {
+			opened = hull_store_open(&store, 0, why, sizeof why);
+			if (opened < 0) {
+				fprintf(stderr, "hull: the store: %s\n", why);
+				return -1;
+			}
+		}
+		if (opened != 0 || hull_store_checkout(&store, name, 0, path, sizeof path, &skipped,
+		                                        why, sizeof why) != 0)
+			continue;  /* not the store's: an image ref */
+		has_mutable = hull_spec_find(&spec, &machines[i], "mutable", &mutable_entry);
+		if (has_mutable) {
+			hull_sexpr_form mutable_head;
+			hull_sexpr_form mutable_value;
+
+			hull_sexpr_child(&spec.doc, &mutable_entry, &mutable_head);
+			if (hull_sexpr_next(&spec.doc, &mutable_head, &mutable_value) &&
+			    hull_sexpr_is(&spec.doc, &mutable_value, "direct")) {
+				fprintf(stderr, "%s: %s is a stored tree, which nothing writes: "
+				        "(mutable direct) needs a dir source\n", file, name);
+				result = -1;
+				break;
+			}
+		}
+		if (create && hull_store_checkout(&store, name, 1, path, sizeof path, &skipped, why,
+		                                  sizeof why) != 0) {
+			fprintf(stderr, "%s: %s: %s\n", file, name, why);
+			result = -1;
+			break;
+		}
+		if (strpbrk(path, "\"\\") != NULL) {
+			fprintf(stderr, "%s: %s: the store's path cannot be written as a source\n", file,
+			        name);
+			result = -1;
+			break;
+		}
+		for (const unsigned char *p = (const unsigned char *)path; *p != '\0'; p++)
+			if (*p < 0x20u || *p == 0x7fu) {
+				fprintf(stderr, "%s: %s: the store's path cannot be written as a source\n",
+				        file, name);
+				result = -1;
+				break;
+			}
+		if (result != 0)
+			break;
+		/* From the value to the end of the entry, so that the overlay is
+		 * an entry of the machine's own, after the source. */
+		rewrites[count].at  = value.offset;
+		rewrites[count].cut = entry.offset + entry.extent - value.offset;
+		snprintf(rewrites[count].text, sizeof rewrites[count].text, "\"dir:%s\")%s", path,
+		         has_mutable ? "" : " (mutable overlay)");
+		count++;
+	}
+	if (opened == 0)
+		hull_store_close(&store);
+	/* Last first, so that each rewrite's offset is still the file's. */
+	for (unsigned i = count; result == 0 && i-- > 0u;) {
+		size_t added = strlen(rewrites[i].text);
+		size_t tail  = *length - rewrites[i].at - rewrites[i].cut;
+
+		if (*length - rewrites[i].cut + added > MAX_FILE) {
+			fprintf(stderr, "%s: larger than %u bytes once its stored sources are named\n",
+			        file, MAX_FILE);
+			return -1;
+		}
+		memmove(data + rewrites[i].at + added, data + rewrites[i].at + rewrites[i].cut, tail);
+		memcpy(data + rewrites[i].at, rewrites[i].text, added);
+		*length = *length - rewrites[i].cut + added;
+	}
+	return result;
+}
+
 /* One machine on one backend. Returns 1 if anything was rejected, 0 if
  * not, and 2 if it could not be planned at all. `name` is NULL for a
  * file's single `(machine ...)`. */
@@ -240,6 +383,10 @@ static int resolve_all(const options *o, const hull_registry *registry)
 	data = read_file(o->file, &length);
 	if (data == NULL)
 		return 2;
+	if (store_sources(o->file, data, &length, 0) != 0) {
+		free(data);
+		return 2;
+	}
 	if (hull_spec_open(&spec, data, length, &error) != HULL_SPEC_OK) {
 		fprintf(stderr, "%s:%u:%u: %s%s%s\n", o->file, error.line, error.column,
 		        error.path, error.path[0] != '\0' ? ": " : "", error.reason);
@@ -787,6 +934,10 @@ static int run(options *o, const hull_registry *registry, const char *name)
 	data = read_file(o->file, &length);
 	if (data == NULL)
 		return 125;
+	if (store_sources(o->file, data, &length, 1) != 0) {
+		free(data);
+		return 125;
+	}
 	if (hull_spec_open(&spec, data, length, &error) != HULL_SPEC_OK) {
 		fprintf(stderr, "%s:%u:%u: %s%s%s\n", o->file, error.line, error.column,
 		        error.path, error.path[0] != '\0' ? ": " : "", error.reason);
@@ -1070,6 +1221,7 @@ static int collect(void)
 	hull_wire  wire;
 	uint64_t   manifests = 0u;
 	uint64_t   objects = 0u;
+	uint64_t   checkouts = 0u;
 	char       why[4400] = "";
 	int        status;
 	int        result = 0;
@@ -1077,12 +1229,13 @@ static int collect(void)
 	if ((status = open_store(&store, 0)) == 2) {
 		result = 1;
 	} else if (status == 0) {
-		if (hull_store_gc(&store, &manifests, &objects, why, sizeof why) != 0) {
+		if (hull_store_gc(&store, &manifests, &objects, &checkouts, why, sizeof why) != 0) {
 			fprintf(stderr, "hull: gc: the store: %s\n", why);
 			result = 1;
 		} else {
-			printf("store: removed %llu manifests and %llu objects no ref reaches\n",
-			       (unsigned long long)manifests, (unsigned long long)objects);
+			printf("store: removed %llu manifests, %llu objects and %llu checkouts no ref "
+			       "reaches\n", (unsigned long long)manifests, (unsigned long long)objects,
+			       (unsigned long long)checkouts);
 		}
 		hull_store_close(&store);
 	}
