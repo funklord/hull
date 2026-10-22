@@ -198,22 +198,39 @@ int hull_access_machine(hull_sexpr_doc *doc, const uint8_t *plan, size_t length,
 
 int hull_access_execute(char *const argv[], char *const envp[])
 {
-	static const char fallback[] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-	const char       *search = fallback;
+	static const char fallback[] = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+	const char       *search = fallback + 5;
 	const char       *file = argv[0];
 	size_t            file_length = strlen(file);
 	int               denied = 0;
 	int               last = ENOENT;
+	char             *with_path[1024];
+	size_t            count = 0u;
+	int               has_path = 0;
 
 	if (file[0] == '\0') {
 		errno = ENOENT;
 		return -1;
 	}
+	for (char *const *e = envp; e != NULL && *e != NULL; e++, count++)
+		if (strncmp(*e, "PATH=", 5u) == 0) {
+			search = *e + 5;
+			has_path = 1;
+		}
+	/* Where neither the spec nor the image names a PATH, the one searched
+	 * is the workload's as well: a shell's own default is not exported,
+	 * so its children had none, and gcc, which finds cc1 from where it
+	 * was found, could not, nor `command -v` an sbin program. On the
+	 * stack, since this runs in a child of a process with threads. */
+	if (!has_path && count + 2u <= sizeof with_path / sizeof with_path[0]) {
+		for (size_t i = 0u; i < count; i++)
+			with_path[i] = envp[i];
+		with_path[count]      = (char *)fallback;
+		with_path[count + 1u] = NULL;
+		envp = with_path;
+	}
 	if (strchr(file, '/') != NULL)
 		return execve(file, argv, envp);
-	for (char *const *e = envp; e != NULL && *e != NULL; e++)
-		if (strncmp(*e, "PATH=", 5u) == 0)
-			search = *e + 5;
 	for (const char *at = search;; ) {
 		const char *end = strchr(at, ':');
 		size_t      n = end != NULL ? (size_t)(end - at) : strlen(at);

@@ -1224,6 +1224,15 @@ conf nethost "(command \"/probe\" \"dial\" \"127.0.0.1\" \"$listen_port\") (netw
 from_root 0 "^dial 127\\.0\\.0\\.1:$listen_port=the host loopback\$" -f "$root/nethost.conf"
 conf netnone "(command \"/probe\" \"dial\" \"127.0.0.1\" \"$listen_port\") (network none)"
 from_root 0 "^dial 127\\.0\\.0\\.1:$listen_port=Connection refused\$" -f "$root/netnone.conf"
+# Where neither the spec nor the image names a PATH, the workload is
+# given the one it was searched for on, sbins and all, as docker gives a
+# container one: a shell's own is not exported, and gcc, which finds cc1
+# from where it was found, could not without it. One the spec names is
+# its own.
+conf pathless '(command "/probe" "env" "PATH")'
+from_root 0 '^PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin$' -f "$root/pathless.conf"
+conf pathed '(env (PATH "/opt/only")) (command "/probe" "env" "PATH")'
+from_root 0 '^PATH=/opt/only$' -f "$root/pathed.conf"
 conf nested '(command "/probe" "nest")'
 from_root 0 '^nest=ok$' -f "$root/nested.conf"
 conf nestover '(mutable overlay) (command "/probe" "nest")'

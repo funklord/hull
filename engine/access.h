@@ -53,7 +53,8 @@ int hull_access_exposed(const hull_sexpr_doc *doc, const hull_sexpr_form *machin
 /* `argv` executed with `envp`, as docker runs a container's command: a
  * file with a slash in it as it is, and any other searched for in the
  * PATH `envp` gives, or docker's default where it gives none, the first
- * that runs taken. Returns only when none ran, with errno EACCES where one
+ * that runs taken; where `envp` gives none, that default is added to it,
+ * as docker gives a container one. Returns only when none ran, with errno EACCES where one
  * was found and could not be run, else ENOENT, or what the last said. It
  * allocates nothing, so a child may call it between fork and exec. */
 int hull_access_execute(char *const argv[], char *const envp[]);
