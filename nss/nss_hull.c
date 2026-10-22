@@ -35,6 +35,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 /* Only what is marked EXPORT leaves the library: the Makefile compiles it
  * with hidden visibility, and the directive below says so to fmake. */
@@ -69,16 +70,37 @@ static int machine_of(const char *name, char id[64])
 	return 1;
 }
 
+/* A runtime directory of the user's own and no one else's, as hull's
+ * frontend takes one where XDG_RUNTIME_DIR names none (cli/runtime.c). */
+static int owned(const char *dir)
+{
+	struct stat st;
+
+	return lstat(dir, &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid == getuid() &&
+	       (st.st_mode & 077) == 0;
+}
+
 static FILE *open_hosts(void)
 {
 	char        path[4096];
+	char        dir[4096];
 	const char *runtime = secure_getenv("XDG_RUNTIME_DIR");
 	int         n;
 
-	if (runtime != NULL && runtime[0] == '/')
+	if (runtime != NULL && runtime[0] == '/') {
 		n = snprintf(path, sizeof path, "%s/hull/hosts", runtime);
-	else
-		n = snprintf(path, sizeof path, "/run/user/%u/hull/hosts", (unsigned)getuid());
+	} else {
+		/* Where the frontend would have chosen: /run/user/UID, then
+		 * /dev/shm/hull-UID, then /tmp/hull-UID, read and never made. */
+		snprintf(dir, sizeof dir, "/run/user/%u", (unsigned)getuid());
+		if (!owned(dir))
+			snprintf(dir, sizeof dir, "/dev/shm/hull-%u", (unsigned)getuid());
+		if (!owned(dir))
+			snprintf(dir, sizeof dir, "/tmp/hull-%u", (unsigned)getuid());
+		if (!owned(dir))
+			return NULL;
+		n = snprintf(path, sizeof path, "%s/hull/hosts", dir);
+	}
 	if (n < 0 || (size_t)n >= sizeof path)
 		return NULL;
 	return fopen(path, "re");

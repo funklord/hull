@@ -56,6 +56,7 @@
 #include "matrix.h"
 #include "plan.h"
 #include "registry.h"
+#include "runtime.h"
 #include "sha256.h"
 #include "spec.h"
 #include "pull.h"
@@ -743,6 +744,9 @@ static void interrupt(int signal)
 	interrupted = 1;
 }
 
+/* Why no runtime directory was chosen, where XDG_RUNTIME_DIR named none. */
+static char runtime_why[512];
+
 /* $XDG_RUNTIME_DIR/hull/<leaf>, or 0 if the runtime directory is unset. */
 static int runtime_path(char *out, size_t cap, const char *leaf)
 {
@@ -864,7 +868,8 @@ static int connect_core(hull_wire *wire, int start)
 		return 1;
 	if (fd < 0) {
 		if (getenv("XDG_RUNTIME_DIR") == NULL)
-			fprintf(stderr, "hull: XDG_RUNTIME_DIR is not set, so there is no core\n");
+			fprintf(stderr, "hull: XDG_RUNTIME_DIR is not set, and no runtime directory would "
+			        "do (%s), so there is no core\n", runtime_why);
 		else if (start)
 			fprintf(stderr, "hull: the core did not start; see $XDG_RUNTIME_DIR/hull/core.log\n");
 		return -1;
@@ -3337,6 +3342,22 @@ int main(int argc, char **argv)
 	int           check  = 0;
 
 	memset(&o, 0, sizeof o);
+	/* A service account's job, as a CI server runs one, has no login and
+	 * so no XDG_RUNTIME_DIR: one is chosen, once, here, for the core and
+	 * the engines it starts, and nothing is said of it unless it fails. */
+	{
+		const char *given = getenv("XDG_RUNTIME_DIR");
+
+		if (given == NULL || given[0] == '\0') {
+			char chosen[4096];
+
+			if (hull_runtime_choose(getuid(), hull_runtime_bases, 3u, chosen, sizeof chosen,
+			                        runtime_why, sizeof runtime_why) == 0)
+				setenv("XDG_RUNTIME_DIR", chosen, 1);
+			else
+				unsetenv("XDG_RUNTIME_DIR");
+		}
+	}
 	o.file   = "hull.conf";
 	o.stream = stdout;
 	if (argc < 2) {

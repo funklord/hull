@@ -83,6 +83,45 @@ expect "$root/fixed" ahostsv6 web.hull 0 '::ffff:127.107.3.4 STREAM web.hull
 # then /run/user/UID's, which in the namespace is root's, and none.
 expect "fixed" hosts web.hull 2 ''
 
+# fallback SETUP STATUS ANSWER: with no XDG_RUNTIME_DIR, `getent hosts
+# web.hull` after the shell text SETUP has laid out the places the
+# frontend would choose, each a tmpfs of the namespace's own over
+# /run/user, /dev/shm and /tmp, so that the account's are not seen. The
+# library is reached through a descriptor opened before, since a tree
+# under /tmp, as a scratch copy's is, is hidden by the tmpfs.
+fallback() {
+	out=$(timeout 20 unshare -rm sh -c '
+mount --bind "$1" /etc/nsswitch.conf || exit 99
+exec 3< "$2" || exit 99
+for d in /run/user /dev/shm /tmp; do mount -t tmpfs none "$d" || exit 99; done
+eval "$3"
+LD_LIBRARY_PATH=/proc/self/fd/3 exec env -u XDG_RUNTIME_DIR getent hosts web.hull' sh \
+		"$root/nsswitch.conf" "$lib_dir" "$1" 2>&1)
+	got=$?
+	cases=$((cases + 1))
+	squeezed=$(printf '%s\n' "$out" | tr -s ' \t' '  ' | sed 's/ $//')
+	[ "$got" = "$2" ] && [ "$squeezed" = "$3" ] ||
+		fail "with no XDG_RUNTIME_DIR, after '$1', getent exited $got, wanted $2 and '$3'" "$out"
+}
+
+# plant DIR ADDRESS, as SETUP text: a hosts file in DIR, made 0700.
+plant() {
+	printf 'mkdir -p %s/hull && chmod 700 %s && printf "web %s\\n" > %s/hull/hosts; ' \
+		"$1" "$1" "$2" "$1"
+}
+
+# Where the frontend would have chosen, in its order; one others may
+# enter, and a symlink, are passed over for the next.
+fallback "$(plant /run/user/0 127.107.0.1)$(plant /dev/shm/hull-0 127.107.0.2)" \
+	0 '127.107.0.1 web.hull'
+fallback "$(plant /dev/shm/hull-0 127.107.0.2)$(plant /tmp/hull-0 127.107.0.3)" \
+	0 '127.107.0.2 web.hull'
+fallback "$(plant /tmp/hull-0 127.107.0.3)" 0 '127.107.0.3 web.hull'
+fallback "$(plant /dev/shm/hull-0 127.107.0.2)chmod 755 /dev/shm/hull-0; $(plant /tmp/hull-0 127.107.0.3)" \
+	0 '127.107.0.3 web.hull'
+fallback "$(plant /tmp/elsewhere 127.107.0.4)ln -s /tmp/elsewhere /dev/shm/hull-0" 2 ''
+fallback '' 2 ''
+
 # The core's own: a file that a core which died left is not true once a
 # core runs, a machine it runs has its address there, and the file goes
 # with the core.
