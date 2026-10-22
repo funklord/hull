@@ -28,8 +28,9 @@ once idle, and `hull ps`, `stop`, `kill`, `logs`, `attach`, `exec` and
 machine by its stable address. The optional store keeps trees by content:
 `hull commit`, `materialize`, `diff`, `tag`, `images`, `manifest show`,
 `gc`; `hull pull`, which brings an image from an OCI registry, so that a
-machine whose source names it runs it; and `hull push`, which publishes a
-stored tree as an image.
+machine whose source names it runs it; `hull push`, which publishes a
+stored tree as an image; and `hull build`, which builds one in steps, each
+cached by what it was built from.
 `hull_engine.h` is a draft of the C plugin interface that engines
 implement.
 

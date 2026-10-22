@@ -25,7 +25,6 @@
 #include <zlib.h>
 
 #include "store.h"
-#include "store_private.h"
 
 #define BLOCK   512u
 #define MAX_PAX (1u << 20)

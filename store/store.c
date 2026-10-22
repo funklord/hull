@@ -44,7 +44,6 @@
 #include "sexpr.h"
 #include "sha256.h"
 #include "store.h"
-#include "store_private.h"
 #include "tree.h"
 
 /* --- a growing buffer ------------------------------------------------------ */
@@ -546,7 +545,7 @@ int hull_store_commit(hull_store *store, const char *dir, const char *arch, cons
 	int      result = -1;
 
 	memset(out, 0, sizeof *out);
-	if (!is_ref(ref))
+	if (ref != NULL && !is_ref(ref))
 		return say(why, cap, "a ref is names of letters, digits and ._-:@, joined by /", NULL);
 	if ((top = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) < 0)
 		return say(why, cap, dir, strerror(errno));
@@ -601,7 +600,7 @@ int hull_store_commit(hull_store *store, const char *dir, const char *arch, cons
 		goto done;
 	}
 	if (store_manifest(store, &manifest, out->manifest, why, cap) == 0 &&
-	    set_ref(store, ref, out->manifest, why, cap) == 0)
+	    (ref == NULL || set_ref(store, ref, out->manifest, why, cap) == 0))
 		result = 0;
 done:
 	flock(store->lock, LOCK_UN);
@@ -1036,7 +1035,7 @@ int hull_store_materialize(hull_store *store, const char *ref, const char *dir,
 
 /* --- checkouts ------------------------------------------------------------ */
 
-/* See store_private.h. */
+/* See store.h. */
 int hull_store_remove_tree(int parent, const char *name)
 {
 	int            fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -1514,6 +1513,40 @@ static void show_form(FILE *out, const hull_sexpr_doc *doc, const hull_sexpr_for
 			          string && item.offset != head.offset);
 	}
 	fputc(')', out);
+}
+
+int hull_store_resolve(hull_store *store, const char *name, char hex[65], char *why, size_t cap)
+{
+	uint8_t *data;
+	size_t   length;
+
+	flock(store->lock, LOCK_SH);
+	data = name_manifest(store, name, hex, why, cap) == 0 ?
+	       read_manifest(store, hex, &length, why, cap) : NULL;
+	flock(store->lock, LOCK_UN);
+	free(data);
+	return data != NULL ? 0 : -1;
+}
+
+int hull_store_hold(hull_store *store, char *why, size_t cap)
+{
+	char path[4200];
+	int  fd;
+
+	snprintf(path, sizeof path, "%s/lock", store->root);
+	if ((fd = open(path, O_RDWR | O_CLOEXEC)) < 0 || flock(fd, LOCK_SH) != 0) {
+		say(why, cap, path, strerror(errno));
+		if (fd >= 0)
+			close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+void hull_store_release(int held)
+{
+	if (held >= 0)
+		close(held);
 }
 
 int hull_store_runtime(hull_store *store, const char *name, uint8_t **out, size_t *length,

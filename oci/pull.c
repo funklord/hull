@@ -27,7 +27,6 @@
 #include "pull.h"
 #include "remote.h"
 #include "sha256.h"
-#include "store_private.h"
 
 #define MAX_DOCUMENT  HULL_REMOTE_DOCUMENT
 #define ACCEPT_MANIFESTS                                                     \

@@ -30,6 +30,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <libgen.h>
+#include <linux/openat2.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -41,6 +42,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -54,6 +56,7 @@
 #include "matrix.h"
 #include "plan.h"
 #include "registry.h"
+#include "sha256.h"
 #include "spec.h"
 #include "pull.h"
 #include "push.h"
@@ -91,6 +94,7 @@ static void usage(FILE *out)
 	      " [--resolved]\n"
 	      "       hull check [-f FILE] --backend B[,B...] [--accept TOKEN]...\n"
 	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [NAME]\n"
+	      "       hull build [-f FILE] REF\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
 	      "       hull kill [-s SIGNAL] ID | hull stats [--over S] ID\n"
@@ -1316,6 +1320,709 @@ static int run(options *o, const hull_registry *registry, const char *name)
 	return status;
 }
 
+/* --- hull build ----------------------------------------------------------- */
+
+static int open_store(hull_store *store, int create);
+
+/* A build's step, section 3.6's and Appendix E's: what its cache key is
+ * made of, and what it ran on. */
+typedef struct step_input {
+	uint8_t digest[32];
+	char    manifest[65];  /* a directory's, committed, or "" for a file */
+	char    path[4096];    /* on the host, as the file means it */
+} step_input;
+
+#define MAX_STEP_INPUTS 64u
+
+static void hex_of_bytes(const uint8_t *bytes, size_t n, char *out)
+{
+	for (size_t i = 0u; i < n; i++)
+		snprintf(out + 2u * i, 3, "%02x", bytes[i]);
+}
+
+static int bytes_of_hex(const char *hex, uint8_t *out, size_t n)
+{
+	for (size_t i = 0u; i < n; i++) {
+		unsigned value;
+
+		if (sscanf(hex + 2u * i, "%2x", &value) != 1)
+			return -1;
+		out[i] = (uint8_t)value;
+	}
+	return 0;
+}
+
+/* A string value of `(key "value")` in a record, into `out`, or 0. */
+static int record_text(const hull_spec *spec, const hull_sexpr_form *record, const char *key,
+                       char *out, size_t cap)
+{
+	hull_sexpr_form entry;
+	hull_sexpr_form head;
+	hull_sexpr_form value;
+	size_t          length;
+
+	if (!hull_spec_find(spec, record, key, &entry) || !hull_sexpr_child(&spec->doc, &entry, &head) ||
+	    !hull_sexpr_next(&spec->doc, &head, &value) ||
+	    hull_sexpr_value(&spec->doc, &value, (uint8_t *)out, cap - 1u, &length) != HULL_SEXPR_OK)
+		return 0;
+	out[length] = '\0';
+	return 1;
+}
+
+/* `path`, absolute in a tree, opened beneath `root` as the tree's own
+ * symlinks resolve, its directories made where missing when `make`: the
+ * parent's descriptor, its last part into `*leaf`; -2 for a path with a
+ * `.` or `..` part, or -1 with errno, as where a symlink leads to a
+ * directory the tree has not. `copy` holds the path while `*leaf` points
+ * into it. */
+static int in_tree(int root, const char *path, char *copy, size_t cap, const char **leaf, int make)
+{
+	struct open_how how = { .flags = O_PATH | O_DIRECTORY | O_CLOEXEC,
+	                        .resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS };
+	char           *slash;
+	int             fd;
+
+	while (*path == '/')
+		path++;
+	if ((size_t)snprintf(copy, cap, "%s", path) >= cap || copy[0] == '\0')
+		return -2;
+	for (char *part = copy;; ) {
+		char *end = strchr(part, '/');
+		size_t n = end != NULL ? (size_t)(end - part) : strlen(part);
+
+		if (n == 0u || (n == 1u && part[0] == '.') || (n == 2u && part[0] == '.' && part[1] == '.'))
+			return -2;
+		if (end == NULL)
+			break;
+		part = end + 1;
+	}
+	if ((slash = strrchr(copy, '/')) == NULL) {
+		*leaf = copy;
+		return (int)syscall(SYS_openat2, root, ".", &how, sizeof how);
+	}
+	*slash = '\0';
+	*leaf = slash + 1;
+	fd = (int)syscall(SYS_openat2, root, copy, &how, sizeof how);
+	if (fd < 0 && errno == ENOENT && make) {
+		for (char *at = copy + 1;; at++) {
+			char saved;
+
+			if (*at != '/' && *at != '\0')
+				continue;
+			saved = *at;
+			*at = '\0';
+			{
+				char *last = strrchr(copy, '/');
+				int   above;
+
+				if (last != NULL) {
+					*last = '\0';
+					above = (int)syscall(SYS_openat2, root, copy, &how, sizeof how);
+					*last = '/';
+				} else {
+					above = (int)syscall(SYS_openat2, root, ".", &how, sizeof how);
+				}
+				if (above >= 0) {
+					mkdirat(above, last != NULL ? last + 1 : copy, 0755);
+					close(above);
+				}
+			}
+			*at = saved;
+			if (saved == '\0')
+				break;
+		}
+		fd = (int)syscall(SYS_openat2, root, copy, &how, sizeof how);
+	}
+	return fd;
+}
+
+/* An input's digest: a directory's manifest, committed with no ref, so
+ * that a copy of it has its objects in the store; a file's sha256 over its
+ * mode and bytes. */
+static int input_of(hull_store *store, const char *path, step_input *in, char *why, size_t cap)
+{
+	struct stat st;
+
+	snprintf(in->path, sizeof in->path, "%s", path);
+	in->manifest[0] = '\0';
+	if (stat(path, &st) != 0) {
+		snprintf(why, cap, "%s: %s", path, strerror(errno));
+		return -1;
+	}
+	if (S_ISDIR(st.st_mode)) {
+		hull_commit made;
+
+		if (hull_store_commit(store, path, host_arch(), NULL, NULL, &made, why, cap) != 0)
+			return -1;
+		snprintf(in->manifest, sizeof in->manifest, "%s", made.manifest);
+		return bytes_of_hex(made.manifest, in->digest, 32u);
+	}
+	if (S_ISREG(st.st_mode)) {
+		hull_sha256 h;
+		uint8_t     chunk[65536];
+		char        head[32];
+		ssize_t     n;
+		int         fd = open(path, O_RDONLY | O_CLOEXEC);
+
+		if (fd < 0) {
+			snprintf(why, cap, "%s: %s", path, strerror(errno));
+			return -1;
+		}
+		hull_sha256_init(&h);
+		n = snprintf(head, sizeof head, "file %o\n", (unsigned)(st.st_mode & 07777));
+		hull_sha256_update(&h, head, (size_t)n);
+		while ((n = read(fd, chunk, sizeof chunk)) > 0)
+			hull_sha256_update(&h, chunk, (size_t)n);
+		close(fd);
+		hull_sha256_final(&h, in->digest);
+		return n < 0 ? -1 : 0;
+	}
+	snprintf(why, cap, "%s: neither a file nor a directory", path);
+	return -1;
+}
+
+/* A file into the tree at `to`, its mode kept, replacing what is there. */
+static int copy_file(int root, const char *from, const char *to, char *why, size_t cap)
+{
+	char        copy[4096];
+	const char *leaf;
+	int         dir = in_tree(root, to, copy, sizeof copy, &leaf, 1);
+	struct stat st;
+	uint8_t     chunk[65536];
+	ssize_t     n;
+	int         in;
+	int         out;
+
+	if (dir < 0) {
+		snprintf(why, cap, "%s: %s", to, dir == -2 ? "not a path the tree can hold" :
+		         strerror(errno));
+		return -1;
+	}
+	if ((in = open(from, O_RDONLY | O_CLOEXEC)) < 0 || fstat(in, &st) != 0) {
+		snprintf(why, cap, "%s: %s", from, strerror(errno));
+		close(dir);
+		if (in >= 0)
+			close(in);
+		return -1;
+	}
+	unlinkat(dir, leaf, 0);
+	out = openat(dir, leaf, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+	close(dir);
+	if (out < 0) {
+		snprintf(why, cap, "%s: %s", to, strerror(errno));
+		close(in);
+		return -1;
+	}
+	while ((n = read(in, chunk, sizeof chunk)) > 0)
+		if (write(out, chunk, (size_t)n) != n) {
+			n = -1;
+			break;
+		}
+	close(in);
+	if (n < 0 || fchmod(out, st.st_mode & 07777) != 0 || close(out) != 0) {
+		snprintf(why, cap, "%s: %s", to, strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+/* A directory's committed tree into the tree at `to`, which must be absent
+ * or empty there. */
+static int copy_tree(hull_store *store, int root, const step_input *in, const char *to, char *why,
+                     size_t cap)
+{
+	char        copy[4096];
+	char        target[4200];
+	char        name[80];
+	const char *leaf;
+	uint64_t    skipped = 0u;
+	int         dir = in_tree(root, to, copy, sizeof copy, &leaf, 1);
+	int         result;
+
+	if (dir < 0) {
+		snprintf(why, cap, "%s: %s", to, dir == -2 ? "not a path the tree can hold" :
+		         strerror(errno));
+		return -1;
+	}
+	snprintf(target, sizeof target, "/proc/self/fd/%d/%s", dir, leaf);
+	snprintf(name, sizeof name, "sha256:%s", in->manifest);
+	result = hull_store_materialize(store, name, target, &skipped, why, cap);
+	/* The directory itself has the mode its source has, as its contents
+	 * have theirs from the manifest. */
+	if (result == 0) {
+		struct stat st;
+
+		if (stat(in->path, &st) != 0 || chmod(target, st.st_mode & 07777) != 0) {
+			snprintf(why, cap, "%s: %s", to, strerror(errno));
+			result = -1;
+		}
+	}
+	close(dir);
+	return result;
+}
+
+/* "7d" and its kind as seconds, or 0. */
+static long long seconds_of(const char *text)
+{
+	char     *end;
+	long long n = strtoll(text, &end, 10);
+
+	switch (*end) {
+	case 's': return n;
+	case 'm': return n * 60;
+	case 'h': return n * 3600;
+	case 'd': return n * 86400;
+	case 'w': return n * 604800;
+	default:  return 0;
+	}
+}
+
+/* The env a step runs with: the parent's runtime's, then PATH where it
+ * gives none, and SOURCE_DATE_EPOCH, for toolchains that honour it. */
+static void step_env(text_buf *t, const uint8_t *runtime, size_t runtime_length)
+{
+	hull_sexpr_doc  doc;
+	hull_sexpr_form top;
+	hull_sexpr_form env;
+	int             has_path = 0;
+
+	add_text(t, " (env");
+	if (runtime != NULL &&
+	    hull_sexpr_open(&doc, runtime, runtime_length, HULL_SEXPR_CANONICAL, NULL) == HULL_SEXPR_OK &&
+	    hull_sexpr_first(&doc, &top) && record_find(&doc, &top, "env", &env)) {
+		hull_sexpr_form pair;
+		int             more;
+
+		hull_sexpr_child(&doc, &env, &pair);
+		for (more = hull_sexpr_next(&doc, &pair, &pair); more;
+		     more = hull_sexpr_next(&doc, &pair, &pair)) {
+			hull_sexpr_form key;
+			hull_sexpr_form value;
+			size_t          before = t->length;
+
+			hull_sexpr_child(&doc, &pair, &key);
+			hull_sexpr_next(&doc, &key, &value);
+			if (!is_key(doc.data + key.content, key.content_length) ||
+			    (key.content_length == 17u &&
+			     memcmp(doc.data + key.content, "SOURCE_DATE_EPOCH", 17u) == 0))
+				continue;
+			has_path |= key.content_length == 4u && memcmp(doc.data + key.content, "PATH", 4u) == 0;
+			add_text(t, " (");
+			add_bytes(t, doc.data + key.content, key.content_length);
+			add_text(t, " ");
+			if (add_quoted(t, doc.data + value.content, value.content_length) != 0)
+				cut_text(t, before);
+			else
+				add_text(t, ")");
+		}
+	}
+	if (!has_path)
+		add_text(t, " (PATH \"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\")");
+	add_text(t, " (SOURCE_DATE_EPOCH \"0\"))");
+}
+
+/*
+ * `hull build`: section 3.6's steps over the base, each committed, each
+ * cached by hash(parent, step, inputs). A step's tree is its parent
+ * materialized under the store's tmp/, its copies put in, its run line
+ * run as a chroot machine on it, `(mutable direct)` and its network none
+ * unless it says (network true), and the tree committed, /tmp and its
+ * discard paths dropped, with the parent's runtime and A.5's build
+ * provenance. The last step's manifest is tagged `ref`.
+ */
+static int build_file(options *o, const hull_registry *registry, const char *ref)
+{
+	static uint8_t  canonical[HULL_PLAN_TEXT];
+	static uint8_t  work[3u * HULL_PLAN_TEXT];
+	hull_spec       spec;
+	hull_spec_error error;
+	hull_store      store;
+	hull_sexpr_form steps;
+	hull_sexpr_form step;
+	uint8_t        *data;
+	size_t          length;
+	char            base[4096];
+	char            parent[65];
+	char            why[4400] = "";
+	int             held = -1;
+	int             result = 1;
+	int             more;
+
+	data = read_file(o->file, &length);
+	if (data == NULL)
+		return 1;
+	if (hull_spec_open(&spec, data, length, &error) != HULL_SPEC_OK) {
+		fprintf(stderr, "%s:%u:%u: %s%s%s\n", o->file, error.line, error.column, error.path,
+		        error.path[0] != '\0' ? ": " : "", error.reason);
+		free(data);
+		return 1;
+	}
+	if (!spec.has_build) {
+		fprintf(stderr, "%s: there is no (build ...) to build\n", o->file);
+		free(data);
+		return 1;
+	}
+	if (open_store(&store, 1) != 0) {
+		free(data);
+		return 1;
+	}
+	/* Held from the base to the tag, so that gc, which waits for it,
+	 * cannot take a manifest no ref names yet. */
+	if ((held = hull_store_hold(&store, why, sizeof why)) < 0)
+		goto done;
+	record_text(&spec, &spec.build, "base", base, sizeof base);
+	if (strncmp(base, "dir:", 4u) == 0) {
+		step_input in;
+		char       absolute[8200];
+
+		snprintf(absolute, sizeof absolute, "%s%s%s", base[4] == '/' ? "" : o->base,
+		         base[4] == '/' ? "" : "/", base + 4);
+		if (input_of(&store, absolute, &in, why, sizeof why) != 0 || in.manifest[0] == '\0') {
+			if (in.manifest[0] == '\0' && why[0] == '\0')
+				snprintf(why, sizeof why, "%.4000s: a dir base is a directory", absolute);
+			goto done;
+		}
+		snprintf(parent, sizeof parent, "%s", in.manifest);
+	} else if (hull_store_resolve(&store, base, parent, why, sizeof why) != 0) {
+		hull_commit made;
+
+		why[0] = '\0';
+		fprintf(stderr, "hull: build: %s is not in the store; pulling it\n", base);
+		if (hull_pull(&store, base, base, host_arch(), "hull " HULL_VERSION, &made, why,
+		              sizeof why) != 0)
+			goto done;
+		snprintf(parent, sizeof parent, "%s", made.manifest);
+	}
+	fprintf(stderr, "hull: build: base %s is sha256:%s\n", base, parent);
+
+	more = hull_spec_find(&spec, &spec.build, "steps", &steps) &&
+	       hull_sexpr_child(&spec.doc, &steps, &step);
+	for (more = more && hull_sexpr_next(&spec.doc, &step, &step); more;
+	     more = hull_sexpr_next(&spec.doc, &step, &step)) {
+		static step_input inputs[MAX_STEP_INPUTS];
+		hull_sexpr_form   entry;
+		hull_sexpr_form   item;
+		char              name[256] = "";
+		char              run_line[8192];
+		char              backend[64] = "";
+		char              key_hex[65];
+		char              cache[96];
+		char              scratch[4400];
+		char              root_path[4500];
+		hull_sha256       h;
+		uint8_t           key[32];
+		uint32_t          canonical_length = 0u;
+		unsigned          input_count = 0u;
+		int               network;
+		int               has_run;
+		int               ok;
+
+		record_text(&spec, &step, "name", name, sizeof name);
+		has_run = record_text(&spec, &step, "run", run_line, sizeof run_line);
+		record_text(&spec, &step, "backend", backend, sizeof backend);
+		network = hull_spec_find(&spec, &step, "network", &entry) &&
+		          hull_sexpr_child(&spec.doc, &entry, &item) &&
+		          hull_sexpr_next(&spec.doc, &item, &item) &&
+		          hull_sexpr_is(&spec.doc, &item, "true");
+		if (hull_sexpr_to_canonical(&spec.doc, &step, canonical, sizeof canonical,
+		                            &canonical_length, work, sizeof work) != HULL_SEXPR_OK) {
+			snprintf(why, sizeof why, "step %s could not be put in canonical form", name);
+			goto done;
+		}
+		/* The inputs: what (inputs ...) names, then each copy's from. */
+		if (hull_spec_find(&spec, &step, "inputs", &entry)) {
+			int go;
+
+			hull_sexpr_child(&spec.doc, &entry, &item);
+			for (go = hull_sexpr_next(&spec.doc, &item, &item); go;
+			     go = hull_sexpr_next(&spec.doc, &item, &item)) {
+				char   text[4096];
+				char   absolute[8200];
+				size_t n;
+
+				if (input_count == MAX_STEP_INPUTS ||
+				    hull_sexpr_value(&spec.doc, &item, (uint8_t *)text, sizeof text - 1u, &n) !=
+				        HULL_SEXPR_OK) {
+					snprintf(why, sizeof why, "step %s: too many inputs, or one too long", name);
+					goto done;
+				}
+				text[n] = '\0';
+				snprintf(absolute, sizeof absolute, "%s%s%s", text[0] == '/' ? "" : o->base,
+				         text[0] == '/' ? "" : "/", text);
+				if (input_of(&store, absolute, &inputs[input_count++], why, sizeof why) != 0)
+					goto done;
+			}
+		}
+		if (hull_spec_find(&spec, &step, "copy", &entry)) {
+			int go;
+
+			hull_sexpr_child(&spec.doc, &entry, &item);
+			for (go = hull_sexpr_next(&spec.doc, &item, &item); go;
+			     go = hull_sexpr_next(&spec.doc, &item, &item)) {
+				char from[4096];
+				char absolute[8200];
+
+				if (input_count == MAX_STEP_INPUTS ||
+				    !record_text(&spec, &item, "from", from, sizeof from)) {
+					snprintf(why, sizeof why, "step %s: too many copies", name);
+					goto done;
+				}
+				snprintf(absolute, sizeof absolute, "%s%s%s", from[0] == '/' ? "" : o->base,
+				         from[0] == '/' ? "" : "/", from);
+				if (input_of(&store, absolute, &inputs[input_count++], why, sizeof why) != 0)
+					goto done;
+			}
+		}
+		/* The key: the parent, the step as it is written, the inputs as
+		 * they are, and with a network, the refresh period it falls in. */
+		hull_sha256_init(&h);
+		hull_sha256_update(&h, "hull build step 1\n", 18u);
+		hull_sha256_update(&h, parent, 64u);
+		hull_sha256_update(&h, canonical, canonical_length);
+		for (unsigned i = 0u; i < input_count; i++)
+			hull_sha256_update(&h, inputs[i].digest, 32u);
+		if (network) {
+			char      refresh[64] = "7d";
+			char      bucket[40];
+			long long period;
+			int       n;
+
+			record_text(&spec, &step, "refresh", refresh, sizeof refresh);
+			period = seconds_of(refresh);
+			n = snprintf(bucket, sizeof bucket, "network %lld",
+			             period > 0 ? (long long)time(NULL) / period : 0LL);
+			hull_sha256_update(&h, bucket, (size_t)n);
+		}
+		hull_sha256_final(&h, key);
+		hex_of_bytes(key, 32u, key_hex);
+		snprintf(cache, sizeof cache, "build/cache/%s", key_hex);
+		if (hull_store_resolve(&store, cache, parent, why, sizeof why) == 0) {
+			fprintf(stderr, "hull: build: step %s: cached, sha256:%s\n", name, parent);
+			continue;
+		}
+		why[0] = '\0';
+		fprintf(stderr, "hull: build: step %s\n", name);
+
+		/* Its tree: the parent, as a directory the step writes. */
+		snprintf(scratch, sizeof scratch, "%s/tmp/build-XXXXXX", store.root);
+		if (mkdtemp(scratch) == NULL) {
+			snprintf(why, sizeof why, "%.4000s: %s", scratch, strerror(errno));
+			goto done;
+		}
+		snprintf(root_path, sizeof root_path, "%s/root", scratch);
+		{
+			char        named[80];
+			uint64_t    skipped = 0u;
+			uint8_t    *runtime = NULL;
+			size_t      runtime_length = 0u;
+			hull_commit made;
+			int         root = -1;
+			unsigned    copied = 0u;
+
+			snprintf(named, sizeof named, "sha256:%s", parent);
+			ok = hull_store_materialize(&store, named, root_path, &skipped, why, sizeof why) == 0 &&
+			     hull_store_runtime(&store, named, &runtime, &runtime_length, why, sizeof why) == 0 &&
+			     (root = open(root_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) >= 0;
+			/* The copies, each its committed tree or its file, at its to. */
+			if (ok && hull_spec_find(&spec, &step, "copy", &entry)) {
+				int go;
+				unsigned first = input_count;
+
+				hull_sexpr_child(&spec.doc, &entry, &item);
+				for (go = hull_sexpr_next(&spec.doc, &item, &item); go;
+				     go = hull_sexpr_next(&spec.doc, &item, &item))
+					copied++;
+				first = input_count - copied;
+				hull_sexpr_child(&spec.doc, &entry, &item);
+				for (go = hull_sexpr_next(&spec.doc, &item, &item); go && ok;
+				     go = hull_sexpr_next(&spec.doc, &item, &item), first++) {
+					char to[4096];
+
+					record_text(&spec, &item, "to", to, sizeof to);
+					ok = inputs[first].manifest[0] != '\0' ?
+					     copy_tree(&store, root, &inputs[first], to, why, sizeof why) == 0 :
+					     copy_file(root, inputs[first].path, to, why, sizeof why) == 0;
+				}
+			}
+			/* The run line, in a chroot machine on the tree, or the
+			 * engine the step names. */
+			if (ok && has_run) {
+				text_buf conf = { 0 };
+				options  sub = { 0 };
+				char     conf_path[4600];
+				char     workdir[4096] = "/";
+				FILE    *f;
+				int      status;
+
+				if (runtime != NULL) {
+					hull_sexpr_doc  doc;
+					hull_sexpr_form top;
+					hull_sexpr_form found;
+
+					if (hull_sexpr_open(&doc, runtime, runtime_length, HULL_SEXPR_CANONICAL,
+					                    NULL) == HULL_SEXPR_OK && hull_sexpr_first(&doc, &top) &&
+					    record_find(&doc, &top, "workdir", &found)) {
+						hull_sexpr_form head;
+						hull_sexpr_form value;
+
+						hull_sexpr_child(&doc, &found, &head);
+						hull_sexpr_next(&doc, &head, &value);
+						if (value.content_length < sizeof workdir) {
+							memcpy(workdir, doc.data + value.content, value.content_length);
+							workdir[value.content_length] = '\0';
+						}
+					}
+				}
+				add_text(&conf, "(machine (source ");
+				add_text(&conf, "\"dir:");
+				add_text(&conf, root_path);
+				add_text(&conf, "\") (mutable direct) (backend ");
+				add_text(&conf, backend[0] == '\0' || strcmp(backend, "ns") == 0 ? "chroot" :
+				                backend);
+				add_text(&conf, ") (hostname \"build-");
+				add_bytes(&conf, key_hex, 12u);
+				add_text(&conf, "\")");
+				/* (network true) is the host's on chroot, and on a vm its
+				 * own; otherwise none. */
+				if (!network)
+					add_text(&conf, " (network none)");
+				else if (backend[0] == '\0' || strcmp(backend, "ns") == 0 ||
+				         strcmp(backend, "chroot") == 0)
+					add_text(&conf, " (network host)");
+				add_text(&conf, " (workdir ");
+				add_quoted(&conf, (const uint8_t *)workdir, strlen(workdir));
+				add_text(&conf, ") (command \"/bin/sh\" \"-c\" ");
+				if (add_quoted(&conf, (const uint8_t *)run_line, strlen(run_line)) != 0) {
+					snprintf(why, sizeof why, "step %s: its run line holds what a string cannot",
+					         name);
+					ok = 0;
+				}
+				add_text(&conf, ")");
+				step_env(&conf, runtime, runtime_length);
+				add_text(&conf, ")\n");
+				snprintf(conf_path, sizeof conf_path, "%s/step.conf", scratch);
+				if (ok && (conf.failed || strpbrk(root_path, "\"\\") != NULL ||
+				           (f = fopen(conf_path, "w")) == NULL ||
+				           fwrite(conf.data, 1u, conf.length, f) != conf.length || fclose(f) != 0)) {
+					snprintf(why, sizeof why, "step %s: its machine could not be written", name);
+					ok = 0;
+				}
+				free(conf.data);
+				if (ok) {
+					sub.file = conf_path;
+					sub.stream = stderr;
+					sub.base = scratch;
+					status = run(&sub, registry, NULL);
+					if (status != 0) {
+						snprintf(why, sizeof why, "step %s exited %d", name, status);
+						ok = 0;
+					}
+				}
+			}
+			/* What a step leaves that is not the tree's: /tmp's contents,
+			 * and what it says to discard. */
+			if (ok) {
+				char        copy[4096];
+				const char *leaf;
+				int         tmp = in_tree(root, "/tmp/x", copy, sizeof copy, &leaf, 0);
+
+				if (tmp >= 0) {
+					DIR           *list = fdopendir(openat(tmp, ".", O_RDONLY | O_DIRECTORY |
+					                                            O_CLOEXEC));
+					struct dirent *gone;
+
+					while (list != NULL && (gone = readdir(list)) != NULL)
+						if (strcmp(gone->d_name, ".") != 0 && strcmp(gone->d_name, "..") != 0)
+							hull_store_remove_tree(dirfd(list), gone->d_name);
+					if (list != NULL)
+						closedir(list);
+					close(tmp);
+				}
+				if (hull_spec_find(&spec, &step, "discard", &entry)) {
+					int go;
+
+					hull_sexpr_child(&spec.doc, &entry, &item);
+					for (go = hull_sexpr_next(&spec.doc, &item, &item); go;
+					     go = hull_sexpr_next(&spec.doc, &item, &item)) {
+						char   text[4096];
+						size_t n;
+						int    dir;
+
+						if (hull_sexpr_value(&spec.doc, &item, (uint8_t *)text, sizeof text - 1u,
+						                     &n) != HULL_SEXPR_OK)
+							continue;
+						text[n] = '\0';
+						if ((dir = in_tree(root, text, copy, sizeof copy, &leaf, 0)) >= 0) {
+							hull_store_remove_tree(dir, leaf);
+							close(dir);
+						}
+					}
+				}
+			}
+			if (root >= 0)
+				close(root);
+			/* Committed with its parent's runtime and A.5's provenance:
+			 * the inputs, the parent and the step. */
+			if (ok) {
+				text_buf          provenance = { 0 };
+				hull_commit_extra extra = { 0 };
+				uint8_t           raw[32];
+				char              atom[64];
+
+				add_text(&provenance, "(10:provenance(5:build(6:inputs");
+				for (unsigned i = 0u; i < input_count; i++) {
+					add_text(&provenance, "32:");
+					add_bytes(&provenance, inputs[i].digest, 32u);
+				}
+				add_text(&provenance, ")(6:parent32:");
+				bytes_of_hex(parent, raw, 32u);
+				add_bytes(&provenance, raw, 32u);
+				add_text(&provenance, ")(4:step");
+				add_bytes(&provenance, canonical, canonical_length);
+				snprintf(atom, sizeof atom, "))(7:builder%zu:hull %s))",
+				         strlen("hull " HULL_VERSION), HULL_VERSION);
+				add_text(&provenance, atom);
+				extra.provenance = (const uint8_t *)provenance.data;
+				extra.provenance_length = provenance.length;
+				extra.runtime = runtime;
+				extra.runtime_length = runtime_length;
+				ok = !provenance.failed &&
+				     hull_store_commit(&store, root_path, host_arch(), cache, &extra, &made, why,
+				                       sizeof why) == 0;
+				if (ok) {
+					snprintf(parent, sizeof parent, "%s", made.manifest);
+					fprintf(stderr, "hull: build: step %s: sha256:%s\n", name, parent);
+				}
+				free(provenance.data);
+			}
+			free(runtime);
+			hull_store_remove_tree(AT_FDCWD, scratch);
+			if (!ok) {
+				if (why[0] == '\0')
+					snprintf(why, sizeof why, "step %s could not be built", name);
+				goto done;
+			}
+		}
+	}
+	{
+		char named[80];
+		char hex[65];
+
+		snprintf(named, sizeof named, "sha256:%s", parent);
+		if (hull_store_tag(&store, named, ref, hex, why, sizeof why) != 0)
+			goto done;
+		printf("%s sha256:%s\n", ref, hex);
+		result = 0;
+	}
+done:
+	if (result != 0)
+		fprintf(stderr, "hull: build: %s\n", why[0] != '\0' ? why : "it could not be built");
+	hull_store_release(held);
+	hull_store_close(&store);
+	free(data);
+	return result;
+}
+
 /* --- the other commands -------------------------------------------------- */
 
 /* Whether a core answers, without starting one; or would, holding the
@@ -2409,7 +3116,7 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	if (strcmp(command, "plan") != 0 && strcmp(command, "check") != 0 &&
-	    strcmp(command, "run") != 0) {
+	    strcmp(command, "run") != 0 && strcmp(command, "build") != 0) {
 		usage(stderr);
 		return 2;
 	}
@@ -2431,7 +3138,8 @@ int main(int argc, char **argv)
 			o.explain = 1;
 		} else if (strcmp(arg, "--resolved") == 0 && strcmp(command, "plan") == 0) {
 			o.resolved = 1;
-		} else if (strcmp(command, "run") == 0 && arg[0] != '-' && name == NULL) {
+		} else if ((strcmp(command, "run") == 0 || strcmp(command, "build") == 0) &&
+		           arg[0] != '-' && name == NULL) {
 			name = arg;
 		} else {
 			usage(stderr);
@@ -2450,6 +3158,14 @@ int main(int argc, char **argv)
 	if (strcmp(command, "run") == 0) {
 		o.stream = stderr;
 		return run(&o, &registry, name);
+	}
+	if (strcmp(command, "build") == 0) {
+		if (name == NULL) {
+			fprintf(stderr, "hull: build names the ref it makes: hull build [-f FILE] REF\n");
+			return 2;
+		}
+		o.stream = stderr;
+		return build_file(&o, &registry, name);
 	}
 	if (strcmp(command, "check") == 0 && o.backend_count == 0u) {
 		fprintf(stderr, "hull: check needs --backend, the backends to hold the spec to\n");

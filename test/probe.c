@@ -395,7 +395,22 @@ int main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IONBF, 0);
 	/* Run as a machine's /bin/sh, as `hull ssh` runs one: what it was
 	 * given, and whether that is on a terminal. */
-	if (strcmp(argv[0], "/bin/sh") == 0) {
+	/* And as a build step's shell, `/bin/sh -c "probe STEP ..."`: the
+	 * line's words after `probe` are its steps, so that a build runs with
+	 * no shell in the tree. */
+	if (strcmp(argv[0], "/bin/sh") == 0 && argc == 3 && strcmp(argv[1], "-c") == 0 &&
+	    strncmp(argv[2], "probe ", 6u) == 0) {
+		static char *words[64];
+		int          n = 1;
+
+		words[0] = argv[0];
+		for (char *word = strtok(argv[2] + 6, " "); word != NULL && n < 63;
+		     word = strtok(NULL, " "))
+			words[n++] = word;
+		words[n] = NULL;
+		argv = words;
+		argc = n;
+	} else if (strcmp(argv[0], "/bin/sh") == 0) {
 		for (int i = 1; i < argc; i++)
 			printf("sh %d=%s\n", i, argv[i]);
 		printf("tty=%s\n", isatty(0) ? "yes" : "no");

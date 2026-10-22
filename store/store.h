@@ -53,10 +53,23 @@ typedef struct hull_commit_extra {
 } hull_commit_extra;
 
 /* `dir` as a manifest of `arch`, its files into the objects, named `ref`,
- * with `extra` where it is not NULL. 0, or -1 with `why`. A file this
- * cannot hold is said on stderr and left out, counted in `skipped`. */
+ * or named nothing where `ref` is NULL, with `extra` where it is not NULL.
+ * 0, or -1 with `why`. A file this cannot hold is said on stderr and left
+ * out, counted in `skipped`. A manifest no ref names is gc's to take once
+ * nothing holds the store (hull_store_hold()). */
 int hull_store_commit(hull_store *store, const char *dir, const char *arch, const char *ref,
                       const hull_commit_extra *extra, hull_commit *out, char *why, size_t cap);
+
+/* The manifest `name` names, a ref or sha256:HEX, which the store holds,
+ * read whole and checked: its hex into `hex`. 0, or -1 with `why`. */
+int hull_store_resolve(hull_store *store, const char *name, char hex[65], char *why, size_t cap);
+
+/* The store held, shared, through a descriptor of its own, so that gc
+ * waits however many operations come and go meanwhile, as a build needs
+ * for the manifests it makes before a ref names them: the descriptor, or
+ * -1 with `why`. hull_store_release() lets it go. */
+int hull_store_hold(hull_store *store, char *why, size_t cap);
+void hull_store_release(int held);
 
 /* A.4's runtime defaults of the manifest `name` names, a ref or
  * sha256:HEX, as their canonical form, malloc'd into `*out`; `*out` is
@@ -128,6 +141,12 @@ int hull_unpack_end(hull_unpack *u, char *why, size_t cap);
 int hull_store_layer(hull_store *store, const char *name,
                      int (*sink)(void *context, const uint8_t *data, size_t n), void *context,
                      char arch[64], char *why, size_t cap);
+
+/* `name` in `parent`, and all beneath it, each directory made the user's
+ * to empty first, since a tree's modes may not let it be, and no symlink
+ * followed: as gc removes a checkout, for what a build materialized. 0, or
+ * -1 when something stayed. */
+int hull_store_remove_tree(int parent, const char *name);
 
 /* Each ref and the manifest it names, sorted by ref. */
 int hull_store_list(hull_store *store, void (*each)(void *context, const char *ref,
