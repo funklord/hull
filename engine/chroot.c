@@ -36,6 +36,8 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <pwd.h>
+#include <grp.h>
 #include <fcntl.h>
 #include <net/if.h>
 #include <poll.h>
@@ -87,6 +89,7 @@ struct hull_machine {
 	char            *envp[MAX_ENV + 1u];
 	int              readonly_root;
 	int              overlay;    /* (mutable overlay), and the root not read-only */
+	int              many;       /* the user's subordinate range mapped, not one uid */
 	int              no_new_privs;
 	char            *volume_host[MAX_VOLUMES];
 	char            *volume_guest[MAX_VOLUMES];
@@ -574,8 +577,101 @@ static void relay(int conn, int listener, int out, int err, pid_t workload)
 	}
 }
 
+/*
+ * The user's subordinate range in `file`, /etc/subuid or /etc/subgid: the
+ * line naming the user, by name or by id, as `name:start:count`. 1 and
+ * the range, or 0 where there is none.
+ */
+static int subordinate(const char *file, const char *name, unsigned long id, unsigned long *start,
+                       unsigned long *count)
+{
+	FILE *f = fopen(file, "re");
+	char  line[512];
+	char  number[32];
+	int   found = 0;
+
+	if (f == NULL)
+		return 0;
+	snprintf(number, sizeof number, "%lu", id);
+	while (!found && fgets(line, sizeof line, f) != NULL) {
+		char *first = strtok(line, ":\n");
+		char *from  = strtok(NULL, ":\n");
+		char *many  = strtok(NULL, ":\n");
+
+		if (first != NULL && from != NULL && many != NULL &&
+		    (strcmp(first, name) == 0 || strcmp(first, number) == 0)) {
+			*start = strtoul(from, NULL, 10);
+			*count = strtoul(many, NULL, 10);
+			found  = *count > 0u;
+		}
+	}
+	fclose(f);
+	return found;
+}
+
+/* `helper` (newuidmap or newgidmap) run on `pid`: 0 the user's own id, 1
+ * on the range. Whether it mapped them. */
+static int run_mapper(const char *helper, pid_t pid, unsigned long id, unsigned long start,
+                      unsigned long count)
+{
+	char  text[5][32];
+	char *argv[9];
+	pid_t child;
+	int   status = 0;
+
+	snprintf(text[0], sizeof text[0], "%ld", (long)pid);
+	snprintf(text[1], sizeof text[1], "%lu", id);
+	snprintf(text[2], sizeof text[2], "%lu", start);
+	snprintf(text[3], sizeof text[3], "%lu", count);
+	argv[0] = (char *)helper;
+	argv[1] = text[0];
+	argv[2] = "0";
+	argv[3] = text[1];
+	argv[4] = "1";
+	argv[5] = "1";
+	argv[6] = text[2];
+	argv[7] = text[3];
+	argv[8] = NULL;
+	child = fork();
+	if (child == 0) {
+		int null = open("/dev/null", O_RDWR | O_CLOEXEC);
+
+		if (null >= 0) {
+			dup2(null, 0);
+			dup2(null, 1);
+			dup2(null, 2);
+		}
+		execv(helper, argv);
+		_exit(127);
+	}
+	return child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+	       WEXITSTATUS(status) == 0;
+}
+
+/*
+ * Many uids for the machine `pid`, from outside it: where the user has a
+ * subordinate range of each and the helpers that map one, 0 is the user
+ * and 1 on the range, so a chown inside to an id the range holds works,
+ * as a postinst's to its package's own user must. Whether it did.
+ */
+static int map_many(pid_t pid, uid_t uid, gid_t gid)
+{
+	struct passwd *me = getpwuid(uid);
+	unsigned long  uid_start;
+	unsigned long  uid_count;
+	unsigned long  gid_start;
+	unsigned long  gid_count;
+
+	if (me == NULL ||
+	    !subordinate("/etc/subuid", me->pw_name, (unsigned long)uid, &uid_start, &uid_count) ||
+	    !subordinate("/etc/subgid", me->pw_name, (unsigned long)uid, &gid_start, &gid_count))
+		return 0;
+	return run_mapper("/usr/bin/newuidmap", pid, (unsigned long)uid, uid_start, uid_count) &&
+	       run_mapper("/usr/bin/newgidmap", pid, (unsigned long)gid, gid_start, gid_count);
+}
+
 static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int dir_fd,
-                     int report)
+                     int report, int mapped)
 {
 	static const int forwarded[] = { SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2 };
 	struct sigaction action;
@@ -594,9 +690,9 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	if (null < 0 || dup2(null, 0) < 0 || dup2(null, 1) < 0 || dup2(null, 2) < 0)
 		child_fail(report, "stdio");
 	{
-		int keep[3] = { report, conn, dir_fd };
+		int keep[4] = { report, conn, mapped, dir_fd };
 
-		close_others(keep, dir_fd >= 0 ? 3u : 2u);
+		close_others(keep, dir_fd >= 0 ? 4u : 3u);
 	}
 	if (pipe2(out, O_CLOEXEC) != 0 || pipe2(err, O_CLOEXEC) != 0)
 		child_fail(report, "the workload's pipes");
@@ -621,13 +717,28 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	 * machine behind its back: only stop() signals a machine. */
 	if (setsid() < 0)
 		child_fail(report, "setsid");
-	snprintf(map, sizeof map, "0 %u 1", (unsigned)uid);
-	if (write_file("/proc/self/setgroups", "deny") != 0 ||
-	    write_file("/proc/self/uid_map", map) != 0)
-		child_fail(report, "uid_map");
-	snprintf(map, sizeof map, "0 %u 1", (unsigned)gid);
-	if (write_file("/proc/self/gid_map", map) != 0)
-		child_fail(report, "gid_map");
+	/* The engine says whether it mapped many uids from outside, `M`, or the
+	 * machine is to map its one, `S`, as a process may itself. */
+	{
+		char said = 0;
+
+		if (read(mapped, &said, 1u) != 1)
+			child_fail(report, "the uid map");
+		close(mapped);
+		if (said == 'M') {
+			/* The user's own groups, unmapped here and so nobody's, go. */
+			if (setgroups(0u, NULL) != 0)
+				child_fail(report, "setgroups");
+		} else {
+			snprintf(map, sizeof map, "0 %u 1", (unsigned)uid);
+			if (write_file("/proc/self/setgroups", "deny") != 0 ||
+			    write_file("/proc/self/uid_map", map) != 0)
+				child_fail(report, "uid_map");
+			snprintf(map, sizeof map, "0 %u 1", (unsigned)gid);
+			if (write_file("/proc/self/gid_map", map) != 0)
+				child_fail(report, "gid_map");
+		}
+	}
 	if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
 		child_fail(report, "making mounts private");
 	if (!m->overlay && mount(m->root, m->root, NULL, MS_BIND | MS_REC, NULL) != 0)
@@ -973,6 +1084,7 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 {
 	int         pair[2];
 	int         report[2];
+	int         mapped[2];
 	int         dir_fd = -1;
 	uid_t       uid = getuid();
 	gid_t       gid = getgid();
@@ -992,7 +1104,7 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	}
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0 ||
-	    pipe2(report, O_CLOEXEC) != 0) {
+	    pipe2(report, O_CLOEXEC) != 0 || pipe2(mapped, O_CLOEXEC) != 0) {
 		if (dir_fd >= 0)
 			close(dir_fd);
 		return fail(error, HULL_ERR_RUNTIME, "pipe");
@@ -1008,10 +1120,20 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	if (m->pid == 0) {
 		close(report[0]);
 		close(pair[0]);
-		run_init(m, uid, gid, pair[1], dir_fd, report[1]);
+		close(mapped[1]);
+		run_init(m, uid, gid, pair[1], dir_fd, report[1], mapped[0]);
 	}
 	close(pair[1]);
 	close(report[1]);
+	close(mapped[0]);
+	/* Many uids only above an overlay, whose upper layer is a tmpfs in the
+	 * machine's own namespace: in a directory used in place an owner other
+	 * than the user would be one on the user's own disk. */
+	m->many = m->overlay && !m->readonly_root && map_many(m->pid, uid, gid);
+	if (write(mapped[1], m->many ? "M" : "S", 1u) != 1) {
+		/* The child reads its end closed and says so on the report. */
+	}
+	close(mapped[1]);
 	if (dir_fd >= 0)
 		close(dir_fd);
 	m->conn = pair[0];

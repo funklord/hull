@@ -1246,6 +1246,25 @@ conf pathless '(command "/probe" "env" "PATH")'
 from_root 0 '^PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin$' -f "$root/pathless.conf"
 conf pathed '(env (PATH "/opt/only")) (command "/probe" "env" "PATH")'
 from_root 0 '^PATH=/opt/only$' -f "$root/pathed.conf"
+# Many uids where the user has a subordinate range and the helpers that
+# map one: a chown inside an overlay machine to an id of the range works,
+# as a postinst's to its package's own user must, and the file is that
+# id's there. A directory used in place keeps one uid, an owner there
+# being one on the user's disk; and without a range, so does an overlay.
+me=$(id -un)
+if grep -q "^$me:" /etc/subuid 2>/dev/null && grep -q "^$me:" /etc/subgid 2>/dev/null &&
+	[ -u /usr/bin/newuidmap ] && [ -u /usr/bin/newgidmap ]; then
+	owned_chown='^chown=ok$'
+	owned_owner='^owner=101:101 0644$'
+else
+	owned_chown='^chown=Invalid argument$'
+	owned_owner='^owner=0:0 0644$'
+fi
+conf owned '(mutable overlay) (command "/probe" "write" "/owned" "chown" "/owned" "101" "owner" "/owned")'
+from_root 0 "$owned_chown" -f "$root/owned.conf"
+from_root 0 "$owned_owner" -f "$root/owned.conf"
+conf ownedin '(command "/probe" "chown" "/probe" "101")'
+from_root 0 '^chown=Invalid argument$' -f "$root/ownedin.conf"
 conf nested '(command "/probe" "nest")'
 from_root 0 '^nest=ok$' -f "$root/nested.conf"
 conf nestover '(mutable overlay) (command "/probe" "nest")'

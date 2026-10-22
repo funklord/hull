@@ -21,6 +21,7 @@
  * `poweroff` it powers the machine off. Steps:
  *
  *   target PATH where the symlink PATH points
+ *   chown PATH ID  whether PATH can be given to ID, as its owner and group
  *   nest        whether a user and network namespace can be made inside,
  *               as `unshare -rn` makes one, in a child that then exits
  *   link IF     whether the interface IF can be brought up
@@ -799,6 +800,11 @@ int main(int argc, char **argv)
 			i += 2;
 		} else if (strcmp(step, "resolve") == 0 && i + 2 < argc) {
 			resolve(arg, argv[i + 2]);
+			i += 2;
+		} else if (strcmp(step, "chown") == 0 && i + 2 < argc) {
+			uid_t id = (uid_t)strtoul(argv[i + 2], NULL, 10);
+
+			printf("chown=%s\n", chown(arg, id, (gid_t)id) == 0 ? "ok" : strerror(errno));
 			i += 2;
 		} else if (strcmp(step, "target") == 0) {
 			char    to[4096];
