@@ -1127,6 +1127,8 @@ def convert_c(text: str, width: int,
 	namespace_spec = False		# saw `namespace`, awaiting the `{`
 	await_body = False		# an `else`/`do` whose body shape is not yet known
 	stmt_level = 0			# level of the line the current statement began on
+	inline_body = False		# a braceless body began on its head's line
+	fresh_head = False		# a head closed this line; body not yet seen
 
 	def case_extra(frames: list[Frame]) -> int:
 		"""The level a switch's statements take below its labels.
@@ -1293,8 +1295,15 @@ def convert_c(text: str, width: int,
 			# statement at the head's indentation while its depth is one
 			# deeper, and using the depth would break the alignment at every
 			# tab width except the one it was computed for.
+			#
+			# The same holds outside parens once such a body has begun:
+			# `else e = v ? a` with `: b;` aligned under the `?` continues
+			# the statement on the head's line, and the open braceless
+			# level would put it a tab deeper. Reported from beerssh
+			# 2026-10-09, where that shape was rewritten with braces to
+			# get past the gate.
 			base_paren = stack[-1].paren if stack else 0
-			if paren > base_paren:
+			if paren > base_paren or inline_body:
 				level = stmt_level
 			else:
 				stmt_level = level
@@ -1326,6 +1335,10 @@ def convert_c(text: str, width: int,
 		i, n = 0, len(line)
 		while i < n:
 			c = line[i]
+			if (fresh_head and state == "normal" and not c.isspace()
+			        and c not in "{;" and line[i:i + 2] not in ("//", "/*")):
+				inline_body = True
+				fresh_head = False
 			if state == "raw":
 				# A raw string ends only at `)delim"`. Nothing inside it is
 				# code: hydra embeds whole JavaScript programs this way, and
@@ -1358,6 +1371,7 @@ def convert_c(text: str, width: int,
 							# `else`/`do` followed by a statement rather than
 							# a block: that statement is the body.
 							virtual += 1
+							inline_body = True
 					if linkage_spec:
 						# `extern "C" JNIEXPORT void f(...) { ... }` is a
 						# linkage specifier on one declaration, and that
@@ -1412,6 +1426,7 @@ def convert_c(text: str, width: int,
 						# the head is complete; whatever follows is its body
 						virtual += 1
 						head_paren = None
+						fresh_head = True
 				elif counting and c == "{":
 					# The brace takes the level the braceless body would
 					# have had, rather than adding a second one on top of
@@ -1436,6 +1451,8 @@ def convert_c(text: str, width: int,
 					if virtual > body_floor:
 						virtual -= 1
 					await_body = False
+					inline_body = False
+					fresh_head = False
 					# Remember the paren depth this block opened at. A C++
 					# lambda passed as an argument -- `connect(x, [this] {`
 					# -- runs its whole body at paren depth 1, so a statement
@@ -1522,6 +1539,8 @@ def convert_c(text: str, width: int,
 						stack.pop()
 					virtual = stack[-1].virtual if stack else 0
 					await_body = False
+					inline_body = False
+					fresh_head = False
 					linkage_extern = False
 					linkage_spec = False
 					namespace_spec = False
@@ -1533,6 +1552,8 @@ def convert_c(text: str, width: int,
 					pending_switch = False
 					virtual = stack[-1].virtual if stack else 0
 					await_body = False
+					inline_body = False
+					fresh_head = False
 					# `extern "C" int f(void);` declares rather than opens.
 					linkage_extern = False
 					linkage_spec = False
@@ -1570,6 +1591,7 @@ def convert_c(text: str, width: int,
 			elif ident in ("else", "do"):
 				await_body = True
 		ident = ""
+		fresh_head = False		# the body, if any, is on a later line
 		if state in ("string", "char") and not line.endswith("\\"):
 			state = "normal"
 		if pp_cont or (state_at_start == "normal" and rest[:1] == "#"):

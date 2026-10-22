@@ -50,6 +50,26 @@ class LexerModel(unittest.TestCase):
 		self.assertEqual(tabs("void f(void) {\n\tif (x)\n\t\tg();\n}\n"),
 		                 [0, 1, 2, 0])
 
+	def test_a_body_on_its_heads_line_continues_at_that_line(self):
+		"""beerssh, 2026-10-09: `else e = v ? a` with `: b;` aligned under
+		the `?` was reported a tab too shallow. The braceless level opened
+		on the head's line stayed open across the continuation, so the
+		model put it one deeper than the line the statement began on --
+		which is right only at the tab width it was computed for. Inside
+		parens this was already handled; outside them it was not, and
+		fuzzypickles had two `.arg()` continuations pushed a tab deeper
+		to get past it. `if (...)` and `do` take the same path, and the
+		statement after must come back to the head's level.
+		"""
+		for head in ("else", "if (y)", "do"):
+			src = ("void f(void) {\n"
+			       "\t" + head + " e = v ? a\n"
+			       "\t                : b;\n"
+			       "\tg();\n"
+			       "}\n")
+			with self.subTest(head=head):
+				self.assertEqual(tabs(src), [0, 1, 1, 1, 0])
+
 	def test_braceless_loop_keeps_its_body_past_an_inner_block(self):
 		"""qtty, 2026-08-27: a braceless loop whose body is a block
 		containing another block lost the outer body at the inner closing
