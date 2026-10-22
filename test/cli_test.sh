@@ -95,6 +95,59 @@ expect 2 '^usage: hull plan' "$hull"
 expect 2 '^usage: hull plan' "$hull" frobnicate
 expect 0 '^docker: ns \(runs as root\)$' "$hull" engines
 expect 0 '^qemu: vm emu$' "$hull" engines
+
+# hull doctor: every line a check, its status first, or the fix under one.
+cases=$((cases + 1))
+out=$(timeout 20 "$hull" doctor 2>&1)
+got=$?
+bad=$(printf '%s\n' "$out" | grep -Ev '^(ok|missing|limited|absent) +[a-zA-Z/]|^  fix \(as root\): .')
+[ "$got" = 0 ] && [ -z "$bad" ] && [ -n "$out" ] ||
+	fail "hull doctor exited $got, or a line is not a check's" "$out"
+expect 0 '^ok +user namespaces$' "$hull" doctor
+# A tool is found on PATH, and said where.
+mkdir -p "$dir/tools"
+printf '#!/bin/sh\n' > "$dir/tools/squashfuse"
+chmod 755 "$dir/tools/squashfuse"
+expect 0 "^ok +squashfuse: a squashfs image read through FUSE \\($dir/tools/squashfuse\\)\$" \
+	env PATH="$dir/tools:$PATH" "$hull" doctor
+# Where user namespaces cannot be had, which every rootless engine needs:
+# 1, and the line that gives them. The limit is the namespace's own.
+expect 1 '^missing +user namespaces: ' unshare -r sh -c \
+	'echo 0 > /proc/sys/user/max_user_namespaces && exec "$1" doctor' sh "$hull"
+expect 1 '^  fix \(as root\): sysctl user\.max_user_namespaces=15000$' unshare -r sh -c \
+	'echo 0 > /proc/sys/user/max_user_namespaces && exec "$1" doctor' sh "$hull"
+# With no XDG_RUNTIME_DIR, what the frontend chose, in a namespace whose
+# /run/user, /dev/shm and /tmp are its own, so the account's are not
+# seen: a login's, else /dev/shm's in memory, else /tmp's on a disk;
+# and where none will do, 1 and each reason.
+# doctor_in, run as `sh -c "$doctor_in" sh HULL SETUP`: hull doctor
+# there, after the shell text SETUP. Hull is reached through a descriptor
+# opened before, since a tree under /tmp, as a scratch copy's is, is
+# hidden by the tmpfs. `on_disk D` in SETUP mounts an overlay over D,
+# which is not in memory whatever is under it.
+doctor_in='
+exec 3< "$(dirname "$1")" || exit 99
+for d in /run/user /dev/shm /tmp; do mount -t tmpfs none "$d" || exit 99; done
+on_disk() {
+	mkdir -p "/run/user/layers$1/l" "/run/user/layers$1/u" "/run/user/layers$1/w" &&
+	mount -t overlay none -o "lowerdir=/run/user/layers$1/l,upperdir=/run/user/layers$1/u,workdir=/run/user/layers$1/w" "$1"
+}
+unset XDG_RUNTIME_DIR
+eval "$2" || exit 99
+exec /proc/self/fd/3/hull doctor'
+expect 0 '^ok +runtime directory: /run/user/0$' \
+	unshare -rm sh -c "$doctor_in" sh "$hull" 'mkdir -m 700 /run/user/0'
+expect 0 '^ok +runtime directory: /dev/shm/hull-0$' \
+	unshare -rm sh -c "$doctor_in" sh "$hull" ''
+expect 0 '^ok +runtime directory: /dev/shm/hull-0$' \
+	unshare -rm sh -c "$doctor_in" sh "$hull" 'mkdir -m 755 /run/user/0'
+# An empty one is none.
+expect 0 '^ok +runtime directory: /dev/shm/hull-0$' \
+	unshare -rm sh -c "$doctor_in" sh "$hull" 'export XDG_RUNTIME_DIR='
+expect 0 '^limited +runtime directory: /tmp/hull-0, which is not in memory, so a machine.s secrets are refused$' \
+	unshare -rm sh -c "$doctor_in" sh "$hull" 'on_disk /dev/shm && on_disk /tmp'
+expect 1 '^missing +runtime directory: none would do: /tmp/hull-0: Read-only file system$' \
+	unshare -rm sh -c "$doctor_in" sh "$hull" 'mount -t tmpfs -o ro none /dev/shm && mount -t tmpfs -o ro none /tmp'
 # gc starts a core for itself, which asks each engine that keeps anything:
 # docker, which says it cannot look, and that is not gc failing.
 expect 0 '^docker: the Docker daemon at .*/no-docker\.sock cannot be reached$' "$hull" gc

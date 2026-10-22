@@ -53,6 +53,7 @@
 #include "access.h"
 #include "builtin.h"
 #include "core.h"
+#include "doctor.h"
 #include "matrix.h"
 #include "plan.h"
 #include "registry.h"
@@ -105,7 +106,7 @@ static void usage(FILE *out)
 	      "       hull diff REF REF | hull tag REF NEW | hull tag -d REF\n"
 	      "       hull manifest show REF | hull pull IMAGE [REF] | hull push REF IMAGE\n"
 	      "       hull core\n"
-	      "       hull engines\n"
+	      "       hull engines | hull doctor\n"
 	      "       hull --version\n", out);
 }
 
@@ -3374,6 +3375,8 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
+	if (strcmp(command, "doctor") == 0 && argc == 2)
+		return hull_doctor(runtime_why);
 	hull_registry_init(&registry, host_arch());
 	if (strcmp(command, "core") == 0 && argc == 2)
 		return hull_core_run(host_arch());
