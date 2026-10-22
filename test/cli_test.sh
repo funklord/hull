@@ -153,17 +153,23 @@ expect 1 '^missing +runtime directory: none would do: /tmp/hull-0: Read-only fil
 expect 0 '^docker: the Docker daemon at .*/no-docker\.sock cannot be reached$' "$hull" gc
 expect 0 '^  fidelity\.inotify +rejected: .* \(--accept vm:inotify-poll\)$' "$hull" engines
 
-# plan: the spec's own backend, J.1's ns where it names none.
-expect 0 'ref\.conf: machine on docker \(ns\): ok$' "$hull" plan -f "$dir/ref.conf"
-refute 'native' "$hull" plan -f "$dir/ref.conf"
-expect 0 'source\.ref\.overlay: native$' "$hull" plan --explain -f "$dir/ref.conf"
+# plan: the spec's own backend, J.1's ns where it names none, whose
+# engine is chroot, hull's own and rootless, rather than docker, which
+# would reach for root first (section 7). An image not in the store is
+# refused there with what to do about it; docker takes it as it is.
+expect 0 'dir\.conf: machine on chroot \(ns\): ok$' "$hull" plan -f "$dir/dir.conf"
+expect 1 'machine on chroot \(ns\): source\.ref\.overlay: rejected: an image runs from the store, and this one is not in it: .hull pull. it first$' \
+	"$hull" plan -f "$dir/ref.conf"
+expect 0 'ref\.conf: machine on docker \(ns\): ok$' "$hull" plan -f "$dir/ref.conf" --backend docker
+refute 'native' "$hull" plan -f "$dir/ref.conf" --backend docker
+expect 0 'source\.ref\.overlay: native$' "$hull" plan --explain -f "$dir/ref.conf" --backend docker
 # A field the engine does not declare is refused, not ignored: qemu runs
 # no image yet.
 expect 1 ':1:10: machine on qemu \(vm\): source\.ref\.overlay: rejected: the engine does not declare this field$' \
 	"$hull" plan -f "$dir/ref.conf" --backend vm
 expect 1 ':1:10: machine on docker \(ns\): source\.dir\.direct: rejected: docker cannot' \
-	"$hull" plan -f "$dir/dir.conf"
-expect 1 'machine on docker \(ns\): rejected, 1 field$' "$hull" plan -f "$dir/dir.conf"
+	"$hull" plan -f "$dir/dir.conf" --backend docker
+expect 1 'machine on docker \(ns\): rejected, 1 field$' "$hull" plan -f "$dir/dir.conf" --backend docker
 # Segments are qemu's so far: chroot and docker refuse them, and say why.
 printf '%s\n' '(machine (source "dir:./rootfs") (segments "wire"))' > "$dir/segmented.conf"
 expect 1 'segments: rejected: not yet: a tap in the machine.s namespace' \
@@ -180,7 +186,7 @@ expect 1 'init: rejected: not yet: a container.s PID 1 is docker.s init' \
 	"$hull" plan -f "$dir/inited.conf" --backend docker
 expect 2 'plan takes one backend' "$hull" plan -f "$dir/ref.conf" --backend ns,vm
 expect 0 '^\(machine \(source "debian:13"\) \(ports \(port \(host 8080\) \(guest 80\) \(proto tcp\)\)\) .*\(projection bind\)\)$' \
-	"$hull" plan --resolved -f "$dir/ref.conf"
+	"$hull" plan --resolved -f "$dir/ref.conf" --backend docker
 expect 0 '\(tuning \(vm \(profile micro\) \(kernel bundled\) \(cpu_profile host\)\) \(qemu \(accel auto\)\)\) \(projection passthrough\)\)$' \
 	"$hull" plan --resolved -f "$dir/dir.conf" --backend vm
 expect 0 'vm\.kernel\.bundled: emulated: the host.s own kernel and modules' \
@@ -192,11 +198,12 @@ expect 1 'fidelity\.inotify: rejected: .* \(--accept vm:inotify-poll honours it\
 expect 0 'fidelity\.inotify: accepted' \
 	"$hull" plan -f "$dir/inotify.conf" --backend vm --accept vm:inotify-poll
 expect 1 'source\.dir\.direct: rejected' \
-	"$hull" plan -f "$dir/dir.conf" --accept vm:inotify-poll
+	"$hull" plan -f "$dir/dir.conf" --backend docker --accept vm:inotify-poll
 
 # check: every backend listed, and the worst of them decides.
-expect 1 'machine on qemu \(vm\): ok$' "$hull" check -f "$dir/dir.conf" --backend ns,vm
-expect 1 'machine on docker \(ns\): rejected' "$hull" check -f "$dir/dir.conf" --backend ns,vm
+expect 1 'machine on qemu \(vm\): ok$' "$hull" check -f "$dir/dir.conf" --backend docker,vm
+expect 1 'machine on docker \(ns\): rejected' "$hull" check -f "$dir/dir.conf" --backend docker,vm
+expect 0 'machine on chroot \(ns\): ok$' "$hull" check -f "$dir/dir.conf" --backend ns,vm
 expect 0 'machine on qemu \(emu\): ok$' "$hull" check -f "$dir/dir.conf" --backend vm,emu
 expect 1 'machine on qemu \(vm\): arch: rejected: only the emu class' \
 	"$hull" check -f "$dir/foreign.conf" --backend vm,emu
@@ -209,9 +216,9 @@ expect 2 'check needs --backend' "$hull" check -f "$dir/ref.conf"
 expect 2 'lxc: no engine or class of that name' "$hull" check -f "$dir/ref.conf" --backend lxc
 
 # Every machine of a multi-machine file, by name.
-expect 1 'machines\.conf: web on docker \(ns\): ok$' "$hull" plan -f "$dir/machines.conf"
+expect 1 'machines\.conf: web on docker \(ns\): ok$' "$hull" plan -f "$dir/machines.conf" --backend docker
 expect 1 'machines\.conf: db on docker \(ns\): rejected, 1 field$' \
-	"$hull" plan -f "$dir/machines.conf"
+	"$hull" plan -f "$dir/machines.conf" --backend docker
 expect 0 'no machine to plan, only a build$' "$hull" plan -f "$dir/build.conf"
 
 # Files that cannot be planned at all.
@@ -226,9 +233,9 @@ expect 2 'missing\.conf: No such file' "$hull" plan -f "$dir/missing.conf"
 expect 1 'example\.conf: machine on qemu \(emu\): rejected, 2 fields$' \
 	"$hull" check -f "$dir/example.conf" --backend vm,emu
 expect 1 'example\.conf: machine on docker \(ns\): rejected, 1 field$' \
-	"$hull" check -f "$dir/example.conf" --backend ns
+	"$hull" check -f "$dir/example.conf" --backend docker
 expect 1 'example\.conf:[0-9]+:[0-9]+: machine on docker \(ns\): ssh: rejected' \
-	"$hull" check -f "$dir/example.conf" --backend ns
+	"$hull" check -f "$dir/example.conf" --backend docker
 expect 1 'example\.conf:[0-9]+:[0-9]+: machine on qemu \(vm\): virtualbox: ignored' \
 	"$hull" check -f "$dir/example.conf" --backend vm
 
@@ -365,7 +372,7 @@ printf '(machine (source "stored/root:1") (backend chroot) (mutable direct) %s)\
 from_root 125 'stored/root:1 is a stored tree, which nothing writes' -f "$root/stored-direct.conf"
 # A ref the store does not hold is an image ref still, docker's.
 printf '(machine (source "stored/none:1") (hostname "unstored"))\n' > "$root/unstored.conf"
-expect 0 'machine on docker \(ns\): ok' "$hull" plan -f "$root/unstored.conf"
+expect 0 'machine on docker \(ns\): ok' "$hull" plan -f "$root/unstored.conf" --backend docker
 # And gc keeps the checkout while a ref reaches its manifest, and takes
 # it once none does.
 expect 0 '^store: removed 0 manifests, 0 objects and 0 checkouts no ref reaches$' "$hull" gc

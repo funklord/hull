@@ -18,7 +18,7 @@ the same address, reached the same way.
 ```
 
 ```sh
-hull run --backend chroot   # in namespaces of its own, on the host's kernel
+hull run                    # in namespaces of its own, on the host's kernel
 hull run --backend vm       # the same machine, in a KVM guest
 hull run --backend emu      # the same, under TCG, with no KVM at all
 curl web.hull:8080          # the same address on each (vm and emu; chroot shares the host's ports)
@@ -44,9 +44,8 @@ hull ssh web                # a shell in it, whichever it runs on
 A backend is a **class**, which says what kind of isolation a machine has,
 implemented by one or more **engines**. `(backend vm)` asks for a class
 and lets hull choose the engine; `(backend chroot)` names one. With
-neither, a machine is on the ns class, whose default engine is docker
-today, so a machine from a plain directory names `chroot`, `vm` or `emu`
-for now. `hull
+neither, a machine is on the ns class, whose default engine is chroot,
+hull's own and rootless; docker is used only when a file names it. `hull
 engines` prints every engine's declared capabilities, and `hull plan`
 shows what a given file would get on a given backend, field by field, as
 `native`, `emulated` (honoured, at a stated cost) or `rejected` (with the

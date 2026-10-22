@@ -1706,6 +1706,10 @@ static const hull_cap_entry entries[] = {
 	/* The dir itself, bound onto itself and chrooted into; or beneath an
 	 * overlayfs in the machine's mount namespace, whose upper layer is a
 	 * tmpfs rather than section 3.7's upper/ on the host. */
+	/* A stored tree reaches the plan as a dir; an image ref reaches it
+	 * only where the store has none of that name. */
+	{ "source.ref.overlay",     HULL_SUP_REJECTED,
+	  "an image runs from the store, and this one is not in it: `hull pull` it first", NULL },
 	{ "source.dir.direct",      HULL_SUP_NATIVE,   NULL, NULL },
 	{ "source.dir.overlay",     HULL_SUP_EMULATED,
 	  "an overlayfs in the machine's mount namespace; writes are held in memory and go with it",

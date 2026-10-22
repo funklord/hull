@@ -1879,7 +1879,7 @@ with the same schema per machine (machines in one file form a segment, Appendix 
 | `volumes` | `(volume …)` entries | empty | `(volume (host "<path>") (guest "<path>") (mode rw\|ro))` |
 | `cpus` | integer | engine default | ns: cgroup weight/quota · vm/emu: vCPUs |
 | `memory` | string | engine default | `"2G"`; ns: cgroup ceiling · vm/emu: hard allocation (§6) |
-| `backend` | symbol | `ns` | Class (`ns`/`vm`/`emu` → host default engine of class) or engine (`docker`, `qemu`, `virtualbox`, `vmware`, reserved: `hyperv`, `dosbox`, …) (§5.0) |
+| `backend` | symbol | `ns` | Class (`ns`/`vm`/`emu` → host default engine of class) or engine (`chroot`, `docker`, `qemu`, `virtualbox`, `vmware`, reserved: `hyperv`, `dosbox`, …) (§5.0). **ns's default engine is `chroot`, decided by the holder 2026-10-22**: it had been whichever engine was registered first, docker, so a file naming no backend reached for root first, against §7, and a plain directory was refused, docker running none in place. An image not in the store is refused on chroot with `hull pull` it first, where docker pulled it itself. Set in the frontend, which chooses, and in the core, which then agrees; a sabotage leaving the core's unset survives, the plan naming its engine |
 | `ssh` | boolean | `false` | Provision + supervise minimal sshd with user's authorized_keys, all backends (§8.1.3) |
 | `restart` | `no` \| `on-failure` \| `always` | `no` | Consumed by the systemd generator (§9), not by a daemon |
 | `on_disconnect` | `stop` \| `keep` | `stop` | Machine behavior if the core/CLI dies (B.4); `keep` requires later `hull attach` |
