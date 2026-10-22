@@ -1711,6 +1711,8 @@ static const hull_cap_entry entries[] = {
 	{ "network.host",           HULL_SUP_NATIVE,   NULL, NULL },
 	{ "network.none",           HULL_SUP_NATIVE,
 	  "a network namespace of the machine's own, with lo alone", NULL },
+	{ "segments",               HULL_SUP_REJECTED,
+	  "not yet: a tap in the machine's namespace, on the core's switch, is not written", NULL },
 	{ NULL,                     HULL_SUP_NATIVE,   NULL, NULL },
 };
 

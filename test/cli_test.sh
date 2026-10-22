@@ -164,6 +164,14 @@ expect 1 ':1:10: machine on qemu \(vm\): source\.ref\.overlay: rejected: the eng
 expect 1 ':1:10: machine on docker \(ns\): source\.dir\.direct: rejected: docker cannot' \
 	"$hull" plan -f "$dir/dir.conf"
 expect 1 'machine on docker \(ns\): rejected, 1 field$' "$hull" plan -f "$dir/dir.conf"
+# Segments are qemu's so far: chroot and docker refuse them, and say why.
+printf '%s\n' '(machine (source "dir:./rootfs") (segments "wire"))' > "$dir/segmented.conf"
+expect 1 'segments: rejected: not yet: a tap in the machine.s namespace' \
+	"$hull" plan -f "$dir/segmented.conf" --backend chroot
+expect 1 'segments: rejected: not yet: a container.s NIC on the core.s switch' \
+	"$hull" plan -f "$dir/segmented.conf" --backend docker
+expect 0 'machine on qemu \(vm\): ok|segments: native' \
+	"$hull" plan --explain -f "$dir/segmented.conf" --backend vm
 expect 2 'plan takes one backend' "$hull" plan -f "$dir/ref.conf" --backend ns,vm
 expect 0 '^\(machine \(source "debian:13"\) \(ports \(port \(host 8080\) \(guest 80\) \(proto tcp\)\)\) .*\(projection bind\)\)$' \
 	"$hull" plan --resolved -f "$dir/ref.conf"

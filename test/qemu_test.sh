@@ -231,6 +231,79 @@ has 0 '^booted$'
 cases=$((cases + 1))
 [ ! -e "$root/rootfs/lib" ] || fail "a modules place was made in a directory used in place" \
 	"$(ls -la "$root/rootfs" 2>&1)"
+# Appendix D's segments: a NIC each, after passt's, on the core's switch,
+# with no address given, as a test of network software sets its own.
+# Two vms on one hear each other in raw frames, the shouter's own MAC
+# the source the hearer is given, and are answered; a third, on another
+# segment at the same time, hears nothing. The name is this run's, so
+# two runs at once are not on one wire.
+wire="wire-$$"
+conf hearer "(backend vm) (mutable overlay) (hostname \"hearer\") (segments \"$wire\")" \
+	'(command "/probe" "list" "/sys/class/net" "read" "/sys/class/net/eth1/address"' \
+	'"link" "eth1" "hear" "eth1")'
+conf shouter "(backend vm) (mutable overlay) (hostname \"shouter\") (segments \"$wire\")" \
+	'(command "/probe" "read" "/sys/class/net/eth1/address" "link" "eth1"' \
+	'"shout" "eth1" "over the wire")'
+conf loner "(backend vm) (mutable overlay) (hostname \"loner\") (segments \"elsewhere-$$\")" \
+	'(command "/probe" "link" "eth1" "hear" "eth1")'
+# The core's descriptors, counted before and after: each port goes once
+# its qemu has, which it does only if the core keeps no end of its own.
+# A chroot machine that waits holds the core meanwhile, which would
+# otherwise leave a second after the last machine, and be counted gone.
+conf anchor '(backend chroot) (hostname "anchor") (command "/probe" "say" "ready" "wait")'
+(cd / && exec timeout 120 "$hull" run -f "$root/anchor.conf" > "$root/anchor.out" 2>&1) &
+anchored=$!
+tries=0
+until grep -q '^ready$' "$root/anchor.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+core=$(head -1 "$XDG_RUNTIME_DIR/hull/core.lock" 2>/dev/null)
+fds_before=$(ls "/proc/$core/fd" 2>/dev/null | wc -l)
+(cd / && exec timeout 90 "$hull" run -f "$root/hearer.conf" > "$root/hearer.out" 2>&1) &
+heard=$!
+(cd / && exec timeout 90 "$hull" run -f "$root/loner.conf" > "$root/loner.out" 2>&1) &
+lone=$!
+name=shouter
+boot shouter 90
+wait "$heard"
+heard_status=$?
+wait "$lone"
+has 0 '^link=up$'
+has 0 '^shout=answered$'
+shouter_mac=$(printf '%s\n' "$out" | sed -n 's/^read=//p')
+out=$(cat "$root/hearer.out")
+got=$heard_status
+name=hearer
+has 0 '^list= eth0 eth1 lo$'
+hearer_mac=$(printf '%s\n' "$out" | sed -n 's/^read=//p')
+has 0 "^hear=over the wire from $shouter_mac\$"
+cases=$((cases + 1))
+[ -n "$shouter_mac" ] && [ "$shouter_mac" != "$hearer_mac" ] ||
+	fail "two machines on a segment share a MAC, or have none" "shouter $shouter_mac, hearer $hearer_mac"
+out=$(cat "$root/loner.out")
+got=0
+name=loner
+has 0 '^hear=nothing$'
+tries=0
+fds_after=$(ls "/proc/$core/fd" 2>/dev/null | wc -l)
+while [ "$fds_after" -ne "$fds_before" ] && [ "$tries" -lt 20 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+	fds_after=$(ls "/proc/$core/fd" 2>/dev/null | wc -l)
+done
+cases=$((cases + 1))
+[ -n "$core" ] && [ -d "/proc/$core" ] && [ "$fds_before" -gt 0 ] &&
+	[ "$fds_after" -eq "$fds_before" ] ||
+	fail "the core kept descriptors of a segment's machines" \
+		"core ${core:-none}: $fds_before before, $fds_after after"
+timeout 10 "$hull" kill -s TERM anchor > /dev/null 2>&1
+wait "$anchored"
+# A segment's port is the core's, so a machine on one cannot outlive it.
+conf keptseg "(backend vm) (on_disconnect keep) (segments \"$wire\")" '(command "/probe" "say" "no")'
+name=keptseg
+boot keptseg
+has 125 'cannot outlive the core'
 rm -f "$root/rootfs/srv/kept"
 
 # Volumes, each a share of its own, read-write and read-only.

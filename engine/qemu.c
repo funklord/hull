@@ -43,6 +43,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <stddef.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
@@ -81,6 +82,8 @@
 #define MAX_STREAMS  64u
 #define WINDOW       65536u  /* what the agent gives, and is given, each way */
 #define NETWORK_FD   3       /* passt's socket, in qemu */
+#define SEGMENT_FD   4       /* the first segment's port, in qemu */
+#define MAX_SEGMENTS 8u
 #define FLOW_IDLE    90      /* seconds a udp client's flow is kept unused */
 
 /* The guest's network, which the agent sets to the same addresses. */
@@ -121,6 +124,9 @@ struct hull_machine {
 	char             dir[4096];    /* the machine's files: initrd, console */
 	int              network;      /* qemu's end of passt's socket, or -1 */
 	int              no_network;   /* (network none): no NIC, no passt */
+	char            *segment[MAX_SEGMENTS];     /* Appendix D's, by name */
+	int              segment_fd[MAX_SEGMENTS];  /* their ports, until qemu has them */
+	unsigned         segment_count;
 	pid_t            passt;        /* passt's daemon, by the socket it holds, or 0 */
 	pid_t            qemu;
 	int              keep;         /* (on_disconnect keep): qemu outlives the core */
@@ -267,6 +273,8 @@ static void release(hull_machine *m)
 	free(m->root);
 	for (unsigned i = 0u; i < m->volume_count; i++)
 		free(m->volume_host[i]);
+	for (unsigned i = 0u; i < m->segment_count; i++)
+		free(m->segment[i]);
 	free(m->spec);
 	forget_secrets(m);
 	if (m->pidfd >= 0)
@@ -388,16 +396,30 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	if (m->no_network && hull_access_find(doc, &machine, "ports", &entry))
 		return "ports need the machine's network, which (network none) has not";
 
-	/* Ports from the machine's address, which the core gives the plan. */
-	if (hull_access_find(doc, &machine, "ports", &entry)) {
-		text = hull_access_value(doc, &top, "address");
-		if (text == NULL || strlen(text) >= sizeof m->address_text ||
-		    inet_pton(AF_INET, text, &m->address) != 1) {
-			free(text);
-			return "the plan gives its ports no address";
+	/* A NIC each, after passt's, on the core's switch. */
+	if (hull_access_find(doc, &machine, "segments", &entry)) {
+		hull_sexpr_child(doc, &entry, &item);
+		for (more = hull_sexpr_next(doc, &item, &item); more;
+		     more = hull_sexpr_next(doc, &item, &item)) {
+			if (m->segment_count == MAX_SEGMENTS)
+				return "there are too many segments";
+			if ((m->segment[m->segment_count++] = hull_access_text(doc, &item)) == NULL)
+				return "a segment's name is not text";
 		}
+	}
+
+	/* The machine's address, which the core gives every plan: its ports
+	 * are on it, and its segment NICs' MACs are drawn from it. */
+	text = hull_access_value(doc, &top, "address");
+	if (text != NULL && strlen(text) < sizeof m->address_text &&
+	    inet_pton(AF_INET, text, &m->address) == 1)
 		snprintf(m->address_text, sizeof m->address_text, "%s", text);
-		free(text);
+	free(text);
+	if (m->segment_count != 0u && m->address_text[0] == '\0')
+		return "the plan gives its segments no address to draw a MAC from";
+	if (hull_access_find(doc, &machine, "ports", &entry)) {
+		if (m->address_text[0] == '\0')
+			return "the plan gives its ports no address";
 		hull_sexpr_child(doc, &entry, &item);
 		for (more = hull_sexpr_next(doc, &item, &item); more;
 		     more = hull_sexpr_next(doc, &item, &item)) {
@@ -427,6 +449,10 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		m->keep = disconnect != NULL && strcmp(disconnect, "keep") == 0;
 		free(disconnect);
 	}
+	/* A segment is the core's switch, which goes with the core. */
+	if (m->keep && m->segment_count != 0u)
+		return "a machine on a segment cannot outlive the core, whose switch the segment is: "
+		       "(on_disconnect keep) and (segments ...) do not go together";
 
 	/* The spec the agent applies is the plan's own (machine ...). */
 	m->spec_length = machine.extent;
@@ -788,6 +814,49 @@ static const char *start_network(hull_machine *m)
 	return NULL;
 }
 
+/* A port on each of the machine's segments, from the core's switch, for
+ * one qemu: each attempt's qemu has its own, and the port goes with the
+ * qemu that held it. A reason, or NULL. */
+static const char *open_segments(hull_machine *m)
+{
+	for (unsigned i = 0u; i < m->segment_count; i++) {
+		if (host->struct_size < offsetof(hull_host_ops, segment) + sizeof host->segment ||
+		    host->segment == NULL)
+			return "the core has no switch for a segment";
+		m->segment_fd[i] = host->segment(m->core, m->segment[i], m->detail, sizeof m->detail);
+		if (m->segment_fd[i] < 0)
+			return m->detail;
+	}
+	return NULL;
+}
+
+/* This process's ends of them, once qemu has its own. */
+static void close_segments(hull_machine *m)
+{
+	for (unsigned i = 0u; i < MAX_SEGMENTS; i++) {
+		if (m->segment_fd[i] >= 0)
+			close(m->segment_fd[i]);
+		m->segment_fd[i] = -1;
+	}
+}
+
+/* A segment NIC's address: qemu's prefix, then three bytes of FNV-1a over
+ * the machine's address and the segment, so that two machines, or two
+ * NICs of one, do not share one, and a machine keeps its own. */
+static void segment_mac(const hull_machine *m, unsigned i, char *out, size_t cap)
+{
+	uint32_t hash = 2166136261u;
+
+	for (const char *p = m->address_text; *p != '\0'; p++)
+		hash = (hash ^ (uint8_t)*p) * 16777619u;
+	hash = (hash ^ '/') * 16777619u;
+	for (const char *p = m->segment[i]; *p != '\0'; p++)
+		hash = (hash ^ (uint8_t)*p) * 16777619u;
+	hash = (hash ^ (uint8_t)i) * 16777619u;
+	snprintf(out, cap, "52:54:00:%02x:%02x:%02x", (unsigned)(hash >> 16) & 0xffu,
+	         (unsigned)(hash >> 8) & 0xffu, (unsigned)hash & 0xffu);
+}
+
 /* Fork qemu for `m`, with `cid` for its vsock device. Its stdout and
  * stderr go to qemu.log. */
 static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
@@ -803,10 +872,12 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 	char        root[9000];
 	char        modules[9000];
 	char        modules_at[4200];
+	char        segment_netdev[MAX_SEGMENTS][64];
+	char        segment_device[MAX_SEGMENTS][96];
 	char        fsdev[MAX_VOLUMES][9000];
 	char        device[MAX_VOLUMES][96];
 	char        path[8500];
-	const char *argv[64 + 4u * MAX_VOLUMES];
+	const char *argv[64 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS];
 	unsigned    n = 0u;
 	pid_t       pid;
 
@@ -885,6 +956,20 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 		argv[n++] = "-device";
 		argv[n++] = "virtio-net-pci,netdev=net";
 	}
+	/* After passt's, so that eth0 is its, and each segment the next. */
+	for (unsigned i = 0u; i < m->segment_count; i++) {
+		char mac[24];
+
+		segment_mac(m, i, mac, sizeof mac);
+		snprintf(segment_netdev[i], sizeof segment_netdev[i],
+		         "stream,id=s%u,addr.type=fd,addr.str=%u", i, SEGMENT_FD + i);
+		snprintf(segment_device[i], sizeof segment_device[i], "virtio-net-pci,netdev=s%u,mac=%s",
+		         i, mac);
+		argv[n++] = "-netdev";
+		argv[n++] = segment_netdev[i];
+		argv[n++] = "-device";
+		argv[n++] = segment_device[i];
+	}
 	argv[n] = NULL;
 
 	pid = fork();
@@ -901,15 +986,27 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 		dup2(null, 0);
 		dup2(out, 1);
 		dup2(out, 2);
-		/* passt's socket at NETWORK_FD, and nothing of the core's: its
-		 * sockets, its lock. dup2() onto itself would keep CLOEXEC. */
-		if (m->network < 0)
-			syscall(SYS_close_range, NETWORK_FD, ~0u, 0u);  /* (network none) */
-		else if (m->network == NETWORK_FD)
-			fcntl(NETWORK_FD, F_SETFD, 0);
-		else if (dup2(m->network, NETWORK_FD) < 0)
-			_exit(126);
-		syscall(SYS_close_range, NETWORK_FD + 1u, ~0u, 0u);
+		/* passt's socket at NETWORK_FD, each segment's port after it, and
+		 * nothing of the core's: its sockets, its lock. Each is moved
+		 * above them all first, so that none is closed by another's dup2;
+		 * a dup carries no CLOEXEC. */
+		{
+			int moved_network = -1;
+			int moved[MAX_SEGMENTS];
+
+			if (m->network >= 0 && (moved_network = fcntl(m->network, F_DUPFD, 64)) < 0)
+				_exit(126);
+			for (unsigned i = 0u; i < m->segment_count; i++)
+				if ((moved[i] = fcntl(m->segment_fd[i], F_DUPFD, 64)) < 0)
+					_exit(126);
+			if (moved_network >= 0 ? dup2(moved_network, NETWORK_FD) < 0 :
+			                         close(NETWORK_FD) != 0 && errno != EBADF)
+				_exit(126);  /* (network none): no passt */
+			for (unsigned i = 0u; i < m->segment_count; i++)
+				if (dup2(moved[i], (int)(SEGMENT_FD + i)) < 0)
+					_exit(126);
+			syscall(SYS_close_range, SEGMENT_FD + m->segment_count, ~0u, 0u);
+		}
 		execvp(argv[0], (char *const *)argv);
 		fprintf(stderr, "qemu-system-x86_64: %s\n", strerror(errno));
 		_exit(127);
@@ -1229,6 +1326,8 @@ static hull_status qemu_create(hull_core *core, hull_buf plan, hull_machine **ou
 	m->pidfd = -1;
 	for (unsigned i = 0u; i < MAX_PORTS; i++)
 		m->listeners[i] = -1;
+	for (unsigned i = 0u; i < MAX_SEGMENTS; i++)
+		m->segment_fd[i] = -1;
 	pthread_mutex_init(&m->lock, NULL);
 	pthread_mutex_init(&m->send_lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
@@ -1431,9 +1530,15 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 				snprintf(m->detail, sizeof m->detail, "%s", reason);
 			break;
 		}
+		if ((reason = open_segments(m)) != NULL) {
+			close(m->network);
+			m->network = -1;
+			break;
+		}
 		m->qemu = spawn(m, name.release, cid);
 		close(m->network);
 		m->network = -1;
+		close_segments(m);
 		if (m->qemu < 0)
 			break;
 		fd = dial(m, cid);
@@ -2461,6 +2566,8 @@ static const hull_cap_entry entries[] = {
 	{ "network.host",       HULL_SUP_REJECTED,
 	  "a vm shares no network namespace with the host: use ports", NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   "no NIC: lo alone in the guest", NULL },
+	{ "segments",           HULL_SUP_NATIVE,
+	  "a NIC each after passt's, eth1 on, on the core's switch, with no address given", NULL },
 
 	{ "security.readonly_root", HULL_SUP_NATIVE, NULL, NULL },
 	{ "security.no_new_privs",  HULL_SUP_NATIVE, "set by the agent on the workload", NULL },

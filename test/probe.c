@@ -16,6 +16,12 @@
  *   owner PATH  PATH's owner, group and mode, not following a link
  *   read PATH   PATH's first line
  *   load PATH   whether the module PATH, under /lib/modules/RELEASE, loads
+ *   link IF     whether the interface IF can be brought up
+ *   shout IF T  T in a broadcast frame on IF, of EtherType 0x88b5, the
+ *               IEEE's for local experiments, once a second for 20 s
+ *               or until a frame of that type is heard back
+ *   hear IF     the text of the first such frame IF is given in 20 s,
+ *               and its source; then one back, so a shout ends
  *   stdin       the first line of its stdin
  *   count       all of its stdin: how many bytes, and their FNV-1a hash
  *   spew N      N bytes on stdout, from a xorshift that does not repeat
@@ -70,6 +76,8 @@
 #include <string.h>
 #include <dirent.h>
 #include <arpa/inet.h>
+#include <net/if.h>
+#include <netpacket/packet.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/ioctl.h>
@@ -391,6 +399,115 @@ static void spin(long ms)
 	} while ((long long)now.tv_sec * 1000 + now.tv_nsec / 1000000 < until);
 }
 
+/* The raw frames link, shout and hear speak, of the IEEE's EtherType for
+ * local experiments. */
+#define EXPERIMENT 0x88b5
+
+/* A packet socket bound to `name`, for that type, or -1: datagrams, so
+ * the kernel writes the header from the address given and takes it off
+ * what is read, the source left in the address. */
+static int raw_socket(const char *name, struct sockaddr_ll *at)
+{
+	int fd = socket(AF_PACKET, SOCK_DGRAM | SOCK_CLOEXEC, htons(EXPERIMENT));
+
+	memset(at, 0, sizeof *at);
+	at->sll_family   = AF_PACKET;
+	at->sll_protocol = htons(EXPERIMENT);
+	at->sll_ifindex  = (int)if_nametoindex(name);
+	if (fd >= 0 && (at->sll_ifindex == 0 || bind(fd, (struct sockaddr *)at, sizeof *at) != 0)) {
+		close(fd);
+		fd = -1;
+	}
+	return fd;
+}
+
+static void link_up(const char *name)
+{
+	struct ifreq request;
+	int          fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+
+	memset(&request, 0, sizeof request);
+	snprintf(request.ifr_name, sizeof request.ifr_name, "%s", name);
+	if (fd < 0 || ioctl(fd, SIOCGIFFLAGS, &request) != 0) {
+		printf("link=%s\n", strerror(errno));
+	} else {
+		request.ifr_flags |= IFF_UP;
+		printf("link=%s\n", ioctl(fd, SIOCSIFFLAGS, &request) == 0 ? "up" : strerror(errno));
+	}
+	if (fd >= 0)
+		close(fd);
+}
+
+/* Broadcast `text` on `name`; with `answer`, once, else each second until
+ * a frame comes back or 20 s pass. */
+static void shout(const char *name, const char *text, int answer)
+{
+	struct sockaddr_ll at;
+	uint8_t            frame[256];
+	size_t             length = strlen(text);
+	int                fd = raw_socket(name, &at);
+	int                heard = 0;
+
+	if (fd < 0 || length > 200u) {
+		printf("shout=%s\n", fd < 0 ? strerror(errno) : "too long");
+		if (fd >= 0)
+			close(fd);
+		return;
+	}
+	at.sll_halen = 6;
+	memset(at.sll_addr, 0xff, 6u);
+	frame[0] = (uint8_t)length;
+	memcpy(frame + 1, text, length);
+	for (int tries = 0; tries < (answer ? 1 : 20) && !heard; tries++) {
+		struct pollfd p = { fd, POLLIN, 0 };
+
+		if (sendto(fd, frame, 1u + length, 0, (struct sockaddr *)&at, sizeof at) < 0) {
+			printf("shout=%s\n", strerror(errno));
+			break;
+		}
+		/* A packet socket is given its own frames too, as outgoing. */
+		while (!answer && !heard && poll(&p, 1u, 1000) > 0) {
+			struct sockaddr_ll from;
+			socklen_t          from_length = sizeof from;
+			uint8_t            back[256];
+
+			if (recvfrom(fd, back, sizeof back, 0, (struct sockaddr *)&from, &from_length) < 0)
+				break;
+			heard = from.sll_pkttype != PACKET_OUTGOING;
+		}
+	}
+	if (!answer)
+		printf("shout=%s\n", heard ? "answered" : "unanswered");
+	close(fd);
+}
+
+static void hear(const char *name)
+{
+	struct sockaddr_ll at;
+	int                fd = raw_socket(name, &at);
+	struct pollfd      p = { fd, POLLIN, 0 };
+	uint8_t            frame[256];
+	socklen_t          from_length = sizeof at;
+	ssize_t            n;
+
+	if (fd < 0) {
+		printf("hear=%s\n", strerror(errno));
+		return;
+	}
+	if (poll(&p, 1u, 20000) <= 0 ||
+	    (n = recvfrom(fd, frame, sizeof frame, 0, (struct sockaddr *)&at, &from_length)) < 1 ||
+	    frame[0] + 1 > n) {
+		printf("hear=nothing\n");
+		close(fd);
+		return;
+	}
+	printf("hear=%.*s from %02x:%02x:%02x:%02x:%02x:%02x\n", (int)frame[0], (const char *)frame + 1,
+	       at.sll_addr[0], at.sll_addr[1], at.sll_addr[2], at.sll_addr[3], at.sll_addr[4],
+	       at.sll_addr[5]);
+	close(fd);
+	shout(name, "heard", 1);
+}
+
 int main(int argc, char **argv)
 {
 	char text[256];
@@ -657,6 +774,15 @@ int main(int argc, char **argv)
 		} else if (strcmp(step, "resolve") == 0 && i + 2 < argc) {
 			resolve(arg, argv[i + 2]);
 			i += 2;
+		} else if (strcmp(step, "link") == 0) {
+			link_up(arg);
+			i++;
+		} else if (strcmp(step, "shout") == 0 && i + 2 < argc) {
+			shout(arg, argv[i + 2], 0);
+			i += 2;
+		} else if (strcmp(step, "hear") == 0) {
+			hear(arg);
+			i++;
 		} else if (strcmp(step, "wait") == 0) {
 			printf("waiting\n");
 			alarm(20);

@@ -115,7 +115,7 @@ FRONTEND_GEN = $(GEN_DIR)/frontend.c $(GEN_DIR)/frontend.h
 PROTOCOL_GEN = $(GEN_DIR)/protocol.c $(GEN_DIR)/protocol.h
 WIRE_OBJS    = $(BUILD_DIR)/core/wire.o $(GEN_DIR)/frontend.o $(GEN_DIR)/protocol.o \
                $(BUILD_DIR)/agent/framing.o $(GEN_DIR)/message.o
-CORE_OBJS    = $(BUILD_DIR)/core/core.o $(WIRE_OBJS)
+CORE_OBJS    = $(BUILD_DIR)/core/core.o $(BUILD_DIR)/core/segment.o $(WIRE_OBJS)
 HULL        = $(BUILD_DIR)/hull
 
 # The guest agent, PID 1 in a qemu machine: static, since the initramfs
@@ -146,7 +146,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  shown.conf failing.conf nofile.conf big.conf sealed.conf norun.conf \
                  stored.conf stored-direct.conf unstored.conf idle/hull/core.log idle/hull/core.lock \
                  searched.conf denied.conf unfound.conf rootfs/srv/searchme rootfs/bin/searchme \
-                 listen.out nethost.conf netnone.conf netexec.conf netexec.out vmhost.conf tools/squashfuse) \
+                 listen.out nethost.conf netnone.conf netexec.conf netexec.out vmhost.conf tools/squashfuse segmented.conf) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
 # What test/docker_test.sh writes.
@@ -165,7 +165,7 @@ QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.co
                   ports.conf ports.out client.out taken.conf udp.conf udp.out dial.conf dial.out sshed.conf sshed.out home/.ssh/config keep.conf \
                   overlay.conf overro.conf rootfs/srv/kept adopt.conf brief2.conf ended.conf secret.conf norun.conf pw.txt secret/probe \
                   searched.conf netnone.conf netports.conf rootfs/probe rootfs/bin/sh rootfs/written rootfs/etc/resolv.conf \
-                  data/in data/out modules.conf inplace.conf)
+                  data/in data/out modules.conf inplace.conf hearer.conf hearer.out shouter.conf loner.conf loner.out keptseg.conf anchor.conf anchor.out)
 
 # What test/flip_test.sh writes: the project, and its rsync'd copy.
 FLIP_PROJECT    = hull.conf rootfs/probe rootfs/etc/flip
@@ -185,14 +185,16 @@ TEST_SHA256_OBJS  = $(BUILD_DIR)/test/sha256_test.o
 TEST_TREE_OBJS    = $(BUILD_DIR)/test/tree_tar.o
 TEST_JSON_OBJS    = $(BUILD_DIR)/test/json_test.o
 TEST_RUNTIME_OBJS = $(BUILD_DIR)/test/runtime_test.o
+TEST_SEGMENT_OBJS = $(BUILD_DIR)/test/segment_test.o
 TEST_OBJS = $(TEST_SEXPR_OBJS) $(TEST_FRAMING_OBJS) $(TEST_SPEC_OBJS) $(TEST_MATRIX_OBJS) \
             $(TEST_REGISTRY_OBJS) $(TEST_PLAN_OBJS) $(TEST_WIRE_OBJS) $(TEST_SHA256_OBJS) \
-            $(TEST_TREE_OBJS) $(TEST_JSON_OBJS) $(TEST_RUNTIME_OBJS)
+            $(TEST_TREE_OBJS) $(TEST_JSON_OBJS) $(TEST_RUNTIME_OBJS) $(TEST_SEGMENT_OBJS)
 TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
             $(BUILD_DIR)/test/spec_test $(BUILD_DIR)/test/matrix_test \
             $(BUILD_DIR)/test/registry_test $(BUILD_DIR)/test/plan_test \
             $(BUILD_DIR)/test/wire_test $(BUILD_DIR)/test/sha256_test \
-            $(BUILD_DIR)/test/tree_tar $(BUILD_DIR)/test/json_test $(BUILD_DIR)/test/runtime_test
+            $(BUILD_DIR)/test/tree_tar $(BUILD_DIR)/test/json_test $(BUILD_DIR)/test/runtime_test \
+            $(BUILD_DIR)/test/segment_test
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
@@ -362,6 +364,9 @@ $(BUILD_DIR)/test/json_test: $(TEST_JSON_OBJS) $(BUILD_DIR)/oci/json.o
 $(BUILD_DIR)/test/runtime_test: $(TEST_RUNTIME_OBJS) $(BUILD_DIR)/cli/runtime.o
 	$(CC) $(CFLAGS) -o $@ $^
 
+$(BUILD_DIR)/test/segment_test: $(TEST_SEGMENT_OBJS) $(BUILD_DIR)/core/segment.o
+	$(CC) $(CFLAGS) -o $@ $^ -pthread
+
 -include $(SEXPR_OBJS:.o=.d) $(AGENT_OBJS:.o=.d) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS:.o=.d) \
          $(ENGINE_OBJS:.o=.d) $(STORE_OBJS:.o=.d) $(OCI_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(CORE_OBJS:.o=.d) \
          $(TEST_OBJS:.o=.d) $(BUILD_DIR)/agent/agent.d
@@ -389,6 +394,7 @@ test: $(TEST_BINS) $(HULL) $(PROBE) $(NSS_LIB) vectors
 	$(BUILD_DIR)/test/sha256_test
 	$(BUILD_DIR)/test/json_test
 	BUILD_DIR='$(BUILD_DIR)' $(BUILD_DIR)/test/runtime_test
+	$(BUILD_DIR)/test/segment_test
 	BUILD_DIR='$(BUILD_DIR)' sh test/tree_test.sh '$(BUILD_DIR)/test/tree_tar'
 	BUILD_DIR='$(BUILD_DIR)' sh test/cli_test.sh '$(HULL)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/nss_test.sh '$(HULL)' '$(NSS_LIB)'

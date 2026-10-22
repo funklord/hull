@@ -52,6 +52,7 @@
 #include "builtin.h"
 #include "core.h"
 #include "registry.h"
+#include "segment.h"
 #include "wire.h"
 
 #define MAX_CLIENTS      32u
@@ -321,6 +322,12 @@ static void on_log(hull_core *core, int level, const char *message)
 		fprintf(stderr, "hull core: %s\n", message);
 }
 
+static int on_segment(hull_core *core, const char *key, char *why, size_t cap)
+{
+	(void)core;
+	return hull_segment_port(key, why, cap);
+}
+
 static const hull_host_ops host_ops = {
 	.struct_size = sizeof (hull_host_ops),
 	.on_data     = on_data,
@@ -328,6 +335,7 @@ static const hull_host_ops host_ops = {
 	.on_exit     = on_exit_status,
 	.on_state    = on_state,
 	.log         = on_log,
+	.segment     = on_segment,
 };
 
 /* --- answering ----------------------------------------------------------- */

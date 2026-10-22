@@ -143,6 +143,14 @@ typedef struct hull_host_ops {
 	void (*on_state) (hull_core*, hull_machine*, const char *state
 	                  /* "created","running","stopping","stopped","migrating","dead" */);
 	void (*log)      (hull_core*, int level /*0=debug..3=error*/, const char *msg);
+
+	/* Appended (rule 4): read it only where struct_size reaches it.
+	 * A port on the segment `key` (Appendix D), for one NIC: the
+	 * machine's end of a stream socket framed as qemu's -netdev stream
+	 * frames it, which the engine closes when the machine is done, and
+	 * the core's switch drops the port then. The fd, or -1 with the
+	 * reason in `why`. */
+	int  (*segment)  (hull_core*, const char *key, char *why, size_t cap);
 } hull_host_ops;
 
 /* ---- Engine operations ---------------------------------------------------
