@@ -195,9 +195,14 @@ conf overlay '(backend vm) (mutable overlay) (memory "256M")' \
 name=overlay
 boot overlay
 has 0 'source\.dir\.overlay: emulated: an overlayfs in the guest'
-top=$(stat -c %u:%g "$root/rootfs")
+# Ids as the guest sees them through qemu's user namespace, where the
+# user's are 0 and any other is nobody's, as on chroot.
+guest_id() { # HOST-ID USER-ID
+	if [ "$1" = "$2" ]; then echo 0; else echo 65534; fi
+}
+top=$(guest_id "$(stat -c %u "$root/rootfs")" "$(id -u)"):$(guest_id "$(stat -c %g "$root/rootfs")" "$(id -g)")
 group=0
-[ -g "$root/rootfs" ] && group=$(stat -c %g "$root/rootfs")
+[ -g "$root/rootfs" ] && group=$(guest_id "$(stat -c %g "$root/rootfs")" "$(id -g)")
 has 0 "^owner=$top $(printf '%04d' "$(stat -c %a "$root/rootfs")")\$"
 has 0 '^write=ok$'
 has 0 "^owner=0:$group 0644\$"
@@ -208,6 +213,19 @@ cases=$((cases + 1))
 [ ! -e "$root/rootfs/layered" ] && [ ! -e "$root/rootfs/big" ] &&
 	[ "$(cat "$root/rootfs/srv/kept" 2>&1)" = kept ] ||
 	fail "an overlay's writes reached the directory" "$(ls -l "$root/rootfs" "$root/rootfs/srv" 2>&1)"
+# A setuid file of the user's is setuid root in the guest, as it is on
+# chroot: qemu runs in a user namespace where the user is root, so its 9p
+# server shows the user's files as root's. Outside one, root running it
+# ran as the user, uid 1000 say, and mount, su and sudo with it.
+cp "$probe" "$root/rootfs/suid"
+chmod 4755 "$root/rootfs/suid"
+conf suid '(backend vm) (command "/suid" "uid" "euid" "owner" "/suid")'
+name=suid
+boot suid
+has 0 '^uid=0$'
+has 0 '^euid=0$'
+has 0 '^owner=0:[0-9]+ 4755$'
+rm -f "$root/rootfs/suid"
 # Read-only as well, it is the share itself, read-only.
 conf overro '(backend vm) (mutable overlay) (security (readonly_root true))' \
 	'(command "/probe" "write" "/again")'

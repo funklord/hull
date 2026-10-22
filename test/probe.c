@@ -8,6 +8,7 @@
  *   say TEXT    TEXT on stdout        err TEXT    TEXT on stderr
  *   env NAME    NAME's value          cwd         the working directory
  *   host        the hostname          uid         the uid
+ *   euid        the effective uid, which a setuid file's owner gives
  *   write PATH  whether PATH can be created
  *   remove PATH whether PATH can be removed
  *   mkdir PATH  whether PATH can be made, as a directory
@@ -578,6 +579,8 @@ int main(int argc, char **argv)
 			printf("host=%s\n", gethostname(text, sizeof text) == 0 ? text : "(unknown)");
 		} else if (strcmp(step, "uid") == 0) {
 			printf("uid=%u\n", (unsigned)getuid());
+		} else if (strcmp(step, "euid") == 0) {
+			printf("euid=%u\n", (unsigned)geteuid());
 		} else if (strcmp(step, "write") == 0) {
 			int fd = open(arg, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 

@@ -857,10 +857,28 @@ static void segment_mac(const hull_machine *m, unsigned i, char *out, size_t cap
 	         (unsigned)(hash >> 8) & 0xffu, (unsigned)hash & 0xffu);
 }
 
+/* `format` with `id`, written whole to `path`, as a child between fork and
+ * exec may: no allocation, no stdio. */
+static int write_map(const char *path, const char *format, unsigned id)
+{
+	char    text[64];
+	int     n = snprintf(text, sizeof text, format, id);
+	int     fd = open(path, O_WRONLY | O_CLOEXEC);
+	ssize_t written;
+
+	if (fd < 0 || n < 0)
+		return 0;
+	written = write(fd, text, (size_t)n);
+	close(fd);
+	return written == (ssize_t)n;
+}
+
 /* Fork qemu for `m`, with `cid` for its vsock device. Its stdout and
  * stderr go to qemu.log. */
 static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 {
+	uid_t       uid = getuid();   /* read here: unmapped once unshared */
+	gid_t       gid = getgid();
 	char        kernel[300];
 	char        initrd[4200];
 	char        console[8600];
@@ -1006,6 +1024,20 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 				if (dup2(moved[i], (int)(SEGMENT_FD + i)) < 0)
 					_exit(126);
 			syscall(SYS_close_range, SEGMENT_FD + m->segment_count, ~0u, 0u);
+		}
+		/* qemu in a user namespace where the user is root, as a chroot
+		 * machine is: its 9p server then shows the guest the user's files
+		 * as root's. Outside one it showed them as the user's own uid, so
+		 * a setuid-root program was setuid to the user in the guest, and
+		 * root running mount, su or sudo ran them as the user, which
+		 * systemd's mount units met first. Its devices are opened by the
+		 * user's own rights, groups included, which a user namespace
+		 * keeps; passt is outside it, by the descriptor above. */
+		if (unshare(CLONE_NEWUSER) != 0 || !write_map("/proc/self/setgroups", "deny", 0u) ||
+		    !write_map("/proc/self/uid_map", "0 %u 1", (unsigned)uid) ||
+		    !write_map("/proc/self/gid_map", "0 %u 1", (unsigned)gid)) {
+			fprintf(stderr, "qemu-system-x86_64: a user namespace: %s\n", strerror(errno));
+			_exit(126);
 		}
 		execvp(argv[0], (char *const *)argv);
 		fprintf(stderr, "qemu-system-x86_64: %s\n", strerror(errno));

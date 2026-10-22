@@ -158,12 +158,11 @@ layer 2.
 **Caveats**
 - **The host's kernel, not the image's**: a distribution image boots on
   the kernel the host runs, until hull ships one of its own.
-- **Files are the host user's in the guest.** qemu's 9p shares pass the
-  host's owners through, so every file of the machine's directory is uid
-  1000, say, inside, where on chroot it is root's. A setuid-root program
-  is then setuid to the user: `mount`, `su` and `sudo` run by root fail
-  as the user would. Moving the shares to virtiofs, with virtiofsd in a
-  user namespace of the user's, is the fix and the next in this engine.
+- **The guest sees ids as a user namespace maps them**: qemu runs in
+  one where you are root, so your files are root's in the guest and
+  setuid-root programs work, and a file of any other owner or group is
+  nobody's, 65534, as on chroot. A chown to another id inside is not
+  kept on the host.
 - **`(mutable direct)` writes through 9p as the user**, so a chown in the
   guest fails, and an apt install with it; use `(mutable overlay)`, or
   put packages in the image.
