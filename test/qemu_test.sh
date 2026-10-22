@@ -28,6 +28,24 @@ printf 'nameserver 127.0.0.53\n' > "$dir/rootfs/etc/resolv.conf"
 root=$(cd "$dir" && pwd)
 # The engine's passt, by the arguments only it gives.
 passt='^passt --quiet --fd 3 --one-off --ipv4-only --address 10\.0\.2\.15 '
+# passts_new OTHERS: the engine's passts now, less those in OTHERS, as
+# `others=$(passts_now)` took them before the machine a check is about.
+# Those arguments are every hull vm's, and passt runs non-dumpable, so
+# neither its environment nor its descriptors say whose it is: another
+# session's hull vm on the host is told apart only by having been there
+# first, and one started within a check's own window is not.
+passts_now() {
+	pgrep -f "$passt" | tr '\n' ' '
+}
+passts_new() {
+	for p in $(pgrep -f "$passt"); do
+		case " $1 " in
+		*" $p "*) ;;
+		*) printf '%s\n' "$p" ;;
+		esac
+	done
+}
+others_at_start=$(passts_now)
 cases=0
 failures=0
 
@@ -299,6 +317,61 @@ cases=$((cases + 1))
 		"core ${core:-none}: $fds_before before, $fds_after after"
 timeout 10 "$hull" kill -s TERM anchor > /dev/null 2>&1
 wait "$anchored"
+# (init PATH): PID 1 is the image's init, here the probe as one, which
+# reaps for ever, and the agent goes on beside it; the workload is not
+# PID 1, and when it ends the image's /sbin/poweroff, the probe as one,
+# ends the machine. Without one the kernel's power-off follows the grace.
+mkdir -p "$dir/initroot/sbin" "$dir/initroot/proc" "$dir/initroot/dev" "$dir/initroot/sys" \
+	"$dir/initbare/sbin" "$dir/initbare/proc" "$dir/initbare/dev" "$dir/initbare/sys"
+for d in initroot initbare; do
+	cp "$probe" "$dir/$d/probe"
+	cp "$probe" "$dir/$d/sbin/init"
+done
+cp "$probe" "$dir/initroot/sbin/poweroff"
+printf '(machine (source "dir:./initroot") (backend vm) (mutable overlay) (init "/sbin/init") %s)\n' \
+	'(command "/probe" "target" "/proc/1/exe" "pid")' > "$root/inited.conf"
+name=inited
+started=$(date +%s)
+boot inited
+took=$(( $(date +%s) - started ))
+has 0 '^target=/sbin/init$'
+has 0 '^pid=([2-9]|[1-9][0-9]+)$'
+cases=$((cases + 1))
+[ "$took" -lt 15 ] || fail "a machine handed to its init took ${took}s to end, its poweroff unused" "$out"
+# Through an exec, which the agent beside the init serves, and a stop.
+printf '(machine (source "dir:./initroot") (backend vm) (mutable overlay) (init "/sbin/init") %s)\n' \
+	'(hostname "initexec") (command "/probe" "say" "ready" "wait")' > "$root/initexec.conf"
+rm -f "$root/initexec.out"
+(cd / && exec timeout 60 "$hull" run -f "$root/initexec.conf" > "$root/initexec.out" 2>&1) &
+initexec=$!
+tries=0
+until grep -q '^ready$' "$root/initexec.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+xcase 0 '^target=/sbin/init$' "$hull" exec initexec /probe target /proc/1/exe
+timeout 30 "$hull" stop initexec > /dev/null 2>&1
+wait "$initexec"
+cases=$((cases + 1))
+grep -q '^ready$' "$root/initexec.out" || fail "a machine handed to its init did not run" \
+	"$(cat "$root/initexec.out")"
+# No /sbin/poweroff: the kernel's, after the grace.
+printf '(machine (source "dir:./initbare") (backend vm) (mutable overlay) (init "/sbin/init") %s)\n' \
+	'(command "/probe" "say" "bare")' > "$root/initbare.conf"
+name=initbare
+started=$(date +%s)
+boot initbare 90
+took=$(( $(date +%s) - started ))
+has 0 '^bare$'
+cases=$((cases + 1))
+[ "$took" -ge 18 ] && [ "$took" -lt 60 ] ||
+	fail "a machine with no poweroff ended in ${took}s, not after the grace" "$out"
+# An init that is not there is refused, and said.
+printf '(machine (source "dir:./initroot") (backend vm) (mutable overlay) (init "/sbin/nothing") %s)\n' \
+	'(command "/probe" "say" "never")' > "$root/noinit.conf"
+name=noinit
+boot noinit
+has 125 'no init it can run'
 # A segment's port is the core's, so a machine on one cannot outlive it.
 conf keptseg "(backend vm) (on_disconnect keep) (segments \"$wire\")" '(command "/probe" "say" "no")'
 name=keptseg
@@ -693,6 +766,7 @@ grep -q 'ports: emulated: tcp and udp, forwarded over vsock' "$root/udp.out" ||
 conf trap '(backend vm) (hostname "qtrap") (command "/probe" "trap" "say" "after")'
 cases=$((cases + 1))
 rm -f "$root/trap.out"
+others=$(passts_now)
 (cd / && exec timeout -k 2 60 "$hull" run -f "$root/trap.conf" > "$root/trap.out" 2>&1) &
 runner=$!
 await qtrap
@@ -703,7 +777,7 @@ name=brief
 boot brief
 has 0 '^brief$'
 cases=$((cases + 1))
-left=$(pgrep -f "$passt")
+left=$(passts_new "$others")
 [ "$(printf '%s\n' "$left" | grep -c .)" = 1 ] ||
 	fail "a passt outlived its machine, or the running one has none" "$left"
 listed=$("$hull" ps 2>&1)
@@ -903,6 +977,7 @@ xcase 1 'the machine is not running' "$hull" stats qexec
 # A machine not kept dies with its core: nothing could manage it after.
 conf kept '(backend vm) (hostname "qkept") (command "/probe" "wait")'
 cases=$((cases + 1))
+others=$(passts_now)
 (cd / && exec timeout -k 2 60 "$hull" run -f "$root/kept.conf" > /dev/null 2>&1) &
 runner=$!
 await qkept
@@ -915,7 +990,7 @@ else
 	left=$(pgrep -f "^qemu-system-x86_64 .*$XDG_RUNTIME_DIR/hull/qemu-")
 	[ -z "$left" ] || fail "a vm outlived its core" "$(ps -o pid,args -p "$left")"
 	cases=$((cases + 1))
-	left=$(pgrep -f "$passt")
+	left=$(passts_new "$others")
 	[ -z "$left" ] || fail "a vm's passt outlived its core" "$(ps -o pid,args -p "$left")"
 fi
 wait "$runner" 2>/dev/null
@@ -954,12 +1029,20 @@ s.settimeout(10)
 s.connect((int(sys.argv[1]), 1))
 def say(m):
 	s.sendall(struct.pack(">I", len(m)) + m)
-say(b"(5:hello(2:ch1:0)(8:features)(5:proto1:1))")
-say(b"(6:resume(2:ch1:0)(5:token32:" + b"x" * 32 + b"))")
-say(b"(4:exec(4:argv6:/probe)(2:ch1:7)(3:tty5:false))")
+# The agent may close as soon as it has read the false token, before the
+# exec is sent: a closed connection, whenever it closes, is the answer.
+try:
+	say(b"(5:hello(2:ch1:0)(8:features)(5:proto1:1))")
+	say(b"(6:resume(2:ch1:0)(5:token32:" + b"x" * 32 + b"))")
+	say(b"(4:exec(4:argv6:/probe)(2:ch1:7)(3:tty5:false))")
+except (BrokenPipeError, ConnectionResetError):
+	pass
 got = b""
 while True:
-	piece = s.recv(4096)
+	try:
+		piece = s.recv(4096)
+	except ConnectionResetError:
+		break
 	if not piece:
 		break
 	got += piece
@@ -1124,7 +1207,7 @@ rm -rf "${shm:?}"
 cases=$((cases + 1))
 sleep 2
 left=$(pgrep -f "^qemu-system-x86_64 .*$XDG_RUNTIME_DIR/hull/qemu-")
-left=$left$(pgrep -f "$passt")
+left=$left$(passts_new "$others_at_start")
 dirs=$(ls -d "$XDG_RUNTIME_DIR"/hull/qemu-* 2>/dev/null)
 [ -z "$left" ] && [ -z "$dirs" ] || fail "a vm or its directory was left" "$left $dirs"
 

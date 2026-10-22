@@ -172,6 +172,12 @@ expect 1 'segments: rejected: not yet: a container.s NIC on the core.s switch' \
 	"$hull" plan -f "$dir/segmented.conf" --backend docker
 expect 0 'machine on qemu \(vm\): ok|segments: native' \
 	"$hull" plan --explain -f "$dir/segmented.conf" --backend vm
+# So is handing PID 1 to the image's init.
+printf '%s\n' '(machine (source "dir:./rootfs") (init "/sbin/init"))' > "$dir/inited.conf"
+expect 1 'init: rejected: not yet: the machine.s PID 1 is the engine.s own' \
+	"$hull" plan -f "$dir/inited.conf" --backend chroot
+expect 1 'init: rejected: not yet: a container.s PID 1 is docker.s init' \
+	"$hull" plan -f "$dir/inited.conf" --backend docker
 expect 2 'plan takes one backend' "$hull" plan -f "$dir/ref.conf" --backend ns,vm
 expect 0 '^\(machine \(source "debian:13"\) \(ports \(port \(host 8080\) \(guest 80\) \(proto tcp\)\)\) .*\(projection bind\)\)$' \
 	"$hull" plan --resolved -f "$dir/ref.conf"

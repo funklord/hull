@@ -16,6 +16,10 @@
  *   owner PATH  PATH's owner, group and mode, not following a link
  *   read PATH   PATH's first line
  *   load PATH   whether the module PATH, under /lib/modules/RELEASE, loads
+ * Run as PID 1 with no arguments it is an init that reaps for ever; run as
+ * `poweroff` it powers the machine off. Steps:
+ *
+ *   target PATH where the symlink PATH points
  *   nest        whether a user and network namespace can be made inside,
  *               as `unshare -rn` makes one, in a child that then exits
  *   link IF     whether the interface IF can be brought up
@@ -86,6 +90,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/prctl.h>
+#include <sys/reboot.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
@@ -514,6 +519,21 @@ static void hear(const char *name)
 int main(int argc, char **argv)
 {
 	char text[256];
+	/* An image's init and its poweroff, for (init PATH)'s test. */
+	{
+		const char *base = strrchr(argv[0], '/') != NULL ? strrchr(argv[0], '/') + 1 : argv[0];
+
+		if (strcmp(base, "poweroff") == 0) {
+			sync();
+			reboot(RB_POWER_OFF);
+			return 1;
+		}
+		if (getpid() == 1 && argc == 1) {
+			for (;;)
+				if (wait(NULL) < 0)
+					pause();
+		}
+	}
 
 	setvbuf(stdout, NULL, _IONBF, 0);
 	/* Run as a machine's /bin/sh, as `hull ssh` runs one: what it was
@@ -777,6 +797,15 @@ int main(int argc, char **argv)
 		} else if (strcmp(step, "resolve") == 0 && i + 2 < argc) {
 			resolve(arg, argv[i + 2]);
 			i += 2;
+		} else if (strcmp(step, "target") == 0) {
+			char    to[4096];
+			ssize_t n = readlink(arg, to, sizeof to - 1u);
+
+			if (n < 0)
+				printf("target=%s\n", strerror(errno));
+			else
+				printf("target=%.*s\n", (int)n, to);
+			i++;
 		} else if (strcmp(step, "nest") == 0) {
 			int   status = 0;
 			pid_t child = fork();

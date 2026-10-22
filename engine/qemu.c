@@ -2566,6 +2566,9 @@ static const hull_cap_entry entries[] = {
 	{ "network.host",       HULL_SUP_REJECTED,
 	  "a vm shares no network namespace with the host: use ports", NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   "no NIC: lo alone in the guest", NULL },
+	{ "init",               HULL_SUP_NATIVE,
+	  "the image's init is PID 1, the agent a child of it, and its poweroff ends the machine",
+	  NULL },
 	{ "segments",           HULL_SUP_NATIVE,
 	  "a NIC each after passt's, eth1 on, on the core's switch, with no address given", NULL },
 

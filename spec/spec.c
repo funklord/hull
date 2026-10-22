@@ -383,6 +383,7 @@ static const key machine_keys[] = {
 	{ .name = "on_disconnect", .type = CHOICE, .choices = disconnect_values },
 	{ .name = "network",       .type = CHOICE, .choices = network_values },
 	{ .name = "segments",      .type = STRINGS, .value = label },
+	{ .name = "init",          .type = STRING, .value = absolute },
 	{ .name = "hostname",      .type = STRING, .value = label },
 	{ .name = "security",      .type = RECORD, .record = &security },
 	{ .name = "secrets",       .type = MAP, .record = &secret, .names = secret_name },

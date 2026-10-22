@@ -1671,6 +1671,8 @@ static const hull_cap_entry entries[] = {
 	{ "env",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "network.host",       HULL_SUP_NATIVE,   NULL, NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   NULL, NULL },
+	{ "init",               HULL_SUP_REJECTED,
+	  "not yet: a container's PID 1 is docker's init, for its signals", NULL },
 	{ "segments",           HULL_SUP_REJECTED,
 	  "not yet: a container's NIC on the core's switch is not written", NULL },
 	{ "ports",              HULL_SUP_NATIVE,

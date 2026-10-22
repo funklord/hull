@@ -101,6 +101,8 @@
 static char  *argv_[MAX_ARGS + 1u];
 static char  *envp_[MAX_ENV + 1u];
 static char  *workdir;
+static char  *init_;       /* (init PATH): the image's init, PID 1 once handed to */
+static int    handed;      /* PID 1 is the image's init, and this is the agent beside it */
 static int    no_new_privs;
 static int    applied;     /* the spec is applied: the root is the machine's */
 
@@ -163,8 +165,33 @@ static void say(const char *what, const char *detail)
 	        detail != NULL ? detail : "");
 }
 
+/* Seconds the image's own shutdown is given before the machine is
+ * powered off regardless. */
+#define SHUTDOWN_GRACE 20
+
 static void power_off(void)
 {
+	/* Handed to the image's init, its own shutdown, which every init of
+	 * note answers as /sbin/poweroff, so that what it started ends as it
+	 * would; the kernel's after the grace, if it has not ended this. */
+	if (handed) {
+		pid_t asked = fork();
+
+		if (asked == 0) {
+			char *const argv[] = { "poweroff", NULL };
+			sigset_t    none;
+
+			sigemptyset(&none);
+			sigprocmask(SIG_SETMASK, &none, NULL);
+			execv("/sbin/poweroff", argv);
+			_exit(127);
+		}
+		for (int i = 0; i < SHUTDOWN_GRACE * 4; i++) {
+			struct timespec quarter = { 0, 250000000L };
+
+			nanosleep(&quarter, NULL);
+		}
+	}
 	sync();
 	reboot(RB_POWER_OFF);
 	for (;;)
@@ -599,6 +626,9 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 		}
 	}
 	workdir = hull_access_value(doc, machine, "workdir");
+	init_ = hull_access_value(doc, machine, "init");
+	if (init_ != NULL && init_[0] != '/')
+		return "the machine's init is not an absolute path";
 	{
 		char *disconnect = hull_access_value(doc, machine, "on_disconnect");
 
@@ -871,10 +901,48 @@ static const char *spawn(uint32_t ch, char *const *argv, const char *cwd, char *
 	return NULL;
 }
 
+/* (init PATH): PID 1 becomes the image's init, and the agent goes on in a
+ * child of it, the reaper of what it starts, as it was. PID 1's signals
+ * are given back first, since a mask outlives exec; and should the exec
+ * fail, PID 1 reaps for ever rather than end, which would panic the
+ * kernel. */
+static const char *hand_over(void)
+{
+	pid_t agent;
+
+	if (access(init_, X_OK) != 0)
+		return "the machine has no init it can run at its (init ...) path";
+	agent = fork();
+	if (agent < 0)
+		return "the agent could not be forked";
+	if (agent > 0) {
+		char *const argv[] = { init_, NULL };
+		sigset_t    none;
+
+		sigemptyset(&none);
+		sigprocmask(SIG_SETMASK, &none, NULL);
+		signal(SIGCHLD, SIG_DFL);
+		signal(SIGPIPE, SIG_DFL);
+		execv(init_, argv);
+		say("init", strerror(errno));
+		for (;;)
+			if (wait(NULL) < 0)
+				pause();
+	}
+	handed = 1;
+	if (prctl(PR_SET_CHILD_SUBREAPER, 1L, 0L, 0L, 0L) != 0)
+		say("subreaper", strerror(errno));
+	return NULL;
+}
+
 static const char *start(void)
 {
+	const char *reason;
+
 	if (workload() != NULL)
 		return "the workload has been started already";
+	if (init_ != NULL && !handed && (reason = hand_over()) != NULL)
+		return reason;
 	return spawn(0u, argv_, workdir, NULL, NULL, 0);
 }
 
@@ -1446,7 +1514,9 @@ static void finish(void)
 		return;
 	}
 	send_status(0u, workload()->status);
-	kill(-1, SIGKILL);
+	/* What the image's init started is its own to end, as it shuts down. */
+	if (!handed)
+		kill(-1, SIGKILL);
 	farewell();
 }
 
