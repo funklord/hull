@@ -25,6 +25,9 @@ typedef struct writer {
 	char          *detail;
 	size_t         detail_cap;
 	char           path[MAX_PATH];  /* the entry's name in the stream */
+	int            one_fs;          /* only the root's own mount */
+	uint64_t       mount;           /* the root's mount id, where one_fs */
+	dev_t          device;          /* its device, where no mount id is given */
 	uint8_t        buffer[65536];
 } writer;
 
@@ -201,6 +204,18 @@ static int by_name(const void *a, const void *b)
 
 static int walk(writer *w, int dir, size_t base, unsigned depth);
 
+/* Whether `name` in `dir` is on a mount other than the root's. */
+static int elsewhere(const writer *w, int dir, const char *name, const struct stat *st)
+{
+	struct statx found;
+
+	if (w->mount != 0u &&
+	    statx(dir, name, AT_SYMLINK_NOFOLLOW, STATX_MNT_ID, &found) == 0 &&
+	    (found.stx_mask & STATX_MNT_ID) != 0u)
+		return found.stx_mnt_id != w->mount;
+	return st->st_dev != w->device;
+}
+
 static int entry(writer *w, int dir, const char *name, size_t base, unsigned depth)
 {
 	struct stat st;
@@ -213,6 +228,20 @@ static int entry(writer *w, int dir, const char *name, size_t base, unsigned dep
 	if (fstatat(dir, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
 		return fail(w, strerror(errno));
 
+	/* On another mount, under one_fs: a directory is a mount point,
+	 * written as itself and not what is mounted on it, as an image keeps
+	 * an empty /proc; anything else is a file bound over one, left out. A
+	 * bind from the same filesystem keeps its device, so the mount id is
+	 * what tells, and the device only where the kernel gives none. */
+	if (w->one_fs && elsewhere(w, dir, name, &st)) {
+		if (S_ISDIR(st.st_mode)) {
+			w->path[base + length]      = '/';
+			w->path[base + length + 1u] = '\0';
+			status = header(w, w->path, '5', &st, 0u, NULL);
+		}
+		w->path[base] = '\0';
+		return status;
+	}
 	if (S_ISDIR(st.st_mode)) {
 		int fd;
 
@@ -306,8 +335,15 @@ static int walk(writer *w, int dir, size_t base, unsigned depth)
 int hull_tree_tar(const char *root, hull_tree_sink sink, void *context, char *detail,
                   size_t detail_cap)
 {
+	return hull_tree_tar_fs(root, 0, sink, context, detail, detail_cap);
+}
+
+int hull_tree_tar_fs(const char *root, int one_fs, hull_tree_sink sink, void *context,
+                     char *detail, size_t detail_cap)
+{
 	static const uint8_t end[2u * BLOCK];
 	writer              *w = calloc(1u, sizeof *w);
+	struct stat          top;
 	int                  dir;
 	int                  status;
 
@@ -320,10 +356,21 @@ int hull_tree_tar(const char *root, hull_tree_sink sink, void *context, char *de
 	w->detail     = detail;
 	w->detail_cap = detail_cap;
 	dir = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-	if (dir < 0) {
+	if (dir < 0 || fstat(dir, &top) != 0) {
 		snprintf(detail, detail_cap, "%s: %s", root, strerror(errno));
+		if (dir >= 0)
+			close(dir);
 		free(w);
 		return -1;
+	}
+	w->one_fs = one_fs;
+	w->device = top.st_dev;
+	{
+		struct statx root_mount;
+
+		if (statx(dir, "", AT_EMPTY_PATH, STATX_MNT_ID, &root_mount) == 0 &&
+		    (root_mount.stx_mask & STATX_MNT_ID) != 0u)
+			w->mount = root_mount.stx_mnt_id;
 	}
 	status = walk(w, dir, 0u, 0u);
 	if (status == 0)

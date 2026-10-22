@@ -175,6 +175,25 @@ cases=$((cases + 1))
 [ "$got" = 1 ] && printf '%s\n' "$out" | grep -q '^tree_tar: a/file: Permission denied$' ||
 	fail "an unreadable file exited $got" "$out"
 
+# --one-fs: in a user and mount namespace of its own, a tmpfs mounted in
+# the tree and a file bound over one of it. The mount point is written,
+# empty, and what is on the tmpfs and the bound file are left out; the
+# rest is as it was.
+mkdir -p "$dir/fs/kept" "$dir/fs/mnt"
+printf 'kept\n' > "$dir/fs/kept/file"
+printf 'mine\n' > "$dir/fs/bound"
+printf 'theirs\n' > "$dir/other"
+out=$(timeout 60 unshare -rm sh -c '
+mount -t tmpfs none "$1/fs/mnt" && printf "hidden\n" > "$1/fs/mnt/inside" &&
+mount --bind "$1/other" "$1/fs/bound" && exec "$2" --one-fs "$1/fs"' sh "$dir" "$tar_of" 2>&1 \
+	> "$dir/fs.tar")
+got=$?
+cases=$((cases + 1))
+names=$(python3 -c 'import sys, tarfile; print(" ".join(sorted(m.name for m in tarfile.open(sys.argv[1]))))' \
+	"$dir/fs.tar" 2>&1)
+[ "$got" = 0 ] && [ "$names" = "kept kept/file mnt" ] ||
+	fail "--one-fs gave $names, exiting $got" "$out"
+
 clear
 printf 'tree: %d cases, %d failed\n' "$cases" "$failures"
 [ "$failures" = 0 ]

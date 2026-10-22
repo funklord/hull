@@ -37,6 +37,13 @@ typedef int (*hull_tree_sink)(void *context, const uint8_t *data, size_t n);
 int hull_tree_tar(const char *root, hull_tree_sink sink, void *context, char *detail,
                   size_t detail_cap);
 
+/* The same, and with `one_fs` only what is on `root`'s own filesystem: a
+ * directory on another, a mount point, is written as itself and empty,
+ * and anything else on another, a file bound over one, is left out, so a
+ * machine's tree comes without its /proc, /sys, /dev and volumes. */
+int hull_tree_tar_fs(const char *root, int one_fs, hull_tree_sink sink, void *context,
+                     char *detail, size_t detail_cap);
+
 /* One entry of such a stream, for a writer that has no directory to walk,
  * as `hull push` writes a layer from a manifest: its name as the stream
  * holds it, a directory's ending in `/`; its type, '0' a file, '2' a
