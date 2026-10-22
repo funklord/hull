@@ -1578,16 +1578,48 @@ static long long seconds_of(const char *text)
 	}
 }
 
-/* The env a step runs with: the parent's runtime's, then PATH where it
- * gives none, and SOURCE_DATE_EPOCH, for toolchains that honour it. */
-static void step_env(text_buf *t, const uint8_t *runtime, size_t runtime_length)
+/* The env a step runs with: the parent's runtime's, each name the step's
+ * own (env ...) gives replaced by its value, then PATH where neither gives
+ * one, and SOURCE_DATE_EPOCH, for toolchains that honour it. */
+static void step_env(text_buf *t, const uint8_t *runtime, size_t runtime_length,
+                     const hull_spec *spec, const hull_sexpr_form *step)
 {
 	hull_sexpr_doc  doc;
 	hull_sexpr_form top;
 	hull_sexpr_form env;
+	hull_sexpr_form own;
+	int             has_own = hull_spec_find(spec, step, "env", &own);
 	int             has_path = 0;
 
 	add_text(t, " (env");
+	if (has_own) {
+		hull_sexpr_form pair;
+		int             more;
+
+		hull_sexpr_child(&spec->doc, &own, &pair);
+		for (more = hull_sexpr_next(&spec->doc, &pair, &pair); more;
+		     more = hull_sexpr_next(&spec->doc, &pair, &pair)) {
+			hull_sexpr_form key;
+			hull_sexpr_form value;
+			char            text[8192];
+			size_t          n;
+			size_t          before = t->length;
+
+			hull_sexpr_child(&spec->doc, &pair, &key);
+			hull_sexpr_next(&spec->doc, &key, &value);
+			if (hull_sexpr_value(&spec->doc, &value, (uint8_t *)text, sizeof text - 1u, &n) !=
+			    HULL_SEXPR_OK)
+				continue;
+			has_path |= hull_sexpr_is(&spec->doc, &key, "PATH");
+			add_text(t, " (");
+			add_bytes(t, spec->doc.data + key.content, key.content_length);
+			add_text(t, " ");
+			if (add_quoted(t, (const uint8_t *)text, n) != 0)
+				cut_text(t, before);
+			else
+				add_text(t, ")");
+		}
+	}
 	if (runtime != NULL &&
 	    hull_sexpr_open(&doc, runtime, runtime_length, HULL_SEXPR_CANONICAL, NULL) == HULL_SEXPR_OK &&
 	    hull_sexpr_first(&doc, &top) && record_find(&doc, &top, "env", &env)) {
@@ -1601,12 +1633,20 @@ static void step_env(text_buf *t, const uint8_t *runtime, size_t runtime_length)
 			hull_sexpr_form value;
 			size_t          before = t->length;
 
+			hull_sexpr_form mine;
+			char            name[256];
+
 			hull_sexpr_child(&doc, &pair, &key);
 			hull_sexpr_next(&doc, &key, &value);
 			if (!is_key(doc.data + key.content, key.content_length) ||
+			    key.content_length >= sizeof name ||
 			    (key.content_length == 17u &&
 			     memcmp(doc.data + key.content, "SOURCE_DATE_EPOCH", 17u) == 0))
 				continue;
+			memcpy(name, doc.data + key.content, key.content_length);
+			name[key.content_length] = '\0';
+			if (has_own && hull_spec_find(spec, &own, name, &mine))
+				continue;  /* the step's own */
 			has_path |= key.content_length == 4u && memcmp(doc.data + key.content, "PATH", 4u) == 0;
 			add_text(t, " (");
 			add_bytes(t, doc.data + key.content, key.content_length);
@@ -1620,6 +1660,231 @@ static void step_env(text_buf *t, const uint8_t *runtime, size_t runtime_length)
 	if (!has_path)
 		add_text(t, " (PATH \"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\")");
 	add_text(t, " (SOURCE_DATE_EPOCH \"0\"))");
+}
+
+/* One canonical atom of `n` bytes. */
+static void add_atom(text_buf *t, const void *bytes, size_t n)
+{
+	char length[24];
+
+	snprintf(length, sizeof length, "%zu:", n);
+	add_text(t, length);
+	add_bytes(t, bytes, n);
+}
+
+typedef struct named_text {
+	char *name;
+	char *value;
+} named_text;
+
+static int named_order(const void *a, const void *b)
+{
+	return strcmp(((const named_text *)a)->name, ((const named_text *)b)->name);
+}
+
+/* Each string of the spec's `(key "a" ...)` into `items`, as names. */
+static void spec_words(const hull_spec *spec, const hull_sexpr_form *record, const char *key,
+                       named_text *items, size_t *count, size_t cap)
+{
+	hull_sexpr_form entry;
+	hull_sexpr_form item;
+	int             more;
+
+	if (!hull_spec_find(spec, record, key, &entry))
+		return;
+	hull_sexpr_child(&spec->doc, &entry, &item);
+	for (more = hull_sexpr_next(&spec->doc, &item, &item); more && *count < cap;
+	     more = hull_sexpr_next(&spec->doc, &item, &item)) {
+		char   text[8192];
+		size_t n;
+
+		if (hull_sexpr_value(&spec->doc, &item, (uint8_t *)text, sizeof text - 1u, &n) !=
+		    HULL_SEXPR_OK)
+			continue;
+		text[n] = '\0';
+		items[*count].name = strdup(text);
+		items[*count].value = NULL;
+		if (items[*count].name != NULL)
+			(*count)++;
+	}
+}
+
+/* Each atom of a canonical `(key a ...)` into `items`, as names. */
+static void canonical_words(const hull_sexpr_doc *doc, const hull_sexpr_form *record,
+                            const char *key, named_text *items, size_t *count, size_t cap)
+{
+	hull_sexpr_form list;
+	hull_sexpr_form item;
+	int             more;
+
+	if (record == NULL || !record_find(doc, record, key, &list))
+		return;
+	hull_sexpr_child(doc, &list, &item);
+	for (more = hull_sexpr_next(doc, &item, &item); more && *count < cap;
+	     more = hull_sexpr_next(doc, &item, &item)) {
+		items[*count].name = strndup((const char *)doc->data + item.content, item.content_length);
+		items[*count].value = NULL;
+		if (items[*count].name != NULL)
+			(*count)++;
+	}
+}
+
+/*
+ * J.6's (runtime ...) laid over the base's, as A.4's canonical form: the
+ * command, the entrypoint, the stop signal, the user and the workdir the
+ * build's where it gives them, an empty (cmd) clearing the base's, as an
+ * ENTRYPOINT does a CMD; the env merged by name, the build's winning; the
+ * ports and the volumes joined. The workdir `/` where neither gives one.
+ */
+static int build_runtime(const hull_spec *spec, const hull_sexpr_form *own, const uint8_t *base,
+                         size_t base_length, text_buf *out)
+{
+	static named_text items[1024];
+	hull_sexpr_doc    doc;
+	hull_sexpr_form   top;
+	hull_sexpr_form   found;
+	hull_sexpr_form  *from = NULL;
+	static const char *const lists[] = { "cmd", "entrypoint" };
+	static const char *const opens[] = { "(3:cmd", "(10:entrypoint" };
+	static const char *const ones[] = { "stop_signal", "user", "workdir" };
+	static const char *const one_opens[] = { "(11:stop_signal", "(4:user", "(7:workdir" };
+	size_t            count;
+
+	if (base != NULL && hull_sexpr_open(&doc, base, base_length, HULL_SEXPR_CANONICAL, NULL) ==
+	                        HULL_SEXPR_OK && hull_sexpr_first(&doc, &top))
+		from = &top;
+	add_text(out, "(7:runtime");
+	for (unsigned k = 0u; k < 2u; k++) {
+		count = 0u;
+		if (hull_spec_find(spec, own, lists[k], &found))
+			spec_words(spec, own, lists[k], items, &count, 1024u);
+		else
+			canonical_words(&doc, from, lists[k], items, &count, 1024u);
+		if (count > 0u) {
+			add_text(out, opens[k]);
+			for (size_t i = 0u; i < count; i++)
+				add_atom(out, items[i].name, strlen(items[i].name));
+			add_text(out, ")");
+		}
+		for (size_t i = 0u; i < count; i++)
+			free(items[i].name);
+	}
+	/* env: the base's pairs, then the build's over them by name. */
+	count = 0u;
+	if (from != NULL && record_find(&doc, from, "env", &found)) {
+		hull_sexpr_form pair;
+		int             more;
+
+		hull_sexpr_child(&doc, &found, &pair);
+		for (more = hull_sexpr_next(&doc, &pair, &pair); more && count < 1024u;
+		     more = hull_sexpr_next(&doc, &pair, &pair)) {
+			hull_sexpr_form key;
+			hull_sexpr_form value;
+
+			hull_sexpr_child(&doc, &pair, &key);
+			hull_sexpr_next(&doc, &key, &value);
+			items[count].name = strndup((const char *)doc.data + key.content, key.content_length);
+			items[count].value = strndup((const char *)doc.data + value.content,
+			                             value.content_length);
+			count++;
+		}
+	}
+	if (hull_spec_find(spec, own, "env", &found)) {
+		hull_sexpr_form pair;
+		int             more;
+
+		hull_sexpr_child(&spec->doc, &found, &pair);
+		for (more = hull_sexpr_next(&spec->doc, &pair, &pair); more && count < 1024u;
+		     more = hull_sexpr_next(&spec->doc, &pair, &pair)) {
+			hull_sexpr_form key;
+			hull_sexpr_form value;
+			char            text[8192];
+			size_t          n;
+			char           *name;
+
+			hull_sexpr_child(&spec->doc, &pair, &key);
+			hull_sexpr_next(&spec->doc, &key, &value);
+			if (hull_sexpr_value(&spec->doc, &value, (uint8_t *)text, sizeof text - 1u, &n) !=
+			    HULL_SEXPR_OK)
+				continue;
+			name = strndup((const char *)spec->doc.data + key.content, key.content_length);
+			for (size_t i = 0u; name != NULL && i < count; i++)
+				if (strcmp(items[i].name, name) == 0) {
+					free(items[i].name);
+					free(items[i].value);
+					items[i] = items[--count];
+					break;
+				}
+			items[count].name = name;
+			items[count].value = strndup(text, n);
+			count++;
+		}
+	}
+	qsort(items, count, sizeof items[0], named_order);
+	if (count > 0u) {
+		add_text(out, "(3:env");
+		for (size_t i = 0u; i < count; i++) {
+			add_text(out, "(");
+			add_atom(out, items[i].name, items[i].name != NULL ? strlen(items[i].name) : 0u);
+			add_atom(out, items[i].value, items[i].value != NULL ? strlen(items[i].value) : 0u);
+			add_text(out, ")");
+			free(items[i].name);
+			free(items[i].value);
+		}
+		add_text(out, ")");
+	}
+	/* ports, then after the stop signal and user, volumes: joined. */
+	for (unsigned k = 0u; k < 3u; k++) {
+		static const char *const joined[] = { "ports", NULL, "volumes" };
+		static const char *const joined_opens[] = { "(5:ports", NULL, "(7:volumes" };
+
+		if (k == 1u) {
+			for (unsigned j = 0u; j < 2u; j++) {
+				char text[8192];
+
+				if (record_text(spec, own, ones[j], text, sizeof text)) {
+					add_text(out, one_opens[j]);
+					add_atom(out, text, strlen(text));
+					add_text(out, ")");
+				} else if (from != NULL && record_find(&doc, from, ones[j], &found)) {
+					add_bytes(out, doc.data + found.offset, found.extent);
+				}
+			}
+			continue;
+		}
+		count = 0u;
+		canonical_words(&doc, from, joined[k], items, &count, 1024u);
+		spec_words(spec, own, joined[k], items, &count, 1024u);
+		qsort(items, count, sizeof items[0], named_order);
+		if (count > 0u) {
+			add_text(out, joined_opens[k]);
+			for (size_t i = 0u; i < count; i++)
+				if (i == 0u || strcmp(items[i].name, items[i - 1u].name) != 0)
+					add_atom(out, items[i].name, strlen(items[i].name));
+			add_text(out, ")");
+		}
+		for (size_t i = 0u; i < count; i++)
+			free(items[i].name);
+	}
+	{
+		char text[8192];
+
+		add_text(out, one_opens[2]);
+		if (record_text(spec, own, "workdir", text, sizeof text))
+			add_atom(out, text, strlen(text));
+		else if (from != NULL && record_find(&doc, from, "workdir", &found)) {
+			hull_sexpr_form head;
+			hull_sexpr_form value;
+
+			hull_sexpr_child(&doc, &found, &head);
+			hull_sexpr_next(&doc, &head, &value);
+			add_atom(out, doc.data + value.content, value.content_length);
+		} else {
+			add_atom(out, "/", 1u);
+		}
+		add_text(out, "))");
+	}
+	return out->failed ? -1 : 0;
 }
 
 /*
@@ -1893,6 +2158,22 @@ next_pass:
 						}
 					}
 				}
+				/* The step's own, made in the tree where it is missing, as
+				 * docker makes a WORKDIR. */
+				record_text(&spec, &step, "workdir", workdir, sizeof workdir);
+				if (strcmp(workdir, "/") != 0) {
+					char        copy[4096];
+					const char *leaf;
+					int         above = in_tree(root, workdir, copy, sizeof copy, &leaf, 1);
+
+					if (above < 0 || (mkdirat(above, leaf, 0755) != 0 && errno != EEXIST)) {
+						snprintf(why, sizeof why, "step %s: its workdir %s: %s", name, workdir,
+						         above == -2 ? "not a path the tree can hold" : strerror(errno));
+						ok = 0;
+					}
+					if (above >= 0)
+						close(above);
+				}
 				add_text(&conf, "(machine (source ");
 				add_text(&conf, "\"dir:");
 				add_text(&conf, root_path);
@@ -1918,7 +2199,7 @@ next_pass:
 					ok = 0;
 				}
 				add_text(&conf, ")");
-				step_env(&conf, runtime, runtime_length);
+				step_env(&conf, runtime, runtime_length, &spec, &step);
 				add_text(&conf, ")\n");
 				snprintf(conf_path, sizeof conf_path, "%s/step.conf", scratch);
 				if (ok && (conf.failed || strpbrk(root_path, "\"\\") != NULL ||
@@ -2042,6 +2323,36 @@ next_pass:
 	}
 	if (check && pass++ == 0)
 		goto next_pass;
+	/* The build's own runtime over the tree's: a manifest of the same
+	 * entries and provenance, its runtime the two laid together. */
+	{
+		hull_sexpr_form own;
+
+		if (hull_spec_find(&spec, &spec.build, "runtime", &own)) {
+			text_buf runtime = { 0 };
+			uint8_t *carried = NULL;
+			size_t   carried_length = 0u;
+			char     named[80];
+			char     hex[65];
+			int      laid;
+
+			snprintf(named, sizeof named, "sha256:%s", parent);
+			laid = hull_store_runtime(&store, named, &carried, &carried_length, why,
+			                          sizeof why) == 0 &&
+			       build_runtime(&spec, &own, carried, carried_length, &runtime) == 0 &&
+			       hull_store_with_runtime(&store, named, (const uint8_t *)runtime.data,
+			                               runtime.length, hex, why, sizeof why) == 0;
+			free(carried);
+			free(runtime.data);
+			if (!laid) {
+				if (why[0] == '\0')
+					snprintf(why, sizeof why, "the build's runtime could not be laid over its tree");
+				goto done;
+			}
+			snprintf(parent, sizeof parent, "%s", hex);
+			fprintf(stderr, "hull: build: its runtime: sha256:%s\n", parent);
+		}
+	}
 	if (check)
 		printf("reproducible: every step the same manifest twice\n");
 	{

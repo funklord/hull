@@ -1528,6 +1528,55 @@ int hull_store_resolve(hull_store *store, const char *name, char hex[65], char *
 	return data != NULL ? 0 : -1;
 }
 
+int hull_store_with_runtime(hull_store *store, const char *name, const uint8_t *runtime,
+                            size_t runtime_length, char hex[65], char *why, size_t cap)
+{
+	char            from[65];
+	uint8_t        *data;
+	size_t          length;
+	hull_sexpr_doc  doc;
+	hull_sexpr_form top;
+	hull_sexpr_form found;
+	buf             out = { 0 };
+	size_t          cut_at;
+	size_t          cut_length = 0u;
+	int             result = -1;
+
+	flock(store->lock, LOCK_SH);
+	data = name_manifest(store, name, from, why, cap) == 0 ?
+	       read_manifest(store, from, &length, why, cap) : NULL;
+	if (data == NULL)
+		goto done;
+	if (hull_sexpr_open(&doc, data, length, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
+	    !hull_sexpr_first(&doc, &top)) {
+		say(why, cap, name, "its manifest is not one");
+		goto done;
+	}
+	/* In the runtime's place, or where it goes, before the schema. */
+	if (find(&doc, &top, "runtime", &found)) {
+		cut_at = found.offset;
+		cut_length = found.extent;
+	} else if (find(&doc, &top, "schema", &found)) {
+		cut_at = found.offset;
+	} else {
+		say(why, cap, name, "its manifest is not one");
+		goto done;
+	}
+	put(&out, data, cut_at);
+	put(&out, runtime, runtime_length);
+	put(&out, data + cut_at + cut_length, length - cut_at - cut_length);
+	if (out.failed) {
+		say(why, cap, "out of memory", NULL);
+		goto done;
+	}
+	result = store_manifest(store, &out, hex, why, cap);
+done:
+	flock(store->lock, LOCK_UN);
+	free(data);
+	free(out.data);
+	return result;
+}
+
 int hull_store_hold(hull_store *store, char *why, size_t cap)
 {
 	char path[4200];

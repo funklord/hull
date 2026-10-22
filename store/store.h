@@ -64,6 +64,13 @@ int hull_store_commit(hull_store *store, const char *dir, const char *arch, cons
  * read whole and checked: its hex into `hex`. 0, or -1 with `why`. */
 int hull_store_resolve(hull_store *store, const char *name, char hex[65], char *why, size_t cap);
 
+/* The manifest `name` names, with `runtime`, a canonical `(7:runtime
+ * ...)`, in place of its own or where one goes: its entries and its
+ * provenance as they were. Stored, named by no ref, its hex into `hex`. 0,
+ * or -1 with `why`. */
+int hull_store_with_runtime(hull_store *store, const char *name, const uint8_t *runtime,
+                            size_t runtime_length, char hex[65], char *why, size_t cap);
+
 /* The store held, shared, through a descriptor of its own, so that gc
  * waits however many operations come and go meanwhile, as a build needs
  * for the manifests it makes before a ref names them: the descriptor, or

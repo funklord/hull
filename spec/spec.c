@@ -409,6 +409,8 @@ static const key step_keys[] = {
 	{ .name = "refresh", .type = STRING, .value = duration },
 	{ .name = "backend", .type = SYMBOL, .value = identifier },
 	{ .name = "discard", .type = STRINGS, .value = absolute },
+	{ .name = "env",     .type = MAP, .names = env_name },
+	{ .name = "workdir", .type = STRING, .value = absolute },
 };
 static const schema step = TABLE_ACROSS(step_keys, step_across);
 
@@ -416,9 +418,24 @@ static const schema step = TABLE_ACROSS(step_keys, step_across);
 #define STEP_NETWORK 4u
 #define STEP_REFRESH 5u
 
+/* J.6: what the build's image carries, A.4's runtime in its keys, laid
+ * over the base's. */
+static const key runtime_keys[] = {
+	{ .name = "cmd",         .type = STRINGS },
+	{ .name = "entrypoint",  .type = STRINGS },
+	{ .name = "env",         .type = MAP, .names = env_name },
+	{ .name = "ports",       .type = STRINGS, .value = nonempty },
+	{ .name = "stop_signal", .type = STRING, .value = nonempty },
+	{ .name = "user",        .type = STRING, .value = nonempty },
+	{ .name = "volumes",     .type = STRINGS, .value = absolute },
+	{ .name = "workdir",     .type = STRING, .value = absolute },
+};
+static const schema runtime = TABLE(runtime_keys);
+
 static const key build_keys[] = {
-	{ .name = "base",  .type = STRING, .required = 1, .value = nonempty },
-	{ .name = "steps", .type = ENTRIES, .record = &step, .entry = "step" },
+	{ .name = "base",    .type = STRING, .required = 1, .value = nonempty },
+	{ .name = "steps",   .type = ENTRIES, .record = &step, .entry = "step" },
+	{ .name = "runtime", .type = RECORD, .record = &runtime },
 };
 static const schema build = TABLE(build_keys);
 

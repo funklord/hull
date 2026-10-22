@@ -197,6 +197,46 @@ printf '%s\n' "$out" | grep -q '^~ stamp: content$' && [ ! -e "$store/refs/app/s
 	! printf '%s\n' "$out" | grep -q '^step pure is not' ||
 	fail "--check did not say the step and its difference, or tagged the build" "$out"
 
+# A step's own env, over its parent's, and its own workdir, made in the
+# tree where missing; and the build's runtime, laid over the base's as the
+# image's: run, a machine on it takes its command and workdir.
+cat > "$root/b/rt.conf" <<'EOF'
+(build
+  (base "dir:./base")
+  (steps (step (name "here") (env (GREETING "hi")) (workdir "/work/dir")
+               (run "probe env GREETING cwd write made-here")))
+  (runtime (cmd "/probe" "say" "from the runtime" "cwd") (env (A "1") (C "3")) (ports "80/tcp")
+           (workdir "/work")))
+EOF
+expect 0 '^GREETING=hi$' "$hull" build -f "$root/b/rt.conf" app/rt
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^cwd=/work/dir$' || fail "a step's workdir was not its own" "$out"
+expect 0 '^  \(runtime \(cmd /probe say "from the runtime" cwd\) \(env \(A 1\) \(C 3\)\) \(ports 80/tcp\) \(workdir /work\)\)$' \
+	"$hull" manifest show app/rt
+expect 0 '' "$hull" materialize app/rt "$root/rt"
+cases=$((cases + 1))
+[ -e "$root/rt/work/dir/made-here" ] || fail "a step's workdir was not made, or not where it wrote" ""
+printf '(machine (source "app/rt") (backend chroot) (hostname "built"))\n' > "$root/b/run.conf"
+expect 0 '^from the runtime$' "$hull" run -f "$root/b/run.conf"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^cwd=/work$' || fail "a built image's workdir was not its runtime's" "$out"
+# Over a base that has one: the env merged, the build's A over the base's
+# and the base's C kept, an empty (cmd) clearing the base's, the ports
+# joined and the workdir kept; the manifest still the schema's.
+cat > "$root/b/over.conf" <<'EOF'
+(build (base "app/rt") (steps) (runtime (cmd) (env (B "2") (A "one")) (ports "53/udp")))
+EOF
+expect 0 '' "$hull" build -f "$root/b/over.conf" app/over
+expect 0 '^  \(runtime \(env \(A one\) \(B 2\) \(C 3\)\) \(ports 53/udp 80/tcp\) \(workdir /work\)\)$' \
+	"$hull" manifest show app/over
+over=$(timeout 10 "$hull" images | awk '$1 == "app/over" { sub("sha256:", "", $2); print $2 }')
+cases=$((cases + 1))
+printf 'manifest over %s\n' "$(od -An -v -tx1 "$store/manifests/sha256/$over" |
+	tr -s ' \n' '  ' | sed 's/^ //; s/ $//' | tr a-f A-F)" > "$root/over.vectors"
+verified=$(timeout 300 python3 "$situc" verify "$here/../manifest/manifest.situ" "$root/over.vectors" 2>&1)
+printf '%s\n' "$verified" | grep -q '^situc: 1 vectors conform to' ||
+	fail "a manifest with a laid runtime is not the schema's" "$verified"
+
 # A step's own line changed: it and the steps after it run again, its
 # parent the same and theirs not.
 sed 's|probe write /made write /gone|probe write /made write /other write /gone|' "$root/b/hull.conf" \
