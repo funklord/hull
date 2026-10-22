@@ -177,6 +177,26 @@ cases=$((cases + 1))
 [ "$(printf '%s\n' "$out" | sed -n 's/^app\/2 sha256://p')" != "$first" ] ||
 	fail "a changed input made the same tree" "$out"
 
+# --check: every step twice from the base, no cache read, and each step's
+# manifests the same; and a step that writes the time, which no two runs
+# write the same, named, its difference said, and nothing tagged.
+expect 0 '^reproducible: every step the same manifest twice$' \
+	"$hull" build --check -f "$root/b/hull.conf" app/checked
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^hull: build: pass 2 of 2$' &&
+	! printf '%s\n' "$out" | grep -q ': cached, sha256:' ||
+	fail "--check did not run every step twice, uncached" "$out"
+cat > "$root/b/stamp.conf" <<'EOF'
+(build (base "dir:./base") (steps (step (name "pure") (run "probe write /pure"))
+                                  (step (name "stamped") (run "probe stamp /stamp"))))
+EOF
+expect 1 '^step stamped is not reproducible: sha256:[0-9a-f]{64}, then sha256:[0-9a-f]{64}$' \
+	"$hull" build --check -f "$root/b/stamp.conf" app/stamped
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^~ stamp: content$' && [ ! -e "$store/refs/app/stamped" ] &&
+	! printf '%s\n' "$out" | grep -q '^step pure is not' ||
+	fail "--check did not say the step and its difference, or tagged the build" "$out"
+
 # A step's own line changed: it and the steps after it run again, its
 # parent the same and theirs not.
 sed 's|probe write /made write /gone|probe write /made write /other write /gone|' "$root/b/hull.conf" \

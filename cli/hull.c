@@ -94,7 +94,7 @@ static void usage(FILE *out)
 	      " [--resolved]\n"
 	      "       hull check [-f FILE] --backend B[,B...] [--accept TOKEN]...\n"
 	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [NAME]\n"
-	      "       hull build [-f FILE] REF\n"
+	      "       hull build [-f FILE] [--check] REF\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
 	      "       hull kill [-s SIGNAL] ID | hull stats [--over S] ID\n"
@@ -1323,6 +1323,7 @@ static int run(options *o, const hull_registry *registry, const char *name)
 /* --- hull build ----------------------------------------------------------- */
 
 static int open_store(hull_store *store, int create);
+static void print_change(void *context, char change, const char *path, const char *what);
 
 /* A build's step, section 3.6's and Appendix E's: what its cache key is
  * made of, and what it ran on. */
@@ -1630,8 +1631,14 @@ static void step_env(text_buf *t, const uint8_t *runtime, size_t runtime_length)
  * discard paths dropped, with the parent's runtime and A.5's build
  * provenance. The last step's manifest is tagged `ref`.
  */
-static int build_file(options *o, const hull_registry *registry, const char *ref)
+#define MAX_BUILD_STEPS 256u
+
+static int build_file(options *o, const hull_registry *registry, const char *ref, int check)
 {
+	static char     first_pass[MAX_BUILD_STEPS][65];
+	char            base_hex[65];
+	unsigned        index = 0u;
+	int             pass = 0;
 	static uint8_t  canonical[HULL_PLAN_TEXT];
 	static uint8_t  work[3u * HULL_PLAN_TEXT];
 	hull_spec       spec;
@@ -1694,11 +1701,20 @@ static int build_file(options *o, const hull_registry *registry, const char *ref
 		snprintf(parent, sizeof parent, "%s", made.manifest);
 	}
 	fprintf(stderr, "hull: build: base %s is sha256:%s\n", base, parent);
+	snprintf(base_hex, sizeof base_hex, "%s", parent);
 
+	/* With --check, Appendix E's test of a build: every step run twice
+	 * from the base, the cache read by neither, and each step's two
+	 * manifests the same. */
+next_pass:
+	if (check)
+		fprintf(stderr, "hull: build: pass %d of 2\n", pass + 1);
+	snprintf(parent, sizeof parent, "%s", base_hex);
+	index = 0u;
 	more = hull_spec_find(&spec, &spec.build, "steps", &steps) &&
 	       hull_sexpr_child(&spec.doc, &steps, &step);
 	for (more = more && hull_sexpr_next(&spec.doc, &step, &step); more;
-	     more = hull_sexpr_next(&spec.doc, &step, &step)) {
+	     more = hull_sexpr_next(&spec.doc, &step, &step), index++) {
 		static step_input inputs[MAX_STEP_INPUTS];
 		hull_sexpr_form   entry;
 		hull_sexpr_form   item;
@@ -1796,7 +1812,11 @@ static int build_file(options *o, const hull_registry *registry, const char *ref
 		hull_sha256_final(&h, key);
 		hex_of_bytes(key, 32u, key_hex);
 		snprintf(cache, sizeof cache, "build/cache/%s", key_hex);
-		if (hull_store_resolve(&store, cache, parent, why, sizeof why) == 0) {
+		if (index == MAX_BUILD_STEPS) {
+			snprintf(why, sizeof why, "more than %u steps", MAX_BUILD_STEPS);
+			goto done;
+		}
+		if (!check && hull_store_resolve(&store, cache, parent, why, sizeof why) == 0) {
 			fprintf(stderr, "hull: build: step %s: cached, sha256:%s\n", name, parent);
 			continue;
 		}
@@ -1993,6 +2013,22 @@ static int build_file(options *o, const hull_registry *registry, const char *ref
 					snprintf(parent, sizeof parent, "%s", made.manifest);
 					fprintf(stderr, "hull: build: step %s: sha256:%s\n", name, parent);
 				}
+				if (ok && check && pass == 0)
+					snprintf(first_pass[index], sizeof first_pass[index], "%s", parent);
+				if (ok && check && pass == 1 && strcmp(first_pass[index], parent) != 0) {
+					char then[80];
+					char now[80];
+
+					printf("step %s is not reproducible: sha256:%s, then sha256:%s%s\n", name,
+					       first_pass[index], parent,
+					       network ? "; it has a network, which Appendix E does not expect to "
+					                 "reproduce" : "");
+					snprintf(then, sizeof then, "sha256:%.64s", first_pass[index]);
+					snprintf(now, sizeof now, "sha256:%.64s", parent);
+					hull_store_diff(&store, then, now, print_change, NULL, why, sizeof why);
+					snprintf(why, sizeof why, "the build is not reproducible");
+					ok = 0;
+				}
 				free(provenance.data);
 			}
 			free(runtime);
@@ -2004,6 +2040,10 @@ static int build_file(options *o, const hull_registry *registry, const char *ref
 			}
 		}
 	}
+	if (check && pass++ == 0)
+		goto next_pass;
+	if (check)
+		printf("reproducible: every step the same manifest twice\n");
 	{
 		char named[80];
 		char hex[65];
@@ -2983,6 +3023,7 @@ int main(int argc, char **argv)
 	const char   *command;
 	const char   *reason = NULL;
 	const char   *name   = NULL;
+	int           check  = 0;
 
 	memset(&o, 0, sizeof o);
 	o.file   = "hull.conf";
@@ -3138,6 +3179,8 @@ int main(int argc, char **argv)
 			o.explain = 1;
 		} else if (strcmp(arg, "--resolved") == 0 && strcmp(command, "plan") == 0) {
 			o.resolved = 1;
+		} else if (strcmp(arg, "--check") == 0 && strcmp(command, "build") == 0) {
+			check = 1;
 		} else if ((strcmp(command, "run") == 0 || strcmp(command, "build") == 0) &&
 		           arg[0] != '-' && name == NULL) {
 			name = arg;
@@ -3165,7 +3208,7 @@ int main(int argc, char **argv)
 			return 2;
 		}
 		o.stream = stderr;
-		return build_file(&o, &registry, name);
+		return build_file(&o, &registry, name, check);
 	}
 	if (strcmp(command, "check") == 0 && o.backend_count == 0u) {
 		fprintf(stderr, "hull: check needs --backend, the backends to hold the spec to\n");

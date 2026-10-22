@@ -546,6 +546,19 @@ int main(int argc, char **argv)
 				held[at] = 1;
 			printf("held=%s\n", held != NULL ? arg : "no");
 			i++;
+		} else if (strcmp(step, "stamp") == 0) {
+			/* The time, to the nanosecond: what no two builds write the
+			 * same, for `hull build --check` to find. */
+			struct timespec now;
+			FILE           *f = fopen(arg, "w");
+
+			clock_gettime(CLOCK_REALTIME, &now);
+			if (f != NULL) {
+				fprintf(f, "%lld.%09ld\n", (long long)now.tv_sec, now.tv_nsec);
+				fclose(f);
+			}
+			printf("stamp=%s\n", f != NULL ? "ok" : strerror(errno));
+			i++;
 		} else if (strcmp(step, "fill") == 0 && i + 2 < argc) {
 			static char block[1u << 20];
 			int         fd = open(arg, O_WRONLY | O_CREAT | O_TRUNC, 0644);
