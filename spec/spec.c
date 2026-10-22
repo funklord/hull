@@ -272,6 +272,7 @@ static const char *const writeback_values[]  = { "none", "sync-on-stop", NULL };
 static const char *const projection_values[] = { "auto", "bind", "passthrough", "block", NULL };
 static const char *const restart_values[]    = { "no", "on-failure", "always", NULL };
 static const char *const disconnect_values[] = { "stop", "keep", NULL };
+static const char *const network_values[]    = { "host", "none", NULL };
 static const char *const proto_values[]      = { "tcp", "udp", NULL };
 static const char *const mode_values[]       = { "rw", "ro", NULL };
 static const char *const expose_values[]     = { "env", NULL };
@@ -380,6 +381,7 @@ static const key machine_keys[] = {
 	{ .name = "ssh",           .type = BOOLEAN },
 	{ .name = "restart",       .type = CHOICE, .choices = restart_values },
 	{ .name = "on_disconnect", .type = CHOICE, .choices = disconnect_values },
+	{ .name = "network",       .type = CHOICE, .choices = network_values },
 	{ .name = "hostname",      .type = STRING, .value = label },
 	{ .name = "security",      .type = RECORD, .record = &security },
 	{ .name = "secrets",       .type = MAP, .record = &secret, .names = secret_name },

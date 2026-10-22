@@ -846,6 +846,22 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	 * own: PID 1 ignores a signal it has no handler for, so a workload
 	 * there would sit through stop's SIGTERM, and nothing would reap. */
 	add_text(&body, ",\"HostConfig\":{\"Init\":true,\"CapDrop\":[\"ALL\"]");
+	/* (network none) is docker's none, lo alone; (network host) its host;
+	 * none given, its own bridge, as it always was. Ports need one. */
+	if ((value = hull_access_value(doc, machine, "network")) != NULL) {
+		int ported = hull_access_find(doc, machine, "ports", &entry);
+
+		if (strcmp(value, "none") == 0 || strcmp(value, "host") == 0) {
+			if (ported) {
+				free(value);
+				free(body.data);
+				return "ports need the machine's own network: (network none) has none to "
+				       "put them on, and (network host) is the host's";
+			}
+			addf(&body, ",\"NetworkMode\":\"%s\"", value);
+		}
+		free(value);
+	}
 	if (hull_access_find(doc, machine, "volumes", &entry))
 		reason = add_binds(&binds, doc, &entry, m->detail, sizeof m->detail);
 	/* The secrets the core wrote, read-only where J.3 puts them; the
@@ -1653,6 +1669,8 @@ static const hull_cap_entry entries[] = {
 	{ "command",            HULL_SUP_NATIVE,   NULL, NULL },
 	{ "workdir",            HULL_SUP_NATIVE,   NULL, NULL },
 	{ "env",                HULL_SUP_NATIVE,   NULL, NULL },
+	{ "network.host",       HULL_SUP_NATIVE,   NULL, NULL },
+	{ "network.none",       HULL_SUP_NATIVE,   NULL, NULL },
 	{ "ports",              HULL_SUP_NATIVE,
 	  "bound on the machine's address", NULL },
 	{ "volumes",            HULL_SUP_NATIVE,   NULL, NULL },

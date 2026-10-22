@@ -37,6 +37,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
@@ -97,6 +98,7 @@ struct hull_machine {
 	pid_t            pid;        /* the machine's init */
 	int              conn;       /* the init's frames, or -1 */
 	int              keep;       /* (on_disconnect keep) */
+	int              no_network; /* (network none): a namespace with only lo */
 	int              adopted;    /* taken back: the init is not this process's child */
 	int              pidfd;      /* the init's, when adopted, else -1 */
 	char             dir[4096];  /* the machine's directory, for init.sock, or "" */
@@ -262,6 +264,12 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 
 	source  = hull_access_value(doc, &machine, "on_disconnect");
 	m->keep = source != NULL && strcmp(source, "keep") == 0;
+	free(source);
+
+	/* (network host), or none given, is the host's own, as it always was;
+	 * (network none) is a namespace of the machine's own, lo alone. */
+	source = hull_access_value(doc, &machine, "network");
+	m->no_network = source != NULL && strcmp(source, "none") == 0;
 	free(source);
 
 	/* The secrets the core wrote (J.3), and those to be in the env. */
@@ -653,6 +661,20 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	}
 	if (m->hostname != NULL && sethostname(m->hostname, strlen(m->hostname)) != 0)
 		child_fail(report, "sethostname");
+	/* A namespace of its own starts with lo down: up, so that a dial to a
+	 * port nothing holds is refused rather than unreachable. */
+	if (m->no_network) {
+		struct ifreq lo = { 0 };
+		int          fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+
+		snprintf(lo.ifr_name, sizeof lo.ifr_name, "lo");
+		if (fd < 0 || ioctl(fd, SIOCGIFFLAGS, &lo) != 0)
+			child_fail(report, "lo");
+		lo.ifr_flags |= IFF_UP;
+		if (ioctl(fd, SIOCSIFFLAGS, &lo) != 0)
+			child_fail(report, "lo");
+		close(fd);
+	}
 	if (m->overlay)
 		layer(m, report);
 	if (m->overlay ? chroot("merged") != 0 : chroot(m->root) != 0)
@@ -957,7 +979,8 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	 * of its own. The ids are read first, since in the child's new user
 	 * namespace they are unmapped until it maps them. */
 	m->pid = (pid_t)syscall(SYS_clone, CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWUTS |
-	                        CLONE_NEWPID | SIGCHLD, NULL, NULL, NULL, 0L);
+	                        CLONE_NEWPID | (m->no_network ? CLONE_NEWNET : 0) | SIGCHLD, NULL,
+	                        NULL, NULL, 0L);
 	if (m->pid < 0)
 		return fail(error, HULL_ERR_RUNTIME, "clone");
 	if (m->pid == 0) {
@@ -1271,12 +1294,13 @@ static void *read_exec(void *arg)
 static void run_helper(const hull_machine *m, char *const *argv, const int *ns, int root,
                        int in, int out, int err, int tty, int report, int status_pipe)
 {
-	static const int kinds[] = { CLONE_NEWUSER, CLONE_NEWNS, CLONE_NEWUTS, CLONE_NEWPID };
+	static const int kinds[] = { CLONE_NEWUSER, CLONE_NEWNS, CLONE_NEWUTS, CLONE_NEWPID,
+	                             CLONE_NEWNET };
 	static const int forwarded[] = { SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2 };
 	struct sigaction action;
 	int              status = 0;
 	pid_t            command;
-	int              keep[11] = { ns[0], ns[1], ns[2], ns[3], root, in, out, err, report,
+	int              keep[12] = { ns[0], ns[1], ns[2], ns[3], ns[4], root, in, out, err, report,
 	                              status_pipe, -1 };
 
 	/* Held from the start: a signal before the command exists is
@@ -1285,9 +1309,11 @@ static void run_helper(const hull_machine *m, char *const *argv, const int *ns, 
 	action.sa_handler = hold;
 	for (unsigned i = 0u; i < sizeof forwarded / sizeof forwarded[0]; i++)
 		sigaction(forwarded[i], &action, NULL);
-	close_others(keep, 10u);
-	for (unsigned i = 0u; i < 4u; i++)
-		if (setns(ns[i], kinds[i]) != 0)
+	close_others(keep, 11u);
+	/* The net namespace only where the machine has its own: the host's is
+	 * not this user namespace's to join. */
+	for (unsigned i = 0u; i < 5u; i++)
+		if (ns[i] >= 0 && setns(ns[i], kinds[i]) != 0)
 			child_fail(report, "joining the machine");
 	if (fchdir(root) != 0 || chroot(".") != 0 || chdir(m->workdir) != 0)
 		child_fail(report, "the machine's root");
@@ -1396,10 +1422,10 @@ static void free_argv(char **argv)
 static hull_status chroot_exec(hull_core *core, hull_machine *m, hull_buf spec,
                                hull_stream **out, hull_error *error)
 {
-	static const char *const kinds[] = { "user", "mnt", "uts", "pid" };
+	static const char *const kinds[] = { "user", "mnt", "uts", "pid", "net" };
 	char        *argv[MAX_ARGS + 1u] = { NULL };
 	char         path[64];
-	int          ns[4] = { -1, -1, -1, -1 };
+	int          ns[5] = { -1, -1, -1, -1, -1 };
 	int          root;
 	int          in[2] = { -1, -1 }, o[2] = { -1, -1 }, e[2] = { -1, -1 };
 	int          report[2], status[2];
@@ -1420,7 +1446,7 @@ static hull_status chroot_exec(hull_core *core, hull_machine *m, hull_buf spec,
 		return fail(error, HULL_ERR_UNSUPPORTED, "an exec names a command");
 	}
 	tty = size.ws_col != 0u;
-	for (unsigned i = 0u; i < 4u; i++) {
+	for (unsigned i = 0u; i < (m->no_network ? 5u : 4u); i++) {
 		snprintf(path, sizeof path, "/proc/%ld/ns/%s", (long)m->pid, kinds[i]);
 		ns[i] = open(path, O_RDONLY | O_CLOEXEC);
 	}
@@ -1429,10 +1455,11 @@ static hull_status chroot_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	st = calloc(1u, sizeof *st);
 	opened = tty ? open_terminal(&size, in, o, e) : pipe2(in, O_CLOEXEC) == 0 &&
 	         pipe2(o, O_CLOEXEC) == 0 && pipe2(e, O_CLOEXEC) == 0;
-	if (ns[0] < 0 || ns[1] < 0 || ns[2] < 0 || ns[3] < 0 || root < 0 || st == NULL ||
+	if (ns[0] < 0 || ns[1] < 0 || ns[2] < 0 || ns[3] < 0 || (m->no_network && ns[4] < 0) ||
+	    root < 0 || st == NULL ||
 	    !opened || pipe2(report, O_CLOEXEC) != 0 || pipe2(status, O_CLOEXEC) != 0) {
-		const int ends[] = { ns[0], ns[1], ns[2], ns[3], root, in[0], in[1], o[0], o[1],
-		                     e[0], e[1] };
+		const int ends[] = { ns[0], ns[1], ns[2], ns[3], ns[4], root, in[0], in[1], o[0],
+		                     o[1], e[0], e[1] };
 
 		/* On a terminal one descriptor stands in three places. */
 		for (unsigned i = 0u; i < sizeof ends / sizeof ends[0]; i++) {
@@ -1457,8 +1484,9 @@ static hull_status chroot_exec(hull_core *core, hull_machine *m, hull_buf spec,
 		close(status[0]);
 		run_helper(m, argv, ns, root, in[0], o[1], e[1], tty, report[1], status[1]);
 	}
-	for (unsigned i = 0u; i < 4u; i++)
-		close(ns[i]);
+	for (unsigned i = 0u; i < 5u; i++)
+		if (ns[i] >= 0)
+			close(ns[i]);
 	close(root);
 	/* On a terminal the three are the one other end, closed once. */
 	close(in[0]);
@@ -1680,6 +1708,9 @@ static const hull_cap_entry entries[] = {
 	  "the workload's last 256 KiB meanwhile", NULL },
 	{ "ports",                  HULL_SUP_REJECTED,
 	  "chroot shares the host's network, so a port is the host's own", NULL },
+	{ "network.host",           HULL_SUP_NATIVE,   NULL, NULL },
+	{ "network.none",           HULL_SUP_NATIVE,
+	  "a network namespace of the machine's own, with lo alone", NULL },
 	{ NULL,                     HULL_SUP_NATIVE,   NULL, NULL },
 };
 

@@ -380,6 +380,11 @@ static void network(void)
 	}
 	if (bring_up(fd, "lo") != 0)
 		say("lo", strerror(errno));
+	/* A machine of (network none) has no NIC: lo alone, said nowhere. */
+	if (if_nametoindex("eth0") == 0) {
+		close(fd);
+		return;
+	}
 	memset(&request, 0, sizeof request);
 	snprintf(request.ifr_name, sizeof request.ifr_name, "eth0");
 	set_address(&request.ifr_addr, GUEST_ADDRESS);

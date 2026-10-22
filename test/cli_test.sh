@@ -1134,6 +1134,54 @@ conf denied '(command "searchme") (env (PATH "/srv"))'
 from_root 125 'searchme: Permission denied' -f "$root/denied.conf"
 conf unfound '(command "nowhere-at-all")'
 from_root 125 'nowhere-at-all: No such file or directory' -f "$root/unfound.conf"
+
+# (network host) is the host's, as no key is: a listener on the host's
+# loopback is reached. (network none) is a namespace of the machine's own,
+# lo up and nothing else, so the same dial is refused, and an exec in it
+# joins it. A vm cannot share the host's network.
+rm -f "$root/listen.out"
+(timeout -k 2 60 python3 -c '
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+s.listen(4)
+s.settimeout(50)
+print(s.getsockname()[1], flush=True)
+while True:
+	c, _ = s.accept()
+	c.sendall(b"the host loopback\n")
+	c.close()
+' > "$root/listen.out" 2>&1) &
+host_listener=$!
+tries=0
+until [ -s "$root/listen.out" ] || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.1
+done
+listen_port=$(head -1 "$root/listen.out")
+conf nethost "(command \"/probe\" \"dial\" \"127.0.0.1\" \"$listen_port\") (network host)"
+from_root 0 "^dial 127\\.0\\.0\\.1:$listen_port=the host loopback\$" -f "$root/nethost.conf"
+conf netnone "(command \"/probe\" \"dial\" \"127.0.0.1\" \"$listen_port\") (network none)"
+from_root 0 "^dial 127\\.0\\.0\\.1:$listen_port=Connection refused\$" -f "$root/netnone.conf"
+conf netexec '(command "/probe" "say" "ready" "wait") (network none) (hostname "netexec") (on_disconnect stop)'
+rm -f "$root/netexec.out"
+(cd / && exec timeout -k 2 30 "$hull_abs" run -f "$root/netexec.conf" > "$root/netexec.out" 2>&1) &
+netexec=$!
+tries=0
+until grep -q '^ready$' "$root/netexec.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+expect 0 "^dial 127\\.0\\.0\\.1:$listen_port=Connection refused\$" \
+	"$hull" exec netexec /probe dial 127.0.0.1 "$listen_port"
+expect 0 '' "$hull" kill -s KILL netexec
+wait "$netexec" 2>/dev/null
+kill "$host_listener" 2>/dev/null
+wait "$host_listener" 2>/dev/null
+printf '(machine (source "dir:./rootfs") (backend vm) (network host) (command "/probe"))\n' \
+	> "$root/vmhost.conf"
+expect 1 'network\.host: rejected: a vm shares no network namespace with the host' \
+	"$hull" plan -f "$root/vmhost.conf"
 printf '%s\n' '(machines (alpha (source "dir:./rootfs") (backend chroot) (command "/probe" "host")))' \
 	> "$root/pair.conf"
 from_root 0 '^host=alpha$' -f "$root/pair.conf" alpha

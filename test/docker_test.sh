@@ -281,6 +281,19 @@ printf '%s\n' "$out" | grep -q '^from a dir$' && printf '%s\n' "$out" | grep -q 
 	printf '%s\n' "$out" | grep -q '^write=ok$' &&
 	printf '%s\n' "$out" | grep -q '^write=Permission denied$' ||
 	fail "a dir's machine ran otherwise" "$out"
+# (network none) is docker's none: lo alone, so a dial to a port nothing
+# holds there is refused and one out is unreachable; ports with it are
+# refused, having no network to be on. The same tree, so the same import.
+printf '(machine (source "dir:./rootfs") (mutable overlay) (backend docker) (hostname "dtest") %s)\n' \
+	'(network none) (command "/probe" "dial" "127.0.0.1" "9" "dial" "192.0.2.1" "9")' \
+	> "$root/netnone.conf"
+expect 0 '^dial 127\.0\.0\.1:9=Connection refused$' netnone
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^dial 192\.0\.2\.1:9=Network is unreachable$' ||
+	fail "a machine of (network none) reached out" "$out"
+printf '(machine (source "dir:./rootfs") (mutable overlay) (backend docker) (hostname "dtest") %s)\n' \
+	'(network none) (ports (port (host 18099) (guest 80))) (command "/probe")' > "$root/netports.conf"
+expect 125 'ports need the machine.s own network' netports
 cases=$((cases + 1))
 created=$(timeout 10 docker image inspect -f '{{.Created}}' "hull-dir:$digest" 2>&1) ||
 	fail "no image hull-dir:$digest" "$created"

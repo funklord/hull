@@ -131,6 +131,19 @@ name=searched
 boot searched
 has 0 '^searched$'
 
+# (network none): no NIC, so the host's gateway is unreachable, and lo up,
+# so a dial to a port nothing holds there is refused; ports with it are
+# refused, having no network to be on.
+conf netnone '(backend vm) (network none) (command "/probe" "dial" "127.0.0.1" "9" "dial" "10.0.2.2" "9")'
+name=netnone
+boot netnone
+has 0 '^dial 127\.0\.0\.1:9=Connection refused$'
+has 0 '^dial 10\.0\.2\.2:9=Network is unreachable$'
+conf netports '(backend vm) (network none) (ports (port (host 8080) (guest 80))) (command "/probe")'
+name=netports
+boot netports
+has 125 'ports need the machine.s network, which \(network none\) has not'
+
 # The directory in place, as the user's, and read-only when asked.
 conf write '(backend vm) (command "/probe" "write" "/written")'
 name=write

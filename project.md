@@ -621,6 +621,9 @@ Two of these had first passed: copying other tuning and copied offsets. Each was
 
 - **Namespaces:** it is cloned into new user, mount, UTS and PID namespaces, with the invoking user mapped to root. The dir source is bound onto itself, read-only for `(readonly_root true)`, and chrooted into. `/proc` is mounted where the dir has a `/proc` to mount it on; nothing is created in the user's dir.
 - **Then, in order:** it changes to `workdir`, sets `hostname` and `no_new_privs`, and execs `command` with the environment `env` names and nothing else.
+- **`(network none)`, since 2026-10-22, the holder's choice of a machine key over a build-only path,** clones the machine into a network namespace of its own as well, which a user namespace's root may make, and brings its `lo` up, so a dial to a port nothing holds is refused rather than unreachable; `hull exec` joins that namespace too, and only that one, the host's not being the machine's user namespace's to join. `(network host)`, and no key, is the host's own, as chroot always gave. docker takes the two as its `NetworkMode`, `none` and `host`, and qemu gives `none` no NIC and no passt, the agent bringing up `lo` alone when it finds no `eth0`; qemu rejects `host`. Ports with either are refused at create, there being no network of the machine's own to put them on.
+  - **Measured** in `test/cli_test.sh`: a chroot machine of `(network host)` reaching a listener on the host's loopback, one of `(network none)` refused at the same port, an exec in a running one refused there too, and a vm of `(network host)` rejected by the plan; in `test/docker_test.sh`, `none` refused at loopback and unreachable out, and ports with it refused; in `test/qemu_test.sh`, the same, and ports with it refused.
+  - **Sabotage,** baseline first, in scratch copies, each suite its own: no namespace cloned, `lo` left down, an exec outside the namespace, and the key unknown to the spec check, through `make test`; docker given no `NetworkMode` and ports taken with it, through `make check-docker`; and qemu's NIC kept and ports taken with it, through `make check-qemu`; each failed a named case.
 - **Its declaration says exactly that.** It is an `ns`-class engine. It shares the host's network, so `ports` is declared rejected with that reason. `cpus`, `memory` and an image ref are left out, so they are rejected.
 - **Registration order:** it registers after docker, so `(backend ns)` still picks docker, and `(backend chroot)` asks for it.
 - **The bind remount must keep the flags its mount was copied with.** A user namespace locks `nosuid`, `nodev` and the rest, so the engine reads them with `statvfs` and keeps them. bwrap meets the same rule.
@@ -1268,7 +1271,8 @@ The matrix is data, not documentation: assembled at load time from each engine's
 | `cpus`, `memory` | native (cgroups; memory = ceiling) | native (hard allocation) | native (hard allocation; cpus = threads) |
 | `readonly_root` | native | native | native |
 | `arch` ≠ host | rejected → `emulated` with `(binfmt true)` (qemu-user) | rejected: KVM is same-arch → use emu | native (that's the point) |
-| host networking | native, **opt-in flag** | rejected: no shared netns → use `ports` | rejected: same |
+| host networking, `(network host)` | native, **opt-in flag** | rejected: no shared netns → use `ports` | rejected: same |
+| no network, `(network none)` | native (an empty netns, lo up) | native (no NIC) | native (no NIC) |
 | device passthrough | rejected in rootless (no nodes) | emulated: virtio/VFIO/USB where permitted | emulated: QEMU-emulated devices only |
 | custom kernel / modules | rejected: shared host kernel | native (`kernel` key; `full` profile for distro kernels) | native |
 | inotify on volumes | native | rejected-by-default: virtiofs event gaps → poll option offered | rejected-by-default: same |
@@ -1741,6 +1745,7 @@ with the same schema per machine (machines in one file form a segment, Appendix 
 | `ssh` | boolean | `false` | Provision + supervise minimal sshd with user's authorized_keys, all backends (§8.1.3) |
 | `restart` | `no` \| `on-failure` \| `always` | `no` | Consumed by the systemd generator (§9), not by a daemon |
 | `on_disconnect` | `stop` \| `keep` | `stop` | Machine behavior if the core/CLI dies (B.4); `keep` requires later `hull attach` |
+| `network` | `host` \| `none` | the engine's own | `host` shares the host's (ns only, §6); `none` is lo alone, which a build step has unless it says `(network true)` (Appendix E). Absent, each engine keeps the network it gives: chroot the host's, docker its bridge, qemu passt's. `ports` need the machine's own network, so neither value takes them |
 | `hostname` | string | machine name | Also the ingress DNS label `<name>.hull` (§8.1) |
 
 ## J.2 `(security …)` (§7)

@@ -145,7 +145,8 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  data/in data/out rootfs/mnt-link lone.conf adopt.conf kbrief.conf cended.conf nosecret.conf pw.txt big.bin secret/probe \
                  shown.conf failing.conf nofile.conf big.conf sealed.conf norun.conf \
                  stored.conf stored-direct.conf unstored.conf idle/hull/core.log idle/hull/core.lock \
-                 searched.conf denied.conf unfound.conf rootfs/srv/searchme rootfs/bin/searchme) \
+                 searched.conf denied.conf unfound.conf rootfs/srv/searchme rootfs/bin/searchme \
+                 listen.out nethost.conf netnone.conf netexec.conf netexec.out vmhost.conf) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
 # What test/docker_test.sh writes.
@@ -154,7 +155,8 @@ DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf vol
                     nocmd.conf execd.conf killd.conf killd.out held.out data/in data/out \
                     dirov.conf dirin.conf dirkeep.conf dirkeep.out rootfs/probe rootfs/srv/added \
                     rootfs/srv/more rootfs/srv/written udp.conf udp.out dial.conf dial.out statsd.conf statsd.out gone.conf inuse.conf inuse.out \
-                    adopt.conf adopt.out secret.conf pw.txt gone/probe inuse/probe inuse/srv/which)
+                    adopt.conf adopt.out secret.conf pw.txt gone/probe inuse/probe inuse/srv/which \
+                    netnone.conf netports.conf)
 
 # What test/qemu_test.sh writes.
 QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.conf write.conf \
@@ -162,7 +164,7 @@ QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.co
                   emu.conf execd.conf held.out xtrap.out xstop.out net.conf listen.out brief.conf \
                   ports.conf ports.out client.out taken.conf udp.conf udp.out dial.conf dial.out sshed.conf sshed.out home/.ssh/config keep.conf \
                   overlay.conf overro.conf rootfs/srv/kept adopt.conf brief2.conf ended.conf secret.conf norun.conf pw.txt secret/probe \
-                  searched.conf rootfs/probe rootfs/bin/sh rootfs/written rootfs/etc/resolv.conf \
+                  searched.conf netnone.conf netports.conf rootfs/probe rootfs/bin/sh rootfs/written rootfs/etc/resolv.conf \
                   data/in data/out)
 
 # What test/flip_test.sh writes: the project, and its rsync'd copy.

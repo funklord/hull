@@ -120,6 +120,7 @@ struct hull_machine {
 
 	char             dir[4096];    /* the machine's files: initrd, console */
 	int              network;      /* qemu's end of passt's socket, or -1 */
+	int              no_network;   /* (network none): no NIC, no passt */
 	pid_t            passt;        /* passt's daemon, by the socket it holds, or 0 */
 	pid_t            qemu;
 	int              keep;         /* (on_disconnect keep): qemu outlives the core */
@@ -378,6 +379,14 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 				return "a volume is missing its host path";
 		}
 	}
+
+	/* (network none) is a machine with no NIC, lo alone in the guest; a
+	 * vm shares no host network to give (network host). */
+	text = hull_access_value(doc, &machine, "network");
+	m->no_network = text != NULL && strcmp(text, "none") == 0;
+	free(text);
+	if (m->no_network && hull_access_find(doc, &machine, "ports", &entry))
+		return "ports need the machine's network, which (network none) has not";
 
 	/* Ports from the machine's address, which the core gives the plan. */
 	if (hull_access_find(doc, &machine, "ports", &entry)) {
@@ -715,6 +724,12 @@ static const char *start_network(hull_machine *m)
 	int         status;
 	pid_t       pid;
 
+	if (m->no_network) {
+		m->network = -1;
+		m->passt = 0;
+		return NULL;
+	}
+
 	snprintf(log, sizeof log, "%s/passt.log", m->dir);
 	argv[n++] = "passt";
 	argv[n++] = "--quiet";
@@ -850,10 +865,12 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 	}
 	argv[n++] = "-device";
 	argv[n++] = vsock;
-	argv[n++] = "-netdev";
-	argv[n++] = netdev;
-	argv[n++] = "-device";
-	argv[n++] = "virtio-net-pci,netdev=net";
+	if (!m->no_network) {
+		argv[n++] = "-netdev";
+		argv[n++] = netdev;
+		argv[n++] = "-device";
+		argv[n++] = "virtio-net-pci,netdev=net";
+	}
 	argv[n] = NULL;
 
 	pid = fork();
@@ -872,7 +889,9 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 		dup2(out, 2);
 		/* passt's socket at NETWORK_FD, and nothing of the core's: its
 		 * sockets, its lock. dup2() onto itself would keep CLOEXEC. */
-		if (m->network == NETWORK_FD)
+		if (m->network < 0)
+			syscall(SYS_close_range, NETWORK_FD, ~0u, 0u);  /* (network none) */
+		else if (m->network == NETWORK_FD)
 			fcntl(NETWORK_FD, F_SETFD, 0);
 		else if (dup2(m->network, NETWORK_FD) < 0)
 			_exit(126);
@@ -2425,6 +2444,9 @@ static const hull_cap_entry entries[] = {
 	/* Section 6's host forwarder: the engine's, over vsock to the agent. */
 	{ "ports",              HULL_SUP_EMULATED,
 	  "tcp and udp, forwarded over vsock from the machine's address", NULL },
+	{ "network.host",       HULL_SUP_REJECTED,
+	  "a vm shares no network namespace with the host: use ports", NULL },
+	{ "network.none",       HULL_SUP_NATIVE,   "no NIC: lo alone in the guest", NULL },
 
 	{ "security.readonly_root", HULL_SUP_NATIVE, NULL, NULL },
 	{ "security.no_new_privs",  HULL_SUP_NATIVE, "set by the agent on the workload", NULL },
