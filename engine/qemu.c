@@ -801,6 +801,8 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 	char        vsock[64];
 	char        netdev[64];
 	char        root[9000];
+	char        modules[9000];
+	char        modules_at[4200];
 	char        fsdev[MAX_VOLUMES][9000];
 	char        device[MAX_VOLUMES][96];
 	char        path[8500];
@@ -863,6 +865,18 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 		argv[n++] = "-device";
 		argv[n++] = device[i];
 	}
+	/* The guest runs the host's kernel, so its modules are the host's:
+	 * shared read-only, for the agent to mount where modprobe in the
+	 * machine looks, as a test of network software loads mac80211_hwsim
+	 * or pppoe. */
+	snprintf(path, sizeof path, "/lib/modules/%s", release);
+	escaped(modules_at, sizeof modules_at, path);
+	snprintf(modules, sizeof modules, "local,id=modules,path=%s,security_model=none,readonly=on",
+	         modules_at);
+	argv[n++] = "-fsdev";
+	argv[n++] = modules;
+	argv[n++] = "-device";
+	argv[n++] = "virtio-9p-pci,fsdev=modules,mount_tag=modules";
 	argv[n++] = "-device";
 	argv[n++] = vsock;
 	if (!m->no_network) {

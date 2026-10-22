@@ -68,6 +68,7 @@
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -663,6 +664,24 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 			make_path(at);
 			if (share(tag, at, readonly) != 0)
 				return "a volume could not be mounted";
+		}
+	}
+	/* The host's modules, which are this kernel's, where modprobe looks,
+	 * read-only. Their place is made only above an overlay, whose upper
+	 * is a tmpfs: in a directory used in place it would be made in the
+	 * user's own tree, unasked, so there it is used only if it is there,
+	 * and a root without it boots without them. */
+	{
+		struct utsname kernel;
+		struct stat    place;
+		char           at[4200];
+
+		if (uname(&kernel) == 0) {
+			snprintf(at, sizeof at, "/machine/lib/modules/%s", kernel.release);
+			if (layered && !readonly_root)
+				make_path(at);
+			if (stat(at, &place) == 0 && S_ISDIR(place.st_mode) && share("modules", at, 1) != 0)
+				say("modules", strerror(errno));
 		}
 	}
 	if (secrets != NULL && (reason = place_secrets(doc, machine, secrets, &n)) != NULL)

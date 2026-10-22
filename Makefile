@@ -146,7 +146,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  shown.conf failing.conf nofile.conf big.conf sealed.conf norun.conf \
                  stored.conf stored-direct.conf unstored.conf idle/hull/core.log idle/hull/core.lock \
                  searched.conf denied.conf unfound.conf rootfs/srv/searchme rootfs/bin/searchme \
-                 listen.out nethost.conf netnone.conf netexec.conf netexec.out vmhost.conf) \
+                 listen.out nethost.conf netnone.conf netexec.conf netexec.out vmhost.conf tools/squashfuse) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
 # What test/docker_test.sh writes.
@@ -165,7 +165,7 @@ QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.co
                   ports.conf ports.out client.out taken.conf udp.conf udp.out dial.conf dial.out sshed.conf sshed.out home/.ssh/config keep.conf \
                   overlay.conf overro.conf rootfs/srv/kept adopt.conf brief2.conf ended.conf secret.conf norun.conf pw.txt secret/probe \
                   searched.conf netnone.conf netports.conf rootfs/probe rootfs/bin/sh rootfs/written rootfs/etc/resolv.conf \
-                  data/in data/out)
+                  data/in data/out modules.conf inplace.conf)
 
 # What test/flip_test.sh writes: the project, and its rsync'd copy.
 FLIP_PROJECT    = hull.conf rootfs/probe rootfs/etc/flip

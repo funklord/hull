@@ -15,6 +15,7 @@
  *   list PATH   the names in the directory PATH, sorted
  *   owner PATH  PATH's owner, group and mode, not following a link
  *   read PATH   PATH's first line
+ *   load PATH   whether the module PATH, under /lib/modules/RELEASE, loads
  *   stdin       the first line of its stdin
  *   count       all of its stdin: how many bytes, and their FNV-1a hash
  *   spew N      N bytes on stdout, from a xorshift that does not repeat
@@ -75,6 +76,8 @@
 #include <sys/socket.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -488,6 +491,26 @@ int main(int argc, char **argv)
 				printf("read=%s", text);
 			if (file != NULL)
 				fclose(file);
+			i++;
+		} else if (strcmp(step, "load") == 0) {
+			/* As modprobe would, a compressed module the kernel
+			 * unpacks: 4 is MODULE_INIT_COMPRESSED_FILE. */
+			struct utsname kernel;
+			char           path[4400];
+			int            fd = -1;
+
+			if (uname(&kernel) == 0) {
+				snprintf(path, sizeof path, "/lib/modules/%s/%s", kernel.release, arg);
+				fd = open(path, O_RDONLY | O_CLOEXEC);
+			}
+			if (fd < 0)
+				printf("load=%s\n", strerror(errno));
+			else if (syscall(SYS_finit_module, fd, "", 4) != 0 && errno != EEXIST)
+				printf("load=%s\n", strerror(errno));
+			else
+				printf("load=ok\n");
+			if (fd >= 0)
+				close(fd);
 			i++;
 		} else if (strcmp(step, "stdin") == 0) {
 			ssize_t n = read(0, text, sizeof text - 1u);

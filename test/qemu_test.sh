@@ -196,6 +196,41 @@ conf overro '(backend vm) (mutable overlay) (security (readonly_root true))' \
 name=overro
 boot overro
 has 0 '^write=Read-only file system$'
+# The host's modules, which are the guest kernel's: where modprobe looks,
+# read-only, and loadable, as a test of network software loads
+# mac80211_hwsim and gets two radios. Its dependencies are loaded first,
+# the last listed first, as modprobe does. Above an overlay their place is
+# made; in a directory used in place, which has none, none is made.
+release=$(uname -r)
+hwsim=$(grep '/mac80211_hwsim\.ko[^:]*:' "/lib/modules/$release/modules.dep")
+if [ -z "$hwsim" ]; then
+	printf 'qemu: the host has no mac80211_hwsim, so its case is skipped\n'
+else
+	loads=
+	for module in $(printf '%s\n' "${hwsim#*:}" | tr ' ' '\n' | sed '/^$/d' | tac) "${hwsim%%:*}"; do
+		loads="$loads \"load\" \"$module\""
+	done
+	conf modules '(backend vm) (mutable overlay)' \
+		"(command \"/probe\" $loads \"list\" \"/sys/class/ieee80211\"" \
+		"\"write\" \"/lib/modules/$release/written\")"
+	name=modules
+	boot modules
+	has 0 '^load=ok$'
+	has 0 '^list= phy0 phy1$'
+	has 0 '^write=Read-only file system$'
+	refute_out() { # PATTERN: no line of the last boot's matches it
+		cases=$((cases + 1))
+		! printf '%s\n' "$out" | grep -Eq -- "$1" || fail "$name: a line matches /$1/" "$out"
+	}
+	refute_out '^load=[^o]'
+fi
+conf inplace '(backend vm)' '(command "/probe" "say" "booted")'
+name=inplace
+boot inplace
+has 0 '^booted$'
+cases=$((cases + 1))
+[ ! -e "$root/rootfs/lib" ] || fail "a modules place was made in a directory used in place" \
+	"$(ls -la "$root/rootfs" 2>&1)"
 rm -f "$root/rootfs/srv/kept"
 
 # Volumes, each a share of its own, read-write and read-only.
