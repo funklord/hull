@@ -1224,6 +1224,10 @@ conf nethost "(command \"/probe\" \"dial\" \"127.0.0.1\" \"$listen_port\") (netw
 from_root 0 "^dial 127\\.0\\.0\\.1:$listen_port=the host loopback\$" -f "$root/nethost.conf"
 conf netnone "(command \"/probe\" \"dial\" \"127.0.0.1\" \"$listen_port\") (network none)"
 from_root 0 "^dial 127\\.0\\.0\\.1:$listen_port=Connection refused\$" -f "$root/netnone.conf"
+conf nested '(command "/probe" "nest")'
+from_root 0 '^nest=ok$' -f "$root/nested.conf"
+conf nestover '(mutable overlay) (command "/probe" "nest")'
+from_root 0 '^nest=ok$' -f "$root/nestover.conf"
 conf netexec '(command "/probe" "say" "ready" "wait") (network none) (hostname "netexec") (on_disconnect stop)'
 rm -f "$root/netexec.out"
 (cd / && exec timeout -k 2 30 "$hull_abs" run -f "$root/netexec.conf" > "$root/netexec.out" 2>&1) &
@@ -1235,6 +1239,10 @@ until grep -q '^ready$' "$root/netexec.out" 2>/dev/null || [ "$tries" -ge 40 ]; 
 done
 expect 0 "^dial 127\\.0\\.0\\.1:$listen_port=Connection refused\$" \
 	"$hull" exec netexec /probe dial 127.0.0.1 "$listen_port"
+# Inside a machine, and inside an exec, a user namespace of its own can
+# be made, as `unshare -rn` makes one: the machine's root is its mount
+# namespace's, by pivot_root, where under chroot(2) the kernel refused.
+expect 0 '^nest=ok$' "$hull" exec netexec /probe nest
 expect 0 '' "$hull" kill -s KILL netexec
 wait "$netexec" 2>/dev/null
 kill "$host_listener" 2>/dev/null

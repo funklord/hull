@@ -16,6 +16,8 @@
  *   owner PATH  PATH's owner, group and mode, not following a link
  *   read PATH   PATH's first line
  *   load PATH   whether the module PATH, under /lib/modules/RELEASE, loads
+ *   nest        whether a user and network namespace can be made inside,
+ *               as `unshare -rn` makes one, in a child that then exits
  *   link IF     whether the interface IF can be brought up
  *   shout IF T  T in a broadcast frame on IF, of EtherType 0x88b5, the
  *               IEEE's for local experiments, once a second for 20 s
@@ -70,6 +72,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -774,6 +777,17 @@ int main(int argc, char **argv)
 		} else if (strcmp(step, "resolve") == 0 && i + 2 < argc) {
 			resolve(arg, argv[i + 2]);
 			i += 2;
+		} else if (strcmp(step, "nest") == 0) {
+			int   status = 0;
+			pid_t child = fork();
+
+			if (child == 0)
+				_exit(unshare(CLONE_NEWUSER | CLONE_NEWNET) == 0 ? 0 : errno);
+			if (child < 0 || waitpid(child, &status, 0) != child || !WIFEXITED(status))
+				printf("nest=%s\n", strerror(errno));
+			else
+				printf("nest=%s\n", WEXITSTATUS(status) == 0 ? "ok" :
+				       strerror(WEXITSTATUS(status)));
 		} else if (strcmp(step, "link") == 0) {
 			link_up(arg);
 			i++;

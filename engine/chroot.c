@@ -677,8 +677,35 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	}
 	if (m->overlay)
 		layer(m, report);
-	if (m->overlay ? chroot("merged") != 0 : chroot(m->root) != 0)
-		child_fail(report, "chroot");
+	/* Its root becomes the mount namespace's own, by pivot_root and not
+	 * chroot(2): the kernel refuses a new user namespace to a process
+	 * whose root is not its namespace's, so in a chroot `unshare -rn`
+	 * failed, which netcfgd's live scripts and any nested rootless tool
+	 * need. The old root is stacked on the new and detached. */
+	{
+		struct stat now;
+		struct stat new_root;
+
+		if (chdir(m->overlay ? "merged" : m->root) != 0 || stat("/", &now) != 0 ||
+		    stat(".", &new_root) != 0)
+			child_fail(report, "the machine's root");
+		/* This namespace's processes, where the dir has room for them:
+		 * nothing is created in the user's dir. Mounted before the old
+		 * root goes, since a user namespace may mount a proc only while
+		 * another is wholly visible to it. */
+		if (stat("proc", &st) == 0 && S_ISDIR(st.st_mode) &&
+		    mount("proc", "proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) != 0)
+			child_fail(report, "mounting /proc");
+		/* A machine of the host's own / has nothing to pivot to: its root
+		 * is the bind stacked over /, which it is put on, so that its root
+		 * is still the namespace's. */
+		if (now.st_dev == new_root.st_dev && now.st_ino == new_root.st_ino ?
+		        chdir("/") != 0 || chroot(".") != 0 :
+		        syscall(SYS_pivot_root, ".", ".") != 0 || umount2(".", MNT_DETACH) != 0)
+			child_fail(report, "pivot_root");
+		if (chdir("/") != 0)
+			child_fail(report, "the machine's root");
+	}
 	for (unsigned i = 0u; i < m->volume_count; i++) {
 		snprintf(step, sizeof step, "volume %s", m->volume_guest[i]);
 		/* A symlink at the guest path is followed, inside the machine. */
@@ -697,11 +724,6 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		    move_mount(secrets, "", AT_FDCWD, "/run/hull/secrets", MOVE_MOUNT_F_EMPTY_PATH) != 0)
 			child_fail(report, "the secrets");
 	}
-	/* This namespace's processes, where the dir has room for them: nothing
-	 * is created in the user's dir. */
-	if (stat("/proc", &st) == 0 && S_ISDIR(st.st_mode) &&
-	    mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) != 0)
-		child_fail(report, "mounting /proc");
 	if (chdir(m->workdir) != 0)
 		child_fail(report, "workdir");
 	if (m->no_new_privs && prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) != 0)
