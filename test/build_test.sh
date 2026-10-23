@@ -72,7 +72,7 @@ expect() {
 cp "$probe" "$root/b/base/bin/sh"
 cp "$probe" "$root/b/base/probe"
 ln -s "$root/outside" "$root/b/base/out"
-mkdir -p "$root/b/base/usr/lib"
+mkdir -p "$root/b/base/usr/lib" "$root/b/base/dev"
 ln -s /usr/lib "$root/b/base/lib"
 printf 'hello\n' > "$root/b/src/hello"
 chmod 750 "$root/b/src"
@@ -106,7 +106,7 @@ cat > "$root/b/hull.conf" <<EOF
   (base "dir:./base")
   (steps
     (step (name "write")
-          (run "probe write /made write /gone write /tmp/scratch dial 127.0.0.1 $port")
+          (run "probe write /made write /gone write /tmp/scratch write /dev/stray kind /dev/null dial 127.0.0.1 $port")
           (discard "/gone"))
     (step (name "copy")
           (copy (path (from "./src") (to "/app")) (path (from "./extra") (to "/etc/extra")))
@@ -147,6 +147,12 @@ check "a copied file" [ "$(cat "$root/tree/etc/extra")" = extra ]
 check "a discard dropped" [ ! -e "$root/tree/gone" ]
 check "/tmp emptied" [ -z "$(ls -A "$root/tree/tmp")" ]
 check "/tmp itself kept" [ -d "$root/tree/tmp" ]
+# A step's /dev is the machine's, its null the host's device, and what it
+# wrote there is not in the tree: as an empty /dev was, a write to
+# /dev/null made a file that the build committed.
+cases=$((cases + 1))
+printf '%s\n' "$built" | grep -q '^kind=chr 1:3$' || fail "a step's /dev/null was not the device" "$built"
+check "a step's /dev kept out of its tree" [ -z "$(ls -A "$root/tree/dev")" ]
 
 # A built manifest is the schema's, its provenance A.5's: the build's
 # inputs, its parent and its step, and the builder.

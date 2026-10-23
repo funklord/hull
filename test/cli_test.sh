@@ -985,6 +985,29 @@ printf 'kept\n' > "$root/rootfs/mapped/kept"
 mkdir -p "$root/rootfs/mapped/d"
 printf 'f\n' > "$root/rootfs/mapped/d/f"
 printf 'kept\n' > "$root/rootfs/srv/kept"
+# A machine's /dev, where its tree has one: the host's devices bound into a
+# tmpfs of its own, and what is written there not on the tree's disk.
+mkdir -p "$root/devroot/dev"
+cp "$root/rootfs/probe" "$root/devroot/probe"
+printf '(machine (source "dir:./devroot") (backend chroot) (command "/probe" %s))\n' \
+	'"kind" "/dev/null" "kind" "/dev/zero" "kind" "/dev/full" "kind" "/dev/urandom" "kind" "/dev/fd" "owner" "/dev/shm" "write" "/dev/stray"' \
+	> "$root/devs.conf"
+for want in '^kind=chr 1:3$' '^kind=chr 1:5$' '^kind=chr 1:7$' '^kind=chr 1:9$' '^kind=lnk$' \
+	'^owner=0:0 1777$' '^write=ok$'; do
+	from_root 0 "$want" -f "$root/devs.conf"
+done
+cases=$((cases + 1))
+[ -z "$(ls -A "$root/devroot/dev")" ] || fail "a write to a machine's /dev reached its tree" "$(ls -A "$root/devroot/dev")"
+# A machine whose root is the host's own / keeps the host's /dev, whose
+# devices are more than the six bound in elsewhere.
+extra=
+for f in /dev/*; do
+	case ${f#/dev/} in null|zero|full|random|urandom|tty) continue ;; esac
+	[ -c "$f" ] && extra=$f && break
+done
+printf '(machine (source "dir:/") (backend chroot) (command "%s" "kind" "%s"))\n' \
+	"$root/devroot/probe" "$extra" > "$root/hostdev.conf"
+from_root 0 "^kind=chr $(stat -c '%Hr:%Lr' "$extra")\$" -f "$root/hostdev.conf"
 conf overlay '(mutable overlay)' \
 	'(command "/probe" "owner" "/" "write" "/layered" "remove" "/mapped/kept" "read" "/mapped/kept"' \
 	'"remove" "/srv/kept")'

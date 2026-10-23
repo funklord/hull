@@ -504,6 +504,53 @@ static unsigned long locked_flags(const char *path)
 }
 
 /*
+ * The machine's /dev, where its tree has the directory: a tmpfs of its own
+ * with the host's null, zero, full, random, urandom and tty bound in, as a
+ * user namespace may bind a device but not make one, its pts a devpts of
+ * its own and shm a tmpfs. Mounted before the old root goes, from the
+ * host's /dev. Without it /dev was the tree's own, empty in an image, so
+ * the first `>/dev/null` made a regular file, what was written to it was
+ * read back, and a build committed it into its tree.
+ */
+static void make_dev(int report)
+{
+	static const char *const nodes[] = { "null", "zero", "full", "random", "urandom", "tty" };
+	static const char *const links[][2] = {
+		{ "fd", "/proc/self/fd" }, { "stdin", "/proc/self/fd/0" },
+		{ "stdout", "/proc/self/fd/1" }, { "stderr", "/proc/self/fd/2" },
+		{ "ptmx", "pts/ptmx" },
+	};
+	char path[64];
+
+	if (mount("tmpfs", "dev", "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=0755,size=1m") != 0)
+		child_fail(report, "mounting /dev");
+	for (size_t i = 0u; i < sizeof nodes / sizeof nodes[0]; i++) {
+		char host[64];
+		int  fd;
+
+		snprintf(path, sizeof path, "dev/%s", nodes[i]);
+		snprintf(host, sizeof host, "/dev/%s", nodes[i]);
+		fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+		if (fd < 0 || close(fd) != 0 || mount(host, path, NULL, MS_BIND, NULL) != 0)
+			child_fail(report, "binding a device into /dev");
+	}
+	for (size_t i = 0u; i < sizeof links / sizeof links[0]; i++) {
+		snprintf(path, sizeof path, "dev/%s", links[i][0]);
+		if (symlink(links[i][1], path) != 0)
+			child_fail(report, "a link in /dev");
+	}
+	if (mkdir("dev/pts", 0755) != 0 || mkdir("dev/shm", 01777) != 0)
+		child_fail(report, "a directory in /dev");
+	/* A devpts of the machine's own, for a pty it opens; a kernel that
+	 * refuses one to a user namespace leaves the directory empty. */
+	if (mount("devpts", "dev/pts", "devpts", MS_NOSUID | MS_NOEXEC,
+	          "newinstance,ptmxmode=0666,mode=0620") != 0)
+		errno = 0;
+	if (mount("tmpfs", "dev/shm", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777") != 0)
+		child_fail(report, "mounting /dev/shm");
+}
+
+/*
  * The directory as an overlay, in the machine's own mount namespace: a
  * clone of it beneath, and above it a tmpfs, which goes with the machine.
  * The clone is taken first, then the tmpfs is mounted over the
@@ -1297,6 +1344,11 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		if (stat("proc", &st) == 0 && S_ISDIR(st.st_mode) &&
 		    mount("proc", "proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) != 0)
 			child_fail(report, "mounting /proc");
+		/* And its devices; a machine of the host's own / keeps the
+		 * host's /dev, which is already its tree's. */
+		if (!(now.st_dev == new_root.st_dev && now.st_ino == new_root.st_ino) &&
+		    stat("dev", &st) == 0 && S_ISDIR(st.st_mode))
+			make_dev(report);
 		/* A machine of the host's own / has nothing to pivot to: its root
 		 * is the bind stacked over /, which it is put on, so that its root
 		 * is still the namespace's. */

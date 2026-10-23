@@ -16,6 +16,7 @@
  *   rmdir PATH  whether the directory PATH can be removed
  *   list PATH   the names in the directory PATH, sorted
  *   owner PATH  PATH's owner, group and mode, not following a link
+ *   kind PATH   PATH's kind, and a character device's major:minor
  *   read PATH   PATH's first line
  *   load PATH   whether the module PATH, under /lib/modules/RELEASE, loads
  * Run as PID 1 with no arguments it is an init that reaps for ever; run as
@@ -96,6 +97,7 @@
 #include <sys/prctl.h>
 #include <sys/reboot.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
@@ -621,6 +623,17 @@ int main(int argc, char **argv)
 				free(names);
 				printf("\n");
 			}
+			i++;
+		} else if (strcmp(step, "kind") == 0) {
+			struct stat file;
+
+			if (lstat(arg, &file) != 0)
+				printf("kind=%s\n", strerror(errno));
+			else if (S_ISCHR(file.st_mode))
+				printf("kind=chr %u:%u\n", major(file.st_rdev), minor(file.st_rdev));
+			else
+				printf("kind=%s\n", S_ISREG(file.st_mode) ? "reg" : S_ISDIR(file.st_mode) ? "dir" :
+				       S_ISLNK(file.st_mode) ? "lnk" : "other");
 			i++;
 		} else if (strcmp(step, "owner") == 0) {
 			struct stat file;
