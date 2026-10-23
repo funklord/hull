@@ -996,13 +996,25 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	if (setsid() < 0)
 		child_fail(report, "setsid");
 	/* The engine says whether it mapped many uids from outside, `M`, or the
-	 * machine is to map its one, `S`, as a process may itself. */
+	 * machine is to map its one, `S`, as a process may itself; or `O`, one
+	 * where many were wanted and the host gives the user no range, which
+	 * is said, with its way round, once, on the workload's stderr. */
 	{
 		char said = 0;
 
 		if (read(mapped, &said, 1u) != 1)
 			child_fail(report, "the uid map");
 		close(mapped);
+		if (said == 'O') {
+			static const char one[] =
+			    "hull: one uid is mapped, the host giving this user no subordinate range: "
+			    "a chown to another of the machine's users fails, and apt-get wants "
+			    "-o APT::Sandbox::User=root; hull doctor gives the line that adds a range\n";
+
+			if (write(err[1], one, sizeof one - 1u) < 0) {
+				/* the workload's stderr is gone; nothing to tell */
+			}
+		}
 		if (said == 'M') {
 			/* The user's own groups, unmapped here and so nobody's, go. */
 			if (setgroups(0u, NULL) != 0)
@@ -1414,6 +1426,7 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	int         report[2];
 	int         mapped[2];
 	int         dir_fd = -1;
+	int         wanted;
 	uid_t       uid = getuid();
 	gid_t       gid = getgid();
 	ssize_t     n;
@@ -1465,9 +1478,10 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 		/* Nor with a volume's upper kept, on the user's disk too. */
 		for (unsigned i = 0u; i < m->volume_count; i++)
 			kept = kept || m->volume_stack[i].upper != NULL;
-		m->many = m->overlay && !m->readonly_root && !kept && map_many(m->pid, uid, gid);
+		wanted = m->overlay && !m->readonly_root && !kept;
+		m->many = wanted && map_many(m->pid, uid, gid);
 	}
-	if (write(mapped[1], m->many ? "M" : "S", 1u) != 1) {
+	if (write(mapped[1], m->many ? "M" : wanted ? "O" : "S", 1u) != 1) {
 		/* The child reads its end closed and says so on the report. */
 	}
 	close(mapped[1]);

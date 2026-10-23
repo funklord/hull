@@ -1034,6 +1034,23 @@ cases=$((cases + 1))
 [ ! -e "$root/rootfs/layered" ] || fail "an overlay's write reached the directory through exec's machine" ""
 rm -f "$root/rootfs/srv/kept" "$root/rootfs/mapped/kept" "$root/rootfs/mapped/d/f"
 rmdir "$root/rootfs/mapped/d" "$root/rootfs/mapped"
+# Where the host gives the user no subordinate range, one uid is mapped
+# and said once, with its way round: root in a user namespace of the
+# user's own has none here, so hull run there, with a core of its own in
+# a runtime directory of its own, which the suite's core outside would
+# otherwise map from. Where many are mapped, nothing is said.
+mkdir -p "$root/onerun"
+chmod 700 "$root/onerun"
+conf onemap '(mutable overlay) (command "/probe" "say" "ran")'
+expect 0 '^hull: one uid is mapped, .* hull doctor gives the line that adds a range$' \
+	unshare -r env XDG_RUNTIME_DIR="$root/onerun" sh -c 'cd / && exec "$0" run -f "$1"' \
+	"$(cd "$(dirname "$hull")" && pwd)/$(basename "$hull")" "$root/onemap.conf"
+from_root 0 '^ran$' -f "$root/onemap.conf"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q 'one uid is mapped' &&
+	fail "one uid was said where many are mapped" "$out"
+sleep 2
+rm -rf "${root:?}/onerun"
 expect 1 'no such machine' "$hull" stats nobody
 expect 2 'usage' "$hull" stats
 

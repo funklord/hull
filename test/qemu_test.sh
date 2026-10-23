@@ -760,6 +760,15 @@ boot taken
 has 125 "port $greet on $(printf '%s' "$at" | sed 's/\./\\./g'): Address already in use"
 kill "$holder" 2>/dev/null
 wait "$holder" 2>/dev/null
+# A host port below the lowest a user may bind is refused before the
+# machine boots, naming the setting and the way round.
+lowest=$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null)
+if [ "${lowest:-0}" -gt 80 ]; then
+	conf lowport '(backend vm) (ports (port (host 80) (guest 80))) (command "/probe" "say" "never")'
+	name=lowport
+	boot lowport
+	has 125 "port 80 on .*: below $lowest, the lowest a user may bind .*: give a host port of $lowest or more"
+fi
 
 # hull proxy-ssh: the machine's own port 22, declared nowhere, reached as
 # ssh's ProxyCommand would, by name with or without .hull. Nothing on a

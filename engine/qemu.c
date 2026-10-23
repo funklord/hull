@@ -1684,6 +1684,21 @@ static void remove_dir(hull_machine *m)
 	m->dir[0] = '\0';
 }
 
+/* The lowest port a user may bind, 1024 where it cannot be read. */
+static unsigned unprivileged_port_start(void)
+{
+	char text[32] = "";
+	int  fd = open("/proc/sys/net/ipv4/ip_unprivileged_port_start", O_RDONLY | O_CLOEXEC);
+
+	if (fd >= 0) {
+		ssize_t n = read(fd, text, sizeof text - 1u);
+
+		text[n > 0 ? n : 0] = '\0';
+		close(fd);
+	}
+	return text[0] >= '0' && text[0] <= '9' ? (unsigned)strtoul(text, NULL, 10) : 1024u;
+}
+
 /* Each port's listener on the machine's address, bound before the machine boots, so a
  * port that is taken refuses the start. A reason, or NULL. */
 static const char *open_listeners(hull_machine *m)
@@ -1701,8 +1716,19 @@ static const char *open_listeners(hull_machine *m)
 		if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0 ||
 		    bind(fd, (struct sockaddr *)&at, sizeof at) != 0 ||
 		    (!m->port_udp[i] && listen(fd, 64) != 0)) {
-			snprintf(m->detail, sizeof m->detail, "port %u on %s: %s", m->port_host[i],
-			         m->address_text, strerror(errno));
+			unsigned lowest = unprivileged_port_start();
+
+			/* Below the lowest port a user may bind, which is the host's
+			 * owner's to lower, and said so, with the way round. */
+			if (errno == EACCES && m->port_host[i] < lowest)
+				snprintf(m->detail, sizeof m->detail,
+				         "port %u on %s: below %u, the lowest a user may bind "
+				         "(net.ipv4.ip_unprivileged_port_start): give a host port of %u or "
+				         "more, or see hull doctor", m->port_host[i], m->address_text, lowest,
+				         lowest);
+			else
+				snprintf(m->detail, sizeof m->detail, "port %u on %s: %s", m->port_host[i],
+				         m->address_text, strerror(errno));
 			if (fd >= 0)
 				close(fd);
 			close_listeners(m);
