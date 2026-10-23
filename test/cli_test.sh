@@ -1265,6 +1265,40 @@ from_root 0 "$owned_chown" -f "$root/owned.conf"
 from_root 0 "$owned_owner" -f "$root/owned.conf"
 conf ownedin '(command "/probe" "chown" "/probe" "101")'
 from_root 0 '^chown=Invalid argument$' -f "$root/ownedin.conf"
+# (export PATH): an overlay machine's tree as a tar once its workload
+# ends, each owner as the machine saw it, so a file it gave another
+# owner is 101's in the tar and on no disk as 101's; its /proc is an empty
+# directory there, its own mount being left out. The tar commits with the
+# owner kept. In place there is nothing to export: the tree is the
+# user's own.
+rm -f "$root/exported.tar"
+conf exported "(mutable overlay) (export \"$root/exported.tar\")" \
+	'(command "/probe" "write" "/made" "chown" "/made" "101")'
+from_root 0 "$owned_chown" -f "$root/exported.conf"
+cases=$((cases + 1))
+said=$(timeout 30 python3 -c '
+import sys, tarfile
+t = tarfile.open(sys.argv[1])
+names = {m.name: m for m in t}
+print("made", names["made"].uid if "made" in names else "-")
+print("probe", names["probe"].uid if "probe" in names else "-")
+print("proc", "empty" if "proc" in names and not any(n.startswith("proc/") for n in names) else "not")' \
+	"$root/exported.tar" 2>&1)
+case $owned_chown in
+*ok*) made_uid=101 ;;
+*) made_uid=0 ;;
+esac
+[ "$said" = "$(printf 'made %s\nprobe 0\nproc empty' "$made_uid")" ] ||
+	fail "an export's tree is not as the machine saw it" "$said"
+expect 0 '^exported/1 sha256:' "$hull" commit --tar "$root/exported.tar" exported/1
+cases=$((cases + 1))
+timeout 30 "$hull" manifest show exported/1 > "$root/exported.view" 2>&1
+if [ "$made_uid" = 101 ]; then
+	grep -qF '(owner (gid 101) (uid 101)) (path "made")' "$root/exported.view" ||
+		fail "an export's owner was not kept by its commit" "$(grep made "$root/exported.view")"
+fi
+conf exportin "(export \"$root/never.tar\")" '(command "/probe" "say" "no")'
+from_root 125 'an export is of an overlay.s tree' -f "$root/exportin.conf"
 conf nested '(command "/probe" "nest")'
 from_root 0 '^nest=ok$' -f "$root/nested.conf"
 conf nestover '(mutable overlay) (command "/probe" "nest")'

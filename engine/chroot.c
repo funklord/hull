@@ -63,6 +63,7 @@
 #include <unistd.h>
 
 #include "access.h"
+#include "tree.h"
 #include "builtin.h"
 #include "usage.h"
 
@@ -96,6 +97,7 @@ struct hull_machine {
 	int              volume_readonly[MAX_VOLUMES];
 	unsigned         volume_count;
 	char            *secrets;    /* the core's directory of them, or NULL */
+	char            *export;     /* (export PATH): the tree's tar, once the workload ends */
 	unsigned         env_count;  /* envp's, while secrets are added to it */
 
 	pid_t            pid;        /* the machine's init */
@@ -128,6 +130,7 @@ static void release(hull_machine *m)
 	free(m->workdir);
 	free(m->hostname);
 	free(m->secrets);
+	free(m->export);
 	free(m->plan);
 	free(m->persisted);
 	if (m->pidfd >= 0)
@@ -268,6 +271,19 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	source  = hull_access_value(doc, &machine, "on_disconnect");
 	m->keep = source != NULL && strcmp(source, "keep") == 0;
 	free(source);
+
+	/* (export PATH): what the machine made of its tree, as a tar, owners
+	 * as it saw them. Only an overlay's: in place the tree is the user's
+	 * own directory already, and its owners the user's. */
+	if ((source = hull_access_value(doc, &machine, "export")) != NULL) {
+		m->export = hull_access_path(doc, source);
+		free(source);
+		if (m->export == NULL)
+			return "the export's path cannot be read";
+		if (!m->overlay)
+			return "an export is of an overlay's tree: (export ...) needs (mutable overlay) and "
+			       "a root that is not read-only";
+	}
 
 	/* (network host), or none given, is the host's own, as it always was;
 	 * (network none) is a namespace of the machine's own, lo alone. */
@@ -497,6 +513,53 @@ static void relay_hold(int which, const uint8_t *bytes, size_t n)
  * next connection is the core taking the machine back, and is given what
  * was held first.
  */
+/* (export PATH)'s file, opened before the pivot, so the user's, or -1. */
+static int export_fd = -1;
+
+static int export_sink(void *context, const uint8_t *data, size_t n)
+{
+	(void)context;
+	while (n > 0u) {
+		ssize_t wrote = write(export_fd, data, n);
+
+		if (wrote < 0 && errno == EINTR)
+			continue;
+		if (wrote <= 0)
+			return -1;
+		data += wrote;
+		n -= (size_t)wrote;
+	}
+	return 0;
+}
+
+/* The merged root as engine/tree.c's tar, its own mount alone, so no
+ * /proc, volume or secret, each owner as this namespace sees it, which
+ * is what keeps an owner of the subordinate range off the user's disk.
+ * A failure empties the file, which no commit takes, says why on the
+ * workload's stderr, and makes the end 125. */
+static void export_tree(int conn, int *status, pid_t workload)
+{
+	char detail[512] = "";
+
+	if (export_fd < 0)
+		return;
+	if (hull_tree_tar_fs("/", 1, export_sink, NULL, detail, sizeof detail) != 0 ||
+	    fsync(export_fd) != 0) {
+		char said[600];
+		int  n = snprintf(said, sizeof said, "hull: export: %s\n",
+		                  detail[0] != '\0' ? detail : strerror(errno));
+
+		if (ftruncate(export_fd, 0) != 0) {
+			/* nothing more can be done; the status says it */
+		}
+		if (conn >= 0 && n > 0)
+			send_frame(conn, 'd', 2, said, (size_t)n, workload);
+		*status = 125 << 8;
+	}
+	close(export_fd);
+	export_fd = -1;
+}
+
 static void relay(int conn, int listener, int out, int err, pid_t workload)
 {
 	uint8_t buffer[16384];
@@ -525,6 +588,8 @@ static void relay(int conn, int listener, int out, int err, pid_t workload)
 		if (ended) {
 			int idle = poll(fds, 2u, 0) == 0 || (out < 0 && err < 0);
 
+			if (idle)
+				export_tree(conn, &status, workload);
 			if (idle && conn >= 0 &&
 			    send_frame(conn, 'x', 0, &status, sizeof status, workload) == 0)
 				_exit(0);
@@ -786,6 +851,12 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 			child_fail(report, "lo");
 		close(fd);
 	}
+	/* The export's file, while the host's paths are still to be seen; the
+	 * user's, as the namespace's root is, and no file of the workload's. */
+	if (m->export != NULL &&
+	    (export_fd = open(m->export, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+	                      0600)) < 0)
+		child_fail(report, "the export's file");
 	if (m->overlay)
 		layer(m, report);
 	/* Its root becomes the mount namespace's own, by pivot_root and not
@@ -1859,6 +1930,9 @@ static const hull_cap_entry entries[] = {
 	{ "network.host",           HULL_SUP_NATIVE,   NULL, NULL },
 	{ "network.none",           HULL_SUP_NATIVE,
 	  "a network namespace of the machine's own, with lo alone", NULL },
+	{ "export",                 HULL_SUP_NATIVE,
+	  "a tar of the overlay's tree when the workload ends, owners as the machine saw them",
+	  NULL },
 	{ "init",                   HULL_SUP_REJECTED,
 	  "not yet: the machine's PID 1 is the engine's own, which reaps and forwards signals",
 	  NULL },

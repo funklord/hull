@@ -146,7 +146,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  shown.conf failing.conf nofile.conf big.conf sealed.conf norun.conf \
                  stored.conf stored-direct.conf unstored.conf idle/hull/core.log idle/hull/core.lock \
                  searched.conf denied.conf unfound.conf rootfs/srv/searchme rootfs/bin/searchme \
-                 listen.out nethost.conf netnone.conf netexec.conf netexec.out vmhost.conf tools/squashfuse segmented.conf nested.conf nestover.conf inited.conf pathless.conf pathed.conf owned.conf ownedin.conf) \
+                 listen.out nethost.conf netnone.conf netexec.conf netexec.out vmhost.conf tools/squashfuse segmented.conf nested.conf nestover.conf inited.conf pathless.conf pathed.conf owned.conf ownedin.conf exported.conf exported.tar exported.view exportin.conf) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
 # What test/docker_test.sh writes.
