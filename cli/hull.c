@@ -111,10 +111,24 @@ static void usage(FILE *out)
 	      "       hull --version\n", out);
 }
 
+/* The commit, where the build that made this one wrote it: fmake's does
+ * not, and says so. */
+#if defined(__has_include)
+#if __has_include("commit.h")
+#include "commit.h"
+#endif
+#endif
+#ifndef HULL_COMMIT
+#define HULL_COMMIT "unknown"
+#endif
+
+/* The first line is what scripts read, so it keeps its shape; the commit
+ * is a line of its own. */
 static void version(void)
 {
 	printf("hull %s\n", HULL_VERSION);
 	printf("Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>\n");
+	printf("commit %s\n", HULL_COMMIT);
 }
 
 /* The kernel's name for the host's arch, in the spec's spelling. */

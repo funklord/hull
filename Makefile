@@ -200,7 +200,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all check check-docker check-qemu check-flip test vectors style style-source style-docs contract hooks clean help install-nss
+.PHONY: all check check-docker check-qemu check-flip test vectors style style-source style-docs contract hooks clean help install-nss FORCE
 
 all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL) $(AGENT_BIN) $(NSS_LIB)
 
@@ -280,6 +280,22 @@ $(BUILD_DIR)/core/%.o: core/%.c VERSION | $(GEN_HEADERS) $(AGENT_GEN) $(FRONTEND
                                           $(PROTOCOL_GEN)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) -DHULL_VERSION='"$(VERSION)"' $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+
+# The commit hull is built from, for --version, so that a result can name
+# the hull it rested on without guessing from where the binary sits. The
+# rule runs every time and replaces the file only when what it says
+# changes: a new commit rebuilds what prints it, and nothing else, where
+# a -D flag alone would leave an object naming an old one. -dirty where the
+# tree had changes of anybody's, as it was built from those.
+$(GEN_DIR)/commit.h: FORCE
+	@mkdir -p '$(@D)'
+	@commit=$$(git describe --always --dirty --abbrev=12 2>/dev/null || echo unknown); \
+	printf '#define HULL_COMMIT "%s"\n' "$$commit" > '$@.new'; \
+	if cmp -s '$@.new' '$@'; then rm -f '$@.new'; else mv '$@.new' '$@'; fi
+
+FORCE:
+
+$(BUILD_DIR)/cli/hull.o: $(GEN_DIR)/commit.h
 
 # The version is a prerequisite, so a new number rebuilds what prints it.
 $(BUILD_DIR)/cli/%.o: cli/%.c VERSION | $(GEN_HEADERS) $(AGENT_GEN) $(FRONTEND_GEN)
@@ -481,6 +497,6 @@ clean:
 	        $(SPEC_OBJS) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS) $(PLAN_OBJS:.o=.d) \
 	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(STORE_OBJS) $(STORE_OBJS:.o=.d) $(OCI_OBJS) $(OCI_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) \
 	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) \
-	        $(AGENT_BIN) $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d \
+	        $(AGENT_BIN) $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) \
 	        $(FLIP_TEST_FILES) $(NSS_LIB)

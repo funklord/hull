@@ -91,6 +91,12 @@ awk '/^## 4\. The spec/ { inside = 1 }
 # What it says about itself.
 expect 0 '^hull [0-9]+\.[0-9]+$' "$hull" --version
 expect 0 '^Copyright \(C\) 2026 Nabeel Sowan <nabeel@vibes\.se>$' "$hull" --version
+# The commit it was built from, on a line of its own after the first two,
+# so a result can name the hull it rested on.
+expect 0 '^commit ([0-9a-f]{12}(-dirty)?|unknown)$' "$hull" --version
+cases=$((cases + 1))
+[ "$(timeout 10 "$hull" --version | head -1 | grep -cE '^hull [0-9]+\.[0-9]+$')" = 1 ] ||
+	fail "--version's first line lost its shape" "$(timeout 10 "$hull" --version)"
 expect 2 '^usage: hull plan' "$hull"
 expect 2 '^usage: hull plan' "$hull" frobnicate
 expect 0 '^docker: ns \(runs as root\)$' "$hull" engines
