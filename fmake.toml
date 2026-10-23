@@ -14,9 +14,12 @@ ldflags = ["-static"]
 # libnss_hull.so with the soname glibc loads, libnss_hull.so.2, which
 # `make install-nss` installs it as. Its hidden visibility is the file's
 # own @cflags, since a shared target takes no cflags here.
+# A module, named by exactly what loads it: glibc builds libnss_hull.so.2
+# from the hosts line and dlopens that, so the version gives the soname,
+# and no .pc is written, which a shared target would (fmake b0eaafe).
 [target.nss]
-name = "nss_hull"
-kind = "shared"
+name = "libnss_hull"
+kind = "module"
 version = "2"
 sources = ["nss/nss_hull.c"]
 
