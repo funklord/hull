@@ -1656,9 +1656,15 @@ static void handle_exec(client *c, uint32_t ch, const hull_sexpr_doc *body, int 
 		status = ops->exec(&s->core, s->handle, spec, &stream, &error);
 	pthread_mutex_lock(&flow_lock);
 	adopting = NULL;
-	if (status == HULL_OK)
-		x->stream = stream;
-	else
+	/* Held to the window from here, as the exec is had: opened only
+	 * once its input's writer ran, what the reader read in between was
+	 * never held back, 167936 bytes on 65536 of credit at a load of 199.
+	 * Not during exec() itself, where a reader held for credit would be
+	 * one a failing engine joins. */
+	if (status == HULL_OK) {
+		x->stream      = stream;
+		x->output_open = 1;
+	} else
 		*x = (exec_entry){ 0 };
 	pthread_mutex_unlock(&flow_lock);
 	if (status != HULL_OK) {
@@ -1670,6 +1676,12 @@ static void handle_exec(client *c, uint32_t ch, const hull_sexpr_doc *body, int 
 	pthread_mutex_init(&x->lock, NULL);
 	pthread_cond_init(&x->more, NULL);
 	if (x->input == NULL || pthread_create(&x->writer, NULL, write_input, x) != 0) {
+		/* A reader waiting for credit is let go first, as close_exec()
+		 * lets it, since stream_close() waits for it. */
+		pthread_mutex_lock(&flow_lock);
+		x->output_open = 0;
+		pthread_cond_broadcast(&flow_room);
+		pthread_mutex_unlock(&flow_lock);
 		s->engine->ops->stream_close(&s->core, stream, &error);
 		pthread_cond_destroy(&x->more);
 		pthread_mutex_destroy(&x->lock);
@@ -1680,9 +1692,6 @@ static void handle_exec(client *c, uint32_t ch, const hull_sexpr_doc *body, int 
 		send_error(c, ch, "the core cannot take the command's input");
 		return;
 	}
-	pthread_mutex_lock(&flow_lock);
-	x->output_open = 1;
-	pthread_mutex_unlock(&flow_lock);
 	send_started(c, ch, s);
 	send_credit(c, ch, INPUT_WINDOW);
 }
