@@ -175,6 +175,27 @@ cases=$((cases + 1))
 [ "$got" = 1 ] && printf '%s\n' "$out" | grep -q '^tree_tar: a/file: Permission denied$' ||
 	fail "an unreadable file exited $got" "$out"
 
+# xattrs: a file's and a directory's user.* go with them, in pax records,
+# as a file capability must, read back by tarfile, which shares nothing
+# with hull's writer.
+mkdir -p "$dir/xa/d"
+printf 'x\n' > "$dir/xa/f"
+cases=$((cases + 1))
+if timeout 30 python3 -c '
+import os, sys
+os.setxattr(sys.argv[1] + "/f", "user.note", b"on the file")
+os.setxattr(sys.argv[1] + "/d", "user.note", b"on the dir")' "$dir/xa" 2>/dev/null; then
+	timeout 60 "$tar_of" "$dir/xa" > "$dir/xa.tar" 2>&1
+	said=$(timeout 30 python3 -c '
+import sys, tarfile
+for m in sorted(tarfile.open(sys.argv[1]), key=lambda m: m.name):
+	print(m.name, m.pax_headers.get("SCHILY.xattr.user.note", "-"))' "$dir/xa.tar" 2>&1)
+	[ "$said" = "$(printf 'd on the dir\nf on the file')" ] ||
+		fail "a tree's xattrs did not go with it" "$said"
+else
+	printf 'tree: the filesystem holds no user xattrs, so their case is skipped\n'
+fi
+
 # --one-fs: in a user and mount namespace of its own, a tmpfs mounted in
 # the tree and a file bound over one of it. The mount point is written,
 # empty, and what is on the tmpfs and the bound file are left out; the

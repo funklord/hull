@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include "tree.h"
@@ -160,17 +161,68 @@ static int write_header(writer *w, const hull_tar_entry *e)
 	return put(w, block, sizeof block);
 }
 
-/* An entry of the tree on disk: its mode, owner and mtime as they are. */
-static int header(writer *w, const char *name, char type, const struct stat *st,
-                  unsigned long long size, const char *link)
+static int name_order(const void *a, const void *b)
+{
+	return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* An entry of the tree on disk: its mode, owner and mtime as they are, and
+ * its user.* and security.* xattrs, by name, as a store's commit keeps
+ * them, so that a file capability, ping's say, goes with the file. `at`
+ * is `entry` in `dir`, or -1 for none. */
+static int header(writer *w, int dir, const char *at, const char *name, char type,
+                  const struct stat *st, unsigned long long size, const char *link)
 {
 	hull_tar_entry e = { .name = name, .type = type, .mode = (unsigned)(st->st_mode & 07777),
 	                     .uid = (unsigned long long)st->st_uid,
 	                     .gid = (unsigned long long)st->st_gid,
 	                     .mtime = st->st_mtime > 0 ? (unsigned long long)st->st_mtime : 0u,
 	                     .size = size, .link = link };
+	static char     list[65536];
+	char           *names[256];
+	const uint8_t  *values[256];
+	size_t          lengths[256];
+	uint8_t        *held[256];
+	unsigned        count = 0u;
+	int             status;
+	int             fd = dir >= 0 ? openat(dir, at, O_PATH | O_NOFOLLOW | O_CLOEXEC) : -1;
 
-	return write_header(w, &e);
+	if (fd >= 0) {
+		char    path[64];
+		ssize_t n;
+
+		/* Through the descriptor's magic link, which the l- calls would
+		 * take as the link itself; it leads to the file, a symlink too. */
+		snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
+		n = listxattr(path, list, sizeof list);
+		for (ssize_t i = 0; n > 0 && i < n && count < 256u; i += (ssize_t)strlen(list + i) + 1)
+			if (strncmp(list + i, "user.", 5u) == 0 || strncmp(list + i, "security.", 9u) == 0)
+				names[count++] = list + i;
+		qsort(names, count, sizeof names[0], name_order);
+		for (unsigned i = 0u; i < count; i++) {
+			ssize_t v = getxattr(path, names[i], NULL, 0u);
+
+			held[i] = v >= 0 ? malloc((size_t)v + 1u) : NULL;
+			lengths[i] = held[i] != NULL && v >= 0 ?
+			             (size_t)getxattr(path, names[i], held[i], (size_t)v + 1u) : 0u;
+			values[i] = held[i];
+		}
+		close(fd);
+	}
+	e.xattr_names   = (const char *const *)names;
+	e.xattr_values  = values;
+	e.xattr_lengths = lengths;
+	e.xattr_count   = count;
+	for (unsigned i = 0u; i < count; i++)
+		if (held[i] == NULL) {
+			for (unsigned k = 0u; k < count; k++)
+				free(held[k]);
+			return fail(w, "an xattr could not be read");
+		}
+	status = write_header(w, &e);
+	for (unsigned i = 0u; i < count; i++)
+		free(held[i]);
+	return status;
 }
 
 /* A regular file's content, exactly the size its header gave. */
@@ -237,7 +289,7 @@ static int entry(writer *w, int dir, const char *name, size_t base, unsigned dep
 		if (S_ISDIR(st.st_mode)) {
 			w->path[base + length]      = '/';
 			w->path[base + length + 1u] = '\0';
-			status = header(w, w->path, '5', &st, 0u, NULL);
+			status = header(w, -1, NULL, w->path, '5', &st, 0u, NULL);
 		}
 		w->path[base] = '\0';
 		return status;
@@ -252,7 +304,7 @@ static int entry(writer *w, int dir, const char *name, size_t base, unsigned dep
 			return fail(w, strerror(errno));
 		w->path[base + length]      = '/';
 		w->path[base + length + 1u] = '\0';
-		status = header(w, w->path, '5', &st, 0u, NULL);
+		status = header(w, dir, name, w->path, '5', &st, 0u, NULL);
 		if (status == 0)
 			status = walk(w, fd, base + length + 1u, depth + 1u);
 		close(fd);
@@ -265,7 +317,7 @@ static int entry(writer *w, int dir, const char *name, size_t base, unsigned dep
 		if (fstat(fd, &opened) != 0 || !S_ISREG(opened.st_mode) || opened.st_ino != st.st_ino)
 			status = fail(w, "it changed while it was read");
 		else
-			status = header(w, w->path, '0', &opened, (unsigned long long)opened.st_size,
+			status = header(w, dir, name, w->path, '0', &opened, (unsigned long long)opened.st_size,
 			                NULL) != 0 ? -1 : content(w, fd, (unsigned long long)opened.st_size);
 		close(fd);
 	} else if (S_ISLNK(st.st_mode)) {
@@ -277,9 +329,9 @@ static int entry(writer *w, int dir, const char *name, size_t base, unsigned dep
 		if ((size_t)n == sizeof target - 1u)
 			return fail(w, "its target is too long");
 		target[n] = '\0';
-		status = header(w, w->path, '2', &st, 0u, target);
+		status = header(w, dir, name, w->path, '2', &st, 0u, target);
 	} else if (S_ISFIFO(st.st_mode)) {
-		status = header(w, w->path, '6', &st, 0u, NULL);
+		status = header(w, dir, name, w->path, '6', &st, 0u, NULL);
 	} else if (S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode)) {
 		status = fail(w, "a device node is not imported");
 	}
