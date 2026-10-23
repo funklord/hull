@@ -259,6 +259,27 @@ expect 1 '' "$hull" diff again/1 plain/back
 cases=$((cases + 1))
 [ "$out" = "$(printf 'runtime added\nprovenance')" ] ||
 	fail "a tree with no runtime did not come back as it went" "$out"
+# A tree with owners pushes them: a file of 101's and 102's, committed
+# from a tar, is theirs in the layer, as a reader apart from hull's sees.
+timeout 30 python3 - "$root/owned.tar" <<'PYEOF2'
+import io, sys, tarfile
+t = tarfile.open(sys.argv[1], "w", format=tarfile.PAX_FORMAT)
+i = tarfile.TarInfo("owned"); i.uid, i.gid, i.mode, i.size = 101, 102, 0o640, 3
+t.addfile(i, io.BytesIO(b"hi\n"))
+t.close()
+PYEOF2
+expect 0 '' "$hull" commit --tar "$root/owned.tar" owned/1
+expect 0 '' "$hull" push owned/1 "127.0.0.1:$port/test/owned:1"
+owned_digest=$(printf '%s\n' "$out" | sed -n 's/^.* \(sha256:[0-9a-f]\{64\}\)$/\1/p')
+cases=$((cases + 1))
+seen=$(timeout 30 python3 -c '
+import gzip, io, json, os, sys, tarfile
+blobs = sys.argv[1]
+manifest = json.load(open(os.path.join(blobs, sys.argv[2])))
+raw = gzip.decompress(open(os.path.join(blobs, manifest["layers"][0]["digest"]), "rb").read())
+print(" ".join("%s=%d:%d" % (m.name, m.uid, m.gid) for m in tarfile.open(fileobj=io.BytesIO(raw))))
+' "$root/registry/blobs" "$owned_digest" 2>&1)
+[ "$seen" = "owned=101:102" ] || fail "a pushed layer did not keep its owners" "$seen"
 # An object not its name is not pushed: the layer is checked as it is read.
 mkdir -p "$root/tiny"
 printf 'tiny\n' > "$root/tiny/file"

@@ -2066,9 +2066,11 @@ int hull_store_layer(hull_store *store, const char *name,
 
 			hull_sexpr_child(&doc, &owner, &head);
 			hull_sexpr_next(&doc, &head, &class);
+			/* The record itself, (owner (gid N) (uid N)), holds the ids:
+			 * read from its first sibling, every id was 0, root's. */
 			if (class.kind == HULL_SEXPR_LIST) {
-				e.uid = id_of(&doc, &class, "uid");
-				e.gid = id_of(&doc, &class, "gid");
+				e.uid = id_of(&doc, &owner, "uid");
+				e.gid = id_of(&doc, &owner, "gid");
 			} else if (!hull_sexpr_is(&doc, &class, "root")) {
 				say(why, cap, path, "an owner of class user, which has no number in an image");
 				goto done;
