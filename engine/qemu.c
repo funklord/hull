@@ -52,6 +52,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/eventfd.h>
 #include <sys/prctl.h>
 #include <sys/random.h>
@@ -105,6 +106,11 @@ struct hull_machine {
 	char            *root;         /* the dir source, without "dir:" */
 	int              readonly_root;
 	int              overlay;      /* (mutable overlay): the share is read-only */
+	char            *layer_path[MAX_VOLUMES];  /* (layers ...): read-only, each above the last */
+	unsigned         layer_count;
+	char            *upper;        /* (upper PATH): the overlay's writes, kept */
+	char            *upper_work;   /* overlayfs's work directory beside it, hidden */
+	int              host_overlay; /* layers or an upper: the overlay is qemu's, the share it */
 	char            *volume_host[MAX_VOLUMES];
 	int              volume_readonly[MAX_VOLUMES];
 	unsigned         volume_count;
@@ -275,6 +281,10 @@ static void release(hull_machine *m)
 		free(m->volume_host[i]);
 	for (unsigned i = 0u; i < m->segment_count; i++)
 		free(m->segment[i]);
+	for (unsigned i = 0u; i < m->layer_count; i++)
+		free(m->layer_path[i]);
+	free(m->upper);
+	free(m->upper_work);
 	free(m->spec);
 	forget_secrets(m);
 	if (m->pidfd >= 0)
@@ -337,6 +347,46 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	text = hull_access_value(doc, &machine, "mutable");
 	m->overlay = text != NULL && strcmp(text, "overlay") == 0;
 	free(text);
+
+	/* (layers ...) and (upper PATH): the overlay mounted host-side, in the
+	 * user and mount namespace qemu runs in, and the merged tree the
+	 * share, since the guest's overlayfs cannot take a 9p share as its
+	 * upper (section 3.7). */
+	if (hull_access_find(doc, &machine, "layers", &entry)) {
+		hull_sexpr_child(doc, &entry, &item);
+		for (more = hull_sexpr_next(doc, &item, &item); more;
+		     more = hull_sexpr_next(doc, &item, &item)) {
+			char *layer = hull_access_text(doc, &item);
+
+			if (m->layer_count == MAX_VOLUMES || layer == NULL ||
+			    strncmp(layer, "dir:", 4u) != 0) {
+				free(layer);
+				return "a layer is a dir: source, and there are at most 64";
+			}
+			m->layer_path[m->layer_count] = hull_access_path(doc, layer + 4);
+			free(layer);
+			if (m->layer_path[m->layer_count++] == NULL)
+				return "a layer's path cannot be read";
+		}
+	}
+	if ((text = hull_access_value(doc, &machine, "upper")) != NULL) {
+		const char *slash;
+
+		m->upper = hull_access_path(doc, text);
+		free(text);
+		if (m->upper == NULL || (m->upper_work = malloc(strlen(m->upper) + 16u)) == NULL)
+			return "the upper's path cannot be read";
+		slash = strrchr(m->upper, '/');
+		if (slash == NULL)
+			sprintf(m->upper_work, ".%s.hull-work", m->upper);
+		else
+			sprintf(m->upper_work, "%.*s/.%s.hull-work", (int)(slash - m->upper), m->upper,
+			        slash + 1);
+	}
+	m->host_overlay = m->layer_count != 0u || m->upper != NULL;
+	if (m->host_overlay && (!m->overlay || m->readonly_root))
+		return "layers and an upper lie in an overlay: they need (mutable overlay) and a root "
+		       "that is not read-only";
 
 	m->memory_mib = 512u;
 	if ((text = hull_access_value(doc, &machine, "memory")) != NULL) {
@@ -857,6 +907,73 @@ static void segment_mac(const hull_machine *m, unsigned i, char *out, size_t cap
 	         (unsigned)(hash >> 8) & 0xffu, (unsigned)hash & 0xffu);
 }
 
+/*
+ * In qemu's child, in its own user and mount namespace: the overlay of the
+ * machine's directory, its layers, each above the last, and its upper, or
+ * a tmpfs where it keeps none, mounted at merged/ in its runtime
+ * directory, as the chroot engine mounts its own (engine/chroot.c). The
+ * upper's directory is cloned once with the work directory beside it,
+ * which overlayfs wants on one mount, and that work directory is made the
+ * user's own group and not setgid, overlayfs refusing one of a group the
+ * namespace does not map. The step that failed, or NULL.
+ */
+static const char *stage_overlay(const hull_machine *m)
+{
+	char   options[8800u + 16u * MAX_VOLUMES];
+	char   upper_dir[4200] = "mem/upper";
+	char   work_dir[4200] = "mem/work";
+	size_t at;
+	int    tree;
+
+	if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
+		return "making mounts private";
+	if (chdir(m->dir) != 0 || mkdir("lower", 0700) != 0 || mkdir("merged", 0700) != 0)
+		return "its staging";
+	if ((tree = open_tree(AT_FDCWD, m->root, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC)) < 0 ||
+	    move_mount(tree, "", AT_FDCWD, "lower", MOVE_MOUNT_F_EMPTY_PATH) != 0)
+		return "the lower layer";
+	close(tree);
+	for (unsigned i = 0u; i < m->layer_count; i++) {
+		char name[32];
+
+		snprintf(name, sizeof name, "lower%u", i + 1u);
+		if (mkdir(name, 0700) != 0 ||
+		    (tree = open_tree(AT_FDCWD, m->layer_path[i], OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC)) < 0 ||
+		    move_mount(tree, "", AT_FDCWD, name, MOVE_MOUNT_F_EMPTY_PATH) != 0)
+			return "a layer";
+		close(tree);
+	}
+	if (m->upper != NULL) {
+		char        parent[4200];
+		const char *slash = strrchr(m->upper, '/');
+		const char *work = strrchr(m->upper_work, '/');
+
+		snprintf(parent, sizeof parent, "%.*s", slash != NULL && slash != m->upper ?
+		         (int)(slash - m->upper) : 1, slash != NULL ? m->upper : ".");
+		snprintf(upper_dir, sizeof upper_dir, "kept/%s", slash != NULL ? slash + 1 : m->upper);
+		snprintf(work_dir, sizeof work_dir, "kept/%s", work != NULL ? work + 1 : m->upper_work);
+		if (strpbrk(upper_dir, ",:") != NULL || (mkdir(m->upper, 0755) != 0 && errno != EEXIST) ||
+		    (mkdir(m->upper_work, 0700) != 0 && errno != EEXIST) ||
+		    chown(m->upper_work, (uid_t)-1, 0) != 0 || chmod(m->upper_work, 0700) != 0 ||
+		    mkdir("kept", 0700) != 0 ||
+		    (tree = open_tree(AT_FDCWD, parent, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC)) < 0 ||
+		    move_mount(tree, "", AT_FDCWD, "kept", MOVE_MOUNT_F_EMPTY_PATH) != 0)
+			return "the upper, kept";
+		close(tree);
+	} else if (mkdir("mem", 0700) != 0 || mount("tmpfs", "mem", "tmpfs", 0u, "mode=0700") != 0 ||
+	           mkdir("mem/upper", 0755) != 0 || mkdir("mem/work", 0700) != 0) {
+		return "the upper, in memory";
+	}
+	at = (size_t)snprintf(options, sizeof options, "lowerdir=");
+	for (unsigned i = m->layer_count; i > 0u; i--)
+		at += (size_t)snprintf(options + at, sizeof options - at, "lower%u:", i);
+	snprintf(options + at, sizeof options - at, "lower,upperdir=%s,workdir=%s,userxattr",
+	         upper_dir, work_dir);
+	if (mount("overlay", "merged", "overlay", 0u, options) != 0)
+		return "mounting it";
+	return NULL;
+}
+
 /* `format` with `id`, written whole to `path`, as a child between fork and
  * exec may: no allocation, no stdio. */
 static int write_map(const char *path, const char *format, unsigned id)
@@ -908,9 +1025,19 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 	snprintf(cpus, sizeof cpus, "%u", m->cpus);
 	snprintf(vsock, sizeof vsock, "vhost-vsock-pci,guest-cid=%u", cid);
 	snprintf(netdev, sizeof netdev, "stream,id=net,addr.type=fd,addr.str=%d", NETWORK_FD);
-	escaped(path, sizeof path, m->root);
+	/* The share is the directory, or with layers or an upper the overlay
+	 * qemu's child mounts in its runtime directory, which the guest then
+	 * writes through as it would a directory in place. */
+	if (m->host_overlay) {
+		char merged[4200];
+
+		snprintf(merged, sizeof merged, "%s/merged", m->dir);
+		escaped(path, sizeof path, merged);
+	} else {
+		escaped(path, sizeof path, m->root);
+	}
 	snprintf(root, sizeof root, "local,id=root,path=%s,security_model=none%s", path,
-	         m->readonly_root || m->overlay ? ",readonly=on" : "");
+	         m->readonly_root || (m->overlay && !m->host_overlay) ? ",readonly=on" : "");
 
 	argv[n++] = "qemu-system-x86_64";
 	argv[n++] = "-nodefaults";
@@ -1033,11 +1160,21 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 		 * systemd's mount units met first. Its devices are opened by the
 		 * user's own rights, groups included, which a user namespace
 		 * keeps; passt is outside it, by the descriptor above. */
-		if (unshare(CLONE_NEWUSER) != 0 || !write_map("/proc/self/setgroups", "deny", 0u) ||
+		if (unshare(CLONE_NEWUSER | (m->host_overlay ? CLONE_NEWNS : 0)) != 0 ||
+		    !write_map("/proc/self/setgroups", "deny", 0u) ||
 		    !write_map("/proc/self/uid_map", "0 %u 1", (unsigned)uid) ||
 		    !write_map("/proc/self/gid_map", "0 %u 1", (unsigned)gid)) {
 			fprintf(stderr, "qemu-system-x86_64: a user namespace: %s\n", strerror(errno));
 			_exit(126);
+		}
+		if (m->host_overlay) {
+			const char *failed = stage_overlay(m);
+
+			if (failed != NULL) {
+				fprintf(stderr, "qemu-system-x86_64: the overlay: %s: %s\n", failed,
+				        strerror(errno));
+				_exit(126);
+			}
 		}
 		execvp(argv[0], (char *const *)argv);
 		fprintf(stderr, "qemu-system-x86_64: %s\n", strerror(errno));
@@ -1408,9 +1545,22 @@ static void remove_files(const char *dir)
 	                                     "passt.pid" /* written by a core before 2026-10-21 */ };
 	char path[4200];
 
+	static const char *const staging[] = { "merged", "lower", "kept", "mem" };
+
 	for (unsigned i = 0u; i < sizeof files / sizeof files[0]; i++) {
 		snprintf(path, sizeof path, "%s/%s", dir, files[i]);
 		unlink(path);
+	}
+	/* What a host-side overlay staged, by name: on the host each is an empty
+	 * directory, its mounts having been in qemu's own namespace, and rmdir
+	 * takes nothing that is not. */
+	for (unsigned i = 0u; i < sizeof staging / sizeof staging[0]; i++) {
+		snprintf(path, sizeof path, "%s/%s", dir, staging[i]);
+		rmdir(path);
+	}
+	for (unsigned i = 1u; i <= MAX_VOLUMES; i++) {
+		snprintf(path, sizeof path, "%s/lower%u", dir, i);
+		rmdir(path);
 	}
 	rmdir(dir);
 }
@@ -2600,10 +2750,10 @@ static const hull_cap_entry entries[] = {
 	{ "network.none",       HULL_SUP_NATIVE,   "no NIC: lo alone in the guest", NULL },
 	{ "export",             HULL_SUP_REJECTED,
 	  "not yet: the guest's tree is the agent's to write, and it does not", NULL },
-	{ "layers",             HULL_SUP_REJECTED,
-	  "not yet: the guest's overlay has the directory alone beneath it", NULL },
-	{ "upper",              HULL_SUP_REJECTED,
-	  "not yet: an upper over 9p is no overlayfs upper; mounting it host-side is designed", NULL },
+	{ "layers",             HULL_SUP_NATIVE,
+	  "read-only, in an overlay qemu mounts host-side, the guest's share its merged tree", NULL },
+	{ "upper",              HULL_SUP_NATIVE,
+	  "the overlay's writes kept in the directory, mounted host-side, one uid", NULL },
 	{ "owners",             HULL_SUP_REJECTED,
 	  "not yet: a guest's chown is not kept through 9p", NULL },
 	{ "init",               HULL_SUP_NATIVE,

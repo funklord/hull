@@ -166,7 +166,7 @@ QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.co
                   overlay.conf overro.conf rootfs/srv/kept adopt.conf brief2.conf ended.conf secret.conf norun.conf pw.txt secret/probe \
                   searched.conf netnone.conf netports.conf rootfs/probe rootfs/bin/sh rootfs/written rootfs/etc/resolv.conf \
                   data/in data/out modules.conf inplace.conf hearer.conf hearer.out shouter.conf loner.conf loner.out keptseg.conf anchor.conf anchor.out \
-                  inited.conf initexec.conf initexec.out initbare.conf noinit.conf suid.conf rootfs/suid \
+                  inited.conf initexec.conf initexec.out initbare.conf noinit.conf suid.conf rootfs/suid vlayered.conf vrelayered.conf \
                   initroot/probe initroot/sbin/init initroot/sbin/poweroff initbare/probe initbare/sbin/init)
 
 # What test/flip_test.sh writes: the project, and its rsync'd copy.

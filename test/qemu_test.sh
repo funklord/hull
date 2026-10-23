@@ -394,6 +394,41 @@ printf '(machine (source "dir:./initroot") (backend vm) (mutable overlay) (init 
 name=noinit
 boot noinit
 has 125 'no init it can run'
+# (layers ...) and (upper PATH) on a vm: the overlay is mounted host-side,
+# in the user and mount namespace qemu runs in, and the guest's share is
+# its merged tree. The layer wins, a write lands in the upper and a
+# removal there as a whiteout, the template untouched, and a second
+# machine sees what the first left.
+rm -rf "${root:?}/vtemplate" "${root:?}/vsite" "${root:?}/vdata" "${root:?}/.vdata.hull-work"
+mkdir -p "$root/vtemplate/proc" "$root/vtemplate/dev" "$root/vtemplate/sys" "$root/vsite" "$root/vdata"
+cp "$probe" "$root/vtemplate/probe"
+printf 'template\n' > "$root/vtemplate/a"
+printf 'site\n' > "$root/vsite/a"
+printf 'b\n' > "$root/vsite/b"
+printf 'c\n' > "$root/vdata/c"
+printf '(machine (source "dir:%s/vtemplate") (backend vm) (mutable overlay) %s %s)\n' "$root" \
+	"(layers \"dir:$root/vsite\") (upper \"$root/vdata\")" \
+	'(command "/probe" "read" "/a" "read" "/c" "write" "/d" "remove" "/b")' > "$root/vlayered.conf"
+name=vlayered
+boot vlayered
+has 0 '^read=site$'
+has 0 '^read=c$'
+has 0 '^remove=ok$'
+cases=$((cases + 1))
+[ "$(cat "$root/vtemplate/a")" = template ] && [ -e "$root/vsite/b" ] && [ -e "$root/vdata/d" ] &&
+	[ -c "$root/vdata/b" ] ||
+	fail "a layered vm's writes did not land in its upper alone" \
+		"$(ls -la "$root/vtemplate" "$root/vsite" "$root/vdata" 2>&1)"
+printf '(machine (source "dir:%s/vtemplate") (backend vm) (mutable overlay) %s %s)\n' "$root" \
+	"(layers \"dir:$root/vsite\") (upper \"$root/vdata\")" \
+	'(command "/probe" "read" "/b" "read" "/d")' > "$root/vrelayered.conf"
+name=vrelayered
+boot vrelayered
+has 0 '^read=No such file or directory$'
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^read=No such file' && printf '%s\n' "$out" | grep -qv '^read=d' ||
+	fail "a second layered vm did not see what the first left" "$out"
+rm -rf "${root:?}/vtemplate" "${root:?}/vsite" "${root:?}/vdata" "${root:?}/.vdata.hull-work"
 # A segment's port is the core's, so a machine on one cannot outlive it.
 conf keptseg "(backend vm) (on_disconnect keep) (segments \"$wire\")" '(command "/probe" "say" "no")'
 name=keptseg

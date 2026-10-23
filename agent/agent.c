@@ -648,7 +648,11 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	}
 	free(hostname);
 	mutability = hull_access_value(doc, machine, "mutable");
-	layered    = mutability != NULL && strcmp(mutability, "overlay") == 0;
+	/* With layers or an upper the overlay is the host's, mounted where qemu
+	 * runs, and the share its merged tree, written as a directory is. */
+	layered    = mutability != NULL && strcmp(mutability, "overlay") == 0 &&
+	             !hull_access_find(doc, machine, "layers", &entry) &&
+	             !hull_access_find(doc, machine, "upper", &entry);
 	free(mutability);
 
 	/* A read-only root has nothing for an overlay to hold, so it is the
