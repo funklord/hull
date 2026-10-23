@@ -2390,3 +2390,83 @@ done:
 	free(kept_objects.items);
 	return result;
 }
+
+/* --- owners ------------------------------------------------------------------ */
+
+int hull_store_owners(hull_store *store, const char *name, int fd, uint64_t *count, char *why,
+                      size_t cap)
+{
+	char            hex[65];
+	uint8_t        *data;
+	size_t          length;
+	hull_sexpr_doc  doc;
+	hull_sexpr_form entries;
+	hull_sexpr_form entry;
+	hull_sexpr_form value;
+	buf             list = { 0 };
+	int             more;
+	int             result = -1;
+
+	*count = 0u;
+	flock(store->lock, LOCK_SH);
+	if (name_manifest(store, name, hex, why, cap) != 0 ||
+	    (data = read_manifest(store, hex, &length, why, cap)) == NULL) {
+		flock(store->lock, LOCK_UN);
+		return -1;
+	}
+	if (!open_entries(&doc, data, length, &entries)) {
+		say(why, cap, name, "its manifest is not one");
+		goto done;
+	}
+	more = hull_sexpr_child(&doc, &entries, &entry);
+	for (more = more && hull_sexpr_next(&doc, &entry, &entry); more;
+	     more = hull_sexpr_next(&doc, &entry, &entry)) {
+		hull_sexpr_form owner;
+		hull_sexpr_form head;
+		hull_sexpr_form class;
+		char            number[48];
+
+		/* Only what is given by ids: (owner root) is what the user's own
+		 * files are in a machine already. */
+		if (!find(&doc, &entry, "owner", &owner))
+			continue;
+		hull_sexpr_child(&doc, &owner, &head);
+		if (!hull_sexpr_next(&doc, &head, &class) || class.kind != HULL_SEXPR_LIST)
+			continue;
+		if (!field(&doc, &entry, "path", &value)) {
+			say(why, cap, name, "an entry of its manifest has no path");
+			goto done;
+		}
+		/* The record itself, (owner (gid N) (uid N)), holds the ids. */
+		snprintf(number, sizeof number, "%llu", id_of(&doc, &owner, "uid"));
+		put(&list, (const uint8_t *)number, strlen(number) + 1u);
+		snprintf(number, sizeof number, "%llu", id_of(&doc, &owner, "gid"));
+		put(&list, (const uint8_t *)number, strlen(number) + 1u);
+		put(&list, doc.data + value.content, value.content_length);
+		put(&list, (const uint8_t *)"", 1u);
+		(*count)++;
+	}
+	if (list.failed) {
+		say(why, cap, "out of memory", NULL);
+		goto done;
+	}
+	{
+		size_t at = 0u;
+
+		while (at < list.length) {
+			ssize_t n = write(fd, list.data + at, list.length - at);
+
+			if (n <= 0) {
+				say(why, cap, "the owners' list", strerror(errno));
+				goto done;
+			}
+			at += (size_t)n;
+		}
+	}
+	result = 0;
+done:
+	flock(store->lock, LOCK_UN);
+	free(list.data);
+	free(data);
+	return result;
+}

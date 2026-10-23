@@ -1993,6 +1993,12 @@ next_pass:
 		char              name[256] = "";
 		char              run_line[8192];
 		char              backend[64] = "";
+		char              owners_path[4600];
+		char              tar_path[4600];
+		int               chrooted;
+		static char       drops[64][4096];
+		const char       *drop[66];
+		unsigned          dropping = 0u;
 		char              key_hex[65];
 		char              cache[96];
 		char              scratch[4400];
@@ -2008,6 +2014,10 @@ next_pass:
 		record_text(&spec, &step, "name", name, sizeof name);
 		has_run = record_text(&spec, &step, "run", run_line, sizeof run_line);
 		record_text(&spec, &step, "backend", backend, sizeof backend);
+		/* Exported only where a machine runs: a step of copies alone gives
+		 * no owner, and its tree is the directory as it stands. */
+		chrooted = has_run && (backend[0] == '\0' || strcmp(backend, "ns") == 0 ||
+		                       strcmp(backend, "chroot") == 0);
 		network = hull_spec_find(&spec, &step, "network", &entry) &&
 		          hull_sexpr_child(&spec.doc, &entry, &item) &&
 		          hull_sexpr_next(&spec.doc, &item, &item) &&
@@ -2101,6 +2111,13 @@ next_pass:
 			snprintf(why, sizeof why, "%.4000s: %s", scratch, strerror(errno));
 			goto done;
 		}
+		/* Not setgid, though the store's directory may be: what is made in
+		 * it takes the user's own group, which a machine's namespace maps,
+		 * and not one overlayfs could not copy up, EOVERFLOW. */
+		if (chmod(scratch, 0700) != 0) {
+			snprintf(why, sizeof why, "%.4000s: %s", scratch, strerror(errno));
+			goto done;
+		}
 		snprintf(root_path, sizeof root_path, "%s/root", scratch);
 		{
 			char        named[80];
@@ -2115,6 +2132,21 @@ next_pass:
 			ok = hull_store_materialize(&store, named, root_path, &skipped, why, sizeof why) == 0 &&
 			     hull_store_runtime(&store, named, &runtime, &runtime_length, why, sizeof why) == 0 &&
 			     (root = open(root_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) >= 0;
+			/* On chroot, the step's machine is an overlay of that copy, the
+			 * parent's owners given back in it and its tree exported, so an
+			 * owner it gives, a package's own user's, is kept with no file
+			 * of another owner on the user's disk (section 7). */
+			snprintf(owners_path, sizeof owners_path, "%s/owners.list", scratch);
+			snprintf(tar_path, sizeof tar_path, "%s/tree.tar", scratch);
+			if (ok && chrooted) {
+				int      list = open(owners_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+				uint64_t owned = 0u;
+
+				ok = list >= 0 &&
+				     hull_store_owners(&store, named, list, &owned, why, sizeof why) == 0;
+				if (list >= 0 && close(list) != 0)
+					ok = 0;
+			}
 			/* The copies, each its committed tree or its file, at its to. */
 			if (ok && hull_spec_find(&spec, &step, "copy", &entry)) {
 				int go;
@@ -2184,7 +2216,15 @@ next_pass:
 				add_text(&conf, "(machine (source ");
 				add_text(&conf, "\"dir:");
 				add_text(&conf, root_path);
-				add_text(&conf, "\") (mutable direct) (backend ");
+				if (chrooted) {
+					add_text(&conf, "\") (mutable overlay) (owners ");
+					add_quoted(&conf, (const uint8_t *)owners_path, strlen(owners_path));
+					add_text(&conf, ") (export ");
+					add_quoted(&conf, (const uint8_t *)tar_path, strlen(tar_path));
+					add_text(&conf, ") (backend ");
+				} else {
+					add_text(&conf, "\") (mutable direct) (backend ");
+				}
 				add_text(&conf, backend[0] == '\0' || strcmp(backend, "ns") == 0 ? "chroot" :
 				                backend);
 				add_text(&conf, ") (hostname \"build-");
@@ -2228,8 +2268,30 @@ next_pass:
 				}
 			}
 			/* What a step leaves that is not the tree's: /tmp's contents,
-			 * and what it says to discard. */
-			if (ok) {
+			 * and what it says to discard; removed from a tree written in
+			 * place, or left out of an exported one's commit. */
+			if (chrooted) {
+				dropping = 0u;
+				drop[dropping++] = "/tmp/";
+				if (ok && hull_spec_find(&spec, &step, "discard", &entry)) {
+					int go;
+
+					hull_sexpr_child(&spec.doc, &entry, &item);
+					for (go = hull_sexpr_next(&spec.doc, &item, &item); go && dropping < 64u;
+					     go = hull_sexpr_next(&spec.doc, &item, &item)) {
+						size_t n;
+
+						if (hull_sexpr_value(&spec.doc, &item, (uint8_t *)drops[dropping],
+						                     sizeof drops[0] - 1u, &n) != HULL_SEXPR_OK)
+							continue;
+						drops[dropping][n] = '\0';
+						drop[dropping] = drops[dropping];
+						dropping++;
+					}
+				}
+				drop[dropping] = NULL;
+			}
+			if (ok && !chrooted) {
 				char        copy[4096];
 				const char *leaf;
 				int         tmp = in_tree(root, "/tmp/x", copy, sizeof copy, &leaf, 0);
@@ -2294,9 +2356,21 @@ next_pass:
 				extra.provenance_length = provenance.length;
 				extra.runtime = runtime;
 				extra.runtime_length = runtime_length;
-				ok = !provenance.failed &&
-				     hull_store_commit(&store, root_path, host_arch(), cache, &extra, &made, why,
-				                       sizeof why) == 0;
+				if (!provenance.failed && chrooted) {
+					int tar = open(tar_path, O_RDONLY | O_CLOEXEC);
+
+					ok = tar >= 0 && hull_store_commit_tar(&store, tar, host_arch(), cache, drop,
+					                                       &extra, &made, why, sizeof why) == 0;
+					if (tar < 0)
+						snprintf(why, sizeof why, "step %s: its tree was not exported: %s", name,
+						         strerror(errno));
+					if (tar >= 0)
+						close(tar);
+				} else {
+					ok = !provenance.failed &&
+					     hull_store_commit(&store, root_path, host_arch(), cache, &extra, &made,
+					                       why, sizeof why) == 0;
+				}
 				if (ok) {
 					snprintf(parent, sizeof parent, "%s", made.manifest);
 					fprintf(stderr, "hull: build: step %s: sha256:%s\n", name, parent);

@@ -32,6 +32,17 @@ HULL_CORE_IDLE=1
 HOME=$root/home
 export XDG_DATA_HOME XDG_RUNTIME_DIR DOCKER_HOST HULL_CORE_IDLE HOME
 store=$root/data/hull/store
+# The store's directory setgid to a group of the user's that is not their
+# own, where the user has one, as a shared or inherited data directory may
+# be: a step's scratch under it must still make its tree in the user's own
+# group, which a machine's namespace maps, since overlayfs cannot copy up
+# a file of an unmapped one. Wherever this suite's tree sits, the case is
+# made here rather than left to where it happens to be.
+other_group=$(id -G | tr ' ' '\n' | grep -vx "$(id -g)" | head -1)
+mkdir -p "$root/data"
+if [ -n "$other_group" ]; then
+	chgrp "$other_group" "$root/data" && chmod g+s "$root/data"
+fi
 cases=0
 failures=0
 
@@ -271,6 +282,25 @@ EOF
 expect 1 '/out/landed: No such file or directory' "$hull" build -f "$root/b/through.conf" app/through
 cases=$((cases + 1))
 [ -z "$(ls -A "$root/outside")" ] || fail "a copy wrote through a symlink to the host" "$(ls "$root/outside")"
+# Owners a step gives are kept, with no file of theirs on the user's disk:
+# the step runs above an overlay of its parent, with many uids where the
+# user has a range, its tree exported and committed; and the next step,
+# on that, is given them back before it runs, so they last. Where one uid
+# is mapped there are none to keep, and the step says so.
+me=$(id -un)
+if grep -q "^$me:" /etc/subuid 2>/dev/null && grep -q "^$me:" /etc/subgid 2>/dev/null &&
+	[ -u /usr/bin/newuidmap ] && [ -u /usr/bin/newgidmap ]; then
+	cat > "$root/b/owned.conf" <<'EOF'
+(build (base "dir:./base")
+  (steps (step (name "give") (run "probe write /given chown /given 101"))
+         (step (name "look") (run "probe owner /given"))))
+EOF
+	expect 0 '^owner=101:101 ' "$hull" build -f "$root/b/owned.conf" app/owned
+	expect 0 '\(owner \(gid 101\) \(uid 101\)\) \(path "given"\)' "$hull" manifest show app/owned
+else
+	printf 'build: this user has no subordinate range, so the owners case is skipped\n'
+fi
+
 cat > "$root/b/inroot.conf" <<'EOF'
 (build (base "dir:./base") (steps (step (name "inroot") (copy (path (from "./extra") (to "/lib/landed"))))))
 EOF

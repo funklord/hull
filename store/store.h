@@ -67,6 +67,13 @@ int hull_store_commit(hull_store *store, const char *dir, const char *arch, cons
  * owners keeps them while no file of theirs is on disk. What `drop`
  * names, NULL-ended paths of the tree, is left out, a name with what is
  * under it, and one ending in `/` only what is under it. 0, or -1. */
+/* The explicit owners of the manifest `name` names, as (owners PATH) reads
+ * them, to `fd`: each entry's uid, gid and path, each ended by a NUL, for
+ * every entry whose owner is ids rather than root. The count of them into
+ * `count`. 0, or -1 with `why`. */
+int hull_store_owners(hull_store *store, const char *name, int fd, uint64_t *count, char *why,
+                      size_t cap);
+
 int hull_store_commit_tar(hull_store *store, int fd, const char *arch, const char *ref,
                           const char *const *drop, const hull_commit_extra *extra,
                           hull_commit *out, char *why, size_t cap);
