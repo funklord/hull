@@ -1830,6 +1830,25 @@ static const char *unwanted(const char *inspected, char *tree_path, size_t cap)
 	return NULL;
 }
 
+/* The daemon's pause, its cgroup freezer, and unpause. */
+static hull_status docker_pause(hull_core *core, hull_machine *m, int paused, hull_error *error)
+{
+	char  path[160];
+	char *answer = NULL;
+	int   status = 0;
+
+	(void)core;
+	snprintf(path, sizeof path, "/containers/%s/%s", m->id, paused ? "pause" : "unpause");
+	if (call("POST", path, NULL, &status, &answer) != 0)
+		return fail(error, HULL_ERR_RUNTIME, "the docker daemon could not be reached");
+	free(answer);
+	if (status == 409 || status == 404)
+		return fail(error, HULL_ERR_GONE, "the machine is not running");
+	if (status != 204)
+		return fail(error, HULL_ERR_RUNTIME, "the docker daemon refused the pause");
+	return HULL_OK;
+}
+
 /* Each hull-dir import nothing wants, removed unforced, so that the
  * daemon keeps one a container uses or one with another name; a line
  * each, of what was removed and what was kept. */
@@ -1922,6 +1941,7 @@ static const hull_engine_ops ops = {
 	.stats        = docker_stats,
 	.gc           = docker_gc,
 	.dial         = docker_dial,
+	.pause        = docker_pause,
 };
 
 static const hull_engine engine = {

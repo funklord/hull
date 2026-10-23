@@ -123,6 +123,7 @@ struct slot {
 	int                kept;        /* hull/machines/ID is written for it */
 	int                secrets;     /* hull/secrets/ID is written for it */
 	client            *owner;       /* the frontend that ran it */
+	int                paused;      /* hull pause, and no unpause since */
 	int                exited;
 	int                code;
 	int                signal;
@@ -742,10 +743,25 @@ static void *run_stop(void *arg)
 	return NULL;
 }
 
+/* A paused machine let go on, so that it can hear what is asked of it
+ * next: a stopped process acts on no signal but SIGKILL. */
+static void wake_machine(slot *s)
+{
+	hull_error error = { .struct_size = sizeof error };
+
+	if (!s->paused || s->handle == NULL)
+		return;
+	s->engine->ops->pause(&s->core, s->handle, 0, &error);
+	s->paused = 0;
+	snprintf(s->state, sizeof s->state, "running");
+}
+
 static void stop_machine(slot *s, int timeout_ms)
 {
 	stop_job *job = malloc(sizeof *job);
 	pthread_t thread;
+
+	wake_machine(s);
 
 	if (job == NULL || s->exited || s->handle == NULL) {
 		free(job);
@@ -1881,9 +1897,37 @@ static void handle_kill(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		send_error(c, ch, "the machine is not running");
 	} else if (s->engine->ops->signal == NULL) {
 		send_error(c, ch, "that engine cannot signal a machine");
-	} else if (s->engine->ops->signal(&s->core, s->handle, NULL, number, &error) != HULL_OK) {
+	} else if (wake_machine(s), s->engine->ops->signal(&s->core, s->handle, NULL, number,
+	                                                   &error) != HULL_OK) {
 		send_error(c, ch, error.detail != NULL ? error.detail : "refused");
 	} else {
+		send_simple(c, "(4:done", ch);
+	}
+}
+
+/* `hull pause` and `hull unpause`: every process of a running machine
+ * stopped where it is, or let go on; answered `done`. */
+static void handle_pause(client *c, uint32_t ch, const hull_sexpr_doc *body, int paused)
+{
+	hull_error             error = { .struct_size = sizeof error };
+	slot                  *s = named(c, ch, body);
+	const hull_engine_ops *ops;
+
+	if (s == NULL)
+		return;
+	ops = s->engine->ops;
+	if (s->exited || s->handle == NULL) {
+		send_error(c, ch, "the machine is not running");
+	} else if (ops->struct_size < offsetof(hull_engine_ops, pause) + sizeof ops->pause ||
+	           ops->pause == NULL) {
+		send_error(c, ch, "that engine cannot pause a machine");
+	} else if (s->paused == paused) {
+		send_error(c, ch, paused ? "the machine is paused already" : "the machine is not paused");
+	} else if (ops->pause(&s->core, s->handle, paused, &error) != HULL_OK) {
+		send_error(c, ch, error.detail != NULL ? error.detail : "refused");
+	} else {
+		s->paused = paused;
+		snprintf(s->state, sizeof s->state, "%s", paused ? "paused" : "running");
 		send_simple(c, "(4:done", ch);
 	}
 }
@@ -2283,6 +2327,10 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		handle_control(c, (uint32_t)ch, body, 0);
 	} else if (hull_msg_is(body, "kill")) {
 		handle_kill(c, (uint32_t)ch, body);
+	} else if (hull_msg_is(body, "pause")) {
+		handle_pause(c, (uint32_t)ch, body, 1);
+	} else if (hull_msg_is(body, "unpause")) {
+		handle_pause(c, (uint32_t)ch, body, 0);
 	} else if (hull_msg_is(body, "segment")) {
 		handle_segment(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "impair")) {

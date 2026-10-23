@@ -2794,6 +2794,20 @@ static void *forward_ports(void *arg)
 	return NULL;
 }
 
+/* The guest stopped whole, qemu with it, or let go on: qemu is stopped
+ * as a process, every vCPU and device with it, so the guest sees nothing
+ * but its clock having jumped, and its network stops answering. */
+static hull_status qemu_pause(hull_core *core, hull_machine *m, int paused, hull_error *error)
+{
+	int gone;
+
+	(void)core;
+	pthread_mutex_lock(&m->lock);
+	gone = !m->started || m->done || m->qemu <= 0 || kill(m->qemu, paused ? SIGSTOP : SIGCONT) != 0;
+	pthread_mutex_unlock(&m->lock);
+	return gone ? fail(error, HULL_ERR_GONE, "the machine is not running") : HULL_OK;
+}
+
 /* --- the declaration ----------------------------------------------------- */
 
 static const hull_cap_entry entries[] = {
@@ -2895,6 +2909,7 @@ static const hull_engine_ops ops = {
 	.signal       = qemu_signal,
 	.stats        = qemu_stats,
 	.dial         = qemu_dial,
+	.pause        = qemu_pause,
 };
 
 static const hull_engine engine = {

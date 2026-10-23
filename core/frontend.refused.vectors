@@ -152,3 +152,6 @@ client_message impair_without_direction 28 36 3A 69 6D 70 61 69 72 28 32 3A 63 6
 
 # segment_without_name: (7:segment(2:ch1:3))
 client_message segment_without_name 28 37 3A 73 65 67 6D 65 6E 74 28 32 3A 63 68 31 3A 33 29 29
+
+# pause_without_machine: (5:pause(2:ch1:7))
+client_message pause_without_machine 28 35 3A 70 61 75 73 65 28 32 3A 63 68 31 3A 37 29 29

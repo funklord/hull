@@ -31,6 +31,8 @@ const STATS    = ('5' << 24) | (':' << 16) | ('s' << 8) | 't';  // both ways
 const GC       = ('2' << 24) | (':' << 16) | ('g' << 8) | 'c';
 const DIAL     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'i';
 const SEGMENT  = ('7' << 24) | (':' << 16) | ('s' << 8) | 'e';
+const PAUSE    = ('5' << 24) | (':' << 16) | ('p' << 8) | 'a';
+const UNPAUSE  = ('7' << 24) | (':' << 16) | ('u' << 8) | 'n';
 const IMPAIR   = ('6' << 24) | (':' << 16) | ('i' << 8) | 'm';
 const STARTED  = ('7' << 24) | (':' << 16) | ('s' << 8) | 't';
 const DATA     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'a';
@@ -62,6 +64,8 @@ struct client_message {
 		case STATS:   stats         stats;
 		case GC:      gc            gc;
 		case DIAL:    dial          dial;
+		case PAUSE:   pause         pause;
+		case UNPAUSE: unpause       unpause;
 		case SEGMENT: segment       segment;
 		case IMPAIR:  impair        impair;
 		case DATA:    client_data   data;
@@ -234,6 +238,22 @@ struct kill {
 // What the host spends on a running machine, answered `measured`.
 struct stats {
 	preamble u8[7] = "5:stats";
+	channel        ch;
+	machine_entry  machine;
+	u8  close  [must_eq = ')'];
+}
+
+// Every process of a running machine stopped where it is, a peer gone to
+// sleep; answered `done`. `unpause` lets it go on.
+struct pause {
+	preamble u8[7] = "5:pause";
+	channel        ch;
+	machine_entry  machine;
+	u8  close  [must_eq = ')'];
+}
+
+struct unpause {
+	preamble u8[9] = "7:unpause";
 	channel        ch;
 	machine_entry  machine;
 	u8  close  [must_eq = ')'];

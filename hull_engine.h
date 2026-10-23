@@ -231,6 +231,13 @@ typedef struct hull_engine_ops {
 	 * signal on it resets it. NULL where a machine has no port of its
 	 * own, as chroot's, sharing the host's network. Appended (rule 4). */
 	hull_status (*dial)(hull_core*, hull_machine*, uint16_t port, hull_stream**, hull_error*);
+
+	/* Every process of the machine stopped where it is, `paused` 1, or
+	 * let go on, 0: a peer gone to sleep mid-transfer. Its clock runs on
+	 * meanwhile, and its network stops answering. The core resumes a
+	 * paused machine before it stops or signals one. NULL where an
+	 * engine cannot. Appended (rule 4). */
+	hull_status (*pause)(hull_core*, hull_machine*, int paused, hull_error*);
 } hull_engine_ops;
 
 /* ---- Registration --------------------------------------------------------

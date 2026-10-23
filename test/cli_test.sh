@@ -1117,6 +1117,50 @@ cases=$((cases + 1))
 grep -q '^shouter | shout=answered$' "$root/cut.out" && grep -q '^hearer  | hear=through from 52:54:00:' "$root/cut.out" ||
 	fail "a healed link was not heard across" "$(cat "$root/cut.out")"
 expect 1 'no machine is on that segment' "$hull" segment "nowhere-$$"
+# A machine paused: every process of it stopped where it is, its ticks,
+# a child's, ceasing while it is and going on after; a paused machine is
+# shown so, and stopped at once, having been let go on first.
+conf pausing '(hostname "pausing") (command "/probe" "ticks" "300")'
+(cd / && exec timeout 60 "$whole_hull" run -f "$root/pausing.conf" > "$root/pausing.out" 2>&1) &
+pauser=$!
+ticks() { grep -c '^tick=' "$root/pausing.out"; }
+tries=0
+until [ "$(ticks)" -ge 3 ] || [ "$tries" -ge 80 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+expect 0 '' "$hull" pause pausing
+expect 0 '^pausing +127\.107\.[0-9.]+ +chroot +ns +paused$' "$hull" ps
+expect 1 'the machine is paused already' "$hull" pause pausing
+# Every process stopped, the ticking child's too, as the host sees them:
+# the ticks reach here through the init, which relays them, so the init
+# alone stopped would stop them too.
+cases=$((cases + 1))
+states=$(ps -eo stat=,args= | awk '$2 == "/probe" && $3 == "ticks" { print $1 }')
+[ "$(printf '%s\n' "$states" | grep -c '^T')" = 2 ] && ! printf '%s\n' "$states" | grep -qv '^T' ||
+	fail "a paused machine's processes were not all stopped" "$states"
+sleep 0.3
+before=$(ticks)
+sleep 1.5
+cases=$((cases + 1))
+[ "$(ticks)" = "$before" ] || fail "a paused machine went on ticking" "$before, then $(ticks)"
+expect 0 '' "$hull" unpause pausing
+expect 1 'the machine is not paused' "$hull" unpause pausing
+sleep 1.5
+cases=$((cases + 1))
+[ "$(ticks)" -ge $((before + 5)) ] || fail "an unpaused machine did not go on" "$before, then $(ticks)"
+expect 0 '' "$hull" pause pausing
+# The stop's TERM is heard at once, where a machine left stopped would
+# hear only the KILL its timeout ends in, five seconds on.
+started=$(date +%s)
+expect 0 '' "$hull" stop --timeout 5 pausing
+took=$(($(date +%s) - started))
+cases=$((cases + 1))
+[ "$took" -lt 3 ] || fail "a paused machine was stopped only by its timeout" "${took}s"
+wait "$pauser"
+cases=$((cases + 1))
+! grep -q '^tick=300$' "$root/pausing.out" || fail "a paused machine was not stopped" "$(tail -3 "$root/pausing.out")"
+expect 1 'no such machine' "$hull" pause nobody
 expect 2 'is not an impairment' "$hull" segment "nowhere-$$" impair all in wobble=1
 expect 2 'a direction is in, out or both' "$hull" segment "nowhere-$$" impair all sideways
 conf csegment "(segments \"$wire\")" '(command "/probe" "say" "never")'

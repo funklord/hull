@@ -1073,6 +1073,30 @@ after=$(timeout 10 "$hull" exec qexec /probe procs 2>&1)
 [ -n "$before" ] && [ "$before" = "$after" ] ||
 	fail "a command outlived its killed frontend" "before $before, after $after"
 
+# A vm paused: qemu stopped whole, so a command in the guest ticks no
+# more while it is and goes on after; the machine is shown paused.
+(timeout 60 "$hull" exec qexec /probe ticks 300 > "$root/qticks.out" 2>&1) &
+ticker=$!
+qticks() { grep -c '^tick=' "$root/qticks.out"; }
+tries=0
+until [ "$(qticks)" -ge 3 ] || [ "$tries" -ge 80 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+xcase 0 '' "$hull" pause qexec
+xcase 0 '^qexec +127\.107\.[0-9.]+ +qemu +vm +paused$' "$hull" ps
+sleep 0.5
+before=$(qticks)
+sleep 1.5
+cases=$((cases + 1))
+[ "$(qticks)" = "$before" ] || fail "a paused vm went on ticking" "$before, then $(qticks)"
+xcase 0 '' "$hull" unpause qexec
+sleep 1.5
+cases=$((cases + 1))
+[ "$(qticks)" -ge $((before + 5)) ] || fail "an unpaused vm did not go on" "$before, then $(qticks)"
+kill "$ticker" 2>/dev/null
+wait "$ticker" 2>/dev/null
+
 # What the host spends on a vm: qemu's own CPU time, io and memory, which
 # hold the guest's. An exec's 300 ms of CPU, 300 more in a child it
 # reaps, and 4 MiB written through 9p show in qemu's figures.

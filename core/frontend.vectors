@@ -121,3 +121,9 @@ client_message impair 28 36 3A 69 6D 70 61 69 72 28 32 3A 63 68 31 3A 35 29 28 3
 
 # ports: (5:ports(2:ch1:3)(4:port(2:in(5:bytes2:90)(6:frames1:1))(7:machine5:alpha)(3:out(5:bytes1:0)(6:frames1:0))))
 core_message ports 28 35 3A 70 6F 72 74 73 28 32 3A 63 68 31 3A 33 29 28 34 3A 70 6F 72 74 28 32 3A 69 6E 28 35 3A 62 79 74 65 73 32 3A 39 30 29 28 36 3A 66 72 61 6D 65 73 31 3A 31 29 29 28 37 3A 6D 61 63 68 69 6E 65 35 3A 61 6C 70 68 61 29 28 33 3A 6F 75 74 28 35 3A 62 79 74 65 73 31 3A 30 29 28 36 3A 66 72 61 6D 65 73 31 3A 30 29 29 29 29
+
+# pause: (5:pause(2:ch1:7)(7:machine3:web))
+client_message pause 28 35 3A 70 61 75 73 65 28 32 3A 63 68 31 3A 37 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 29
+
+# unpause: (7:unpause(2:ch1:9)(7:machine3:web))
+client_message unpause 28 37 3A 75 6E 70 61 75 73 65 28 32 3A 63 68 31 3A 39 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 29

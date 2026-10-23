@@ -100,6 +100,7 @@ static void usage(FILE *out)
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
 	      "       hull kill [-s SIGNAL] ID | hull stats [--over S] ID\n"
+	      "       hull pause ID | hull unpause ID\n"
 	      "       hull segment NAME [impair MACHINE|all in|out|both [KEY=VALUE|down]...]\n"
 	      "       hull ssh ID | hull proxy-ssh HOST\n"
 	      "       hull ssh-config [--remove] | hull gc\n"
@@ -3818,6 +3819,24 @@ static int segment_command(int argc, char **argv)
 	return 0;
 }
 
+/* `hull pause ID` and `hull unpause ID`: every process of the machine
+ * stopped where it is, or let go on. */
+static int pause_of(const char *id, int paused)
+{
+	hull_wire wire;
+	int       status = connect_core(&wire, 0);
+
+	if (status != 0) {
+		if (status == 1)
+			fprintf(stderr, "hull: no core is running, so no machine is\n");
+		return status == 1 ? 1 : 2;
+	}
+	send_request(&wire, paused ? "(5:pause" : "(7:unpause", 1u, id, NULL);
+	status = answered(&wire);
+	hull_wire_close(&wire);
+	return status;
+}
+
 /* stop, kill, logs and attach: one request about one machine, followed
  * to its end. A Ctrl-C under attach or logs only leaves. `signal_name`
  * is kill's, a name the core checks. */
@@ -4038,6 +4057,9 @@ int main(int argc, char **argv)
 
 	if (strcmp(command, "segment") == 0)
 		return segment_command(argc, argv);
+	if ((strcmp(command, "pause") == 0 || strcmp(command, "unpause") == 0) && argc == 3 &&
+	    argv[2][0] != '-')
+		return pause_of(argv[2], command[0] == 'p');
 	if (strcmp(command, "stats") == 0 && argc == 3 && argv[2][0] != '-')
 		return stats_of(argv[2], 0);
 	if (strcmp(command, "stats") == 0 && argc == 5 && strcmp(argv[2], "--over") == 0 &&

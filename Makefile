@@ -151,7 +151,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  stored.conf stored-direct.conf unstored.conf idle/hull/core.log idle/hull/core.lock \
                  searched.conf denied.conf unfound.conf rootfs/srv/searchme rootfs/bin/searchme \
                  listen.out nethost.conf netnone.conf netexec.conf netexec.out vmhost.conf tools/squashfuse segmented.conf nested.conf nestover.conf inited.conf pathless.conf pathed.conf owned.conf ownedin.conf exported.conf exported.tar exported.view exportin.conf owners.list owned_back.conf rootfs/given ownedin_back.conf layered.conf relayered.conf layeredin.conf sharedupper.conf \
-                 whole.conf quit.conf refused.conf devs.conf devroot/probe hostdev.conf cut.conf cut.out counts.out impair.err) \
+                 whole.conf quit.conf refused.conf devs.conf devroot/probe hostdev.conf cut.conf cut.out counts.out impair.err pausing.conf pausing.out) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
 # What test/docker_test.sh writes.
@@ -173,7 +173,8 @@ QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.co
                   data/in data/out modules.conf inplace.conf hearer.conf hearer.out shouter.conf loner.conf loner.out keptseg.conf anchor.conf anchor.out \
                   inited.conf initexec.conf initexec.out initbare.conf noinit.conf suid.conf rootfs/suid vlayered.conf vrelayered.conf \
                   vstack.conf vstackmem.conf vstackro.conf lowport.conf mixhear.conf mixhear.out \
-                  initroot/probe initroot/sbin/init initroot/sbin/poweroff initbare/probe initbare/sbin/init)
+                  initroot/probe initroot/sbin/init initroot/sbin/poweroff initbare/probe initbare/sbin/init \
+                  qticks.out)
 
 # What test/flip_test.sh writes: the project, and its rsync'd copy.
 FLIP_PROJECT    = hull.conf rootfs/probe rootfs/etc/flip

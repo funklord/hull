@@ -2393,6 +2393,89 @@ static hull_status chroot_signal(hull_core *core, hull_machine *m, hull_stream *
 	return HULL_OK;
 }
 
+/* Whether process `pid` is stopped: `T` in /proc/PID/stat, after its name,
+ * which is in parentheses and may hold either. */
+static int stopped(long pid)
+{
+	char  path[64];
+	char  text[512];
+	char *close;
+	FILE *f;
+	size_t n;
+
+	snprintf(path, sizeof path, "/proc/%ld/stat", pid);
+	if ((f = fopen(path, "r")) == NULL)
+		return 1;
+	n = fread(text, 1u, sizeof text - 1u, f);
+	fclose(f);
+	text[n] = '\0';
+	close = strrchr(text, ')');
+	return close == NULL || close[1] == '\0' || close[2] == 'T' || close[2] == 't';
+}
+
+/* SIGSTOP or SIGCONT to every process in `pid`'s pid namespace: the
+ * count still running after the sweep, for SIGSTOP, else 0; or -1 where
+ * the namespace cannot be read. */
+static int signal_namespace(pid_t pid, int signum)
+{
+	struct stat    own;
+	struct dirent *entry;
+	DIR           *proc;
+	char           path[64];
+	int            running = 0;
+
+	snprintf(path, sizeof path, "/proc/%ld/ns/pid", (long)pid);
+	if (stat(path, &own) != 0 || (proc = opendir("/proc")) == NULL)
+		return -1;
+	while ((entry = readdir(proc)) != NULL) {
+		struct stat other;
+		char       *end;
+		long        n = strtol(entry->d_name, &end, 10);
+
+		if (*end != '\0' || n <= 0)
+			continue;
+		snprintf(path, sizeof path, "/proc/%ld/ns/pid", n);
+		if (stat(path, &other) != 0 || other.st_ino != own.st_ino || other.st_dev != own.st_dev)
+			continue;
+		if (signum == SIGSTOP && stopped(n))
+			continue;
+		kill((pid_t)n, signum);
+		running += signum == SIGSTOP;
+	}
+	closedir(proc);
+	return running;
+}
+
+/* Every process of the machine stopped, or let go on. A process forked
+ * as the sweep ran is missed by it, so the sweep is made again until one
+ * finds every process stopped already, a second at most. */
+static hull_status chroot_pause(hull_core *core, hull_machine *m, int paused, hull_error *error)
+{
+	int left = -1;
+
+	(void)core;
+	pthread_mutex_lock(&m->lock);
+	if (!m->started || m->done) {
+		pthread_mutex_unlock(&m->lock);
+		return fail(error, HULL_ERR_GONE, "the machine is not running");
+	}
+	if (!paused) {
+		left = signal_namespace(m->pid, SIGCONT);
+	} else {
+		for (int sweep = 0; sweep < 100; sweep++) {
+			struct timespec pause = { 0, 10000000L };
+
+			if ((left = signal_namespace(m->pid, SIGSTOP)) <= 0)
+				break;
+			nanosleep(&pause, NULL);
+		}
+	}
+	pthread_mutex_unlock(&m->lock);
+	if (left < 0)
+		return fail(error, HULL_ERR_GONE, "the machine's processes cannot be read");
+	return left == 0 ? HULL_OK : fail(error, HULL_ERR_RUNTIME, "the machine's processes would not stop");
+}
+
 /* Ends the command, if it has not ended, and frees the stream; on_exit
  * has been or is then reported. */
 /* What the host spends on the machine: every process in its pid
@@ -2514,6 +2597,7 @@ static const hull_engine_ops ops = {
 	.resize       = chroot_resize,
 	.signal       = chroot_signal,
 	.stats        = chroot_stats,
+	.pause        = chroot_pause,
 };
 
 static const hull_engine engine = {

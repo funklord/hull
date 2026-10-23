@@ -7,6 +7,7 @@
  *
  *   say TEXT    TEXT on stdout        err TEXT    TEXT on stderr
  *   bare TEXT   TEXT on stdout, with no newline after it
+ *   ticks N     tick=1 to tick=N, a tenth of a second apart, from a child
  *   env NAME    NAME's value          cwd         the working directory
  *   host        the hostname          uid         the uid
  *   euid        the effective uid, which a setuid file's owner gives
@@ -710,6 +711,23 @@ int main(int argc, char **argv)
 				printf("drank %s\n", text);
 				close(peer);
 			}
+			i++;
+		} else if (strcmp(step, "ticks") == 0) {
+			/* In a child, so that a pause is seen to stop more than
+			 * the workload's own process. */
+			pid_t child = fork();
+
+			if (child == 0) {
+				for (long t = 1; t <= atol(arg); t++) {
+					struct timespec tenth = { 0, 100000000L };
+
+					printf("tick=%ld\n", t);
+					nanosleep(&tenth, NULL);
+				}
+				_exit(0);
+			}
+			if (child > 0)
+				waitpid(child, NULL, 0);
 			i++;
 		} else if (strcmp(step, "spin") == 0) {
 			spin(atol(arg));
