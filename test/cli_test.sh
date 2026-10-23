@@ -1509,7 +1509,31 @@ expect 1 'network\.host: rejected: a vm shares no network namespace with the hos
 printf '%s\n' '(machines (alpha (source "dir:./rootfs") (backend chroot) (command "/probe" "host")))' \
 	> "$root/pair.conf"
 from_root 0 '^host=alpha$' -f "$root/pair.conf" alpha
-from_root 125 'name the machine to run' -f "$root/pair.conf"
+from_root 125 'no such machine in \(machines \.\.\.\)' -f "$root/pair.conf" omega
+# With no name, every machine of the file at once, a line at a time
+# behind its name, the names padded to the longest.
+m='(source "dir:./rootfs") (backend chroot)'
+printf '(machines (alpha %s (command "/probe" "host")) (beta %s (command "/probe" "host" "err" "to stderr")) (gamma %s (command "/probe" "bare" "unended")))\n' \
+	"$m" "$m" "$m" > "$root/whole.conf"
+from_root 0 '^alpha \| host=alpha$' -f "$root/whole.conf"
+from_root 0 '^beta  \| host=beta$' -f "$root/whole.conf"
+from_root 0 '^beta  \| to stderr$' -f "$root/whole.conf"
+# The machine's stderr is hull's stderr, not mixed into its stdout.
+refute 'to stderr' sh -c 'cd / && exec "$0" run -f "$1" 2>/dev/null' "$hull_abs" "$root/whole.conf"
+# A last line with no newline is not lost when its machine ends.
+from_root 0 '^gamma \| unended$' -f "$root/whole.conf"
+# The first to fail ends the run with its status, and stops the rest
+# rather than leaving them to run out.
+printf '(machines (quitter %s (command "/probe" "sleep" "1" "exit" "3")) (sleeper %s (command "/probe" "sleep" "60" "say" "woke")))\n' \
+	"$m" "$m" > "$root/quit.conf"
+limit=20
+from_root 3 '' -f "$root/quit.conf"
+refute 'woke' sh -c 'cd / && exec "$0" run -f "$1"' "$hull_abs" "$root/quit.conf"
+# One the file cannot run starts none of it.
+printf '(machines (alpha %s (command "/probe" "host")) (omega (source "dir:./rootfs") (backend vm) (network host) (command "/probe")))\n' \
+	"$m" > "$root/refused.conf"
+from_root 125 'omega on qemu \(vm\): not run: the plan is rejected' -f "$root/refused.conf"
+refute 'host=alpha' sh -c 'cd / && exec "$0" run -f "$1"' "$hull_abs" "$root/refused.conf"
 from_root 125 'run takes one backend' -f "$root/pair.conf" --backend ns,vm alpha
 
 # And the core leaves once nothing needs it.

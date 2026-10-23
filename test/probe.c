@@ -6,6 +6,7 @@
  * inside:
  *
  *   say TEXT    TEXT on stdout        err TEXT    TEXT on stderr
+ *   bare TEXT   TEXT on stdout, with no newline after it
  *   env NAME    NAME's value          cwd         the working directory
  *   host        the hostname          uid         the uid
  *   euid        the effective uid, which a setuid file's owner gives
@@ -569,6 +570,10 @@ int main(int argc, char **argv)
 
 		if (strcmp(step, "say") == 0) {
 			printf("%s\n", arg);
+			i++;
+		} else if (strcmp(step, "bare") == 0) {
+			printf("%s", arg);
+			fflush(stdout);
 			i++;
 		} else if (strcmp(step, "err") == 0) {
 			fprintf(stderr, "%s\n", arg);

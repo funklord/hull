@@ -1233,20 +1233,274 @@ static int add_secrets(hull_msg *m, const uint8_t *plan, size_t length)
 	return result;
 }
 
+/* One machine planned, and its run's request built on channel `ch`: the
+ * plan, and the secrets it asks for, which may prompt. 0, else 125 having
+ * said why; nothing is started. */
+static int prepare_run(options *o, const hull_registry *registry, hull_spec *spec,
+                       const hull_sexpr_form *machine, const char *name, uint32_t ch,
+                       hull_msg *request, char *id, size_t id_cap)
+{
+	static hull_plan plan;
+	hull_choice      choice;
+	const char      *reason = NULL;
+	const char      *shown  = name != NULL ? name : "machine";
+	report           r;
+	hull_plan_status planned;
+
+	if (!machine_id(spec, machine, name, o->base, id, id_cap)) {
+		fprintf(stderr, "%s: name the machine with (hostname ...)\n", o->file);
+		return 125;
+	}
+	if (hull_registry_choose(registry, spec, machine,
+	                         o->backend_count != 0u ? o->backends[0] : NULL, &choice,
+	                         &reason) != HULL_REGISTRY_OK) {
+		fprintf(stderr, "%s: %s: %s\n", o->file, shown, reason);
+		return 125;
+	}
+	r.options  = o;
+	r.spec     = spec;
+	r.machine  = shown;
+	r.choice   = &choice;
+	r.rejected = 0u;
+	planned = hull_plan_build(&plan, spec, machine, name, o->base, &choice,
+	                          registry->host_arch, o->tokens, print_resolution, &r);
+	if (planned != HULL_PLAN_OK) {
+		fprintf(stderr, "%s: %s on %s (%s): not run: %s\n", o->file, shown,
+		        choice.engine->caps->engine_name, choice.class_name,
+		        planned == HULL_PLAN_REJECTED ? "the plan is rejected" : "it could not be planned");
+		return 125;
+	}
+	{
+		const hull_engine_ops *ops = choice.engine->ops;
+
+		if (ops->create == NULL || ops->start == NULL || ops->stop == NULL ||
+		    ops->destroy == NULL) {
+			fprintf(stderr, "%s: %s: the %s engine cannot run a machine yet\n", o->file,
+			        shown, choice.engine->caps->engine_name);
+			return 125;
+		}
+	}
+
+	/* Before the core is reached, and before SIGINT would stop a machine:
+	 * a command asked for a secret may prompt, and ^C there ends this. */
+	hull_msg_raw(request, "(3:run");
+	hull_msg_channel(request, ch);
+	hull_msg_raw(request, "(7:machine");
+	hull_msg_text(request, id);
+	hull_msg_raw(request, ")");
+	hull_msg_bytes(request, plan.canonical, plan.canonical_length);
+	if (add_secrets(request, plan.canonical, plan.canonical_length) != 0) {
+		fprintf(stderr, "%s: %s: not run: a secret could not be had\n", o->file, shown);
+		return 125;
+	}
+	hull_msg_raw(request, ")");
+	return 0;
+}
+
+/* --- run, a whole file --------------------------------------------------- */
+
+#define LINE_CAP 4096u
+
+/* One machine of a whole file's run: its channel is 1 + 2 * its place, and
+ * its stop's the one after. */
+typedef struct member {
+	char     id[64];
+	char     name[64];
+	int      ended;
+	int      status;
+	size_t   held[2];             /* a line not yet ended, per stream */
+	uint8_t  line[2][LINE_CAP];
+} member;
+
+/* What a member wrote, a line at a time, each behind its name: so that
+ * two machines writing at once do not split each other's lines. A line
+ * longer than LINE_CAP goes in pieces, each prefixed. */
+static void member_write(member *m, int width, int stream, const uint8_t *data, size_t n,
+                         int flush)
+{
+	FILE *to = stream == 2 ? stderr : stdout;
+
+	for (size_t i = 0u; i <= n; i++) {
+		int  end_of_data = i == n;
+		int  newline     = !end_of_data && data[i] == '\n';
+
+		if (!end_of_data && !newline)
+			m->line[stream - 1][m->held[stream - 1]++] = data[i];
+		if (newline || m->held[stream - 1] == LINE_CAP ||
+		    (end_of_data && flush && m->held[stream - 1] != 0u)) {
+			fprintf(to, "%-*s | %.*s\n", width, m->name, (int)m->held[stream - 1],
+			        (const char *)m->line[stream - 1]);
+			m->held[stream - 1] = 0u;
+		}
+	}
+	fflush(to);
+}
+
+/* Every machine of a (machines ...) file: each planned before any starts,
+ * so one the file cannot run starts none; all run at once on one
+ * connection, a channel each, their output a line at a time behind their
+ * names; and the first to fail, or SIGINT or SIGTERM, stops the rest. The
+ * run ends when every machine has: 0 when each ended 0, else the status
+ * of the first that did not. */
+static int run_all(options *o, const hull_registry *registry, hull_spec *spec, uint8_t *data)
+{
+	static member   members[64];
+	hull_msg        requests[64];
+	hull_sexpr_form entry;
+	hull_wire       wire;
+	struct sigaction action;
+	unsigned        count = 0u;
+	unsigned        left;
+	int             width = 0;
+	int             status = 0;
+	int             stopping = 0;
+
+	memset(requests, 0, sizeof requests);
+	memset(members, 0, sizeof members);
+	hull_sexpr_child(&spec->doc, &spec->machines, &entry);
+	while (hull_sexpr_next(&spec->doc, &entry, &entry)) {
+		hull_sexpr_form key;
+		size_t          length;
+		member         *m;
+
+		if (count == sizeof members / sizeof members[0]) {
+			fprintf(stderr, "%s: a run takes at most %u machines\n", o->file, count);
+			status = 125;
+			break;
+		}
+		m = &members[count];
+		hull_sexpr_child(&spec->doc, &entry, &key);
+		if (hull_sexpr_value(&spec->doc, &key, (uint8_t *)m->name, sizeof m->name - 1u,
+		                     &length) != HULL_SEXPR_OK) {
+			status = 125;
+			break;
+		}
+		m->name[length] = '\0';
+		if (prepare_run(o, registry, spec, &entry, m->name, 1u + 2u * count, &requests[count],
+		                m->id, sizeof m->id) != 0) {
+			status = 125;
+			break;
+		}
+		if ((int)length > width)
+			width = (int)length;
+		count++;
+	}
+	free(data);
+	if (status != 0) {
+		for (unsigned i = 0u; i <= count && i < 64u; i++)
+			hull_msg_free(&requests[i]);
+		return status;
+	}
+
+	memset(&action, 0, sizeof action);
+	action.sa_handler = interrupt;
+	sigaction(SIGINT, &action, NULL);
+	sigaction(SIGTERM, &action, NULL);
+	if (connect_core(&wire, 1) != 0) {
+		for (unsigned i = 0u; i < count; i++)
+			hull_msg_free(&requests[i]);
+		return 125;
+	}
+	for (unsigned i = 0u; i < count; i++) {
+		if (requests[i].failed || hull_wire_send(wire.fd, &requests[i]) != 0) {
+			fprintf(stderr, "hull: the run of %s could not be sent\n", members[i].name);
+			for (unsigned j = i; j < count; j++)
+				hull_msg_free(&requests[j]);
+			hull_wire_close(&wire);
+			return 125;
+		}
+		hull_msg_free(&requests[i]);
+	}
+
+	for (left = count; left > 0u;) {
+		hull_sexpr_doc   body;
+		hull_sexpr_form  value;
+		long long        channel = -1;
+		hull_wire_status read;
+		member          *m;
+		int              ended = -1;
+
+		if ((interrupted || status != 0) && !stopping) {
+			stopping = 1;
+			for (unsigned i = 0u; i < count; i++)
+				if (!members[i].ended)
+					send_request(&wire, "(4:stop", 2u + 2u * i, members[i].id,
+					             "(10:timeout_ms5:10000)");
+		}
+		read = hull_wire_read(&wire, &body);
+		if (read == HULL_WIRE_WAIT)
+			continue;
+		if (read != HULL_WIRE_OK) {
+			fprintf(stderr, "hull: the core went away\n");
+			hull_wire_close(&wire);
+			return 125;
+		}
+		if (!hull_msg_find(&body, "ch", &value) || !hull_msg_long(&body, &value, &channel) ||
+		    channel < 1 || channel % 2 != 1 || (unsigned long long)channel >= 1u + 2u * count)
+			continue;
+		m = &members[(channel - 1) / 2];
+		if (m->ended)
+			continue;
+		if (hull_msg_is(&body, "data")) {
+			hull_sexpr_form buf;
+			hull_sexpr_form fd;
+
+			if (hull_msg_find(&body, "buf", &buf) && hull_msg_find(&body, "fd", &fd))
+				member_write(m, width, hull_sexpr_is(&body, &fd, "2") ? 2 : 1,
+				             body.data + buf.content, buf.content_length, 0);
+		} else if (hull_msg_is(&body, "lost")) {
+			long long bytes = 0;
+
+			if (hull_msg_find(&body, "bytes", &value))
+				hull_msg_long(&body, &value, &bytes);
+			fprintf(stderr, "hull: %s: %lld bytes of output lost: this reader fell behind\n",
+			        m->name, bytes);
+		} else if (hull_msg_is(&body, "exited")) {
+			long long code = 0;
+			long long sig  = 0;
+
+			if (hull_msg_find(&body, "code", &value))
+				hull_msg_long(&body, &value, &code);
+			if (hull_msg_find(&body, "signal", &value))
+				hull_msg_long(&body, &value, &sig);
+			ended = sig != 0 ? 128 + (int)sig : (int)code;
+		} else if (hull_msg_is(&body, "error")) {
+			char reason[512] = "an error";
+
+			if (hull_msg_find(&body, "reason", &value))
+				hull_msg_string(&body, &value, reason, sizeof reason);
+			fprintf(stderr, "hull: %s: %s\n", m->name, reason);
+			ended = 125;
+		} else if (hull_msg_is(&body, "eof") || hull_msg_is(&body, "done")) {
+			ended = 0;
+		}
+		if (ended >= 0) {
+			member_write(m, width, 1, NULL, 0u, 1);
+			member_write(m, width, 2, NULL, 0u, 1);
+			m->ended  = 1;
+			m->status = ended;
+			left--;
+			/* A machine the rest stopped is not the failure the run
+			 * reports: the first that ended other than 0 is. */
+			if (ended != 0 && status == 0 && !stopping)
+				status = ended;
+		}
+	}
+	hull_wire_close(&wire);
+	if (status == 0 && interrupted)
+		for (unsigned i = 0u; i < count && status == 0; i++)
+			status = members[i].status;
+	return status;
+}
+
 static int run(options *o, const hull_registry *registry, const char *name)
 {
-	static hull_plan     plan;
 	hull_spec            spec;
 	hull_spec_error      error;
 	hull_sexpr_form      machine;
-	hull_choice          choice;
 	hull_wire            wire;
 	hull_msg             request = { 0 };
-	const char          *reason = NULL;
-	const char          *shown;
 	struct sigaction     action;
-	report               r;
-	hull_plan_status     planned;
 	uint8_t             *data;
 	size_t               length;
 	char                 id[64];
@@ -1264,65 +1518,24 @@ static int run(options *o, const hull_registry *registry, const char *name)
 		        error.path, error.path[0] != '\0' ? ": " : "", error.reason);
 		return 125;
 	}
+	if (spec.has_machines && name == NULL)
+		return run_all(o, registry, &spec, data);
 	if (spec.has_machine && name == NULL) {
 		machine = spec.machine;
-	} else if (spec.has_machines && name != NULL &&
-	           hull_spec_find(&spec, &spec.machines, name, &machine)) {
+	} else if (spec.has_machines && hull_spec_find(&spec, &spec.machines, name, &machine)) {
 		;
 	} else {
 		fprintf(stderr, "%s: %s\n", o->file, spec.has_machines ?
-		        "name the machine to run, one of (machines ...)" :
+		        "no such machine in (machines ...)" :
 		        name != NULL ? "a single machine takes no name" : "there is no machine to run");
 		return 125;
 	}
-	shown = name != NULL ? name : "machine";
-	if (!machine_id(&spec, &machine, name, o->base, id, sizeof id)) {
-		fprintf(stderr, "%s: name the machine with (hostname ...)\n", o->file);
-		return 125;
-	}
-	if (hull_registry_choose(registry, &spec, &machine,
-	                         o->backend_count != 0u ? o->backends[0] : NULL, &choice,
-	                         &reason) != HULL_REGISTRY_OK) {
-		fprintf(stderr, "%s: %s: %s\n", o->file, shown, reason);
-		return 125;
-	}
-	r.options  = o;
-	r.spec     = &spec;
-	r.machine  = shown;
-	r.choice   = &choice;
-	r.rejected = 0u;
-	planned = hull_plan_build(&plan, &spec, &machine, name, o->base, &choice,
-	                          registry->host_arch, o->tokens, print_resolution, &r);
-	if (planned != HULL_PLAN_OK) {
-		fprintf(stderr, "%s: %s on %s (%s): not run: %s\n", o->file, shown,
-		        choice.engine->caps->engine_name, choice.class_name,
-		        planned == HULL_PLAN_REJECTED ? "the plan is rejected" : "it could not be planned");
-		return 125;
-	}
+	status = prepare_run(o, registry, &spec, &machine, name, 1u, &request, id, sizeof id);
 	free(data);
-	{
-		const hull_engine_ops *ops = choice.engine->ops;
-
-		if (ops->create == NULL || ops->start == NULL || ops->stop == NULL ||
-		    ops->destroy == NULL) {
-			fprintf(stderr, "%s: %s: the %s engine cannot run a machine yet\n", o->file,
-			        shown, choice.engine->caps->engine_name);
-			return 125;
-		}
-	}
-
-	/* Before the core is reached, and before SIGINT would stop a machine:
-	 * a command asked for a secret may prompt, and ^C there ends this. */
-	hull_msg_raw(&request, "(3:run(2:ch1:1)(7:machine");
-	hull_msg_text(&request, id);
-	hull_msg_raw(&request, ")");
-	hull_msg_bytes(&request, plan.canonical, plan.canonical_length);
-	if (add_secrets(&request, plan.canonical, plan.canonical_length) != 0) {
-		fprintf(stderr, "%s: %s: not run: a secret could not be had\n", o->file, shown);
+	if (status != 0) {
 		hull_msg_free(&request);
-		return 125;
+		return status;
 	}
-	hull_msg_raw(&request, ")");
 
 	/* SIGINT and SIGTERM stop the machine; a hangup only leaves it, to
 	 * whatever (on_disconnect ...) says. */
