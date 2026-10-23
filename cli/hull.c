@@ -102,7 +102,8 @@ static void usage(FILE *out)
 	      "       hull kill [-s SIGNAL] ID | hull stats [--over S] ID\n"
 	      "       hull ssh ID | hull proxy-ssh HOST\n"
 	      "       hull ssh-config [--remove] | hull gc\n"
-	      "       hull commit [--arch A] DIR REF | hull materialize REF DIR | hull images\n"
+	      "       hull commit [--arch A] DIR REF | hull commit --tar FILE REF\n"
+	      "       hull materialize REF DIR | hull images\n"
 	      "       hull diff REF REF | hull tag REF NEW | hull tag -d REF\n"
 	      "       hull manifest show REF | hull pull IMAGE [REF] | hull push REF IMAGE\n"
 	      "       hull core\n"
@@ -2455,17 +2456,30 @@ static int open_store(hull_store *store, int create)
 	return opened < 0 ? 2 : opened;
 }
 
-static int commit(const char *dir, const char *ref, const char *arch)
+/* `hull commit`: a directory, or with `tar` a tar of engine/tree.c's shape
+ * from the file `dir` names, `-` for stdin, its owners kept. */
+static int commit(const char *dir, const char *ref, const char *arch, int tar)
 {
 	hull_store  store;
 	hull_commit made;
 	char        why[4400] = "";
 	int         status;
+	int         fd = -1;
 
-	if ((status = open_store(&store, 1)) != 0)
+	if (tar && (fd = strcmp(dir, "-") == 0 ? 0 : open(dir, O_RDONLY | O_CLOEXEC)) < 0) {
+		fprintf(stderr, "hull: commit: %s: %s\n", dir, strerror(errno));
+		return 1;
+	}
+	if ((status = open_store(&store, 1)) != 0) {
+		if (fd > 0)
+			close(fd);
 		return status;
-	status = hull_store_commit(&store, dir, arch, ref, NULL, &made, why, sizeof why);
+	}
+	status = tar ? hull_store_commit_tar(&store, fd, arch, ref, NULL, NULL, &made, why, sizeof why) :
+	               hull_store_commit(&store, dir, arch, ref, NULL, &made, why, sizeof why);
 	hull_store_close(&store);
+	if (fd > 0)
+		close(fd);
 	if (status != 0) {
 		fprintf(stderr, "hull: commit: %s\n", why);
 		return 1;
@@ -3385,9 +3399,11 @@ int main(int argc, char **argv)
 	if (strcmp(command, "gc") == 0 && argc == 2)
 		return collect();
 	if (strcmp(command, "commit") == 0 && argc == 4)
-		return commit(argv[2], argv[3], host_arch());
+		return commit(argv[2], argv[3], host_arch(), 0);
+	if (strcmp(command, "commit") == 0 && argc == 5 && strcmp(argv[2], "--tar") == 0)
+		return commit(argv[3], argv[4], host_arch(), 1);
 	if (strcmp(command, "commit") == 0 && argc == 6 && strcmp(argv[2], "--arch") == 0)
-		return commit(argv[4], argv[5], argv[3]);
+		return commit(argv[4], argv[5], argv[3], 0);
 	if (strcmp(command, "materialize") == 0 && argc == 4)
 		return materialize(argv[2], argv[3]);
 	if (strcmp(command, "images") == 0 && argc == 2)

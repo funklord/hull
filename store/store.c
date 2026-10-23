@@ -287,10 +287,11 @@ static void read_xattrs(int dir, const char *name, buf *out)
 	close(fd);
 }
 
-/* The file's content into the objects: hashed while copied to tmp/, then
- * linked in under its name, unless the store has it. */
-static int store_object(hull_store *store, int fd, const struct stat *st, uint8_t digest[32],
-                        int *made, char *why, size_t cap)
+/* The next `limit` bytes of `fd`, or all of it where `limit` is UINT64_MAX,
+ * into the objects: hashed while copied to tmp/, then linked in under its
+ * name, unless the store has it. */
+static int store_object_of(hull_store *store, int fd, uint64_t limit, const struct stat *st,
+                           uint8_t digest[32], int *made, char *why, size_t cap)
 {
 	static uint8_t chunk[1 << 16];
 	hull_sha256    h;
@@ -298,20 +299,27 @@ static int store_object(hull_store *store, int fd, const struct stat *st, uint8_
 	char           final[4300];
 	char           hex[65];
 	int            out;
-	ssize_t        n;
+	ssize_t        n = 0;
+	uint64_t       left = limit;
 
 	snprintf(temp, sizeof temp, "%s/tmp/object.XXXXXX", store->root);
 	out = mkostemp(temp, O_CLOEXEC);
 	if (out < 0)
 		return say(why, cap, temp, strerror(errno));
 	hull_sha256_init(&h);
-	while ((n = read(fd, chunk, sizeof chunk)) > 0) {
+	while (left > 0u &&
+	       (n = read(fd, chunk, left < sizeof chunk ? (size_t)left : sizeof chunk)) > 0) {
 		hull_sha256_update(&h, chunk, (size_t)n);
 		if (write(out, chunk, (size_t)n) != n) {
 			n = -1;
 			break;
 		}
+		if (limit != UINT64_MAX)
+			left -= (uint64_t)n;
 	}
+	/* A limit is the size the tar gave: one that ends short is cut. */
+	if (limit != UINT64_MAX && left != 0u && n >= 0)
+		n = -1;
 	hull_sha256_final(&h, digest);
 	if (n < 0 || fchmod(out, (st->st_mode & 0111) != 0 ? 0555 : 0444) != 0 || close(out) != 0) {
 		unlink(temp);
@@ -330,6 +338,13 @@ static int store_object(hull_store *store, int fd, const struct stat *st, uint8_
 	}
 	unlink(temp);
 	return 0;
+}
+
+/* The file's content into the objects, the whole of it. */
+static int store_object(hull_store *store, int fd, const struct stat *st, uint8_t digest[32],
+                        int *made, char *why, size_t cap)
+{
+	return store_object_of(store, fd, UINT64_MAX, st, digest, made, why, cap);
 }
 
 static int walk_dir(hull_store *store, walk *w, int dir, const char *prefix, hull_commit *out);
@@ -535,28 +550,313 @@ static int set_ref(hull_store *store, const char *ref, const char *hex, char *wh
 	return 0;
 }
 
-int hull_store_commit(hull_store *store, const char *dir, const char *arch, const char *ref,
-                      const hull_commit_extra *extra, hull_commit *out, char *why, size_t cap)
+/* --- committing a tar ------------------------------------------------------ */
+
+/* The octal number in a ustar field of `width`, or 0 where it is none. */
+static unsigned long long tar_octal(const uint8_t *field, size_t width)
 {
-	walk     w = { .why = why, .why_cap = cap };
+	unsigned long long value = 0u;
+
+	for (size_t i = 0u; i < width && field[i] >= '0' && field[i] <= '7'; i++)
+		value = value * 8u + (unsigned long long)(field[i] - '0');
+	return value;
+}
+
+/* All of `n` bytes from `fd`. 0, or -1. */
+static int read_all(int fd, uint8_t *data, size_t n)
+{
+	while (n > 0u) {
+		ssize_t got = read(fd, data, n);
+
+		if (got <= 0)
+			return -1;
+		data += got;
+		n -= (size_t)got;
+	}
+	return 0;
+}
+
+/* `n` bytes of `fd` passed over. 0, or -1. */
+static int skip_bytes(int fd, unsigned long long n)
+{
+	uint8_t chunk[4096];
+
+	while (n > 0u) {
+		size_t want = n < sizeof chunk ? (size_t)n : sizeof chunk;
+
+		if (read_all(fd, chunk, want) != 0)
+			return -1;
+		n -= want;
+	}
+	return 0;
+}
+
+/* What a pax header says of the entry after it. */
+typedef struct pax_said {
+	char              *path;
+	char              *link;
+	int                has_size;
+	unsigned long long size;
+	int                has_uid;
+	unsigned long long uid;
+	int                has_gid;
+	unsigned long long gid;
+	char              *xattr_name[512];
+	uint8_t           *xattr_value[512];
+	size_t             xattr_length[512];
+	unsigned           xattr_count;
+} pax_said;
+
+static void pax_clear(pax_said *p)
+{
+	free(p->path);
+	free(p->link);
+	for (unsigned i = 0u; i < p->xattr_count; i++) {
+		free(p->xattr_name[i]);
+		free(p->xattr_value[i]);
+	}
+	memset(p, 0, sizeof *p);
+}
+
+/* pax's records, `length key=value\n` each, into `p`. 0, or -1. */
+static int pax_read(const uint8_t *data, size_t n, pax_said *p)
+{
+	size_t at = 0u;
+
+	while (at < n) {
+		size_t         length = 0u;
+		size_t         i = at;
+		const uint8_t *key;
+		const uint8_t *equals;
+		const uint8_t *end;
+
+		while (i < n && data[i] >= '0' && data[i] <= '9')
+			length = length * 10u + (size_t)(data[i++] - '0');
+		if (i >= n || data[i] != ' ' || length == 0u || at + length > n || data[at + length - 1u] != '\n')
+			return -1;
+		key = data + i + 1u;
+		end = data + at + length - 1u;
+		equals = memchr(key, '=', (size_t)(end - key));
+		if (equals == NULL)
+			return -1;
+		{
+			size_t         key_length = (size_t)(equals - key);
+			const uint8_t *value = equals + 1;
+			size_t         value_length = (size_t)(end - value);
+
+#define KEY_IS(k) (key_length == sizeof k - 1u && memcmp(key, k, key_length) == 0)
+			if (KEY_IS("path") || KEY_IS("linkpath")) {
+				char **to = KEY_IS("path") ? &p->path : &p->link;
+
+				free(*to);
+				if ((*to = strndup((const char *)value, value_length)) == NULL)
+					return -1;
+			} else if (KEY_IS("size") || KEY_IS("uid") || KEY_IS("gid")) {
+				unsigned long long number = strtoull((const char *)value, NULL, 10);
+
+				if (KEY_IS("size")) {
+					p->has_size = 1;
+					p->size = number;
+				} else if (KEY_IS("uid")) {
+					p->has_uid = 1;
+					p->uid = number;
+				} else {
+					p->has_gid = 1;
+					p->gid = number;
+				}
+			} else if (key_length > 13u && memcmp(key, "SCHILY.xattr.", 13u) == 0 &&
+			           p->xattr_count < 512u) {
+				unsigned x = p->xattr_count;
+
+				p->xattr_name[x] = strndup((const char *)key + 13, key_length - 13u);
+				p->xattr_value[x] = malloc(value_length + 1u);
+				if (p->xattr_name[x] == NULL || p->xattr_value[x] == NULL)
+					return -1;
+				memcpy(p->xattr_value[x], value, value_length);
+				p->xattr_length[x] = value_length;
+				p->xattr_count++;
+			}
+#undef KEY_IS
+		}
+		at += length;
+	}
+	return 0;
+}
+
+/* Whether `path`, a tree's relative path, is one `drop` leaves out: a name
+ * there, or under it; one ending in `/` leaves out only what is under it,
+ * as /tmp's contents and not /tmp. */
+static int dropped(const char *path, const char *const *drop)
+{
+	for (size_t i = 0u; drop != NULL && drop[i] != NULL; i++) {
+		const char *d = drop[i][0] == '/' ? drop[i] + 1 : drop[i];
+		size_t      n = strlen(d);
+		int         contents = n > 0u && d[n - 1u] == '/';
+
+		if (contents) {
+			if (strncmp(path, d, n) == 0 && path[n] != '\0')
+				return 1;
+		} else if (n > 0u && strncmp(path, d, n) == 0 && (path[n] == '\0' || path[n] == '/')) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* The xattrs a pax header gave, as read_xattrs() writes them: user.* and
+ * security.* only, by name. */
+static void pax_xattrs(const pax_said *p, buf *out)
+{
+	unsigned order[512];
+	unsigned count = 0u;
+
+	for (unsigned i = 0u; i < p->xattr_count; i++)
+		if (strncmp(p->xattr_name[i], "user.", 5u) == 0 ||
+		    strncmp(p->xattr_name[i], "security.", 9u) == 0)
+			order[count++] = i;
+	for (unsigned i = 1u; i < count; i++)
+		for (unsigned j = i; j > 0u && strcmp(p->xattr_name[order[j - 1u]],
+		                                      p->xattr_name[order[j]]) > 0; j--) {
+			unsigned swap = order[j];
+
+			order[j] = order[j - 1u];
+			order[j - 1u] = swap;
+		}
+	for (unsigned k = 0u; k < count; k++) {
+		unsigned i = order[k];
+
+		if (out->length == 0u)
+			put_text(out, "(6:xattrs");
+		put_text(out, "(");
+		put_atom(out, p->xattr_name[i], strlen(p->xattr_name[i]));
+		put_atom(out, p->xattr_value[i], p->xattr_length[i]);
+		put_text(out, ")");
+	}
+	if (out->length != 0u)
+		put_text(out, ")");
+}
+
+/* The tar on `fd`, engine/tree.c's, into `w`'s items: its files into the
+ * objects, each entry's owner as the tar gives it, 0 being root's. 0, or
+ * -1 with `w->why`. */
+static int read_tar(hull_store *store, walk *w, int fd, const char *const *drop, hull_commit *out)
+{
+	uint8_t  block[512];
+	pax_said pax = { 0 };
+	int      zeroes = 0;
+
+	while (read_all(fd, block, sizeof block) == 0) {
+		char               name[PATH_MAX];
+		char               link[PATH_MAX];
+		unsigned long long size;
+		unsigned long long uid;
+		unsigned long long gid;
+		char               type = (char)block[156];
+		int                empty = 1;
+		item              *it;
+		size_t             length;
+
+		for (size_t i = 0u; i < sizeof block && empty; i++)
+			empty = block[i] == 0u;
+		if (empty) {
+			if (++zeroes == 2)
+				break;
+			continue;
+		}
+		zeroes = 0;
+		size = pax.has_size ? pax.size : tar_octal(block + 124, 12u);
+		if (type == 'x') {
+			uint8_t *records = size <= (16u << 20) ? malloc((size_t)size) : NULL;
+			int      ok = records != NULL && read_all(fd, records, (size_t)size) == 0 &&
+			         skip_bytes(fd, (512u - size % 512u) % 512u) == 0 &&
+			         pax_read(records, (size_t)size, &pax) == 0;
+
+			free(records);
+			if (!ok) {
+				say(w->why, w->why_cap, "the tree's tar", "a pax header could not be read");
+				goto fail;
+			}
+			continue;
+		}
+		snprintf(name, sizeof name, "%s", pax.path != NULL ? pax.path : "");
+		if (pax.path == NULL) {
+			memcpy(name, block, 100u);
+			name[100] = '\0';
+		}
+		snprintf(link, sizeof link, "%s", pax.link != NULL ? pax.link : "");
+		if (pax.link == NULL) {
+			memcpy(link, block + 157, 100u);
+			link[100] = '\0';
+		}
+		uid = pax.has_uid ? pax.uid : tar_octal(block + 108, 8u);
+		gid = pax.has_gid ? pax.gid : tar_octal(block + 116, 8u);
+		length = strlen(name);
+		while (length > 0u && name[length - 1u] == '/')
+			name[--length] = '\0';
+		if (length == 0u || dropped(name, drop) || !is_utf8(name) ||
+		    !(type == '0' || type == '5' || type == '2' || type == '6')) {
+			if (length != 0u && !dropped(name, drop))
+				fprintf(stderr, "hull: commit: %s: %s, left out\n", name,
+				        !is_utf8(name) ? "not UTF-8, which a manifest's path must be" :
+				                         "a kind a manifest is not given here");
+			if (type == '0' && skip_bytes(fd, size + (512u - size % 512u) % 512u) != 0)
+				goto cut;
+			pax_clear(&pax);
+			continue;
+		}
+		if ((it = add_item(w)) == NULL || (it->path = strdup(name)) == NULL) {
+			say(w->why, w->why_cap, "out of memory", NULL);
+			goto fail;
+		}
+		it->st.st_mode = (mode_t)(tar_octal(block + 100, 8u) & 07777) |
+		                 (type == '5' ? S_IFDIR : type == '2' ? S_IFLNK : type == '6' ? S_IFIFO :
+		                                                                    S_IFREG);
+		/* Root inside the machine is the class root, as the user's own file
+		 * is in a directory's commit; any other owner is its ids. */
+		it->st.st_uid = uid == 0u ? getuid() : (uid_t)uid;
+		it->st.st_gid = (gid_t)gid;
+		it->st.st_size = (off_t)(type == '0' ? size : 0u);
+		pax_xattrs(&pax, &it->xattrs);
+		if (type == '2' && (it->target = strdup(link)) == NULL) {
+			say(w->why, w->why_cap, "out of memory", NULL);
+			goto fail;
+		}
+		if (type == '0') {
+			int made = 0;
+
+			if (store_object_of(store, fd, size, &it->st, it->digest, &made, w->why,
+			                    w->why_cap) != 0 ||
+			    skip_bytes(fd, (512u - size % 512u) % 512u) != 0)
+				goto cut;
+			out->new_objects += (uint64_t)made;
+		}
+		pax_clear(&pax);
+	}
+	pax_clear(&pax);
+	if (zeroes == 2)
+		return 0;
+cut:
+	if (w->why[0] == '\0')
+		say(w->why, w->why_cap, "the tree's tar", "it ends before its end");
+fail:
+	pax_clear(&pax);
+	w->failed = 1;
+	return -1;
+}
+
+/* `w`'s items as a manifest of `arch`, stored and named `ref`, with
+ * `extra`; then the items freed. 0, or -1 with `why`. */
+static int finish_commit(hull_store *store, walk *wp, const char *arch, const char *ref,
+                         const hull_commit_extra *extra, hull_commit *out, char *why, size_t cap)
+{
+	walk     w = *wp;
 	buf      manifest = { 0 };
 	uint8_t *digests;
-	int      top;
 	int      result = -1;
 
-	memset(out, 0, sizeof *out);
-	if (ref != NULL && !is_ref(ref))
-		return say(why, cap, "a ref is names of letters, digits and ._-:@, joined by /", NULL);
-	if ((top = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) < 0)
-		return say(why, cap, dir, strerror(errno));
-	/* Shared: commits may run together, but not beside a gc, which could
-	 * take an object before the ref that reaches it is written. */
-	flock(store->lock, LOCK_SH);
-	if (walk_dir(store, &w, top, "", out) != 0) {
-		if (why[0] == '\0')
-			say(why, cap, dir, "it could not be read whole");
+	/* A tree not read whole is no tree to name. */
+	if (w.failed)
 		goto done;
-	}
 	qsort(w.items, w.count, sizeof w.items[0], path_order);
 	digests = malloc(32u * (w.count + 1u));
 	if (digests == NULL)
@@ -603,7 +903,6 @@ int hull_store_commit(hull_store *store, const char *dir, const char *arch, cons
 	    (ref == NULL || set_ref(store, ref, out->manifest, why, cap) == 0))
 		result = 0;
 done:
-	flock(store->lock, LOCK_UN);
 	for (size_t i = 0u; i < w.count; i++) {
 		free(w.items[i].path);
 		free(w.items[i].target);
@@ -611,6 +910,45 @@ done:
 	}
 	free(w.items);
 	free(manifest.data);
+	return result;
+}
+
+int hull_store_commit(hull_store *store, const char *dir, const char *arch, const char *ref,
+                      const hull_commit_extra *extra, hull_commit *out, char *why, size_t cap)
+{
+	walk w = { .why = why, .why_cap = cap };
+	int  top;
+	int  result;
+
+	memset(out, 0, sizeof *out);
+	if (ref != NULL && !is_ref(ref))
+		return say(why, cap, "a ref is names of letters, digits and ._-:@, joined by /", NULL);
+	if ((top = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) < 0)
+		return say(why, cap, dir, strerror(errno));
+	/* Shared: commits may run together, but not beside a gc, which could
+	 * take an object before the ref that reaches it is written. */
+	flock(store->lock, LOCK_SH);
+	if (walk_dir(store, &w, top, "", out) != 0 && why[0] == '\0')
+		say(why, cap, dir, "it could not be read whole");
+	result = finish_commit(store, &w, arch, ref, extra, out, why, cap);
+	flock(store->lock, LOCK_UN);
+	return result;
+}
+
+int hull_store_commit_tar(hull_store *store, int fd, const char *arch, const char *ref,
+                          const char *const *drop, const hull_commit_extra *extra,
+                          hull_commit *out, char *why, size_t cap)
+{
+	walk w = { .why = why, .why_cap = cap };
+	int  result;
+
+	memset(out, 0, sizeof *out);
+	if (ref != NULL && !is_ref(ref))
+		return say(why, cap, "a ref is names of letters, digits and ._-:@, joined by /", NULL);
+	flock(store->lock, LOCK_SH);
+	read_tar(store, &w, fd, drop, out);
+	result = finish_commit(store, &w, arch, ref, extra, out, why, cap);
+	flock(store->lock, LOCK_UN);
 	return result;
 }
 

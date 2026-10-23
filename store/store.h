@@ -60,6 +60,17 @@ typedef struct hull_commit_extra {
 int hull_store_commit(hull_store *store, const char *dir, const char *arch, const char *ref,
                       const hull_commit_extra *extra, hull_commit *out, char *why, size_t cap);
 
+/* The tar on `fd`, engine/tree.c's (ustar, pax for what does not fit, a
+ * file's xattrs as SCHILY.xattr), as hull_store_commit() commits a dir,
+ * with each entry's owner as the tar gives it: 0 is (owner root), any
+ * other its ids, as A.3 has them, so a tree a machine saw with many
+ * owners keeps them while no file of theirs is on disk. What `drop`
+ * names, NULL-ended paths of the tree, is left out, a name with what is
+ * under it, and one ending in `/` only what is under it. 0, or -1. */
+int hull_store_commit_tar(hull_store *store, int fd, const char *arch, const char *ref,
+                          const char *const *drop, const hull_commit_extra *extra,
+                          hull_commit *out, char *why, size_t cap);
+
 /* The manifest `name` names, a ref or sha256:HEX, which the store holds,
  * read whole and checked: its hex into `hex`. 0, or -1 with `why`. */
 int hull_store_resolve(hull_store *store, const char *name, char hex[65], char *why, size_t cap);

@@ -443,6 +443,52 @@ expect 1 'No such file' "$hull" tag \
 	sha256:0000000000000000000000000000000000000000000000000000000000000000 one/tagged
 expect 1 'no such ref' "$hull" manifest show one/nope
 
+# commit --tar: a tar of engine/tree.c's shape, made here by Python's own
+# tarfile, its owners kept as the tar gives them, 0 as root and others as
+# their ids, as a machine's export carries what it saw while no file of
+# another owner is on the disk: a file of 101's and a directory, a symlink,
+# a name too long for ustar and an xattr, both by pax. Cut short, it is
+# refused and names nothing.
+timeout 30 python3 - "$root/owned.tar" <<'PYEOF2'
+import io, sys, tarfile
+t = tarfile.open(sys.argv[1], "w", format=tarfile.PAX_FORMAT)
+def add(name, kind, uid, gid, mode, data=b"", link="", pax=None):
+	i = tarfile.TarInfo(name)
+	i.type, i.uid, i.gid, i.mode, i.size, i.linkname = kind, uid, gid, mode, len(data), link
+	if pax:
+		i.pax_headers = pax
+	t.addfile(i, io.BytesIO(data) if data else None)
+add("etc", tarfile.DIRTYPE, 0, 0, 0o755)
+add("etc/owned", tarfile.REGTYPE, 101, 102, 0o640, b"dnsmasq's\n", pax={"SCHILY.xattr.user.note": "kept"})
+add("etc/link", tarfile.SYMTYPE, 0, 0, 0o777, link="owned")
+add("etc/" + "x" * 120, tarfile.REGTYPE, 0, 0, 0o644, b"long\n")
+add("run", tarfile.DIRTYPE, 101, 0, 0o750)
+t.close()
+PYEOF2
+expect 0 '^tarred/1 sha256:[0-9a-f]{64}$' "$hull" commit --tar "$root/owned.tar" tarred/1
+timeout 30 "$hull" manifest show tarred/1 > "$root/tarred.view" 2>&1
+for want in '(entry (kind dir) (mode 493) (owner root) (path "etc"))' \
+	'(owner (gid 102) (uid 101)) (path "etc/owned") (size 10) (xattrs (user.note kept)))' \
+	'(entry (kind symlink) (mode 511) (owner root) (path "etc/link") (target "owned"))' \
+	"(path \"etc/$(printf 'x%.0s' $(seq 120))\") (size 5))" \
+	'(entry (kind dir) (mode 488) (owner (gid 0) (uid 101)) (path "run")))'; do
+	cases=$((cases + 1))
+	grep -qF -- "$want" "$root/tarred.view" || fail "a tar's entry is not as it was: $want" \
+		"$(cat "$root/tarred.view")"
+done
+head -c 1500 "$root/owned.tar" > "$root/cut.tar"
+expect 1 'commit: the tree.s tar: (it ends before its end|a pax header could not be read)$' "$hull" commit --tar "$root/cut.tar" tarred/cut
+expect 1 'no such ref' "$hull" manifest show tarred/cut
+# And one whole to its last entry but without the two blocks of zeroes
+# that end a tar, as one whose writer died between entries would be.
+timeout 30 python3 -c '
+import sys
+data = open(sys.argv[1], "rb").read().rstrip(b"\0")
+data += b"\0" * (-len(data) % 512)
+open(sys.argv[2], "wb").write(data)' "$root/owned.tar" "$root/unended.tar"
+expect 1 'commit: the tree.s tar: it ends before its end$' "$hull" commit --tar "$root/unended.tar" tarred/unended
+expect 1 'no such ref' "$hull" manifest show tarred/unended
+
 # The test's core leaves once idle, before its directory goes.
 tries=0
 while [ -S "$XDG_RUNTIME_DIR/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
