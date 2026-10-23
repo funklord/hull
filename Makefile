@@ -333,19 +333,6 @@ install-nss: $(NSS_LIB)
 $(GEN_DIR)/%.o: $(GEN_DIR)/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
-# The generated frontend protocol compiles only behind a forward
-# declaration (situ finding 18): core/frontend_view.h comes first, and the
-# header's own guard makes the file's include of it a no-op. This rule
-# goes with that file.
-$(GEN_DIR)/frontend.o: $(GEN_DIR)/frontend.c core/frontend_view.h
-	$(CC) $(CPPFLAGS) -include core/frontend_view.h $(CFLAGS) $(WARNINGS) $(DEPFLAGS) \
-	      -c -o $@ $(filter %.c,$^)
-
-# The agent protocol's, the same way and for the same finding.
-$(GEN_DIR)/protocol.o: $(GEN_DIR)/protocol.c agent/protocol_view.h
-	$(CC) $(CPPFLAGS) -include agent/protocol_view.h $(CFLAGS) $(WARNINGS) $(DEPFLAGS) \
-	      -c -o $@ $(filter %.c,$^)
-
 $(BUILD_DIR)/situ/situ.o: $(SITU_DIR)/runtime/c/situ.c
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<

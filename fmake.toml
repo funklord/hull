@@ -43,15 +43,12 @@ command = "mkdir -p gen && vendor/situ/bin/situc build --target c --layer frame 
 inputs = ["agent/message.situ"]
 outputs = ["gen/message.c", "gen/message.h", "gen/message_frame.h", "gen/message_build.h", "gen/message_edit.h"]
 
-# The view header comes first in the generated source, as the Makefile's
-# -include puts it (situ finding 18); each schema has its own, so no
-# tree-wide flag can say it, and the rule writes the line instead.
 [generate.frontend]
-command = "mkdir -p gen && vendor/situ/bin/situc build --target c --prefix hull_frontend --out gen core/frontend.situ && sed -i '1i #include \"core/frontend_view.h\"' gen/frontend.c"
-inputs = ["core/frontend.situ", "sexpr/canonical.situ", "core/frontend_view.h"]
+command = "mkdir -p gen && vendor/situ/bin/situc build --target c --prefix hull_frontend --out gen core/frontend.situ"
+inputs = ["core/frontend.situ", "sexpr/canonical.situ"]
 outputs = ["gen/frontend.c", "gen/frontend.h"]
 
 [generate.protocol]
-command = "mkdir -p gen && vendor/situ/bin/situc build --target c --prefix hull_protocol --out gen agent/protocol.situ && sed -i '1i #include \"agent/protocol_view.h\"' gen/protocol.c"
-inputs = ["agent/protocol.situ", "sexpr/canonical.situ", "agent/protocol_view.h"]
+command = "mkdir -p gen && vendor/situ/bin/situc build --target c --prefix hull_protocol --out gen agent/protocol.situ"
+inputs = ["agent/protocol.situ", "sexpr/canonical.situ"]
 outputs = ["gen/protocol.c", "gen/protocol.h"]

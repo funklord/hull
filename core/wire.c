@@ -10,8 +10,8 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "frontend_view.h"
-#include "protocol_view.h"
+#include "frontend.h"
+#include "protocol.h"
 #include "wire.h"
 
 int hull_wire_open(hull_wire *wire, int fd, hull_wire_from from)
