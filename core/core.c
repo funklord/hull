@@ -32,6 +32,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -322,10 +323,11 @@ static void on_log(hull_core *core, int level, const char *message)
 		fprintf(stderr, "hull core: %s\n", message);
 }
 
+/* The port is labelled with its machine's id, which `hull segment` names
+ * it by and an impairment is asked for. */
 static int on_segment(hull_core *core, const char *key, char *why, size_t cap)
 {
-	(void)core;
-	return hull_segment_port(key, why, cap);
+	return hull_segment_port(key, core->slot->id, why, cap);
 }
 
 static const hull_host_ops host_ops = {
@@ -1937,6 +1939,203 @@ static void handle_stats(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	send_to(c, &m);
 }
 
+/* --- segments (Appendix D) ---------------------------------------------------- */
+
+/* A probability, 0 to 1, as a decimal atom. */
+static int probability(const hull_sexpr_doc *body, const hull_sexpr_form *value, double *out)
+{
+	char  text[32];
+	char *end;
+
+	if (!hull_msg_string(body, value, text, sizeof text) || text[0] < '0' || text[0] > '9')
+		return 0;
+	errno = 0;
+	*out = strtod(text, &end);
+	return errno == 0 && *end == '\0' && *out >= 0.0 && *out <= 1.0;
+}
+
+/* A count from 0 to `most`, as a minimal decimal atom. */
+static int whole_count(const hull_sexpr_doc *body, const hull_sexpr_form *value, long long most,
+                 uint64_t *out)
+{
+	long long n;
+
+	if (!hull_msg_long(body, value, &n) || n < 0 || n > most)
+		return 0;
+	*out = (uint64_t)n;
+	return 1;
+}
+
+/* `impair`'s `(impairment ...)` entry as the switch takes it: NULL, or
+ * what is wrong with it. */
+static const char *impairment_of(const hull_sexpr_doc *body, const hull_sexpr_form *entry,
+                                 hull_impairment *m)
+{
+	hull_sexpr_form item;
+	int             more;
+
+	memset(m, 0, sizeof *m);
+	if (entry->kind != HULL_SEXPR_LIST || !hull_sexpr_child(body, entry, &item))
+		return "an impairment is a list";
+	for (more = hull_sexpr_next(body, &item, &item); more;
+	     more = hull_sexpr_next(body, &item, &item)) {
+		hull_sexpr_form key;
+		hull_sexpr_form value;
+		uint64_t        n = 0u;
+		char            name[16];
+
+		if (item.kind != HULL_SEXPR_LIST || !hull_sexpr_child(body, &item, &key) ||
+		    !hull_msg_string(body, &key, name, sizeof name) ||
+		    !hull_sexpr_next(body, &key, &value))
+			return "an impairment's entry is (key value)";
+		if (strcmp(name, "down") == 0) {
+			if (!hull_sexpr_is(body, &value, "true"))
+				return "down is true";
+			m->down = 1;
+		} else if (strcmp(name, "loss") == 0 || strcmp(name, "duplicate") == 0 ||
+		           strcmp(name, "corrupt") == 0 || strcmp(name, "reorder") == 0) {
+			double *to = name[0] == 'l' ? &m->loss : name[0] == 'd' ? &m->duplicate :
+			             name[0] == 'c' ? &m->corrupt : &m->reorder;
+
+			if (!probability(body, &value, to))
+				return "a probability is from 0 to 1";
+		} else if (strcmp(name, "gemodel") == 0) {
+			double *to[4] = { &m->p, &m->r, &m->bad_loss, &m->good_loss };
+
+			for (unsigned k = 0u; k < 4u; k++)
+				if ((k > 0u && !hull_sexpr_next(body, &value, &value)) ||
+				    !probability(body, &value, to[k]))
+					return "gemodel is four probabilities: p, r, 1-h and 1-k";
+			m->gemodel = 1;
+		} else if (strcmp(name, "delay") == 0 || strcmp(name, "jitter") == 0 ||
+		           strcmp(name, "mtu") == 0 || strcmp(name, "limit") == 0) {
+			/* A minute's delay, a jumbo frame, netem's own bound. */
+			long long most = name[0] == 'm' ? 65535 : name[0] == 'l' ? 65536 : 60000;
+
+			if (!whole_count(body, &value, most, &n))
+				return name[0] == 'm' ? "an mtu is at most 65535" :
+				       name[0] == 'l' ? "a limit is at most 65536 frames" :
+				                        "a delay or a jitter is at most 60000 ms";
+			if (name[0] == 'd')
+				m->delay_ms = (unsigned)n;
+			else if (name[0] == 'j')
+				m->jitter_ms = (unsigned)n;
+			else if (name[0] == 'm')
+				m->mtu = (unsigned)n;
+			else
+				m->limit = (unsigned)n;
+		} else if (strcmp(name, "rate") == 0 || strcmp(name, "seed") == 0) {
+			if (!whole_count(body, &value, LLONG_MAX, name[0] == 'r' ? &m->rate : &m->seed))
+				return "a rate in bits a second, or a seed, is a whole number";
+		} else {
+			return "an impairment has no such key";
+		}
+		if (hull_sexpr_next(body, &value, &value) && strcmp(name, "gemodel") != 0)
+			return "an impairment's entry is (key value)";
+	}
+	if (m->jitter_ms > m->delay_ms)
+		return "a jitter is at most its delay";
+	return NULL;
+}
+
+static void handle_impair(client *c, uint32_t ch, const hull_sexpr_doc *body)
+{
+	hull_sexpr_form value;
+	hull_impairment impairment;
+	const char     *wrong = NULL;
+	char            name[512];
+	char            machine[64];
+	char            direction[8];
+	char            why[256];
+
+	if (!hull_msg_find(body, "name", &value) || !hull_msg_string(body, &value, name, sizeof name) ||
+	    !hull_msg_find(body, "machine", &value) ||
+	    !hull_msg_string(body, &value, machine, sizeof machine) ||
+	    (strcmp(machine, "*") != 0 && !is_label(machine)) ||
+	    !hull_msg_find(body, "direction", &value) ||
+	    !hull_msg_string(body, &value, direction, sizeof direction) ||
+	    (strcmp(direction, "in") != 0 && strcmp(direction, "out") != 0)) {
+		send_error(c, ch, "impair names a segment, a machine or *, and in or out");
+		return;
+	}
+	if (!hull_msg_find(body, "impairment", &value) ||
+	    (wrong = impairment_of(body, &value, &impairment)) != NULL) {
+		send_error(c, ch, wrong != NULL ? wrong : "impair carries an impairment");
+		return;
+	}
+	if (hull_segment_impair(name, strcmp(machine, "*") == 0 ? NULL : machine,
+	                        strcmp(direction, "in") == 0 ? HULL_SEGMENT_IN : HULL_SEGMENT_OUT,
+	                        &impairment, why, sizeof why) != 0) {
+		send_error(c, ch, why);
+		return;
+	}
+	send_simple(c, "(4:done", ch);
+}
+
+static void handle_segment(client *c, uint32_t ch, const hull_sexpr_doc *body)
+{
+	static const char *const names[] = { "bytes", "corrupted", "duplicated", "frames", "full",
+	                                     "lost", "overflow", "passed", "passed_bytes",
+	                                     "too_big" };
+	static hull_segment_counts counts[64];
+	hull_sexpr_form value;
+	hull_msg        m = { 0 };
+	char            name[512];
+	int             n;
+
+	if (!hull_msg_find(body, "name", &value) ||
+	    !hull_msg_string(body, &value, name, sizeof name)) {
+		send_error(c, ch, "segment names a segment");
+		return;
+	}
+	n = hull_segment_counts_of(name, counts, sizeof counts / sizeof counts[0]);
+	if (n < 0) {
+		send_error(c, ch, "no machine is on that segment");
+		return;
+	}
+	hull_msg_raw(&m, "(5:ports");
+	hull_msg_channel(&m, ch);
+	for (int i = 0; i < n; i++) {
+		/* Sorted as A.1 sorts: in, machine, out, and each way's
+		 * counts by name. */
+		for (int part = 0; part < 3; part++) {
+			const hull_segment_count *w;
+			uint64_t                  of[10];
+
+			if (part == 0)
+				hull_msg_raw(&m, "(4:port");
+			if (part == 1) {
+				hull_msg_raw(&m, "(7:machine");
+				hull_msg_text(&m, counts[i].machine);
+				hull_msg_raw(&m, ")");
+				continue;
+			}
+			w = &counts[i].way[part == 0 ? HULL_SEGMENT_IN : HULL_SEGMENT_OUT];
+			of[0] = w->bytes;
+			of[1] = w->corrupted;
+			of[2] = w->duplicated;
+			of[3] = w->frames;
+			of[4] = w->full;
+			of[5] = w->lost;
+			of[6] = w->overflow;
+			of[7] = w->passed;
+			of[8] = w->passed_bytes;
+			of[9] = w->too_big;
+			hull_msg_raw(&m, part == 0 ? "(2:in" : "(3:out");
+			for (unsigned k = 0u; k < 10u; k++) {
+				hull_msg_raw(&m, "(");
+				hull_msg_text(&m, names[k]);
+				hull_msg_number(&m, (long long)of[k]);
+				hull_msg_raw(&m, ")");
+			}
+			hull_msg_raw(&m, ")");
+		}
+		hull_msg_raw(&m, ")");
+	}
+	hull_msg_raw(&m, ")");
+	send_to(c, &m);
+}
+
 static void handle_list(client *c, uint32_t ch)
 {
 	hull_msg m = { 0 };
@@ -2084,6 +2283,10 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		handle_control(c, (uint32_t)ch, body, 0);
 	} else if (hull_msg_is(body, "kill")) {
 		handle_kill(c, (uint32_t)ch, body);
+	} else if (hull_msg_is(body, "segment")) {
+		handle_segment(c, (uint32_t)ch, body);
+	} else if (hull_msg_is(body, "impair")) {
+		handle_impair(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "stats")) {
 		handle_stats(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "gc")) {

@@ -2,7 +2,8 @@
  * segment_test.c -- core/segment.c's switch, through its ports alone, as
  * qemu's `-netdev stream` would use them: frames written with their
  * lengths, and what each port is given read back. Each wait for a frame
- * gives up after a second, and each wait for none after a tenth.
+ * gives up after a second, and each wait for none after a tenth; the
+ * impairments, then, the same way, with the switch's counts beside.
  */
 
 #define _GNU_SOURCE
@@ -12,6 +13,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "segment.h"
@@ -25,14 +27,55 @@ static void fail(const char *what, const char *detail)
 	printf("FAIL %s: %s\n", what, detail);
 }
 
-static int port(const char *key)
+static int port_of(const char *key, const char *machine)
 {
 	char why[256] = "";
-	int  fd = hull_segment_port(key, why, sizeof why);
+	int  fd = hull_segment_port(key, machine, why, sizeof why);
 
 	if (fd < 0)
 		fail("a port", why);
 	return fd;
+}
+
+static int port(const char *key)
+{
+	return port_of(key, "m");
+}
+
+static void impair(const char *key, const char *machine, int direction, const hull_impairment *m)
+{
+	char why[256] = "";
+
+	if (hull_segment_impair(key, machine, direction, m, why, sizeof why) != 0)
+		fail("an impairment", why);
+}
+
+/* `machine`'s counts on `key`, one way. */
+static hull_segment_count counted(const char *key, const char *machine, int direction)
+{
+	hull_segment_counts counts[8];
+	hull_segment_count  none = { 0 };
+	int                 n = hull_segment_counts_of(key, counts, 8u);
+
+	for (int i = 0; i < n; i++)
+		if (strcmp(counts[i].machine, machine) == 0)
+			return counts[i].way[direction];
+	return none;
+}
+
+static void check(const char *what, int ok)
+{
+	cases++;
+	if (!ok)
+		fail(what, "no");
+}
+
+static uint64_t ms_now(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
 }
 
 /* A frame from `source` to `destination`, its payload `tag`, framed. */
@@ -98,6 +141,39 @@ static void expect(const char *what, int fd, char want)
 		         want != 0 ? want : '-');
 		fail(what, detail);
 	}
+}
+
+/* Which of `n` frames from `from` reach `to` with `seed` and `loss`, as a
+ * pattern of bits, on a segment of their own. */
+static uint64_t pattern(const char *key, uint64_t seed, double loss, unsigned n)
+{
+	hull_impairment m = { 0 };
+	uint64_t        got = 0u;
+	int             from = port_of(key, "from");
+	int             to = port_of(key, "to");
+
+	m.loss = loss;
+	m.seed = seed;
+	impair(key, "from", HULL_SEGMENT_OUT, &m);
+	for (unsigned i = 0u; i < n; i++)
+		send_frame(from, 0xffu, 1u, (char)('A' + i % 26u));
+	for (unsigned i = 0u; i < n; i++) {
+		char tag;
+
+		/* What reaches `to` arrives in order; each one sent either
+		 * came or did not. */
+		if ((tag = next_tag(to, 100)) == 0)
+			break;
+		for (unsigned k = i; k < n; k++)
+			if ((char)('A' + k % 26u) == tag) {
+				got |= 1ull << k;
+				i = k;
+				break;
+			}
+	}
+	close(from);
+	close(to);
+	return got;
 }
 
 int main(void)
@@ -173,6 +249,210 @@ int main(void)
 	close(c);
 	close(d);
 	close(other);
+
+	/* --- impairments, each on a segment of its own --- */
+	{
+		hull_impairment m = { 0 };
+		char            why[256] = "";
+
+		cases++;
+		if (hull_segment_impair("nowhere", NULL, HULL_SEGMENT_OUT, &m, why, sizeof why) == 0)
+			fail("an impairment of no segment", "was taken");
+	}
+	{
+		/* Loss of 1 on one way drops every frame there, counted, and
+		 * leaves the other way a wire. */
+		hull_impairment m = { 0 };
+		int             x = port_of("lossy", "x");
+		int             y = port_of("lossy", "y");
+
+		m.loss = 1.0;
+		impair("lossy", "x", HULL_SEGMENT_OUT, &m);
+		send_frame(x, 0xffu, 1u, 'X');
+		expect("loss 1, nothing to y", y, 0);
+		send_frame(y, 0xffu, 2u, 'Y');
+		expect("loss 1 one way, the other a wire", x, 'Y');
+		check("loss counted out of x", counted("lossy", "x", HULL_SEGMENT_OUT).lost == 1u &&
+		      counted("lossy", "x", HULL_SEGMENT_OUT).frames == 1u &&
+		      counted("lossy", "x", HULL_SEGMENT_OUT).passed == 0u);
+		check("y's way out counted", counted("lossy", "y", HULL_SEGMENT_OUT).passed == 1u &&
+		      counted("lossy", "y", HULL_SEGMENT_OUT).bytes == 15u &&
+		      counted("lossy", "x", HULL_SEGMENT_IN).passed == 1u);
+		/* Changed during the run: a wire again. */
+		memset(&m, 0, sizeof m);
+		impair("lossy", "x", HULL_SEGMENT_OUT, &m);
+		send_frame(x, 0xffu, 1u, 'H');
+		expect("a link healed", y, 'H');
+		/* Down on y's way in: a cut, every frame to it dropped. */
+		m.down = 1;
+		impair("lossy", "y", HULL_SEGMENT_IN, &m);
+		send_frame(x, 0xffu, 1u, 'D');
+		expect("down, nothing to y", y, 0);
+		check("down counted as lost into y", counted("lossy", "y", HULL_SEGMENT_IN).lost == 1u &&
+		      counted("lossy", "x", HULL_SEGMENT_OUT).passed == 2u);
+		close(x);
+		close(y);
+	}
+	{
+		/* Every machine's rule, a machine's own over it, and a port
+		 * that joins later taking the rule. */
+		hull_impairment cut = { 0 };
+		hull_impairment wire = { 0 };
+		int             x = port_of("ruled", "x");
+		int             y;
+
+		cut.down = 1;
+		impair("ruled", NULL, HULL_SEGMENT_IN, &cut);
+		impair("ruled", "x", HULL_SEGMENT_IN, &wire);
+		y = port_of("ruled", "y");
+		send_frame(y, 0xffu, 2u, 'R');
+		expect("a machine's own rule over every machine's", x, 'R');
+		send_frame(x, 0xffu, 1u, 'J');
+		expect("a port joining later takes every machine's rule", y, 0);
+		close(x);
+		close(y);
+	}
+	{
+		/* A frame longer than the mtu after its header, dropped. */
+		hull_impairment m = { 0 };
+		int             x = port_of("narrow", "x");
+		int             y = port_of("narrow", "y");
+
+		m.mtu = 1u;
+		impair("narrow", "y", HULL_SEGMENT_IN, &m);
+		send_frame(x, 0xffu, 1u, 'M');
+		expect("a frame inside the mtu", y, 'M');
+		{
+			uint8_t data[64];
+			size_t  length = frame(data, 0xffu, 1u, 'T');
+
+			/* Two bytes of payload: one past the mtu. */
+			data[3] = (uint8_t)(data[3] + 1u);
+			data[length] = 'u';
+			if (write(x, data, length + 1u) != (ssize_t)(length + 1u))
+				fail("a write", strerror(errno));
+		}
+		expect("a frame past the mtu, dropped", y, 0);
+		check("too big counted", counted("narrow", "y", HULL_SEGMENT_IN).too_big == 1u);
+		close(x);
+		close(y);
+	}
+	{
+		/* Duplicate 1: two of each. Corrupt 1: the payload's bit
+		 * flipped, the frame still at its port. */
+		hull_impairment m = { 0 };
+		int             x = port_of("noisy", "x");
+		int             y = port_of("noisy", "y");
+
+		m.duplicate = 1.0;
+		impair("noisy", "x", HULL_SEGMENT_OUT, &m);
+		send_frame(x, 0xffu, 1u, 'W');
+		expect("duplicate 1, the first", y, 'W');
+		expect("duplicate 1, the second", y, 'W');
+		expect("duplicate 1, no third", y, 0);
+		memset(&m, 0, sizeof m);
+		m.corrupt = 1.0;
+		impair("noisy", "x", HULL_SEGMENT_OUT, &m);
+		send_frame(x, 0xffu, 1u, 'C');
+		{
+			char tag = next_tag(y, 1000);
+
+			check("corrupt 1, a bit of the payload flipped",
+			      tag != 0 && tag != 'C' && __builtin_popcount((unsigned)(uint8_t)(tag ^ 'C')) == 1);
+		}
+		check("duplicated and corrupted counted",
+		      counted("noisy", "x", HULL_SEGMENT_OUT).duplicated == 1u &&
+		      counted("noisy", "x", HULL_SEGMENT_OUT).corrupted == 1u);
+		close(x);
+		close(y);
+	}
+	{
+		/* Delay: held 300 ms. With reorder 1 a frame is not held, and
+		 * overtakes. A limit of 1 drops the second held frame. */
+		hull_impairment m = { 0 };
+		int             x = port_of("slow", "x");
+		int             y = port_of("slow", "y");
+		uint64_t        sent;
+		char            tag;
+
+		m.delay_ms = 300u;
+		impair("slow", "x", HULL_SEGMENT_OUT, &m);
+		sent = ms_now();
+		send_frame(x, 0xffu, 1u, 'S');
+		expect("a delay of 300 ms, not within 100", y, 0);
+		tag = next_tag(y, 1000);
+		check("a delay of 300 ms, then the frame", tag == 'S' && ms_now() - sent >= 290u);
+		m.reorder = 1.0;
+		impair("slow", "x", HULL_SEGMENT_OUT, &m);
+		send_frame(x, 0xffu, 1u, 'O');
+		/* Within a tenth, where a held frame is three tenths behind. */
+		check("reorder 1, not held", next_tag(y, 100) == 'O');
+		memset(&m, 0, sizeof m);
+		m.delay_ms = 300u;
+		m.limit = 1u;
+		impair("slow", "x", HULL_SEGMENT_OUT, &m);
+		send_frame(x, 0xffu, 1u, '1');
+		send_frame(x, 0xffu, 1u, '2');
+		expect("a limit of 1, the first held frame", y, '1');
+		expect("a limit of 1, the second dropped", y, 0);
+		check("overflow counted", counted("slow", "x", HULL_SEGMENT_OUT).overflow == 1u);
+		close(x);
+		close(y);
+	}
+	{
+		/* A rate: 8000 bits a second, 15 bytes a frame, 15 ms each, so
+		 * the tenth of ten sent at once is at least 135 ms behind. */
+		hull_impairment m = { 0 };
+		int             x = port_of("thin", "x");
+		int             y = port_of("thin", "y");
+		uint64_t        sent;
+		unsigned        got = 0u;
+
+		m.rate = 8000u;
+		impair("thin", "x", HULL_SEGMENT_OUT, &m);
+		sent = ms_now();
+		for (unsigned i = 0u; i < 10u; i++)
+			send_frame(x, 0xffu, 1u, (char)('a' + i));
+		while (got < 10u && next_tag(y, 1000) != 0)
+			got++;
+		check("a rate: ten frames, the last at least 135 ms on",
+		      got == 10u && ms_now() - sent >= 130u);
+		close(x);
+		close(y);
+	}
+	{
+		/* netem's Gilbert-Elliott: with p 1 and r 0, the first frame
+		 * finds the good state and passes, and the model is then bad
+		 * for good, losing every frame with 1-h of 1. */
+		hull_impairment m = { 0 };
+		int             x = port_of("bursty", "x");
+		int             y = port_of("bursty", "y");
+
+		m.gemodel = 1;
+		m.p = 1.0;
+		m.r = 0.0;
+		m.bad_loss = 1.0;
+		impair("bursty", "x", HULL_SEGMENT_OUT, &m);
+		send_frame(x, 0xffu, 1u, 'g');
+		send_frame(x, 0xffu, 1u, 'b');
+		send_frame(x, 0xffu, 1u, 'c');
+		expect("gemodel, the good state's frame", y, 'g');
+		expect("gemodel, the bad state's, lost", y, 0);
+		check("gemodel, two lost", counted("bursty", "x", HULL_SEGMENT_OUT).lost == 2u);
+		close(x);
+		close(y);
+	}
+	{
+		/* Seeded: the same seed loses the same frames; another seed,
+		 * other ones. */
+		uint64_t first = pattern("seeded1", 7u, 0.5, 26u);
+		uint64_t again = pattern("seeded2", 7u, 0.5, 26u);
+		uint64_t other = pattern("seeded3", 8u, 0.5, 26u);
+
+		check("a seed's losses, again the same", first == again);
+		check("a seed's losses, some and not all", first != 0u && first != (1ull << 26) - 1u);
+		check("another seed's losses, other ones", first != other);
+	}
 	printf("segment: %u cases, %u failed\n", cases, failures);
 	return failures != 0;
 }

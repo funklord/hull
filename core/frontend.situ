@@ -30,6 +30,8 @@ const KILL     = ('4' << 24) | (':' << 16) | ('k' << 8) | 'i';
 const STATS    = ('5' << 24) | (':' << 16) | ('s' << 8) | 't';  // both ways
 const GC       = ('2' << 24) | (':' << 16) | ('g' << 8) | 'c';
 const DIAL     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'i';
+const SEGMENT  = ('7' << 24) | (':' << 16) | ('s' << 8) | 'e';
+const IMPAIR   = ('6' << 24) | (':' << 16) | ('i' << 8) | 'm';
 const STARTED  = ('7' << 24) | (':' << 16) | ('s' << 8) | 't';
 const DATA     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'a';
 const EXITED   = ('6' << 24) | (':' << 16) | ('e' << 8) | 'x';
@@ -39,6 +41,7 @@ const DONE     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'o';
 const CREDIT   = ('6' << 24) | (':' << 16) | ('c' << 8) | 'r';
 const LOST     = ('4' << 24) | (':' << 16) | ('l' << 8) | 'o';  // LOGS's, the other way
 const ERROR    = ('5' << 24) | (':' << 16) | ('e' << 8) | 'r';
+const PORTS    = ('5' << 24) | (':' << 16) | ('p' << 8) | 'o';
 
 // --- what a frontend sends ----------------------------------------------------
 
@@ -59,6 +62,8 @@ struct client_message {
 		case STATS:   stats         stats;
 		case GC:      gc            gc;
 		case DIAL:    dial          dial;
+		case SEGMENT: segment       segment;
+		case IMPAIR:  impair        impair;
 		case DATA:    client_data   data;
 		case EOF:     eof           eof;
 		case CREDIT:  credit        credit;
@@ -234,6 +239,33 @@ struct stats {
 	u8  close  [must_eq = ')'];
 }
 
+// A segment's ports and what each has counted, each way, answered
+// `ports` (project.md Appendix D).
+struct segment {
+	preamble u8[9] = "7:segment";
+	channel  ch;
+	preamble u8[7] = "(4:name";
+	atom  name;
+	preamble u8[2] = "))";
+}
+
+// One direction, `in` or `out`, of the ports a machine has on a segment,
+// or every machine's where the machine is `*`, given an impairment in
+// netem's terms, replacing what it had; answered `done`. Its entries are
+// `(key value)`, and `(gemodel p r 1-h 1-k)`, which the core checks.
+struct impair {
+	preamble u8[8] = "6:impair";
+	channel        ch;
+	preamble u8[12] = "(9:direction";
+	atom  direction;
+	preamble u8[15] = ")(10:impairment";
+	form  entries[]  until ")";
+	machine_entry  machine;
+	preamble u8[7] = "(4:name";
+	atom  name;
+	preamble u8[2] = "))";
+}
+
 // An exec's stdin: always fd 0.
 struct client_data {
 	preamble u8[12] = "4:data(3:buf";
@@ -274,6 +306,7 @@ struct core_message {
 		case CREDIT:    credit      credit;
 		case LOST:      lost        lost;
 		case STATS:     measured    stats;
+		case PORTS:     ports       ports;
 		case ERROR:     failure     error;
 		default:        unknown     unknown;
 	}
@@ -390,6 +423,13 @@ struct measured {
 	preamble u8[2] = "))";
 }
 
+// `segment`'s answer: each port, its machine, and its counts out and in.
+struct ports {
+	preamble u8[7] = "5:ports";
+	channel  ch;
+	form     items[]  until ")";
+}
+
 // A request carried out, where there is nothing more to say: `stop`.
 struct done {
 	preamble u8[6] = "4:done";
@@ -450,5 +490,7 @@ struct machine_entry {
 // - that a machine id is a DNS label (section 4.10), and a plan one
 //   hull_plan_build() would write;
 // - that the numbers are minimal decimal;
+// - an impairment's entries and each port of `ports`, which situ frames
+//   and does not read, and that a direction is in or out;
 // - the elements of a run -- each `listed` of `machines`, the plan's
 //   entries in `run` -- which situ frames and does not read.

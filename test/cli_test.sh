@@ -1084,6 +1084,41 @@ grep -q '^hear=over the wire from 52:54:00:' "$root/chearer.out" ||
 cases=$((cases + 1))
 grep -q '^hear=nothing$' "$root/cloner.out" ||
 	fail "a chroot machine on another segment heard something" "$(cat "$root/cloner.out")"
+# Impairment in the switch, changed during a run: a hearer and a shouter
+# on one segment, the shouter's way out cut before it shouts, its frames
+# counted lost, then healed, so a later shout is heard and answered.
+cut="cut-$$"
+printf '(machines (hearer %s) (shouter %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (network none) (segments \"$cut\") (command \"/probe\" \"link\" \"eth0\" \"hear\" \"eth0\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (network none) (segments \"$cut\") (command \"/probe\" \"link\" \"eth0\" \"sleep\" \"3\" \"shout\" \"eth0\" \"through\")" \
+	> "$root/cut.conf"
+(cd / && exec timeout 60 "$whole_hull" run -f "$root/cut.conf" > "$root/cut.out" 2>&1) &
+cutrun=$!
+cases=$((cases + 1))
+tries=0
+until "$hull" segment "$cut" impair shouter out loss=1 2> "$root/impair.err"; do
+	tries=$((tries + 1))
+	[ "$tries" -lt 40 ] || break
+	sleep 0.25
+done
+[ "$tries" -lt 40 ] || fail "a segment's impairment could not be set" "$(cat "$root/impair.err")"
+cases=$((cases + 1))
+tries=0
+until "$hull" segment "$cut" > "$root/counts.out" 2>&1 &&
+	grep -Eq '^shouter +out frames=[1-9][0-9]* .* lost=[1-9]' "$root/counts.out"; do
+	tries=$((tries + 1))
+	[ "$tries" -lt 60 ] || break
+	sleep 0.25
+done
+[ "$tries" -lt 60 ] || fail "a cut link's frames were not counted lost" "$(cat "$root/counts.out")"
+expect 0 '' "$hull" segment "$cut" impair shouter out
+wait "$cutrun"
+cases=$((cases + 1))
+grep -q '^shouter | shout=answered$' "$root/cut.out" && grep -q '^hearer  | hear=through from 52:54:00:' "$root/cut.out" ||
+	fail "a healed link was not heard across" "$(cat "$root/cut.out")"
+expect 1 'no machine is on that segment' "$hull" segment "nowhere-$$"
+expect 2 'is not an impairment' "$hull" segment "nowhere-$$" impair all in wobble=1
+expect 2 'a direction is in, out or both' "$hull" segment "nowhere-$$" impair all sideways
 conf csegment "(segments \"$wire\")" '(command "/probe" "say" "never")'
 from_root 125 'a chroot machine on a segment has a network of its own' -f "$root/csegment.conf"
 # Where the host gives the user no subordinate range, one uid is mapped

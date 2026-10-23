@@ -100,6 +100,7 @@ static void usage(FILE *out)
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
 	      "       hull kill [-s SIGNAL] ID | hull stats [--over S] ID\n"
+	      "       hull segment NAME [impair MACHINE|all in|out|both [KEY=VALUE|down]...]\n"
 	      "       hull ssh ID | hull proxy-ssh HOST\n"
 	      "       hull ssh-config [--remove] | hull gc\n"
 	      "       hull commit [--arch A] DIR REF | hull commit --tar FILE REF\n"
@@ -3577,6 +3578,246 @@ static int stats_of(const char *id, long over)
 	return 0;
 }
 
+/* --- segments ------------------------------------------------------------ */
+
+/* The atom `text`, as a canonical s-expression writes it. */
+static void msg_entry(hull_msg *m, const char *key, const char *value)
+{
+	hull_msg_raw(m, "(");
+	hull_msg_text(m, key);
+	if (value != NULL)
+		hull_msg_text(m, value);
+	hull_msg_raw(m, ")");
+}
+
+/* netem's names, as `KEY=VALUE` words, into an impairment's entries,
+ * sorted as a canonical form's are. 0, or 2 having said why. */
+static int impairment_words(int argc, char **argv, hull_msg *m)
+{
+	static const char *const keys[] = { "corrupt", "delay", "down", "duplicate", "gemodel",
+	                                    "jitter", "limit", "loss", "mtu", "rate", "reorder",
+	                                    "seed" };
+	const char *given[sizeof keys / sizeof keys[0]] = { NULL };
+
+	for (int i = 0; i < argc; i++) {
+		const char *equals = strchr(argv[i], '=');
+		size_t      length = equals != NULL ? (size_t)(equals - argv[i]) : strlen(argv[i]);
+		unsigned    k;
+
+		for (k = 0u; k < sizeof keys / sizeof keys[0]; k++)
+			if (strlen(keys[k]) == length && strncmp(keys[k], argv[i], length) == 0)
+				break;
+		if (k == sizeof keys / sizeof keys[0] || (equals == NULL) != (strcmp(keys[k], "down") == 0)) {
+			fprintf(stderr, "hull: segment: %s is not an impairment: down, or one of loss, "
+			        "gemodel, delay, jitter, reorder, duplicate, corrupt, rate, limit, mtu "
+			        "and seed with =VALUE\n", argv[i]);
+			return 2;
+		}
+		given[k] = equals != NULL ? equals + 1 : "true";
+	}
+	for (unsigned k = 0u; k < sizeof keys / sizeof keys[0]; k++) {
+		char        values[4][32];
+		const char *at = given[k];
+		unsigned    count = 0u;
+
+		if (at == NULL)
+			continue;
+		/* gemodel=p[,r[,1-h[,1-k]]], with netem's defaults: r is 1-p,
+		 * 1-h is 1 and 1-k is 0. */
+		if (strcmp(keys[k], "gemodel") != 0) {
+			msg_entry(m, keys[k], at);
+			continue;
+		}
+		while (count < 4u && *at != '\0') {
+			size_t length = strcspn(at, ",");
+
+			if (length == 0u || length >= sizeof values[0])
+				break;
+			memcpy(values[count], at, length);
+			values[count++][length] = '\0';
+			at += length + (at[length] == ',' ? 1u : 0u);
+		}
+		if (count == 0u || *at != '\0') {
+			fprintf(stderr, "hull: segment: gemodel is p[,r[,1-h[,1-k]]]\n");
+			return 2;
+		}
+		if (count < 2u)
+			snprintf(values[1], sizeof values[1], "%.17g", 1.0 - strtod(values[0], NULL));
+		if (count < 3u)
+			snprintf(values[2], sizeof values[2], "1");
+		if (count < 4u)
+			snprintf(values[3], sizeof values[3], "0");
+		hull_msg_raw(m, "(7:gemodel");
+		for (unsigned v = 0u; v < 4u; v++)
+			hull_msg_text(m, values[v]);
+		hull_msg_raw(m, ")");
+	}
+	return 0;
+}
+
+/* The core's `done` or `error` for a request on channel 1: 0, or 1 said. */
+static int answered(hull_wire *wire)
+{
+	hull_sexpr_doc  body;
+	hull_sexpr_form value;
+	char            reason[512] = "an error";
+
+	if (hull_wire_read(wire, &body) != HULL_WIRE_OK) {
+		fprintf(stderr, "hull: the core went away\n");
+		return 1;
+	}
+	if (hull_msg_is(&body, "done"))
+		return 0;
+	if (hull_msg_find(&body, "reason", &value))
+		hull_msg_string(&body, &value, reason, sizeof reason);
+	fprintf(stderr, "hull: %s\n", reason);
+	return 1;
+}
+
+/* One way of a port as `ports` gives it: its counts, named, in the order
+ * printed. */
+static void print_way(const hull_sexpr_doc *body, const hull_sexpr_form *way, const char *machine,
+                      const char *direction)
+{
+	static const char *const counts[] = { "frames", "bytes", "passed", "passed_bytes", "lost",
+	                                      "too_big", "overflow", "full", "duplicated",
+	                                      "corrupted" };
+	hull_sexpr_form item;
+	int             more;
+
+	printf("%-20s %-3s", machine, direction);
+	for (unsigned k = 0u; k < sizeof counts / sizeof counts[0]; k++) {
+		long long n = 0;
+
+		hull_sexpr_child(body, way, &item);
+		for (more = hull_sexpr_next(body, &item, &item); more;
+		     more = hull_sexpr_next(body, &item, &item)) {
+			hull_sexpr_form name;
+			hull_sexpr_form value;
+
+			if (item.kind == HULL_SEXPR_LIST && hull_sexpr_child(body, &item, &name) &&
+			    hull_sexpr_is(body, &name, counts[k]) && hull_sexpr_next(body, &name, &value))
+				hull_msg_long(body, &value, &n);
+		}
+		printf(" %s=%lld", counts[k], n);
+	}
+	printf("\n");
+}
+
+/* `hull segment NAME`: each port's counts, a line each way. `hull segment
+ * NAME impair MACHINE|all in|out|both [KEY=VALUE|down]...`: that impairment,
+ * in netem's terms, for those ports' directions, replacing theirs; with no
+ * words, a wire. */
+static int segment_command(int argc, char **argv)
+{
+	hull_wire       wire;
+	hull_sexpr_doc  body;
+	hull_sexpr_form message;
+	hull_sexpr_form item;
+	int             status;
+	int             more;
+
+	if (argc < 3 || (argc > 3 && (strcmp(argv[3], "impair") != 0 || argc < 6))) {
+		usage(stderr);
+		return 2;
+	}
+	if (argc > 3 && strcmp(argv[5], "in") != 0 && strcmp(argv[5], "out") != 0 &&
+	    strcmp(argv[5], "both") != 0) {
+		fprintf(stderr, "hull: segment: a direction is in, out or both\n");
+		return 2;
+	}
+	if ((status = connect_core(&wire, 0)) != 0) {
+		if (status == 1)
+			fprintf(stderr, "hull: no core is running, so no machine is on a segment\n");
+		return status == 1 ? 1 : 2;
+	}
+	if (argc > 3) {
+		static const char *const directions[] = { "in", "out" };
+
+		for (unsigned d = 0u; d < 2u && status == 0; d++) {
+			hull_msg m = { 0 };
+
+			if (strcmp(argv[5], "both") != 0 && strcmp(argv[5], directions[d]) != 0)
+				continue;
+			hull_msg_raw(&m, "(6:impair");
+			hull_msg_channel(&m, 1u);
+			msg_entry(&m, "direction", directions[d]);
+			hull_msg_raw(&m, "(10:impairment");
+			status = impairment_words(argc - 6, argv + 6, &m);
+			hull_msg_raw(&m, ")");
+			msg_entry(&m, "machine", strcmp(argv[4], "all") == 0 ? "*" : argv[4]);
+			msg_entry(&m, "name", argv[2]);
+			hull_msg_raw(&m, ")");
+			if (status == 0 && (m.failed || hull_wire_send(wire.fd, &m) != 0))
+				status = 1;
+			hull_msg_free(&m);
+			if (status == 0)
+				status = answered(&wire);
+		}
+		hull_wire_close(&wire);
+		return status;
+	}
+	{
+		hull_msg m = { 0 };
+
+		hull_msg_raw(&m, "(7:segment");
+		hull_msg_channel(&m, 1u);
+		msg_entry(&m, "name", argv[2]);
+		hull_msg_raw(&m, ")");
+		status = m.failed || hull_wire_send(wire.fd, &m) != 0;
+		hull_msg_free(&m);
+	}
+	if (status != 0 || hull_wire_read(&wire, &body) != HULL_WIRE_OK) {
+		hull_wire_close(&wire);
+		fprintf(stderr, "hull: the core went away\n");
+		return 1;
+	}
+	if (!hull_msg_is(&body, "ports")) {
+		hull_sexpr_form value;
+		char            reason[512] = "an error";
+
+		if (hull_msg_find(&body, "reason", &value))
+			hull_msg_string(&body, &value, reason, sizeof reason);
+		fprintf(stderr, "hull: %s\n", reason);
+		hull_wire_close(&wire);
+		return 1;
+	}
+	hull_sexpr_first(&body, &message);
+	hull_sexpr_child(&body, &message, &item);
+	for (more = hull_sexpr_next(&body, &item, &item); more;
+	     more = hull_sexpr_next(&body, &item, &item)) {
+		hull_sexpr_form name;
+		hull_sexpr_form field;
+		hull_sexpr_form ways[2];
+		char            machine[64] = "?";
+		int             found = 0;
+
+		if (item.kind != HULL_SEXPR_LIST || !hull_sexpr_child(&body, &item, &name) ||
+		    !hull_sexpr_is(&body, &name, "port"))
+			continue;
+		for (int go = hull_sexpr_next(&body, &name, &field); go;
+		     go = hull_sexpr_next(&body, &field, &field)) {
+			hull_sexpr_form key;
+			hull_sexpr_form value;
+
+			if (field.kind != HULL_SEXPR_LIST || !hull_sexpr_child(&body, &field, &key))
+				continue;
+			if (hull_sexpr_is(&body, &key, "machine") && hull_sexpr_next(&body, &key, &value))
+				hull_msg_string(&body, &value, machine, sizeof machine);
+			else if (hull_sexpr_is(&body, &key, "out"))
+				ways[0] = field, found |= 1;
+			else if (hull_sexpr_is(&body, &key, "in"))
+				ways[1] = field, found |= 2;
+		}
+		if (found & 1)
+			print_way(&body, &ways[0], machine, "out");
+		if (found & 2)
+			print_way(&body, &ways[1], machine, "in");
+	}
+	hull_wire_close(&wire);
+	return 0;
+}
+
 /* stop, kill, logs and attach: one request about one machine, followed
  * to its end. A Ctrl-C under attach or logs only leaves. `signal_name`
  * is kill's, a name the core checks. */
@@ -3795,6 +4036,8 @@ int main(int argc, char **argv)
 		return about(command, id, follow, timeout < 0 ? 0 : timeout, signal_name);
 	}
 
+	if (strcmp(command, "segment") == 0)
+		return segment_command(argc, argv);
 	if (strcmp(command, "stats") == 0 && argc == 3 && argv[2][0] != '-')
 		return stats_of(argv[2], 0);
 	if (strcmp(command, "stats") == 0 && argc == 5 && strcmp(argv[2], "--over") == 0 &&
