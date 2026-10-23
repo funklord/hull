@@ -210,7 +210,9 @@ Ownership: a single-uid tree — the common case for a service rootfs — needs 
 
 **Layers and a kept upper, designed 2026-10-23 at the holder's asking, built after §7's build owners:** a read-only template with more read-only layers over it, and the machine's writes kept in a directory of the user's that may hold files of its own, as unionfs did and overlayfs, its successor in the kernel, does.
 
-```scheme
+Designed keys, not yet the spec's, so a plain block rather than a ```scheme one, which `test/spec_test.c` holds to the spec:
+
+```
 (machine
   (source "dir:./template")              ; the lowest layer, read-only
   (layers "dir:./site" "dir:./extra")    ; each above the last, read-only
