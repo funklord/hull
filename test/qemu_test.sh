@@ -81,6 +81,16 @@ has() {
 
 # address_of ID: section 8.1's address, worked here rather than taken
 # from the core: FNV-1a of the id, modulo 256 * 254, as x * 254 + y - 1.
+xcase() { # STATUS PATTERN COMMAND...: an exec, as has() checks a boot
+	want=$1
+	pattern=$2
+	shift 2
+	name="exec $*"
+	out=$(timeout 30 "$@" 2>&1)
+	got=$?
+	has "$want" "$pattern"
+}
+
 address_of() {
 	python3 -c '
 import sys
@@ -286,8 +296,10 @@ conf loner "(backend vm) (mutable overlay) (hostname \"loner\") (segments \"else
 # its qemu has, which it does only if the core keeps no end of its own.
 # A chroot machine that waits holds the core meanwhile, which would
 # otherwise leave a second after the last machine, and be counted gone.
+# Its ceiling is well above the cases' own: at a load of 212 they outlived
+# its 120 s, and the core idled out before its descriptors were counted.
 conf anchor '(backend chroot) (hostname "anchor") (command "/probe" "say" "ready" "wait")'
-(cd / && exec timeout 120 "$hull" run -f "$root/anchor.conf" > "$root/anchor.out" 2>&1) &
+(cd / && exec timeout 300 "$hull" run -f "$root/anchor.conf" > "$root/anchor.out" 2>&1) &
 anchored=$!
 tries=0
 until grep -q '^ready$' "$root/anchor.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
@@ -428,6 +440,48 @@ has 0 '^read=No such file or directory$'
 cases=$((cases + 1))
 printf '%s\n' "$out" | grep -q '^read=No such file' && printf '%s\n' "$out" | grep -qv '^read=d' ||
 	fail "a second layered vm did not see what the first left" "$out"
+# A volume that is a stack of its own, at /stk, staged host-side as the
+# root's is and shared: the layer wins, writes and a whiteout in its upper
+# alone; with no upper its writes are memory; read-only, it is written to
+# by nothing.
+rm -rf "${root:?}/vdata" "${root:?}/.vdata.hull-work"
+mkdir -p "$root/vdata"
+printf 'c\n' > "$root/vdata/c"
+conf vstack '(backend vm) (mutable overlay)' \
+	"(volumes (volume (guest \"/stk\") (layers \"dir:$root/vtemplate\" \"dir:$root/vsite\") (upper \"$root/vdata\")))" \
+	'(command "/probe" "read" "/stk/a" "read" "/stk/c" "write" "/stk/d" "remove" "/stk/b")'
+name=vstack
+boot vstack
+has 0 '^read=site$'
+has 0 '^read=c$'
+has 0 '^remove=ok$'
+cases=$((cases + 1))
+[ "$(cat "$root/vtemplate/a")" = template ] && [ -e "$root/vsite/b" ] && [ -e "$root/vdata/d" ] &&
+	[ -c "$root/vdata/b" ] && [ ! -e "$root/rootfs/stk" ] ||
+	fail "a vm's stacked volume's writes did not land in its upper alone" \
+		"$(ls -la "$root/vtemplate" "$root/vsite" "$root/vdata" 2>&1)"
+# What overlayfs left in the work directory beside the upper, mode 000,
+# is given back to the user, who could not otherwise remove it.
+cases=$((cases + 1))
+[ -x "$root/.vdata.hull-work/work" ] ||
+	fail "a kept upper's work directory was left unremovable" "$(ls -la "$root/.vdata.hull-work" 2>&1)"
+conf vstackmem '(backend vm) (mutable overlay)' \
+	"(volumes (volume (guest \"/stk\") (layers \"dir:$root/vtemplate\" \"dir:$root/vsite\")))" \
+	'(command "/probe" "write" "/stk/e" "read" "/stk/a")'
+name=vstackmem
+boot vstackmem
+has 0 '^write=ok$'
+has 0 '^read=site$'
+cases=$((cases + 1))
+[ ! -e "$root/vtemplate/e" ] && [ ! -e "$root/vsite/e" ] && [ ! -e "$root/vdata/e" ] ||
+	fail "a vm's stacked volume's write in memory reached a disk" ""
+conf vstackro '(backend vm) (mutable overlay)' \
+	"(volumes (volume (guest \"/stk\") (layers \"dir:$root/vtemplate\" \"dir:$root/vsite\") (mode ro)))" \
+	'(command "/probe" "read" "/stk/a" "write" "/stk/f")'
+name=vstackro
+boot vstackro
+has 0 '^read=site$'
+has 0 '^write=Read-only file system$'
 rm -rf "${root:?}/vtemplate" "${root:?}/vsite" "${root:?}/vdata" "${root:?}/.vdata.hull-work"
 # A segment's port is the core's, so a machine on one cannot outlive it.
 conf keptseg "(backend vm) (on_disconnect keep) (segments \"$wire\")" '(command "/probe" "say" "no")'
@@ -873,15 +927,6 @@ conf execd '(backend vm) (hostname "qexec") (env (GREETING "hi")) (command "/pro
 (cd / && exec timeout -k 2 140 "$hull" run -f "$root/execd.conf" > /dev/null 2>&1) &
 execer=$!
 await qexec
-xcase() { # STATUS PATTERN COMMAND...: an exec, as has() checks a boot
-	want=$1
-	pattern=$2
-	shift 2
-	name="exec $*"
-	out=$(timeout 30 "$@" 2>&1)
-	got=$?
-	has "$want" "$pattern"
-}
 xcase 4 '^hello$' "$hull" exec qexec /probe say hello env GREETING host exit 4
 xcase 4 '^GREETING=hi$' "$hull" exec qexec /probe say hello env GREETING host exit 4
 xcase 4 '^host=qexec$' "$hull" exec qexec /probe say hello env GREETING host exit 4

@@ -191,6 +191,19 @@ static void test_records(void)
 	OK(M("(volumes (volume (host \"./data\") (guest \"/var/data\") (mode ro)))"));
 	NO(M("(volumes (volume (host \"./data\") (guest \"data\")))"), VALUE, "\"data\"",
 	   "machine.volumes.volume.guest");
+	/* A volume that is a stack of layers, 3.7. */
+	OK(M("(volumes (volume (guest \"/etc\") (layers \"dir:./t\" \"dir:./s\") (upper \"./d\")))"));
+	OK(M("(volumes (volume (guest \"/etc\") (layers \"dir:./t\" \"dir:./s\") (mode ro)))"));
+	NO(M("(volumes (volume (guest \"/etc\")))"), MISSING, "(volume ",
+	   "machine.volumes.volume");
+	NO(M("(volumes (volume (host \"./a\") (guest \"/etc\") (layers \"dir:./t\")))"), SHAPE,
+	   "(layers", "machine.volumes.volume.layers");
+	NO(M("(volumes (volume (host \"./a\") (guest \"/etc\") (upper \"./d\")))"), SHAPE,
+	   "(upper", "machine.volumes.volume.upper");
+	NO(M("(volumes (volume (guest \"/etc\") (layers \"dir:./t\") (upper \"./d\") (mode ro)))"),
+	   SHAPE, "(upper", "machine.volumes.volume.upper");
+	NO(M("(volumes (volume (guest \"/etc\") (layers)))"), SHAPE, "(layers)",
+	   "machine.volumes.volume.layers");
 	OK(M("(media (medium (type cdrom) (source \"dir:./cd\")))"));
 	NO(M("(media (medium (type cdrom) (source \"./cd\")))"), VALUE, "\"./cd\"",
 	   "machine.media.medium.source");

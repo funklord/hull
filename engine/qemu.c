@@ -71,6 +71,7 @@
 
 #include "access.h"
 #include "usage.h"
+#include "stack.h"
 #include "builtin.h"
 #include "wire.h"
 
@@ -113,6 +114,8 @@ struct hull_machine {
 	int              host_overlay; /* layers or an upper: the overlay is qemu's, the share it */
 	char            *volume_host[MAX_VOLUMES];
 	int              volume_readonly[MAX_VOLUMES];
+	hull_stack       volume_stack[MAX_VOLUMES];  /* a volume of (layers ...), or count 0 */
+	int              staged;     /* a volume is a stack: mounted host-side, as the root's */
 	unsigned         volume_count;
 	struct in_addr   address;                /* section 8.1's, the core's */
 	char             address_text[16];
@@ -279,6 +282,8 @@ static void release(hull_machine *m)
 	free(m->root);
 	for (unsigned i = 0u; i < m->volume_count; i++)
 		free(m->volume_host[i]);
+	for (unsigned i = 0u; i < m->volume_count; i++)
+		hull_stack_release(&m->volume_stack[i]);
 	for (unsigned i = 0u; i < m->segment_count; i++)
 		free(m->segment[i]);
 	for (unsigned i = 0u; i < m->layer_count; i++)
@@ -420,20 +425,34 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		hull_sexpr_child(doc, &entry, &item);
 		for (more = hull_sexpr_next(doc, &item, &item); more;
 		     more = hull_sexpr_next(doc, &item, &item)) {
-			char *host_path = hull_access_value(doc, &item, "host");
-			char *mode      = hull_access_value(doc, &item, "mode");
+			char       *host_path = hull_access_value(doc, &item, "host");
+			char       *mode      = hull_access_value(doc, &item, "mode");
+			const char *why;
 
 			if (m->volume_count == MAX_VOLUMES) {
 				free(host_path);
 				free(mode);
 				return "there are too many volumes";
 			}
-			m->volume_readonly[m->volume_count] = mode != NULL && strcmp(mode, "ro") == 0;
-			m->volume_host[m->volume_count] =
-			    host_path != NULL ? hull_access_path(doc, host_path) : NULL;
-			free(host_path);
+			unsigned    i = m->volume_count++;
+
+			m->volume_readonly[i] = mode != NULL && strcmp(mode, "ro") == 0;
 			free(mode);
-			if (m->volume_host[m->volume_count++] == NULL)
+			if ((why = hull_access_stack(doc, &item, m->volume_readonly[i],
+			                             &m->volume_stack[i])) != NULL) {
+				free(host_path);
+				return why;
+			}
+			/* A stack is shared from where it is staged, in the machine's
+			 * directory, which spawn() names. */
+			if (m->volume_stack[i].count > 0u) {
+				m->staged = 1;
+				free(host_path);
+				continue;
+			}
+			m->volume_host[i] = host_path != NULL ? hull_access_path(doc, host_path) : NULL;
+			free(host_path);
+			if (m->volume_host[i] == NULL)
 				return "a volume is missing its host path";
 		}
 	}
@@ -925,8 +944,6 @@ static const char *stage_overlay(const hull_machine *m)
 	size_t at;
 	int    tree;
 
-	if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
-		return "making mounts private";
 	if (chdir(m->dir) != 0 || mkdir("lower", 0700) != 0 || mkdir("merged", 0700) != 0)
 		return "its staging";
 	if ((tree = open_tree(AT_FDCWD, m->root, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC)) < 0 ||
@@ -1072,7 +1089,10 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 	argv[n++] = "-device";
 	argv[n++] = "virtio-9p-pci,fsdev=root,mount_tag=root";
 	for (unsigned i = 0u; i < m->volume_count; i++) {
-		escaped(path, sizeof path, m->volume_host[i]);
+		char staged[4300];
+
+		snprintf(staged, sizeof staged, "%s/v%u/merged", m->dir, i);
+		escaped(path, sizeof path, m->volume_stack[i].count > 0u ? staged : m->volume_host[i]);
 		snprintf(fsdev[i], sizeof fsdev[i], "local,id=v%u,path=%s,security_model=none%s", i,
 		         path, m->volume_readonly[i] ? ",readonly=on" : "");
 		snprintf(device[i], sizeof device[i], "virtio-9p-pci,fsdev=v%u,mount_tag=v%u", i, i);
@@ -1160,11 +1180,16 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 		 * systemd's mount units met first. Its devices are opened by the
 		 * user's own rights, groups included, which a user namespace
 		 * keeps; passt is outside it, by the descriptor above. */
-		if (unshare(CLONE_NEWUSER | (m->host_overlay ? CLONE_NEWNS : 0)) != 0 ||
+		if (unshare(CLONE_NEWUSER | (m->host_overlay || m->staged ? CLONE_NEWNS : 0)) != 0 ||
 		    !write_map("/proc/self/setgroups", "deny", 0u) ||
 		    !write_map("/proc/self/uid_map", "0 %u 1", (unsigned)uid) ||
 		    !write_map("/proc/self/gid_map", "0 %u 1", (unsigned)gid)) {
 			fprintf(stderr, "qemu-system-x86_64: a user namespace: %s\n", strerror(errno));
+			_exit(126);
+		}
+		if ((m->host_overlay || m->staged) &&
+		    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+			fprintf(stderr, "qemu-system-x86_64: making mounts private: %s\n", strerror(errno));
 			_exit(126);
 		}
 		if (m->host_overlay) {
@@ -1172,6 +1197,25 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 
 			if (failed != NULL) {
 				fprintf(stderr, "qemu-system-x86_64: the overlay: %s: %s\n", failed,
+				        strerror(errno));
+				_exit(126);
+			}
+		}
+		/* Each volume that is a stack, staged as the root's overlay is,
+		 * in v0, v1, ... of the machine's directory. */
+		for (unsigned i = 0u; i < m->volume_count; i++) {
+			char        at[4300];
+			const char *failed = NULL;
+
+			if (m->volume_stack[i].count == 0u)
+				continue;
+			snprintf(at, sizeof at, "%s/v%u", m->dir, i);
+			if (mkdir(at, 0700) != 0)
+				failed = "its staging";
+			if (failed == NULL)
+				failed = hull_stack_stage(&m->volume_stack[i], at);
+			if (failed != NULL) {
+				fprintf(stderr, "qemu-system-x86_64: volume %u: %s: %s\n", i, failed,
 				        strerror(errno));
 				_exit(126);
 			}
@@ -1561,6 +1605,12 @@ static void remove_files(const char *dir)
 	for (unsigned i = 1u; i <= MAX_VOLUMES; i++) {
 		snprintf(path, sizeof path, "%s/lower%u", dir, i);
 		rmdir(path);
+	}
+	/* And each volume's stack, staged in v0, v1, .... */
+	for (unsigned i = 0u; i < MAX_VOLUMES; i++) {
+		snprintf(path, sizeof path, "%s/v%u", dir, i);
+		if (access(path, F_OK) == 0)
+			hull_stack_unstage(path);
 	}
 	rmdir(dir);
 }
@@ -2073,6 +2123,11 @@ static hull_status qemu_destroy(hull_core *core, hull_machine *m, hull_error *er
 		pthread_mutex_unlock(&m->lock);
 		hull_wire_close(&m->wire);
 	}
+	/* The work directories overlayfs left, which the user could not
+	 * remove: its namespace, and so its mounts, are gone with it. */
+	hull_stack_unwork(m->upper_work);
+	for (unsigned i = 0u; i < m->volume_count; i++)
+		hull_stack_unwork(m->volume_stack[i].upper_work);
 	remove_dir(m);
 	release(m);
 	return HULL_OK;
@@ -2737,6 +2792,8 @@ static const hull_cap_entry entries[] = {
 	{ "env",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "hostname",           HULL_SUP_NATIVE,   NULL, NULL },
 	{ "volumes",            HULL_SUP_NATIVE,   "a 9p share each", NULL },
+	{ "volumes.layers",     HULL_SUP_NATIVE,
+	  "an overlay mounted host-side, in qemu's namespace, and shared", NULL },
 	{ "secrets",            HULL_SUP_NATIVE,
 	  "placed by the agent on a tmpfs under one at the machine's /run, which it must "
 	  "have", NULL },

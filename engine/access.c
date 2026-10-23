@@ -255,3 +255,41 @@ int hull_access_execute(char *const argv[], char *const envp[])
 	errno = denied ? EACCES : last;
 	return -1;
 }
+
+const char *hull_access_stack(const hull_sexpr_doc *doc, const hull_sexpr_form *volume,
+                              int readonly, hull_stack *stack)
+{
+	hull_sexpr_form entry;
+	hull_sexpr_form item;
+	char           *upper;
+
+	memset(stack, 0, sizeof *stack);
+	if (!hull_access_find(doc, volume, "layers", &entry))
+		return NULL;
+	hull_sexpr_child(doc, &entry, &item);
+	for (int more = hull_sexpr_next(doc, &item, &item); more;
+	     more = hull_sexpr_next(doc, &item, &item)) {
+		char *text = hull_access_text(doc, &item);
+
+		if (stack->count == HULL_STACK_MAX) {
+			free(text);
+			return "a volume has too many layers";
+		}
+		if (text == NULL || strncmp(text, "dir:", 4u) != 0) {
+			free(text);
+			return "a volume's layer is a dir: source";
+		}
+		stack->layer[stack->count] = hull_access_path(doc, text + 4);
+		free(text);
+		if (stack->layer[stack->count++] == NULL)
+			return "a volume's layer's path cannot be read";
+	}
+	stack->readonly = readonly;
+	if ((upper = hull_access_value(doc, volume, "upper")) != NULL) {
+		stack->upper = hull_access_path(doc, upper);
+		free(upper);
+		if (stack->upper == NULL || (stack->upper_work = hull_stack_work_of(stack->upper)) == NULL)
+			return "a volume's upper's path cannot be read";
+	}
+	return NULL;
+}

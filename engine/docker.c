@@ -1686,6 +1686,8 @@ static const hull_cap_entry entries[] = {
 	{ "ports",              HULL_SUP_NATIVE,
 	  "bound on the machine's address", NULL },
 	{ "volumes",            HULL_SUP_NATIVE,   NULL, NULL },
+	{ "volumes.layers",     HULL_SUP_REJECTED,
+	  "not yet: a stack of layers would be an overlay the daemon mounts", NULL },
 	{ "secrets",            HULL_SUP_NATIVE,
 	  "bound read-only from the core's tmpfs; one exposed is in the container's "
 	  "configuration too, where docker inspect shows it", NULL },

@@ -162,6 +162,10 @@ static void test_ids(void)
 	OK("(machine (source \"dir:.\") (ports (port (host 80) (guest 80)))"
 	   " (env (A \"b\")) (volumes (volume (host \"a\") (guest \"/b\"))))", &qemu, "vm",
 	   "source.dir.direct:n ports:e env:n volumes:n");
+	/* A volume that is a stack asks for that once, wherever it is. */
+	NO("(machine (source \"dir:.\") (volumes (volume (host \"a\") (guest \"/b\"))"
+	   " (volume (guest \"/c\") (layers \"dir:./t\")) (volume (guest \"/d\") (layers \"dir:./u\"))))",
+	   &qemu, "vm", "source.dir.direct:n volumes:n volumes.layers:r");
 	NO("(machine (source \"dir:.\") (security (readonly_root true) (no_new_privs false)"
 	   " (allow net_admin)))", &qemu, "vm",
 	   "source.dir.direct:n security.readonly_root:n security.allow:r");

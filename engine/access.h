@@ -11,6 +11,7 @@
 #define HULL_ACCESS_H
 
 #include "sexpr.h"
+#include "stack.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,6 +43,12 @@ int hull_access_terminal(const hull_sexpr_doc *doc, const hull_sexpr_form *exec,
  * and the path is not absolute. The caller frees it; NULL if memory ran
  * out. */
 char *hull_access_path(const hull_sexpr_doc *doc, const char *path);
+
+/* A volume's (layers "dir:..." ...) and (upper PATH), into `stack`, its
+ * work directory beside the upper and `readonly` its mode's; a volume
+ * with no layers leaves `stack` empty. NULL, or why it cannot be read. */
+const char *hull_access_stack(const hull_sexpr_doc *doc, const hull_sexpr_form *volume,
+                              int readonly, hull_stack *stack);
 
 /* The secrets the plan's machine puts in its environment, `(expose env)`
  * (J.3), each as `NAME=VALUE`, VALUE read from the file the core wrote in

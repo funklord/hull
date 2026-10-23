@@ -66,6 +66,7 @@
 #include "tree.h"
 #include "builtin.h"
 #include "usage.h"
+#include "stack.h"
 
 #define MAX_ARGS    256u
 #define MAX_ENV     256u
@@ -95,7 +96,9 @@ struct hull_machine {
 	char            *volume_host[MAX_VOLUMES];
 	char            *volume_guest[MAX_VOLUMES];
 	int              volume_readonly[MAX_VOLUMES];
+	hull_stack       volume_stack[MAX_VOLUMES];  /* a volume of (layers ...), or count 0 */
 	unsigned         volume_count;
+	int              staged;     /* a volume is a stack, staged in the machine's directory */
 	char            *secrets;    /* the core's directory of them, or NULL */
 	char            *export;     /* (export PATH): the tree's tar, once the workload ends */
 	char            *owners;     /* (owners PATH): owners to give back, before the workload */
@@ -154,6 +157,7 @@ static void release(hull_machine *m)
 	for (unsigned i = 0u; i < m->volume_count; i++) {
 		free(m->volume_host[i]);
 		free(m->volume_guest[i]);
+		hull_stack_release(&m->volume_stack[i]);
 	}
 	pthread_mutex_destroy(&m->lock);
 	pthread_cond_destroy(&m->done_cond);
@@ -249,21 +253,30 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		hull_sexpr_child(doc, &entry, &item);
 		for (more = hull_sexpr_next(doc, &item, &item); more;
 		     more = hull_sexpr_next(doc, &item, &item)) {
-			char *mode;
-			char *host_path;
+			char       *mode;
+			char       *host_path;
+			const char *why;
+			unsigned    i = m->volume_count;
 
 			if (m->volume_count == MAX_VOLUMES)
 				return "there are too many volumes";
-			host_path = hull_access_value(doc, &item, "host");
-			m->volume_host[m->volume_count] =
-			    host_path != NULL ? hull_access_path(doc, host_path) : NULL;
-			free(host_path);
-			m->volume_guest[m->volume_count] = hull_access_value(doc, &item, "guest");
+			m->volume_count++;
+			m->volume_guest[i] = hull_access_value(doc, &item, "guest");
 			mode = hull_access_value(doc, &item, "mode");
-			m->volume_readonly[m->volume_count] = mode != NULL && strcmp(mode, "ro") == 0;
+			m->volume_readonly[i] = mode != NULL && strcmp(mode, "ro") == 0;
 			free(mode);
-			if (m->volume_host[m->volume_count] == NULL ||
-			    m->volume_guest[m->volume_count++] == NULL)
+			if ((why = hull_access_stack(doc, &item, m->volume_readonly[i],
+			                             &m->volume_stack[i])) != NULL)
+				return why;
+			if (m->volume_stack[i].count > 0u) {
+				m->staged = 1;
+			} else {
+				host_path = hull_access_value(doc, &item, "host");
+				m->volume_host[i] = host_path != NULL ? hull_access_path(doc, host_path) : NULL;
+				free(host_path);
+			}
+			if ((m->volume_host[i] == NULL && m->volume_stack[i].count == 0u) ||
+			    m->volume_guest[i] == NULL)
 				return "a volume is missing its host or guest path";
 		}
 	}
@@ -383,6 +396,23 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 /* --- the child ----------------------------------------------------------- */
 
 /* Tell the parent which step failed, and why, then leave. */
+/* `path` and every directory above it, 0755, as mkdir -p. 0, or -1. */
+static int make_path(const char *path)
+{
+	char at[4200];
+
+	snprintf(at, sizeof at, "%s", path);
+	for (char *slash = strchr(at + 1, '/'); ; slash = strchr(slash + 1, '/')) {
+		if (slash != NULL)
+			*slash = '\0';
+		if (mkdir(at, 0755) != 0 && errno != EEXIST)
+			return -1;
+		if (slash == NULL)
+			return 0;
+		*slash = '/';
+	}
+}
+
 static void child_fail(int report, const char *step)
 {
 	char   message[200];
@@ -995,11 +1025,32 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	    mount(NULL, m->root, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | locked_flags(m->root),
 	          NULL) != 0)
 		child_fail(report, "making the root read-only");
+	/* A volume that is a stack is staged in the machine's directory, on a
+	 * tmpfs of this namespace's, so that on the host it stays empty; the
+	 * stack holds its own clones of the layers and the upper, and so
+	 * outlives the old root it is staged under. */
+	if (m->staged && mount("tmpfs", m->dir, "tmpfs", 0u, "mode=0700") != 0)
+		child_fail(report, "the volumes' staging");
 	for (unsigned i = 0u; i < m->volume_count; i++) {
 		struct mount_attr readonly = { .attr_set = MOUNT_ATTR_RDONLY };
+		char              staged[4300];
 
-		snprintf(step, sizeof step, "volume %s", m->volume_host[i]);
-		volumes[i] = open_tree(AT_FDCWD, m->volume_host[i],
+		snprintf(step, sizeof step, "volume %s", m->volume_stack[i].count > 0u ?
+		         m->volume_guest[i] : m->volume_host[i]);
+		if (m->volume_stack[i].count > 0u) {
+			const char *why;
+
+			snprintf(staged, sizeof staged, "%s/v%u", m->dir, i);
+			if (mkdir(staged, 0700) != 0)
+				child_fail(report, step);
+			if ((why = hull_stack_stage(&m->volume_stack[i], staged)) != NULL) {
+				snprintf(step, sizeof step, "volume %s: %s", m->volume_guest[i], why);
+				child_fail(report, step);
+			}
+			snprintf(staged, sizeof staged, "%s/v%u/merged", m->dir, i);
+		}
+		volumes[i] = open_tree(AT_FDCWD, m->volume_stack[i].count > 0u ? staged :
+		                                                                m->volume_host[i],
 		                       OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_RECURSIVE);
 		if (volumes[i] < 0)
 			child_fail(report, step);
@@ -1079,7 +1130,23 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		owners_fd = -1;
 	}
 	for (unsigned i = 0u; i < m->volume_count; i++) {
+		struct stat place;
+
 		snprintf(step, sizeof step, "volume %s", m->volume_guest[i]);
+		/* A guest path that is not there is made where the root's writes
+		 * are the overlay's; in a dir used in place, or a read-only root,
+		 * it would be made in the user's own tree, so it is refused,
+		 * naming it as the guest path. */
+		if (stat(m->volume_guest[i], &place) != 0 && errno == ENOENT) {
+			if (!m->overlay) {
+				snprintf(step, sizeof step, "volume %s: the guest path is not in the machine, "
+				         "and is made only above an overlay", m->volume_guest[i]);
+				errno = ENOENT;
+				child_fail(report, step);
+			}
+			if (make_path(m->volume_guest[i]) != 0)
+				child_fail(report, step);
+		}
 		/* A symlink at the guest path is followed, inside the machine. */
 		if (move_mount(volumes[i], "", AT_FDCWD, m->volume_guest[i],
 		               MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_SYMLINKS) != 0)
@@ -1355,8 +1422,9 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	if (m->started)
 		return fail(error, HULL_ERR_BUSY, "the machine has been started already");
 	/* A kept machine's directory, for its init.sock. */
-	if (m->keep && ((reason = make_dir(m)) != NULL ||
-	                (dir_fd = open(m->dir, O_PATH | O_DIRECTORY | O_CLOEXEC)) < 0)) {
+	if ((m->keep || m->staged) &&
+	    ((reason = make_dir(m)) != NULL ||
+	     (m->keep && (dir_fd = open(m->dir, O_PATH | O_DIRECTORY | O_CLOEXEC)) < 0))) {
 		snprintf(m->detail, sizeof m->detail, "%s",
 		         reason != NULL ? reason : "the machine's directory cannot be opened");
 		if (m->dir[0] != '\0')
@@ -1391,7 +1459,14 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	 * machine's own namespace: in a directory used in place an owner other
 	 * than the user would be one on the user's own disk. */
 	/* Not with a kept upper, which is on the user's disk. */
-	m->many = m->overlay && !m->readonly_root && m->upper == NULL && map_many(m->pid, uid, gid);
+	{
+		int kept = m->upper != NULL;
+
+		/* Nor with a volume's upper kept, on the user's disk too. */
+		for (unsigned i = 0u; i < m->volume_count; i++)
+			kept = kept || m->volume_stack[i].upper != NULL;
+		m->many = m->overlay && !m->readonly_root && !kept && map_many(m->pid, uid, gid);
+	}
 	if (write(mapped[1], m->many ? "M" : "S", 1u) != 1) {
 		/* The child reads its end closed and says so on the report. */
 	}
@@ -1481,6 +1556,11 @@ static hull_status chroot_destroy(hull_core *core, hull_machine *m, hull_error *
 		chroot_stop(core, m, 0, error);
 		pthread_join(m->reader, NULL);
 	}
+	/* The work directories overlayfs left, which the user could not
+	 * remove: its namespace, and so its mounts, are gone with it. */
+	hull_stack_unwork(m->upper_work);
+	for (unsigned i = 0u; i < m->volume_count; i++)
+		hull_stack_unwork(m->volume_stack[i].upper_work);
 	if (m->dir[0] != '\0') {
 		mark_adopted(m->dir, 0);
 		remove_dir(m->dir);
@@ -2106,7 +2186,10 @@ static const hull_cap_entry entries[] = {
 	  NULL },
 	{ "hostname",               HULL_SUP_NATIVE,   NULL, NULL },
 	{ "volumes",                HULL_SUP_NATIVE,
-	  "the guest path must exist in the dir; it is not created", NULL },
+	  "a guest path that is not there is made above an overlay, and refused in a dir used "
+	  "in place", NULL },
+	{ "volumes.layers",         HULL_SUP_NATIVE,
+	  "an overlay mounted at the guest path, staged in the machine's namespace", NULL },
 	{ "secrets",                HULL_SUP_NATIVE,
 	  "on a tmpfs the machine mounts at /run, which the dir must have; one exposed is "
 	  "in the env of the workload and of every exec", NULL },

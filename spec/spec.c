@@ -291,13 +291,26 @@ static const key port_keys[] = {
 };
 static const schema port = TABLE(port_keys);
 
-/* (volume (host "./data") (guest "/var/data") (mode rw)) */
+static hull_spec_status volume_across(walk *w, const hull_sexpr_form *record,
+                                      const hull_sexpr_form *found, uint32_t present);
+
+/* (volume (host "./data") (guest "/var/data") (mode rw)), or a stack of
+ * directories in place of the one: (volume (guest "/etc") (layers
+ * "dir:./etc-template" "dir:./etc-site") (upper "./etc-data")), 3.7. */
 static const key volume_keys[] = {
-	{ .name = "host",  .type = STRING, .required = 1, .value = nonempty },
-	{ .name = "guest", .type = STRING, .required = 1, .value = absolute },
-	{ .name = "mode",  .type = CHOICE, .choices = mode_values },
+	{ .name = "host",   .type = STRING, .value = nonempty },
+	{ .name = "guest",  .type = STRING, .required = 1, .value = absolute },
+	{ .name = "mode",   .type = CHOICE, .choices = mode_values },
+	{ .name = "layers", .type = STRINGS, .nonempty = 1, .value = nonempty },
+	{ .name = "upper",  .type = STRING, .value = nonempty },
 };
-static const schema volume = TABLE(volume_keys);
+static const schema volume = TABLE_ACROSS(volume_keys, volume_across);
+
+/* Where these sit in volume_keys, for volume_across. */
+#define VOLUME_HOST   0u
+#define VOLUME_MODE   2u
+#define VOLUME_LAYERS 3u
+#define VOLUME_UPPER  4u
 
 /* J.2 */
 static const key security_keys[] = {
@@ -820,6 +833,40 @@ static hull_spec_status file_across(walk *w, const hull_sexpr_form *record,
 	if (present == 0u)
 		return fail(w, HULL_SPEC_ERR_MISSING, 0u, "a file holds machine, machines or build");
 	return HULL_SPEC_OK;
+}
+
+static hull_spec_status volume_across(walk *w, const hull_sexpr_form *record,
+                                      const hull_sexpr_form *found, uint32_t present)
+{
+	const char *why = NULL;
+	unsigned    at = VOLUME_LAYERS;
+	size_t      saved;
+
+	if (!(present & (1u << VOLUME_HOST)) && !(present & (1u << VOLUME_LAYERS)))
+		return fail(w, HULL_SPEC_ERR_MISSING, record->offset,
+		            "a volume is a host directory or a stack of layers: host or layers");
+	if ((present & (1u << VOLUME_HOST)) && (present & (1u << VOLUME_LAYERS))) {
+		why = "cannot stand beside host: a volume is one directory or a stack of them";
+	} else if ((present & (1u << VOLUME_UPPER)) && !(present & (1u << VOLUME_LAYERS))) {
+		at = VOLUME_UPPER;
+		why = "is a stack's: it needs layers";
+	} else if ((present & (1u << VOLUME_UPPER)) && (present & (1u << VOLUME_MODE))) {
+		hull_sexpr_form head;
+		hull_sexpr_form value;
+
+		hull_sexpr_child(w->doc, &found[VOLUME_MODE], &head);
+		hull_sexpr_next(w->doc, &head, &value);
+		if (hull_sexpr_is(w->doc, &value, "ro")) {
+			at = VOLUME_UPPER;
+			why = "keeps writes, which a volume of (mode ro) has none of";
+		}
+	}
+	if (why == NULL)
+		return HULL_SPEC_OK;
+	saved = push_text(w, at == VOLUME_UPPER ? "upper" : "layers");
+	fail(w, HULL_SPEC_ERR_SHAPE, found[at].offset, why);
+	pop(w, saved);
+	return HULL_SPEC_ERR_SHAPE;
 }
 
 /* --- the calls ----------------------------------------------------------- */

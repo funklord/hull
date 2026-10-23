@@ -409,6 +409,19 @@ hull_matrix_status hull_matrix_resolve(const hull_spec *spec, const hull_sexpr_f
 			/* ports, volumes, env, secrets: the key, once. */
 			join_form(&r, id, NULL, &key);
 			resolve(&r, id, entry.offset);
+			/* A volume that is a stack of layers (3.7) asks for more
+			 * than a directory: once, at the first. */
+			if (hull_sexpr_is(&spec->doc, &key, "volumes")) {
+				hull_sexpr_form item = first;
+				hull_sexpr_form layers;
+
+				do {
+					if (hull_spec_find(spec, &item, "layers", &layers)) {
+						resolve(&r, "volumes.layers", layers.offset);
+						break;
+					}
+				} while (hull_sexpr_next(&spec->doc, &item, &item));
+			}
 		} else {
 			resolve_entry(&r, NULL, &entry);
 		}

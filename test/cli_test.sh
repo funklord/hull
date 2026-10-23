@@ -341,7 +341,15 @@ conf vollink '(command "/probe" "read" "/mnt/in")' \
 	'(volumes (volume (host "./data") (guest "/mnt-link")))'
 from_root 0 '^read=from the host$' -f "$root/vollink.conf"
 conf volmissing '(command "/probe")' '(volumes (volume (host "./data") (guest "/absent")))'
-from_root 125 'volume /absent: No such file or directory' -f "$root/volmissing.conf"
+from_root 125 'volume /absent: the guest path is not in the machine, and is made only above an overlay' \
+	-f "$root/volmissing.conf"
+# Above an overlay it is made, in the overlay's upper, and the dir keeps
+# no trace of it.
+conf volmade '(mutable overlay) (command "/probe" "read" "/absent/deeper/in")' \
+	'(volumes (volume (host "./data") (guest "/absent/deeper")))'
+from_root 0 '^read=from the host$' -f "$root/volmade.conf"
+cases=$((cases + 1))
+[ ! -e "$root/rootfs/absent" ] || fail "a volume's guest path was made in the dir itself" ""
 conf volhost '(command "/probe")' '(volumes (volume (host "./nodata") (guest "/mnt")))'
 from_root 125 'volume /.*/test/cli/\./nodata: No such file or directory' -f "$root/volhost.conf"
 
@@ -1376,6 +1384,52 @@ if [ -n "$other_group" ]; then
 fi
 conf layeredin "(layers \"dir:$root/site\")" '(command "/probe" "say" "no")'
 from_root 125 'layers lie under an overlay' -f "$root/layeredin.conf"
+# A volume that is a stack of its own, at a path in the machine, on a
+# root used in place: the same template, site and upper as above, at
+# /mnt. The top layer wins, writes and a whiteout land in the upper
+# alone, and a later run sees them: each from_root is a run of its own,
+# so the removal is seen by the run after the first.
+rm -rf "${root:?}/data" "${root:?}/.data.hull-work"
+mkdir -p "$root/data"
+printf 'c\n' > "$root/data/c"
+chgrp -R "$(id -g)" "$root/data"
+conf volstack '(command "/probe" "read" "/mnt/a" "read" "/mnt/c" "write" "/mnt/d" "remove" "/mnt/b")' \
+	"(volumes (volume (guest \"/mnt\") (layers \"dir:$root/template\" \"dir:$root/site\") (upper \"$root/data\")))"
+from_root 0 '^read=site$' -f "$root/volstack.conf"
+from_root 0 '^read=c$' -f "$root/volstack.conf"
+cases=$((cases + 1))
+[ "$(cat "$root/template/a")" = template ] && [ -e "$root/site/b" ] && [ -e "$root/data/d" ] &&
+	[ ! -e "$root/template/d" ] && [ ! -e "$root/site/d" ] && [ ! -e "$root/rootfs/mnt/d" ] ||
+	fail "a stacked volume's writes did not land in its upper alone" \
+		"$(ls -la "$root/template" "$root/site" "$root/data" "$root/rootfs/mnt" 2>&1)"
+cases=$((cases + 1))
+[ -x "$root/.data.hull-work/work" ] ||
+	fail "a kept upper's work directory was left unremovable" "$(ls -la "$root/.data.hull-work" 2>&1)"
+conf volrestack '(command "/probe" "read" "/mnt/b" "read" "/mnt/d")' \
+	"(volumes (volume (guest \"/mnt\") (layers \"dir:$root/template\" \"dir:$root/site\") (upper \"$root/data\")))"
+from_root 0 '^read=No such file or directory$' -f "$root/volrestack.conf"
+# With no upper, its writes are memory: written, and nowhere on disk.
+conf volmem '(command "/probe" "write" "/mnt/e" "read" "/mnt/a")' \
+	"(volumes (volume (guest \"/mnt\") (layers \"dir:$root/template\" \"dir:$root/site\")))"
+from_root 0 '^write=ok$' -f "$root/volmem.conf"
+cases=$((cases + 1))
+[ ! -e "$root/template/e" ] && [ ! -e "$root/site/e" ] && [ ! -e "$root/data/e" ] &&
+	[ ! -e "$root/rootfs/mnt/e" ] || fail "a stacked volume's write in memory reached a disk" ""
+# Read-only, of two layers and of one, the second being the layer bound.
+conf volstackro '(command "/probe" "read" "/mnt/a" "write" "/mnt/f")' \
+	"(volumes (volume (guest \"/mnt\") (layers \"dir:$root/template\" \"dir:$root/site\") (mode ro)))"
+from_root 0 '^read=site$' -f "$root/volstackro.conf"
+from_root 0 '^write=Read-only file system$' -f "$root/volstackro.conf"
+conf volstackone '(command "/probe" "read" "/mnt/a" "write" "/mnt/f")' \
+	"(volumes (volume (guest \"/mnt\") (layers \"dir:$root/template\") (mode ro)))"
+from_root 0 '^read=template$' -f "$root/volstackone.conf"
+from_root 0 '^write=Read-only file system$' -f "$root/volstackone.conf"
+cases=$((cases + 1))
+[ ! -e "$root/template/f" ] && [ ! -e "$root/site/f" ] || fail "a read-only stack was written" ""
+# Each machine's directory, where its stacks were staged, is gone with it.
+cases=$((cases + 1))
+left=$(ls "$XDG_RUNTIME_DIR/hull" 2>/dev/null | grep '^chroot-')
+[ -z "$left" ] || fail "a stacked volume's machine directory was left" "$left"
 rm -rf "${root:?}/template" "${root:?}/site" "${root:?}/data" "${root:?}/.data.hull-work"
 conf exportin "(export \"$root/never.tar\")" '(command "/probe" "say" "no")'
 from_root 125 'an export is of an overlay.s tree' -f "$root/exportin.conf"
