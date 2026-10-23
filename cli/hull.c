@@ -122,6 +122,11 @@ static void usage(FILE *out)
 #define HULL_COMMIT "unknown"
 #endif
 
+/* Which hull made a tree, as A.5's builder records it on every manifest
+ * hull writes, a commit's as well as a build's and a pull's: so that a
+ * stored image says, as long as it lasts, which hull it was made by. */
+#define HULL_BUILDER "hull " HULL_VERSION " (" HULL_COMMIT ")"
+
 /* The first line is what scripts read, so it keeps its shape; the commit
  * is a line of its own. */
 static void version(void)
@@ -1981,7 +1986,7 @@ static int build_file(options *o, const hull_registry *registry, const char *ref
 
 		why[0] = '\0';
 		fprintf(stderr, "hull: build: %s is not in the store; pulling it\n", base);
-		if (hull_pull(&store, base, base, host_arch(), "hull " HULL_VERSION, &made, why,
+		if (hull_pull(&store, base, base, host_arch(), HULL_BUILDER, &made, why,
 		              sizeof why) != 0)
 			goto done;
 		snprintf(parent, sizeof parent, "%s", made.manifest);
@@ -2363,8 +2368,8 @@ next_pass:
 				add_bytes(&provenance, raw, 32u);
 				add_text(&provenance, ")(4:step");
 				add_bytes(&provenance, canonical, canonical_length);
-				snprintf(atom, sizeof atom, "))(7:builder%zu:hull %s))",
-				         strlen("hull " HULL_VERSION), HULL_VERSION);
+				snprintf(atom, sizeof atom, "))(7:builder%zu:%s))", strlen(HULL_BUILDER),
+				         HULL_BUILDER);
 				add_text(&provenance, atom);
 				extra.provenance = (const uint8_t *)provenance.data;
 				extra.provenance_length = provenance.length;
@@ -2563,8 +2568,19 @@ static int commit(const char *dir, const char *ref, const char *arch, int tar)
 			close(fd);
 		return status;
 	}
-	status = tar ? hull_store_commit_tar(&store, fd, arch, ref, NULL, NULL, &made, why, sizeof why) :
-	               hull_store_commit(&store, dir, arch, ref, NULL, &made, why, sizeof why);
+	{
+		char              provenance[200];
+		hull_commit_extra extra = { 0 };
+
+		/* A.5's builder, alone: a commit has no build and no registry. */
+		snprintf(provenance, sizeof provenance, "(10:provenance(7:builder%zu:%s))",
+		         strlen(HULL_BUILDER), HULL_BUILDER);
+		extra.provenance = (const uint8_t *)provenance;
+		extra.provenance_length = strlen(provenance);
+		status = tar ? hull_store_commit_tar(&store, fd, arch, ref, NULL, &extra, &made, why,
+		                                     sizeof why) :
+		               hull_store_commit(&store, dir, arch, ref, &extra, &made, why, sizeof why);
+	}
 	hull_store_close(&store);
 	if (fd > 0)
 		close(fd);
@@ -2640,7 +2656,7 @@ static int pull(const char *name, const char *ref)
 	}
 	if ((status = open_store(&store, 1)) != 0)
 		return status;
-	status = hull_pull(&store, name, ref, arch, "hull " HULL_VERSION, &made, why, sizeof why);
+	status = hull_pull(&store, name, ref, arch, HULL_BUILDER, &made, why, sizeof why);
 	hull_store_close(&store);
 	if (status != 0) {
 		fprintf(stderr, "hull: pull: %s\n", why);

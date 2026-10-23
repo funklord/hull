@@ -1605,7 +1605,7 @@ The OCI config-blob equivalents, overridable by `hull.conf`, every one optional:
 
 ## A.5 Provenance
 
-Audit trail, excluded from the identity hash's *cache-key view*: `(oci (digests …) (registry …))` for pulled images, in OCI's digest spelling; `(build (inputs hash…) (parent hash) (step …))` for built ones, the step being its own s-expression (Appendix E); and `(builder version)` always. Excluded from cache keys so that re-pulling the same content from a mirror doesn't invalidate builds — two manifests with identical entries have identical *content identity* even if provenance differs. (Concretely: the manifest hash covers everything; the build cache keys on `sha256(entries + runtime)` only.)
+Audit trail, excluded from the identity hash's *cache-key view*: `(oci (digests …) (registry …))` for pulled images, in OCI's digest spelling; `(build (inputs hash…) (parent hash) (step …))` for built ones, the step being its own s-expression (Appendix E); and `(builder version)` always — **since 2026-10-23 on every manifest hull writes, a plain `hull commit`'s too, and naming the commit hull was built from**, `hull 0.1 (f48d7c28516b)`, as `--version`'s third line does, `-dirty` where the tree had changes and `unknown` from a build that does not write it, so a stored image says which hull made it for as long as it lasts; asked by netcfgd, whose images outlive the session that made them. A commit had none at all before. Excluded from cache keys so that re-pulling the same content from a mirror doesn't invalidate builds — two manifests with identical entries have identical *content identity* even if provenance differs. (Concretely: the manifest hash covers everything; the build cache keys on `sha256(entries + runtime)` only.)
 
 ## A.6 Verity binding
 

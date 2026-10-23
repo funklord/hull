@@ -466,6 +466,11 @@ add("run", tarfile.DIRTYPE, 101, 0, 0o750)
 t.close()
 PYEOF2
 expect 0 '^tarred/1 sha256:[0-9a-f]{64}$' "$hull" commit --tar "$root/owned.tar" tarred/1
+# A commit says which hull made it, as a build and a pull do: the builder
+# --version names, its commit with it, so a stored image says it for as
+# long as it lasts.
+expect 0 '^  \(provenance \(builder "hull [0-9]+\.[0-9]+ \(([0-9a-f]{12}(-dirty)?|unknown)\)"\)\)$' \
+	"$hull" manifest show tarred/1
 timeout 30 "$hull" manifest show tarred/1 > "$root/tarred.view" 2>&1
 for want in '(entry (kind dir) (mode 493) (owner root) (path "etc"))' \
 	'(owner (gid 102) (uid 101)) (path "etc/owned") (size 10) (xattrs (user.note kept)))' \
