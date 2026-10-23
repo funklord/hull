@@ -1297,6 +1297,28 @@ if [ "$made_uid" = 101 ]; then
 	grep -qF '(owner (gid 101) (uid 101)) (path "made")' "$root/exported.view" ||
 		fail "an export's owner was not kept by its commit" "$(grep made "$root/exported.view")"
 fi
+# (owners PATH): owners given back before the workload, in the overlay,
+# the file on the user's disk staying the user's: what lets a stored
+# tree, all the user's in its checkout, run with the owners its manifest
+# keeps. Where one uid is mapped they cannot be, and it is said.
+# At the root, in the user's own group, as a stored tree's checkout is:
+# the build directory here is setgid to a group the namespace does not
+# map, and overlayfs cannot copy up a file, nor the directories above
+# it, of an unmapped group.
+printf 'given\n' > "$root/rootfs/given"
+chgrp "$(id -g)" "$root/rootfs/given"
+printf '101\000102\000given\000' > "$root/owners.list"
+conf owned_back "(mutable overlay) (owners \"$root/owners.list\")" '(command "/probe" "owner" "/given")'
+case $owned_chown in
+*ok*) from_root 0 '^owner=101:102 0[0-7]{3}$' -f "$root/owned_back.conf" ;;
+*) from_root 0 'hull: owners: 1 of 1 not given' -f "$root/owned_back.conf" ;;
+esac
+cases=$((cases + 1))
+[ "$(stat -c %u "$root/rootfs/given")" = "$(id -u)" ] ||
+	fail "an owner given in a machine reached the user's disk" "$(ls -ln "$root/rootfs/given")"
+rm -f "$root/rootfs/given"
+conf ownedin_back "(owners \"$root/owners.list\")" '(command "/probe" "say" "no")'
+from_root 125 'owners are given above an overlay' -f "$root/ownedin_back.conf"
 conf exportin "(export \"$root/never.tar\")" '(command "/probe" "say" "no")'
 from_root 125 'an export is of an overlay.s tree' -f "$root/exportin.conf"
 conf nested '(command "/probe" "nest")'

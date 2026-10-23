@@ -98,6 +98,7 @@ struct hull_machine {
 	unsigned         volume_count;
 	char            *secrets;    /* the core's directory of them, or NULL */
 	char            *export;     /* (export PATH): the tree's tar, once the workload ends */
+	char            *owners;     /* (owners PATH): owners to give back, before the workload */
 	unsigned         env_count;  /* envp's, while secrets are added to it */
 
 	pid_t            pid;        /* the machine's init */
@@ -131,6 +132,7 @@ static void release(hull_machine *m)
 	free(m->hostname);
 	free(m->secrets);
 	free(m->export);
+	free(m->owners);
 	free(m->plan);
 	free(m->persisted);
 	if (m->pidfd >= 0)
@@ -282,6 +284,18 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			return "the export's path cannot be read";
 		if (!m->overlay)
 			return "an export is of an overlay's tree: (export ...) needs (mutable overlay) and "
+			       "a root that is not read-only";
+	}
+	/* (owners PATH): a stored tree's owners, given back in the merged tree
+	 * before the workload, which copies each file so given up into the
+	 * overlay's tmpfs; in place they would be owners on the user's disk. */
+	if ((source = hull_access_value(doc, &machine, "owners")) != NULL) {
+		m->owners = hull_access_path(doc, source);
+		free(source);
+		if (m->owners == NULL)
+			return "the owners' path cannot be read";
+		if (!m->overlay)
+			return "owners are given above an overlay: (owners ...) needs (mutable overlay) and "
 			       "a root that is not read-only";
 	}
 
@@ -515,6 +529,60 @@ static void relay_hold(int which, const uint8_t *bytes, size_t n)
  */
 /* (export PATH)'s file, opened before the pivot, so the user's, or -1. */
 static int export_fd = -1;
+
+/*
+ * (owners PATH)'s list, read whole from `fd`: each entry `UID`, `GID` and
+ * a path of the tree, each ended by a NUL, since a path may hold a
+ * newline. Each is given its owner in the merged root, not following a
+ * link. Those that cannot be, as where one uid is mapped, are counted
+ * and said once on `err`, the workload's stderr, since a build that took
+ * them silently would lose owners it seemed to keep.
+ */
+static void give_owners(int fd, int err)
+{
+	static char data[8u << 20];
+	size_t      length = 0u;
+	ssize_t     n;
+	unsigned    refused = 0u;
+	unsigned    given = 0u;
+
+	while (length < sizeof data && (n = read(fd, data + length, sizeof data - length)) > 0)
+		length += (size_t)n;
+	close(fd);
+	for (size_t at = 0u; at < length; ) {
+		const char *fields[3];
+		unsigned    k = 0u;
+		char        path[4200];
+
+		for (; k < 3u && at < length; k++) {
+			fields[k] = data + at;
+			while (at < length && data[at] != '\0')
+				at++;
+			if (at == length)
+				break;
+			at++;
+		}
+		if (k < 3u)
+			break;
+		snprintf(path, sizeof path, "/%s", fields[2]);
+		if (fchownat(AT_FDCWD, path, (uid_t)strtoul(fields[0], NULL, 10),
+		             (gid_t)strtoul(fields[1], NULL, 10), AT_SYMLINK_NOFOLLOW) == 0)
+			given++;
+		else
+			refused++;
+	}
+	if (refused != 0u) {
+		char said[200];
+		int  m = snprintf(said, sizeof said, "hull: owners: %u of %u not given: %s\n", refused,
+		                  refused + given, "the machine maps one uid, or a path is not there");
+
+		if (m > 0 && write(err, said, (size_t)m) < 0) {
+			/* the workload's stderr is gone; nothing to tell */
+		}
+	}
+}
+
+static int owners_fd = -1;
 
 static int export_sink(void *context, const uint8_t *data, size_t n)
 {
@@ -857,6 +925,9 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	    (export_fd = open(m->export, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
 	                      0600)) < 0)
 		child_fail(report, "the export's file");
+	if (m->owners != NULL &&
+	    (owners_fd = open(m->owners, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)) < 0)
+		child_fail(report, "the owners' file");
 	if (m->overlay)
 		layer(m, report);
 	/* Its root becomes the mount namespace's own, by pivot_root and not
@@ -887,6 +958,10 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 			child_fail(report, "pivot_root");
 		if (chdir("/") != 0)
 			child_fail(report, "the machine's root");
+	}
+	if (owners_fd >= 0) {
+		give_owners(owners_fd, err[1]);
+		owners_fd = -1;
 	}
 	for (unsigned i = 0u; i < m->volume_count; i++) {
 		snprintf(step, sizeof step, "volume %s", m->volume_guest[i]);
@@ -1933,6 +2008,8 @@ static const hull_cap_entry entries[] = {
 	{ "export",                 HULL_SUP_NATIVE,
 	  "a tar of the overlay's tree when the workload ends, owners as the machine saw them",
 	  NULL },
+	{ "owners",                 HULL_SUP_NATIVE,
+	  "given in the overlay before the workload, where many uids are mapped", NULL },
 	{ "init",                   HULL_SUP_REJECTED,
 	  "not yet: the machine's PID 1 is the engine's own, which reaps and forwards signals",
 	  NULL },

@@ -385,6 +385,7 @@ static const key machine_keys[] = {
 	{ .name = "segments",      .type = STRINGS, .value = label },
 	{ .name = "init",          .type = STRING, .value = absolute },
 	{ .name = "export",        .type = STRING, .value = nonempty },
+	{ .name = "owners",        .type = STRING, .value = nonempty },
 	{ .name = "hostname",      .type = STRING, .value = label },
 	{ .name = "security",      .type = RECORD, .record = &security },
 	{ .name = "secrets",       .type = MAP, .record = &secret, .names = secret_name },
