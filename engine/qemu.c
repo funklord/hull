@@ -909,21 +909,14 @@ static void close_segments(hull_machine *m)
 	}
 }
 
-/* A segment NIC's address: qemu's prefix, then three bytes of FNV-1a over
- * the machine's address and the segment, so that two machines, or two
- * NICs of one, do not share one, and a machine keeps its own. */
+/* A segment NIC's address, as hull_access_segment_mac() draws it. */
 static void segment_mac(const hull_machine *m, unsigned i, char *out, size_t cap)
 {
-	uint32_t hash = 2166136261u;
+	unsigned char mac[6];
 
-	for (const char *p = m->address_text; *p != '\0'; p++)
-		hash = (hash ^ (uint8_t)*p) * 16777619u;
-	hash = (hash ^ '/') * 16777619u;
-	for (const char *p = m->segment[i]; *p != '\0'; p++)
-		hash = (hash ^ (uint8_t)*p) * 16777619u;
-	hash = (hash ^ (uint8_t)i) * 16777619u;
-	snprintf(out, cap, "52:54:00:%02x:%02x:%02x", (unsigned)(hash >> 16) & 0xffu,
-	         (unsigned)(hash >> 8) & 0xffu, (unsigned)hash & 0xffu);
+	hull_access_segment_mac(m->address_text, m->segment[i], i, mac);
+	snprintf(out, cap, "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4],
+	         mac[5]);
 }
 
 /*

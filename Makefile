@@ -139,7 +139,8 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  home/.ssh/config ssh-config.before foreign.conf machines.conf build.conf bad.conf example.conf run.conf \
                  writable.conf readonly.conf die.conf wait.conf ports.conf noargs.conf nope.conf \
                  pair.conf rootfs/written rootfs/bin/sh vol.conf volro.conf vollink.conf \
-                 onemap.conf volmissing.conf volmade.conf volhost.conf volstack.conf volrestack.conf \
+                 onemap.conf chearer.conf chearer.out cshouter.conf cloner.conf cloner.out csegment.conf \
+                 volmissing.conf volmade.conf volhost.conf volstack.conf volrestack.conf \
                  volmem.conf volstackro.conf volstackone.conf pid.conf keep.conf slow.conf slow.out \
                  statsd.conf statsd.out overlay.conf ownerin.conf overro.conf overx.conf overx.out \
                  rootfs/srv/kept rootfs/mapped/kept \
@@ -170,7 +171,7 @@ QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.co
                   searched.conf netnone.conf netports.conf rootfs/probe rootfs/bin/sh rootfs/written rootfs/etc/resolv.conf \
                   data/in data/out modules.conf inplace.conf hearer.conf hearer.out shouter.conf loner.conf loner.out keptseg.conf anchor.conf anchor.out \
                   inited.conf initexec.conf initexec.out initbare.conf noinit.conf suid.conf rootfs/suid vlayered.conf vrelayered.conf \
-                  vstack.conf vstackmem.conf vstackro.conf lowport.conf \
+                  vstack.conf vstackmem.conf vstackro.conf lowport.conf mixhear.conf mixhear.out \
                   initroot/probe initroot/sbin/init initroot/sbin/poweroff initbare/probe initbare/sbin/init)
 
 # What test/flip_test.sh writes: the project, and its rsync'd copy.

@@ -50,6 +50,13 @@ char *hull_access_path(const hull_sexpr_doc *doc, const char *path);
 const char *hull_access_stack(const hull_sexpr_doc *doc, const hull_sexpr_form *volume,
                               int readonly, hull_stack *stack);
 
+/* The MAC of a machine's NIC on segment `segment`, its `index`th: qemu's
+ * prefix, 52:54:00, then three bytes of FNV-1a over the machine's
+ * `address`, the segment and the index, so that two machines, or two NICs
+ * of one, do not share one, and a machine keeps its own on every engine. */
+void hull_access_segment_mac(const char *address, const char *segment, unsigned index,
+                             unsigned char mac[6]);
+
 /* The secrets the plan's machine puts in its environment, `(expose env)`
  * (J.3), each as `NAME=VALUE`, VALUE read from the file the core wrote in
  * the plan's `(secrets DIR)`: `each` is called with one, which it does

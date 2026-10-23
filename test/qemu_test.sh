@@ -345,6 +345,32 @@ cases=$((cases + 1))
 	[ "$fds_after" -eq "$fds_before" ] ||
 	fail "the core kept descriptors of a segment's machines" \
 		"core ${core:-none}: $fds_before before, $fds_after after"
+# A chroot machine and a vm on one segment: the chroot's tap and the
+# vm's NIC frame alike on the core's switch, so the chroot hears the vm
+# from the vm's own MAC; and the core keeps no end of the chroot's port.
+conf mixhear "(backend chroot) (hostname \"mixhear\") (network none) (segments \"$wire\")" \
+	'(command "/probe" "link" "eth0" "hear" "eth0")'
+(cd / && exec timeout 90 "$hull" run -f "$root/mixhear.conf" > "$root/mixhear.out" 2>&1) &
+mixheard=$!
+name=shouter
+boot shouter 90
+wait "$mixheard"
+has 0 '^shout=answered$'
+shouter_mac=$(printf '%s\n' "$out" | sed -n 's/^read=//p')
+cases=$((cases + 1))
+[ -n "$shouter_mac" ] && grep -q "^hear=over the wire from $shouter_mac\$" "$root/mixhear.out" ||
+	fail "a chroot machine did not hear a vm on its segment" "vm $shouter_mac: $(cat "$root/mixhear.out")"
+tries=0
+fds_after=$(ls "/proc/$core/fd" 2>/dev/null | wc -l)
+while [ "$fds_after" -ne "$fds_before" ] && [ "$tries" -lt 20 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+	fds_after=$(ls "/proc/$core/fd" 2>/dev/null | wc -l)
+done
+cases=$((cases + 1))
+[ -d "/proc/$core" ] && [ "$fds_after" -eq "$fds_before" ] ||
+	fail "the core kept descriptors of a chroot machine's segment" \
+		"core ${core:-none}: $fds_before before, $fds_after after"
 timeout 10 "$hull" kill -s TERM anchor > /dev/null 2>&1
 wait "$anchored"
 # (init PATH): PID 1 is the image's init, here the probe as one, which

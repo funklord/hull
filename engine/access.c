@@ -293,3 +293,22 @@ const char *hull_access_stack(const hull_sexpr_doc *doc, const hull_sexpr_form *
 	}
 	return NULL;
 }
+
+void hull_access_segment_mac(const char *address, const char *segment, unsigned index,
+                             unsigned char mac[6])
+{
+	unsigned hash = 2166136261u;
+
+	for (const char *p = address; *p != '\0'; p++)
+		hash = (hash ^ (unsigned char)*p) * 16777619u;
+	hash = (hash ^ '/') * 16777619u;
+	for (const char *p = segment; *p != '\0'; p++)
+		hash = (hash ^ (unsigned char)*p) * 16777619u;
+	hash = (hash ^ (unsigned char)index) * 16777619u;
+	mac[0] = 0x52u;
+	mac[1] = 0x54u;
+	mac[2] = 0x00u;
+	mac[3] = (unsigned char)(hash >> 16);
+	mac[4] = (unsigned char)(hash >> 8);
+	mac[5] = (unsigned char)hash;
+}

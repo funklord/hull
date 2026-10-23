@@ -39,6 +39,7 @@
 #include <pwd.h>
 #include <grp.h>
 #include <fcntl.h>
+#include <linux/if_tun.h>
 #include <net/if.h>
 #include <poll.h>
 #include <pthread.h>
@@ -71,6 +72,7 @@
 #define MAX_ARGS    256u
 #define MAX_ENV     256u
 #define MAX_VOLUMES 64u
+#define MAX_SEGMENTS 8u
 #define HELD_LIMIT  (256u * 1024u)  /* output an init holds for no core */
 
 /* A frame from the init: data on fd 1 or 2, or the workload's end, whose
@@ -112,6 +114,10 @@ struct hull_machine {
 	int              conn;       /* the init's frames, or -1 */
 	int              keep;       /* (on_disconnect keep) */
 	int              no_network; /* (network none): a namespace with only lo */
+	char            *segment[MAX_SEGMENTS];     /* Appendix D's, by name */
+	int              segment_fd[MAX_SEGMENTS];  /* their ports, until the init has them */
+	unsigned         segment_count;
+	char             address_text[64];          /* the plan's, for each NIC's MAC */
 	int              adopted;    /* taken back: the init is not this process's child */
 	int              pidfd;      /* the init's, when adopted, else -1 */
 	char             dir[4096];  /* the machine's directory, for init.sock, or "" */
@@ -158,6 +164,11 @@ static void release(hull_machine *m)
 		free(m->volume_host[i]);
 		free(m->volume_guest[i]);
 		hull_stack_release(&m->volume_stack[i]);
+	}
+	for (unsigned i = 0u; i < m->segment_count; i++) {
+		free(m->segment[i]);
+		if (m->segment_fd[i] >= 0)
+			close(m->segment_fd[i]);
 	}
 	pthread_mutex_destroy(&m->lock);
 	pthread_cond_destroy(&m->done_cond);
@@ -375,6 +386,38 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	source = hull_access_value(doc, &machine, "network");
 	m->no_network = source != NULL && strcmp(source, "none") == 0;
 	free(source);
+
+	/* (segments ...): a NIC on each, eth0, eth1, ..., in the machine's own
+	 * network namespace, which only (network none) gives it: a tap needs a
+	 * namespace the user's own, and the host's is not. So named, a spec
+	 * keeps its NICs' names on a vm of (network none), where no passt NIC
+	 * comes first. A segment is the core's switch, which goes with it. */
+	if (hull_access_find(doc, &machine, "segments", &entry)) {
+		hull_sexpr_form top;
+
+		hull_sexpr_child(doc, &entry, &item);
+		for (more = hull_sexpr_next(doc, &item, &item); more;
+		     more = hull_sexpr_next(doc, &item, &item)) {
+			if (m->segment_count == MAX_SEGMENTS)
+				return "there are too many segments";
+			if ((m->segment[m->segment_count++] = hull_access_text(doc, &item)) == NULL)
+				return "a segment's name is not text";
+		}
+		if (m->segment_count != 0u && !m->no_network)
+			return "a chroot machine on a segment has a network of its own: (network none) "
+			       "beside (segments ...)";
+		if (m->segment_count != 0u && m->keep)
+			return "a machine on a segment cannot outlive the core, whose switch the segment "
+			       "is: (on_disconnect keep) and (segments ...) do not go together";
+		hull_sexpr_first(doc, &top);
+		source = hull_access_value(doc, &top, "address");
+		if (m->segment_count != 0u && (source == NULL || strlen(source) >= sizeof m->address_text)) {
+			free(source);
+			return "the plan gives its segments no address to draw a MAC from";
+		}
+		snprintf(m->address_text, sizeof m->address_text, "%s", source != NULL ? source : "");
+		free(source);
+	}
 
 	/* The secrets the core wrote (J.3), and those to be in the env. */
 	if (hull_access_find(doc, &machine, "secrets", &entry)) {
@@ -948,6 +991,126 @@ static int map_many(pid_t pid, uid_t uid, gid_t gid)
 	       run_mapper("/usr/bin/newgidmap", pid, (unsigned long)gid, gid_start, gid_count);
 }
 
+/*
+ * Frames between `tap`, a NIC's, and `port`, its segment's port on the
+ * core's switch, which frames each after its length as 32 bits in network
+ * order, as qemu's -netdev stream does: in a process of the machine's own,
+ * which goes with its namespace. Returns when a port closes.
+ */
+static void relay_frames(const int *tap, const int *port, unsigned n)
+{
+	static uint8_t from_port[MAX_SEGMENTS][4u + 65536u];
+	size_t         held[MAX_SEGMENTS] = { 0u };
+	uint8_t        frame[4u + 65536u];
+	struct pollfd  fds[2u * MAX_SEGMENTS];
+
+	for (unsigned i = 0u; i < n; i++) {
+		fds[2u * i]      = (struct pollfd){ .fd = tap[i], .events = POLLIN };
+		fds[2u * i + 1u] = (struct pollfd){ .fd = port[i], .events = POLLIN };
+	}
+	for (;;) {
+		if (poll(fds, 2u * n, -1) < 0) {
+			if (errno == EINTR)
+				continue;
+			return;
+		}
+		for (unsigned i = 0u; i < n; i++) {
+			if (fds[2u * i].revents & POLLIN) {
+				ssize_t got = read(tap[i], frame + 4, 65536u);
+
+				if (got > 0) {
+					size_t at = 0u;
+
+					frame[0] = (uint8_t)((size_t)got >> 24);
+					frame[1] = (uint8_t)((size_t)got >> 16);
+					frame[2] = (uint8_t)((size_t)got >> 8);
+					frame[3] = (uint8_t)got;
+					while (at < (size_t)got + 4u) {
+						ssize_t put = write(port[i], frame + at, (size_t)got + 4u - at);
+
+						if (put <= 0)
+							return;
+						at += (size_t)put;
+					}
+				}
+			}
+			if (fds[2u * i + 1u].revents & (POLLIN | POLLHUP | POLLERR)) {
+				ssize_t got = read(port[i], from_port[i] + held[i],
+				                   sizeof from_port[i] - held[i]);
+
+				if (got <= 0)
+					return;
+				held[i] += (size_t)got;
+				for (;;) {
+					size_t length;
+
+					if (held[i] < 4u)
+						break;
+					length = (size_t)from_port[i][0] << 24 | (size_t)from_port[i][1] << 16 |
+					         (size_t)from_port[i][2] << 8 | from_port[i][3];
+					if (length > 65536u)
+						return;
+					if (held[i] < 4u + length)
+						break;
+					/* A frame the tap refuses, as one while the NIC is down, is
+					 * dropped, as a wire drops it. */
+					if (write(tap[i], from_port[i] + 4, length) < 0) {
+					}
+					memmove(from_port[i], from_port[i] + 4u + length, held[i] - 4u - length);
+					held[i] -= 4u + length;
+				}
+			}
+		}
+	}
+}
+
+/*
+ * The machine's NICs on its segments, eth0, eth1, ..., each a tap in its
+ * own network namespace with the MAC hull_access_segment_mac() gives it,
+ * left down, as a vm's are until its workload brings them up; and the
+ * relay between them and their ports, forked here. The init keeps neither.
+ */
+static void join_segments(const hull_machine *m, int report)
+{
+	int   tap[MAX_SEGMENTS];
+	pid_t relayer;
+
+	for (unsigned i = 0u; i < m->segment_count; i++) {
+		struct ifreq request = { 0 };
+		int          fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+
+		snprintf(request.ifr_name, sizeof request.ifr_name, "eth%u", i);
+		request.ifr_flags = IFF_TAP | IFF_NO_PI;
+		if (fd < 0 || (tap[i] = open("/dev/net/tun", O_RDWR | O_CLOEXEC)) < 0 ||
+		    ioctl(tap[i], TUNSETIFF, &request) != 0)
+			child_fail(report, "a segment's NIC");
+		request.ifr_hwaddr.sa_family = 1; /* ARPHRD_ETHER */
+		hull_access_segment_mac(m->address_text, m->segment[i], i,
+		                        (unsigned char *)request.ifr_hwaddr.sa_data);
+		if (ioctl(fd, SIOCSIFHWADDR, &request) != 0)
+			child_fail(report, "a segment's NIC's address");
+		close(fd);
+	}
+	relayer = fork();
+	if (relayer < 0)
+		child_fail(report, "the segments' relay");
+	if (relayer == 0) {
+		int keep[2u * MAX_SEGMENTS];
+
+		for (unsigned i = 0u; i < m->segment_count; i++) {
+			keep[2u * i] = tap[i];
+			keep[2u * i + 1u] = m->segment_fd[i];
+		}
+		close_others(keep, 2u * m->segment_count);
+		relay_frames(tap, m->segment_fd, m->segment_count);
+		_exit(0);
+	}
+	for (unsigned i = 0u; i < m->segment_count; i++) {
+		close(tap[i]);
+		close(m->segment_fd[i]);
+	}
+}
+
 static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int dir_fd,
                      int report, int mapped)
 {
@@ -968,9 +1131,14 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	if (null < 0 || dup2(null, 0) < 0 || dup2(null, 1) < 0 || dup2(null, 2) < 0)
 		child_fail(report, "stdio");
 	{
-		int keep[4] = { report, conn, mapped, dir_fd };
+		int      keep[4u + MAX_SEGMENTS] = { report, conn, mapped };
+		unsigned n = 3u;
 
-		close_others(keep, dir_fd >= 0 ? 4u : 3u);
+		if (dir_fd >= 0)
+			keep[n++] = dir_fd;
+		for (unsigned i = 0u; i < m->segment_count; i++)
+			keep[n++] = m->segment_fd[i];
+		close_others(keep, n);
 	}
 	if (pipe2(out, O_CLOEXEC) != 0 || pipe2(err, O_CLOEXEC) != 0)
 		child_fail(report, "the workload's pipes");
@@ -1097,6 +1265,8 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 			child_fail(report, "lo");
 		close(fd);
 	}
+	if (m->segment_count != 0u)
+		join_segments(m, report);
 	/* The export's file, while the host's paths are still to be seen; the
 	 * user's, as the namespace's root is, and no file of the workload's. */
 	if (m->export != NULL &&
@@ -1401,6 +1571,8 @@ static hull_status chroot_create(hull_core *core, hull_buf plan, hull_machine **
 	m->core  = core;
 	m->conn  = -1;
 	m->pidfd = -1;
+	for (unsigned i = 0u; i < MAX_SEGMENTS; i++)
+		m->segment_fd[i] = -1;
 	pthread_mutex_init(&m->lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
 	reason = read_plan(m, &doc);
@@ -1445,6 +1617,27 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 		m->dir[0] = '\0';
 		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	}
+	/* A port on each segment, from the core's switch, which the init takes
+	 * and the engine then closes, so that the port goes with the machine. */
+	for (unsigned i = 0u; i < m->segment_count; i++) {
+		if (host->struct_size < offsetof(hull_host_ops, segment) + sizeof host->segment ||
+		    host->segment == NULL) {
+			snprintf(m->detail, sizeof m->detail, "the core has no switch for a segment");
+			m->segment_fd[i] = -1;
+		} else {
+			m->segment_fd[i] = host->segment(m->core, m->segment[i], m->detail,
+			                                 sizeof m->detail);
+		}
+		if (m->segment_fd[i] < 0) {
+			for (unsigned j = 0u; j < i; j++) {
+				close(m->segment_fd[j]);
+				m->segment_fd[j] = -1;
+			}
+			if (dir_fd >= 0)
+				close(dir_fd);
+			return fail(error, HULL_ERR_RUNTIME, m->detail);
+		}
+	}
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0 ||
 	    pipe2(report, O_CLOEXEC) != 0 || pipe2(mapped, O_CLOEXEC) != 0) {
 		if (dir_fd >= 0)
@@ -1468,6 +1661,10 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	close(pair[1]);
 	close(report[1]);
 	close(mapped[0]);
+	for (unsigned i = 0u; i < m->segment_count; i++) {
+		close(m->segment_fd[i]);
+		m->segment_fd[i] = -1;
+	}
 	/* Many uids only above an overlay, whose upper layer is a tmpfs in the
 	 * machine's own namespace: in a directory used in place an owner other
 	 * than the user would be one on the user's own disk. */
@@ -1642,6 +1839,8 @@ static hull_status chroot_adopt(hull_core *core, hull_buf state, hull_machine **
 	m->conn  = -1;
 	m->pid   = (pid_t)pid;
 	m->keep  = 1;
+	for (unsigned i = 0u; i < MAX_SEGMENTS; i++)
+		m->segment_fd[i] = -1;
 	pthread_mutex_init(&m->lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
 	m->plan_length = state.len - (size_t)(plan_at - text);
@@ -2218,6 +2417,9 @@ static const hull_cap_entry entries[] = {
 	{ "network.host",           HULL_SUP_NATIVE,   NULL, NULL },
 	{ "network.none",           HULL_SUP_NATIVE,
 	  "a network namespace of the machine's own, with lo alone", NULL },
+	{ "segments",               HULL_SUP_NATIVE,
+	  "a tap each, eth0 and on, in the machine's own network namespace, relayed to the core's "
+	  "switch; with (network none)", NULL },
 	{ "export",                 HULL_SUP_NATIVE,
 	  "a tar of the overlay's tree when the workload ends, owners as the machine saw them",
 	  NULL },
@@ -2231,8 +2433,6 @@ static const hull_cap_entry entries[] = {
 	{ "init",                   HULL_SUP_REJECTED,
 	  "not yet: the machine's PID 1 is the engine's own, which reaps and forwards signals",
 	  NULL },
-	{ "segments",               HULL_SUP_REJECTED,
-	  "not yet: a tap in the machine's namespace, on the core's switch, is not written", NULL },
 	{ NULL,                     HULL_SUP_NATIVE,   NULL, NULL },
 };
 

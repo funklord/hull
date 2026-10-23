@@ -176,10 +176,10 @@ expect 1 ':1:10: machine on qemu \(vm\): source\.ref\.overlay: rejected: the eng
 expect 1 ':1:10: machine on docker \(ns\): source\.dir\.direct: rejected: docker cannot' \
 	"$hull" plan -f "$dir/dir.conf" --backend docker
 expect 1 'machine on docker \(ns\): rejected, 1 field$' "$hull" plan -f "$dir/dir.conf" --backend docker
-# Segments are qemu's so far: chroot and docker refuse them, and say why.
+# Segments are qemu's and chroot's: docker refuses them, and says why.
 printf '%s\n' '(machine (source "dir:./rootfs") (segments "wire"))' > "$dir/segmented.conf"
-expect 1 'segments: rejected: not yet: a tap in the machine.s namespace' \
-	"$hull" plan -f "$dir/segmented.conf" --backend chroot
+expect 0 'segments: native: a tap each' \
+	"$hull" plan --explain -f "$dir/segmented.conf" --backend chroot
 expect 1 'segments: rejected: not yet: a container.s NIC on the core.s switch' \
 	"$hull" plan -f "$dir/segmented.conf" --backend docker
 expect 0 'machine on qemu \(vm\): ok|segments: native' \
@@ -1034,6 +1034,35 @@ cases=$((cases + 1))
 [ ! -e "$root/rootfs/layered" ] || fail "an overlay's write reached the directory through exec's machine" ""
 rm -f "$root/rootfs/srv/kept" "$root/rootfs/mapped/kept" "$root/rootfs/mapped/d/f"
 rmdir "$root/rootfs/mapped/d" "$root/rootfs/mapped"
+# Appendix D's segments on chroot: a tap each, eth0 first, in the
+# machine's own network namespace, which (network none) gives it, relayed
+# to the core's switch. Two machines on one hear each other in raw frames,
+# from a MAC of qemu's prefix, and the shouter is answered; a third, on
+# another segment at the same time, hears nothing. The name is this run's.
+# Without (network none) a segment is refused, the host's namespace being
+# none a tap can be made in.
+wire="cwire-$$"
+whole_hull=$(cd "$(dirname "$hull")" && pwd)/$(basename "$hull")
+conf chearer "(hostname \"chearer\") (network none) (segments \"$wire\")" '(command "/probe" "link" "eth0" "hear" "eth0")'
+conf cshouter "(hostname \"cshouter\") (network none) (segments \"$wire\")" \
+	'(command "/probe" "link" "eth0" "shout" "eth0" "over the wire")'
+conf cloner "(hostname \"cloner\") (network none) (segments \"elsewhere-$$\")" '(command "/probe" "link" "eth0" "hear" "eth0")'
+(cd / && exec timeout 60 "$whole_hull" run -f "$root/chearer.conf" > "$root/chearer.out" 2>&1) &
+heard=$!
+(cd / && exec timeout 60 "$whole_hull" run -f "$root/cloner.conf" > "$root/cloner.out" 2>&1) &
+lone=$!
+limit=40
+from_root 0 '^shout=answered$' -f "$root/cshouter.conf"
+wait "$heard"
+wait "$lone"
+cases=$((cases + 1))
+grep -q '^hear=over the wire from 52:54:00:' "$root/chearer.out" ||
+	fail "a chroot machine on a segment did not hear the other" "$(cat "$root/chearer.out")"
+cases=$((cases + 1))
+grep -q '^hear=nothing$' "$root/cloner.out" ||
+	fail "a chroot machine on another segment heard something" "$(cat "$root/cloner.out")"
+conf csegment "(segments \"$wire\")" '(command "/probe" "say" "never")'
+from_root 125 'a chroot machine on a segment has a network of its own' -f "$root/csegment.conf"
 # Where the host gives the user no subordinate range, one uid is mapped
 # and said once, with its way round: root in a user namespace of the
 # user's own has none here, so hull run there, with a core of its own in
