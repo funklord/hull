@@ -350,6 +350,8 @@ int hull_pull(hull_store *store, const char *name, const char *ref, const char *
 	canon             digests = { 0 };   /* A.5's, in the order fetched */
 	canon             provenance = { 0 };
 	hull_commit_extra extra;
+	hull_owner       *owners = NULL;
+	size_t            owner_count = 0u;
 	hull_remote       s = { 0 };
 	uint8_t          *data = malloc(MAX_DOCUMENT);
 	hull_remote_sink  body = { .data = data, .cap = MAX_DOCUMENT, .fd = -1 };
@@ -508,6 +510,9 @@ int hull_pull(hull_store *store, const char *name, const char *ref, const char *
 		if (hull_unpack_layer(u, layer_fd, &skipped, why, cap) != 0)
 			goto done;
 	}
+	/* The layers' owners, which the tree on disk, all the user's, cannot
+	 * keep, given to the commit over it. */
+	hull_unpack_owners(u, &owners, &owner_count);
 	{
 		hull_unpack *ended = u;
 
@@ -535,12 +540,14 @@ int hull_pull(hull_store *store, const char *name, const char *ref, const char *
 		say(why, cap, "out of memory", NULL);
 		goto done;
 	}
-	extra = (hull_commit_extra){ provenance.data, provenance.length, runtime.data, runtime.length };
+	extra = (hull_commit_extra){ provenance.data, provenance.length, runtime.data, runtime.length,
+	                             owners, owner_count };
 	if (hull_store_commit(store, tree, image_arch, ref, &extra, out, why, cap) != 0)
 		goto done;
 	out->skipped += skipped;
 	result = 0;
 done:
+	hull_owners_free(owners, owner_count);
 	{
 		char ignored[64];
 

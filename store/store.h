@@ -45,11 +45,21 @@ void hull_store_close(hull_store *store);
 
 /* What a manifest may carry beside its tree, each a canonical form or
  * NULL: A.5's `(10:provenance ...)` and A.4's `(7:runtime ...)`. */
+/* An owner a tree's path has where its file on disk, the user's, cannot
+ * say it: a pulled layer's, by its tar. */
+typedef struct hull_owner {
+	char              *path;
+	unsigned long long uid;
+	unsigned long long gid;
+} hull_owner;
+
 typedef struct hull_commit_extra {
-	const uint8_t *provenance;
-	size_t         provenance_length;
-	const uint8_t *runtime;
-	size_t         runtime_length;
+	const uint8_t    *provenance;
+	size_t            provenance_length;
+	const uint8_t    *runtime;
+	size_t            runtime_length;
+	const hull_owner *owners;       /* by path, bytewise; the owner of each, over the disk's */
+	size_t            owner_count;
 } hull_commit_extra;
 
 /* `dir` as a manifest of `arch`, its files into the objects, named `ref`,
@@ -150,6 +160,12 @@ hull_unpack *hull_unpack_begin(const char *dir, char *why, size_t cap);
 
 /* The layer `fd` reads, from its start: 0, or -1 with `why`. */
 int hull_unpack_layer(hull_unpack *u, int fd, uint64_t *skipped, char *why, size_t cap);
+
+/* The owners the layers gave, other than root's, taken from `u` before
+ * hull_unpack_end(), sorted by path for hull_commit_extra: the last layer
+ * to make a path says its owner. Freed with hull_owners_free(). */
+void hull_unpack_owners(hull_unpack *u, hull_owner **owners, size_t *count);
+void hull_owners_free(hull_owner *owners, size_t count);
 
 /* The directories given their modes, and `u` freed, whatever came before:
  * 0, or -1 with `why`. */

@@ -40,7 +40,69 @@ struct hull_unpack {
 	size_t    dir_count;
 	char    **made;       /* paths this layer made, for an opaque whiteout */
 	size_t    made_count;
+	hull_owner *owners;   /* each path's owner, where not root's, by the last layer to make it */
+	size_t      owner_count;
+	size_t      owner_cap;
 };
+
+/* `path`'s owner, by the layer that made it last: root's leaves no row. A
+ * path a whiteout took keeps its row, which no tree's path then matches. */
+static void owner_set(hull_unpack *u, const char *path, unsigned long long uid,
+                      unsigned long long gid)
+{
+	for (size_t i = 0u; i < u->owner_count; i++)
+		if (strcmp(u->owners[i].path, path) == 0) {
+			if (uid == 0u && gid == 0u) {
+				free(u->owners[i].path);
+				u->owners[i] = u->owners[--u->owner_count];
+			} else {
+				u->owners[i].uid = uid;
+				u->owners[i].gid = gid;
+			}
+			return;
+		}
+	if (uid == 0u && gid == 0u)
+		return;
+	if (u->owner_count == u->owner_cap) {
+		size_t      cap = u->owner_cap != 0u ? 2u * u->owner_cap : 64u;
+		hull_owner *grown = realloc(u->owners, cap * sizeof *grown);
+
+		if (grown == NULL)
+			return;
+		u->owners = grown;
+		u->owner_cap = cap;
+	}
+	if ((u->owners[u->owner_count].path = strdup(path)) == NULL)
+		return;
+	u->owners[u->owner_count].uid = uid;
+	u->owners[u->owner_count].gid = gid;
+	u->owner_count++;
+}
+
+static int owner_order(const void *a, const void *b)
+{
+	return strcmp(((const hull_owner *)a)->path, ((const hull_owner *)b)->path);
+}
+
+void hull_unpack_owners(hull_unpack *u, hull_owner **owners, size_t *count)
+{
+	*owners = NULL;
+	*count = 0u;
+	if (u == NULL)
+		return;
+	qsort(u->owners, u->owner_count, sizeof u->owners[0], owner_order);
+	*owners = u->owners;
+	*count = u->owner_count;
+	u->owners = NULL;
+	u->owner_count = u->owner_cap = 0u;
+}
+
+void hull_owners_free(hull_owner *owners, size_t count)
+{
+	for (size_t i = 0u; i < count; i++)
+		free(owners[i].path);
+	free(owners);
+}
 
 static int say(char *why, size_t cap, const char *what, const char *detail)
 {
@@ -225,6 +287,10 @@ typedef struct entry {
 	char              *link;
 	unsigned long long size;
 	int                has_size;  /* pax gave the size */
+	unsigned long long uid;
+	unsigned long long gid;
+	int                has_uid;   /* pax gave them */
+	int                has_gid;
 	char               type;
 	mode_t             mode;
 	char             **xattr_names;
@@ -364,6 +430,23 @@ static int read_pax(const uint8_t *data, size_t n, entry *e)
 				return -1;
 			e->size = strtoull(text, NULL, 10);
 			e->has_size = 1;
+		} else if ((key_length == 3u && memcmp(key, "uid", 3u) == 0) ||
+		           (key_length == 3u && memcmp(key, "gid", 3u) == 0)) {
+			char text[32];
+
+			if (value_length == 0u || value_length >= sizeof text)
+				return -1;
+			memcpy(text, equals + 1, value_length);
+			text[value_length] = '\0';
+			if (strspn(text, "0123456789") != value_length)
+				return -1;
+			if (key[0] == 'u') {
+				e->uid = strtoull(text, NULL, 10);
+				e->has_uid = 1;
+			} else {
+				e->gid = strtoull(text, NULL, 10);
+				e->has_gid = 1;
+			}
 		} else if (key_length > 12u && memcmp(key, "SCHILY.xattr.", 13u) == 0) {
 			size_t    i = e->xattr_count;
 			char    **names = realloc(e->xattr_names, (i + 1u) * sizeof *names);
@@ -466,6 +549,10 @@ static int next_entry(gzFile gz, entry *e, char *why, size_t cap)
 		found = 1;
 		e->type = type == '\0' || type == '7' ? '0' : type;
 		e->mode = (mode_t)(number(block + 100, 8u) & 07777);
+		if (!e->has_uid)
+			e->uid = (unsigned long long)number(block + 108, 8u);
+		if (!e->has_gid)
+			e->gid = (unsigned long long)number(block + 116, 8u);
 		if (!e->has_size)
 			e->size = (unsigned long long)size;
 		if (e->name == NULL) {
@@ -675,8 +762,10 @@ static int apply(hull_unpack *u, gzFile gz, entry *e, uint64_t *skipped, char *w
 		(*skipped)++;
 		break;
 	}
-	if (e->type != '3' && e->type != '4')
+	if (e->type != '3' && e->type != '4') {
 		apply_xattrs(dir, leaf, path, e, skipped);
+		owner_set(u, path, e->uid, e->gid);
+	}
 	note_made(u, path);
 	result = 0;
 	/* A file read its own data; any other entry's, a hardlink's say, is
@@ -754,6 +843,7 @@ int hull_unpack_end(hull_unpack *u, char *why, size_t cap)
 		free(u->made[i]);
 	free(u->dirs);
 	free(u->made);
+	hull_owners_free(u->owners, u->owner_count);
 	close(u->root);
 	free(u);
 	return result;

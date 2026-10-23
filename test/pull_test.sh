@@ -280,6 +280,14 @@ raw = gzip.decompress(open(os.path.join(blobs, manifest["layers"][0]["digest"]),
 print(" ".join("%s=%d:%d" % (m.name, m.uid, m.gid) for m in tarfile.open(fileobj=io.BytesIO(raw))))
 ' "$root/registry/blobs" "$owned_digest" 2>&1)
 [ "$seen" = "owned=101:102" ] || fail "a pushed layer did not keep its owners" "$seen"
+# And pulled back, the layer's owners are the tree's again: the same tree
+# but for where it came from, and the runtime a pull gives a tree that had
+# none, as the plain one above.
+expect 0 '' "$hull" pull "127.0.0.1:$port/test/owned:1" owned/back
+expect 1 '' "$hull" diff owned/1 owned/back
+cases=$((cases + 1))
+[ "$out" = "$(printf 'runtime added\nprovenance')" ] ||
+	fail "an image's owners did not come back with a pull" "$out"
 # An object not its name is not pushed: the layer is checked as it is read.
 mkdir -p "$root/tiny"
 printf 'tiny\n' > "$root/tiny/file"

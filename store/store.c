@@ -429,6 +429,11 @@ static int walk_dir(hull_store *store, walk *w, int dir, const char *prefix, hul
 	return w->failed ? -1 : 0;
 }
 
+static int owner_order(const void *a, const void *b)
+{
+	return strcmp(((const hull_owner *)a)->path, ((const hull_owner *)b)->path);
+}
+
 static int path_order(const void *a, const void *b)
 {
 	return strcmp(((const item *)a)->path, ((const item *)b)->path);
@@ -880,8 +885,21 @@ static int finish_commit(hull_store *store, walk *wp, const char *arch, const ch
 	put_text(&manifest, "(8:manifest(4:arch");
 	put_atom(&manifest, arch, strlen(arch));
 	put_text(&manifest, ")(7:entries");
-	for (size_t i = 0u; i < w.count; i++)
+	for (size_t i = 0u; i < w.count; i++) {
+		/* An owner the disk cannot say, a pulled layer's, over the disk's:
+		 * uid 0 is root's, as the user's own file is. */
+		if (extra != NULL && extra->owners != NULL) {
+			hull_owner        key = { .path = w.items[i].path };
+			const hull_owner *found = bsearch(&key, extra->owners, extra->owner_count,
+			                                  sizeof extra->owners[0], owner_order);
+
+			if (found != NULL) {
+				w.items[i].st.st_uid = found->uid == 0u ? getuid() : (uid_t)found->uid;
+				w.items[i].st.st_gid = (gid_t)found->gid;
+			}
+		}
 		put_entry(&manifest, &w.items[i]);
+	}
 	put_text(&manifest, ")");
 	/* In A.2's order, after the entries and before the schema. */
 	if (extra != NULL && extra->provenance != NULL)
