@@ -208,18 +208,20 @@ Write semantics are per machine:
 
 Ownership: a single-uid tree — the common case for a service rootfs — needs nothing special: the user's files are root's in a machine, on chroot by its user namespace and on vm and emu by qemu's (§4.11). **A tree of many owners keeps them in the store's manifest, given back when a machine starts, as §7 decided 2026-10-22 and 2026-10-23,** not as a `user.hull.owner` xattr on each file, which this paragraph once said: an idmapped mount maps ranges and not a file's own attribute, so presenting such xattrs would need a FUSE layer of its own. The holder chose the manifest's way on 2026-10-23.
 
-**Layers and a kept upper, designed 2026-10-23 at the holder's asking, built after §7's build owners:** a read-only template with more read-only layers over it, and the machine's writes kept in a directory of the user's that may hold files of its own, as unionfs did and overlayfs, its successor in the kernel, does.
+**Layers and a kept upper, designed 2026-10-23 at the holder's asking, built on chroot the same day:** a read-only template with more read-only layers over it, and the machine's writes kept in a directory of the user's that may hold files of its own, as unionfs did and overlayfs, its successor in the kernel, does.
 
-Designed keys, not yet the spec's, so a plain block rather than a ```scheme one, which `test/spec_test.c` holds to the spec:
-
-```
+```scheme
 (machine
   (source "dir:./template")              ; the lowest layer, read-only
   (layers "dir:./site" "dir:./extra")    ; each above the last, read-only
-  (mutable (overlay (upper "./data"))))  ; writes, kept
+  (mutable overlay)
+  (upper "./data")                       ; writes, kept
+  (command "/bin/sh"))
 ```
 
-- **chroot:** overlayfs in the machine's own namespaces, its lower layers the source and then each of `layers`, its upper `./data`, which a user namespace may mount on 5.11 and later. A removal of what a lower layer has is a whiteout in `./data`, a 0:0 device node, and its directories carry `user.overlay.*` xattrs, both the user's to read and remove. The work directory overlayfs needs on the upper's filesystem is kept beside it, hidden.
+The upper is a key of its own, beside `(mutable overlay)`, where the design first had `(mutable (overlay (upper …)))`: that would have made `mutable` a record in every engine's reading of it, for no more than one key says.
+
+- **chroot, built:** overlayfs in the machine's own namespaces, its lower layers the source and then each of `layers`, the last topmost, its upper `./data`, made if missing, which a user namespace may mount on 5.11 and later. A removal of what a lower layer has is a whiteout in `./data`, a 0:0 device node, and its directories carry `user.overlay.*` xattrs, both the user's to read and remove. overlayfs wants the upper and its work directory on one mount, so the directory holding both is cloned once; the work directory, `.data.hull-work` beside it, is hull's, and is made the user's own group and not setgid, since overlayfs refuses a work directory of a group the namespace does not map, `EPERM`, which is what one inherited from a shared setgid directory is; the upper itself it takes in any group. Each layer, and the upper, is cloned while its path is still the host's. **Measured** in `test/cli_test.sh`: a template beneath a layer, the layer's file winning, an upper with a file of its own, a write landing in the upper and a removal there as a whiteout, the template and the layer untouched, and a second run seeing what the first left; an upper inside a directory setgid to another of the user's groups working; layers without an overlay refused. **Sabotage:** baseline first, in scratch copies: layers ignored, their order reversed so the template won, the upper left in memory, the work directory left in its inherited group, and layers allowed without an overlay, each failed a named case.
 - **vm and emu:** the guest's overlayfs cannot take a 9p share as its upper, so the overlay is mounted on the host side, in the user namespace qemu now runs in, and the merged tree is the share.
 - **docker:** refused, its writable layer being the daemon's.
 - **One uid, with an upper on disk:** an owner other than the user written there would be a subordinate id's file on the user's disk, which §7's decision rules out, so such a machine is mapped as one uid.

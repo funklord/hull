@@ -99,6 +99,10 @@ struct hull_machine {
 	char            *secrets;    /* the core's directory of them, or NULL */
 	char            *export;     /* (export PATH): the tree's tar, once the workload ends */
 	char            *owners;     /* (owners PATH): owners to give back, before the workload */
+	char            *layer_path[MAX_VOLUMES];  /* (layers ...): read-only, each above the last */
+	unsigned         layer_count;
+	char            *upper;      /* (upper PATH): the overlay's writes, kept, the user's */
+	char            *upper_work; /* overlayfs's work directory, beside it, hidden */
 	unsigned         env_count;  /* envp's, while secrets are added to it */
 
 	pid_t            pid;        /* the machine's init */
@@ -133,6 +137,10 @@ static void release(hull_machine *m)
 	free(m->secrets);
 	free(m->export);
 	free(m->owners);
+	for (unsigned i = 0u; i < m->layer_count; i++)
+		free(m->layer_path[i]);
+	free(m->upper);
+	free(m->upper_work);
 	free(m->plan);
 	free(m->persisted);
 	if (m->pidfd >= 0)
@@ -286,6 +294,56 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			return "an export is of an overlay's tree: (export ...) needs (mutable overlay) and "
 			       "a root that is not read-only";
 	}
+	/* (layers "dir:..." ...): read-only layers over the source, each above
+	 * the last, and (upper PATH): the overlay's writes kept in a directory
+	 * of the user's, as unionfs's were, rather than in memory (3.7). */
+	if (hull_access_find(doc, &machine, "layers", &entry)) {
+		hull_sexpr_form item;
+		int             more;
+
+		hull_sexpr_child(doc, &entry, &item);
+		for (more = hull_sexpr_next(doc, &item, &item); more;
+		     more = hull_sexpr_next(doc, &item, &item)) {
+			char *text = hull_access_text(doc, &item);
+
+			if (m->layer_count == MAX_VOLUMES) {
+				free(text);
+				return "there are too many layers";
+			}
+			if (text == NULL || strncmp(text, "dir:", 4u) != 0) {
+				free(text);
+				return "a layer is a dir: source";
+			}
+			m->layer_path[m->layer_count] = hull_access_path(doc, text + 4);
+			free(text);
+			if (m->layer_path[m->layer_count++] == NULL)
+				return "a layer's path cannot be read";
+		}
+		if (!m->overlay)
+			return "layers lie under an overlay: (layers ...) needs (mutable overlay) and a root "
+			       "that is not read-only";
+	}
+	if ((source = hull_access_value(doc, &machine, "upper")) != NULL) {
+		char *slash;
+
+		m->upper = hull_access_path(doc, source);
+		free(source);
+		if (m->upper == NULL)
+			return "the upper's path cannot be read";
+		if (!m->overlay)
+			return "an upper is an overlay's: (upper ...) needs (mutable overlay) and a root "
+			       "that is not read-only";
+		/* overlayfs's work directory must be on the upper's own filesystem,
+		 * so beside it, named for it and hidden. */
+		if ((m->upper_work = malloc(strlen(m->upper) + 16u)) == NULL)
+			return "out of memory";
+		slash = strrchr(m->upper, '/');
+		if (slash == NULL)
+			sprintf(m->upper_work, ".%s.hull-work", m->upper);
+		else
+			sprintf(m->upper_work, "%.*s/.%s.hull-work", (int)(slash - m->upper), m->upper,
+			        slash + 1);
+	}
 	/* (owners PATH): a stored tree's owners, given back in the merged tree
 	 * before the workload, which copies each file so given up into the
 	 * overlay's tmpfs; in place they would be owners on the user's disk. */
@@ -390,9 +448,44 @@ static void layer(const hull_machine *m, int report)
 {
 	struct stat lower;
 	int         tree = open_tree(AT_FDCWD, m->root, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+	int         layers[MAX_VOLUMES];
+	int         kept = -1;
+	char        options[8800u + 16u * MAX_VOLUMES];
+	char        upper_dir[4200] = "upper";
+	char        work_dir[4200] = "work";
+	size_t      at;
 
 	if (tree < 0 || fstat(tree, &lower) != 0)
 		child_fail(report, "the overlay's lower layer");
+	/* Every layer cloned while its path is still the host's, before the
+	 * tmpfs goes over the directory's. */
+	for (unsigned i = 0u; i < m->layer_count; i++)
+		if ((layers[i] = open_tree(AT_FDCWD, m->layer_path[i],
+		                           OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC)) < 0)
+			child_fail(report, "a layer");
+	/* overlayfs wants the upper and its work directory on one mount, so the
+	 * directory holding both is cloned, once, and they are named in it. */
+	if (m->upper != NULL) {
+		char        parent[4200];
+		const char *slash = strrchr(m->upper, '/');
+
+		snprintf(parent, sizeof parent, "%.*s", slash != NULL && slash != m->upper ?
+		         (int)(slash - m->upper) : 1, slash != NULL ? m->upper : ".");
+		snprintf(upper_dir, sizeof upper_dir, "kept/%s", slash != NULL ? slash + 1 : m->upper);
+		snprintf(work_dir, sizeof work_dir, "kept/%s", strrchr(m->upper_work, '/') != NULL ?
+		         strrchr(m->upper_work, '/') + 1 : m->upper_work);
+		/* The work directory is hull's, made here: the user's own group and
+		 * not setgid, though its parent may be setgid to another, since
+		 * overlayfs refuses a work directory of a group the namespace does
+		 * not map, EPERM, which is what one inherited from a shared setgid
+		 * directory is. The upper itself it takes in any group. */
+		if (strpbrk(upper_dir, ",:") != NULL ||
+		    (mkdir(m->upper, 0755) != 0 && errno != EEXIST) ||
+		    (mkdir(m->upper_work, 0700) != 0 && errno != EEXIST) ||
+		    chown(m->upper_work, (uid_t)-1, 0) != 0 || chmod(m->upper_work, 0700) != 0 ||
+		    (kept = open_tree(AT_FDCWD, parent, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC)) < 0)
+			child_fail(report, "the overlay's upper layer, kept");
+	}
 	if (mount("tmpfs", m->root, "tmpfs", 0u, "mode=0700") != 0 || chdir(m->root) != 0 ||
 	    mkdir("lower", 0700) != 0 || mkdir("upper", 0700) != 0 ||
 	    mkdir("work", 0700) != 0 || mkdir("merged", 0700) != 0)
@@ -400,13 +493,35 @@ static void layer(const hull_machine *m, int report)
 	if (move_mount(tree, "", AT_FDCWD, "lower", MOVE_MOUNT_F_EMPTY_PATH) != 0)
 		child_fail(report, "the overlay's lower layer");
 	close(tree);
-	/* No chown: the namespace maps the user and the user's group, to root,
-	 * who made upper/, so the directory's owner and group are root's here
-	 * already or are not mapped and cannot be given. */
-	if (chmod("upper", lower.st_mode & 07777) != 0)
+	for (unsigned i = 0u; i < m->layer_count; i++) {
+		char name[32];
+
+		snprintf(name, sizeof name, "lower%u", i + 1u);
+		if (mkdir(name, 0700) != 0 ||
+		    move_mount(layers[i], "", AT_FDCWD, name, MOVE_MOUNT_F_EMPTY_PATH) != 0)
+			child_fail(report, "a layer");
+		close(layers[i]);
+	}
+	if (kept >= 0) {
+		/* The user's own directory: its mode is its own, not the source's. */
+		if (mkdir("kept", 0700) != 0 ||
+		    move_mount(kept, "", AT_FDCWD, "kept", MOVE_MOUNT_F_EMPTY_PATH) != 0)
+			child_fail(report, "the overlay's upper layer, kept");
+		close(kept);
+	} else if (chmod("upper", lower.st_mode & 07777) != 0) {
+		/* No chown: the namespace maps the user and the user's group, to
+		 * root, who made upper/, so the directory's owner and group are
+		 * root's here already or are not mapped and cannot be given. */
 		child_fail(report, "the overlay's upper layer");
-	if (mount("overlay", "merged", "overlay", 0u,
-	          "lowerdir=lower,upperdir=upper,workdir=work,userxattr") != 0)
+	}
+	/* The topmost lower layer first: the last of (layers ...), down to the
+	 * source. */
+	at = (size_t)snprintf(options, sizeof options, "lowerdir=");
+	for (unsigned i = m->layer_count; i > 0u; i--)
+		at += (size_t)snprintf(options + at, sizeof options - at, "lower%u:", i);
+	snprintf(options + at, sizeof options - at, "lower,upperdir=%s,workdir=%s,userxattr",
+	         upper_dir, work_dir);
+	if (mount("overlay", "merged", "overlay", 0u, options) != 0)
 		child_fail(report, "mounting the overlay");
 }
 
@@ -1275,7 +1390,8 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	/* Many uids only above an overlay, whose upper layer is a tmpfs in the
 	 * machine's own namespace: in a directory used in place an owner other
 	 * than the user would be one on the user's own disk. */
-	m->many = m->overlay && !m->readonly_root && map_many(m->pid, uid, gid);
+	/* Not with a kept upper, which is on the user's disk. */
+	m->many = m->overlay && !m->readonly_root && m->upper == NULL && map_many(m->pid, uid, gid);
 	if (write(mapped[1], m->many ? "M" : "S", 1u) != 1) {
 		/* The child reads its end closed and says so on the report. */
 	}
@@ -2007,6 +2123,11 @@ static const hull_cap_entry entries[] = {
 	  "a network namespace of the machine's own, with lo alone", NULL },
 	{ "export",                 HULL_SUP_NATIVE,
 	  "a tar of the overlay's tree when the workload ends, owners as the machine saw them",
+	  NULL },
+	{ "layers",                 HULL_SUP_NATIVE,
+	  "read-only, in the machine's overlay, each above the last", NULL },
+	{ "upper",                  HULL_SUP_NATIVE,
+	  "the overlay's writes kept in the directory, one uid, its work directory hidden beside it",
 	  NULL },
 	{ "owners",                 HULL_SUP_NATIVE,
 	  "given in the overlay before the workload, where many uids are mapped", NULL },

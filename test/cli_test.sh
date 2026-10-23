@@ -1325,6 +1325,58 @@ cases=$((cases + 1))
 rm -f "$root/rootfs/given"
 conf ownedin_back "(owners \"$root/owners.list\")" '(command "/probe" "say" "no")'
 from_root 125 'owners are given above an overlay' -f "$root/ownedin_back.conf"
+# (layers ...) and (upper PATH): a template read-only beneath, a layer
+# above it, and the writes kept in a directory of the user's that has
+# files of its own, as unionfs did. The top layer wins; what is written
+# lands in the upper, a removal there as a whiteout, and the template is
+# untouched; a second run sees what the first left.
+rm -rf "${root:?}/template" "${root:?}/site" "${root:?}/data" "${root:?}/.data.hull-work"
+mkdir -p "$root/template/proc" "$root/site" "$root/data"
+cp "$probe" "$root/template/probe"
+printf 'template\n' > "$root/template/a"
+printf 'site\n' > "$root/site/a"
+printf 'b\n' > "$root/site/b"
+printf 'c\n' > "$root/data/c"
+# In the user's own group, as a directory of the user's is: this build
+# tree is setgid to a group the namespace does not map, and a file of such
+# a group cannot be copied up, EOVERFLOW, as a removal or a write over it
+# does. The upper's own group is no matter; its work directory's is,
+# which hull makes, and the case after this holds that.
+chgrp -R "$(id -g)" "$root/template" "$root/site" "$root/data"
+chmod g-s "$root/template" "$root/site" "$root/data" "$root"
+printf '(machine (source "dir:%s/template") (backend chroot) (mutable overlay) %s %s)\n' "$root" \
+	"(layers \"dir:$root/site\") (upper \"$root/data\")" \
+	'(command "/probe" "read" "/a" "read" "/b" "read" "/c" "write" "/d" "remove" "/b")' > "$root/layered.conf"
+from_root 0 '^read=site$' -f "$root/layered.conf"
+cases=$((cases + 1))
+[ "$(cat "$root/template/a")" = template ] && [ -e "$root/site/b" ] && [ -e "$root/data/d" ] &&
+	[ -c "$root/data/b" ] ||
+	fail "a layered machine's writes did not land in its upper alone" \
+		"$(ls -la "$root/template" "$root/site" "$root/data" 2>&1)"
+printf '(machine (source "dir:%s/template") (backend chroot) (mutable overlay) %s %s)\n' "$root" \
+	"(layers \"dir:$root/site\") (upper \"$root/data\")" \
+	'(command "/probe" "read" "/b" "list" "/")' > "$root/relayered.conf"
+from_root 0 '^read=No such file or directory$' -f "$root/relayered.conf"
+from_root 0 '^list=.* a c d .*probe' -f "$root/relayered.conf"
+# An upper inside a directory setgid to another of the user's groups, as
+# a shared one is: overlayfs refuses a work directory of a group the
+# namespace does not map, and the one hull makes beside the upper would
+# inherit it, so hull gives it the user's own. The machine runs.
+other_group=$(id -G | tr ' ' '\n' | grep -vx "$(id -g)" | head -1)
+if [ -n "$other_group" ]; then
+	mkdir -p "$root/shared"
+	chgrp "$other_group" "$root/shared" && chmod g+s "$root/shared"
+	printf '(machine (source "dir:%s/template") (backend chroot) (mutable overlay) %s %s)\n' "$root" \
+		"(upper \"$root/shared/data\")" '(command "/probe" "write" "/kept")' > "$root/sharedupper.conf"
+	from_root 0 '^write=ok$' -f "$root/sharedupper.conf"
+	cases=$((cases + 1))
+	[ -e "$root/shared/data/kept" ] || fail "a write did not land in an upper in a shared directory" \
+		"$(ls -la "$root/shared" "$root/shared/data" 2>&1)"
+	rm -rf "${root:?}/shared"
+fi
+conf layeredin "(layers \"dir:$root/site\")" '(command "/probe" "say" "no")'
+from_root 125 'layers lie under an overlay' -f "$root/layeredin.conf"
+rm -rf "${root:?}/template" "${root:?}/site" "${root:?}/data" "${root:?}/.data.hull-work"
 conf exportin "(export \"$root/never.tar\")" '(command "/probe" "say" "no")'
 from_root 125 'an export is of an overlay.s tree' -f "$root/exportin.conf"
 conf nested '(command "/probe" "nest")'
