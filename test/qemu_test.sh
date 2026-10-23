@@ -339,7 +339,7 @@ wait "$anchored"
 # reaps for ever, and the agent goes on beside it; the workload is not
 # PID 1, and when it ends the image's /sbin/poweroff, the probe as one,
 # ends the machine. Without one the kernel's power-off follows the grace.
-mkdir -p "$dir/initroot/sbin" "$dir/initroot/proc" "$dir/initroot/dev" "$dir/initroot/sys" \
+mkdir -p "$dir/initroot/sbin" "$dir/initroot/proc" "$dir/initroot/dev" "$dir/initroot/sys" "$dir/initroot/run" \
 	"$dir/initbare/sbin" "$dir/initbare/proc" "$dir/initbare/dev" "$dir/initbare/sys"
 for d in initroot initbare; do
 	cp "$probe" "$dir/$d/probe"
@@ -347,13 +347,17 @@ for d in initroot initbare; do
 done
 cp "$probe" "$dir/initroot/sbin/poweroff"
 printf '(machine (source "dir:./initroot") (backend vm) (mutable overlay) (init "/sbin/init") %s)\n' \
-	'(command "/probe" "target" "/proc/1/exe" "pid")' > "$root/inited.conf"
+	'(memory "512M") (command "/probe" "target" "/proc/1/exe" "pid" "fsflags" "/run")' > "$root/inited.conf"
 name=inited
 started=$(date +%s)
 boot inited
 took=$(( $(date +%s) - started ))
 has 0 '^target=/sbin/init$'
 has 0 '^pid=([2-9]|[1-9][0-9]+)$'
+# /run as a distribution's initramfs leaves it for its init: nosuid,
+# nodev and noexec, a tenth of memory, which a unit's exec restriction
+# rests on.
+has 0 '^fsflags=nosuid,nodev,noexec size=(4[0-9]|5[0-9])$'
 cases=$((cases + 1))
 [ "$took" -lt 15 ] || fail "a machine handed to its init took ${took}s to end, its poweroff unused" "$out"
 # Through an exec, which the agent beside the init serves, and a stop.

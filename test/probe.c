@@ -21,6 +21,7 @@
  * `poweroff` it powers the machine off. Steps:
  *
  *   target PATH where the symlink PATH points
+ *   fsflags PATH  the nosuid, nodev and noexec of PATH's mount, and its size in MiB
  *   chown PATH ID  whether PATH can be given to ID, as its owner and group
  *   nest        whether a user and network namespace can be made inside,
  *               as `unshare -rn` makes one, in a child that then exits
@@ -94,6 +95,7 @@
 #include <sys/prctl.h>
 #include <sys/reboot.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -806,6 +808,17 @@ int main(int argc, char **argv)
 
 			printf("chown=%s\n", chown(arg, id, (gid_t)id) == 0 ? "ok" : strerror(errno));
 			i += 2;
+		} else if (strcmp(step, "fsflags") == 0) {
+			struct statvfs fs;
+
+			if (statvfs(arg, &fs) != 0)
+				printf("fsflags=%s\n", strerror(errno));
+			else
+				printf("fsflags=%s%s%s size=%llu\n", (fs.f_flag & ST_NOSUID) ? "nosuid," : "",
+				       (fs.f_flag & ST_NODEV) ? "nodev," : "",
+				       (fs.f_flag & ST_NOEXEC) ? "noexec" : "exec",
+				       (unsigned long long)fs.f_blocks * fs.f_frsize / (1024u * 1024u));
+			i++;
 		} else if (strcmp(step, "target") == 0) {
 			char    to[4096];
 			ssize_t n = readlink(arg, to, sizeof to - 1u);

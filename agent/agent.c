@@ -103,6 +103,7 @@ static char  *envp_[MAX_ENV + 1u];
 static char  *workdir;
 static char  *init_;       /* (init PATH): the image's init, PID 1 once handed to */
 static int    handed;      /* PID 1 is the image's init, and this is the agent beside it */
+static int    run_made;    /* /run is a tmpfs made here, as an initramfs makes it */
 static int    no_new_privs;
 static int    applied;     /* the spec is applied: the root is the machine's */
 
@@ -501,7 +502,8 @@ static const char *place_secrets(const hull_sexpr_doc *doc, const hull_sexpr_for
 	hull_sexpr_form wanted;
 	int             more;
 
-	if (mount("tmpfs", "/machine/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755,size=1m") != 0)
+	if (!run_made &&
+	    mount("tmpfs", "/machine/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755,size=1m") != 0)
 		return "the machine has no /run for its secrets";
 	if (mkdir("/machine/run/hull", 0755) != 0 || mkdir("/machine/run/hull/secrets", 0700) != 0 ||
 	    mount("tmpfs", "/machine/run/hull/secrets", "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,
@@ -713,6 +715,23 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 			if (stat(at, &place) == 0 && S_ISDIR(place.st_mode) && share("modules", at, 1) != 0)
 				say("modules", strerror(errno));
 		}
+	}
+	/* Handed to an image's init, /run as a distribution's initramfs leaves
+	 * it, which the init keeps rather than makes: initramfs-tools and
+	 * dracut both mount it nosuid, nodev and noexec, and systemd making
+	 * its own gives no noexec, so a unit's exec restriction resting on it
+	 * went unenforced, which netcfgd's sandbox_writes.sh control found. A
+	 * root without /run boots without it, said. */
+	if (init_ != NULL) {
+		struct stat place;
+
+		if (stat("/machine/run", &place) != 0 || !S_ISDIR(place.st_mode))
+			say("/run", "the machine has none for its init");
+		else if (mount("tmpfs", "/machine/run", "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+		               "mode=0755,size=10%") != 0)
+			say("/run", strerror(errno));
+		else
+			run_made = 1;
 	}
 	if (secrets != NULL && (reason = place_secrets(doc, machine, secrets, &n)) != NULL)
 		return reason;
