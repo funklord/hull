@@ -544,6 +544,44 @@ int main(void)
 		close(x);
 		close(y);
 	}
+	{
+		/* The switch injecting its own frame: to one target, counted
+		 * injected and not reaching another port; then a random flood
+		 * to all, counted on each. */
+		uint8_t  data[64];
+		size_t   len = frame(data, 0xffu, 9u, 'I');
+		int      a = port_of("inj", "a");
+		int      b = port_of("inj", "b");
+		char     why[256] = "";
+
+		if (hull_segment_inject("inj", "b", data + 4, len - 4u, 0, 0u, 1u, 0u, 0u, why,
+		                        sizeof why) != 0)
+			fail("an inject", why);
+		expect("an injected frame reaches its target", b, 'I');
+		expect("an injected frame spares another port", a, 0);
+		check("the inject counted on its target",
+		      counted("inj", "b", HULL_SEGMENT_IN).injected == 1u &&
+		      counted("inj", "a", HULL_SEGMENT_IN).injected == 0u);
+		if (hull_segment_inject("inj", NULL, NULL, 0u, 1, 20u, 3u, 0u, 1u, why, sizeof why) != 0)
+			fail("a flood", why);
+		for (int i = 0; i < 3; i++) {
+			(void)next_tag(a, 1000);
+			(void)next_tag(b, 1000);
+		}
+		check("a flood counted on every port",
+		      counted("inj", "a", HULL_SEGMENT_IN).injected == 3u &&
+		      counted("inj", "b", HULL_SEGMENT_IN).injected == 4u);
+		close(a);
+		close(b);
+	}
+	{
+		/* Inject onto a segment no machine is on is refused. */
+		char why[256] = "";
+
+		cases++;
+		if (hull_segment_inject("void", NULL, NULL, 0u, 1, 20u, 1u, 0u, 0u, why, sizeof why) == 0)
+			fail("an inject with no machine", "was taken");
+	}
 	printf("segment: %u cases, %u failed\n", cases, failures);
 	return failures != 0;
 }

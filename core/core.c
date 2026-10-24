@@ -2375,11 +2375,85 @@ static void handle_tamper(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	send_simple(c, "(4:done", ch);
 }
 
+static void handle_inject(client *c, uint32_t ch, const hull_sexpr_doc *body)
+{
+	hull_sexpr_form value;
+	unsigned char   frame[65600];
+	char            name[512];
+	char            machine[64];
+	char            hex[131200];
+	long long       count = 1;
+	long long       every = 0;
+	long long       size = 0;
+	long long       seed = 0;
+	size_t          length = 0u;
+	int             randomize;
+	char            why[256];
+
+	if (!hull_msg_find(body, "name", &value) || !hull_msg_string(body, &value, name, sizeof name)) {
+		send_error(c, ch, "inject names a segment");
+		return;
+	}
+	machine[0] = '*';
+	machine[1] = '\0';
+	if (hull_msg_find(body, "machine", &value) &&
+	    (!hull_msg_string(body, &value, machine, sizeof machine) ||
+	     (strcmp(machine, "*") != 0 && !is_label(machine)))) {
+		send_error(c, ch, "inject names a machine or *");
+		return;
+	}
+	if ((hull_msg_find(body, "count", &value) && !hull_msg_long(body, &value, &count)) ||
+	    (hull_msg_find(body, "every", &value) && !hull_msg_long(body, &value, &every)) ||
+	    (hull_msg_find(body, "seed", &value) && !hull_msg_long(body, &value, &seed)) ||
+	    count < 0 || count > 1000000000 || every < 0 || every > 60000) {
+		send_error(c, ch, "inject's count, every and seed are whole numbers");
+		return;
+	}
+	randomize = hull_msg_find(body, "size", &value);
+	if (randomize) {
+		if (!hull_msg_long(body, &value, &size) || size < 14 || size > 65600) {
+			send_error(c, ch, "a flood's size is 14 to 65600 bytes");
+			return;
+		}
+	} else if (count != 0 && hull_msg_find(body, "frame", &value)) {
+		size_t n;
+		size_t k;
+
+		if (!hull_msg_string(body, &value, hex, sizeof hex) || (n = strlen(hex)) < 28u ||
+		    n % 2u != 0u || n / 2u > sizeof frame) {
+			send_error(c, ch, "a frame is 14 to 65600 bytes of hex");
+			return;
+		}
+		for (k = 0u; k < n; k++)
+			if (!isxdigit((unsigned char)hex[k])) {
+				send_error(c, ch, "a frame is hex digits");
+				return;
+			}
+		for (k = 0u; k < n; k += 2u) {
+			unsigned byte;
+
+			sscanf(hex + k, "%2x", &byte);
+			frame[k / 2u] = (unsigned char)byte;
+		}
+		length = n / 2u;
+	} else if (count != 0) {
+		send_error(c, ch, "inject takes a frame of hex, or a size for random bytes");
+		return;
+	}
+	if (hull_segment_inject(name, strcmp(machine, "*") == 0 ? NULL : machine, frame, length,
+	                        randomize, (unsigned)size, (uint64_t)count, (unsigned)every,
+	                        (uint64_t)seed, why, sizeof why) != 0) {
+		send_error(c, ch, why);
+		return;
+	}
+	send_simple(c, "(4:done", ch);
+}
+
 static void handle_segment(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
 	static const char *const names[] = { "bytes", "corrupted", "duplicated", "frames", "full",
-	                                     "lost", "matched", "overflow", "passed", "passed_bytes",
-	                                     "replayed", "tampered", "too_big" };
+	                                     "injected", "lost", "matched", "overflow", "passed",
+	                                     "passed_bytes", "replayed", "tampered", "too_big" };
 	static hull_segment_counts counts[64];
 	hull_sexpr_form value;
 	hull_msg        m = { 0 };
@@ -2403,7 +2477,7 @@ static void handle_segment(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		 * counts by name. */
 		for (int part = 0; part < 3; part++) {
 			const hull_segment_count *w;
-			uint64_t                  of[13];
+			uint64_t                  of[14];
 
 			if (part == 0)
 				hull_msg_raw(&m, "(4:port");
@@ -2419,16 +2493,17 @@ static void handle_segment(client *c, uint32_t ch, const hull_sexpr_doc *body)
 			of[2] = w->duplicated;
 			of[3] = w->frames;
 			of[4] = w->full;
-			of[5] = w->lost;
-			of[6] = w->matched;
-			of[7] = w->overflow;
-			of[8] = w->passed;
-			of[9] = w->passed_bytes;
-			of[10] = w->replayed;
-			of[11] = w->tampered;
-			of[12] = w->too_big;
+			of[5] = w->injected;
+			of[6] = w->lost;
+			of[7] = w->matched;
+			of[8] = w->overflow;
+			of[9] = w->passed;
+			of[10] = w->passed_bytes;
+			of[11] = w->replayed;
+			of[12] = w->tampered;
+			of[13] = w->too_big;
 			hull_msg_raw(&m, part == 0 ? "(2:in" : "(3:out");
-			for (unsigned k = 0u; k < 13u; k++) {
+			for (unsigned k = 0u; k < 14u; k++) {
 				hull_msg_raw(&m, "(");
 				hull_msg_text(&m, names[k]);
 				hull_msg_number(&m, (long long)of[k]);
@@ -2597,6 +2672,8 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		handle_segment(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "tamper")) {
 		handle_tamper(c, (uint32_t)ch, body);
+	} else if (hull_msg_is(body, "inject")) {
+		handle_inject(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "impair")) {
 		handle_impair(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "stats")) {

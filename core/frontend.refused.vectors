@@ -159,3 +159,6 @@ client_message pause_without_machine 28 35 3A 70 61 75 73 65 28 32 3A 63 68 31 3
 
 # tamper_without_name: (6:tamper(2:ch1:7)(9:direction3:out)(5:fault)(7:machine5:alpha))
 client_message tamper_without_name 28 36 3A 74 61 6D 70 65 72 28 32 3A 63 68 31 3A 37 29 28 39 3A 64 69 72 65 63 74 69 6F 6E 33 3A 6F 75 74 29 28 35 3A 66 61 75 6C 74 29 28 37 3A 6D 61 63 68 69 6E 65 35 3A 61 6C 70 68 61 29 29
+
+# inject_without_channel: (6:inject(5:count1:5)(4:name4:wire))
+client_message inject_without_channel 28 36 3A 69 6E 6A 65 63 74 28 35 3A 63 6F 75 6E 74 31 3A 35 29 28 34 3A 6E 61 6D 65 34 3A 77 69 72 65 29 29

@@ -103,6 +103,7 @@ static void usage(FILE *out)
 	      "       hull pause ID | hull unpause ID\n"
 	      "       hull segment NAME [impair MACHINE|all in|out|both [KEY=VALUE|down]...]\n"
 	      "       hull segment NAME tamper MACHINE|all in|out|both [KEY=VALUE]...\n"
+	      "       hull segment NAME inject MACHINE|all frame=HEX|size=N [count=N] [every=MS]\n"
 	      "       hull ssh ID | hull proxy-ssh HOST\n"
 	      "       hull ssh-config [--remove] | hull gc\n"
 	      "       hull commit [--arch A] DIR REF | hull commit --tar FILE REF\n"
@@ -3717,7 +3718,7 @@ static void print_way(const hull_sexpr_doc *body, const hull_sexpr_form *way, co
 {
 	static const char *const counts[] = { "frames", "bytes", "passed", "passed_bytes", "lost",
 	                                      "too_big", "overflow", "full", "duplicated",
-	                                      "corrupted", "matched", "tampered", "replayed" };
+	                                      "corrupted", "matched", "tampered", "replayed", "injected" };
 	hull_sexpr_form item;
 	int             more;
 
@@ -3754,6 +3755,46 @@ static int segment_command(int argc, char **argv)
 	int             more;
 
 	int tamper = argc > 3 && strcmp(argv[3], "tamper") == 0;
+	int inject = argc > 3 && strcmp(argv[3], "inject") == 0;
+
+	/* inject NAME MACHINE|all KEY=VALUE...: the switch's own frames, no
+	 * direction. Sent on its own, outside the impair/tamper shape. */
+	if (inject) {
+		hull_msg m = { 0 };
+		int      d;
+
+		if (argc < 5) {
+			usage(stderr);
+			return 2;
+		}
+		if ((status = connect_core(&wire, 0)) != 0) {
+			if (status == 1)
+				fprintf(stderr, "hull: no core is running, so no machine is on a segment\n");
+			return status == 1 ? 1 : 2;
+		}
+		hull_msg_raw(&m, "(6:inject");
+		hull_msg_channel(&m, 1u);
+		for (d = 5; d < argc; d++) {
+			const char *equals = strchr(argv[d], '=');
+
+			if (equals == NULL) {
+				fprintf(stderr, "hull: segment: %s is KEY=VALUE\n", argv[d]);
+				hull_msg_free(&m);
+				hull_wire_close(&wire);
+				return 2;
+			}
+			*(char *)equals = '\0';
+			msg_entry(&m, argv[d], equals + 1);
+			*(char *)equals = '=';
+		}
+		msg_entry(&m, "machine", strcmp(argv[4], "all") == 0 ? "*" : argv[4]);
+		msg_entry(&m, "name", argv[2]);
+		hull_msg_raw(&m, ")");
+		status = m.failed || hull_wire_send(wire.fd, &m) != 0 ? 1 : answered(&wire);
+		hull_msg_free(&m);
+		hull_wire_close(&wire);
+		return status;
+	}
 
 	if (argc < 3 || (argc > 3 && ((strcmp(argv[3], "impair") != 0 && !tamper) || argc < 6))) {
 		usage(stderr);

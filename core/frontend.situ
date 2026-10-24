@@ -35,6 +35,7 @@ const PAUSE    = ('5' << 24) | (':' << 16) | ('p' << 8) | 'a';
 const UNPAUSE  = ('7' << 24) | (':' << 16) | ('u' << 8) | 'n';
 const IMPAIR   = ('6' << 24) | (':' << 16) | ('i' << 8) | 'm';
 const TAMPER   = ('6' << 24) | (':' << 16) | ('t' << 8) | 'a';
+const INJECT   = ('6' << 24) | (':' << 16) | ('i' << 8) | 'n';
 const STARTED  = ('7' << 24) | (':' << 16) | ('s' << 8) | 't';
 const DATA     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'a';
 const EXITED   = ('6' << 24) | (':' << 16) | ('e' << 8) | 'x';
@@ -70,6 +71,7 @@ struct client_message {
 		case SEGMENT: segment       segment;
 		case IMPAIR:  impair        impair;
 		case TAMPER:  tamper        tamper;
+		case INJECT:  inject        inject;
 		case DATA:    client_data   data;
 		case EOF:     eof           eof;
 		case CREDIT:  credit        credit;
@@ -304,6 +306,17 @@ struct tamper {
 	preamble u8[7] = "(4:name";
 	atom  name;
 	preamble u8[2] = "))";
+}
+
+// The switch itself puts frames into a segment, as an attacker on the
+// wire would: `count` frames `every` ms apart toward `machine` (or every
+// port where it is `*`), each `frame`'s hex bytes, or `size` random bytes
+// where there is no frame. A count of 0 removes the target's injectors.
+// The core reads the entries by key; answered `done`.
+struct inject {
+	preamble u8[8] = "6:inject";
+	channel  ch;
+	form  entries[]  until ")";
 }
 
 // An exec's stdin: always fd 0.

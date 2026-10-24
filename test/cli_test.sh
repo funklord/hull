@@ -1183,6 +1183,40 @@ wait "$tamrun" 2>/dev/null
 # And in the spec, before the machine runs.
 conf badtam "(network none) (segments \"bt-$$\") (tamper (bt-$$ (out (set \"0:ff\")))) (command \"/probe\" \"say\" \"ran\")"
 from_root 125 'a set needs a rewrite probability' -f "$root/badtam.conf"
+
+# The switch injecting a frame of its own: a broadcast of EtherType
+# 0x88b5 carrying "test", from a source MAC no machine has, reaches the
+# hearer and is counted injected, apart from what crosses the link.
+inj="inj-$$"
+conf injhear "(hostname \"injhear\") (network none) (segments \"$inj\") (command \"/probe\" \"link\" \"eth0\" \"hear\" \"eth0\" \"sleep\" \"5\")"
+(cd / && exec timeout 60 "$whole_hull" run -f "$root/injhear.conf" > "$root/injhear.out" 2>&1) &
+injrun=$!
+cases=$((cases + 1))
+tries=0
+until "$hull" segment "$inj" > /dev/null 2>&1; do
+	tries=$((tries + 1))
+	[ "$tries" -lt 40 ] || break
+	sleep 0.25
+done
+[ "$tries" -lt 40 ] || fail "the inject segment never came up" ""
+# A machine not on the segment is refused while it is up.
+expect 1 'that machine is not on the segment' "$hull" segment "$inj" inject nobody frame=ffffffffffff02000000009988b50474
+"$hull" segment "$inj" inject all frame=ffffffffffff02000000009988b50474657374 count=5 every=40 2> "$root/inj.err" ||
+	fail "inject was refused" "$(cat "$root/inj.err")"
+tries=0
+until grep -q '^hear=test from 02:00:00:00:00:99$' "$root/injhear.out" || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+cases=$((cases + 1))
+grep -q '^hear=test from 02:00:00:00:00:99$' "$root/injhear.out" ||
+	fail "an injected frame was not heard" "$(cat "$root/injhear.out")"
+cases=$((cases + 1))
+"$hull" segment "$inj" 2> /dev/null | grep -Eq '^injhear +in .* injected=[1-9]' ||
+	fail "an injected frame was not counted" "$("$hull" segment "$inj" 2>&1)"
+"$hull" stop --timeout 5 injhear > /dev/null 2>&1
+wait "$injrun" 2>/dev/null
+expect 1 'no machine is on that segment' "$hull" segment "gone-$$" inject all size=64 count=10
 # A machine paused: every process of it stopped where it is, its ticks,
 # a child's, ceasing while it is and going on after; a paused machine is
 # shown so, and stopped at once, having been let go on first.

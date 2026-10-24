@@ -43,6 +43,7 @@
 #define MAX_PORTS    32u
 #define MAX_LEARNED  256u
 #define MAX_RULES    32u
+#define MAX_SOURCES  16u
 #define MAX_FRAME    (65536u + 64u)
 #define QUEUE_FRAMES 1000u   /* netem's limit, where none is given */
 
@@ -99,6 +100,22 @@ typedef struct rule {
 	int             used;
 } rule;
 
+/* The switch putting frames into a segment itself, as an attacker would:
+ * toward one machine (empty = every port), a fixed frame or fresh random
+ * bytes, `left` more to send, `every_ms` apart, next due at `next`. */
+typedef struct source {
+	char     machine[64];
+	uint8_t  frame[MAX_FRAME];
+	size_t   length;
+	int      randomize;
+	unsigned size;
+	uint64_t left;
+	unsigned every_ms;
+	uint64_t next;
+	uint64_t random;
+	int      used;
+} source;
+
 typedef struct segment {
 	char     key[512];
 	port    *ports[MAX_PORTS];
@@ -106,6 +123,7 @@ typedef struct segment {
 	learned  table[MAX_LEARNED];
 	unsigned next;    /* the entry a new address replaces, round the table */
 	rule     rules[MAX_RULES];
+	source   sources[MAX_SOURCES];
 } segment;
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -128,13 +146,20 @@ static uint64_t now_ns(void)
 }
 
 /* splitmix64: small, and the same everywhere for a seed. */
-static uint64_t draw(way *w)
+/* splitmix64 from `*state`, which it advances: small, and the same
+ * everywhere for a seed. */
+static uint64_t splitmix(uint64_t *state)
 {
-	uint64_t z = (w->random += 0x9e3779b97f4a7c15u);
+	uint64_t z = (*state += 0x9e3779b97f4a7c15u);
 
 	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9u;
 	z = (z ^ (z >> 27)) * 0x94d049bb133111ebu;
 	return z ^ (z >> 31);
+}
+
+static uint64_t draw(way *w)
+{
+	return splitmix(&w->random);
 }
 
 /* Whether an event of probability `p` happens, from 53 bits of a draw. */
@@ -277,6 +302,62 @@ static void write_port(port *p, const uint8_t *framed, size_t length)
 	}
 	w->count.passed++;
 	w->count.passed_bytes += length - 4u;
+}
+
+/* A frame the switch injects, written to `p`'s socket, counted apart
+ * from what crosses the link: dropped where the socket will not take it. */
+static void inject_to(port *p, const uint8_t *framed, size_t length)
+{
+	ssize_t n;
+
+	if (p->out_length != 0u)
+		return;
+	n = send(p->fd, framed, length, MSG_DONTWAIT | MSG_NOSIGNAL);
+	if (n < 0)
+		n = 0;
+	if ((size_t)n < length) {
+		memcpy(p->out, framed + n, length - (size_t)n);
+		p->out_length = length - (size_t)n;
+	}
+	p->way[HULL_SEGMENT_IN].count.injected++;
+}
+
+/* A segment's injectors fired for all that are due by `now`: a frame to
+ * the target port, or every port where the target is empty. The first
+ * still-pending injector's time, or UINT64_MAX. A spent one is freed. */
+static uint64_t fire_sources(segment *s, uint64_t now)
+{
+	uint64_t first = UINT64_MAX;
+
+	for (unsigned k = 0u; k < MAX_SOURCES; k++) {
+		source *src = &s->sources[k];
+
+		while (src->used && src->next <= now) {
+			uint8_t  frame[4u + MAX_FRAME];
+			size_t   length = src->randomize ? 4u + src->size : 4u + src->length;
+
+			frame[0] = (uint8_t)((length - 4u) >> 24);
+			frame[1] = (uint8_t)((length - 4u) >> 16);
+			frame[2] = (uint8_t)((length - 4u) >> 8);
+			frame[3] = (uint8_t)(length - 4u);
+			if (src->randomize)
+				for (unsigned b = 0u; b < src->size; b++)
+					frame[4u + b] = (uint8_t)(splitmix(&src->random) & 0xffu);
+			else
+				memcpy(frame + 4u, src->frame, src->length);
+			for (unsigned i = 0u; i < s->port_count; i++)
+				if (src->machine[0] == '\0' || strcmp(s->ports[i]->machine, src->machine) == 0)
+					inject_to(s->ports[i], frame, length);
+			if (--src->left == 0u) {
+				src->used = 0;
+				break;
+			}
+			src->next += (uint64_t)src->every_ms * 1000000u;
+		}
+		if (src->used && src->next < first)
+			first = src->next;
+	}
+	return first;
 }
 
 static void forward(segment *s, unsigned from, const uint8_t *framed, size_t length);
@@ -616,13 +697,15 @@ static void *serve(void *arg)
 		first = UINT64_MAX;
 		for (unsigned k = 0u; k < MAX_SEGMENTS; k++) {
 			segment *s = segments[k];
+			uint64_t due;
 
 			for (unsigned i = 0u; s != NULL && i < s->port_count; i++) {
-				uint64_t due = release(s, i, now);
-
+				due = release(s, i, now);
 				if (due < first)
 					first = due;
 			}
+			if (s != NULL && (due = fire_sources(s, now)) < first)
+				first = due;
 		}
 		for (unsigned k = 0u; k < MAX_SEGMENTS; k++) {
 			if (segments[k] != NULL && segments[k]->port_count == 0u) {
@@ -811,6 +894,74 @@ int hull_segment_tamper(const char *key, const char *machine, int direction,
 		if (machine == NULL || strcmp(p->machine, machine) == 0)
 			apply_rule(s, p, direction);
 	}
+	pthread_mutex_unlock(&lock);
+	(void)!write(wake[1], "", 1u);
+	return 0;
+}
+
+int hull_segment_inject(const char *key, const char *machine, const unsigned char *frame,
+                        size_t length, int randomize, unsigned size, uint64_t count,
+                        unsigned every_ms, uint64_t seed, char *why, size_t cap)
+{
+	segment *s;
+	source  *src = NULL;
+	int      present = 0;
+
+	if (machine != NULL && strlen(machine) >= sizeof src->machine) {
+		say(why, cap, "a port's machine is named by its id");
+		return -1;
+	}
+	if (count != 0u && (randomize ? (size < 14u || size > MAX_FRAME) : (length < 14u || length > MAX_FRAME))) {
+		say(why, cap, "a frame is 14 to 65600 bytes");
+		return -1;
+	}
+	pthread_mutex_lock(&lock);
+	s = find(key);
+	if (s == NULL) {
+		pthread_mutex_unlock(&lock);
+		say(why, cap, "no machine is on that segment");
+		return -1;
+	}
+	/* A named target must be on the segment. */
+	for (unsigned i = 0u; i < s->port_count; i++)
+		if (machine == NULL || strcmp(s->ports[i]->machine, machine) == 0)
+			present = 1;
+	if (!present) {
+		pthread_mutex_unlock(&lock);
+		say(why, cap, "that machine is not on the segment");
+		return -1;
+	}
+	/* A count of 0 removes the target's injectors. */
+	if (count == 0u) {
+		for (unsigned k = 0u; k < MAX_SOURCES; k++)
+			if (s->sources[k].used &&
+			    strcmp(s->sources[k].machine, machine != NULL ? machine : "") == 0)
+				s->sources[k].used = 0;
+		pthread_mutex_unlock(&lock);
+		(void)!write(wake[1], "", 1u);
+		return 0;
+	}
+	for (unsigned k = 0u; k < MAX_SOURCES && src == NULL; k++)
+		if (!s->sources[k].used)
+			src = &s->sources[k];
+	if (src == NULL) {
+		pthread_mutex_unlock(&lock);
+		say(why, cap, "too many injectors on the segment");
+		return -1;
+	}
+	memset(src, 0, sizeof *src);
+	snprintf(src->machine, sizeof src->machine, "%s", machine != NULL ? machine : "");
+	src->randomize = randomize;
+	src->size      = size;
+	if (!randomize) {
+		memcpy(src->frame, frame, length);
+		src->length = length;
+	}
+	src->left     = count;
+	src->every_ms = every_ms;
+	src->random   = seed;
+	src->next     = now_ns();
+	src->used     = 1;
 	pthread_mutex_unlock(&lock);
 	(void)!write(wake[1], "", 1u);
 	return 0;

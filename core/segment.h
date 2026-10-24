@@ -99,6 +99,7 @@ typedef struct hull_segment_count {
 	uint64_t matched;      /* frames a tamper matched */
 	uint64_t tampered;     /* matched frames dropped, rewritten or flipped */
 	uint64_t replayed;     /* copies a tamper re-sent */
+	uint64_t injected;     /* frames the switch injected toward this port (in) */
 } hull_segment_count;
 
 typedef struct hull_segment_counts {
@@ -129,6 +130,21 @@ int hull_segment_impair(const char *key, const char *machine, int direction,
  * machine joins later takes it too. 0, or -1 and the reason in `why`. */
 int hull_segment_tamper(const char *key, const char *machine, int direction,
                         const hull_tamper *tamper, char *why, size_t cap);
+
+/*
+ * Put a frame into the segment `key` from the switch itself, as an
+ * attacker on the wire would: toward the port of `machine`, or every
+ * port where `machine` is NULL. `count` frames, `every_ms` apart; the
+ * first at once. Where `randomize`, each is `size` bytes of fresh pseudo-
+ * random payload from `seed` rather than `frame`. `frame` is a whole
+ * Ethernet frame (destination and source MACs and on), at least 14 bytes.
+ * It bypasses the links' impairment and tamper, being the switch's own.
+ * 0, or -1 and the reason in `why`: a segment no machine is on, or too
+ * many sources. A `count` of 0 removes the machine's injectors.
+ */
+int hull_segment_inject(const char *key, const char *machine, const unsigned char *frame,
+                        size_t length, int randomize, unsigned size, uint64_t count,
+                        unsigned every_ms, uint64_t seed, char *why, size_t cap);
 
 /* The counts of each port on `key`, at most `cap` of them: how many there
  * are, or -1 where no machine is on it. */
