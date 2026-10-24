@@ -409,6 +409,28 @@ static const key link_keys[] = {
 };
 static const schema link = TABLE(link_keys);
 
+/* A targeted fault on one direction of a link (Appendix D): a matched
+ * frame dropped, rewritten or a bit flipped, and replayed. match and set
+ * are "OFFSET:HEX"; the core checks the shape and that a probability is
+ * at most 1. */
+static const key fault_keys[] = {
+	{ .name = "match",   .type = STRING, .value = nonempty },
+	{ .name = "drop",    .type = NUMBER },
+	{ .name = "set",     .type = STRING, .value = nonempty },
+	{ .name = "rewrite", .type = NUMBER },
+	{ .name = "flip",    .type = NUMBER },
+	{ .name = "replay",  .type = NUMBER },
+	{ .name = "copies",  .type = COUNT },
+	{ .name = "every",   .type = COUNT },
+};
+static const schema fault = TABLE(fault_keys);
+
+static const key fault_link_keys[] = {
+	{ .name = "out", .type = RECORD, .record = &fault },
+	{ .name = "in",  .type = RECORD, .record = &fault },
+};
+static const schema fault_link = TABLE(fault_link_keys);
+
 /* J.1 */
 static const key machine_keys[] = {
 	{ .name = "source",        .type = STRING, .required = 1, .value = nonempty },
@@ -432,6 +454,7 @@ static const key machine_keys[] = {
 	{ .name = "network",       .type = CHOICE, .choices = network_values },
 	{ .name = "segments",      .type = STRINGS, .value = label },
 	{ .name = "impair",        .type = MAP, .record = &link, .names = label },
+	{ .name = "tamper",        .type = MAP, .record = &fault_link, .names = label },
 	{ .name = "init",          .type = STRING, .value = absolute },
 	{ .name = "export",        .type = STRING, .value = nonempty },
 	{ .name = "owners",        .type = STRING, .value = nonempty },

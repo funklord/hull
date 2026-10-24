@@ -1147,6 +1147,42 @@ conf offwire "(network none) (segments \"on-$$\") (impair (off-$$ (out (loss 0.5
 from_root 125 'impair names a segment the machine is not on' -f "$root/offwire.conf"
 expect 1 'impair: rejected: not yet: a link is impaired' "$hull" plan --backend docker -f "$root/offwire.conf"
 expect 1 'no machine is on that segment' "$hull" segment "nowhere-$$"
+
+# A targeted fault set at runtime: the shouter's frames whose payload has
+# 'o' (its text's first byte) at offset 1 dropped, so the hearer hears
+# nothing and the shouter's way out counts them matched and tampered.
+tam="tam-$$"
+printf '(machines (hearer %s) (shouter %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (network none) (segments \"$tam\") (command \"/probe\" \"link\" \"eth0\" \"hear\" \"eth0\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (network none) (segments \"$tam\") (command \"/probe\" \"link\" \"eth0\" \"sleep\" \"2\" \"shout\" \"eth0\" \"over\")" \
+	> "$root/tam.conf"
+(cd / && exec timeout 60 "$whole_hull" run -f "$root/tam.conf" > "$root/tam.out" 2>&1) &
+tamrun=$!
+cases=$((cases + 1))
+tries=0
+until "$hull" segment "$tam" impair shouter out 2>/dev/null &&
+      "$hull" segment "$tam" tamper shouter out match=1:6f drop=1 2> "$root/tam.err"; do
+	tries=$((tries + 1))
+	[ "$tries" -lt 40 ] || break
+	sleep 0.25
+done
+[ "$tries" -lt 40 ] || fail "a runtime tamper could not be set" "$(cat "$root/tam.err")"
+tries=0
+until "$hull" segment "$tam" > "$root/tam.counts" 2>&1 &&
+      grep -Eq '^shouter +out .* matched=[1-9][0-9]* tampered=[1-9]' "$root/tam.counts"; do
+	tries=$((tries + 1))
+	[ "$tries" -lt 120 ] || break
+	sleep 0.25
+done
+[ "$tries" -lt 120 ] || fail "a tamper's matched frames were not counted" "$(cat "$root/tam.counts")"
+# A fault's bad shape is refused by the core while the segment is live.
+expect 1 'OFFSET:HEX' "$hull" segment "$tam" tamper shouter out match=notanumber
+"$hull" stop --timeout 5 hearer > /dev/null 2>&1
+"$hull" stop --timeout 5 shouter > /dev/null 2>&1
+wait "$tamrun" 2>/dev/null
+# And in the spec, before the machine runs.
+conf badtam "(network none) (segments \"bt-$$\") (tamper (bt-$$ (out (set \"0:ff\")))) (command \"/probe\" \"say\" \"ran\")"
+from_root 125 'a set needs a rewrite probability' -f "$root/badtam.conf"
 # A machine paused: every process of it stopped where it is, its ticks,
 # a child's, ceasing while it is and going on after; a paused machine is
 # shown so, and stopped at once, having been let go on first.

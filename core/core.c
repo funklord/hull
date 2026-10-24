@@ -37,6 +37,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
@@ -130,6 +131,8 @@ struct slot {
 		char            segment[64];
 		int             given[2];
 		hull_impairment way[2];
+		int             tampered[2];
+		hull_tamper     fault[2];
 	}                  links[8];
 	unsigned           link_count;
 	int                exited;
@@ -344,9 +347,12 @@ static int on_segment(hull_core *core, const char *key, char *why, size_t cap)
 		if (strcmp(s->links[i].segment, key) != 0)
 			continue;
 		for (int direction = 0; direction < 2; direction++) {
-			if (s->links[i].given[direction] &&
-			    hull_segment_impair(key, s->id, direction, &s->links[i].way[direction], why,
-			                        cap) != 0) {
+			if ((s->links[i].given[direction] &&
+			     hull_segment_impair(key, s->id, direction, &s->links[i].way[direction], why,
+			                         cap) != 0) ||
+			    (s->links[i].tampered[direction] &&
+			     hull_segment_tamper(key, s->id, direction, &s->links[i].fault[direction], why,
+			                         cap) != 0)) {
 				close(fd);
 				return -1;
 			}
@@ -1354,53 +1360,74 @@ static void adopt_kept(void)
 
 static const char *impairment_of(const hull_sexpr_doc *body, const hull_sexpr_form *entry,
                                  hull_impairment *m);
+static const char *tamper_of(const hull_sexpr_doc *body, const hull_sexpr_form *entry,
+                             hull_tamper *t);
 
-/* The plan's (impair (SEGMENT (out ...) (in ...)) ...) into `s`: NULL, or
- * why it cannot be. A segment the machine is not on is refused. */
+/* The plan's (impair ...) and (tamper ...) into `s`: NULL, or why it
+ * cannot be. A segment the machine is not on is refused. */
 static const char *links_of(slot *s, const hull_sexpr_doc *doc, const hull_sexpr_form *machine)
 {
-	hull_sexpr_form impair;
-	hull_sexpr_form segments;
-	hull_sexpr_form link;
-	int             has_segments = hull_access_find(doc, machine, "segments", &segments);
+	static const char *const which[2] = { "impair", "tamper" };
+	hull_sexpr_form          segments;
+	int                      has_segments = hull_access_find(doc, machine, "segments", &segments);
 
-	if (!hull_access_find(doc, machine, "impair", &impair))
-		return NULL;
-	hull_sexpr_child(doc, &impair, &link);
-	while (hull_sexpr_next(doc, &link, &link)) {
-		hull_sexpr_form name;
-		hull_sexpr_form way;
-		hull_sexpr_form joined;
-		int             on = 0;
-		size_t          length;
+	for (int kind = 0; kind < 2; kind++) {
+		hull_sexpr_form group;
+		hull_sexpr_form link;
 
-		if (s->link_count == sizeof s->links / sizeof s->links[0])
-			return "impair names more segments than a machine joins";
-		if (link.kind != HULL_SEXPR_LIST || !hull_sexpr_child(doc, &link, &name) ||
-		    hull_sexpr_value(doc, &name, (uint8_t *)s->links[s->link_count].segment,
-		                     sizeof s->links[0].segment - 1u, &length) != HULL_SEXPR_OK)
-			return "impair is (SEGMENT (out ...) (in ...))";
-		s->links[s->link_count].segment[length] = '\0';
-		if (has_segments) {
-			hull_sexpr_child(doc, &segments, &joined);
-			while (!on && hull_sexpr_next(doc, &joined, &joined))
-				on = hull_sexpr_is(doc, &joined, s->links[s->link_count].segment);
+		if (!hull_access_find(doc, machine, which[kind], &group))
+			continue;
+		hull_sexpr_child(doc, &group, &link);
+		while (hull_sexpr_next(doc, &link, &link)) {
+			hull_sexpr_form name;
+			hull_sexpr_form way;
+			hull_sexpr_form joined;
+			char            segment[64];
+			unsigned        at;
+			int             on = 0;
+			size_t          length;
+
+			if (link.kind != HULL_SEXPR_LIST || !hull_sexpr_child(doc, &link, &name) ||
+			    hull_sexpr_value(doc, &name, (uint8_t *)segment, sizeof segment - 1u,
+			                     &length) != HULL_SEXPR_OK)
+				return "impair and tamper are (SEGMENT (out ...) (in ...))";
+			segment[length] = '\0';
+			if (has_segments) {
+				hull_sexpr_child(doc, &segments, &joined);
+				while (!on && hull_sexpr_next(doc, &joined, &joined))
+					on = hull_sexpr_is(doc, &joined, segment);
+			}
+			if (!on)
+				return kind == 0 ? "impair names a segment the machine is not on"
+				                 : "tamper names a segment the machine is not on";
+			/* One slot per segment, shared by its impair and tamper. */
+			for (at = 0u; at < s->link_count && strcmp(s->links[at].segment, segment) != 0; at++)
+				;
+			if (at == s->link_count) {
+				if (s->link_count == sizeof s->links / sizeof s->links[0])
+					return "more segments impaired than a machine joins";
+				snprintf(s->links[at].segment, sizeof s->links[at].segment, "%s", segment);
+				s->link_count++;
+			}
+			for (way = name; hull_sexpr_next(doc, &way, &way);) {
+				hull_sexpr_form head;
+				const char     *wrong;
+				int             direction;
+
+				if (way.kind != HULL_SEXPR_LIST || !hull_sexpr_child(doc, &way, &head))
+					return "impair and tamper are (SEGMENT (out ...) (in ...))";
+				direction = hull_sexpr_is(doc, &head, "in") ? HULL_SEGMENT_IN : HULL_SEGMENT_OUT;
+				if (kind == 0) {
+					if ((wrong = impairment_of(doc, &way, &s->links[at].way[direction])) != NULL)
+						return wrong;
+					s->links[at].given[direction] = 1;
+				} else {
+					if ((wrong = tamper_of(doc, &way, &s->links[at].fault[direction])) != NULL)
+						return wrong;
+					s->links[at].tampered[direction] = 1;
+				}
+			}
 		}
-		if (!on)
-			return "impair names a segment the machine is not on";
-		for (way = name; hull_sexpr_next(doc, &way, &way);) {
-			hull_sexpr_form head;
-			const char     *wrong;
-			int             direction;
-
-			if (way.kind != HULL_SEXPR_LIST || !hull_sexpr_child(doc, &way, &head))
-				return "impair is (SEGMENT (out ...) (in ...))";
-			direction = hull_sexpr_is(doc, &head, "in") ? HULL_SEGMENT_IN : HULL_SEGMENT_OUT;
-			if ((wrong = impairment_of(doc, &way, &s->links[s->link_count].way[direction])) != NULL)
-				return wrong;
-			s->links[s->link_count].given[direction] = 1;
-		}
-		s->link_count++;
 	}
 	return NULL;
 }
@@ -2189,6 +2216,97 @@ static const char *impairment_of(const hull_sexpr_doc *body, const hull_sexpr_fo
 	return NULL;
 }
 
+/* "OFFSET:HEX" into an offset and bytes: a byte offset from 0 to 65535,
+ * a colon, and an even run of hex. NULL, or what is wrong. */
+static const char *offset_hex(const char *text, unsigned *offset, unsigned char *out,
+                              unsigned *len)
+{
+	const char *colon = strchr(text, ':');
+	char       *end;
+	long        off;
+	size_t      n;
+	size_t      k;
+
+	if (colon == NULL)
+		return "match and set are \"OFFSET:HEX\"";
+	off = strtol(text, &end, 10);
+	if (end != colon || off < 0 || off > 65535)
+		return "match and set offsets are 0 to 65535";
+	n = strlen(colon + 1);
+	if (n == 0u || n % 2u != 0u || n / 2u > 32u)
+		return "match and set take 1 to 32 bytes of hex";
+	for (k = 0u; k < n; k++)
+		if (!isxdigit((unsigned char)colon[1 + k]))
+			return "match and set hex is hex digits";
+	for (k = 0u; k < n; k += 2u) {
+		unsigned byte;
+
+		sscanf(colon + 1 + k, "%2x", &byte);
+		out[k / 2u] = (unsigned char)byte;
+	}
+	*offset = (unsigned)off;
+	*len    = (unsigned)(n / 2u);
+	return NULL;
+}
+
+/* `tamper`'s `(fault ...)` entry as the switch takes it: NULL, or what
+ * is wrong with it. Every value is one atom; match and set are
+ * "OFFSET:HEX". */
+static const char *tamper_of(const hull_sexpr_doc *body, const hull_sexpr_form *entry,
+                             hull_tamper *t)
+{
+	hull_sexpr_form item;
+	int             more;
+
+	memset(t, 0, sizeof *t);
+	if (entry->kind != HULL_SEXPR_LIST || !hull_sexpr_child(body, entry, &item))
+		return "a fault is a list";
+	for (more = hull_sexpr_next(body, &item, &item); more;
+	     more = hull_sexpr_next(body, &item, &item)) {
+		hull_sexpr_form key;
+		hull_sexpr_form value;
+		uint64_t        n = 0u;
+		char            name[12];
+
+		if (item.kind != HULL_SEXPR_LIST || !hull_sexpr_child(body, &item, &key) ||
+		    !hull_msg_string(body, &key, name, sizeof name) ||
+		    !hull_sexpr_next(body, &key, &value))
+			return "a fault's entry is (key value)";
+		if (strcmp(name, "match") == 0 || strcmp(name, "set") == 0) {
+			char        text[80];
+			const char *wrong;
+
+			if (!hull_msg_string(body, &value, text, sizeof text))
+				return "match and set are \"OFFSET:HEX\"";
+			wrong = name[0] == 'm' ? offset_hex(text, &t->match_offset, t->match, &t->match_length)
+			                       : offset_hex(text, &t->set_offset, t->set, &t->set_length);
+			if (wrong != NULL)
+				return wrong;
+		} else if (strcmp(name, "drop") == 0 || strcmp(name, "rewrite") == 0 ||
+		           strcmp(name, "flip") == 0 || strcmp(name, "replay") == 0) {
+			double *to = name[0] == 'd' ? &t->drop : name[0] == 'r' && name[1] == 'e' &&
+			             name[2] == 'w' ? &t->rewrite : name[0] == 'f' ? &t->flip : &t->replay;
+
+			if (!probability(body, &value, to))
+				return "a probability is from 0 to 1";
+		} else if (strcmp(name, "copies") == 0 || strcmp(name, "every") == 0) {
+			if (!whole_count(body, &value, name[0] == 'c' ? 1000 : 60000, &n))
+				return "copies is at most 1000, every at most 60000 ms";
+			if (name[0] == 'c')
+				t->copies = (unsigned)n;
+			else
+				t->every_ms = (unsigned)n;
+		} else {
+			return "a fault has no such key";
+		}
+		if (hull_sexpr_next(body, &value, &value))
+			return "a fault's entry is (key value)";
+	}
+	if (t->set_length != 0u && t->rewrite == 0.0)
+		return "a set needs a rewrite probability";
+	return NULL;
+}
+
 static void handle_impair(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
 	hull_sexpr_form value;
@@ -2223,11 +2341,45 @@ static void handle_impair(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	send_simple(c, "(4:done", ch);
 }
 
+static void handle_tamper(client *c, uint32_t ch, const hull_sexpr_doc *body)
+{
+	hull_sexpr_form value;
+	hull_tamper     fault;
+	const char     *wrong = NULL;
+	char            name[512];
+	char            machine[64];
+	char            direction[8];
+	char            why[256];
+
+	if (!hull_msg_find(body, "name", &value) || !hull_msg_string(body, &value, name, sizeof name) ||
+	    !hull_msg_find(body, "machine", &value) ||
+	    !hull_msg_string(body, &value, machine, sizeof machine) ||
+	    (strcmp(machine, "*") != 0 && !is_label(machine)) ||
+	    !hull_msg_find(body, "direction", &value) ||
+	    !hull_msg_string(body, &value, direction, sizeof direction) ||
+	    (strcmp(direction, "in") != 0 && strcmp(direction, "out") != 0)) {
+		send_error(c, ch, "tamper names a segment, a machine or *, and in or out");
+		return;
+	}
+	if (!hull_msg_find(body, "fault", &value) ||
+	    (wrong = tamper_of(body, &value, &fault)) != NULL) {
+		send_error(c, ch, wrong != NULL ? wrong : "tamper carries a fault");
+		return;
+	}
+	if (hull_segment_tamper(name, strcmp(machine, "*") == 0 ? NULL : machine,
+	                        strcmp(direction, "in") == 0 ? HULL_SEGMENT_IN : HULL_SEGMENT_OUT,
+	                        &fault, why, sizeof why) != 0) {
+		send_error(c, ch, why);
+		return;
+	}
+	send_simple(c, "(4:done", ch);
+}
+
 static void handle_segment(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
 	static const char *const names[] = { "bytes", "corrupted", "duplicated", "frames", "full",
-	                                     "lost", "overflow", "passed", "passed_bytes",
-	                                     "too_big" };
+	                                     "lost", "matched", "overflow", "passed", "passed_bytes",
+	                                     "replayed", "tampered", "too_big" };
 	static hull_segment_counts counts[64];
 	hull_sexpr_form value;
 	hull_msg        m = { 0 };
@@ -2251,7 +2403,7 @@ static void handle_segment(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		 * counts by name. */
 		for (int part = 0; part < 3; part++) {
 			const hull_segment_count *w;
-			uint64_t                  of[10];
+			uint64_t                  of[13];
 
 			if (part == 0)
 				hull_msg_raw(&m, "(4:port");
@@ -2268,12 +2420,15 @@ static void handle_segment(client *c, uint32_t ch, const hull_sexpr_doc *body)
 			of[3] = w->frames;
 			of[4] = w->full;
 			of[5] = w->lost;
-			of[6] = w->overflow;
-			of[7] = w->passed;
-			of[8] = w->passed_bytes;
-			of[9] = w->too_big;
+			of[6] = w->matched;
+			of[7] = w->overflow;
+			of[8] = w->passed;
+			of[9] = w->passed_bytes;
+			of[10] = w->replayed;
+			of[11] = w->tampered;
+			of[12] = w->too_big;
 			hull_msg_raw(&m, part == 0 ? "(2:in" : "(3:out");
-			for (unsigned k = 0u; k < 10u; k++) {
+			for (unsigned k = 0u; k < 13u; k++) {
 				hull_msg_raw(&m, "(");
 				hull_msg_text(&m, names[k]);
 				hull_msg_number(&m, (long long)of[k]);
@@ -2440,6 +2595,8 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		handle_pause(c, (uint32_t)ch, body, 0);
 	} else if (hull_msg_is(body, "segment")) {
 		handle_segment(c, (uint32_t)ch, body);
+	} else if (hull_msg_is(body, "tamper")) {
+		handle_tamper(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "impair")) {
 		handle_impair(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "stats")) {

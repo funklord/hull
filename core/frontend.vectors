@@ -127,3 +127,7 @@ client_message pause 28 35 3A 70 61 75 73 65 28 32 3A 63 68 31 3A 37 29 28 37 3A
 
 # unpause: (7:unpause(2:ch1:9)(7:machine3:web))
 client_message unpause 28 37 3A 75 6E 70 61 75 73 65 28 32 3A 63 68 31 3A 39 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 29
+
+
+# tamper: (6:tamper(2:ch1:7)(9:direction3:out)(5:fault(4:drop3:0.5)(5:match10:0:deadbeef)(6:replay1:1)(6:copies1:3)(5:every2:20))(7:machine5:alpha)(4:name4:wire))
+client_message tamper 28 36 3A 74 61 6D 70 65 72 28 32 3A 63 68 31 3A 37 29 28 39 3A 64 69 72 65 63 74 69 6F 6E 33 3A 6F 75 74 29 28 35 3A 66 61 75 6C 74 28 34 3A 64 72 6F 70 33 3A 30 2E 35 29 28 35 3A 6D 61 74 63 68 31 30 3A 30 3A 64 65 61 64 62 65 65 66 29 28 36 3A 72 65 70 6C 61 79 31 3A 31 29 28 36 3A 63 6F 70 69 65 73 31 3A 33 29 28 35 3A 65 76 65 72 79 32 3A 32 30 29 29 28 37 3A 6D 61 63 68 69 6E 65 35 3A 61 6C 70 68 61 29 28 34 3A 6E 61 6D 65 34 3A 77 69 72 65 29 29

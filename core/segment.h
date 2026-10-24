@@ -56,6 +56,32 @@ typedef struct hull_impairment {
 	uint64_t seed;
 } hull_impairment;
 
+/*
+ * A targeted fault on one direction of a link, for testing a protocol
+ * against a hostile wire rather than against random noise. A frame is
+ * matched when `match_length` is 0, or its Ethernet payload (past the
+ * 14-byte header) has `match` at byte `match_offset`. A matched frame is,
+ * with probability `drop`, dropped; else, with `rewrite`, its payload
+ * bytes at `set_offset` overwritten with `set`; else, with `flip`, one
+ * bit of its payload flipped. `replay` keeps a copy and sends it again
+ * `copies` times, `every_ms` apart, as a captured frame re-sent. All zero
+ * does nothing. Draws share the link's seed.
+ */
+typedef struct hull_tamper {
+	unsigned      match_offset;
+	unsigned char match[32];
+	unsigned      match_length;
+	double        drop;
+	double        rewrite;
+	unsigned      set_offset;
+	unsigned char set[32];
+	unsigned      set_length;
+	double        flip;
+	double        replay;
+	unsigned      copies;
+	unsigned      every_ms;
+} hull_tamper;
+
 /* What one direction of a port has seen: frames and their bytes, those
  * handed on, those dropped by why, and the copies and damage made. A
  * frame dropped for a socket that would not take it is `full`. */
@@ -70,6 +96,9 @@ typedef struct hull_segment_count {
 	uint64_t full;
 	uint64_t duplicated;
 	uint64_t corrupted;
+	uint64_t matched;      /* frames a tamper matched */
+	uint64_t tampered;     /* matched frames dropped, rewritten or flipped */
+	uint64_t replayed;     /* copies a tamper re-sent */
 } hull_segment_count;
 
 typedef struct hull_segment_counts {
@@ -94,6 +123,12 @@ int hull_segment_port(const char *key, const char *machine, char *why, size_t ca
  */
 int hull_segment_impair(const char *key, const char *machine, int direction,
                         const hull_impairment *impairment, char *why, size_t cap);
+
+/* `tamper` for `direction` of every port `machine` has on `key`, or every
+ * machine's where `machine` is NULL, replacing what it had; a port the
+ * machine joins later takes it too. 0, or -1 and the reason in `why`. */
+int hull_segment_tamper(const char *key, const char *machine, int direction,
+                        const hull_tamper *tamper, char *why, size_t cap);
 
 /* The counts of each port on `key`, at most `cap` of them: how many there
  * are, or -1 where no machine is on it. */

@@ -199,6 +199,11 @@ static void test_records(void)
 	NO(M("(impair (wire (out (gemodel (r 0.3)))))"), MISSING, "(gemodel ",
 	   "machine.impair.wire.out.gemodel.p");
 	NO(M("(impair (wire (sideways (loss 0.5))))"), UNKNOWN, "sideways", "machine.impair.wire.sideways");
+	/* A link given a targeted fault, Appendix D. */
+	OK(M("(segments \"wire\") (tamper (wire (out (match \"0:deadbeef\") (drop 0.5) "
+	     "(replay 1) (copies 3) (every 20)) (in (set \"4:00\") (rewrite 1) (flip 0.1))))"));
+	NO(M("(tamper (wire (out (wobble 1))))"), UNKNOWN, "wobble", "machine.tamper.wire.out.wobble");
+	NO(M("(tamper (wire (sideways (drop 1))))"), UNKNOWN, "sideways", "machine.tamper.wire.sideways");
 	/* A volume that is a stack of layers, 3.7. */
 	OK(M("(volumes (volume (guest \"/etc\") (layers \"dir:./t\" \"dir:./s\") (upper \"./d\")))"));
 	OK(M("(volumes (volume (guest \"/etc\") (layers \"dir:./t\" \"dir:./s\") (mode ro)))"));

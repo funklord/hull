@@ -2557,6 +2557,8 @@ static const hull_cap_entry entries[] = {
 	  "switch; with (network none)", NULL },
 	{ "impair",                 HULL_SUP_NATIVE,
 	  "in the core's switch, each way of the machine's port on a segment, in netem's terms", NULL },
+	{ "tamper",                 HULL_SUP_NATIVE,
+	  "in the core's switch, a targeted fault on each way of the machine's port on a segment", NULL },
 	{ "export",                 HULL_SUP_NATIVE,
 	  "a tar of the overlay's tree when the workload ends, owners as the machine saw them",
 	  NULL },

@@ -34,6 +34,7 @@ const SEGMENT  = ('7' << 24) | (':' << 16) | ('s' << 8) | 'e';
 const PAUSE    = ('5' << 24) | (':' << 16) | ('p' << 8) | 'a';
 const UNPAUSE  = ('7' << 24) | (':' << 16) | ('u' << 8) | 'n';
 const IMPAIR   = ('6' << 24) | (':' << 16) | ('i' << 8) | 'm';
+const TAMPER   = ('6' << 24) | (':' << 16) | ('t' << 8) | 'a';
 const STARTED  = ('7' << 24) | (':' << 16) | ('s' << 8) | 't';
 const DATA     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'a';
 const EXITED   = ('6' << 24) | (':' << 16) | ('e' << 8) | 'x';
@@ -68,6 +69,7 @@ struct client_message {
 		case UNPAUSE: unpause       unpause;
 		case SEGMENT: segment       segment;
 		case IMPAIR:  impair        impair;
+		case TAMPER:  tamper        tamper;
 		case DATA:    client_data   data;
 		case EOF:     eof           eof;
 		case CREDIT:  credit        credit;
@@ -280,6 +282,23 @@ struct impair {
 	preamble u8[12] = "(9:direction";
 	atom  direction;
 	preamble u8[15] = ")(10:impairment";
+	form  entries[]  until ")";
+	machine_entry  machine;
+	preamble u8[7] = "(4:name";
+	atom  name;
+	preamble u8[2] = "))";
+}
+
+// One direction of a machine's link on a segment given a targeted fault,
+// or every machine's where the machine is `*`; answered `done`. The
+// fault's entries are `(key value)`, and match and set `(key OFFSET
+// bytes)`, which the core checks.
+struct tamper {
+	preamble u8[8] = "6:tamper";
+	channel        ch;
+	preamble u8[12] = "(9:direction";
+	atom  direction;
+	preamble u8[9] = ")(5:fault";
 	form  entries[]  until ")";
 	machine_entry  machine;
 	preamble u8[7] = "(4:name";

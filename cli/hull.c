@@ -102,6 +102,7 @@ static void usage(FILE *out)
 	      "       hull kill [-s SIGNAL] ID | hull stats [--over S] ID\n"
 	      "       hull pause ID | hull unpause ID\n"
 	      "       hull segment NAME [impair MACHINE|all in|out|both [KEY=VALUE|down]...]\n"
+	      "       hull segment NAME tamper MACHINE|all in|out|both [KEY=VALUE]...\n"
 	      "       hull ssh ID | hull proxy-ssh HOST\n"
 	      "       hull ssh-config [--remove] | hull gc\n"
 	      "       hull commit [--arch A] DIR REF | hull commit --tar FILE REF\n"
@@ -3593,6 +3594,36 @@ static void msg_entry(hull_msg *m, const char *key, const char *value)
 
 /* netem's names, as `KEY=VALUE` words, into an impairment's entries,
  * sorted as a canonical form's are. 0, or 2 having said why. */
+/* A segment fault's KEY=VALUE words into `(fault ...)` entries, in key
+ * order; match and set take OFFSET:HEX, carried as a string the core
+ * splits. 0, or 2 having said why. */
+static int fault_words(int argc, char **argv, hull_msg *m)
+{
+	static const char *const keys[] = { "copies", "drop", "every", "flip", "match", "replay",
+	                                    "rewrite", "set" };
+	const char *given[sizeof keys / sizeof keys[0]] = { NULL };
+
+	for (int i = 0; i < argc; i++) {
+		const char *equals = strchr(argv[i], '=');
+		size_t      length = equals != NULL ? (size_t)(equals - argv[i]) : strlen(argv[i]);
+		unsigned    k;
+
+		for (k = 0u; k < sizeof keys / sizeof keys[0]; k++)
+			if (strlen(keys[k]) == length && strncmp(keys[k], argv[i], length) == 0)
+				break;
+		if (k == sizeof keys / sizeof keys[0] || equals == NULL) {
+			fprintf(stderr, "hull: segment: %s is not a fault: match and set with OFFSET:HEX, "
+			        "and drop, rewrite, flip, replay, copies and every with =VALUE\n", argv[i]);
+			return 2;
+		}
+		given[k] = equals + 1;
+	}
+	for (unsigned k = 0u; k < sizeof keys / sizeof keys[0]; k++)
+		if (given[k] != NULL)
+			msg_entry(m, keys[k], given[k]);
+	return 0;
+}
+
 static int impairment_words(int argc, char **argv, hull_msg *m)
 {
 	static const char *const keys[] = { "corrupt", "delay", "down", "duplicate", "gemodel",
@@ -3686,7 +3717,7 @@ static void print_way(const hull_sexpr_doc *body, const hull_sexpr_form *way, co
 {
 	static const char *const counts[] = { "frames", "bytes", "passed", "passed_bytes", "lost",
 	                                      "too_big", "overflow", "full", "duplicated",
-	                                      "corrupted" };
+	                                      "corrupted", "matched", "tampered", "replayed" };
 	hull_sexpr_form item;
 	int             more;
 
@@ -3722,7 +3753,9 @@ static int segment_command(int argc, char **argv)
 	int             status;
 	int             more;
 
-	if (argc < 3 || (argc > 3 && (strcmp(argv[3], "impair") != 0 || argc < 6))) {
+	int tamper = argc > 3 && strcmp(argv[3], "tamper") == 0;
+
+	if (argc < 3 || (argc > 3 && ((strcmp(argv[3], "impair") != 0 && !tamper) || argc < 6))) {
 		usage(stderr);
 		return 2;
 	}
@@ -3744,11 +3777,12 @@ static int segment_command(int argc, char **argv)
 
 			if (strcmp(argv[5], "both") != 0 && strcmp(argv[5], directions[d]) != 0)
 				continue;
-			hull_msg_raw(&m, "(6:impair");
+			hull_msg_raw(&m, tamper ? "(6:tamper" : "(6:impair");
 			hull_msg_channel(&m, 1u);
 			msg_entry(&m, "direction", directions[d]);
-			hull_msg_raw(&m, "(10:impairment");
-			status = impairment_words(argc - 6, argv + 6, &m);
+			hull_msg_raw(&m, tamper ? "(5:fault" : "(10:impairment");
+			status = tamper ? fault_words(argc - 6, argv + 6, &m)
+			                : impairment_words(argc - 6, argv + 6, &m);
 			hull_msg_raw(&m, ")");
 			msg_entry(&m, "machine", strcmp(argv[4], "all") == 0 ? "*" : argv[4]);
 			msg_entry(&m, "name", argv[2]);

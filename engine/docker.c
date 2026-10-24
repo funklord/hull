@@ -1685,6 +1685,8 @@ static const hull_cap_entry entries[] = {
 	  "not yet: a container's NIC on the core's switch is not written", NULL },
 	{ "impair",             HULL_SUP_REJECTED,
 	  "not yet: a link is impaired in the core's switch, which a container is not on", NULL },
+	{ "tamper",             HULL_SUP_REJECTED,
+	  "not yet: a fault on a link in the core's switch, which a container is not on", NULL },
 	{ "ports",              HULL_SUP_NATIVE,
 	  "bound on the machine's address", NULL },
 	{ "volumes",            HULL_SUP_NATIVE,   NULL, NULL },

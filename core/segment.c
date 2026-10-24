@@ -59,6 +59,8 @@ typedef struct held {
 typedef struct way {
 	hull_impairment    impairment;
 	int                impaired;   /* anything but a wire */
+	hull_tamper        tamper;
+	int                tampering;  /* a tamper is set */
 	uint64_t           random;     /* the draws' state */
 	int                bursting;   /* the Gilbert-Elliott model in its bad state */
 	uint64_t           link_free;  /* when the rate's link is next free, ns */
@@ -83,12 +85,17 @@ typedef struct learned {
 	int      used;
 } learned;
 
-/* An impairment asked for a machine's ports, or every machine's where
- * `machine` is empty: given to each port that joins. */
+#define KIND_IMPAIR 0
+#define KIND_TAMPER 1
+
+/* An impairment or a tamper asked for a machine's ports, or every
+ * machine's where `machine` is empty: given to each port that joins. */
 typedef struct rule {
 	char            machine[64];
 	int             direction;
+	int             kind;          /* KIND_IMPAIR or KIND_TAMPER */
 	hull_impairment impairment;
+	hull_tamper     tamper;
 	int             used;
 } rule;
 
@@ -156,16 +163,32 @@ static void impair_way(way *w, const char *machine, int direction,
 	w->link_free = 0u;
 }
 
-/* The rule `p`'s `direction` takes: its machine's own, else every
- * machine's, else none. */
-static const rule *rule_for(const segment *s, const port *p, int direction)
+/* The tamper `tamper` for `w` of `machine`'s, its draws seeded afresh. */
+static void tamper_way(way *w, const char *machine, int direction, const hull_tamper *tamper)
+{
+	const hull_tamper none = { 0 };
+	uint64_t          seed = 0xcbf29ce484222325u;
+
+	w->tamper    = *tamper;
+	w->tampering = memcmp(tamper, &none, sizeof none) != 0;
+	for (const char *c = machine; *c != '\0'; c++)
+		seed = (seed ^ (uint8_t)*c) * 0x100000001b3u;
+	/* A direction impaired and tampered shares one draw stream, seeded
+	 * by the impairment; a tamper alone seeds it here. */
+	if (!w->impaired)
+		w->random = seed ^ (uint64_t)direction << 63;
+}
+
+/* The rule `p`'s `direction` takes of `kind`: its machine's own, else
+ * every machine's, else none. */
+static const rule *rule_for(const segment *s, const port *p, int direction, int kind)
 {
 	const rule *every = NULL;
 
 	for (unsigned k = 0u; k < MAX_RULES; k++) {
 		const rule *r = &s->rules[k];
 
-		if (!r->used || r->direction != direction)
+		if (!r->used || r->direction != direction || r->kind != kind)
 			continue;
 		if (r->machine[0] == '\0')
 			every = r;
@@ -175,13 +198,16 @@ static const rule *rule_for(const segment *s, const port *p, int direction)
 	return every;
 }
 
-/* `p`'s `direction` given the rule it takes, if any. */
+/* `p`'s `direction` given the impairment and tamper it takes, if any. */
 static void apply_rule(const segment *s, port *p, int direction)
 {
-	const rule *r = rule_for(s, p, direction);
+	const rule *impair = rule_for(s, p, direction, KIND_IMPAIR);
+	const rule *tamper = rule_for(s, p, direction, KIND_TAMPER);
 
-	if (r != NULL)
-		impair_way(&p->way[direction], p->machine, direction, &r->impairment);
+	if (impair != NULL)
+		impair_way(&p->way[direction], p->machine, direction, &impair->impairment);
+	if (tamper != NULL)
+		tamper_way(&p->way[direction], p->machine, direction, &tamper->tamper);
 }
 
 /* Where the port on `s` that `mac` was last seen on is, learning `from`
@@ -255,6 +281,68 @@ static void write_port(port *p, const uint8_t *framed, size_t length)
 
 static void forward(segment *s, unsigned from, const uint8_t *framed, size_t length);
 
+/* A frame onto `w`'s queue, in due order, unless it holds `limit` already
+ * (netem's 1000 where 0): 1, or 0 where it is full or out of memory. */
+static int schedule(way *w, const uint8_t *framed, size_t length, uint64_t due, unsigned limit)
+{
+	held  *h;
+	held **into = &w->queue;
+
+	if (w->queued >= (limit != 0u ? limit : QUEUE_FRAMES) || (h = malloc(sizeof *h + length)) == NULL)
+		return 0;
+	h->due    = due;
+	h->length = length;
+	memcpy(h->framed, framed, length);
+	while (*into != NULL && (*into)->due <= due)
+		into = &(*into)->next;
+	h->next = *into;
+	*into   = h;
+	w->queued++;
+	return 1;
+}
+
+/* A matched frame tampered: its copies re-sent later (replay), then the
+ * frame dropped, rewritten or a bit flipped. `work` holds a copy a set or
+ * a flip may change; `*frame` points at it where it did. 1 to drop the
+ * frame, else 0. */
+static int tamper(way *w, uint64_t now, const uint8_t **frame, uint8_t *work, size_t length)
+{
+	const hull_tamper *t = &w->tamper;
+	size_t             payload = 4u + 14u;
+
+	if (t->match_length != 0u) {
+		if (length < payload + t->match_offset + t->match_length ||
+		    memcmp(*frame + payload + t->match_offset, t->match, t->match_length) != 0)
+			return 0;
+	}
+	w->count.matched++;
+	for (unsigned c = 0u; c < t->copies && happens(w, t->replay); c++) {
+		if (schedule(w, *frame, length, now + (uint64_t)(c + 1u) * t->every_ms * 1000000u,
+		             w->impairment.limit))
+			w->count.replayed++;
+	}
+	if (happens(w, t->drop)) {
+		w->count.tampered++;
+		return 1;
+	}
+	if (t->set_length != 0u && happens(w, t->rewrite) &&
+	    length >= payload + t->set_offset + t->set_length) {
+		memcpy(work, *frame, length);
+		memcpy(work + payload + t->set_offset, t->set, t->set_length);
+		*frame = work;
+		w->count.tampered++;
+	} else if (length > payload && happens(w, t->flip)) {
+		uint64_t bit = draw(w) % ((length - payload) * 8u);
+
+		if (*frame != work)
+			memcpy(work, *frame, length);
+		work[payload + bit / 8u] ^= (uint8_t)(1u << (bit % 8u));
+		*frame = work;
+		w->count.tampered++;
+	}
+	return 0;
+}
+
 /* A frame through `w`, which is port `at` of `s`'s, direction
  * `direction`: dropped, held, or handed on now. */
 static void cross(segment *s, unsigned at, int direction, const uint8_t *framed, size_t length)
@@ -263,10 +351,15 @@ static void cross(segment *s, unsigned at, int direction, const uint8_t *framed,
 	way                   *w = &p->way[direction];
 	const hull_impairment *m = &w->impairment;
 	unsigned               copies = 1u;
-	uint64_t               now;
+	uint64_t               now = now_ns();
+	uint8_t                work[4u + MAX_FRAME];
 
 	w->count.frames++;
 	w->count.bytes += length - 4u;
+	/* A targeted fault first: it may drop the frame, or hand on a
+	 * rewritten one, and schedule its replays. */
+	if (w->tampering && tamper(w, now, &framed, work, length))
+		return;
 	if (!w->impaired) {
 		if (direction == HULL_SEGMENT_OUT) {
 			w->count.passed++;
@@ -304,7 +397,6 @@ static void cross(segment *s, unsigned at, int direction, const uint8_t *framed,
 		copies = 2u;
 		w->count.duplicated++;
 	}
-	now = now_ns();
 	for (unsigned c = 0u; c < copies; c++) {
 		uint8_t  copy[4u + MAX_FRAME];
 		uint64_t due = now;
@@ -344,28 +436,11 @@ static void cross(segment *s, unsigned at, int direction, const uint8_t *framed,
 			}
 			continue;
 		}
-		if (w->queued >= (m->limit != 0u ? m->limit : QUEUE_FRAMES)) {
+		if (!schedule(w, copy, length, due, m->limit)) {
 			w->count.overflow++;
 			if (m->rate != 0u)
 				w->link_free -= (uint64_t)(length - 4u) * 8u * 1000000000u / m->rate;
 			continue;
-		}
-		{
-			held  *h = malloc(sizeof *h + length);
-			held **into = &w->queue;
-
-			if (h == NULL) {
-				w->count.overflow++;
-				continue;
-			}
-			h->due    = due;
-			h->length = length;
-			memcpy(h->framed, copy, length);
-			while (*into != NULL && (*into)->due <= due)
-				into = &(*into)->next;
-			h->next = *into;
-			*into   = h;
-			w->queued++;
 		}
 	}
 }
@@ -635,17 +710,41 @@ int hull_segment_port(const char *key, const char *machine, char *why, size_t ca
 	return pair[1];
 }
 
+/* The rule of `kind` already set for `machine` (or every machine) on
+ * `direction` of `s`, else a free one, else NULL where the segment is
+ * full; it is marked used and keyed, its payload the caller's to set. */
+static rule *rule_slot(segment *s, const char *machine, int direction, int kind)
+{
+	rule *r = NULL;
+
+	for (unsigned k = 0u; k < MAX_RULES && r == NULL; k++)
+		if (s->rules[k].used && s->rules[k].direction == direction &&
+		    s->rules[k].kind == kind &&
+		    strcmp(s->rules[k].machine, machine != NULL ? machine : "") == 0)
+			r = &s->rules[k];
+	for (unsigned k = 0u; k < MAX_RULES && r == NULL; k++)
+		if (!s->rules[k].used)
+			r = &s->rules[k];
+	if (r != NULL) {
+		r->used      = 1;
+		r->direction = direction;
+		r->kind      = kind;
+		snprintf(r->machine, sizeof r->machine, "%s", machine != NULL ? machine : "");
+	}
+	return r;
+}
+
 int hull_segment_impair(const char *key, const char *machine, int direction,
                         const hull_impairment *impairment, char *why, size_t cap)
 {
 	segment *s;
-	rule    *r = NULL;
+	rule    *r;
 
 	if (direction != HULL_SEGMENT_OUT && direction != HULL_SEGMENT_IN) {
 		say(why, cap, "a direction is out or in");
 		return -1;
 	}
-	if (machine != NULL && strlen(machine) >= sizeof r->machine) {
+	if (machine != NULL && strlen(machine) >= sizeof s->ports[0]->machine) {
 		say(why, cap, "a port's machine is named by its id");
 		return -1;
 	}
@@ -656,27 +755,56 @@ int hull_segment_impair(const char *key, const char *machine, int direction,
 		say(why, cap, "no machine is on that segment");
 		return -1;
 	}
-	/* The rule it replaces, else a free one. */
-	for (unsigned k = 0u; k < MAX_RULES && r == NULL; k++)
-		if (s->rules[k].used && s->rules[k].direction == direction &&
-		    strcmp(s->rules[k].machine, machine != NULL ? machine : "") == 0)
-			r = &s->rules[k];
-	for (unsigned k = 0u; k < MAX_RULES && r == NULL; k++)
-		if (!s->rules[k].used)
-			r = &s->rules[k];
+	r = rule_slot(s, machine, direction, KIND_IMPAIR);
 	if (r == NULL) {
 		pthread_mutex_unlock(&lock);
 		say(why, cap, "too many impairments on the segment");
 		return -1;
 	}
-	r->used       = 1;
-	r->direction  = direction;
 	r->impairment = *impairment;
-	snprintf(r->machine, sizeof r->machine, "%s", machine != NULL ? machine : "");
 	/* Each port it reaches takes the rule it now takes, which for a
 	 * machine with a rule of its own stays that one: a machine named
 	 * outranks every machine. The other direction is left as it was,
 	 * draws and all. */
+	for (unsigned i = 0u; i < s->port_count; i++) {
+		port *p = s->ports[i];
+
+		if (machine == NULL || strcmp(p->machine, machine) == 0)
+			apply_rule(s, p, direction);
+	}
+	pthread_mutex_unlock(&lock);
+	(void)!write(wake[1], "", 1u);
+	return 0;
+}
+
+int hull_segment_tamper(const char *key, const char *machine, int direction,
+                        const hull_tamper *tamper, char *why, size_t cap)
+{
+	segment *s;
+	rule    *r;
+
+	if (direction != HULL_SEGMENT_OUT && direction != HULL_SEGMENT_IN) {
+		say(why, cap, "a direction is out or in");
+		return -1;
+	}
+	if (machine != NULL && strlen(machine) >= sizeof s->ports[0]->machine) {
+		say(why, cap, "a port's machine is named by its id");
+		return -1;
+	}
+	pthread_mutex_lock(&lock);
+	s = find(key);
+	if (s == NULL) {
+		pthread_mutex_unlock(&lock);
+		say(why, cap, "no machine is on that segment");
+		return -1;
+	}
+	r = rule_slot(s, machine, direction, KIND_TAMPER);
+	if (r == NULL) {
+		pthread_mutex_unlock(&lock);
+		say(why, cap, "too many faults on the segment");
+		return -1;
+	}
+	r->tamper = *tamper;
 	for (unsigned i = 0u; i < s->port_count; i++) {
 		port *p = s->ports[i];
 

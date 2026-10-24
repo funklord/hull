@@ -50,6 +50,14 @@ static void impair(const char *key, const char *machine, int direction, const hu
 		fail("an impairment", why);
 }
 
+static void set_tamper(const char *key, const char *machine, int direction, const hull_tamper *t)
+{
+	char why[256] = "";
+
+	if (hull_segment_tamper(key, machine, direction, t, why, sizeof why) != 0)
+		fail("a tamper", why);
+}
+
 /* `machine`'s counts on `key`, one way. */
 static hull_segment_count counted(const char *key, const char *machine, int direction)
 {
@@ -452,6 +460,89 @@ int main(void)
 		check("a seed's losses, again the same", first == again);
 		check("a seed's losses, some and not all", first != 0u && first != (1ull << 26) - 1u);
 		check("another seed's losses, other ones", first != other);
+	}
+	/* --- targeted faults, each on a segment of its own. The frame's
+	 * payload begins at the tag byte, so offset 0 is the tag. --- */
+	{
+		/* A match drops just the matching frames; the rest pass. */
+		hull_tamper t = { 0 };
+		int         x = port_of("tdrop", "x");
+		int         y = port_of("tdrop", "y");
+
+		t.match[0] = 'A';
+		t.match_length = 1u;
+		t.drop = 1.0;
+		set_tamper("tdrop", "x", HULL_SEGMENT_OUT, &t);
+		send_frame(x, 0xffu, 1u, 'A');
+		expect("a matched frame dropped", y, 0);
+		send_frame(x, 0xffu, 1u, 'B');
+		expect("an unmatched frame passed", y, 'B');
+		check("the match and drop counted",
+		      counted("tdrop", "x", HULL_SEGMENT_OUT).matched == 1u &&
+		      counted("tdrop", "x", HULL_SEGMENT_OUT).tampered == 1u);
+		close(x);
+		close(y);
+	}
+	{
+		/* No match pattern matches every frame; a rewrite overwrites a
+		 * payload byte, a flip turns one bit. */
+		hull_tamper t = { 0 };
+		int         x = port_of("tset", "x");
+		int         y = port_of("tset", "y");
+		char        tag;
+
+		t.rewrite = 1.0;
+		t.set[0] = 'Z';
+		t.set_length = 1u;
+		set_tamper("tset", "x", HULL_SEGMENT_OUT, &t);
+		send_frame(x, 0xffu, 1u, 'C');
+		expect("a rewritten frame reaches its port changed", y, 'Z');
+		memset(&t, 0, sizeof t);
+		t.flip = 1.0;
+		set_tamper("tset", "x", HULL_SEGMENT_OUT, &t);
+		send_frame(x, 0xffu, 1u, 'C');
+		tag = next_tag(y, 1000);
+		check("a flipped frame differs by one bit",
+		      tag != 0 && tag != 'C' && __builtin_popcount((unsigned)(uint8_t)(tag ^ 'C')) == 1);
+		close(x);
+		close(y);
+	}
+	{
+		/* Replay keeps copies of a matched frame and re-sends them: the
+		 * original, then two more. */
+		hull_tamper t = { 0 };
+		int         x = port_of("treplay", "x");
+		int         y = port_of("treplay", "y");
+
+		t.replay = 1.0;
+		t.copies = 2u;
+		t.every_ms = 30u;
+		set_tamper("treplay", "x", HULL_SEGMENT_OUT, &t);
+		send_frame(x, 0xffu, 1u, 'P');
+		expect("a replayed frame, the original", y, 'P');
+		expect("a replayed frame, the first copy", y, 'P');
+		expect("a replayed frame, the second copy", y, 'P');
+		expect("a replayed frame, no third", y, 0);
+		check("the replays counted", counted("treplay", "x", HULL_SEGMENT_OUT).replayed == 2u);
+		close(x);
+		close(y);
+	}
+	{
+		/* A match at an offset past the frame never matches. */
+		hull_tamper t = { 0 };
+		int         x = port_of("tfar", "x");
+		int         y = port_of("tfar", "y");
+
+		t.match_offset = 100u;
+		t.match[0] = 'A';
+		t.match_length = 1u;
+		t.drop = 1.0;
+		set_tamper("tfar", "x", HULL_SEGMENT_OUT, &t);
+		send_frame(x, 0xffu, 1u, 'A');
+		expect("a match past the frame does not match", y, 'A');
+		check("nothing matched", counted("tfar", "x", HULL_SEGMENT_OUT).matched == 0u);
+		close(x);
+		close(y);
 	}
 	printf("segment: %u cases, %u failed\n", cases, failures);
 	return failures != 0;
