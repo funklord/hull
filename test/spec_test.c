@@ -191,6 +191,14 @@ static void test_records(void)
 	OK(M("(volumes (volume (host \"./data\") (guest \"/var/data\") (mode ro)))"));
 	NO(M("(volumes (volume (host \"./data\") (guest \"data\")))"), VALUE, "\"data\"",
 	   "machine.volumes.volume.guest");
+	/* A machine's links to its segments impaired, in netem's terms
+	 * (Appendix D). */
+	OK(M("(segments \"wire\") (impair (wire (out (loss 0.03) (delay 40) (jitter 10) (seed 7)) "
+	     "(in (gemodel (p 0.01) (r 0.3)) (rate 1000000) (limit 64) (down false))))"));
+	NO(M("(impair (wire (out (wobble 1))))"), UNKNOWN, "wobble", "machine.impair.wire.out.wobble");
+	NO(M("(impair (wire (out (gemodel (r 0.3)))))"), MISSING, "(gemodel ",
+	   "machine.impair.wire.out.gemodel.p");
+	NO(M("(impair (wire (sideways (loss 0.5))))"), UNKNOWN, "sideways", "machine.impair.wire.sideways");
 	/* A volume that is a stack of layers, 3.7. */
 	OK(M("(volumes (volume (guest \"/etc\") (layers \"dir:./t\" \"dir:./s\") (upper \"./d\")))"));
 	OK(M("(volumes (volume (guest \"/etc\") (layers \"dir:./t\" \"dir:./s\") (mode ro)))"));

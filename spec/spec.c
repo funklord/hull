@@ -374,6 +374,41 @@ static const key tuning_keys[] = {
 };
 static const schema tuning = TABLE(tuning_keys);
 
+/* netem's Gilbert-Elliott model (tc-netem(8)): p leaves the good state,
+ * r the bad, and each state loses its own share. */
+static const key gemodel_keys[] = {
+	{ .name = "p",         .type = NUMBER, .required = 1 },
+	{ .name = "r",         .type = NUMBER },
+	{ .name = "bad_loss",  .type = NUMBER },
+	{ .name = "good_loss", .type = NUMBER },
+};
+static const schema gemodel = TABLE(gemodel_keys);
+
+/* One direction of a machine's link to a segment (Appendix D), in
+ * netem's terms: the core checks that a probability is at most 1. */
+static const key link_way_keys[] = {
+	{ .name = "down",      .type = BOOLEAN },
+	{ .name = "mtu",       .type = COUNT },
+	{ .name = "loss",      .type = NUMBER },
+	{ .name = "gemodel",   .type = RECORD, .record = &gemodel },
+	{ .name = "duplicate", .type = NUMBER },
+	{ .name = "corrupt",   .type = NUMBER },
+	{ .name = "delay",     .type = COUNT },
+	{ .name = "jitter",    .type = COUNT },
+	{ .name = "reorder",   .type = NUMBER },
+	{ .name = "rate",      .type = COUNT },
+	{ .name = "limit",     .type = COUNT },
+	{ .name = "seed",      .type = COUNT },
+};
+static const schema link_way = TABLE(link_way_keys);
+
+/* What the machine sends to a segment, and what it is given from it. */
+static const key link_keys[] = {
+	{ .name = "out", .type = RECORD, .record = &link_way },
+	{ .name = "in",  .type = RECORD, .record = &link_way },
+};
+static const schema link = TABLE(link_keys);
+
 /* J.1 */
 static const key machine_keys[] = {
 	{ .name = "source",        .type = STRING, .required = 1, .value = nonempty },
@@ -396,6 +431,7 @@ static const key machine_keys[] = {
 	{ .name = "on_disconnect", .type = CHOICE, .choices = disconnect_values },
 	{ .name = "network",       .type = CHOICE, .choices = network_values },
 	{ .name = "segments",      .type = STRINGS, .value = label },
+	{ .name = "impair",        .type = MAP, .record = &link, .names = label },
 	{ .name = "init",          .type = STRING, .value = absolute },
 	{ .name = "export",        .type = STRING, .value = nonempty },
 	{ .name = "owners",        .type = STRING, .value = nonempty },

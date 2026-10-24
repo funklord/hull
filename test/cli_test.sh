@@ -1116,6 +1116,36 @@ wait "$cutrun"
 cases=$((cases + 1))
 grep -q '^shouter | shout=answered$' "$root/cut.out" && grep -q '^hearer  | hear=through from 52:54:00:' "$root/cut.out" ||
 	fail "a healed link was not heard across" "$(cat "$root/cut.out")"
+# An impairment the spec gives, from the machine's first frame: the
+# shouter's way out down, so that not even its kernel's frames reach the
+# hearer, its loss counted; healed during the run, its shout is heard.
+cutin="cutin-$$"
+printf '(machines (hearer %s) (shouter %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (network none) (segments \"$cutin\") (command \"/probe\" \"link\" \"eth0\" \"hear\" \"eth0\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (network none) (segments \"$cutin\") (impair ($cutin (out (down true)))) (command \"/probe\" \"link\" \"eth0\" \"sleep\" \"1\" \"shout\" \"eth0\" \"through\")" \
+	> "$root/cutin.conf"
+(cd / && exec timeout 60 "$whole_hull" run -f "$root/cutin.conf" > "$root/cutin.out" 2>&1) &
+cutinrun=$!
+cases=$((cases + 1))
+tries=0
+until "$hull" segment "$cutin" > "$root/cutin.counts" 2>&1 &&
+	grep -Eq '^shouter +out frames=[1-9][0-9]* .* lost=[1-9]' "$root/cutin.counts"; do
+	tries=$((tries + 1))
+	[ "$tries" -lt 60 ] || break
+	sleep 0.25
+done
+[ "$tries" -lt 60 ] && grep -Eq '^hearer +in +frames=0 ' "$root/cutin.counts" ||
+	fail "a spec's impairment did not hold from the first frame" "$(cat "$root/cutin.counts")"
+expect 0 '' "$hull" segment "$cutin" impair shouter out
+wait "$cutinrun"
+cases=$((cases + 1))
+grep -q '^shouter | shout=answered$' "$root/cutin.out" ||
+	fail "a spec's impairment healed at runtime was not heard across" "$(cat "$root/cutin.out")"
+# One for a segment the machine is not on is refused before it runs, and
+# docker has no link of the core's to impair.
+conf offwire "(network none) (segments \"on-$$\") (impair (off-$$ (out (loss 0.5)))) (command \"/probe\" \"say\" \"ran\")"
+from_root 125 'impair names a segment the machine is not on' -f "$root/offwire.conf"
+expect 1 'impair: rejected: not yet: a link is impaired' "$hull" plan --backend docker -f "$root/offwire.conf"
 expect 1 'no machine is on that segment' "$hull" segment "nowhere-$$"
 # A machine paused: every process of it stopped where it is, its ticks,
 # a child's, ceasing while it is and going on after; a paused machine is

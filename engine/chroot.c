@@ -2555,6 +2555,8 @@ static const hull_cap_entry entries[] = {
 	{ "segments",               HULL_SUP_NATIVE,
 	  "a tap each, eth0 and on, in the machine's own network namespace, relayed to the core's "
 	  "switch; with (network none)", NULL },
+	{ "impair",                 HULL_SUP_NATIVE,
+	  "in the core's switch, each way of the machine's port on a segment, in netem's terms", NULL },
 	{ "export",                 HULL_SUP_NATIVE,
 	  "a tar of the overlay's tree when the workload ends, owners as the machine saw them",
 	  NULL },

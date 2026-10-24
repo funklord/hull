@@ -124,6 +124,14 @@ struct slot {
 	int                secrets;     /* hull/secrets/ID is written for it */
 	client            *owner;       /* the frontend that ran it */
 	int                paused;      /* hull pause, and no unpause since */
+	/* The plan's (impair ...): each segment's link, given its port
+	 * as the machine joins it. */
+	struct {
+		char            segment[64];
+		int             given[2];
+		hull_impairment way[2];
+	}                  links[8];
+	unsigned           link_count;
 	int                exited;
 	int                code;
 	int                signal;
@@ -328,7 +336,23 @@ static void on_log(hull_core *core, int level, const char *message)
  * it by and an impairment is asked for. */
 static int on_segment(hull_core *core, const char *key, char *why, size_t cap)
 {
-	return hull_segment_port(key, core->slot->id, why, cap);
+	const slot *s = core->slot;
+	int         fd = hull_segment_port(key, s->id, why, cap);
+
+	/* Before the machine runs, so that its first frame meets its link. */
+	for (unsigned i = 0u; fd >= 0 && i < s->link_count; i++) {
+		if (strcmp(s->links[i].segment, key) != 0)
+			continue;
+		for (int direction = 0; direction < 2; direction++) {
+			if (s->links[i].given[direction] &&
+			    hull_segment_impair(key, s->id, direction, &s->links[i].way[direction], why,
+			                        cap) != 0) {
+				close(fd);
+				return -1;
+			}
+		}
+	}
+	return fd;
 }
 
 static const hull_host_ops host_ops = {
@@ -1328,6 +1352,59 @@ static void adopt_kept(void)
 		closedir(dir);
 }
 
+static const char *impairment_of(const hull_sexpr_doc *body, const hull_sexpr_form *entry,
+                                 hull_impairment *m);
+
+/* The plan's (impair (SEGMENT (out ...) (in ...)) ...) into `s`: NULL, or
+ * why it cannot be. A segment the machine is not on is refused. */
+static const char *links_of(slot *s, const hull_sexpr_doc *doc, const hull_sexpr_form *machine)
+{
+	hull_sexpr_form impair;
+	hull_sexpr_form segments;
+	hull_sexpr_form link;
+	int             has_segments = hull_access_find(doc, machine, "segments", &segments);
+
+	if (!hull_access_find(doc, machine, "impair", &impair))
+		return NULL;
+	hull_sexpr_child(doc, &impair, &link);
+	while (hull_sexpr_next(doc, &link, &link)) {
+		hull_sexpr_form name;
+		hull_sexpr_form way;
+		hull_sexpr_form joined;
+		int             on = 0;
+		size_t          length;
+
+		if (s->link_count == sizeof s->links / sizeof s->links[0])
+			return "impair names more segments than a machine joins";
+		if (link.kind != HULL_SEXPR_LIST || !hull_sexpr_child(doc, &link, &name) ||
+		    hull_sexpr_value(doc, &name, (uint8_t *)s->links[s->link_count].segment,
+		                     sizeof s->links[0].segment - 1u, &length) != HULL_SEXPR_OK)
+			return "impair is (SEGMENT (out ...) (in ...))";
+		s->links[s->link_count].segment[length] = '\0';
+		if (has_segments) {
+			hull_sexpr_child(doc, &segments, &joined);
+			while (!on && hull_sexpr_next(doc, &joined, &joined))
+				on = hull_sexpr_is(doc, &joined, s->links[s->link_count].segment);
+		}
+		if (!on)
+			return "impair names a segment the machine is not on";
+		for (way = name; hull_sexpr_next(doc, &way, &way);) {
+			hull_sexpr_form head;
+			const char     *wrong;
+			int             direction;
+
+			if (way.kind != HULL_SEXPR_LIST || !hull_sexpr_child(doc, &way, &head))
+				return "impair is (SEGMENT (out ...) (in ...))";
+			direction = hull_sexpr_is(doc, &head, "in") ? HULL_SEGMENT_IN : HULL_SEGMENT_OUT;
+			if ((wrong = impairment_of(doc, &way, &s->links[s->link_count].way[direction])) != NULL)
+				return wrong;
+			s->links[s->link_count].given[direction] = 1;
+		}
+		s->link_count++;
+	}
+	return NULL;
+}
+
 static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
 	hull_sexpr_form    value;
@@ -1467,6 +1544,15 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	on_disconnect = hull_access_value(&plan_doc, &machine, "on_disconnect");
 	s->keep = on_disconnect != NULL && strcmp(on_disconnect, "keep") == 0;
 	free(on_disconnect);
+	{
+		const char *wrong = links_of(s, &plan_doc, &machine);
+
+		if (wrong != NULL) {
+			send_error(c, ch, wrong);
+			s->used = 0;
+			return;
+		}
+	}
 
 	addressed = with_address(&plan, address, &addressed_length);
 	if (addressed == NULL) {
@@ -2044,12 +2130,33 @@ static const char *impairment_of(const hull_sexpr_doc *body, const hull_sexpr_fo
 			if (!probability(body, &value, to))
 				return "a probability is from 0 to 1";
 		} else if (strcmp(name, "gemodel") == 0) {
-			double *to[4] = { &m->p, &m->r, &m->bad_loss, &m->good_loss };
+			/* (gemodel (bad_loss 1-h)? (good_loss 1-k)? (p p) (r r)?),
+			 * with netem's defaults: r is 1-p, 1-h is 1, 1-k is 0. */
+			static const char *const parts[] = { "bad_loss", "good_loss", "p", "r" };
+			double *to[4] = { &m->bad_loss, &m->good_loss, &m->p, &m->r };
+			int     given[4] = { 0, 0, 0, 0 };
 
-			for (unsigned k = 0u; k < 4u; k++)
-				if ((k > 0u && !hull_sexpr_next(body, &value, &value)) ||
-				    !probability(body, &value, to[k]))
-					return "gemodel is four probabilities: p, r, 1-h and 1-k";
+			for (int go = 1; go; go = hull_sexpr_next(body, &value, &value)) {
+				hull_sexpr_form part;
+				hull_sexpr_form number;
+				unsigned        k;
+
+				if (value.kind != HULL_SEXPR_LIST || !hull_sexpr_child(body, &value, &part) ||
+				    !hull_sexpr_next(body, &part, &number))
+					return "gemodel is (p n) and maybe (r n), (bad_loss n) and (good_loss n)";
+				for (k = 0u; k < 4u && !hull_sexpr_is(body, &part, parts[k]); k++)
+					;
+				if (k == 4u || given[k] || !probability(body, &number, to[k]))
+					return "gemodel is (p n) and maybe (r n), (bad_loss n) and (good_loss n), "
+					       "each from 0 to 1";
+				given[k] = 1;
+			}
+			if (!given[2])
+				return "gemodel needs its p";
+			if (!given[0])
+				m->bad_loss = 1.0;
+			if (!given[3])
+				m->r = 1.0 - m->p;
 			m->gemodel = 1;
 		} else if (strcmp(name, "delay") == 0 || strcmp(name, "jitter") == 0 ||
 		           strcmp(name, "mtu") == 0 || strcmp(name, "limit") == 0) {

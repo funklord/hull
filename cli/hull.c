@@ -3648,9 +3648,13 @@ static int impairment_words(int argc, char **argv, hull_msg *m)
 			snprintf(values[2], sizeof values[2], "1");
 		if (count < 4u)
 			snprintf(values[3], sizeof values[3], "0");
+		/* As the spec writes it, its parts sorted: bad_loss, good_loss,
+		 * p and r. */
 		hull_msg_raw(m, "(7:gemodel");
-		for (unsigned v = 0u; v < 4u; v++)
-			hull_msg_text(m, values[v]);
+		msg_entry(m, "bad_loss", values[2]);
+		msg_entry(m, "good_loss", values[3]);
+		msg_entry(m, "p", values[0]);
+		msg_entry(m, "r", values[1]);
 		hull_msg_raw(m, ")");
 	}
 	return 0;

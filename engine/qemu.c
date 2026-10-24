@@ -2851,6 +2851,8 @@ static const hull_cap_entry entries[] = {
 	  NULL },
 	{ "segments",           HULL_SUP_NATIVE,
 	  "a NIC each after passt's, eth1 on, on the core's switch, with no address given", NULL },
+	{ "impair",             HULL_SUP_NATIVE,
+	  "in the core's switch, each way of the machine's port on a segment, in netem's terms", NULL },
 
 	{ "security.readonly_root", HULL_SUP_NATIVE, NULL, NULL },
 	{ "security.no_new_privs",  HULL_SUP_NATIVE, "set by the agent on the workload", NULL },

@@ -272,7 +272,8 @@ struct segment {
 // One direction, `in` or `out`, of the ports a machine has on a segment,
 // or every machine's where the machine is `*`, given an impairment in
 // netem's terms, replacing what it had; answered `done`. Its entries are
-// `(key value)`, and `(gemodel p r 1-h 1-k)`, which the core checks.
+// `(key value)`, and `(gemodel (bad_loss n) (good_loss n) (p n) (r n))`, as
+// the spec writes them, which the core checks.
 struct impair {
 	preamble u8[8] = "6:impair";
 	channel        ch;
