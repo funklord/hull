@@ -101,6 +101,23 @@ expect 2 '^usage: hull plan' "$hull"
 expect 2 '^usage: hull plan' "$hull" frobnicate
 expect 0 '^docker: ns \(runs as root\)$' "$hull" engines
 expect 0 '^qemu: vm emu$' "$hull" engines
+# hull systemd: a user service unit for a machine (section 9). Restart= is
+# the spec's (restart ...), a readable symbol the engine's atom accessor
+# would miss, so a non-default value is the one to check; the binary and
+# conf are absolute, for a boot with neither this PATH nor cwd; a
+# (machines ...) file needs the machine named.
+printf '%s\n' '(machine (hostname "web") (source "dir:./rootfs") (restart always))' > "$dir/sdunit.conf"
+expect 0 '^Restart=always$' "$hull" systemd -f "$dir/sdunit.conf"
+expect 0 '^ExecStart=/.*/hull run -f /.*/sdunit\.conf$' "$hull" systemd -f "$dir/sdunit.conf"
+expect 0 '^Description=hull machine web$' "$hull" systemd -f "$dir/sdunit.conf"
+expect 0 '^WantedBy=default\.target$' "$hull" systemd -f "$dir/sdunit.conf"
+printf '%s\n' '(machine (source "dir:./rootfs"))' > "$dir/sdnore.conf"
+expect 0 '^Restart=no$' "$hull" systemd -f "$dir/sdnore.conf"
+printf '%s\n' '(machines (web (source "dir:./w")) (db (source "dir:./d") (restart on-failure)))' > "$dir/sdmulti.conf"
+expect 0 '^ExecStart=/.*/hull run -f /.*/sdmulti\.conf db$' "$hull" systemd -f "$dir/sdmulti.conf" db
+expect 0 '^Restart=on-failure$' "$hull" systemd -f "$dir/sdmulti.conf" db
+expect 125 'name the machine' "$hull" systemd -f "$dir/sdmulti.conf"
+expect 125 'no such machine' "$hull" systemd -f "$dir/sdmulti.conf" nope
 
 # hull doctor: every line a check, its status first, or the fix under one.
 cases=$((cases + 1))

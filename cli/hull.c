@@ -106,6 +106,7 @@ static void usage(FILE *out)
 	      "       hull segment NAME inject MACHINE|all frame=HEX|size=N [count=N] [every=MS]\n"
 	      "       hull ssh ID | hull proxy-ssh HOST\n"
 	      "       hull ssh-config [--remove] | hull gc\n"
+	      "       hull systemd [-f FILE] [NAME]\n"
 	      "       hull commit [--arch A] DIR REF | hull commit --tar FILE REF\n"
 	      "       hull materialize REF DIR | hull images\n"
 	      "       hull diff REF REF | hull tag REF NEW | hull tag -d REF\n"
@@ -1563,6 +1564,102 @@ static int run_all(options *o, const hull_registry *registry, hull_spec *spec, u
 		for (unsigned i = 0u; i < count && status == 0; i++)
 			status = members[i].status;
 	return status;
+}
+
+/* `hull systemd [NAME]`: a systemd user service unit for a machine, on
+ * stdout. It runs `hull run` at boot; `systemctl --user enable` and
+ * `loginctl enable-linger` start it, as section 9 says. A plain .service,
+ * not a podman-style quadlet, which would want a generator installed; this
+ * needs nothing but systemd. Restart= is the spec's (restart ...), journald
+ * takes the output by default, and socket activation (section 9, optional)
+ * is not emitted. The binary and the file are named by absolute path, a
+ * boot having neither this PATH nor this working directory. */
+static int systemd_unit(options *o, const char *name)
+{
+	hull_spec       spec;
+	hull_spec_error error;
+	hull_sexpr_form machine;
+	uint8_t        *data;
+	size_t          length;
+	char            id[64];
+	char            self[PATH_MAX];
+	char            conf[PATH_MAX];
+	char            dir[PATH_MAX];
+	char            restart[32] = "no";
+	char           *slash;
+	ssize_t         n;
+
+	data = read_file(o->file, &length);
+	if (data == NULL)
+		return 125;
+	/* No store_sources: the unit's own `hull run` resolves a bare ref; here
+	 * only the machine and its restart are read. */
+	if (hull_spec_open(&spec, data, length, &error) != HULL_SPEC_OK) {
+		fprintf(stderr, "%s:%u:%u: %s%s%s\n", o->file, error.line, error.column,
+		        error.path, error.path[0] != '\0' ? ": " : "", error.reason);
+		free(data);
+		return 125;
+	}
+	if (spec.has_machine && name == NULL) {
+		machine = spec.machine;
+	} else if (spec.has_machines && name != NULL &&
+	           hull_spec_find(&spec, &spec.machines, name, &machine)) {
+		;
+	} else {
+		fprintf(stderr, "%s: %s\n", o->file, spec.has_machines ?
+		        (name == NULL ? "name the machine: a (machines ...) file holds several" :
+		         "no such machine in (machines ...)") :
+		        name != NULL ? "a single machine takes no name" : "there is no machine");
+		free(data);
+		return 125;
+	}
+	if (!machine_id(&spec, &machine, name, o->base, id, sizeof id)) {
+		fprintf(stderr, "%s: name the machine with (hostname ...)\n", o->file);
+		free(data);
+		return 125;
+	}
+	/* (restart no|on-failure|always), hull's own (section 4.4): the spec's
+	 * values are systemd's Restart= spelling, so they pass through. Read
+	 * with the spec accessor, not the engine's, since a readable symbol is
+	 * not the atom hull_access_* wants; the default is no. */
+	{
+		hull_sexpr_form rentry;
+		hull_sexpr_form rhead;
+		hull_sexpr_form rvalue;
+		size_t          rl;
+
+		if (hull_spec_find(&spec, &machine, "restart", &rentry) &&
+		    hull_sexpr_child(&spec.doc, &rentry, &rhead) &&
+		    hull_sexpr_next(&spec.doc, &rhead, &rvalue) &&
+		    hull_sexpr_value(&spec.doc, &rvalue, (uint8_t *)restart, sizeof restart - 1u, &rl) ==
+		        HULL_SEXPR_OK)
+			restart[rl] = '\0';
+	}
+	free(data);
+
+	n = readlink("/proc/self/exe", self, sizeof self - 1u);
+	if (n <= 0 || realpath(o->file, conf) == NULL) {
+		fprintf(stderr, "hull: %s: %s\n", o->file, strerror(errno));
+		return 1;
+	}
+	self[n] = '\0';
+	snprintf(dir, sizeof dir, "%s", conf);
+	slash = strrchr(dir, '/');
+	if (slash != NULL)
+		slash[slash == dir ? 1 : 0] = '\0';
+
+	printf("[Unit]\n");
+	printf("Description=hull machine %s\n", id);
+	printf("After=network.target\n\n");
+	printf("[Service]\n");
+	printf("WorkingDirectory=%s\n", dir);
+	if (name != NULL)
+		printf("ExecStart=%s run -f %s %s\n", self, conf, id);
+	else
+		printf("ExecStart=%s run -f %s\n", self, conf);
+	printf("Restart=%s\n", restart);
+	printf("\n[Install]\nWantedBy=default.target\n");
+	return 0;
 }
 
 static int run(options *o, const hull_registry *registry, const char *name)
@@ -4238,7 +4335,8 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	if (strcmp(command, "plan") != 0 && strcmp(command, "check") != 0 &&
-	    strcmp(command, "run") != 0 && strcmp(command, "build") != 0) {
+	    strcmp(command, "run") != 0 && strcmp(command, "build") != 0 &&
+	    strcmp(command, "systemd") != 0) {
 		usage(stderr);
 		return 2;
 	}
@@ -4262,8 +4360,8 @@ int main(int argc, char **argv)
 			o.resolved = 1;
 		} else if (strcmp(arg, "--check") == 0 && strcmp(command, "build") == 0) {
 			check = 1;
-		} else if ((strcmp(command, "run") == 0 || strcmp(command, "build") == 0) &&
-		           arg[0] != '-' && name == NULL) {
+		} else if ((strcmp(command, "run") == 0 || strcmp(command, "build") == 0 ||
+		            strcmp(command, "systemd") == 0) && arg[0] != '-' && name == NULL) {
 			name = arg;
 		} else {
 			usage(stderr);
@@ -4283,6 +4381,8 @@ int main(int argc, char **argv)
 		o.stream = stderr;
 		return run(&o, &registry, name);
 	}
+	if (strcmp(command, "systemd") == 0)
+		return systemd_unit(&o, name);
 	if (strcmp(command, "build") == 0) {
 		if (name == NULL) {
 			fprintf(stderr, "hull: build names the ref it makes: hull build [-f FILE] REF\n");
