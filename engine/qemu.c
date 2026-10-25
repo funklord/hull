@@ -135,6 +135,7 @@ struct hull_machine {
 	uint8_t         *spec;         /* the plan's (machine ...), for the agent */
 	size_t           spec_length;
 	hull_msg         secrets;      /* `(secrets (NAME VALUE) ...)` for it, or empty */
+	hull_msg         ssh;          /* `(ssh (host_key V)(authorized_keys V)(config V))`, or empty */
 
 	char             dir[4096];    /* the machine's files: initrd, console */
 	int              network;      /* qemu's end of passt's socket, or -1 */
@@ -229,6 +230,64 @@ static void forget_secrets(hull_machine *m)
 	hull_msg_free(&m->secrets);
 }
 
+/* The ssh material (the host key is private), on the same terms as secrets:
+ * zeroed once in the spec or once the machine goes. */
+static void forget_ssh(hull_machine *m)
+{
+	if (m->ssh.data != NULL)
+		explicit_bzero(m->ssh.data, m->ssh.cap);
+	hull_msg_free(&m->ssh);
+}
+
+/*
+ * (ssh true)'s material, for the agent to place in the guest: read from the
+ * three files the core wrote in the plan's `(ssh_dir DIR)` -- host_key,
+ * authorized_keys and config -- into `(ssh (host_key V)(authorized_keys
+ * V)(config V))`, which goes after the machine in the spec. A machine with
+ * no `(ssh true)` has no `(ssh_dir ...)` and this is a no-op. Returns a
+ * reason, or NULL.
+ */
+static const char *read_ssh(hull_machine *m, const hull_sexpr_doc *doc)
+{
+	static const char *const names[] = { "host_key", "authorized_keys", "config", NULL };
+	static uint8_t           value[65537];
+	hull_sexpr_form          top;
+	char                    *dir;
+	const char              *reason = NULL;
+
+	hull_sexpr_first(doc, &top);
+	if ((dir = hull_access_value(doc, &top, "ssh_dir")) == NULL)
+		return NULL;
+	hull_msg_raw(&m->ssh, "(3:ssh");
+	for (unsigned i = 0u; names[i] != NULL && reason == NULL; i++) {
+		char    path[4400];
+		size_t  n = 0u;
+		ssize_t got = 0;
+		int     fd = -1;
+
+		if ((size_t)snprintf(path, sizeof path, "%s/%s", dir, names[i]) < sizeof path)
+			fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+		while (fd >= 0 && n < sizeof value && (got = read(fd, value + n, sizeof value - n)) > 0)
+			n += (size_t)got;
+		if (fd < 0 || got < 0 || n == sizeof value) {
+			reason = "an ssh material file cannot be read";
+		} else {
+			hull_msg_raw(&m->ssh, "(");
+			hull_msg_text(&m->ssh, names[i]);
+			hull_msg_atom(&m->ssh, value, n);
+			hull_msg_raw(&m->ssh, ")");
+		}
+		explicit_bzero(value, n);
+		if (fd >= 0)
+			close(fd);
+	}
+	hull_msg_raw(&m->ssh, ")");
+	free(dir);
+	if (reason == NULL && m->ssh.failed)
+		reason = "out of memory";
+	return reason;
+}
+
 /*
  * J.3's secrets, for the agent to place in the guest: read from the files
  * the core wrote in the plan's `(secrets DIR)`, by the names the plan's
@@ -304,6 +363,7 @@ static void release(hull_machine *m)
 	free(m->kernel_path);
 	free(m->spec);
 	forget_secrets(m);
+	forget_ssh(m);
 	if (m->pidfd >= 0)
 		close(m->pidfd);
 	pthread_mutex_destroy(&m->lock);
@@ -584,7 +644,13 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	if (m->spec == NULL)
 		return "out of memory";
 	memcpy(m->spec, doc->data + machine.offset, m->spec_length);
-	return read_secrets(m, doc, &machine);
+	{
+		const char *reason = read_secrets(m, doc, &machine);
+
+		if (reason != NULL)
+			return reason;
+	}
+	return read_ssh(m, doc);
 }
 
 /* --- the initramfs ------------------------------------------------------- */
@@ -2068,8 +2134,11 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		hull_msg_bytes(&msg, m->spec, m->spec_length);
 		if (m->secrets.data != NULL)
 			hull_msg_bytes(&msg, m->secrets.data, m->secrets.length);
+		if (m->ssh.data != NULL)
+			hull_msg_bytes(&msg, m->ssh.data, m->ssh.length);
 		hull_msg_raw(&msg, ")");
 		forget_secrets(m);
+		forget_ssh(m);
 		pthread_mutex_lock(&m->send_lock);
 		if (m->connected && hull_wire_send(m->wire.fd, &msg) != 0)
 			m->connected = 0;
@@ -3127,6 +3196,10 @@ static const hull_cap_entry entries[] = {
 	{ "network.host",       HULL_SUP_REJECTED,
 	  "a vm shares no network namespace with the host: use ports", NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   "no NIC: lo alone in the guest", NULL },
+	{ "ssh",                HULL_SUP_NATIVE,
+	  "the agent supervises the image's own sshd on the guest's port 22, with a host key, "
+	  "the user's authorized_keys and a config the core delivers; refused at start if the "
+	  "image has no sshd", NULL },
 	{ "export",             HULL_SUP_REJECTED,
 	  "not yet: the guest's tree is the agent's to write, and it does not", NULL },
 	{ "layers",             HULL_SUP_NATIVE,

@@ -88,24 +88,36 @@ struct host_hello {
 }
 
 // The resolved machine spec, `(machine ...)` as in hull.conf (section 4),
-// applied before `start`. A machine with `(secrets ...)` (J.3) has their
-// values after it, `(secrets (NAME VALUE) ...)`, which the agent places
-// at /run/hull/secrets.
+// applied before `start`. After the machine come zero or more trailing
+// forms the core adds: `(secrets (NAME VALUE) ...)` (J.3), which the agent
+// places at /run/hull/secrets, and `(ssh (host_key V)(authorized_keys
+// V)(config V))` for (ssh true), which it places at /run/hull/ssh. Each is
+// optional; the agent reads them by name, so they are forms here and the
+// agent's own checks are what refuse a malformed one.
 struct spec {
 	preamble u8[6] = "4:spec";
 	control  ch;
 	preamble u8[10] = "(7:machine";
 	form  entries[]  until ")";
 	peek u8  after_machine;
-	variant extra switch (after_machine) {
-		case '(':  secrets_entry  has_secrets;
-		default:   absent         no_secrets;
+	variant first switch (after_machine) {
+		case '(':  tail_entry  has_first;
+		default:   absent      no_first;
+	}
+	peek u8  after_first;
+	variant second switch (after_first) {
+		case '(':  tail_entry  has_second;
+		default:   absent      no_second;
 	}
 	u8  close  [must_eq = ')'];
 }
 
-struct secrets_entry {
-	preamble u8[10] = "(7:secrets";
+// One trailing form after the machine: `(secrets (NAME VALUE) ...)` or
+// `(ssh (host_key V) ...)`, in that order, each optional. A list, so the
+// leading `(` is required and a bare atom after the machine is refused by
+// the close that follows. The agent reads each by name.
+struct tail_entry {
+	u8  open  [must_eq = '('];
 	form  values[]  until ")";
 }
 

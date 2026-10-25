@@ -341,11 +341,12 @@ expect 2 'bad\.conf:1:11: machine\.sauce: is not a key here$' "$hull" plan -f "$
 expect 2 'missing\.conf: No such file' "$hull" plan -f "$dir/missing.conf"
 
 # Section 4's example is refused on every engine that runs. On ns it is
-# refused for one field, (ssh true): no engine provisions sshd yet
-# (section 8.1), and the docker adapter says so rather than run without
-# one. On vm and emu it is two: its image source and ssh, neither of
-# which the qemu engine does yet; its port is forwarded.
-expect 1 'example\.conf: machine on qemu \(emu\): rejected, 2 fields$' \
+# refused for one field, (ssh true): the docker adapter provisions no
+# sshd, and says so rather than run without one (section 8.1). On vm and
+# emu it is one field, its image source: the qemu engine provisions
+# (ssh true) from the image's own sshd since 2026-10-25, and its port is
+# forwarded.
+expect 1 'example\.conf: machine on qemu \(emu\): rejected, 1 field$' \
 	"$hull" check -f "$dir/example.conf" --backend vm,emu
 expect 1 'example\.conf: machine on docker \(ns\): rejected, 1 field$' \
 	"$hull" check -f "$dir/example.conf" --backend docker

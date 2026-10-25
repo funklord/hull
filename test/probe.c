@@ -536,6 +536,50 @@ int main(int argc, char **argv)
 			reboot(RB_POWER_OFF);
 			return 1;
 		}
+		/* A stand-in for the image's own sshd, for (ssh true)'s test: it
+		 * records how hull invoked it and the files it was pointed at into
+		 * /sshd.stub, then listens on :22 and answers with an SSH banner,
+		 * so the test checks hull's whole job -- find the sshd, place the
+		 * host key, authorized_keys and config, start it on 22 -- without a
+		 * real OpenSSH in the guest. */
+		if (strcmp(base, "sshd") == 0) {
+			const char *config = "";
+			const char *hostkey = "";
+			int         one = 1;
+			int         fd;
+			FILE       *rec;
+			struct sockaddr_in at;
+
+			for (int i = 1; i < argc; i++) {
+				if (strcmp(argv[i], "-f") == 0 && i + 1 < argc)
+					config = argv[++i];
+				else if (strcmp(argv[i], "-h") == 0 && i + 1 < argc)
+					hostkey = argv[++i];
+			}
+			fd = socket(AF_INET, SOCK_STREAM, 0);
+			memset(&at, 0, sizeof at);
+			at.sin_family = AF_INET;
+			at.sin_port   = htons(22);
+			setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+			if (fd < 0 || bind(fd, (struct sockaddr *)&at, sizeof at) != 0 || listen(fd, 1) != 0)
+				return 1;
+			if ((rec = fopen("/sshd.stub", "w")) != NULL) {
+				/* A summary first, since a reader takes one line: the
+				 * config and host key hull pointed sshd at. */
+				fprintf(rec, "started config=%s hostkey=%s\n", config, hostkey);
+				for (int i = 0; i < argc; i++)
+					fprintf(rec, "argv%d=%s\n", i, argv[i]);
+				fclose(rec);
+			}
+			for (;;) {
+				int peer = accept(fd, NULL, NULL);
+
+				if (peer < 0)
+					continue;
+				(void)!write(peer, "SSH-2.0-hull-stub\r\n", 19u);
+				close(peer);
+			}
+		}
 		if (getpid() == 1 && argc == 1) {
 			for (;;)
 				if (wait(NULL) < 0)

@@ -106,6 +106,8 @@ static int    handed;      /* PID 1 is the image's init, and this is the agent b
 static int    run_made;    /* /run is a tmpfs made here, as an initramfs makes it */
 static int    no_new_privs;
 static int    applied;     /* the spec is applied: the root is the machine's */
+static int    ssh_enabled; /* (ssh true): supervise the image's own sshd */
+static char   ssh_bin[256]; /* the image's sshd the agent found, absolute */
 
 /* A process the host follows on a channel: the workload on 0, each exec
  * on its own. */
@@ -625,8 +627,61 @@ static const char *place_secrets(const hull_sexpr_doc *doc, const hull_sexpr_for
 	return NULL;
 }
 
+/*
+ * (ssh true)'s material, from the spec's `(ssh (host_key V)(authorized_keys
+ * V)(config V))` the core generates and delivers: each written 0400 in
+ * /run/hull/ssh on a tmpfs of its own under the machine's /run, as secrets
+ * are, so the image's sshd reads its host key, the user's authorized_keys
+ * and a minimal config from absolute paths and nothing is left in the
+ * machine's tree. Called before the pivot, as place_secrets is. Returns a
+ * reason, or NULL.
+ */
+static const char *place_ssh(const hull_sexpr_doc *doc, const hull_sexpr_form *given)
+{
+	static const char *const names[] = { "host_key", "authorized_keys", "config", NULL };
+
+	if (!run_made &&
+	    mount("tmpfs", "/machine/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755,size=1m") != 0)
+		return "the machine has no /run for its ssh material";
+	run_made = 1;
+	if (mkdir("/machine/run/hull", 0755) != 0 && errno != EEXIST)
+		return "the ssh material's directory could not be made";
+	if (mkdir("/machine/run/hull/ssh", 0700) != 0 ||
+	    mount("tmpfs", "/machine/run/hull/ssh", "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+	          "mode=0700,size=1m") != 0)
+		return "the ssh material's tmpfs could not be made";
+	for (unsigned i = 0u; names[i] != NULL; i++) {
+		hull_sexpr_form pair;
+		hull_sexpr_form key;
+		hull_sexpr_form value;
+		char            path[256];
+		int             fd;
+
+		/* `(host_key VALUE)` etc.: find the pair, then its value atom; the
+		 * value is binary (a host key has NUL-free but newline-bearing
+		 * bytes), so it is taken by offset, not as a C string. */
+		if (!hull_access_find(doc, given, names[i], &pair) ||
+		    !hull_sexpr_child(doc, &pair, &key) || !hull_sexpr_next(doc, &key, &value) ||
+		    value.kind != HULL_SEXPR_ATOM)
+			return "the ssh material is not host_key, authorized_keys and config";
+		snprintf(path, sizeof path, "/machine/run/hull/ssh/%s", names[i]);
+		fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0400);
+		if (fd < 0 || write(fd, doc->data + value.content, value.content_length) !=
+		                  (ssize_t)value.content_length) {
+			if (fd >= 0)
+				close(fd);
+			return "an ssh material file could not be written";
+		}
+		close(fd);
+	}
+	if (mount(NULL, "/machine/run/hull/ssh", NULL,
+	          MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) != 0)
+		return "the ssh material could not be made read-only";
+	return NULL;
+}
+
 static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
-                         const hull_sexpr_form *secrets)
+                         const hull_sexpr_form *secrets, const hull_sexpr_form *ssh)
 {
 	hull_sexpr_form entry;
 	hull_sexpr_form item;
@@ -794,6 +849,13 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	}
 	if (secrets != NULL && (reason = place_secrets(doc, machine, secrets, &n)) != NULL)
 		return reason;
+	ssh_enabled = hull_access_true(doc, machine, "ssh");
+	if (ssh_enabled) {
+		if (ssh == NULL)
+			return "(ssh true) asked for, but no ssh material was delivered";
+		if ((reason = place_ssh(doc, ssh)) != NULL)
+			return reason;
+	}
 	/* The kernel's filesystems inside, where the machine has a place for
 	 * them; then the directory becomes /. */
 	if (mount("proc", "/machine/proc", "proc", 0u, NULL) != 0 && errno != ENOENT)
@@ -810,6 +872,20 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	if (chdir("/machine") != 0 || mount(".", "/", NULL, MS_MOVE, NULL) != 0 ||
 	    chroot(".") != 0 || chdir("/") != 0)
 		return "the machine's directory could not become its root";
+	/* The image's own sshd, now that its root is in place: the first of the
+	 * usual two paths that is executable. Absent, (ssh true) is refused
+	 * here rather than run silently without one (section 6). Bundling one
+	 * for a bare rootfs is a later increment (section 8.1). */
+	if (ssh_enabled) {
+		static const char *const where[] = { "/usr/sbin/sshd", "/usr/bin/sshd", NULL };
+		unsigned                 i;
+
+		for (i = 0u; where[i] != NULL && access(where[i], X_OK) != 0; i++)
+			;
+		if (where[i] == NULL)
+			return "(ssh true): the image has no sshd at /usr/sbin/sshd or /usr/bin/sshd";
+		snprintf(ssh_bin, sizeof ssh_bin, "%s", where[i]);
+	}
 	applied = 1;
 	return NULL;
 }
@@ -1013,6 +1089,22 @@ static const char *hand_over(void)
 	return NULL;
 }
 
+/* The image's sshd, supervised beside the workload: a child off every
+ * channel, so its exit is reaped like any orphan and never ends the machine
+ * (which only channel 0 does). It reads its host key, authorized_keys and
+ * config from the tmpfs place_ssh made, by absolute path. */
+static void start_sshd(void)
+{
+	pid_t child = fork();
+
+	if (child != 0)
+		return;
+	setsid();
+	execl(ssh_bin, "sshd", "-D", "-e", "-f", "/run/hull/ssh/config",
+	      "-h", "/run/hull/ssh/host_key", (char *)NULL);
+	_exit(127);
+}
+
 static const char *start(void)
 {
 	const char *reason;
@@ -1021,6 +1113,8 @@ static const char *start(void)
 		return "the workload has been started already";
 	if (init_ != NULL && !handed && (reason = hand_over()) != NULL)
 		return reason;
+	if (ssh_enabled)
+		start_sshd();
 	return spawn(0u, argv_, workdir, NULL, NULL, 0);
 }
 
@@ -1435,6 +1529,7 @@ static void handle(const hull_sexpr_doc *body)
 	} else if (hull_msg_is(body, "spec")) {
 		hull_sexpr_form machine;
 		hull_sexpr_form secrets;
+		hull_sexpr_form ssh;
 
 		if (applied)
 			reason = "the spec has been applied already";
@@ -1442,7 +1537,8 @@ static void handle(const hull_sexpr_doc *body)
 			reason = "the spec holds no machine";
 		else
 			reason = apply(body, &machine,
-			               hull_access_find(body, &message, "secrets", &secrets) ? &secrets : NULL);
+			               hull_access_find(body, &message, "secrets", &secrets) ? &secrets : NULL,
+			               hull_access_find(body, &message, "ssh", &ssh) ? &ssh : NULL);
 		if (reason != NULL)
 			send_error(0u, reason);
 		else

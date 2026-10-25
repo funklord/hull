@@ -26,6 +26,15 @@ cp "$probe" "$dir/rootfs/probe"
 # A resolver no machine can reach, which the agent's must cover.
 printf 'nameserver 127.0.0.53\n' > "$dir/rootfs/etc/resolv.conf"
 root=$(cd "$dir" && pwd)
+# A HOME of the test's own, never the account's: the core reads the user's
+# ~/.ssh public keys for (ssh true)'s authorized_keys, and it must read a
+# fixture rather than the real ones. Exported so the core, started by the
+# first hull call below, has it. The ssh-config case below already used
+# this HOME per command.
+export HOME="$root/home"
+mkdir -p "$root/home/.ssh"
+chmod 700 "$root/home/.ssh"
+printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5hulltestkey hull-test\n' > "$root/home/.ssh/id_ed25519.pub"
 # The engine's passt, by the arguments only it gives.
 passt='^passt --quiet --fd 3 --one-off --ipv4-only --address 10\.0\.2\.15 '
 # passts_new OTHERS: the engine's passts now, less those in OTHERS, as
@@ -1015,6 +1024,75 @@ wait "$runner"
 grep -q '^served=SSH-2\.0-' "$root/sshed.out" ||
 	fail "ssh through ssh-config's block did not reach the machine's port 22" \
 		"$said; $(cat "$root/sshed.out")"
+# (ssh true): the agent supervises the image's own sshd on the guest's port
+# 22. A root of its own carries a stand-in sshd (the probe run as sshd,
+# which records how hull invoked it in /sshd.stub and answers the SSH
+# banner), so this checks hull's whole job -- generate a host key, write the
+# user's authorized_keys and a config, find the image's sshd and start it on
+# 22 -- without a real OpenSSH in the guest. proxy-ssh reaches the banner;
+# the machine carries the three files the agent placed; the stub was started
+# with the host key.
+# The host key is private, so the core keeps the ssh material in memory and
+# refuses a runtime directory that is not a tmpfs, as it does for secrets.
+# $BUILD_DIR is on disk here, so these cases run a core of their own under a
+# tmpfs in /dev/shm, as cli_test's secrets cases do. Both roots carry /run
+# for the material's tmpfs and proc/dev/sys as mountpoints.
+sshrt=$(mktemp -d /dev/shm/hull-qssh.XXXXXX 2>/dev/null)
+if [ -z "$sshrt" ]; then
+	printf 'qemu: ssh cases not tried: no tmpfs under /dev/shm for the ssh material\n'
+else
+	chmod 700 "$sshrt"
+	rm -rf "$root/sshroot" "$root/nosshroot"
+	for d in sshroot nosshroot; do
+		mkdir -p "$root/$d/run" "$root/$d/proc" "$root/$d/dev" "$root/$d/sys"
+		cp "$probe" "$root/$d/probe"
+	done
+	mkdir -p "$root/sshroot/usr/sbin"
+	cp "$probe" "$root/sshroot/usr/sbin/sshd"
+	printf '(machine (source "dir:./sshroot") (backend vm) (hostname "qssh") (ssh true) %s)\n' \
+		'(command "/probe" "say" "ready" "wait")' > "$root/qssh.conf"
+	rm -f "$root/qssh.out"
+	(cd / && exec env XDG_RUNTIME_DIR="$sshrt" timeout -k 2 90 "$hull" run -f "$root/qssh.conf" \
+		> "$root/qssh.out" 2>&1) &
+	runner=$!
+	tries=0
+	until grep -q '^ready$' "$root/qssh.out" 2>/dev/null || [ "$tries" -ge 60 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+	banner=$(cd / && XDG_RUNTIME_DIR="$sshrt" timeout 20 "$hull" proxy-ssh qssh < /dev/null 2>&1 | head -1)
+	akeys=$(XDG_RUNTIME_DIR="$sshrt" timeout 20 "$hull" exec qssh /probe read /run/hull/ssh/authorized_keys 2>&1)
+	invoked=$(XDG_RUNTIME_DIR="$sshrt" timeout 20 "$hull" exec qssh /probe read /sshd.stub 2>&1)
+	XDG_RUNTIME_DIR="$sshrt" timeout 30 "$hull" stop qssh > /dev/null 2>&1
+	wait "$runner"
+	cases=$((cases + 1))
+	case $banner in
+	SSH-2.0-hull-stub*) ;;
+	*) fail "(ssh true) did not start the image's sshd on the guest's port 22" \
+		"$banner; $(cat "$root/qssh.out")" ;;
+	esac
+	cases=$((cases + 1))
+	case $akeys in
+	*hulltestkey*) ;;
+	*) fail "(ssh true) did not write the user's authorized_keys into the machine" "$akeys" ;;
+	esac
+	cases=$((cases + 1))
+	case $invoked in
+	*host_key*) ;;
+	*) fail "the agent did not start the image's sshd with the host key" "$invoked" ;;
+	esac
+	# And refused when the image has no sshd: (ssh true) must fail at start,
+	# not run the machine silently without one (section 6). nosshroot has
+	# /run, so the material is placed and the refusal is for the sshd alone.
+	printf '(machine (source "dir:./nosshroot") (backend vm) (hostname "qnossh") (ssh true) %s)\n' \
+		'(command "/probe" "say" "ready")' > "$root/qnossh.conf"
+	noout=$(cd / && XDG_RUNTIME_DIR="$sshrt" timeout -k 2 90 "$hull" run -f "$root/qnossh.conf" 2>&1)
+	nocode=$?
+	cases=$((cases + 1))
+	{ [ "$nocode" != 0 ] && printf '%s\n' "$noout" | grep -q 'has no sshd'; } ||
+		fail "(ssh true) on an image with no sshd was not refused at start" "$nocode: $noout"
+	rm -rf "$sshrt"
+fi
 # A udp port: each client its own flow, each datagram whole, an empty one
 # too, and the machine's replies to the client that sent. A datagram the
 # machine is not yet listening for is dropped, as udp's are, and the

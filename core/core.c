@@ -45,6 +45,7 @@
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -136,6 +137,7 @@ struct slot {
 	int                keep;        /* (on_disconnect keep) */
 	int                kept;        /* hull/machines/ID is written for it */
 	int                secrets;     /* hull/secrets/ID is written for it */
+	int                ssh;         /* hull/ssh/ID is written for it, (ssh true) */
 	client            *owner;       /* the frontend that ran it */
 	int                paused;      /* hull pause, and no unpause since */
 	/* The plan's (impair ...): each segment's link, given its port
@@ -820,6 +822,7 @@ static void stop_machine(slot *s, int timeout_ms)
 
 static void forget_machine(slot *s);
 static void forget_secrets(slot *s);
+static void forget_ssh(slot *s);
 
 /* The machine has ended: tell whoever is waiting, and let the engine go. */
 static void machine_exited(slot *s, int code, int signal)
@@ -848,6 +851,7 @@ static void machine_exited(slot *s, int code, int signal)
 		s->handle = NULL;
 	}
 	forget_secrets(s);
+	forget_ssh(s);
 }
 
 static void drain_list(event *e);
@@ -1172,6 +1176,188 @@ static void forget_secrets(slot *s)
 	if (s->secrets)
 		remove_secrets(s->id);
 	s->secrets = 0;
+}
+
+/* --- (ssh true) provisioning --------------------------------------------- */
+
+/*
+ * Section 8.1's item 3, the image's own sshd: for a machine with (ssh true),
+ * the core generates a host key, reads the user's public keys as the
+ * authorized_keys, and writes a minimal sshd_config, into hull/ssh/ID beside
+ * the socket. The engine is given that path as the plan's `(ssh_dir DIR)`
+ * and the agent places the three files on a tmpfs the image's sshd reads by
+ * absolute path. The host key is private, so this directory is a tmpfs like
+ * secrets', and goes with the machine. The key is ephemeral in this cut; a
+ * persistent, backend-surviving one is a later increment (section 8.1).
+ */
+static char ssh_root[4200];
+
+static int ssh_path(const char *id, char *out, size_t cap)
+{
+	int n = snprintf(out, cap, "%s/%s", ssh_root, id);
+
+	return ssh_root[0] != '\0' && n > 0 && (size_t)n < cap;
+}
+
+static void remove_ssh(const char *id)
+{
+	char           path[4300];
+	DIR           *dir;
+	struct dirent *entry;
+
+	if (!ssh_path(id, path, sizeof path) || (dir = opendir(path)) == NULL)
+		return;
+	while ((entry = readdir(dir)) != NULL)
+		if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0)
+			unlinkat(dirfd(dir), entry->d_name, 0);
+	closedir(dir);
+	rmdir(path);
+}
+
+/* The user's public keys, concatenated, as the machine's authorized_keys:
+ * every `.pub` in ~/.ssh, so the key a `hull ssh` or plain ssh offers is
+ * authorized. Written to `at`/authorized_keys, 0400. NULL, or why not. */
+static const char *write_authorized_keys(int at)
+{
+	const char    *home = getenv("HOME");
+	char           dir[4096];
+	DIR           *d;
+	struct dirent *entry;
+	int            out;
+	int            wrote = 0;
+
+	if (home == NULL || home[0] != '/')
+		return "(ssh true): HOME is not set, so there is no public key to authorize";
+	if ((size_t)snprintf(dir, sizeof dir, "%s/.ssh", home) >= sizeof dir)
+		return "(ssh true): the path to ~/.ssh is too long";
+	out = openat(at, "authorized_keys", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0400);
+	if (out < 0)
+		return "(ssh true): the authorized_keys file cannot be made";
+	if ((d = opendir(dir)) != NULL) {
+		int dfd = dirfd(d);
+
+		while ((entry = readdir(d)) != NULL) {
+			size_t len = strlen(entry->d_name);
+			char   buf[8192];
+			int    in;
+			ssize_t n;
+
+			if (len < 4u || strcmp(entry->d_name + len - 4u, ".pub") != 0)
+				continue;
+			if ((in = openat(dfd, entry->d_name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)) < 0)
+				continue;
+			while ((n = read(in, buf, sizeof buf)) > 0)
+				if (write(out, buf, (size_t)n) == n)
+					wrote = 1;
+			close(in);
+		}
+		closedir(d);
+	}
+	close(out);
+	if (!wrote)
+		return "(ssh true): no public key in ~/.ssh to authorize; make one with ssh-keygen";
+	return NULL;
+}
+
+/* An ephemeral ed25519 host key, by the host's own ssh-keygen, into
+ * `at`/host_key. NULL, or why not. */
+static const char *write_host_key(const char *dir)
+{
+	char  path[4300];
+	pid_t child;
+	int   status;
+
+	if ((size_t)snprintf(path, sizeof path, "%s/host_key", dir) >= sizeof path)
+		return "(ssh true): the host key's path is too long";
+	child = fork();
+	if (child < 0)
+		return "(ssh true): the host key could not be generated";
+	if (child == 0) {
+		int null = open("/dev/null", O_WRONLY);
+
+		if (null >= 0) {
+			dup2(null, 1);
+			dup2(null, 2);
+		}
+		execlp("ssh-keygen", "ssh-keygen", "-q", "-t", "ed25519", "-f", path, "-N", "",
+		       "-C", "hull", (char *)NULL);
+		_exit(127);
+	}
+	if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		return "(ssh true): ssh-keygen could not generate a host key; is it installed?";
+	return NULL;
+}
+
+/* The ssh material for `id`, into a fresh hull/ssh/ID: a host key, the
+ * user's authorized_keys, and a config that points the image's sshd at
+ * both. Its path is put in `dir`. NULL, or why not. */
+static const char *write_ssh(const char *id, char *dir, size_t cap)
+{
+	static const char config[] =
+	    "Port 22\n"
+	    "HostKey /run/hull/ssh/host_key\n"
+	    "AuthorizedKeysFile /run/hull/ssh/authorized_keys\n"
+	    "PasswordAuthentication no\n"
+	    "PermitRootLogin prohibit-password\n"
+	    "UsePAM no\n";
+	struct statfs where;
+	const char   *why;
+	int           at;
+	int           fd;
+
+	if (ssh_root[0] == '\0')
+		return "(ssh true): the runtime directory has no place for ssh material";
+	if (statfs(ssh_root, &where) != 0 ||
+	    (where.f_type != TMPFS_MAGIC && where.f_type != RAMFS_MAGIC))
+		return "(ssh true): the host key is kept in memory only, and the runtime directory is "
+		       "not a tmpfs";
+	if (!ssh_path(id, dir, cap))
+		return "(ssh true): the ssh directory's path is too long";
+	remove_ssh(id);
+	if (mkdir(dir, 0700) != 0 || (at = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC)) < 0)
+		return "(ssh true): the ssh directory cannot be made";
+	why = write_host_key(dir);
+	if (why == NULL)
+		why = write_authorized_keys(at);
+	if (why == NULL) {
+		fd = openat(at, "config", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0400);
+		if (fd < 0 || write(fd, config, sizeof config - 1u) != (ssize_t)(sizeof config - 1u))
+			why = "(ssh true): the sshd config cannot be written";
+		if (fd >= 0)
+			close(fd);
+	}
+	close(at);
+	if (why != NULL)
+		remove_ssh(id);
+	return why;
+}
+
+/* The plan with `(ssh_dir DIR)` added: "ssh_dir" sorts after "secrets" and
+ * every other key a plan has, so it goes last, as with_secrets' does. */
+static uint8_t *with_ssh(const hull_buf *plan, const char *dir, size_t *length)
+{
+	char     entry[4400];
+	int      written = snprintf(entry, sizeof entry, "(7:ssh_dir%zu:%s)", strlen(dir), dir);
+	uint8_t *out;
+
+	if (written < 0 || (size_t)written >= sizeof entry || plan->len == 0u ||
+	    plan->data[plan->len - 1u] != ')')
+		return NULL;
+	*length = plan->len + (size_t)written;
+	out = malloc(*length);
+	if (out == NULL)
+		return NULL;
+	memcpy(out, plan->data, plan->len - 1u);
+	memcpy(out + plan->len - 1u, entry, (size_t)written);
+	out[*length - 1u] = ')';
+	return out;
+}
+
+static void forget_ssh(slot *s)
+{
+	if (s->ssh)
+		remove_ssh(s->id);
+	s->ssh = 0;
 }
 
 /* --- machines that outlive the core -------------------------------------- */
@@ -1627,11 +1813,33 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		s->used = 0;
 		return;
 	}
+	if (hull_access_true(&plan_doc, &machine, "ssh")) {
+		char        dir[4300];
+		const char *why = write_ssh(id, dir, sizeof dir);
+		uint8_t    *with = why == NULL ? with_ssh(&plan, dir, &addressed_length) : NULL;
+
+		if (why == NULL && with == NULL) {
+			why = "the plan is not a plan";
+			remove_ssh(id);
+		}
+		free(addressed);
+		if (why != NULL) {
+			send_error(c, ch, why);
+			forget_secrets(s);
+			s->used = 0;
+			return;
+		}
+		s->ssh    = 1;
+		addressed = with;
+		plan.data = with;
+		plan.len  = addressed_length;
+	}
 	created = engine->ops->create(&s->core, plan, &s->handle, &error);
 	free(addressed);
 	if (created != HULL_OK) {
 		send_error(c, ch, error.detail != NULL ? error.detail : "create failed");
 		forget_secrets(s);
+		forget_ssh(s);
 		s->used = 0;
 		return;
 	}
@@ -1640,6 +1848,7 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		send_error(c, ch, error.detail != NULL ? error.detail : "start failed");
 		engine->ops->destroy(&s->core, s->handle, &error);
 		forget_secrets(s);
+		forget_ssh(s);
 		s->handle         = NULL;
 		s->used           = 0;
 		s->follower_count = 0u;
@@ -2923,6 +3132,9 @@ int hull_core_run(const char *host_arch)
 		secrets_root[0] = '\0';  /* no machine with secrets can run */
 	else
 		remove_stale_secrets();
+	snprintf(ssh_root, sizeof ssh_root, "%s/ssh", dir);
+	if (mkdir(ssh_root, 0700) != 0 && errno != EEXIST)
+		ssh_root[0] = '\0';  /* no machine with (ssh true) can run */
 
 	memset(&action, 0, sizeof action);
 	action.sa_handler = end;
