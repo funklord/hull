@@ -44,6 +44,7 @@ static const hull_cap_entry qemu_entries[] = {
 	{ "vm.profile.micro",       HULL_SUP_NATIVE,   NULL, NULL },
 	{ "vm.kernel.bundled",      HULL_SUP_NATIVE,   NULL, NULL },
 	{ "vm.kernel.path",         HULL_SUP_NATIVE,   NULL, NULL },
+	{ "vm.kernel.image",        HULL_SUP_NATIVE,   NULL, NULL },
 	{ "qemu.accel.tcg",         HULL_SUP_NATIVE,   NULL, NULL },
 	{ "emu.cores_scale",        HULL_SUP_NATIVE,   NULL, NULL },
 	{ NULL,                     HULL_SUP_NATIVE,   NULL, NULL },
@@ -225,6 +226,8 @@ static void test_tuning(void)
 	   "source.dir.direct:n vm.profile.full:r");
 	OK("(machine (source \"dir:.\") (tuning (vm (kernel \"path:./bzImage\"))))", &qemu, "vm",
 	   "source.dir.direct:n vm.kernel.path:n");
+	OK("(machine (source \"dir:.\") (tuning (vm (kernel image))))", &qemu, "vm",
+	   "source.dir.direct:n vm.kernel.image:n");
 	/* An empty section asks nothing; false asks nothing. */
 	OK("(machine (source \"dir:.\") (tuning (vm) (ns (binfmt false))))", &qemu, "vm",
 	   "source.dir.direct:n ns:i");

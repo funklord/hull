@@ -322,6 +322,46 @@ cases=$((cases + 1))
 cases=$((cases + 1))
 ! printf '%s\n' "$out" | grep -q '^booted$' ||
 	fail "vkernelbad ran the command, so qemu did not get the given file" "$out"
+# (kernel image): the image's own /hull/kernel, booted as given -- a
+# different kernel version per machine, which Docker cannot do. Proven, as
+# the path case is, with the host's own kernel put in the image tree: it
+# boots from there, its release read and its modules loaded, and no bundled
+# emulated line. A tree with no /hull/kernel is refused, and a /hull/kernel
+# that is not a kernel reaches qemu rather than falling back to the host's.
+rm -rf "${root:?}/vkimg"
+mkdir -p "$root/vkimg/proc" "$root/vkimg/dev" "$root/vkimg/sys" "$root/vkimg/hull"
+cp "$probe" "$root/vkimg/probe"
+cp "/boot/vmlinuz-$release" "$root/vkimg/hull/kernel"
+if [ -n "$hwsim" ]; then
+	printf '(machine (source "dir:%s/vkimg") (backend vm) (mutable overlay) %s %s)\n' "$root" \
+		'(tuning (vm (kernel image)))' \
+		"(command \"/probe\" $loads \"list\" \"/sys/class/ieee80211\" \"read\" \"/proc/sys/kernel/osrelease\")" \
+		> "$root/vkimage.conf"
+	name=vkimage
+	boot vkimage
+	has 0 '^load=ok$'
+	has 0 '^list= phy0 phy1$'
+	has 0 "^read=$release_re\$"
+	refute_out 'vm\.kernel\.bundled: emulated'
+fi
+# No /hull/kernel in the tree: refused before any boot.
+printf '(machine (source "dir:./rootfs") (backend vm) %s %s)\n' \
+	'(tuning (vm (kernel image)))' '(command "/probe" "say" "no")' > "$root/vkimageno.conf"
+name=vkimageno
+boot vkimageno
+has 125 'kernel image.*/hull/kernel.*has none'
+# A /hull/kernel that is not a kernel reaches qemu, not a bundled fallback.
+head -c 4096 /dev/urandom > "$root/vkimg/hull/kernel"
+printf '(machine (source "dir:%s/vkimg") (backend vm) %s %s)\n' "$root" \
+	'(tuning (vm (kernel image)))' '(command "/probe" "say" "booted")' > "$root/vkimagebad.conf"
+name=vkimagebad
+boot vkimagebad
+cases=$((cases + 1))
+[ "$got" != 0 ] || fail "vkimagebad booted a non-kernel (a bundled fallback?)" "$out"
+cases=$((cases + 1))
+! printf '%s\n' "$out" | grep -q '^booted$' ||
+	fail "vkimagebad ran the command, so qemu did not get the image's /hull/kernel" "$out"
+rm -rf "${root:?}/vkimg"
 # Appendix D's segments: a NIC each, after passt's, on the core's switch,
 # with no address given, as a test of network software sets its own.
 # Two vms on one hear each other in raw frames, the shouter's own MAC

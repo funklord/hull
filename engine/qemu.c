@@ -117,6 +117,7 @@ struct hull_machine {
 	char            *owners;       /* (owners PATH): a stored tree's owners, given back */
 	int              many;         /* the user's subordinate range mapped, not one uid */
 	char            *kernel_path;  /* (kernel "path:FILE"): bring your own, else the host's */
+	int              kernel_image; /* (kernel image): the image's own /hull/kernel */
 	char            *volume_host[MAX_VOLUMES];
 	int              volume_readonly[MAX_VOLUMES];
 	hull_stack       volume_stack[MAX_VOLUMES];  /* a volume of (layers ...), or count 0 */
@@ -422,11 +423,12 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		m->host_overlay = 1;
 	}
 
-	/* (tuning (vm (kernel "path:FILE"))): a bring-your-own kernel, in place
-	 * of the host's. vm's tuning applies under emu too (section 4), so the
-	 * (vm ...) section carries it for both classes. bundled and image are
-	 * atoms, not strings, and name no path: bundled is the host's (below)
-	 * and image is a refused vector the matrix catches. */
+	/* (tuning (vm (kernel ...))): the kernel the vm boots, in place of the
+	 * host's. vm's tuning applies under emu too (section 4), so the (vm ...)
+	 * section carries it for both classes. "path:FILE" is a bring-your-own
+	 * kernel on the user's disk; "image" is the image's own /hull/kernel
+	 * (Appendix F), read at boot since the source is known only here where
+	 * m->root is; "bundled" is the host's (below) and names no kernel. */
 	if (hull_access_find(doc, &machine, "tuning", &entry) &&
 	    hull_access_find(doc, &entry, "vm", &item) &&
 	    (text = hull_access_value(doc, &item, "kernel")) != NULL) {
@@ -436,6 +438,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			if (m->kernel_path == NULL)
 				return "the kernel's path cannot be read";
 		} else {
+			m->kernel_image = strcmp(text, "image") == 0;
 			free(text);
 		}
 	}
@@ -1915,6 +1918,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	const char    *kernel;         /* the -kernel file */
 	const char    *release;        /* its release, for its modules on the host */
 	char           kbuf[512];      /* the host kernel's path, for bundled */
+	char           ibuf[4200];     /* the image's /hull/kernel, for (kernel image) */
 	char           rbuf[256];      /* a path kernel's release */
 	int            load_modules;   /* the host has this release's modules */
 	int            fd = -1;
@@ -1930,14 +1934,22 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		return fail(error, HULL_ERR_RUNTIME, "/dev/vhost-vsock is not open to this user");
 
 	/* The kernel, and the release whose modules it wants. bundled is the
-	 * host's own, always modular here; a path kernel is the user's, booted
-	 * as given, and its modules are the host's for its release where it has
-	 * them (a distribution kernel), or none where it does not (a kernel
-	 * with its drivers built in, Appendix F). */
-	if (m->kernel_path != NULL) {
-		if (access(m->kernel_path, R_OK) != 0)
-			return fail(error, HULL_ERR_RUNTIME, "the kernel at (kernel \"path:...\") cannot be read");
-		kernel = m->kernel_path;
+	 * host's own, always modular here. A path kernel is the user's on disk,
+	 * and an image kernel is the image's own /hull/kernel (Appendix F): both
+	 * are booted as given, and their modules are the host's for the release
+	 * the image carries where it has them (a distribution kernel), or none
+	 * where it does not (a kernel with its drivers built in). */
+	if (m->kernel_path != NULL || m->kernel_image) {
+		if (m->kernel_image) {
+			snprintf(ibuf, sizeof ibuf, "%s/hull/kernel", m->root);
+			kernel = ibuf;
+		} else {
+			kernel = m->kernel_path;
+		}
+		if (access(kernel, R_OK) != 0)
+			return fail(error, HULL_ERR_RUNTIME, m->kernel_image ?
+			            "(kernel image) wants the image's own /hull/kernel, and it has none" :
+			            "the kernel at (kernel \"path:...\") cannot be read");
 		if (kernel_release(kernel, rbuf, sizeof rbuf)) {
 			char dep[600];
 
@@ -3079,6 +3091,9 @@ static const hull_cap_entry entries[] = {
 	{ "vm.kernel.path",      HULL_SUP_NATIVE,
 	  "the kernel at the given path, booted as given; its modules are the host's for its "
 	  "release where it has them, else it must have its guest drivers built in", NULL },
+	{ "vm.kernel.image",     HULL_SUP_NATIVE,
+	  "the image's own /hull/kernel, booted as given; a different kernel version per machine, "
+	  "its modules the host's for its release where it has them, else built in", NULL },
 	{ "vm.cpu_profile.host", HULL_SUP_NATIVE,  NULL, NULL },
 	{ "qemu.accel.auto",     HULL_SUP_NATIVE,  NULL, NULL },
 	{ "emu.cores_scale",     HULL_SUP_NATIVE,  NULL, NULL },
