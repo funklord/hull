@@ -144,6 +144,13 @@ int hull_store_untag(hull_store *store, const char *ref, char *why, size_t cap);
  * with `why`. */
 int hull_store_show(hull_store *store, const char *name, FILE *out, char *why, size_t cap);
 
+/* A.1's readable view back into the store: made canonical, stored by its
+ * sha256 (in `hex`), and tagged `ref` when one is given. Showing a manifest
+ * and compiling that view back reproduces its bytes, so its name. 0, or -1
+ * with `why`. */
+int hull_store_compile(hull_store *store, const uint8_t *view, size_t length, const char *ref,
+                       char hex[65], char *why, size_t cap);
+
 /* Section 3.5's layers, applied in order into a tree to be committed: a
  * tar each, gzip-compressed or not. Each path is made beneath the tree,
  * its parents resolved in it, so that a symlink in a layer leads nowhere

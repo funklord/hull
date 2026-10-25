@@ -300,6 +300,24 @@ got=$(listing "$root/after")
 [ "$got" = "$committed" ] || fail "a tree materialized after gc is not the tree" \
 	"$(printf '%s\n' "$committed" > "$root/want"; printf '%s\n' "$got" > "$root/got"; diff "$root/want" "$root/got")"
 
+# manifest compile: the view's way back. Showing a manifest and compiling
+# that view reproduces its canonical bytes, so its name -- the octets of an
+# object's sha256, the strings of a path and the bare atoms all made
+# canonical again. An edit gives a new identity; a view that is not a
+# (manifest ...), or not an s-expression, is refused.
+ref_hash=$(readlink "$store/refs/one/tree:1" | sed 's|.*/|sha256:|')
+got=$("$hull" manifest show one/tree:1 | "$hull" manifest compile 2>&1)
+cases=$((cases + 1))
+[ "$got" = "$ref_hash" ] ||
+	fail "compile of a shown manifest did not reproduce its name" "got $got, the ref is $ref_hash"
+edited=$("$hull" manifest show one/tree:1 | sed 's/(arch [^)]*)/(arch hulltest)/' |
+	"$hull" manifest compile 2>&1)
+cases=$((cases + 1))
+{ [ "$edited" != "$ref_hash" ] && printf '%s\n' "$edited" | grep -Eq '^sha256:[0-9a-f]{64}$'; } ||
+	fail "an edited view did not get a new identity" "ref $ref_hash, edited $edited"
+expect 1 'is not a .manifest' sh -c 'printf "(teapot)\n" | '"$hull"' manifest compile'
+expect 1 'not a readable' sh -c 'printf "((( nope\n" | '"$hull"' manifest compile'
+
 # diff: nothing between a tree and its copy, nor between a tree and the
 # tree materialized from it, committed again; a manifest named by its hash
 # as a ref is.

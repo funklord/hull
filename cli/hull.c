@@ -110,7 +110,8 @@ static void usage(FILE *out)
 	      "       hull commit [--arch A] DIR REF | hull commit --tar FILE REF\n"
 	      "       hull materialize REF DIR | hull images\n"
 	      "       hull diff REF REF | hull tag REF NEW | hull tag -d REF\n"
-	      "       hull manifest show REF | hull pull IMAGE [REF] | hull push REF IMAGE\n"
+	      "       hull manifest show REF | hull manifest compile [REF]\n"
+	      "       hull pull IMAGE [REF] | hull push REF IMAGE\n"
 	      "       hull core\n"
 	      "       hull engines | hull doctor\n"
 	      "       hull --version\n", out);
@@ -3137,6 +3138,67 @@ static int show_manifest(const char *name)
 	return 0;
 }
 
+/* `hull manifest compile [REF]`: a readable manifest view on stdin, made
+ * canonical and stored (its sha256 printed), tagged REF where one is given.
+ * The view's way back: `hull manifest show X | edit | hull manifest compile
+ * Y`. Compiling an unedited view reproduces X's bytes, so its name. */
+static int compile_manifest(const char *ref)
+{
+	hull_store store;
+	char       why[4400] = "";
+	char       hex[65];
+	uint8_t   *view = NULL;
+	size_t     length = 0u;
+	size_t     cap = 0u;
+	int        status;
+
+	for (;;) {
+		ssize_t n;
+
+		if (length == cap) {
+			uint8_t *grown;
+
+			if (cap >= (64u << 20)) {
+				fprintf(stderr, "hull: manifest: the view on stdin is too large\n");
+				free(view);
+				return 2;
+			}
+			cap = cap == 0u ? 65536u : cap * 2u;
+			if ((grown = realloc(view, cap)) == NULL) {
+				free(view);
+				fprintf(stderr, "hull: out of memory\n");
+				return 2;
+			}
+			view = grown;
+		}
+		n = read(0, view + length, cap - length);
+		if (n < 0) {
+			fprintf(stderr, "hull: stdin: %s\n", strerror(errno));
+			free(view);
+			return 2;
+		}
+		if (n == 0)
+			break;
+		length += (size_t)n;
+	}
+	if (open_store(&store, 1) != 0) {
+		fprintf(stderr, "hull: manifest: the store could not be opened\n");
+		free(view);
+		return 1;
+	}
+	status = hull_store_compile(&store, view, length, ref, hex, why, sizeof why);
+	hull_store_close(&store);
+	free(view);
+	if (status != 0) {
+		fprintf(stderr, "hull: %s\n", why);
+		return 1;
+	}
+	printf("sha256:%s\n", hex);
+	if (ref != NULL)
+		printf("%s\n", ref);
+	return 0;
+}
+
 /* A path on a line of its own: a backslash, and a byte below a space or
  * DEL, as \ and three octal digits, so a newline in a name cannot start
  * a line of its own. */
@@ -4241,6 +4303,9 @@ int main(int argc, char **argv)
 		return pull(argv[2], argc == 4 ? argv[3] : argv[2]);
 	if (strcmp(command, "manifest") == 0 && argc == 4 && strcmp(argv[2], "show") == 0)
 		return show_manifest(argv[3]);
+	if (strcmp(command, "manifest") == 0 && (argc == 3 || argc == 4) &&
+	    strcmp(argv[2], "compile") == 0)
+		return compile_manifest(argc == 4 ? argv[3] : NULL);
 	if (strcmp(command, "proxy-ssh") == 0 && argc == 3)
 		return proxy_ssh(argv[2]);
 	if (strcmp(command, "ssh-config") == 0 && argc == 2)

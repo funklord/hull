@@ -2026,6 +2026,58 @@ int hull_store_show(hull_store *store, const char *name, FILE *out, char *why, s
 	return 0;
 }
 
+int hull_store_compile(hull_store *store, const uint8_t *view, size_t length, const char *ref,
+                       char hex[65], char *why, size_t cap)
+{
+	hull_sexpr_doc  doc;
+	hull_sexpr_form top;
+	hull_sexpr_form head;
+	uint8_t        *out;
+	uint8_t        *scratch;
+	uint32_t        out_cap;
+	uint32_t        scratch_cap;
+	uint32_t        at = 0u;
+	buf             made;
+	int             status = -1;
+
+	/* The canonical form is about the readable's size, smaller for octets;
+	 * twice it plus a margin is ample, and the writer wants about twice its
+	 * result as scratch. */
+	out_cap     = (uint32_t)(length * 2u + 256u);
+	scratch_cap = (uint32_t)(length * 4u + 512u);
+	if (hull_sexpr_open(&doc, view, length, HULL_SEXPR_READABLE, NULL) != HULL_SEXPR_OK ||
+	    !hull_sexpr_first(&doc, &top))
+		return say(why, cap, "manifest compile", "the view is not a readable s-expression");
+	if (top.kind != HULL_SEXPR_LIST || !hull_sexpr_child(&doc, &top, &head) ||
+	    !hull_sexpr_is(&doc, &head, "manifest"))
+		return say(why, cap, "manifest compile", "the view is not a (manifest ...)");
+	out     = malloc(out_cap);
+	scratch = malloc(scratch_cap);
+	if (out == NULL || scratch == NULL) {
+		free(out);
+		free(scratch);
+		return say(why, cap, "manifest compile", "out of memory");
+	}
+	if (hull_sexpr_to_canonical(&doc, &top, out, out_cap, &at, scratch, scratch_cap) !=
+	    HULL_SEXPR_OK) {
+		free(out);
+		free(scratch);
+		return say(why, cap, "manifest compile", "the view could not be made canonical");
+	}
+	made.data   = out;
+	made.length = at;
+	made.cap    = out_cap;
+	made.failed = 0;
+	flock(store->lock, LOCK_EX);
+	if (store_manifest(store, &made, hex, why, cap) == 0 &&
+	    (ref == NULL || set_ref(store, ref, hex, why, cap) == 0))
+		status = 0;
+	flock(store->lock, LOCK_UN);
+	free(out);
+	free(scratch);
+	return status;
+}
+
 /* --- a layer ------------------------------------------------------------- */
 
 static unsigned long long id_of(const hull_sexpr_doc *doc, const hull_sexpr_form *owner,
