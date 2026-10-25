@@ -43,6 +43,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <grp.h>
 #include <stddef.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -74,6 +75,7 @@
 #include "stack.h"
 #include "builtin.h"
 #include "wire.h"
+#include "idmap.h"
 
 #define MAX_VOLUMES  64u
 #define MAX_PORTS    64u
@@ -112,6 +114,8 @@ struct hull_machine {
 	char            *upper;        /* (upper PATH): the overlay's writes, kept */
 	char            *upper_work;   /* overlayfs's work directory beside it, hidden */
 	int              host_overlay; /* layers or an upper: the overlay is qemu's, the share it */
+	char            *owners;       /* (owners PATH): a stored tree's owners, given back */
+	int              many;         /* the user's subordinate range mapped, not one uid */
 	char            *volume_host[MAX_VOLUMES];
 	int              volume_readonly[MAX_VOLUMES];
 	hull_stack       volume_stack[MAX_VOLUMES];  /* a volume of (layers ...), or count 0 */
@@ -290,6 +294,7 @@ static void release(hull_machine *m)
 		free(m->layer_path[i]);
 	free(m->upper);
 	free(m->upper_work);
+	free(m->owners);
 	free(m->spec);
 	forget_secrets(m);
 	if (m->pidfd >= 0)
@@ -392,6 +397,23 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	if (m->host_overlay && (!m->overlay || m->readonly_root))
 		return "layers and an upper lie in an overlay: they need (mutable overlay) and a root "
 		       "that is not read-only";
+
+	/* (owners PATH): a stored tree's owners, given back in the merged tree
+	 * host-side before qemu starts, which copies each file so given up
+	 * into the overlay's tmpfs. A share in place, or the guest's own
+	 * overlay over a read-only share, has no host-side tree to chown: so
+	 * owners need the overlay qemu mounts, layers or an upper (section
+	 * 4.11). The range those ids need is mapped from outside (below). */
+	if ((text = hull_access_value(doc, &machine, "owners")) != NULL) {
+		m->owners = hull_access_path(doc, text);
+		free(text);
+		if (m->owners == NULL)
+			return "the owners' path cannot be read";
+		if (!m->host_overlay || m->upper != NULL)
+			return "owners are given in the overlay's tmpfs: (owners ...) needs (layers ...) "
+			       "with (mutable overlay) and no kept (upper ...), where an owner would be "
+			       "one on the user's disk";
+	}
 
 	m->memory_mib = 512u;
 	if ((text = hull_access_value(doc, &machine, "memory")) != NULL) {
@@ -1006,6 +1028,8 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 {
 	uid_t       uid = getuid();   /* read here: unmapped once unshared */
 	gid_t       gid = getgid();
+	int         ready[2];         /* the child says its namespace is there */
+	int         decide[2];        /* the parent says how its ids were mapped */
 	char        kernel[300];
 	char        initrd[4200];
 	char        console[8600];
@@ -1130,6 +1154,15 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 	}
 	argv[n] = NULL;
 
+	/* The parent maps the user's subordinate range into the child's user
+	 * namespace from outside, by newuidmap, where a stored tree's owners
+	 * are to be given back: so the child unshares, says so over `ready`,
+	 * and waits on `decide` for the word on its ids. */
+	if (pipe2(ready, O_CLOEXEC) != 0 || pipe2(decide, O_CLOEXEC) != 0) {
+		fprintf(stderr, "qemu-system-x86_64: pipe: %s\n", strerror(errno));
+		return -1;
+	}
+
 	pid = fork();
 	if (pid == 0) {
 		int null = open("/dev/null", O_RDWR);
@@ -1144,10 +1177,54 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 		dup2(null, 0);
 		dup2(out, 1);
 		dup2(out, 2);
+		/* qemu in a user namespace where the user is root, as a chroot
+		 * machine is: its 9p server then shows the guest the user's files
+		 * as root's. Outside one it showed them as the user's own uid, so
+		 * a setuid-root program was setuid to the user in the guest, and
+		 * root running mount, su or sudo ran them as the user, which
+		 * systemd's mount units met first. Its devices are opened by the
+		 * user's own rights, groups included, which a user namespace
+		 * keeps; passt is outside it, by the descriptor below.
+		 *
+		 * The maps come before the fd work, so the namespace is there for
+		 * the parent to map into while the child waits. Where a stored
+		 * tree's owners are to be given back, the parent maps the user's
+		 * subordinate range beside root from outside, by newuidmap, so a
+		 * file given to another id is that id in the guest and not
+		 * nobody; `M` then, the range already mapped, drops only the
+		 * user's own groups, unmapped here; `S`, no owners, map the one
+		 * uid here, as a process may itself. */
+		if (unshare(CLONE_NEWUSER | (m->host_overlay || m->staged ? CLONE_NEWNS : 0)) != 0) {
+			fprintf(stderr, "qemu-system-x86_64: a user namespace: %s\n", strerror(errno));
+			_exit(126);
+		}
+		{
+			char said = 0;
+
+			close(ready[0]);
+			close(decide[1]);
+			if (write(ready[1], "r", 1u) != 1 || read(decide[0], &said, 1u) != 1) {
+				fprintf(stderr, "qemu-system-x86_64: the uid map: %s\n", strerror(errno));
+				_exit(126);
+			}
+			close(ready[1]);
+			close(decide[0]);
+			if (said == 'M') {
+				if (setgroups(0u, NULL) != 0) {
+					fprintf(stderr, "qemu-system-x86_64: setgroups: %s\n", strerror(errno));
+					_exit(126);
+				}
+			} else if (!write_map("/proc/self/setgroups", "deny", 0u) ||
+			           !write_map("/proc/self/uid_map", "0 %u 1", (unsigned)uid) ||
+			           !write_map("/proc/self/gid_map", "0 %u 1", (unsigned)gid)) {
+				fprintf(stderr, "qemu-system-x86_64: a user namespace: %s\n", strerror(errno));
+				_exit(126);
+			}
+		}
 		/* passt's socket at NETWORK_FD, each segment's port after it, and
-		 * nothing of the core's: its sockets, its lock. Each is moved
-		 * above them all first, so that none is closed by another's dup2;
-		 * a dup carries no CLOEXEC. */
+		 * nothing of the core's: its sockets, its lock, the map pipes. Each
+		 * is moved above them all first, so that none is closed by
+		 * another's dup2; a dup carries no CLOEXEC. */
 		{
 			int moved_network = -1;
 			int moved[MAX_SEGMENTS];
@@ -1165,21 +1242,6 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 					_exit(126);
 			syscall(SYS_close_range, SEGMENT_FD + m->segment_count, ~0u, 0u);
 		}
-		/* qemu in a user namespace where the user is root, as a chroot
-		 * machine is: its 9p server then shows the guest the user's files
-		 * as root's. Outside one it showed them as the user's own uid, so
-		 * a setuid-root program was setuid to the user in the guest, and
-		 * root running mount, su or sudo ran them as the user, which
-		 * systemd's mount units met first. Its devices are opened by the
-		 * user's own rights, groups included, which a user namespace
-		 * keeps; passt is outside it, by the descriptor above. */
-		if (unshare(CLONE_NEWUSER | (m->host_overlay || m->staged ? CLONE_NEWNS : 0)) != 0 ||
-		    !write_map("/proc/self/setgroups", "deny", 0u) ||
-		    !write_map("/proc/self/uid_map", "0 %u 1", (unsigned)uid) ||
-		    !write_map("/proc/self/gid_map", "0 %u 1", (unsigned)gid)) {
-			fprintf(stderr, "qemu-system-x86_64: a user namespace: %s\n", strerror(errno));
-			_exit(126);
-		}
 		if ((m->host_overlay || m->staged) &&
 		    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
 			fprintf(stderr, "qemu-system-x86_64: making mounts private: %s\n", strerror(errno));
@@ -1192,6 +1254,22 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 				fprintf(stderr, "qemu-system-x86_64: the overlay: %s: %s\n", failed,
 				        strerror(errno));
 				_exit(126);
+			}
+			/* stage_overlay left the cwd the machine's directory, with
+			 * the overlay at merged/: a stored tree's owners are given
+			 * back there before qemu starts, which copies each file so
+			 * given up into the overlay's tmpfs, as on chroot. The 9p
+			 * share then shows the guest each as its owner, where the
+			 * range above holds the id, and nobody where it does not. */
+			if (m->owners != NULL) {
+				int list = open(m->owners, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+
+				if (list < 0) {
+					fprintf(stderr, "qemu-system-x86_64: the owners' file: %s\n",
+					        strerror(errno));
+					_exit(126);
+				}
+				hull_give_owners(list, "merged/", 2);
 			}
 		}
 		/* Each volume that is a stack, staged as the root's overlay is,
@@ -1217,6 +1295,28 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 		fprintf(stderr, "qemu-system-x86_64: %s\n", strerror(errno));
 		_exit(127);
 	}
+	/* The child unshared its user namespace and waits: map the user's
+	 * subordinate range into it from outside, where a stored tree's owners
+	 * are to be given back and the host grants the user a range, so a chown
+	 * inside to one of those ids works; else let the child map its one uid.
+	 * A fork that failed, or a child gone before it said anything, leaves
+	 * nothing to map and the launch fails below. */
+	close(ready[1]);
+	close(decide[0]);
+	if (pid > 0) {
+		char hello = 0;
+
+		if (read(ready[0], &hello, 1u) == 1) {
+			char said = m->owners != NULL && hull_map_many(pid, uid, gid) ? 'M' : 'S';
+
+			m->many = said == 'M';
+			if (write(decide[1], &said, 1u) != 1) {
+				/* the child reads its end closed, and exits */
+			}
+		}
+	}
+	close(ready[0]);
+	close(decide[1]);
 	return pid;
 }
 
@@ -2844,8 +2944,8 @@ static const hull_cap_entry entries[] = {
 	  "read-only, in an overlay qemu mounts host-side, the guest's share its merged tree", NULL },
 	{ "upper",              HULL_SUP_NATIVE,
 	  "the overlay's writes kept in the directory, mounted host-side, one uid", NULL },
-	{ "owners",             HULL_SUP_REJECTED,
-	  "not yet: a guest's chown is not kept through 9p", NULL },
+	{ "owners",             HULL_SUP_NATIVE,
+	  "given in the overlay qemu shares, where the user's subordinate range is mapped", NULL },
 	{ "init",               HULL_SUP_NATIVE,
 	  "the image's init is PID 1, the agent a child of it, and its poweroff ends the machine",
 	  NULL },
