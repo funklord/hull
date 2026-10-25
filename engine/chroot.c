@@ -68,6 +68,7 @@
 #include "builtin.h"
 #include "usage.h"
 #include "stack.h"
+#include "idmap.h"
 
 #define MAX_ARGS    256u
 #define MAX_ENV     256u
@@ -765,58 +766,8 @@ static void relay_hold(int which, const uint8_t *bytes, size_t n)
 /* (export PATH)'s file, opened before the pivot, so the user's, or -1. */
 static int export_fd = -1;
 
-/*
- * (owners PATH)'s list, read whole from `fd`: each entry `UID`, `GID` and
- * a path of the tree, each ended by a NUL, since a path may hold a
- * newline. Each is given its owner in the merged root, not following a
- * link. Those that cannot be, as where one uid is mapped, are counted
- * and said once on `err`, the workload's stderr, since a build that took
- * them silently would lose owners it seemed to keep.
- */
-static void give_owners(int fd, int err)
-{
-	static char data[8u << 20];
-	size_t      length = 0u;
-	ssize_t     n;
-	unsigned    refused = 0u;
-	unsigned    given = 0u;
-
-	while (length < sizeof data && (n = read(fd, data + length, sizeof data - length)) > 0)
-		length += (size_t)n;
-	close(fd);
-	for (size_t at = 0u; at < length; ) {
-		const char *fields[3];
-		unsigned    k = 0u;
-		char        path[4200];
-
-		for (; k < 3u && at < length; k++) {
-			fields[k] = data + at;
-			while (at < length && data[at] != '\0')
-				at++;
-			if (at == length)
-				break;
-			at++;
-		}
-		if (k < 3u)
-			break;
-		snprintf(path, sizeof path, "/%s", fields[2]);
-		if (fchownat(AT_FDCWD, path, (uid_t)strtoul(fields[0], NULL, 10),
-		             (gid_t)strtoul(fields[1], NULL, 10), AT_SYMLINK_NOFOLLOW) == 0)
-			given++;
-		else
-			refused++;
-	}
-	if (refused != 0u) {
-		char said[200];
-		int  m = snprintf(said, sizeof said, "hull: owners: %u of %u not given: %s\n", refused,
-		                  refused + given, "the machine maps one uid, or a path is not there");
-
-		if (m > 0 && write(err, said, (size_t)m) < 0) {
-			/* the workload's stderr is gone; nothing to tell */
-		}
-	}
-}
-
+/* (owners PATH)'s list, opened before the pivot too: given back in the
+ * merged root, under "/" once the root is the namespace's. */
 static int owners_fd = -1;
 
 static int export_sink(void *context, const uint8_t *data, size_t n)
@@ -943,99 +894,6 @@ static void relay(int conn, int listener, int out, int err, pid_t workload)
 		if (conn < 0 && listener < 0 && out < 0 && err < 0 && !ended)
 			continue;  /* the core went and nothing is kept: the death signal comes */
 	}
-}
-
-/*
- * The user's subordinate range in `file`, /etc/subuid or /etc/subgid: the
- * line naming the user, by name or by id, as `name:start:count`. 1 and
- * the range, or 0 where there is none.
- */
-static int subordinate(const char *file, const char *name, unsigned long id, unsigned long *start,
-                       unsigned long *count)
-{
-	FILE *f = fopen(file, "re");
-	char  line[512];
-	char  number[32];
-	int   found = 0;
-
-	if (f == NULL)
-		return 0;
-	snprintf(number, sizeof number, "%lu", id);
-	while (!found && fgets(line, sizeof line, f) != NULL) {
-		char *first = strtok(line, ":\n");
-		char *from  = strtok(NULL, ":\n");
-		char *many  = strtok(NULL, ":\n");
-
-		if (first != NULL && from != NULL && many != NULL &&
-		    (strcmp(first, name) == 0 || strcmp(first, number) == 0)) {
-			*start = strtoul(from, NULL, 10);
-			*count = strtoul(many, NULL, 10);
-			found  = *count > 0u;
-		}
-	}
-	fclose(f);
-	return found;
-}
-
-/* `helper` (newuidmap or newgidmap) run on `pid`: 0 the user's own id, 1
- * on the range. Whether it mapped them. */
-static int run_mapper(const char *helper, pid_t pid, unsigned long id, unsigned long start,
-                      unsigned long count)
-{
-	char  text[5][32];
-	char *argv[9];
-	pid_t child;
-	int   status = 0;
-
-	snprintf(text[0], sizeof text[0], "%ld", (long)pid);
-	snprintf(text[1], sizeof text[1], "%lu", id);
-	snprintf(text[2], sizeof text[2], "%lu", start);
-	snprintf(text[3], sizeof text[3], "%lu", count);
-	argv[0] = (char *)helper;
-	argv[1] = text[0];
-	argv[2] = "0";
-	argv[3] = text[1];
-	argv[4] = "1";
-	argv[5] = "1";
-	argv[6] = text[2];
-	argv[7] = text[3];
-	argv[8] = NULL;
-	child = fork();
-	if (child == 0) {
-		int null = open("/dev/null", O_RDWR | O_CLOEXEC);
-
-		if (null >= 0) {
-			dup2(null, 0);
-			dup2(null, 1);
-			dup2(null, 2);
-		}
-		execv(helper, argv);
-		_exit(127);
-	}
-	return child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) &&
-	       WEXITSTATUS(status) == 0;
-}
-
-/*
- * Many uids for the machine `pid`, from outside it: where the user has a
- * subordinate range of each and the helpers that map one, 0 is the user
- * and 1 on the range, so a chown inside to an id the range holds works,
- * as a postinst's to its package's own user must. Whether it did.
- */
-static int map_many(pid_t pid, uid_t uid, gid_t gid)
-{
-	struct passwd *me = getpwuid(uid);
-	unsigned long  uid_start;
-	unsigned long  uid_count;
-	unsigned long  gid_start;
-	unsigned long  gid_count;
-
-	if (me == NULL ||
-	    !subordinate("/etc/subuid", me->pw_name, (unsigned long)uid, &uid_start, &uid_count) ||
-	    !subordinate("/etc/subgid", me->pw_name, (unsigned long)uid, &gid_start, &gid_count))
-		return 0;
-	return run_mapper("/usr/bin/newuidmap", pid, (unsigned long)uid, uid_start, uid_count) &&
-	       run_mapper("/usr/bin/newgidmap", pid, (unsigned long)gid, gid_start, gid_count);
 }
 
 /*
@@ -1360,7 +1218,7 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 			child_fail(report, "the machine's root");
 	}
 	if (owners_fd >= 0) {
-		give_owners(owners_fd, err[1]);
+		hull_give_owners(owners_fd, "/", err[1]);
 		owners_fd = -1;
 	}
 	for (unsigned i = 0u; i < m->volume_count; i++) {
@@ -1728,7 +1586,7 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 		for (unsigned i = 0u; i < m->volume_count; i++)
 			kept = kept || m->volume_stack[i].upper != NULL;
 		wanted = m->overlay && !m->readonly_root && !kept;
-		m->many = wanted && map_many(m->pid, uid, gid);
+		m->many = wanted && hull_map_many(m->pid, uid, gid);
 	}
 	if (write(mapped[1], m->many ? "M" : wanted ? "O" : "S", 1u) != 1) {
 		/* The child reads its end closed and says so on the report. */

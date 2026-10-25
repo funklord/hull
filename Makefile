@@ -97,7 +97,7 @@ PLAN_OBJS = $(BUILD_DIR)/plan/matrix.o $(BUILD_DIR)/plan/registry.o \
 ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/chroot.o $(BUILD_DIR)/engine/access.o \
               $(BUILD_DIR)/engine/usage.o $(BUILD_DIR)/engine/sha256.o \
-              $(BUILD_DIR)/engine/stack.o \
+              $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/idmap.o \
               $(BUILD_DIR)/engine/tree.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o $(BUILD_DIR)/cli/runtime.o $(BUILD_DIR)/cli/doctor.o
 # Section 3's optional store, which only the commands that name it use.
