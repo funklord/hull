@@ -116,6 +116,7 @@ struct hull_machine {
 	int              host_overlay; /* layers or an upper: the overlay is qemu's, the share it */
 	char            *owners;       /* (owners PATH): a stored tree's owners, given back */
 	int              many;         /* the user's subordinate range mapped, not one uid */
+	char            *kernel_path;  /* (kernel "path:FILE"): bring your own, else the host's */
 	char            *volume_host[MAX_VOLUMES];
 	int              volume_readonly[MAX_VOLUMES];
 	hull_stack       volume_stack[MAX_VOLUMES];  /* a volume of (layers ...), or count 0 */
@@ -295,6 +296,7 @@ static void release(hull_machine *m)
 	free(m->upper);
 	free(m->upper_work);
 	free(m->owners);
+	free(m->kernel_path);
 	free(m->spec);
 	forget_secrets(m);
 	if (m->pidfd >= 0)
@@ -418,6 +420,24 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		 * upper: a share in place, or the guest's own overlay over a
 		 * read-only share, has no host tree to chown. */
 		m->host_overlay = 1;
+	}
+
+	/* (tuning (vm (kernel "path:FILE"))): a bring-your-own kernel, in place
+	 * of the host's. vm's tuning applies under emu too (section 4), so the
+	 * (vm ...) section carries it for both classes. bundled and image are
+	 * atoms, not strings, and name no path: bundled is the host's (below)
+	 * and image is a refused vector the matrix catches. */
+	if (hull_access_find(doc, &machine, "tuning", &entry) &&
+	    hull_access_find(doc, &entry, "vm", &item) &&
+	    (text = hull_access_value(doc, &item, "kernel")) != NULL) {
+		if (strncmp(text, "path:", 5u) == 0 && text[5] != '\0') {
+			m->kernel_path = hull_access_path(doc, text + 5);
+			free(text);
+			if (m->kernel_path == NULL)
+				return "the kernel's path cannot be read";
+		} else {
+			free(text);
+		}
 	}
 
 	m->memory_mib = 512u;
@@ -719,7 +739,40 @@ static int agent_path(char *out, size_t cap)
 	return snprintf(out, cap, "%s/hull-agent", self) < (int)cap;
 }
 
-static const char *write_initramfs(const char *dir, const char *release)
+/* The release a bzImage carries, for finding its modules on the host. The
+ * boot protocol keeps a pointer to the version string at offset 0x20E, into
+ * the setup area at that pointer plus 0x200, a NUL-terminated
+ * "<release> (builder) #n ..." whose first token is the release. Returns 0
+ * where the file carries none, in which case the kernel is taken to have its
+ * guest drivers built in (Appendix F) and no modules are loaded. */
+static int kernel_release(const char *image, char *out, size_t cap)
+{
+	uint8_t  head[0x210];
+	FILE    *file = fopen(image, "rb");
+	unsigned ptr;
+	char     line[256];
+	size_t   i;
+
+	if (file == NULL)
+		return 0;
+	if (fread(head, 1u, sizeof head, file) != sizeof head) {
+		fclose(file);
+		return 0;
+	}
+	ptr = (unsigned)head[0x20E] | ((unsigned)head[0x20F] << 8);
+	if (ptr == 0u || fseek(file, (long)ptr + 0x200, SEEK_SET) != 0 ||
+	    fgets(line, sizeof line, file) == NULL) {
+		fclose(file);
+		return 0;
+	}
+	fclose(file);
+	for (i = 0u; line[i] != '\0' && line[i] != ' ' && line[i] != '\n' && i + 1u < cap; i++)
+		out[i] = line[i];
+	out[i] = '\0';
+	return i > 0u;
+}
+
+static const char *write_initramfs(const char *dir, const char *release, int load_modules)
 {
 	char        path[4200];
 	char        agent[PATH_MAX];
@@ -732,7 +785,9 @@ static const char *write_initramfs(const char *dir, const char *release)
 
 	if (!agent_path(agent, sizeof agent) || (data = slurp(agent, &length)) == NULL)
 		return "the guest agent, hull-agent beside hull, cannot be read";
-	if ((reason = find_modules(release, &list)) != NULL) {
+	/* A path kernel whose modules the host does not have is taken to have
+	 * its guest drivers built in (Appendix F): no module list, no share. */
+	if (load_modules && (reason = find_modules(release, &list)) != NULL) {
 		free(data);
 		return reason;
 	}
@@ -1029,13 +1084,13 @@ static int write_map(const char *path, const char *format, unsigned id)
 
 /* Fork qemu for `m`, with `cid` for its vsock device. Its stdout and
  * stderr go to qemu.log. */
-static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
+static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int load_modules,
+                   uint32_t cid)
 {
 	uid_t       uid = getuid();   /* read here: unmapped once unshared */
 	gid_t       gid = getgid();
 	int         ready[2];         /* the child says its namespace is there */
 	int         decide[2];        /* the parent says how its ids were mapped */
-	char        kernel[300];
 	char        initrd[4200];
 	char        console[8600];
 	char        log[4200];
@@ -1055,7 +1110,6 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 	unsigned    n = 0u;
 	pid_t       pid;
 
-	snprintf(kernel, sizeof kernel, "/boot/vmlinuz-%s", release);
 	snprintf(initrd, sizeof initrd, "%s/initrd", m->dir);
 	snprintf(log, sizeof log, "%s/qemu.log", m->dir);
 	escaped(path, sizeof path, m->dir);
@@ -1123,18 +1177,21 @@ static pid_t spawn(hull_machine *m, const char *release, uint32_t cid)
 		argv[n++] = "-device";
 		argv[n++] = device[i];
 	}
-	/* The guest runs the host's kernel, so its modules are the host's:
-	 * shared read-only, for the agent to mount where modprobe in the
-	 * machine looks, as a test of network software loads mac80211_hwsim
-	 * or pppoe. */
-	snprintf(path, sizeof path, "/lib/modules/%s", release);
-	escaped(modules_at, sizeof modules_at, path);
-	snprintf(modules, sizeof modules, "local,id=modules,path=%s,security_model=none,readonly=on",
-	         modules_at);
-	argv[n++] = "-fsdev";
-	argv[n++] = modules;
-	argv[n++] = "-device";
-	argv[n++] = "virtio-9p-pci,fsdev=modules,mount_tag=modules";
+	/* The guest runs this release's kernel, so its modules are that
+	 * release's on the host: shared read-only, for the agent to mount where
+	 * modprobe in the machine looks, as a test of network software loads
+	 * mac80211_hwsim or pppoe. A path kernel the host has no modules for is
+	 * taken to have its drivers built in, and gets no share. */
+	if (load_modules) {
+		snprintf(path, sizeof path, "/lib/modules/%s", release);
+		escaped(modules_at, sizeof modules_at, path);
+		snprintf(modules, sizeof modules,
+		         "local,id=modules,path=%s,security_model=none,readonly=on", modules_at);
+		argv[n++] = "-fsdev";
+		argv[n++] = modules;
+		argv[n++] = "-device";
+		argv[n++] = "virtio-9p-pci,fsdev=modules,mount_tag=modules";
+	}
 	argv[n++] = "-device";
 	argv[n++] = vsock;
 	if (!m->no_network) {
@@ -1852,6 +1909,11 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 {
 	struct utsname name;
 	const char    *reason;
+	const char    *kernel;         /* the -kernel file */
+	const char    *release;        /* its release, for its modules on the host */
+	char           kbuf[512];      /* the host kernel's path, for bundled */
+	char           rbuf[256];      /* a path kernel's release */
+	int            load_modules;   /* the host has this release's modules */
 	int            fd = -1;
 	hull_msg       msg = { 0 };
 
@@ -1863,7 +1925,35 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		return fail(error, HULL_ERR_RUNTIME, "/dev/kvm is not open to this user");
 	if (access("/dev/vhost-vsock", R_OK | W_OK) != 0)
 		return fail(error, HULL_ERR_RUNTIME, "/dev/vhost-vsock is not open to this user");
-	if ((reason = make_dir(m)) != NULL || (reason = write_initramfs(m->dir, name.release)) != NULL ||
+
+	/* The kernel, and the release whose modules it wants. bundled is the
+	 * host's own, always modular here; a path kernel is the user's, booted
+	 * as given, and its modules are the host's for its release where it has
+	 * them (a distribution kernel), or none where it does not (a kernel
+	 * with its drivers built in, Appendix F). */
+	if (m->kernel_path != NULL) {
+		if (access(m->kernel_path, R_OK) != 0)
+			return fail(error, HULL_ERR_RUNTIME, "the kernel at (kernel \"path:...\") cannot be read");
+		kernel = m->kernel_path;
+		if (kernel_release(kernel, rbuf, sizeof rbuf)) {
+			char dep[600];
+
+			release = rbuf;
+			snprintf(dep, sizeof dep, "/lib/modules/%s/modules.dep", release);
+			load_modules = access(dep, R_OK) == 0;
+		} else {
+			release = "";
+			load_modules = 0;
+		}
+	} else {
+		snprintf(kbuf, sizeof kbuf, "/boot/vmlinuz-%s", name.release);
+		kernel = kbuf;
+		release = name.release;
+		load_modules = 1;
+	}
+
+	if ((reason = make_dir(m)) != NULL ||
+	    (reason = write_initramfs(m->dir, release, load_modules)) != NULL ||
 	    (reason = open_listeners(m)) != NULL) {
 		if (reason != m->detail)
 			snprintf(m->detail, sizeof m->detail, "%s", reason);
@@ -1891,7 +1981,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 			m->network = -1;
 			break;
 		}
-		m->qemu = spawn(m, name.release, cid);
+		m->qemu = spawn(m, kernel, release, load_modules, cid);
 		close(m->network);
 		m->network = -1;
 		close_segments(m);
@@ -2983,6 +3073,9 @@ static const hull_cap_entry entries[] = {
 	  "a q35 machine on the host's kernel, which boots in about two seconds", NULL },
 	{ "vm.kernel.bundled",   HULL_SUP_EMULATED,
 	  "the host's own kernel and modules, until Appendix F ships one", NULL },
+	{ "vm.kernel.path",      HULL_SUP_NATIVE,
+	  "the kernel at the given path, booted as given; its modules are the host's for its "
+	  "release where it has them, else it must have its guest drivers built in", NULL },
 	{ "vm.cpu_profile.host", HULL_SUP_NATIVE,  NULL, NULL },
 	{ "qemu.accel.auto",     HULL_SUP_NATIVE,  NULL, NULL },
 	{ "emu.cores_scale",     HULL_SUP_NATIVE,  NULL, NULL },

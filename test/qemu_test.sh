@@ -277,6 +277,51 @@ has 0 '^booted$'
 cases=$((cases + 1))
 [ ! -e "$root/rootfs/lib" ] || fail "a modules place was made in a directory used in place" \
 	"$(ls -la "$root/rootfs" 2>&1)"
+# (kernel "path:FILE"): a bring-your-own kernel, booted as given from any
+# path, not /boot. Proven with the host's own kernel copied elsewhere: the
+# engine reads the release from the image's boot header and shares that
+# release's modules, so a load succeeds and the booted osrelease is the
+# copy's. A native vector, so unlike bundled it prints no emulated line.
+# netcfgd's own kernels, built CONFIG_MODULES=n with drivers built in, are
+# the no-modules half (section 7), which the host cannot boot and it runs.
+cp "/boot/vmlinuz-$release" "$root/mykernel"
+if [ -n "$hwsim" ]; then
+	# The release for a grep -E pattern: . and + are its metacharacters.
+	release_re=$(printf '%s' "$release" | sed 's/[][\\.^$*+?(){}|]/\\&/g')
+	printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) %s %s)\n' \
+		"(tuning (vm (kernel \"path:$root/mykernel\")))" \
+		"(command \"/probe\" $loads \"list\" \"/sys/class/ieee80211\" \"read\" \"/proc/sys/kernel/osrelease\")" \
+		> "$root/vkernel.conf"
+	name=vkernel
+	boot vkernel
+	has 0 '^load=ok$'
+	has 0 '^list= phy0 phy1$'
+	has 0 "^read=$release_re\$"
+	refute_out 'vm\.kernel\.bundled: emulated'
+fi
+# A kernel path that is not there is refused to the host, before any boot.
+printf '(machine (source "dir:./rootfs") (backend vm) %s %s)\n' \
+	"(tuning (vm (kernel \"path:$root/nokernel\")))" \
+	'(command "/probe" "say" "no")' > "$root/vkernelno.conf"
+name=vkernelno
+boot vkernelno
+has 125 'the kernel at .kernel .*cannot be read'
+# A readable file that is not a kernel is given to qemu as it stands, which
+# refuses it: it reaches qemu rather than falling back to the host's, where a
+# bundled boot would have run the command and said "booted". It carries no
+# release, so write_initramfs makes a module-free initramfs for it (the
+# no-modules branch) before qemu rejects the image.
+head -c 4096 /dev/urandom > "$root/badkernel"
+printf '(machine (source "dir:./rootfs") (backend vm) %s %s)\n' \
+	"(tuning (vm (kernel \"path:$root/badkernel\")))" \
+	'(command "/probe" "say" "booted")' > "$root/vkernelbad.conf"
+name=vkernelbad
+boot vkernelbad
+cases=$((cases + 1))
+[ "$got" != 0 ] || fail "vkernelbad booted a non-kernel (a bundled fallback?)" "$out"
+cases=$((cases + 1))
+! printf '%s\n' "$out" | grep -q '^booted$' ||
+	fail "vkernelbad ran the command, so qemu did not get the given file" "$out"
 # Appendix D's segments: a NIC each, after passt's, on the core's switch,
 # with no address given, as a test of network software sets its own.
 # Two vms on one hear each other in raw frames, the shouter's own MAC
