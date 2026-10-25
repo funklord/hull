@@ -409,10 +409,15 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		free(text);
 		if (m->owners == NULL)
 			return "the owners' path cannot be read";
-		if (!m->host_overlay || m->upper != NULL)
-			return "owners are given in the overlay's tmpfs: (owners ...) needs (layers ...) "
-			       "with (mutable overlay) and no kept (upper ...), where an owner would be "
-			       "one on the user's disk";
+		if (!m->overlay || m->readonly_root || m->upper != NULL)
+			return "owners are given in the overlay's tmpfs: (owners ...) needs (mutable "
+			       "overlay), a root that is not read-only, and no kept (upper ...), where an "
+			       "owner would be one on the user's disk";
+		/* Chowned in the overlay qemu mounts host-side, so the overlay is
+		 * host-side whenever owners are given, as it is with layers or an
+		 * upper: a share in place, or the guest's own overlay over a
+		 * read-only share, has no host tree to chown. */
+		m->host_overlay = 1;
 	}
 
 	m->memory_mib = 512u;

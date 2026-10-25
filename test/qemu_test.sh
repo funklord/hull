@@ -469,14 +469,16 @@ printf '%s\n' "$out" | grep -q '^read=No such file' && printf '%s\n' "$out" | gr
 # (owners PATH) on a vm: a stored tree's owners given back in the overlay
 # qemu mounts host-side, before the guest boots, where the user's
 # subordinate range is mapped into qemu's namespace from outside by
-# newuidmap. A file the checkout holds as the user's is the manifest's
-# owner, 101:102, in the guest, and still the user's on the host's disk:
-# the chown copies it up into the overlay's tmpfs, so no disk keeps the
-# given owner. Where the host gives the user no range it stays root's, as
-# on chroot, the refusal said on qemu's log. bbq-predictor found a
-# package's uid 997 root's in a guest before this.
-rm -rf "${root:?}/vowntmpl" "${root:?}/vownlayer"
-mkdir -p "$root/vowntmpl/proc" "$root/vowntmpl/dev" "$root/vowntmpl/sys" "$root/vownlayer"
+# newuidmap. Owners ask for that host-side overlay themselves, as layers
+# and an upper do, so (mutable overlay) alone is enough -- no layers. A
+# file the checkout holds as the user's is the manifest's owner, 101:102,
+# in the guest, and still the user's on the host's disk: the chown copies
+# it up into the overlay's tmpfs, so no disk keeps the given owner. Where
+# the host gives the user no range it stays root's, as on chroot, the
+# refusal said on qemu's log. bbq-predictor found a package's uid 997
+# root's in a guest before this.
+rm -rf "${root:?}/vowntmpl"
+mkdir -p "$root/vowntmpl/proc" "$root/vowntmpl/dev" "$root/vowntmpl/sys"
 cp "$probe" "$root/vowntmpl/probe"
 printf 'given\n' > "$root/vowntmpl/given"
 chgrp "$(id -g)" "$root/vowntmpl/given"
@@ -488,22 +490,22 @@ if grep -q "^$me:" /etc/subuid 2>/dev/null && grep -q "^$me:" /etc/subgid 2>/dev
 else
 	vowned_owner='^owner=0:0 0[0-7]{3}$'
 fi
-printf '(machine (source "dir:%s/vowntmpl") (backend vm) (mutable overlay) %s %s %s)\n' "$root" \
-	"(layers \"dir:$root/vownlayer\")" "(owners \"$root/vowners.list\")" \
-	'(command "/probe" "owner" "/given")' > "$root/vowned.conf"
+printf '(machine (source "dir:%s/vowntmpl") (backend vm) (mutable overlay) %s %s)\n' "$root" \
+	"(owners \"$root/vowners.list\")" '(command "/probe" "owner" "/given")' > "$root/vowned.conf"
 name=vowned
 boot vowned
 has 0 "$vowned_owner"
 cases=$((cases + 1))
 [ "$(stat -c %u "$root/vowntmpl/given")" = "$(id -u)" ] ||
 	fail "an owner given in a vm reached the user's disk" "$(ls -ln "$root/vowntmpl/given")"
-# Refused above a guest-side overlay, which has no host tree to chown.
-printf '(machine (source "dir:%s/vowntmpl") (backend vm) (mutable overlay) %s %s)\n' "$root" \
-	"(owners \"$root/vowners.list\")" '(command "/probe" "say" "no")' > "$root/vownedno.conf"
+# Refused in place, where an owner would be one on the user's own disk and
+# there is no overlay tmpfs to hold it.
+printf '(machine (source "dir:%s/vowntmpl") (backend vm) %s)\n' "$root" \
+	"(owners \"$root/vowners.list\") (command \"/probe\" \"say\" \"no\")" > "$root/vownedno.conf"
 name=vownedno
 boot vownedno
 has 125 "owners are given in the overlay.s tmpfs"
-rm -rf "${root:?}/vowntmpl" "${root:?}/vownlayer"
+rm -rf "${root:?}/vowntmpl"
 # A volume that is a stack of its own, at /stk, staged host-side as the
 # root's is and shared: the layer wins, writes and a whiteout in its upper
 # alone; with no upper its writes are memory; read-only, it is written to

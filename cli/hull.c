@@ -605,6 +605,50 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 		add_text(&source, "\")");
 		if (!has_mutable)
 			add_text(&source, " (mutable overlay)");
+		/* A stored image's non-root owners, which the checkout flattened to
+		 * the user's, given back when the machine starts: its manifest
+		 * holds them, hull_store_owners lists each as uid, gid and path, and
+		 * the engine chowns them in the overlay -- chroot's namespace one,
+		 * qemu's host-side. Docker keeps an image's own owners and declares
+		 * the key rejected, so it is given none; and a plan, which makes no
+		 * checkout, names none. The list is a sibling of the checkout,
+		 * written only on a real run and only where the manifest gives an
+		 * explicit owner. */
+		if (create) {
+			char            backend[64] = "";
+			hull_sexpr_form be_entry;
+			hull_sexpr_form be_head;
+			hull_sexpr_form be_value;
+
+			if (hull_spec_find(&spec, &machines[i], "backend", &be_entry) &&
+			    hull_sexpr_child(&spec.doc, &be_entry, &be_head) &&
+			    hull_sexpr_next(&spec.doc, &be_head, &be_value) &&
+			    be_value.content_length < sizeof backend) {
+				memcpy(backend, spec.doc.data + be_value.content, be_value.content_length);
+				backend[be_value.content_length] = '\0';
+			}
+			if (strcmp(backend, "docker") != 0) {
+				char owners_file[4500];
+				int  list;
+
+				snprintf(owners_file, sizeof owners_file, "%s.owners", path);
+				list = open(owners_file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+				if (list >= 0) {
+					uint64_t owned = 0u;
+					int      ok    = hull_store_owners(&store, name, list, &owned, why,
+					                                   sizeof why) == 0;
+
+					close(list);
+					if (ok && owned > 0u) {
+						add_text(&source, " (owners \"");
+						add_text(&source, owners_file);
+						add_text(&source, "\")");
+					} else {
+						unlink(owners_file);
+					}
+				}
+			}
+		}
 		if (add_rewrite(rewrites, &count, value.offset, entry.offset + entry.extent - value.offset,
 		                &source) != 0) {
 			fprintf(stderr, "%s: too many machines on stored trees\n", file);

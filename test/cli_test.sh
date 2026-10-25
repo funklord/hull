@@ -1581,6 +1581,35 @@ cases=$((cases + 1))
 rm -f "$root/rootfs/given"
 conf ownedin_back "(owners \"$root/owners.list\")" '(command "/probe" "say" "no")'
 from_root 125 'owners are given above an overlay' -f "$root/ownedin_back.conf"
+# The same, end to end from a stored image: `hull run` of a bare ref the
+# store holds writes the owners list from the manifest itself, not a
+# hand-written (owners ...), so an image runs with the owners its manifest
+# keeps rather than every file the user's. A tar with a file of 101:102 is
+# committed, so the manifest holds it; the run checks the tree out, all the
+# user's, and gives the owner back above the overlay. bbq-predictor's case,
+# which the engine half alone did not reach.
+timeout 30 python3 - "$root/rootfs/probe" "$root/ownedrun.tar" <<'PYEOF'
+import io, sys, tarfile
+probe, out = sys.argv[1], sys.argv[2]
+t = tarfile.open(out, "w", format=tarfile.PAX_FORMAT)
+def add(name, kind, uid, gid, mode, data=b""):
+	i = tarfile.TarInfo(name)
+	i.type, i.uid, i.gid, i.mode, i.size = kind, uid, gid, mode, len(data)
+	t.addfile(i, io.BytesIO(data) if data else None)
+for d in ("proc", "dev", "sys"):
+	add(d, tarfile.DIRTYPE, 0, 0, 0o755)
+with open(probe, "rb") as f:
+	add("probe", tarfile.REGTYPE, 0, 0, 0o755, f.read())
+add("given", tarfile.REGTYPE, 101, 102, 0o644, b"given\n")
+t.close()
+PYEOF
+expect 0 '^ownedrun/1 sha256:' "$hull" commit --tar "$root/ownedrun.tar" ownedrun/1
+printf '(machine (source "ownedrun/1") (backend chroot) (command "/probe" "owner" "/given"))\n' \
+	> "$root/ownedrun.conf"
+case $owned_chown in
+*ok*) from_root 0 '^owner=101:102 0[0-7]{3}$' -f "$root/ownedrun.conf" ;;
+*) from_root 0 '^owner=0:0 0[0-7]{3}$' -f "$root/ownedrun.conf" ;;
+esac
 # (layers ...) and (upper PATH): a template read-only beneath, a layer
 # above it, and the writes kept in a directory of the user's that has
 # files of its own, as unionfs did. The top layer wins; what is written
