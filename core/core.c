@@ -57,6 +57,19 @@
 #include "segment.h"
 #include "wire.h"
 
+/* The commit this core was built from, so a frontend of another build can
+ * see the skew: the core runs the engine, and a core left from an older
+ * build serves its old engine to a newer frontend (as cli/hull.c's commit
+ * does for --version). fmake's build writes no commit.h and says so. */
+#if defined(__has_include)
+#if __has_include("commit.h")
+#include "commit.h"
+#endif
+#endif
+#ifndef HULL_COMMIT
+#define HULL_COMMIT "unknown"
+#endif
+
 #define MAX_CLIENTS      32u
 #define MAX_MACHINES     64u
 #define MAX_ATTACHED     16u
@@ -2633,7 +2646,7 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		hull_msg m = { 0 };
 
 		hull_msg_raw(&m, "(5:hello(2:ch1:0)(12:core_version");
-		hull_msg_text(&m, HULL_VERSION);
+		hull_msg_text(&m, HULL_COMMIT);
 		hull_msg_raw(&m, ")(5:proto1:1))");
 		send_to(c, &m);
 	} else if (ch == 0) {

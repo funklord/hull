@@ -305,6 +305,9 @@ $(GEN_DIR)/commit.h: FORCE
 FORCE:
 
 $(BUILD_DIR)/cli/hull.o: $(GEN_DIR)/commit.h
+# The core reports this commit in its hello, so a newer frontend sees a
+# core left from an older build; it must rebuild when the commit changes.
+$(BUILD_DIR)/core/core.o: $(GEN_DIR)/commit.h
 
 # The version is a prerequisite, so a new number rebuilds what prints it.
 $(BUILD_DIR)/cli/%.o: cli/%.c VERSION | $(GEN_HEADERS) $(AGENT_GEN) $(FRONTEND_GEN)

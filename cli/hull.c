@@ -956,6 +956,30 @@ static int connect_core(hull_wire *wire, int start)
 		return -1;
 	}
 	hull_msg_free(&hello);
+	/* A core left running from an older build serves its old engine, where
+	 * this frontend plans against the new one, so a feature this build adds
+	 * is planned and then silently does nothing -- which cost a day's
+	 * misdiagnosis once. The core reports the commit it was built from; warn
+	 * when it is not this build's. Both unknown (no git at build) cannot be
+	 * told apart, so say nothing then. */
+	{
+		hull_sexpr_form top;
+		char           *core_commit;
+
+		if (hull_sexpr_first(&body, &top) &&
+		    (core_commit = hull_access_value(&body, &top, "core_version")) != NULL) {
+			if (strcmp(core_commit, "unknown") != 0 && strcmp(HULL_COMMIT, "unknown") != 0 &&
+			    strcmp(core_commit, HULL_COMMIT) != 0)
+				fprintf(stderr,
+				        "hull: warning: the running core was built from %s, but this is %s; a "
+				        "machine planned here runs on the core's older engine, so a newer "
+				        "feature may do nothing until the core is restarted -- it exits on its "
+				        "own once its machines are gone and it has idled, or end its `hull core` "
+				        "process, and the next command starts this build\n",
+				        core_commit, HULL_COMMIT);
+			free(core_commit);
+		}
+	}
 	return 0;
 }
 
