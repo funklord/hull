@@ -107,6 +107,9 @@ core_message lost 28 34 3A 6C 6F 73 74 28 35 3A 62 79 74 65 73 37 3A 31 30 34 38
 # stats: (5:stats(2:ch2:10)(7:machine3:web))
 client_message stats 28 35 3A 73 74 61 74 73 28 32 3A 63 68 32 3A 31 30 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 29
 
+# stats_guest: (5:stats(2:ch2:10)(7:machine3:web)(5:guest4:true))
+client_message stats 28 35 3A 73 74 61 74 73 28 32 3A 63 68 32 3A 31 30 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 28 35 3A 67 75 65 73 74 34 3A 74 72 75 65 29 29
+
 # measured: (5:stats(2:ch2:10)(3:cpu6:250000)(2:io4:8192)(6:memory7:1048576))
 core_message measured 28 35 3A 73 74 61 74 73 28 32 3A 63 68 32 3A 31 30 29 28 33 3A 63 70 75 36 3A 32 35 30 30 30 30 29 28 32 3A 69 6F 34 3A 38 31 39 32 29 28 36 3A 6D 65 6D 6F 72 79 37 3A 31 30 34 38 35 37 36 29 29
 

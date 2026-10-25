@@ -497,6 +497,34 @@ done
 xcase 0 '^target=/sbin/init$' "$hull" exec initexec /probe target /proc/1/exe
 timeout 30 "$hull" stop initexec > /dev/null 2>&1
 wait "$initexec"
+# hull stats --guest: the machine's own view from inside (section 4.10,
+# B.3's (sub (what stats))), against the host's whole cost. The agent reads
+# the guest's /proc: cpu the guest kernel's busy time, memory the used, io 0
+# since a 9p root has no block device. Both positive, and the guest's used
+# memory below the host's whole qemu.
+printf '(machine (source "dir:./rootfs") (backend vm) (hostname "vstats") %s)\n' \
+	'(command "/probe" "say" "ready" "wait")' > "$root/vstats.conf"
+rm -f "$root/vstats.out"
+(cd / && exec timeout 60 "$hull" run -f "$root/vstats.conf" > "$root/vstats.out" 2>&1) &
+vstats=$!
+tries=0
+until grep -q '^ready$' "$root/vstats.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+host_mem=$(timeout 30 "$hull" stats vstats 2>/dev/null | sed -n 's/^memory *\([0-9][0-9]*\) bytes$/\1/p')
+guest_out=$(timeout 30 "$hull" stats --guest vstats 2>&1)
+guest_mem=$(printf '%s\n' "$guest_out" | sed -n 's/^memory *\([0-9][0-9]*\) bytes$/\1/p')
+cases=$((cases + 1))
+printf '%s\n' "$guest_out" | grep -q '^cpu ' || fail "a guest's stats have no cpu line" "$guest_out"
+cases=$((cases + 1))
+{ [ -n "$guest_mem" ] && [ "$guest_mem" -gt 0 ]; } ||
+	fail "a guest's used memory is not a positive figure" "$guest_out"
+cases=$((cases + 1))
+{ [ -n "$host_mem" ] && [ "$guest_mem" -lt "$host_mem" ]; } ||
+	fail "a guest's used memory is not below the host's whole qemu" "guest=$guest_mem host=$host_mem"
+timeout 30 "$hull" stop vstats > /dev/null 2>&1
+wait "$vstats"
 cases=$((cases + 1))
 grep -q '^ready$' "$root/initexec.out" || fail "a machine handed to its init did not run" \
 	"$(cat "$root/initexec.out")"

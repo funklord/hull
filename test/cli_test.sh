@@ -529,6 +529,10 @@ until "$hull" ps 2>/dev/null | grep -q '^gone .*running$' &&
 done
 expect 125 'a machine of that name is running' sh -c 'cd / && exec "$0" run -f "$1"' \
 	"$hull_abs" "$root/keep.conf"
+# hull stats --guest asks for the machine's own view from inside; the chroot
+# engine shares the host's kernel, so there is no inside distinct from it and
+# it has no guest_stats op -- the core says so (section 4.10).
+expect 1 'no view of a machine from inside' "$hull" stats --guest gone
 kill -KILL "$keeper" "$goner"
 wait "$keeper" "$goner" 2>/dev/null
 sleep 1

@@ -244,7 +244,18 @@ struct stats {
 	preamble u8[7] = "5:stats";
 	channel        ch;
 	machine_entry  machine;
+	peek u8  after_machine;
+	variant guest switch (after_machine) {
+		case '(':  guest_entry  has_guest;   // (guest true): the guest's own view
+		default:   absent        no_guest;
+	}
 	u8  close  [must_eq = ')'];
+}
+
+struct guest_entry {
+	preamble u8[8] = "(5:guest";
+	atom  value;
+	u8    close  [must_eq = ')'];
 }
 
 // Every process of a running machine stopped where it is, a peer gone to

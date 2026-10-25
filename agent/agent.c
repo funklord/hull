@@ -341,6 +341,56 @@ static void send_status(uint32_t ch, int wstatus)
 	send_msg(&m);
 }
 
+/* The guest's own stats, for `(sub (what stats))` (B.3): cpu is the guest
+ * kernel's busy time from /proc/stat in microseconds, memory is used
+ * (MemTotal - MemAvailable) from /proc/meminfo in bytes. io is 0: a hull vm
+ * backs its root on 9p, not a block device, so the guest has no disk io to
+ * count -- the host-side figure (section 4.10) is where a vm's io shows. */
+static void send_guest_stats(uint32_t ch)
+{
+	hull_msg           m = { 0 };
+	unsigned long long cpu = 0u;
+	unsigned long long mem = 0u;
+	FILE              *f;
+
+	if ((f = fopen("/proc/stat", "r")) != NULL) {
+		unsigned long long u = 0, n = 0, s = 0, idle = 0, iow = 0, irq = 0, soft = 0;
+
+		if (fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu", &u, &n, &s, &idle, &iow, &irq,
+		           &soft) >= 4) {
+			long hz = sysconf(_SC_CLK_TCK);
+
+			cpu = (u + n + s + irq + soft) * 1000000ull / (unsigned long long)(hz > 0 ? hz : 100);
+		}
+		fclose(f);
+	}
+	if ((f = fopen("/proc/meminfo", "r")) != NULL) {
+		char               line[256];
+		unsigned long long total = 0u;
+		unsigned long long avail = 0u;
+
+		while (fgets(line, sizeof line, f) != NULL) {
+			if (total == 0u)
+				sscanf(line, "MemTotal: %llu kB", &total);
+			if (avail == 0u)
+				sscanf(line, "MemAvailable: %llu kB", &avail);
+		}
+		if (total >= avail)
+			mem = (total - avail) * 1024ull;
+		fclose(f);
+	}
+	hull_msg_raw(&m, "(5:stats");
+	hull_msg_channel(&m, ch);
+	hull_msg_raw(&m, "(3:cpu");
+	hull_msg_number(&m, (long long)cpu);
+	hull_msg_raw(&m, ")(2:io");
+	hull_msg_number(&m, 0);
+	hull_msg_raw(&m, ")(3:mem");
+	hull_msg_number(&m, (long long)mem);
+	hull_msg_raw(&m, "))");
+	send_msg(&m);
+}
+
 /* --- the spec ------------------------------------------------------------ */
 
 static void load_modules(void)
@@ -1435,6 +1485,14 @@ static void handle(const hull_sexpr_doc *body)
 	} else if (hull_msg_is(body, "exec")) {
 		if ((reason = exec(body, &message, (uint32_t)ch)) != NULL)
 			send_error((uint32_t)ch, reason);
+	} else if (hull_msg_is(body, "sub")) {
+		char what[16] = "";
+
+		if (hull_msg_find(body, "what", &value) &&
+		    hull_msg_string(body, &value, what, sizeof what) && strcmp(what, "stats") == 0)
+			send_guest_stats((uint32_t)ch);
+		else
+			send_error((uint32_t)ch, "the agent's sub reports only stats");
 	} else if (hull_msg_is(body, "connect")) {
 		if ((reason = connect_port(body, (uint32_t)ch)) != NULL)
 			send_error((uint32_t)ch, reason);

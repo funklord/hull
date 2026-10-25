@@ -100,7 +100,7 @@ static void usage(FILE *out)
 	      "       hull build [-f FILE] [--check] REF\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
-	      "       hull kill [-s SIGNAL] ID | hull stats [--over S] ID\n"
+	      "       hull kill [-s SIGNAL] ID | hull stats [--guest] [--over S] ID\n"
 	      "       hull pause ID | hull unpause ID\n"
 	      "       hull segment NAME [impair MACHINE|all in|out|both [KEY=VALUE|down]...]\n"
 	      "       hull segment NAME tamper MACHINE|all in|out|both [KEY=VALUE]...\n"
@@ -3736,7 +3736,7 @@ static int ssh_config(int remove)
 
 /* One reading of `id`'s figures, cpu, io and memory, into `values`: 0, 1
  * for the core's refusal, said, or 2 for an answer that is not one. */
-static int read_stats(const char *id, long long values[3])
+static int read_stats(const char *id, long long values[3], int guest)
 {
 	static const char *const keys[] = { "cpu", "io", "memory" };
 	hull_wire       wire;
@@ -3750,7 +3750,7 @@ static int read_stats(const char *id, long long values[3])
 	}
 	if (status != 0)
 		return 2;
-	send_request(&wire, "(5:stats", 1u, id, NULL);
+	send_request(&wire, "(5:stats", 1u, id, guest ? "(5:guest4:true)" : NULL);
 	if (hull_wire_read(&wire, &body) != HULL_WIRE_OK) {
 		status = 2;
 	} else if (hull_msg_is(&body, "error")) {
@@ -3779,7 +3779,7 @@ static int read_stats(const char *id, long long values[3])
  * one CPU, so that a machine using four whole CPUs is 400 %, as top
  * counts; io in bytes a second; and memory as the second reading has it,
  * being what is resident and not a flow. */
-static int stats_of(const char *id, long over)
+static int stats_of(const char *id, long over, int guest)
 {
 	long long       first[3] = { 0, 0, 0 };
 	long long       second[3] = { 0, 0, 0 };
@@ -3789,7 +3789,7 @@ static int stats_of(const char *id, long over)
 	double          elapsed;
 	int             status;
 
-	if ((status = read_stats(id, first)) != 0)
+	if ((status = read_stats(id, first, guest)) != 0)
 		return status;
 	if (over == 0) {
 		printf("cpu     %lld.%06lld s\nio      %lld bytes\nmemory  %lld bytes\n",
@@ -3799,7 +3799,7 @@ static int stats_of(const char *id, long over)
 	clock_gettime(CLOCK_MONOTONIC, &before);
 	while (nanosleep(&pause, &pause) != 0 && errno == EINTR)
 		;
-	if ((status = read_stats(id, second)) != 0)
+	if ((status = read_stats(id, second, guest)) != 0)
 		return status;
 	clock_gettime(CLOCK_MONOTONIC, &after);
 	elapsed = (double)(after.tv_sec - before.tv_sec) +
@@ -4373,18 +4373,34 @@ int main(int argc, char **argv)
 	if ((strcmp(command, "pause") == 0 || strcmp(command, "unpause") == 0) && argc == 3 &&
 	    argv[2][0] != '-')
 		return pause_of(argv[2], command[0] == 'p');
-	if (strcmp(command, "stats") == 0 && argc == 3 && argv[2][0] != '-')
-		return stats_of(argv[2], 0);
-	if (strcmp(command, "stats") == 0 && argc == 5 && strcmp(argv[2], "--over") == 0 &&
-	    argv[4][0] != '-') {
-		char *end = NULL;
-		long  over = strtol(argv[3], &end, 10);
+	if (strcmp(command, "stats") == 0) {
+		const char *id = NULL;
+		int         guest = 0;
+		long        over = 0;
 
-		if (end == argv[3] || *end != '\0' || over < 1 || over > 3600) {
-			fprintf(stderr, "hull: stats --over takes 1 to 3600 seconds\n");
+		for (int i = 2; i < argc; i++) {
+			if (strcmp(argv[i], "--guest") == 0) {
+				guest = 1;
+			} else if (strcmp(argv[i], "--over") == 0 && i + 1 < argc) {
+				char *end = NULL;
+
+				over = strtol(argv[++i], &end, 10);
+				if (end == argv[i] || *end != '\0' || over < 1 || over > 3600) {
+					fprintf(stderr, "hull: stats --over takes 1 to 3600 seconds\n");
+					return 2;
+				}
+			} else if (argv[i][0] != '-' && id == NULL) {
+				id = argv[i];
+			} else {
+				usage(stderr);
+				return 2;
+			}
+		}
+		if (id == NULL) {
+			usage(stderr);
 			return 2;
 		}
-		return stats_of(argv[4], over);
+		return stats_of(id, over, guest);
 	}
 	if (strcmp(command, "ssh") == 0 && argc == 3 && argv[2][0] != '-')
 		return ssh_into(argv[2]);

@@ -2077,13 +2077,22 @@ static void handle_stats(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		send_error(c, ch, "the machine is not running");
 		return;
 	}
-	if (s->engine->ops->stats == NULL) {
-		send_error(c, ch, "that engine does not measure a machine");
-		return;
-	}
-	if (s->engine->ops->stats(&s->core, s->handle, &out, &error) != HULL_OK) {
-		send_error(c, ch, error.detail != NULL ? error.detail : "refused");
-		return;
+	{
+		hull_sexpr_form value;
+		int             guest = hull_msg_find(body, "guest", &value) &&
+		                        hull_sexpr_is(body, &value, "true");
+		hull_status (*measure)(hull_core *, hull_machine *, hull_buf *, hull_error *);
+
+		measure = guest ? s->engine->ops->guest_stats : s->engine->ops->stats;
+		if (measure == NULL) {
+			send_error(c, ch, guest ? "that engine has no view of a machine from inside" :
+			                          "that engine does not measure a machine");
+			return;
+		}
+		if (measure(&s->core, s->handle, &out, &error) != HULL_OK) {
+			send_error(c, ch, error.detail != NULL ? error.detail : "refused");
+			return;
+		}
 	}
 	if (hull_sexpr_open(&stats, out.data, out.len, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
 	    !hull_msg_is(&stats, "stats")) {

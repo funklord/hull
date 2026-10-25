@@ -203,6 +203,12 @@ typedef struct hull_engine_ops {
 	                      hull_error*);
 	hull_status (*stats) (hull_core*, hull_machine*, hull_buf *out, hull_error*);
 
+	/* The guest's own view, as the machine sees it from inside, in the same
+	 * encoding as stats; optional (NULL where there is no inside distinct
+	 * from the host, as for an ns engine that shares the host's kernel). The
+	 * vm engine asks its agent (B.3's (sub (what stats))). */
+	hull_status (*guest_stats) (hull_core*, hull_machine*, hull_buf *out, hull_error*);
+
 	/* Ingress plumbing (section 8.1). The core owns the stable 127.107.x.y
 	 * address and gives it in the plan, `(plan (address "...") ...)`, and
 	 * the engine binds each declared port there itself. This slot, for an

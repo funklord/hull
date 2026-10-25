@@ -130,6 +130,10 @@ core_message lost_no_bytes 28 34 3A 6C 6F 73 74 28 32 3A 63 68 31 3A 33 29 29
 # stats: the machine is required
 client_message stats_no_machine 28 35 3A 73 74 61 74 73 28 32 3A 63 68 32 3A 31 30 29 29
 
+# stats_guest_wrong_key: (5:stats(2:ch2:10)(7:machine3:web)(5:bogus4:true))
+# stats: a tail entry after the machine is the guest flag or nothing
+client_message stats_guest_wrong_key 28 35 3A 73 74 61 74 73 28 32 3A 63 68 32 3A 31 30 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 28 35 3A 62 6F 67 75 73 34 3A 74 72 75 65 29 29
+
 
 # measured_no_memory: (5:stats(2:ch2:10)(3:cpu6:250000)(2:io4:8192))
 # measured: every figure, always

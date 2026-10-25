@@ -163,6 +163,10 @@ struct hull_machine {
 	int              signal;
 	char             detail[512];
 	unsigned char    stats[128];   /* what stats() last gave */
+	pthread_cond_t   guest_cond;   /* the agent's stats reply arrived */
+	uint32_t         guest_ch;     /* the channel a guest-stats request waits on, 0 if none */
+	int              guest_ready;  /* the reply is in `guest_usage` */
+	hull_usage       guest_usage;  /* the guest's own view, from its (sub (what stats)) */
 
 	hull_stream     *streams[MAX_STREAMS];  /* under `lock` */
 	uint32_t         next_ch;
@@ -306,6 +310,7 @@ static void release(hull_machine *m)
 	pthread_mutex_destroy(&m->send_lock);
 	pthread_cond_destroy(&m->done_cond);
 	pthread_cond_destroy(&m->quiet);
+	pthread_cond_destroy(&m->guest_cond);
 	if (m->wake >= 0)
 		close(m->wake);
 	free(m);
@@ -1620,7 +1625,28 @@ static void *read_agent(void *arg)
 			break;
 		if (hull_msg_find(&body, "ch", &value) && hull_msg_long(&body, &value, &number) &&
 		    number != 0) {
-			for_stream(m, &body, number);
+			int taken = 0;
+
+			/* A guest-stats reply on the channel a guest_stats() waits
+			 * on: capture its cpu, io and mem and wake the waiter. */
+			pthread_mutex_lock(&m->lock);
+			if (m->guest_ch != 0u && (uint32_t)number == m->guest_ch && hull_msg_is(&body, "stats")) {
+				hull_sexpr_form f;
+				long long       v;
+
+				m->guest_usage.cpu = hull_msg_find(&body, "cpu", &f) &&
+				                     hull_msg_long(&body, &f, &v) ? (unsigned long long)v : 0u;
+				m->guest_usage.io = hull_msg_find(&body, "io", &f) &&
+				                    hull_msg_long(&body, &f, &v) ? (unsigned long long)v : 0u;
+				m->guest_usage.memory = hull_msg_find(&body, "mem", &f) &&
+				                        hull_msg_long(&body, &f, &v) ? (unsigned long long)v : 0u;
+				m->guest_ready = 1;
+				pthread_cond_signal(&m->guest_cond);
+				taken = 1;
+			}
+			pthread_mutex_unlock(&m->lock);
+			if (!taken)
+				for_stream(m, &body, number);
 		} else if (hull_msg_is(&body, "data")) {
 			hull_sexpr_form buf;
 			hull_sexpr_form fd;
@@ -1706,6 +1732,7 @@ static hull_status qemu_create(hull_core *core, hull_buf plan, hull_machine **ou
 	pthread_mutex_init(&m->send_lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
 	pthread_cond_init(&m->quiet, NULL);
+	pthread_cond_init(&m->guest_cond, NULL);
 	if ((reason = read_plan(m, &doc)) != NULL) {
 		release(m);
 		return fail(error, HULL_ERR_UNSUPPORTED, reason);
@@ -2234,6 +2261,7 @@ static hull_status qemu_adopt(hull_core *core, hull_buf state, hull_machine **ou
 	pthread_mutex_init(&m->send_lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
 	pthread_cond_init(&m->quiet, NULL);
+	pthread_cond_init(&m->guest_cond, NULL);
 	if ((reason = read_state(m, state)) != NULL) {
 		m->dir[0] = '\0';
 		release(m);
@@ -2793,6 +2821,57 @@ static hull_status qemu_stats(hull_core *core, hull_machine *m, hull_buf *out, h
 	return out->len == 0u ? fail(error, HULL_ERR_INTERNAL, "stats do not fit") : HULL_OK;
 }
 
+/* The guest's own view, asked of the agent by B.3's (sub (what stats)) on a
+ * channel of this request's own, and awaited, 5 s at most. The reply's cpu,
+ * io and mem become the engine's (stats ...) the core relays, the same as
+ * the host view's but measured inside. One request at a time holds the one
+ * guest_ch; read_agent captures the reply and wakes the wait. */
+static hull_status qemu_guest_stats(hull_core *core, hull_machine *m, hull_buf *out,
+                                    hull_error *error)
+{
+	hull_msg        msg = { 0 };
+	struct timespec deadline;
+	uint32_t        ch;
+	int             got;
+
+	(void)core;
+	pthread_mutex_lock(&m->lock);
+	if (!m->started || m->done || !m->connected) {
+		pthread_mutex_unlock(&m->lock);
+		return fail(error, HULL_ERR_GONE, "the machine is not running");
+	}
+	ch = ++m->next_ch;
+	m->guest_ch = ch;
+	m->guest_ready = 0;
+	pthread_mutex_unlock(&m->lock);
+
+	hull_msg_raw(&msg, "(3:sub");
+	hull_msg_channel(&msg, ch);
+	hull_msg_raw(&msg, "(4:what5:stats))");
+	pthread_mutex_lock(&m->send_lock);
+	if (m->connected && hull_wire_send(m->wire.fd, &msg) != 0)
+		m->connected = 0;
+	pthread_mutex_unlock(&m->send_lock);
+	hull_msg_free(&msg);
+
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec += 5;
+	pthread_mutex_lock(&m->lock);
+	while (!m->guest_ready)
+		if (pthread_cond_timedwait(&m->guest_cond, &m->lock, &deadline) == ETIMEDOUT)
+			break;
+	got = m->guest_ready;
+	m->guest_ch = 0u;
+	if (got) {
+		out->data = m->stats;
+		out->len = hull_usage_encode(&m->guest_usage, m->stats, sizeof m->stats);
+	}
+	pthread_mutex_unlock(&m->lock);
+	if (!got)
+		return fail(error, HULL_ERR_GONE, "the guest did not answer with its stats");
+	return out->len == 0u ? fail(error, HULL_ERR_INTERNAL, "guest stats do not fit") : HULL_OK;
+}
+
 static void *forward_one(void *arg)
 {
 	connection   *k = arg;
@@ -3128,6 +3207,7 @@ static const hull_engine_ops ops = {
 	.resize       = qemu_resize,
 	.signal       = qemu_signal,
 	.stats        = qemu_stats,
+	.guest_stats  = qemu_guest_stats,
 	.dial         = qemu_dial,
 	.pause        = qemu_pause,
 };

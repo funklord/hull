@@ -180,6 +180,7 @@ QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.co
                   vowned.conf vownedno.conf vowners.list \
                   vkernel.conf vkernelno.conf vkernelbad.conf mykernel badkernel \
                   vkimage.conf vkimageno.conf vkimagebad.conf \
+                  vstats.conf vstats.out \
                   qticks.out)
 
 # What test/flip_test.sh writes: the project, and its rsync'd copy.
