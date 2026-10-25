@@ -1118,9 +1118,12 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int
 	snprintf(cpus, sizeof cpus, "%u", m->cpus);
 	snprintf(vsock, sizeof vsock, "vhost-vsock-pci,guest-cid=%u", cid);
 	snprintf(netdev, sizeof netdev, "stream,id=net,addr.type=fd,addr.str=%d", NETWORK_FD);
-	/* The share is the directory, or with layers or an upper the overlay
-	 * qemu's child mounts in its runtime directory, which the guest then
-	 * writes through as it would a directory in place. */
+	/* The share is the directory, or with layers, an upper or owners the
+	 * overlay qemu's child mounts in its runtime directory, its merged tree.
+	 * It is read-only under (mutable overlay) whenever the guest lays its
+	 * own overlay over it (a tmpfs upper, fast writes in its memory), which
+	 * is every case but a kept (upper PATH): there the guest writes through
+	 * the share to the host-side overlay's kept upper, so it is read-write. */
 	if (m->host_overlay) {
 		char merged[4200];
 
@@ -1130,7 +1133,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int
 		escaped(path, sizeof path, m->root);
 	}
 	snprintf(root, sizeof root, "local,id=root,path=%s,security_model=none%s", path,
-	         m->readonly_root || (m->overlay && !m->host_overlay) ? ",readonly=on" : "");
+	         m->readonly_root || (m->overlay && m->upper == NULL) ? ",readonly=on" : "");
 
 	argv[n++] = "qemu-system-x86_64";
 	argv[n++] = "-nodefaults";

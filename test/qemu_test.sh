@@ -491,9 +491,16 @@ printf 'b\n' > "$root/vsite/b"
 printf 'c\n' > "$root/vdata/c"
 printf '(machine (source "dir:%s/vtemplate") (backend vm) (mutable overlay) %s %s)\n' "$root" \
 	"(layers \"dir:$root/vsite\") (upper \"$root/vdata\")" \
-	'(command "/probe" "read" "/a" "read" "/c" "write" "/d" "remove" "/b")' > "$root/vlayered.conf"
+	'(command "/probe" "read" "/proc/mounts" "read" "/a" "read" "/c" "write" "/d" "remove" "/b")' \
+	> "$root/vlayered.conf"
 name=vlayered
 boot vlayered
+# A kept (upper PATH) wants its writes on the host's disk, so the guest does
+# not lay a tmpfs overlay of its own: its root is the merged 9p share written
+# through to the host-side overlay's kept upper, not an overlayfs. Were it a
+# guest overlay, /d below would land in a tmpfs and not in vdata. Its root,
+# /proc/mounts' first line, is the share, 9p and not overlay.
+has 0 '^read=root / 9p'
 has 0 '^read=site$'
 has 0 '^read=c$'
 has 0 '^remove=ok$'
@@ -536,10 +543,16 @@ else
 	vowned_owner='^owner=0:0 0[0-7]{3}$'
 fi
 printf '(machine (source "dir:%s/vowntmpl") (backend vm) (mutable overlay) %s %s)\n' "$root" \
-	"(owners \"$root/vowners.list\")" '(command "/probe" "owner" "/given")' > "$root/vowned.conf"
+	"(owners \"$root/vowners.list\")" \
+	'(command "/probe" "owner" "/given" "read" "/proc/mounts")' > "$root/vowned.conf"
 name=vowned
 boot vowned
 has 0 "$vowned_owner"
+# The host-side overlay owners force is a read-only lower the guest overlays
+# itself, so its root is an overlayfs with a tmpfs upper, not the merged 9p
+# share written through: writes are fast and in the guest's memory, and the
+# module place can be made. /proc/mounts' first line is that root.
+has 0 '^read=overlay / overlay'
 cases=$((cases + 1))
 [ "$(stat -c %u "$root/vowntmpl/given")" = "$(id -u)" ] ||
 	fail "an owner given in a vm reached the user's disk" "$(ls -ln "$root/vowntmpl/given")"
