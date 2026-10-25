@@ -118,6 +118,46 @@ expect 0 '^ExecStart=/.*/hull run -f /.*/sdmulti\.conf db$' "$hull" systemd -f "
 expect 0 '^Restart=on-failure$' "$hull" systemd -f "$dir/sdmulti.conf" db
 expect 125 'name the machine' "$hull" systemd -f "$dir/sdmulti.conf"
 expect 125 'no such machine' "$hull" systemd -f "$dir/sdmulti.conf" nope
+# hull import: a Dockerfile to a (build ...) form (section 9), best-effort,
+# annotating in `;` comments what it cannot translate faithfully. The
+# result must stay a valid spec: a trailing annotation must not comment out
+# a closing paren, so it is PARSED here (hull plan on a build-only file
+# parses it, then says there is only a build), not just grepped.
+cat > "$dir/Dockerfile.in" <<'DF'
+FROM debian:13-slim AS base
+LABEL x=y
+ENV A=1 B=2
+WORKDIR /srv
+RUN apt-get update && \
+    apt-get install -y curl
+COPY ./app /srv/app
+ADD x.tar.gz /srv/
+EXPOSE 80 53/udp
+USER nobody
+ENTRYPOINT ["/srv/app"]
+CMD echo hi
+HEALTHCHECK CMD true
+DF
+"$hull" import "$dir/Dockerfile.in" > "$dir/imported.build" 2>&1
+expect 0 'no machine to plan, only a build' "$hull" plan -f "$dir/imported.build"
+gb() {
+	cases=$((cases + 1))
+	grep -Eq -- "$1" "$dir/imported.build" ||
+		fail "import: no line matches /$1/" "$(cat "$dir/imported.build")"
+}
+gb '\(base "debian:13-slim"\)'
+gb '\(run "apt-get update'
+gb '\(env \(A "1"\) \(B "2"\)\)'
+gb '\(workdir "/srv"\)'
+gb '\(ports "80/tcp" "53/udp"\)'
+gb '\(copy \(path \(from "\./app"\) \(to "/srv/app"\)\)\)'
+gb '\(entrypoint "/srv/app"\)'
+gb '\(cmd "/bin/sh" "-c" "echo hi"\)'
+gb '; not translated: LABEL'
+gb '; ADD treated as COPY'
+gb '; not translated: HEALTHCHECK'
+printf 'RUN true\n' > "$dir/nofrom.in"
+expect 2 'has no FROM' "$hull" import "$dir/nofrom.in"
 
 # hull doctor: every line a check, its status first, or the fix under one.
 cases=$((cases + 1))

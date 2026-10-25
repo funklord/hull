@@ -99,7 +99,8 @@ ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/usage.o $(BUILD_DIR)/engine/sha256.o \
               $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/idmap.o \
               $(BUILD_DIR)/engine/tree.o
-CLI_OBJS    = $(BUILD_DIR)/cli/hull.o $(BUILD_DIR)/cli/runtime.o $(BUILD_DIR)/cli/doctor.o
+CLI_OBJS    = $(BUILD_DIR)/cli/hull.o $(BUILD_DIR)/cli/runtime.o $(BUILD_DIR)/cli/doctor.o \
+              $(BUILD_DIR)/cli/import.o
 # Section 3's optional store, which only the commands that name it use.
 STORE_OBJS  = $(BUILD_DIR)/store/store.o $(BUILD_DIR)/store/unpack.o
 # Section 3.5's border: what `hull pull` reads a registry with.
@@ -136,7 +137,7 @@ TEST_SEXPR_OBJS   = $(BUILD_DIR)/test/sexpr_test.o
 TEST_FRAMING_OBJS = $(BUILD_DIR)/test/framing_test.o
 # What test/cli_test.sh writes, so that clean can name it.
 CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.conf \
-                 sdunit.conf sdnore.conf sdmulti.conf \
+                 sdunit.conf sdnore.conf sdmulti.conf Dockerfile.in imported.build nofrom.in \
                  home/.ssh/config ssh-config.before foreign.conf machines.conf build.conf bad.conf example.conf run.conf \
                  writable.conf readonly.conf die.conf wait.conf ports.conf noargs.conf nope.conf \
                  pair.conf rootfs/written rootfs/bin/sh vol.conf volro.conf vollink.conf \

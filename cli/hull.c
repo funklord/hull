@@ -54,6 +54,7 @@
 #include "builtin.h"
 #include "core.h"
 #include "doctor.h"
+#include "import.h"
 #include "matrix.h"
 #include "plan.h"
 #include "registry.h"
@@ -112,6 +113,7 @@ static void usage(FILE *out)
 	      "       hull diff REF REF | hull tag REF NEW | hull tag -d REF\n"
 	      "       hull manifest show REF | hull manifest compile [REF]\n"
 	      "       hull pull IMAGE [REF] | hull push REF IMAGE\n"
+	      "       hull import DOCKERFILE\n"
 	      "       hull core\n"
 	      "       hull engines | hull doctor\n"
 	      "       hull --version\n", out);
@@ -4306,6 +4308,8 @@ int main(int argc, char **argv)
 	if (strcmp(command, "manifest") == 0 && (argc == 3 || argc == 4) &&
 	    strcmp(argv[2], "compile") == 0)
 		return compile_manifest(argc == 4 ? argv[3] : NULL);
+	if (strcmp(command, "import") == 0 && argc == 3)
+		return hull_import(argv[2]);
 	if (strcmp(command, "proxy-ssh") == 0 && argc == 3)
 		return proxy_ssh(argv[2]);
 	if (strcmp(command, "ssh-config") == 0 && argc == 2)
