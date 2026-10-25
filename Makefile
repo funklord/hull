@@ -209,7 +209,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all check check-docker check-qemu check-flip test vectors style style-source style-docs contract hooks clean help install-nss FORCE
+.PHONY: all check check-docker check-qemu check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL) $(AGENT_BIN) $(NSS_LIB)
 
@@ -226,6 +226,7 @@ help:
 	@echo '  contract  the schemas'"'"' capability maps against the committed ones'
 	@echo '  hooks     install the commit-msg hook from tool/hooks/'
 	@echo '  install-nss  as root: libnss_hull.so.2 into NSS_LIBDIR, for *.hull names'
+	@echo '  install-apparmor  as root: a profile letting hull make user namespaces'
 	@echo '  clean     remove what the build made, naming each file'
 
 # Each schema generates a header and a source in one situc run, so both are
@@ -336,6 +337,19 @@ $(NSS_LIB): nss/nss_hull.c
 # hosts line of /etc/nsswitch.conf, before `dns`.
 install-nss: $(NSS_LIB)
 	install -D -m 0644 $(NSS_LIB) '$(DESTDIR)$(NSS_LIBDIR)/libnss_hull.so.2'
+
+# The AppArmor profile that lets hull make user namespaces where a host
+# restricts them (Ubuntu 24.04). It attaches by the binary's path, and hull
+# runs from where it is built, so the path is filled in from HULL_BIN (the
+# built binary by default; set it to the installed one). Placing the file is
+# all this does; `apparmor_parser -r` loads it, as the recipe says.
+APPARMOR_DIR ?= /etc/apparmor.d
+HULL_BIN     ?= $(HULL)
+install-apparmor: packaging/apparmor/hull.in
+	sed 's|@HULL@|$(abspath $(HULL_BIN))|' $< > '$(BUILD_DIR)/hull.apparmor'
+	install -D -m 0644 '$(BUILD_DIR)/hull.apparmor' '$(DESTDIR)$(APPARMOR_DIR)/hull'
+	@echo 'installed $(DESTDIR)$(APPARMOR_DIR)/hull for $(abspath $(HULL_BIN))'
+	@echo 'load it (as root): apparmor_parser -r $(DESTDIR)$(APPARMOR_DIR)/hull'
 
 $(GEN_DIR)/%.o: $(GEN_DIR)/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
@@ -498,4 +512,4 @@ clean:
 	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) \
 	        $(AGENT_BIN) $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) \
-	        $(FLIP_TEST_FILES) $(NSS_LIB)
+	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor

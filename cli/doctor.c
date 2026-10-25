@@ -81,8 +81,8 @@ static int user_namespaces(void)
 		line("missing", "user namespaces", "this user cannot make one, and no rootless engine runs");
 		if (read_line("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", value, sizeof value) &&
 		    strcmp(value, "1") == 0)
-			fix("an AppArmor profile that lets hull make user namespaces, or "
-			    "sysctl kernel.apparmor_restrict_unprivileged_userns=0");
+			fix("make install-apparmor (a profile that lets hull make user "
+			    "namespaces), or sysctl kernel.apparmor_restrict_unprivileged_userns=0");
 		if (read_line("/proc/sys/user/max_user_namespaces", value, sizeof value) &&
 		    strcmp(value, "0") == 0)
 			fix("sysctl user.max_user_namespaces=15000");

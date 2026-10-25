@@ -337,6 +337,16 @@ sudo make install-nss   # into /usr/lib/<multiarch>/
 then add `hull` to the `hosts:` line of `/etc/nsswitch.conf`, before
 `dns`, as in `hosts: files hull dns`.
 
+On a host that restricts unprivileged user namespaces (Ubuntu 24.04), a
+profile lets hull make them without turning the restriction off for
+everything; `hull doctor` says whether you need it. It attaches to the
+hull binary by path, so point it at yours:
+
+```sh
+sudo make install-apparmor HULL_BIN=./build/hull   # into /etc/apparmor.d/
+sudo apparmor_parser -r /etc/apparmor.d/hull
+```
+
 # More
 
 `project.md` is the design and the record of what is built and measured,

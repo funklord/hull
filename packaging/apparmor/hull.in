@@ -1,0 +1,29 @@
+# hull: permit user-namespace creation on hosts that restrict it.
+#
+# Ubuntu 24.04 denies unprivileged user namespaces unless the process is
+# under an AppArmor profile that grants them
+# (kernel.apparmor_restrict_unprivileged_userns=1), and hull's chroot and
+# qemu engines need one to map the user to root inside a machine. This
+# profile grants that one permission to the hull binary and confines nothing
+# else, so the restriction stays on for the rest of the host -- the
+# alternative `hull doctor` offers is to turn it off for everything with
+# sysctl kernel.apparmor_restrict_unprivileged_userns=0.
+#
+# `make install-apparmor` writes this to /etc/apparmor.d/hull with the path
+# of the hull binary filled in, since hull runs from where it is built
+# rather than a fixed location; set HULL_BIN to point it elsewhere. Load it:
+#
+#     apparmor_parser -r /etc/apparmor.d/hull
+#
+# One binary serves as the frontend and, run as `hull core`, as the core
+# that creates the namespaces, so the one path covers both. Hosts that do
+# not restrict user namespaces, Debian and Fedora, need none of this.
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile hull @HULL@ flags=(unconfined) {
+  userns,
+
+  include if exists <local/hull>
+}
