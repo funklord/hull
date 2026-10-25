@@ -1362,6 +1362,18 @@ static int materialize_locked(hull_store *store, const char *ref, const char *di
 			say(why, cap, dirs[i - 1u], strerror(errno));
 			goto done;
 		}
+	/* The tree's own root last: a machine's / is a directory anyone may
+	 * enter, as a dir source's is, and a non-root uid in a build step --
+	 * apt's _apt, a maintainer script dropping privilege -- cannot
+	 * traverse a 0700 one, EACCES on execve of a 0755 binary beneath it. A
+	 * commit records the tree's contents, not the root, so there is no
+	 * mode to read; 0755 is the root every image ships. Made 0700 while it
+	 * fills, so a half-built checkout is not entered.
+	 */
+	if (fchmod(root, 0755) != 0) {
+		say(why, cap, dir, strerror(errno));
+		goto done;
+	}
 	result = 0;
 	goto done;
 bad:
@@ -1452,8 +1464,8 @@ int hull_store_checkout(hull_store *store, const char *name, int create, char *p
 		hull_store_remove_tree(AT_FDCWD, made);
 		goto done;
 	}
-	/* A machine's / is a directory anyone may enter, as a dir source's is. */
-	chmod(made, 0755);
+	/* Its / is 0755 already, materialize_locked having made the tree root
+	 * a directory anyone may enter. */
 	if (rename(made, path) != 0) {
 		int taken = errno == EEXIST || errno == ENOTEMPTY;
 

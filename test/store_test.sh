@@ -192,6 +192,14 @@ got=$(listing "$root/out")
 cases=$((cases + 1))
 [ "$(stat -c %i "$root/out/etc/greeting")" != "$(stat -c %i "$root/out/etc/again")" ] ||
 	fail "a hardlink came back as one" ""
+# A machine's / is a directory anyone may enter: the tree root is 0755,
+# not the 0700 it is built under. A non-root uid in a build step cannot
+# traverse a 0700 root -- EACCES on execve of a binary beneath it -- so
+# apt's download sandbox and any maintainer script that drops privilege
+# fail there. netcfgd, 2026-10-25.
+cases=$((cases + 1))
+[ "$(stat -c %a "$root/out")" = 755 ] ||
+	fail "the materialized tree's root is mode $(stat -c %a "$root/out"), not 755" ""
 # Every path is the user's, group too, where a setgid directory above
 # would give its own: a machine's namespace maps the user's group alone.
 mkdir -p "$root/sgid"
