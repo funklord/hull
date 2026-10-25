@@ -18,6 +18,10 @@ dir=${BUILD_DIR:?}/test/qemu
 # A core of the test's own, as in cli_test.sh.
 XDG_RUNTIME_DIR=$(cd "${BUILD_DIR:?}" && pwd)/test/run
 export XDG_RUNTIME_DIR
+# A data home of the test's own too, never the account's: (ssh true) keeps a
+# persistent per-machine host key under it (section 8.1 item 2).
+XDG_DATA_HOME=$(cd "${BUILD_DIR:?}" && pwd)/test/qemu/data
+export XDG_DATA_HOME
 export HULL_CORE_IDLE=1
 mkdir -p "$XDG_RUNTIME_DIR" "$dir/rootfs/proc" "$dir/rootfs/dev" "$dir/rootfs/sys" \
 	"$dir/rootfs/srv" "$dir/rootfs/etc" "$dir/data"
@@ -1081,6 +1085,30 @@ else
 	*host_key*) ;;
 	*) fail "the agent did not start the image's sshd with the host key" "$invoked" ;;
 	esac
+	# The host key is machine state: a second run reuses the one kept under
+	# the data home, so repeated ssh does not trip known_hosts (8.1 item 2).
+	keyfile="$root/data/hull/machines/qssh/host_key"
+	cases=$((cases + 1))
+	if [ -f "$keyfile" ]; then
+		key1=$(sha256sum "$keyfile" | cut -d' ' -f1)
+		rm -f "$root/qssh.out"
+		(cd / && exec env XDG_RUNTIME_DIR="$sshrt" timeout -k 2 90 "$hull" run -f "$root/qssh.conf" \
+			> "$root/qssh.out" 2>&1) &
+		runner=$!
+		tries=0
+		until grep -q '^ready$' "$root/qssh.out" 2>/dev/null || [ "$tries" -ge 60 ]; do
+			tries=$((tries + 1))
+			sleep 0.25
+		done
+		key2=$(sha256sum "$keyfile" | cut -d' ' -f1)
+		XDG_RUNTIME_DIR="$sshrt" timeout 30 "$hull" stop qssh > /dev/null 2>&1
+		wait "$runner"
+		[ "$key1" = "$key2" ] ||
+			fail "(ssh true) did not reuse the machine's host key on a second run" \
+				"run1 $key1, run2 $key2"
+	else
+		fail "(ssh true) kept no persistent host key for the machine" "$keyfile"
+	fi
 	# And refused when the image has no sshd: (ssh true) must fail at start,
 	# not run the machine silently without one (section 6). nosshroot has
 	# /run, so the material is placed and the refusal is for the sshd alone.

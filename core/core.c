@@ -1187,10 +1187,18 @@ static void forget_secrets(slot *s)
  * the socket. The engine is given that path as the plan's `(ssh_dir DIR)`
  * and the agent places the three files on a tmpfs the image's sshd reads by
  * absolute path. The host key is private, so this directory is a tmpfs like
- * secrets', and goes with the machine. The key is ephemeral in this cut; a
- * persistent, backend-surviving one is a later increment (section 8.1).
+ * secrets', and goes with the machine. The host key itself is machine state,
+ * generated once per id under hull/machines and reused, so a machine's SSH
+ * identity is stable across runs (write_host_key); only ephemeral where no
+ * data home says where to keep it.
  */
 static char ssh_root[4200];
+
+/* The persistent per-machine host keys live here, keyed by the stable id,
+ * so a machine's SSH identity survives a restart and (once more than qemu
+ * provisions) a backend switch, as section 8.1 item 2 asks. Empty when no
+ * data home is set, and then the host key is ephemeral, generated per run. */
+static char host_key_root[4200];
 
 static int ssh_path(const char *id, char *out, size_t cap)
 {
@@ -1261,15 +1269,12 @@ static const char *write_authorized_keys(int at)
 
 /* An ephemeral ed25519 host key, by the host's own ssh-keygen, into
  * `at`/host_key. NULL, or why not. */
-static const char *write_host_key(const char *dir)
+/* An ed25519 key pair by the host's own ssh-keygen, into `path`. */
+static const char *keygen(const char *path)
 {
-	char  path[4300];
-	pid_t child;
+	pid_t child = fork();
 	int   status;
 
-	if ((size_t)snprintf(path, sizeof path, "%s/host_key", dir) >= sizeof path)
-		return "(ssh true): the host key's path is too long";
-	child = fork();
 	if (child < 0)
 		return "(ssh true): the host key could not be generated";
 	if (child == 0) {
@@ -1286,6 +1291,62 @@ static const char *write_host_key(const char *dir)
 	if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
 		return "(ssh true): ssh-keygen could not generate a host key; is it installed?";
 	return NULL;
+}
+
+/* Copy the private key bytes from `from` to `to`, mode 0400. */
+static const char *copy_key(const char *from, const char *to)
+{
+	char    buf[8192];
+	ssize_t n;
+	int     in = open(from, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	int     out = -1;
+
+	if (in >= 0)
+		out = open(to, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0400);
+	if (in < 0 || out < 0) {
+		if (in >= 0)
+			close(in);
+		return "(ssh true): the host key could not be read back";
+	}
+	while ((n = read(in, buf, sizeof buf)) > 0)
+		if (write(out, buf, (size_t)n) != n)
+			n = -1;
+	close(in);
+	if (close(out) != 0 || n < 0)
+		return "(ssh true): the host key could not be read back";
+	return NULL;
+}
+
+/* The host key for `id`, into `dir`/host_key for delivery. Where a data
+ * home is known it is machine state: generated once into
+ * hull/machines/ID/host_key and reused, so the machine's SSH identity is
+ * stable across runs; the private key is 0600 there and copied 0400 into
+ * the per-run tmpfs. Without a data home it is ephemeral, generated per
+ * run straight into `dir`. */
+static const char *write_host_key(const char *id, const char *dir)
+{
+	char per_run[4300];
+	char persist_dir[4200];
+	char persist[4300];
+
+	if ((size_t)snprintf(per_run, sizeof per_run, "%s/host_key", dir) >= sizeof per_run)
+		return "(ssh true): the host key's path is too long";
+	if (host_key_root[0] == '\0')
+		return keygen(per_run);
+	if ((size_t)snprintf(persist_dir, sizeof persist_dir, "%s/%s", host_key_root, id) >=
+	        sizeof persist_dir ||
+	    (size_t)snprintf(persist, sizeof persist, "%s/host_key", persist_dir) >= sizeof persist)
+		return "(ssh true): the host key's path is too long";
+	if (access(persist, F_OK) != 0) {
+		const char *why;
+
+		if ((mkdir(host_key_root, 0700) != 0 && errno != EEXIST) ||
+		    (mkdir(persist_dir, 0700) != 0 && errno != EEXIST))
+			return "(ssh true): the machine's key directory cannot be made";
+		if ((why = keygen(persist)) != NULL)
+			return why;
+	}
+	return copy_key(persist, per_run);
 }
 
 /* The ssh material for `id`, into a fresh hull/ssh/ID: a host key, the
@@ -1316,7 +1377,7 @@ static const char *write_ssh(const char *id, char *dir, size_t cap)
 	remove_ssh(id);
 	if (mkdir(dir, 0700) != 0 || (at = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC)) < 0)
 		return "(ssh true): the ssh directory cannot be made";
-	why = write_host_key(dir);
+	why = write_host_key(id, dir);
 	if (why == NULL)
 		why = write_authorized_keys(at);
 	if (why == NULL) {
@@ -3135,6 +3196,30 @@ int hull_core_run(const char *host_arch)
 	snprintf(ssh_root, sizeof ssh_root, "%s/ssh", dir);
 	if (mkdir(ssh_root, 0700) != 0 && errno != EEXIST)
 		ssh_root[0] = '\0';  /* no machine with (ssh true) can run */
+	{
+		/* The persistent per-machine host keys, where the store is, so
+		 * they outlive a core and a reboot as machine state (section 8.1
+		 * item 2): $XDG_DATA_HOME/hull/machines or ~/.local/share's. Empty
+		 * if neither says where, and then a host key is ephemeral. */
+		const char *data = getenv("XDG_DATA_HOME");
+		const char *home = getenv("HOME");
+		char        base[4100];
+
+		base[0] = '\0';
+		if (data != NULL && data[0] == '/')
+			snprintf(base, sizeof base, "%s/hull", data);
+		else if (home != NULL && home[0] == '/')
+			snprintf(base, sizeof base, "%s/.local/share/hull", home);
+		/* mkdir is not recursive, so make the data home and its machines
+		 * directory now; empty host_key_root means ephemeral host keys. */
+		if (base[0] == '\0' || (mkdir(base, 0700) != 0 && errno != EEXIST))
+			host_key_root[0] = '\0';
+		else {
+			snprintf(host_key_root, sizeof host_key_root, "%s/machines", base);
+			if (mkdir(host_key_root, 0700) != 0 && errno != EEXIST)
+				host_key_root[0] = '\0';
+		}
+	}
 
 	memset(&action, 0, sizeof action);
 	action.sa_handler = end;
