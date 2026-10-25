@@ -349,9 +349,8 @@ static void do_env(build *b, char *arg)
 	}
 }
 
-int hull_import(const char *path)
+static int import_dockerfile(FILE *file)
 {
-	FILE  *file = fopen(path, "r");
 	build  b = { { NULL, 0u, 0u, 0 }, { { 0 } }, { { 0 } }, 0u, "", 0, 0, 0u };
 	sb     rt = { NULL, 0u, 0u, 0 };
 	sb     after = { NULL, 0u, 0u, 0 };   /* CMD/ENTRYPOINT/etc. order kept */
@@ -361,10 +360,6 @@ int hull_import(const char *path)
 	size_t at = 0u;
 	int    status = 0;
 
-	if (file == NULL) {
-		fprintf(stderr, "hull: import: %s: cannot open\n", path);
-		return 2;
-	}
 	while (fgets(line, sizeof line, file) != NULL) {
 		char  *p = line;
 		size_t n;
@@ -441,9 +436,8 @@ int hull_import(const char *path)
 			}
 		}
 	}
-	fclose(file);
 	if (base == NULL) {
-		fprintf(stderr, "hull: import: %s has no FROM; only a Dockerfile is imported\n", path);
+		fprintf(stderr, "hull: import: the Dockerfile has no FROM\n");
 		free(b.steps.data);
 		free(rt.data);
 		free(after.data);
@@ -486,5 +480,435 @@ int hull_import(const char *path)
 	free(b.steps.data);
 	free(rt.data);
 	free(after.data);
+	return status;
+}
+
+/* --- compose ------------------------------------------------------------- */
+
+/* A docker-compose.yml to a (machines ...) file (section 9, J.7). Only a
+ * common block subset of YAML is read; what it cannot map onto hull's model
+ * it says in a `;` comment, since J.7's machines share one segment and
+ * section 4.8 plans them all at once with no ordering -- so compose's
+ * networks and depends_on cannot be honoured, and are noted, not invented.
+ */
+typedef struct svc {
+	char name[128];
+	char source[512];      /* from image: */
+	char workdir[512];
+	char hostname[256];
+	char restart[32];
+	sb   command;          /* a (command ...) word list, or empty */
+	sb   env;              /* (NAME "value") entries */
+	sb   ports;            /* (port ...) entries */
+	sb   volumes;          /* (volume ...) entries */
+	sb   notes;            /* this service's `;` annotations */
+	int  open;             /* a service is being read */
+} svc;
+
+/* The scalar `s` without surrounding quotes and outer space. */
+static char *scalar(char *s)
+{
+	size_t n;
+
+	s = trim(s);
+	n = strlen(s);
+	if (n >= 2u && (s[0] == '"' || s[0] == '\'') && s[n - 1u] == s[0]) {
+		s[n - 1u] = '\0';
+		s++;
+	}
+	return s;
+}
+
+/* A flow list `[a, "b"]` into `args` (pointers into `s`, rewritten), or -1
+ * where `s` is not one. Bare and quoted items, which is all compose uses. */
+static int flow_list(char *s, char **args, int max)
+{
+	int n = 0;
+
+	s = trim(s);
+	if (*s != '[')
+		return -1;
+	s++;
+	for (;;) {
+		char *out;
+		char  q = 0;
+
+		while (*s == ' ' || *s == '\t' || *s == ',')
+			s++;
+		if (*s == ']')
+			return n;
+		if (n == max)
+			return -1;
+		if (*s == '"' || *s == '\'') {
+			q = *s++;
+		}
+		args[n++] = out = s;
+		while (*s != '\0' && (q ? *s != q : (*s != ',' && *s != ']'))) {
+			if (*s == '\\' && q && s[1] != '\0')
+				s++;
+			*out++ = *s++;
+		}
+		if (q && *s == q)
+			s++;
+		else
+			while (out > args[n - 1] && (out[-1] == ' ' || out[-1] == '\t'))
+				out--;
+		*out = '\0';
+	}
+}
+
+static void svc_note(svc *s, const char *why, const char *text)
+{
+	sb_str(&s->notes, "\n    ; ");
+	sb_str(&s->notes, why);
+	if (text != NULL && text[0] != '\0') {
+		sb_str(&s->notes, ": ");
+		sb_str(&s->notes, text);
+	}
+}
+
+/* K=V (compose list form) or K: V (map form) into the env list. */
+static void compose_env(svc *s, char *item, int map_form)
+{
+	char *eq = map_form ? strchr(item, ':') : strchr(item, '=');
+
+	if (eq == NULL) {
+		svc_note(s, "environment entry without a value not translated", item);
+		return;
+	}
+	*eq = '\0';
+	sb_str(&s->env, " (");
+	sb_str(&s->env, trim(item));
+	sb_str(&s->env, " ");
+	sb_quoted(&s->env, scalar(eq + 1));
+	sb_str(&s->env, ")");
+}
+
+/* "[host:]guest[/proto]" -> a (port ...). The ip:host:guest and the
+ * host-range forms are noted, not translated. */
+static void compose_port(svc *s, char *spec)
+{
+	char *p = scalar(spec);
+	char *slash = strrchr(p, '/');
+	char *colon;
+	char  proto[8] = "";
+
+	if (strchr(p, ':') != NULL && strchr(p, ':') != strrchr(p, ':')) {
+		svc_note(s, "port with an ip or range not translated", p);
+		return;
+	}
+	if (slash != NULL) {
+		*slash = '\0';
+		snprintf(proto, sizeof proto, "%s", slash + 1);
+	}
+	colon = strchr(p, ':');
+	sb_str(&s->ports, " (port (host ");
+	if (colon != NULL) {
+		*colon = '\0';
+		sb_str(&s->ports, p);
+		sb_str(&s->ports, ") (guest ");
+		sb_str(&s->ports, colon + 1);
+	} else {
+		sb_str(&s->ports, p);
+		sb_str(&s->ports, ") (guest ");
+		sb_str(&s->ports, p);
+	}
+	sb_str(&s->ports, ")");
+	if (proto[0] != '\0' && strcmp(proto, "tcp") != 0) {
+		sb_str(&s->ports, " (proto ");
+		sb_str(&s->ports, proto);
+		sb_str(&s->ports, ")");
+	}
+	sb_str(&s->ports, ")");
+}
+
+/* "host:guest[:ro]" -> a (volume ...). A named volume, no leading /, is
+ * noted: hull has no named volumes. */
+static void compose_volume(svc *s, char *spec)
+{
+	char *p = scalar(spec);
+	char *c1 = strchr(p, ':');
+	char *c2;
+	int   ro;
+
+	if (c1 == NULL) {
+		svc_note(s, "anonymous volume not translated", p);
+		return;
+	}
+	*c1 = '\0';
+	if (p[0] != '/' && p[0] != '.') {
+		svc_note(s, "named volume not translated", p);
+		return;
+	}
+	c2 = strchr(c1 + 1, ':');
+	ro = c2 != NULL && strstr(c2, "ro") != NULL;
+	if (c2 != NULL)
+		*c2 = '\0';
+	sb_str(&s->volumes, " (volume (host ");
+	sb_quoted(&s->volumes, p);
+	sb_str(&s->volumes, ") (guest ");
+	sb_quoted(&s->volumes, trim(c1 + 1));
+	sb_str(&s->volumes, ")");
+	if (ro)
+		sb_str(&s->volumes, " (mode ro)");
+	sb_str(&s->volumes, ")");
+}
+
+static void svc_reset(svc *s)
+{
+	free(s->command.data);
+	free(s->env.data);
+	free(s->ports.data);
+	free(s->volumes.data);
+	free(s->notes.data);
+	memset(s, 0, sizeof *s);
+}
+
+/* The buffered service, as a (name ...) machine, its closing paren on its
+ * own line lest a trailing note comment it out. */
+static void svc_flush(svc *s, sb *out)
+{
+	if (!s->open)
+		return;
+	sb_str(out, "\n  (");
+	sb_str(out, s->name);
+	sb_str(out, " (source ");
+	sb_quoted(out, s->source[0] != '\0' ? s->source : "SET-A-SOURCE");
+	sb_str(out, ")");
+	if (s->command.len > 0u) {
+		sb_str(out, " (command");
+		sb_add(out, s->command.data, s->command.len);
+		sb_str(out, ")");
+	}
+	if (s->env.len > 0u) {
+		sb_str(out, " (env");
+		sb_add(out, s->env.data, s->env.len);
+		sb_str(out, ")");
+	}
+	if (s->ports.len > 0u) {
+		sb_str(out, " (ports");
+		sb_add(out, s->ports.data, s->ports.len);
+		sb_str(out, ")");
+	}
+	if (s->volumes.len > 0u) {
+		sb_str(out, " (volumes");
+		sb_add(out, s->volumes.data, s->volumes.len);
+		sb_str(out, ")");
+	}
+	if (s->workdir[0] != '\0') {
+		sb_str(out, " (workdir ");
+		sb_quoted(out, s->workdir);
+		sb_str(out, ")");
+	}
+	if (s->hostname[0] != '\0') {
+		sb_str(out, " (hostname ");
+		sb_quoted(out, s->hostname);
+		sb_str(out, ")");
+	}
+	if (s->restart[0] != '\0') {
+		sb_str(out, " (restart ");
+		sb_str(out, s->restart);
+		sb_str(out, ")");
+	}
+	sb_add(out, s->notes.data ? s->notes.data : "", s->notes.len);
+	sb_str(out, "\n  )");
+	svc_reset(s);
+}
+
+/* The leading-space count, and the content after it. Tabs in the indent are
+ * YAML-illegal; treat one as a space and let the shape fall where it may. */
+static int indent_of(const char *line, const char **content)
+{
+	int n = 0;
+
+	while (line[n] == ' ' || line[n] == '\t')
+		n++;
+	*content = line + n;
+	return n;
+}
+
+static int import_compose(FILE *file)
+{
+	svc    s = { 0 };
+	sb     out = { NULL, 0u, 0u, 0 };
+	sb     top_notes = { NULL, 0u, 0u, 0 };
+	char   line[LINE_CAP];
+	int    in_services = 0;
+	int    svc_indent = -1;
+	int    field_indent = -1;
+	char   field[64] = "";
+	int    any = 0;
+
+	while (fgets(line, sizeof line, file) != NULL) {
+		const char *c;
+		int         ind;
+		char       *content;
+		char       *colon;
+		char       *key;
+		char       *value;
+
+		line[strcspn(line, "\n")] = '\0';
+		ind = indent_of(line, &c);
+		if (*c == '\0' || *c == '#')
+			continue;
+		content = (char *)c;
+		if (ind == 0) {               /* a top-level key */
+			svc_flush(&s, &out);
+			in_services = 0;
+			colon = strchr(content, ':');
+			if (colon != NULL && strncmp(content, "services:", 9u) == 0) {
+				in_services = 1;
+			} else if (colon != NULL) {
+				*colon = '\0';
+				if (strcmp(content, "version") != 0 && strcmp(content, "name") != 0) {
+					sb_str(&top_notes, "\n; top-level key not translated: ");
+					sb_str(&top_notes, content);
+				}
+			}
+			continue;
+		}
+		if (!in_services)
+			continue;
+		if (svc_indent < 0)
+			svc_indent = ind;
+		colon = strchr(content, ':');
+		if (ind == svc_indent && *content != '-') {   /* a service name */
+			svc_flush(&s, &out);
+			if (colon != NULL)
+				*colon = '\0';
+			snprintf(s.name, sizeof s.name, "%s", trim(content));
+			s.open = 1;
+			any = 1;
+			field_indent = -1;
+			field[0] = '\0';
+			continue;
+		}
+		if (!s.open)
+			continue;
+		if (*content == '-') {        /* a block-list item of `field` */
+			char *item = trim(content + 1);
+
+			if (strcmp(field, "environment") == 0)
+				compose_env(&s, item, 0);
+			else if (strcmp(field, "ports") == 0)
+				compose_port(&s, item);
+			else if (strcmp(field, "volumes") == 0)
+				compose_volume(&s, item);
+			else if (strcmp(field, "command") == 0 || strcmp(field, "entrypoint") == 0) {
+				sb_str(&s.command, " ");
+				sb_quoted(&s.command, scalar(item));
+			} else if (strcmp(field, "depends_on") == 0 || strcmp(field, "networks") == 0)
+				svc_note(&s, field, scalar(item));
+			continue;
+		}
+		if (field_indent < 0)
+			field_indent = ind;
+		if (ind > field_indent && field[0] != '\0') {   /* a map entry of `field` */
+			if (strcmp(field, "environment") == 0)
+				compose_env(&s, content, 1);
+			continue;
+		}
+		/* a field: key and its value, which may be empty (a block follows). */
+		if (colon == NULL)
+			continue;
+		*colon = '\0';
+		key = trim(content);
+		value = trim(colon + 1);
+		snprintf(field, sizeof field, "%s", key);
+		if (value[0] == '\0')
+			continue;             /* a block list or map follows */
+		field[0] = '\0';          /* a scalar or flow value, handled now */
+		if (strcmp(key, "image") == 0)
+			snprintf(s.source, sizeof s.source, "%s", scalar(value));
+		else if (strcmp(key, "working_dir") == 0)
+			snprintf(s.workdir, sizeof s.workdir, "%s", scalar(value));
+		else if (strcmp(key, "hostname") == 0 || strcmp(key, "container_name") == 0)
+			snprintf(s.hostname, sizeof s.hostname, "%s", scalar(value));
+		else if (strcmp(key, "restart") == 0) {
+			char *r = scalar(value);
+
+			if (strcmp(r, "unless-stopped") == 0) {
+				snprintf(s.restart, sizeof s.restart, "always");
+				svc_note(&s, "restart unless-stopped mapped to always", NULL);
+			} else if (strcmp(r, "no") == 0 || strcmp(r, "always") == 0 ||
+			           strcmp(r, "on-failure") == 0)
+				snprintf(s.restart, sizeof s.restart, "%s", r);
+			else
+				svc_note(&s, "restart value not translated", r);
+		} else if (strcmp(key, "command") == 0 || strcmp(key, "entrypoint") == 0) {
+			char *words[64];
+			int   n = flow_list(value, words, 64);
+
+			if (n < 0) {
+				sb_str(&s.command, " \"/bin/sh\" \"-c\" ");
+				sb_quoted(&s.command, scalar(value));
+			} else
+				for (int i = 0; i < n; i++) {
+					sb_str(&s.command, " ");
+					sb_quoted(&s.command, words[i]);
+				}
+		} else if (strcmp(key, "ports") == 0 || strcmp(key, "environment") == 0 ||
+		           strcmp(key, "volumes") == 0) {
+			char *items[64];
+			int   n = flow_list(value, items, 64);
+
+			for (int i = 0; i < n; i++) {
+				if (strcmp(key, "ports") == 0)
+					compose_port(&s, items[i]);
+				else if (strcmp(key, "volumes") == 0)
+					compose_volume(&s, items[i]);
+				else
+					compose_env(&s, items[i], 0);
+			}
+			if (n < 0)
+				svc_note(&s, key, "value not translated");
+		} else if (strcmp(key, "build") == 0)
+			svc_note(&s, "build not translated", "hull import the Dockerfile, then name the ref");
+		else if (strcmp(key, "depends_on") == 0 || strcmp(key, "networks") == 0)
+			svc_note(&s, key, scalar(value));
+		else if (strcmp(key, "user") == 0)
+			svc_note(&s, "user not translated", scalar(value));
+		else
+			svc_note(&s, "key not translated", key);
+	}
+	svc_flush(&s, &out);
+	if (!any) {
+		fprintf(stderr, "hull: import: no services: found; is this a compose file?\n");
+		free(out.data);
+		free(top_notes.data);
+		return 2;
+	}
+	if (out.bad || top_notes.bad) {
+		fprintf(stderr, "hull: import: out of memory\n");
+		free(out.data);
+		free(top_notes.data);
+		return 2;
+	}
+	printf("(machines%s%s\n)\n", top_notes.data ? top_notes.data : "", out.data);
+	free(out.data);
+	free(top_notes.data);
+	return 0;
+}
+
+/* Dockerfile or compose, told apart by the file's name: a compose file ends
+ * .yml or .yaml or is named for compose, anything else is a Dockerfile. */
+int hull_import(const char *path)
+{
+	const char *base = strrchr(path, '/');
+	const char *dot;
+	FILE       *file;
+	int         compose;
+	int         status;
+
+	base = base != NULL ? base + 1 : path;
+	dot = strrchr(base, '.');
+	compose = strstr(base, "compose") != NULL ||
+	          (dot != NULL && (strcmp(dot, ".yml") == 0 || strcmp(dot, ".yaml") == 0));
+	if ((file = fopen(path, "r")) == NULL) {
+		fprintf(stderr, "hull: import: %s: cannot open\n", path);
+		return 2;
+	}
+	status = compose ? import_compose(file) : import_dockerfile(file);
+	fclose(file);
 	return status;
 }

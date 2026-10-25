@@ -158,6 +158,58 @@ gb '; ADD treated as COPY'
 gb '; not translated: HEALTHCHECK'
 printf 'RUN true\n' > "$dir/nofrom.in"
 expect 2 'has no FROM' "$hull" import "$dir/nofrom.in"
+# hull import of a compose file (by its .yml name) to a (machines ...) form.
+# J.7's machines share one segment and section 4.8 plans them at once with
+# no ordering, so depends_on and networks are noted, not invented.
+cat > "$dir/docker-compose.yml" <<'YML'
+version: "3.8"
+services:
+  web:
+    image: nginx:1.27
+    ports:
+      - "8080:80"
+      - "53:53/udp"
+    environment:
+      - FOO=bar
+    volumes:
+      - ./site:/usr/share/nginx/html:ro
+    depends_on:
+      - db
+    restart: unless-stopped
+  db:
+    image: postgres:16
+    container_name: thedb
+    command: ["postgres", "-c", "max_connections=50"]
+    build: ./db
+    networks: [backend]
+networks:
+  backend:
+YML
+"$hull" import "$dir/docker-compose.yml" > "$dir/compose.machines" 2>&1
+# The output parses: hull plan reads the multi-machine file and reaches
+# per-machine planning (a syntax error would not); the machines are rejected
+# only for bare refs not in the store, which is proof it parsed.
+cases=$((cases + 1))
+"$hull" plan -f "$dir/compose.machines" --backend chroot 2>&1 | grep -q 'web on' ||
+	fail "import: the compose output did not parse" "$(cat "$dir/compose.machines")"
+gbc() {
+	cases=$((cases + 1))
+	grep -Eq -- "$1" "$dir/compose.machines" ||
+		fail "import compose: no line matches /$1/" "$(cat "$dir/compose.machines")"
+}
+gbc '\(web \(source "nginx:1.27"\)'
+gbc '\(port \(host 8080\) \(guest 80\)\)'
+gbc '\(guest 53\) \(proto udp\)\)'
+gbc '\(env \(FOO "bar"\)\)'
+gbc '\(volume \(host "\./site"\) \(guest "/usr/share/nginx/html"\) \(mode ro\)\)'
+gbc '\(command "postgres" "-c" "max_connections=50"\)'
+gbc '\(hostname "thedb"\)'
+gbc '\(restart always\)'
+gbc '; depends_on: db'
+gbc '; build not translated'
+gbc '; top-level key not translated: networks'
+printf 'version: "3"\n' > "$dir/noservices.yml"
+expect 2 'no services' "$hull" import "$dir/noservices.yml"
 
 # hull doctor: every line a check, its status first, or the fix under one.
 cases=$((cases + 1))

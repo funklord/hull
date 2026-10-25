@@ -138,6 +138,7 @@ TEST_FRAMING_OBJS = $(BUILD_DIR)/test/framing_test.o
 # What test/cli_test.sh writes, so that clean can name it.
 CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.conf \
                  sdunit.conf sdnore.conf sdmulti.conf Dockerfile.in imported.build nofrom.in \
+                 docker-compose.yml compose.machines noservices.yml \
                  home/.ssh/config ssh-config.before foreign.conf machines.conf build.conf bad.conf example.conf run.conf \
                  writable.conf readonly.conf die.conf wait.conf ports.conf noargs.conf nope.conf \
                  pair.conf rootfs/written rootfs/bin/sh vol.conf volro.conf vollink.conf \
