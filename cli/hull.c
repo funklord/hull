@@ -3555,15 +3555,110 @@ static int exec_in(const char *id, char **argv, int argc, int tty, unsigned port
  * TERM goes in as the shell's argument, which needs nothing in the
  * machine but /bin/sh, and is never read as shell text.
  */
+/* The machine's hull-managed host public key, under the data home where
+ * (ssh true) kept the persistent one; 1 and its path, or 0. Its presence is
+ * how `hull ssh` knows a machine runs an sshd it can reach and verify. */
+static int machine_host_pub(const char *id, char *out, size_t cap)
+{
+	const char *data = getenv("XDG_DATA_HOME");
+	const char *home = getenv("HOME");
+	int         n = -1;
+
+	if (data != NULL && data[0] == '/')
+		n = snprintf(out, cap, "%s/hull/machines/%s/host_key.pub", data, id);
+	else if (home != NULL && home[0] == '/')
+		n = snprintf(out, cap, "%s/.local/share/hull/machines/%s/host_key.pub", home, id);
+	return n > 0 && (size_t)n < cap && access(out, R_OK) == 0;
+}
+
+/*
+ * A real ssh into the machine's own sshd, as section 8.1 item 2 prefers
+ * when one runs: the user's ssh client, over `hull proxy-ssh` to port 22,
+ * logging in as root (the guest's own user) with the user's keys, which
+ * (ssh true) authorized. The machine's host key is pinned from the
+ * persistent one in a known_hosts of its own, so there is no prompt and no
+ * churn across runs or backends, and ssh verifies the machine's identity.
+ * Returns ssh's exit, or -1 where ssh cannot be started -- then the caller
+ * falls back to the exec shell.
+ */
+static int ssh_client(const char *id, const char *pub)
+{
+	char    self[4096];
+	char    known[64];
+	char    proxy[4200];
+	char    hosts[4300];
+	char    target[80];
+	char    line[8192];
+	FILE   *pf;
+	char   *type;
+	char   *key;
+	pid_t   child;
+	int     fd;
+	int     status;
+	ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1u);
+
+	if (n <= 0 || (size_t)n >= sizeof self - 1u || strpbrk(self, "\"%\\\n") != NULL)
+		return -1;  /* no usable path for a ProxyCommand: the exec shell */
+	self[n] = '\0';
+	/* The host public key's type and data, without its comment. */
+	if ((pf = fopen(pub, "r")) == NULL || fgets(line, sizeof line, pf) == NULL) {
+		if (pf != NULL)
+			fclose(pf);
+		return -1;
+	}
+	fclose(pf);
+	type = strtok(line, " \t\n");
+	key  = type != NULL ? strtok(NULL, " \t\n") : NULL;
+	if (type == NULL || key == NULL)
+		return -1;
+	snprintf(known, sizeof known, "/tmp/hull-known.XXXXXX");
+	if ((fd = mkstemp(known)) < 0)
+		return -1;
+	snprintf(line, sizeof line, "%s.hull %s %s\n", id, type, key);
+	if (write(fd, line, strlen(line)) != (ssize_t)strlen(line)) {
+		close(fd);
+		unlink(known);
+		return -1;
+	}
+	close(fd);
+	snprintf(proxy, sizeof proxy, "ProxyCommand=\"%s\" proxy-ssh %%h", self);
+	snprintf(hosts, sizeof hosts, "UserKnownHostsFile=%s", known);
+	snprintf(target, sizeof target, "root@%s.hull", id);
+	child = fork();
+	if (child == 0) {
+		execlp("ssh", "ssh", "-o", proxy, "-o", hosts, "-o", "GlobalKnownHostsFile=/dev/null",
+		       "-o", "StrictHostKeyChecking=yes", target, (char *)NULL);
+		_exit(127);
+	}
+	if (child < 0 || waitpid(child, &status, 0) != child) {
+		unlink(known);
+		return -1;
+	}
+	unlink(known);
+	if (WIFEXITED(status) && WEXITSTATUS(status) == 127)
+		return -1;  /* no ssh client: the exec shell */
+	return WIFEXITED(status) ? WEXITSTATUS(status) : 125;
+}
+
 static int ssh_into(const char *id)
 {
 	const char *term = getenv("TERM");
 	char       *login[] = { "/bin/sh", "-l" };
 	char       *termed[] = { "/bin/sh", "-c", "TERM=\"$1\" exec /bin/sh -l", "sh", NULL };
+	char        pub[4300];
 
 	if (!isatty(0)) {
 		fprintf(stderr, "hull: ssh needs a terminal on stdin\n");
 		return 125;
+	}
+	/* Prefer the machine's own sshd where (ssh true) gave it one, falling
+	 * back to a login shell over the agent where there is none, or no ssh
+	 * client (section 8.1 item 2). */
+	if (machine_host_pub(id, pub, sizeof pub)) {
+		int rc = ssh_client(id, pub);
+
+		if (rc >= 0)
+			return rc;
 	}
 	if (term == NULL || term[0] == '\0')
 		return exec_in(id, login, 2, 1, 0u);

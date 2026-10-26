@@ -1067,6 +1067,12 @@ else
 	banner=$(cd / && XDG_RUNTIME_DIR="$sshrt" timeout 20 "$hull" proxy-ssh qssh < /dev/null 2>&1 | head -1)
 	akeys=$(XDG_RUNTIME_DIR="$sshrt" timeout 20 "$hull" exec qssh /probe read /run/hull/ssh/authorized_keys 2>&1)
 	invoked=$(XDG_RUNTIME_DIR="$sshrt" timeout 20 "$hull" exec qssh /probe read /sshd.stub 2>&1)
+	# hull ssh prefers the machine's own sshd where (ssh true) gave it one:
+	# on a terminal of its own (script), it reaches the stub over proxy-ssh
+	# rather than giving the agent's exec shell. The stub speaks the banner
+	# and closes, so the ssh client reports the connection, not a shell.
+	sshout=$(HULL="$hull" XDG_RUNTIME_DIR="$sshrt" timeout 30 \
+		script -qec '"$HULL" ssh qssh' /dev/null 2>&1 < /dev/null | tr -d '\r')
 	XDG_RUNTIME_DIR="$sshrt" timeout 30 "$hull" stop qssh > /dev/null 2>&1
 	wait "$runner"
 	cases=$((cases + 1))
@@ -1084,6 +1090,11 @@ else
 	case $invoked in
 	*host_key*) ;;
 	*) fail "the agent did not start the image's sshd with the host key" "$invoked" ;;
+	esac
+	cases=$((cases + 1))
+	case $sshout in
+	*SSH-2.0-hull-stub*|*"Connection closed"*|*kex_exchange_identification*) ;;
+	*) fail "hull ssh did not use the machine's own sshd for an (ssh true) machine" "$sshout" ;;
 	esac
 	# The host key is machine state: a second run reuses the one kept under
 	# the data home, so repeated ssh does not trip known_hosts (8.1 item 2).
