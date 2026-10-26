@@ -546,8 +546,11 @@ int main(int argc, char **argv)
 			const char *config = "";
 			const char *hostkey = "";
 			int         one = 1;
+			int         port = 22;
+			char        listen_addr[64] = "";
 			int         fd;
 			FILE       *rec;
+			FILE       *cf;
 			struct sockaddr_in at;
 
 			for (int i = 1; i < argc; i++) {
@@ -556,10 +559,25 @@ int main(int argc, char **argv)
 				else if (strcmp(argv[i], "-h") == 0 && i + 1 < argc)
 					hostkey = argv[++i];
 			}
+			/* Bind what the config says, as a real sshd would: the chroot
+			 * engine points it at the machine's own address on a high port,
+			 * the unprivileged user being unable to bind 22 on the host. */
+			if (config[0] != '\0' && (cf = fopen(config, "r")) != NULL) {
+				char line[256];
+
+				while (fgets(line, sizeof line, cf) != NULL) {
+					if (sscanf(line, " Port %d", &port) == 1)
+						continue;
+					sscanf(line, " ListenAddress %63s", listen_addr);
+				}
+				fclose(cf);
+			}
 			fd = socket(AF_INET, SOCK_STREAM, 0);
 			memset(&at, 0, sizeof at);
 			at.sin_family = AF_INET;
-			at.sin_port   = htons(22);
+			at.sin_port   = htons((unsigned short)port);
+			if (listen_addr[0] == '\0' || inet_pton(AF_INET, listen_addr, &at.sin_addr) != 1)
+				at.sin_addr.s_addr = htonl(INADDR_ANY);
 			setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
 			if (fd < 0 || bind(fd, (struct sockaddr *)&at, sizeof at) != 0 || listen(fd, 1) != 0)
 				return 1;

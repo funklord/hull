@@ -359,6 +359,14 @@ expect 1 'example\.conf:[0-9]+:[0-9]+: machine on qemu \(vm\): virtualbox: ignor
 # make builds. Paths in a file are the file's, so these run from /.
 root=$(cd "$dir" && pwd)
 mkdir -p "$root/rootfs/srv"
+# A HOME of the test's own, never the account's: the core reads the user's
+# ~/.ssh public keys for (ssh true)'s authorized_keys (section 8.1), and it
+# must read a known, benign key rather than whatever the account has. Set
+# before the first run below, which starts the core that reads it.
+export HOME="$root/home"
+mkdir -p "$root/home/.ssh"
+chmod 700 "$root/home/.ssh"
+printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5hulltestkey hull-test\n' > "$root/home/.ssh/id_ed25519.pub"
 conf() { # NAME ENTRIES...
 	name=$1
 	shift
@@ -608,9 +616,9 @@ cmp -s "$root/ssh-config.before" "$root/home/.ssh/config" ||
 	fail "ssh-config --remove did not give back the file as it was" "$(cat "$root/home/.ssh/config")"
 expect 1 '^hull: ssh-config: HOME is not set$' env -u HOME "$hull" ssh-config
 
-# A chroot machine shares the host's network, so it has no port 22 of its
-# own for proxy-ssh; and a name that is only the suffix names none.
-expect 125 "^hull: that engine's machines have no ports of their own$" "$hull" proxy-ssh execd.hull
+# A chroot machine without (ssh true) runs no sshd, so proxy-ssh has
+# nothing to reach; and a name that is only the suffix names none.
+expect 125 "^hull: that machine runs no sshd to reach$" "$hull" proxy-ssh execd.hull
 expect 125 '^hull: \.hull names no machine$' "$hull" proxy-ssh .hull
 expect 0 '^GREETING=hi$' "$hull" exec execd /probe env GREETING
 # Small, and counted from 3 in the machine's own PID namespace, where a
@@ -2041,6 +2049,41 @@ cases=$((cases + 1))
 left=$(ls -A "$shm/hull/secrets")
 [ -z "$left" ] || fail "a refused run left its secrets" "$left"
 # Its core leaves, as this suite's did, before its directory is removed.
+tries=0
+while [ -S "$shm/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+
+# (ssh true) on the chroot engine, on a tmpfs core of its own (the host key
+# is kept in memory, so it needs one). The image's own sshd is supervised on
+# the machine's own 127.107 address at a high port (section 8.1): the
+# unprivileged user cannot bind 22 on the shared host net. proxy-ssh reaches
+# it over the host loopback directly, with no agent, and the core writes the
+# user's ~/.ssh public key in as the machine's authorized_keys. Refused with
+# (network none), which leaves no host network to reach it on.
+mkdir -p "$root/sshroot/run" "$root/sshroot/proc" "$root/sshroot/usr/sbin"
+cp "$root/rootfs/probe" "$root/sshroot/probe"
+cp "$root/rootfs/probe" "$root/sshroot/usr/sbin/sshd"
+printf '(machine (source "dir:./sshroot") (backend chroot) (hostname "csshd") (ssh true) (on_disconnect keep) (command "/probe" "wait"))\n' \
+	> "$root/csshd.conf"
+(cd / && exec env XDG_RUNTIME_DIR="$shm" "$hull_abs" run -f "$root/csshd.conf" > /dev/null 2>&1) &
+csshder=$!
+tries=0
+until env XDG_RUNTIME_DIR="$shm" "$hull" ps 2>/dev/null | grep -q '^csshd .*running$' || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+expect 0 '^SSH-2\.0-hull-stub' env XDG_RUNTIME_DIR="$shm" sh -c 'cd / && exec "$0" proxy-ssh csshd < /dev/null' \
+	"$hull_abs"
+expect 0 'hulltestkey' env XDG_RUNTIME_DIR="$shm" "$hull" exec csshd /probe read /run/hull/ssh/authorized_keys
+env XDG_RUNTIME_DIR="$shm" "$hull" stop csshd > /dev/null 2>&1
+kill -KILL "$csshder" 2>/dev/null
+wait "$csshder" 2>/dev/null
+printf '(machine (source "dir:./sshroot") (backend chroot) (hostname "cnossh") (network none) (ssh true) (command "/probe" "wait"))\n' \
+	> "$root/cnossh.conf"
+expect 125 '\(ssh true\) needs the host network to be reached: not with \(network none\)' \
+	env XDG_RUNTIME_DIR="$shm" sh -c 'cd / && exec "$0" run -f "$1"' "$hull_abs" "$root/cnossh.conf"
 tries=0
 while [ -S "$shm/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
 	tries=$((tries + 1))

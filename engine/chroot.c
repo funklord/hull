@@ -39,8 +39,10 @@
 #include <pwd.h>
 #include <grp.h>
 #include <fcntl.h>
+#include <arpa/inet.h>
 #include <linux/if_tun.h>
 #include <net/if.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
@@ -75,6 +77,10 @@
 #define MAX_VOLUMES 64u
 #define MAX_SEGMENTS 8u
 #define HELD_LIMIT  (256u * 1024u)  /* output an init holds for no core */
+/* (ssh true)'s sshd port: a high one, since the chroot user is unprivileged
+ * on the shared host net and cannot bind 22; the machine's 127.107 address
+ * makes it unique per machine (section 8.1). */
+#define HULL_SSH_PORT 2222
 
 /* A frame from the init: data on fd 1 or 2, or the workload's end, whose
  * wait status is the four bytes after. */
@@ -103,6 +109,8 @@ struct hull_machine {
 	unsigned         volume_count;
 	int              staged;     /* a volume is a stack, staged in the machine's directory */
 	char            *secrets;    /* the core's directory of them, or NULL */
+	char            *ssh_dir;    /* (ssh true): the core's directory of ssh material, or NULL */
+	int              ssh;        /* (ssh true): supervise the image's sshd on the machine's address */
 	char            *export;     /* (export PATH): the tree's tar, once the workload ends */
 	char            *owners;     /* (owners PATH): owners to give back, before the workload */
 	char            *layer_path[MAX_VOLUMES];  /* (layers ...): read-only, each above the last */
@@ -145,6 +153,7 @@ static void release(hull_machine *m)
 	free(m->workdir);
 	free(m->hostname);
 	free(m->secrets);
+	free(m->ssh_dir);
 	free(m->export);
 	free(m->owners);
 	for (unsigned i = 0u; i < m->layer_count; i++)
@@ -433,6 +442,31 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		m->env_count = n;
 		if (hull_access_exposed(doc, &machine, add_exposed, m) != 0 || m->env_count > MAX_ENV)
 			return "a secret to expose cannot be read, holds a NUL, or is one env name too many";
+	}
+
+	/* (ssh true): the image's sshd, which the engine supervises on the
+	 * machine's own 127.107 address, since chroot shares the host network
+	 * (section 8.1). The address is where it binds and where hull reaches
+	 * it, so (network none) -- which has no host-reachable address -- is
+	 * refused. */
+	m->ssh = hull_access_true(doc, &machine, "ssh");
+	if (m->ssh) {
+		hull_sexpr_form top;
+		char           *addr;
+
+		if (m->no_network)
+			return "(ssh true) needs the host network to be reached: not with (network none)";
+		hull_sexpr_first(doc, &top);
+		m->ssh_dir = hull_access_value(doc, &top, "ssh_dir");
+		if (m->ssh_dir == NULL)
+			return "(ssh true): the plan delivered no ssh material";
+		addr = hull_access_value(doc, &top, "address");
+		if (addr == NULL || addr[0] == '\0' || strlen(addr) >= sizeof m->address_text) {
+			free(addr);
+			return "(ssh true): the plan gives the machine no address for its sshd";
+		}
+		snprintf(m->address_text, sizeof m->address_text, "%s", addr);
+		free(addr);
 	}
 	return NULL;
 }
@@ -1026,6 +1060,8 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	char             step[320];
 	int              volumes[MAX_VOLUMES];
 	int              secrets = -1;
+	int              ssh_tree = -1;
+	const char      *ssh_bin = NULL;  /* the image's sshd, once found after the pivot */
 	int              null = open("/dev/null", O_RDWR | O_CLOEXEC);
 	int              out[2];
 	int              err[2];
@@ -1154,6 +1190,16 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		    mount_setattr(secrets, "", AT_EMPTY_PATH, &readonly, sizeof readonly) != 0)
 			child_fail(report, "the secrets");
 	}
+	if (m->ssh_dir != NULL) {
+		struct mount_attr readonly = { .attr_set = MOUNT_ATTR_RDONLY |
+		                                           MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV |
+		                                           MOUNT_ATTR_NOEXEC };
+
+		ssh_tree = open_tree(AT_FDCWD, m->ssh_dir, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+		if (ssh_tree < 0 ||
+		    mount_setattr(ssh_tree, "", AT_EMPTY_PATH, &readonly, sizeof readonly) != 0)
+			child_fail(report, "the ssh material");
+	}
 	if (m->hostname != NULL && sethostname(m->hostname, strlen(m->hostname)) != 0)
 		child_fail(report, "sethostname");
 	/* A namespace of its own starts with lo down: up, so that a dial to a
@@ -1248,12 +1294,49 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	 * the dir's /run, which FHS has emptied at every boot, is hidden, and
 	 * nothing is created in the user's dir. A dir with no /run cannot
 	 * have them. */
-	if (secrets >= 0) {
+	if (secrets >= 0 || ssh_tree >= 0) {
+		/* A tmpfs at /run for the material, hiding the dir's own /run (FHS
+		 * empties it each boot); a dir with no /run cannot have either. */
 		if (mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755,size=1m") != 0)
-			child_fail(report, "the secrets: a tmpfs at /run, which the dir must have");
-		if (mkdir("/run/hull", 0755) != 0 || mkdir("/run/hull/secrets", 0700) != 0 ||
+			child_fail(report, "a tmpfs at /run, which the dir must have");
+		if (mkdir("/run/hull", 0755) != 0)
+			child_fail(report, "/run/hull");
+	}
+	if (secrets >= 0) {
+		if (mkdir("/run/hull/secrets", 0700) != 0 ||
 		    move_mount(secrets, "", AT_FDCWD, "/run/hull/secrets", MOVE_MOUNT_F_EMPTY_PATH) != 0)
 			child_fail(report, "the secrets");
+	}
+	if (ssh_tree >= 0) {
+		/* The host key, authorized_keys and the core's (qemu-shaped) config
+		 * at /run/hull/ssh; a config of chroot's own beside them, binding
+		 * the machine's own 127.107 address on a high port -- the chroot
+		 * user is unprivileged on the shared host net, so not port 22
+		 * (section 8.1). The image's sshd, found at the usual place, serves
+		 * it; absent, (ssh true) is refused here rather than run without one. */
+		static const char *const where[] = { "/usr/sbin/sshd", "/usr/bin/sshd", NULL };
+		char  config[1024];
+		int   fd;
+		int   n;
+		unsigned i;
+
+		if (mkdir("/run/hull/ssh", 0700) != 0 ||
+		    move_mount(ssh_tree, "", AT_FDCWD, "/run/hull/ssh", MOVE_MOUNT_F_EMPTY_PATH) != 0)
+			child_fail(report, "the ssh material");
+		n = snprintf(config, sizeof config,
+		             "Port %d\nListenAddress %s\nHostKey /run/hull/ssh/host_key\n"
+		             "AuthorizedKeysFile /run/hull/ssh/authorized_keys\n"
+		             "PasswordAuthentication no\nPermitRootLogin prohibit-password\nUsePAM no\n",
+		             HULL_SSH_PORT, m->address_text);
+		fd = open("/run/hull/ssh.conf", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0400);
+		if (n <= 0 || n >= (int)sizeof config || fd < 0 || write(fd, config, (size_t)n) != n)
+			child_fail(report, "the ssh config");
+		close(fd);
+		for (i = 0u; where[i] != NULL && access(where[i], X_OK) != 0; i++)
+			;
+		if (where[i] == NULL)
+			child_fail(report, "(ssh true): the image has no sshd at /usr/sbin/sshd or /usr/bin/sshd");
+		ssh_bin = where[i];
 	}
 	if (chdir(m->workdir) != 0)
 		child_fail(report, "workdir");
@@ -1268,6 +1351,30 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	sigaction(SIGCHLD, &action, NULL);
 	action.sa_handler = SIG_IGN;
 	sigaction(SIGPIPE, &action, NULL);
+	/* The image's sshd beside the workload: a child the init reaps like any
+	 * other, so its exit does not end the machine (only the workload's does,
+	 * in relay). It binds the machine's address on HULL_SSH_PORT per its
+	 * config; its own stdio goes nowhere, since it is supervised, not a
+	 * stream. */
+	if (ssh_bin != NULL) {
+		pid_t sshd = fork();
+
+		if (sshd == 0) {
+			action.sa_handler = SIG_DFL;
+			for (unsigned i = 0u; i < sizeof forwarded / sizeof forwarded[0]; i++)
+				sigaction(forwarded[i], &action, NULL);
+			sigaction(SIGCHLD, &action, NULL);
+			sigaction(SIGPIPE, &action, NULL);
+			/* Its own session, so a signal to the init's foreground group
+			 * does not reach it; its stdio is the init's /dev/null, inherited
+			 * (the init dups it there above and close_others spares 0-2), so
+			 * the -e logs go nowhere, as a supervised child's should. */
+			if (setsid() < 0)
+				_exit(126);
+			execl(ssh_bin, "sshd", "-D", "-e", "-f", "/run/hull/ssh.conf", (char *)NULL);
+			_exit(127);
+		}
+	}
 	workload = fork();
 	if (workload < 0)
 		child_fail(report, "fork");
@@ -1826,6 +1933,7 @@ struct hull_stream {
 	int           reaped;  /* the helper's pid is no longer its own */
 	int           writing; /* a stream_write() is using `in` */
 	int           ending;  /* stream_eof() has been called */
+	int           dialed;  /* a raw connection to the machine's sshd, no helper */
 };
 
 static void *read_exec(void *arg)
@@ -1897,6 +2005,98 @@ static void *read_exec(void *arg)
 	else
 		host->on_exit(st->core, st->machine, st, WEXITSTATUS(status), 0);
 	return NULL;
+}
+
+/* A dial's reader: the socket to the machine's sshd, relayed raw as the
+ * stream's output until the far end closes, then the connection's own end,
+ * which is the machine's close (0). No helper to reap. It does not close
+ * the socket; stream_close does, after joining this thread. */
+static void *read_dial(void *arg)
+{
+	hull_stream *st = arg;
+	uint8_t      buffer[4096];
+
+	for (;;) {
+		ssize_t n = read(st->out, buffer, sizeof buffer);
+
+		if (n > 0)
+			host->on_data(st->core, st, 1, buffer, (size_t)n);
+		else if (n == 0 || (errno != EINTR && errno != EAGAIN))
+			break;
+	}
+	host->on_exit(st->core, st->machine, st, 0, 0);
+	return NULL;
+}
+
+/*
+ * A connection to the machine's sshd, for `hull proxy-ssh` and `hull ssh`
+ * (section 8.1). chroot shares the host's network, so the sshd bound the
+ * machine's own 127.107 address on HULL_SSH_PORT (run_init), and this is a
+ * plain connect to it on the host loopback -- no agent, unlike qemu's over
+ * vsock. Only the sshd is reachable this way; a machine with none, or a
+ * dial to any other port, is refused.
+ */
+static hull_status chroot_dial(hull_core *core, hull_machine *m, uint16_t port,
+                               hull_stream **out, hull_error *error)
+{
+	struct sockaddr_in to;
+	struct pollfd      wait;
+	hull_stream       *st;
+	int                fd;
+	int                failed = 0;
+	socklen_t          length = sizeof failed;
+
+	if (!m->ssh)
+		return fail(error, HULL_ERR_UNSUPPORTED, "that machine runs no sshd to reach");
+	if (port != 22u)
+		return fail(error, HULL_ERR_UNSUPPORTED, "a chroot machine has no port to dial but its "
+		            "sshd's, which is port 22");
+	memset(&to, 0, sizeof to);
+	to.sin_family = AF_INET;
+	to.sin_port   = htons(HULL_SSH_PORT);
+	if (inet_pton(AF_INET, m->address_text, &to.sin_addr) != 1)
+		return fail(error, HULL_ERR_GONE, "the machine has no address to dial");
+	fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+	if (fd < 0)
+		return fail(error, HULL_ERR_INTERNAL, "no socket to dial with");
+	if (connect(fd, (struct sockaddr *)&to, sizeof to) != 0) {
+		wait = (struct pollfd){ fd, POLLOUT, 0 };
+		if (errno != EINPROGRESS)
+			failed = errno;
+		else if (poll(&wait, 1u, 2000) != 1)
+			failed = ETIMEDOUT;
+		else if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &failed, &length) != 0)
+			failed = errno;
+	}
+	if (failed != 0) {
+		close(fd);
+		snprintf(m->detail, sizeof m->detail, "port 22: %s", strerror(failed));
+		return fail(error, HULL_ERR_RUNTIME, m->detail);
+	}
+	if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK) != 0 ||
+	    (st = calloc(1u, sizeof *st)) == NULL) {
+		close(fd);
+		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+	}
+	st->machine = m;
+	st->core    = core;
+	st->helper  = -1;
+	st->status  = -1;
+	st->tty     = -1;
+	st->out     = fd;
+	st->in      = dup(fd);
+	st->dialed  = 1;
+	pthread_mutex_init(&st->lock, NULL);
+	if (st->in < 0 || pthread_create(&st->reader, NULL, read_dial, st) != 0) {
+		if (st->in >= 0)
+			close(st->in);
+		pthread_mutex_destroy(&st->lock);
+		close(fd);
+		free(st);
+		return fail(error, HULL_ERR_INTERNAL, "the reader thread could not start");
+	}
+	*out = st;
+	return HULL_OK;
 }
 
 /* The helper: into the machine, then the command. */
@@ -2361,10 +2561,18 @@ static hull_status chroot_stream_close(hull_core *core, hull_stream *st, hull_er
 {
 	chroot_stream_eof(core, st, error);
 	pthread_mutex_lock(&st->lock);
-	if (!st->reaped)
+	if (st->dialed) {
+		/* No helper to signal; wake read_dial, which is reading the socket,
+		 * by shutting it. It leaves the fd for this to close after the join. */
+		if (st->out >= 0)
+			shutdown(st->out, SHUT_RDWR);
+	} else if (!st->reaped) {
 		kill(st->helper, SIGKILL);
+	}
 	pthread_mutex_unlock(&st->lock);
 	pthread_join(st->reader, NULL);
+	if (st->dialed && st->out >= 0)
+		close(st->out);
 	pthread_mutex_destroy(&st->lock);
 	free(st);
 	return HULL_OK;
@@ -2410,6 +2618,10 @@ static const hull_cap_entry entries[] = {
 	{ "network.host",           HULL_SUP_NATIVE,   NULL, NULL },
 	{ "network.none",           HULL_SUP_NATIVE,
 	  "a network namespace of the machine's own, with lo alone", NULL },
+	{ "ssh",                    HULL_SUP_NATIVE,
+	  "the image's own sshd, supervised on the machine's 127.107 address at a high port "
+	  "(the user is unprivileged on the shared host net); needs the host network, refused "
+	  "at start if the image has no sshd", NULL },
 	{ "segments",               HULL_SUP_NATIVE,
 	  "a tap each, eth0 and on, in the machine's own network namespace, relayed to the core's "
 	  "switch; with (network none)", NULL },
@@ -2460,6 +2672,7 @@ static const hull_engine_ops ops = {
 	.signal       = chroot_signal,
 	.stats        = chroot_stats,
 	.pause        = chroot_pause,
+	.dial         = chroot_dial,
 };
 
 static const hull_engine engine = {
