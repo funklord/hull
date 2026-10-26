@@ -1120,6 +1120,32 @@ else
 	else
 		fail "(ssh true) kept no persistent host key for the machine" "$keyfile"
 	fi
+	# hull ssh also finds an image's OWN sshd, with no (ssh true) and so no
+	# persistent key: a machine whose workload is the stub sshd serving :22.
+	# hull ssh probes the port, finds it, and runs ssh (unpinned, the user's
+	# own known_hosts) rather than the exec shell. The stub speaks the banner
+	# and closes, so the ssh client reports the connection.
+	printf '(machine (source "dir:./sshroot") (backend vm) (hostname "qimg") %s)\n' \
+		'(command "/usr/sbin/sshd")' > "$root/qimg.conf"
+	rm -f "$root/qimg.out"
+	(cd / && exec env XDG_RUNTIME_DIR="$sshrt" timeout -k 2 90 "$hull" run -f "$root/qimg.conf" \
+		> "$root/qimg.out" 2>&1) &
+	runner=$!
+	tries=0
+	until XDG_RUNTIME_DIR="$sshrt" timeout 20 "$hull" exec qimg /probe kind /sshd.stub 2>/dev/null |
+	      grep -q '^kind=file$' || [ "$tries" -ge 60 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+	imgout=$(HULL="$hull" XDG_RUNTIME_DIR="$sshrt" timeout 30 \
+		script -qec '"$HULL" ssh qimg' /dev/null 2>&1 < /dev/null | tr -d '\r')
+	XDG_RUNTIME_DIR="$sshrt" timeout 30 "$hull" stop qimg > /dev/null 2>&1
+	wait "$runner"
+	cases=$((cases + 1))
+	case $imgout in
+	*SSH-2.0-hull-stub*|*"Connection "*|*kex_exchange_identification*|*ssh_dispatch_run_fatal*) ;;
+	*) fail "hull ssh did not find an image's own sshd with no (ssh true)" "$imgout" ;;
+	esac
 	# And refused when the image has no sshd: (ssh true) must fail at start,
 	# not run the machine silently without one (section 6). nosshroot has
 	# /run, so the material is placed and the refusal is for the sshd alone.

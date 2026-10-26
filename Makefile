@@ -181,7 +181,7 @@ QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.co
                   vkernel.conf vkernelno.conf vkernelbad.conf mykernel badkernel \
                   vkimage.conf vkimageno.conf vkimagebad.conf \
                   vstats.conf vstats.out \
-                  qssh.conf qssh.out qnossh.conf \
+                  qssh.conf qssh.out qnossh.conf qimg.conf qimg.out \
                   sshroot/probe sshroot/usr/sbin/sshd nosshroot/probe \
                   home/.ssh/id_ed25519.pub \
                   qticks.out)

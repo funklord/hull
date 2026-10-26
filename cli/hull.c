@@ -3574,10 +3574,12 @@ static int machine_host_pub(const char *id, char *out, size_t cap)
 /*
  * A real ssh into the machine's own sshd, as section 8.1 item 2 prefers
  * when one runs: the user's ssh client, over `hull proxy-ssh` to port 22,
- * logging in as root (the guest's own user) with the user's keys, which
- * (ssh true) authorized. The machine's host key is pinned from the
- * persistent one in a known_hosts of its own, so there is no prompt and no
- * churn across runs or backends, and ssh verifies the machine's identity.
+ * logging in as root (the guest's own user). Where `pub` names the
+ * machine's persistent host public key -- an sshd that (ssh true)
+ * provisioned -- it is pinned in a known_hosts of its own, so ssh verifies
+ * the machine with no prompt and no churn across runs. Where `pub` is NULL
+ * -- an sshd the image runs of its own, with its own keys and authorized
+ * keys -- ssh uses the user's own known_hosts as it would for any host.
  * Returns ssh's exit, or -1 where ssh cannot be started -- then the caller
  * falls back to the exec shell.
  */
@@ -3589,9 +3591,9 @@ static int ssh_client(const char *id, const char *pub)
 	char    hosts[4300];
 	char    target[80];
 	char    line[8192];
-	FILE   *pf;
-	char   *type;
-	char   *key;
+	char   *argv[14];
+	int     ai = 0;
+	int     pinned = pub != NULL;
 	pid_t   child;
 	int     fd;
 	int     status;
@@ -3600,44 +3602,91 @@ static int ssh_client(const char *id, const char *pub)
 	if (n <= 0 || (size_t)n >= sizeof self - 1u || strpbrk(self, "\"%\\\n") != NULL)
 		return -1;  /* no usable path for a ProxyCommand: the exec shell */
 	self[n] = '\0';
-	/* The host public key's type and data, without its comment. */
-	if ((pf = fopen(pub, "r")) == NULL || fgets(line, sizeof line, pf) == NULL) {
-		if (pf != NULL)
-			fclose(pf);
-		return -1;
-	}
-	fclose(pf);
-	type = strtok(line, " \t\n");
-	key  = type != NULL ? strtok(NULL, " \t\n") : NULL;
-	if (type == NULL || key == NULL)
-		return -1;
-	snprintf(known, sizeof known, "/tmp/hull-known.XXXXXX");
-	if ((fd = mkstemp(known)) < 0)
-		return -1;
-	snprintf(line, sizeof line, "%s.hull %s %s\n", id, type, key);
-	if (write(fd, line, strlen(line)) != (ssize_t)strlen(line)) {
+	if (pinned) {
+		FILE *pf = fopen(pub, "r");
+		char *type;
+		char *key;
+
+		/* The host public key's type and data, without its comment. */
+		if (pf == NULL || fgets(line, sizeof line, pf) == NULL) {
+			if (pf != NULL)
+				fclose(pf);
+			return -1;
+		}
+		fclose(pf);
+		type = strtok(line, " \t\n");
+		key  = type != NULL ? strtok(NULL, " \t\n") : NULL;
+		if (type == NULL || key == NULL)
+			return -1;
+		snprintf(known, sizeof known, "/tmp/hull-known.XXXXXX");
+		if ((fd = mkstemp(known)) < 0)
+			return -1;
+		snprintf(line, sizeof line, "%s.hull %s %s\n", id, type, key);
+		if (write(fd, line, strlen(line)) != (ssize_t)strlen(line)) {
+			close(fd);
+			unlink(known);
+			return -1;
+		}
 		close(fd);
-		unlink(known);
-		return -1;
+		snprintf(hosts, sizeof hosts, "UserKnownHostsFile=%s", known);
 	}
-	close(fd);
 	snprintf(proxy, sizeof proxy, "ProxyCommand=\"%s\" proxy-ssh %%h", self);
-	snprintf(hosts, sizeof hosts, "UserKnownHostsFile=%s", known);
 	snprintf(target, sizeof target, "root@%s.hull", id);
+	argv[ai++] = "ssh";
+	argv[ai++] = "-o";
+	argv[ai++] = proxy;
+	if (pinned) {
+		argv[ai++] = "-o";
+		argv[ai++] = hosts;
+		argv[ai++] = "-o";
+		argv[ai++] = "GlobalKnownHostsFile=/dev/null";
+		argv[ai++] = "-o";
+		argv[ai++] = "StrictHostKeyChecking=yes";
+	}
+	argv[ai++] = target;
+	argv[ai]   = NULL;
 	child = fork();
 	if (child == 0) {
-		execlp("ssh", "ssh", "-o", proxy, "-o", hosts, "-o", "GlobalKnownHostsFile=/dev/null",
-		       "-o", "StrictHostKeyChecking=yes", target, (char *)NULL);
+		execvp("ssh", argv);
 		_exit(127);
 	}
 	if (child < 0 || waitpid(child, &status, 0) != child) {
-		unlink(known);
+		if (pinned)
+			unlink(known);
 		return -1;
 	}
-	unlink(known);
+	if (pinned)
+		unlink(known);
 	if (WIFEXITED(status) && WEXITSTATUS(status) == 127)
 		return -1;  /* no ssh client: the exec shell */
 	return WIFEXITED(status) ? WEXITSTATUS(status) : 125;
+}
+
+/*
+ * Does something answer on the machine's port 22 -- an sshd the image runs
+ * of its own, which (ssh true) did not provision? Dial it and see whether
+ * the core connects rather than refusing, within a short window: a real
+ * sshd sends its banner at once, so a silent service or none reads as no
+ * sshd and falls to the exec shell. Used only when there is no persistent
+ * host key to go by.
+ */
+static int machine_sshd_open(const char *id)
+{
+	hull_wire      wire;
+	hull_sexpr_doc body;
+	struct pollfd  p;
+	int            open = 0;
+
+	if (connect_core(&wire, 0) != 0)
+		return 0;
+	send_request(&wire, "(4:dial", 1u, id, "(4:port2:22)");
+	p.fd     = wire.fd;
+	p.events = POLLIN;
+	if (poll(&p, 1u, 2000) == 1 && hull_wire_read(&wire, &body) == HULL_WIRE_OK &&
+	    !hull_msg_is(&body, "error"))
+		open = 1;
+	hull_wire_close(&wire);
+	return open;
 }
 
 static int ssh_into(const char *id)
@@ -3646,18 +3695,22 @@ static int ssh_into(const char *id)
 	char       *login[] = { "/bin/sh", "-l" };
 	char       *termed[] = { "/bin/sh", "-c", "TERM=\"$1\" exec /bin/sh -l", "sh", NULL };
 	char        pub[4300];
+	int         rc;
 
 	if (!isatty(0)) {
 		fprintf(stderr, "hull: ssh needs a terminal on stdin\n");
 		return 125;
 	}
-	/* Prefer the machine's own sshd where (ssh true) gave it one, falling
-	 * back to a login shell over the agent where there is none, or no ssh
-	 * client (section 8.1 item 2). */
+	/* Prefer the machine's own sshd where one runs (section 8.1 item 2):
+	 * a (ssh true)-provisioned one, known by its persistent host key and
+	 * pinned; else an image's own, found by a port-22 probe and left to
+	 * the user's own known_hosts. A login shell over the agent otherwise,
+	 * or where there is no ssh client. */
 	if (machine_host_pub(id, pub, sizeof pub)) {
-		int rc = ssh_client(id, pub);
-
-		if (rc >= 0)
+		if ((rc = ssh_client(id, pub)) >= 0)
+			return rc;
+	} else if (machine_sshd_open(id)) {
+		if ((rc = ssh_client(id, NULL)) >= 0)
 			return rc;
 	}
 	if (term == NULL || term[0] == '\0')
