@@ -458,19 +458,89 @@ static int bring_up(int fd, const char *name)
 	return ioctl(fd, SIOCSIFFLAGS, &request);
 }
 
-/* Whether the kernel's command line has hull.passt=1. */
-static int passt_given(void)
+/* The value of `key=` on the kernel's command line, into `out`: 1, or 0
+ * where it is not there. */
+static int cmdline_value(const char *key, char *out, size_t cap)
 {
-	char  line[1024];
-	FILE *cmdline = fopen("/proc/cmdline", "r");
-	int   given = 0;
+	char   line[1024];
+	FILE  *cmdline = fopen("/proc/cmdline", "r");
+	size_t length = strlen(key);
+	int    given = 0;
 
 	if (cmdline != NULL && fgets(line, sizeof line, cmdline) != NULL)
 		for (char *word = strtok(line, " \n"); word != NULL && !given; word = strtok(NULL, " \n"))
-			given = strcmp(word, "hull.passt=1") == 0;
+			if (strncmp(word, key, length) == 0 && word[length] == '=') {
+				snprintf(out, cap, "%s", word + length + 1u);
+				given = 1;
+			}
 	if (cmdline != NULL)
 		fclose(cmdline);
 	return given;
+}
+
+/* Whether the kernel's command line has hull.passt=1. */
+static int passt_given(void)
+{
+	char value[8];
+
+	return cmdline_value("hull.passt", value, sizeof value) && strcmp(value, "1") == 0;
+}
+
+/* On a host bridge (engine/qemu.c): hull.bridge=ADDRESS/PREFIX,GATEWAY on
+ * hull0, eth0 given them and a route out, the host's resolvers from
+ * hull.dns=A,B in /hull/resolv.conf; or hull.bridge=self, eth0 up and its
+ * addressing the workload's. 1 where it is on a bridge. */
+static int bridged(int fd)
+{
+	char           value[96];
+	char           dns[256];
+	char           address[24];
+	char           gateway[24];
+	unsigned       prefix = 0u;
+	struct ifreq   request;
+	struct rtentry route;
+
+	if (!cmdline_value("hull.bridge", value, sizeof value))
+		return 0;
+	memset(&request, 0, sizeof request);
+	snprintf(request.ifr_name, sizeof request.ifr_name, "eth0");
+	if (strcmp(value, "self") != 0) {
+		if (sscanf(value, "%23[0-9.]/%u,%23[0-9.]", address, &prefix, gateway) != 3 ||
+		    prefix < 1u || prefix > 30u) {
+			say("hull.bridge", value);
+			return 1;
+		}
+		set_address(&request.ifr_addr, address);
+		if (ioctl(fd, SIOCSIFADDR, &request) != 0)
+			say("eth0", strerror(errno));
+		memset(&request.ifr_netmask, 0, sizeof request.ifr_netmask);
+		((struct sockaddr_in *)&request.ifr_netmask)->sin_family = AF_INET;
+		((struct sockaddr_in *)&request.ifr_netmask)->sin_addr.s_addr =
+		    htonl(0xffffffffu << (32u - prefix));
+		if (ioctl(fd, SIOCSIFNETMASK, &request) != 0)
+			say("eth0", strerror(errno));
+	}
+	if (bring_up(fd, "eth0") != 0)
+		say("eth0", strerror(errno));
+	if (strcmp(value, "self") == 0)
+		return 1;
+	memset(&route, 0, sizeof route);
+	set_address(&route.rt_dst, "0.0.0.0");
+	set_address(&route.rt_genmask, "0.0.0.0");
+	set_address(&route.rt_gateway, gateway);
+	route.rt_flags = RTF_UP | RTF_GATEWAY;
+	if (ioctl(fd, SIOCADDRT, &route) != 0)
+		say("route", strerror(errno));
+	if (cmdline_value("hull.dns", dns, sizeof dns)) {
+		FILE *resolv = fopen("/hull/resolv.conf", "w");
+
+		for (char *server = strtok(dns, ","); resolv != NULL && server != NULL;
+		     server = strtok(NULL, ","))
+			fprintf(resolv, "nameserver %s\n", server);
+		if (resolv == NULL || fclose(resolv) != 0)
+			say("resolv.conf", strerror(errno));
+	}
+	return 1;
 }
 
 static void network(void)
@@ -488,7 +558,12 @@ static void network(void)
 		say("lo", strerror(errno));
 	/* A machine of (network none) has no passt NIC: lo alone, said
 	 * nowhere, and eth0 is its first segment's, if it has one, which the
-	 * engine says by leaving hull.passt off the command line. */
+	 * engine says by leaving hull.passt off the command line; a bridge's
+	 * eth0 is said by hull.bridge. */
+	if (if_nametoindex("eth0") != 0 && bridged(fd)) {
+		close(fd);
+		return;
+	}
 	if (if_nametoindex("eth0") == 0 || !passt_given()) {
 		close(fd);
 		return;

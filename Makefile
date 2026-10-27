@@ -98,7 +98,7 @@ ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/chroot.o $(BUILD_DIR)/engine/access.o \
               $(BUILD_DIR)/engine/usage.o $(BUILD_DIR)/engine/sha256.o \
               $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/idmap.o \
-              $(BUILD_DIR)/engine/tree.o
+              $(BUILD_DIR)/engine/tree.o $(BUILD_DIR)/engine/hostnet.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o $(BUILD_DIR)/cli/runtime.o $(BUILD_DIR)/cli/doctor.o \
               $(BUILD_DIR)/cli/import.o
 # Section 3's optional store, which only the commands that name it use.
@@ -178,7 +178,7 @@ DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf vol
 QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.conf write.conf \
                   readonly.conf vol.conf volro.conf trap.conf trap.out wait.conf kept.conf \
                   emu.conf execd.conf held.out xtrap.out xstop.out net.conf listen.out brief.conf \
-                  ports.conf ports.out client.out taken.conf udp.conf udp.out dial.conf dial.out sshed.conf sshed.out home/.ssh/config keep.conf \
+                  ports.conf ports.out client.out vbridged.conf vbridge2.conf vbrnamed.conf taken.conf udp.conf udp.out dial.conf dial.out sshed.conf sshed.out home/.ssh/config keep.conf \
                   overlay.conf overro.conf rootfs/srv/kept adopt.conf brief2.conf ended.conf secret.conf norun.conf pw.txt secret/probe \
                   searched.conf netnone.conf netports.conf rootfs/probe rootfs/bin/sh rootfs/written rootfs/etc/resolv.conf \
                   data/in data/out modules.conf inplace.conf hearer.conf hearer.out shouter.conf loner.conf loner.out keptseg.conf anchor.conf anchor.out vnamed.conf mixed.conf \

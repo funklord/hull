@@ -476,6 +476,77 @@ cases=$((cases + 1))
 [ -d "/proc/$core" ] && [ "$fds_after" -eq "$fds_before" ] ||
 	fail "the core kept descriptors of a chroot machine's segment" \
 		"core ${core:-none}: $fds_before before, $fds_after after"
+# (network bridge) on a vm: a tap on a host bridge, which only root may
+# put there, so only a core run as root takes it; as this user, refused.
+# As root in a user namespace of its own, unshare -rmn, whose network is
+# its own: a vm on hull0 given its drawn address, the gateway and an
+# address beyond the bridge reached by its route out, and a chroot
+# machine's port on the same bridge reached, vm and chroot on one wire; a
+# vm on a bridge of its owner's naming, eth0 up and unaddressed; and its
+# tap, persistent, removed with each machine.
+printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) (network bridge) (command "/probe"))\n' \
+	> "$root/vbridged.conf"
+cases=$((cases + 1))
+out=$(cd / && timeout 60 "$hull" run -f "$root/vbridged.conf" 2>&1)
+printf '%s\n' "$out" | grep -q '(network bridge) needs hull.s core to run as root' ||
+	fail "a vm on a bridge was not refused to a core not run as root" "$out"
+vcdb_at=$(python3 -c '
+import sys
+h = 2166136261
+for b in sys.argv[1].encode():
+	h = ((h ^ b) * 16777619) & 0xffffffff
+h %= 256 * 254
+print("172.30.%d.%d" % (h // 254, h % 254 + 1))' vcdb)
+printf '(machines (vbweb %s) (vcdb %s))\n' \
+	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network bridge) (command \"/probe\" \"addr\" \"eth0\" \"dial\" \"172.31.0.1\" \"9\" \"dial\" \"10.200.0.1\" \"8081\" \"dial\" \"$vcdb_at\" \"80\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network bridge) (command \"/probe\" \"serve\" \"tcp\" \"80\")" \
+	> "$root/vbridge2.conf"
+printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) (network bridge) (bridge "brtest") (command "/probe" "addr" "eth0"))\n' \
+	> "$root/vbrnamed.conf"
+rm -rf "${root:?}/vbrrun"
+mkdir -p "$root/vbrrun"
+chmod 700 "$root/vbrrun"
+cases=$((cases + 1))
+vbridge_out=$(timeout 300 unshare -rmn --kill-child sh -c '
+export XDG_RUNTIME_DIR="$2/vbrrun" HULL_CORE_IDLE=1
+ip=/usr/sbin/ip
+[ -x "$ip" ] || ip=/sbin/ip
+"$ip" link set lo up
+"$ip" addr add 10.200.0.1/32 dev lo
+timeout 200 python3 -c "
+import socket
+s = socket.socket()
+s.bind((\"10.200.0.1\", 8081))
+s.listen(1)
+s.settimeout(190)
+c, _ = s.accept()
+c.sendall(b\"hello from beyond the bridge\\n\")
+c.close()
+" &
+cd /
+echo "== pair"; timeout 150 "$1" run -f "$2/vbridge2.conf" 2>&1
+echo "== taps $("$ip" -br link | grep -c "^hv")"
+"$ip" link add brtest type bridge && "$ip" link set brtest up
+echo "== named"; timeout 100 "$1" run -f "$2/vbrnamed.conf" 2>&1
+echo "== taps $("$ip" -br link | grep -c "^hv")"
+' sh "$hull" "$root" 2>&1)
+rm -rf "${root:?}/vbrrun"
+vbweb_at=$(python3 -c '
+import sys
+h = 2166136261
+for b in sys.argv[1].encode():
+	h = ((h ^ b) * 16777619) & 0xffffffff
+h %= 256 * 254
+print("172.30.%d.%d" % (h // 254, h % 254 + 1))' vbweb)
+printf '%s\n' "$vbridge_out" | grep -q "^vbweb *| addr=eth0 $(printf '%s' "$vbweb_at" | sed 's/\./\\./g')/15 up\$" &&
+	printf '%s\n' "$vbridge_out" | grep -q '^vbweb *| dial 172\.31\.0\.1:9=Connection refused$' &&
+	printf '%s\n' "$vbridge_out" | grep -q '^vbweb *| dial 10\.200\.0\.1:8081=hello from beyond the bridge$' &&
+	printf '%s\n' "$vbridge_out" | grep -q "^vbweb *| dial $(printf '%s' "$vcdb_at" | sed 's/\./\\./g'):80=hello from the machine\$" ||
+	fail "a vm on hull0, as root, was not addressed, routed out and on one wire with a chroot machine" "$vbridge_out"
+cases=$((cases + 1))
+printf '%s\n' "$vbridge_out" | grep -q '^addr=eth0 none/0 up$' &&
+	[ "$(printf '%s\n' "$vbridge_out" | grep -c '^== taps 0$')" -eq 2 ] ||
+	fail "a vm on a named bridge was not up and unaddressed, or its tap was left" "$vbridge_out"
 # Appendix D's sibling names on a vm: a segment given a subnet is hull's
 # to address, the agent setting the drawn address on the segment's NIC,
 # eth1 after passt's, and binding every sibling's name over /etc/hosts; a

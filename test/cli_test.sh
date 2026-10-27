@@ -2325,7 +2325,7 @@ printf '%s\n' "$bridge_out" | grep -A1 '^== sshd$' | grep -q '^SSH-2\.0-hull-stu
 	fail "an sshd on hull0 was not reached at the machine's 127.107 address" "$bridge_out"
 conf brdocker '(mutable overlay) (network bridge) (bridge "mynet") (command "/probe")'
 expect 0 'machine on docker \(ns\): ok' "$hull" plan -f "$root/brdocker.conf" --backend docker
-expect 1 'network\.bridge: rejected: not yet: a vm on a host bridge' "$hull" plan -f "$root/brdocker.conf" --backend vm
+expect 0 'machine on qemu \(vm\): ok' "$hull" plan -f "$root/brdocker.conf" --backend vm
 kill "$host_listener" 2>/dev/null
 wait "$host_listener" 2>/dev/null
 printf '(machine (source "dir:./rootfs") (backend vm) (network host) (command "/probe"))\n' \

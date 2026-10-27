@@ -66,6 +66,7 @@
 #include <unistd.h>
 
 #include "access.h"
+#include "hostnet.h"
 #include "tree.h"
 #include "builtin.h"
 #include "usage.h"
@@ -82,16 +83,6 @@
 #define GUEST_ADDRESS   "10.0.2.15"
 #define GATEWAY_ADDRESS "10.0.2.2"
 #define DNS_ADDRESS     "10.0.2.3"
-/* (network bridge) with no (bridge NAME): hull's own host bridge, made on
- * first use as docker makes docker0, its gateway in a /15 whose lower half
- * holds the machines: each 172.30.x.y for its 127.107.x.y (section 8.1),
- * which the core keeps unique, so no two live machines share one. */
-#define HULL_BRIDGE         "hull0"
-#define BRIDGE_GATEWAY      "172.31.0.1"
-#define BRIDGE_PREFIX       15u
-#define BRIDGE_NETWORK      "172.30.0.0/15"
-
-static char *host_resolvers(void);
 #define HELD_LIMIT  (256u * 1024u)  /* output an init holds for no core */
 /* How long an init may take to reach its workload: the core waits for it
  * on its own thread, every frontend with it, so a hang is bounded rather
@@ -458,17 +449,14 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			return "(bridge NAME) names no interface on the host";
 		if (m->bridge_own) {
 			hull_sexpr_form top;
-			unsigned        a, b, x, y;
+			int             drawn;
 
 			hull_sexpr_first(doc, &top);
 			source = hull_access_value(doc, &top, "address");
-			if (source == NULL || sscanf(source, "%u.%u.%u.%u", &a, &b, &x, &y) != 4 || a != 127u ||
-			    b != 107u || x > 255u || y < 1u || y > 254u) {
-				free(source);
-				return "the plan gives the machine no 127.107 address to draw its bridge's from";
-			}
+			drawn = hull_hostnet_address(source, m->bridge_address);
 			free(source);
-			snprintf(m->bridge_address, sizeof m->bridge_address, "172.30.%u.%u", x, y);
+			if (drawn != 0)
+				return "the plan gives the machine no 127.107 address to draw its bridge's from";
 		}
 	}
 	if (hull_access_find(doc, &machine, "ports", &entry)) {
@@ -521,7 +509,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	/* On hull's bridge, the host's own resolvers that are not its loopback,
 	 * which the machine could not reach; a machine on a bridge of its
 	 * owner's naming keeps its tree's, its addressing being its own. */
-	if (m->bridge_own && (m->resolver = host_resolvers()) == NULL && errno == ENOMEM)
+	if (m->bridge_own && (m->resolver = hull_hostnet_resolvers()) == NULL && errno == ENOMEM)
 		return "out of memory";
 
 	/* (segments ...): a NIC on each in the machine's own network namespace,
@@ -1853,173 +1841,30 @@ static void sweep(const char *parent)
 		closedir(list);
 }
 
-/* The host's resolv.conf's nameservers that are not its loopback, as a
- * resolv.conf of their own: a machine on a bridge reaches the host's
- * resolvers only where they are not its loopback, which docker meets the
- * same way. NULL, errno 0, where there are none; ENOMEM where memory ran
- * out. */
-static char *host_resolvers(void)
-{
-	FILE  *conf = fopen("/etc/resolv.conf", "r");
-	char   line[256];
-	char  *text = NULL;
-	size_t at = 0u;
-
-	errno = 0;
-	while (conf != NULL && fgets(line, sizeof line, conf) != NULL) {
-		char   server[64];
-		char  *grown;
-		size_t need;
-
-		if (sscanf(line, "nameserver %63s", server) != 1 || strncmp(server, "127.", 4u) == 0 ||
-		    strcmp(server, "::1") == 0)
-			continue;
-		need = at + strlen(server) + 13u;
-		if ((grown = realloc(text, need)) == NULL) {
-			free(text);
-			fclose(conf);
-			errno = ENOMEM;
-			return NULL;
-		}
-		text = grown;
-		at += (size_t)snprintf(text + at, need - at, "nameserver %s\n", server);
-	}
-	if (conf != NULL)
-		fclose(conf);
-	if (text == NULL)
-		errno = 0;
-	return text;
-}
-
-/* The first of `paths` that is there to run: ip and nft live in /usr/sbin
- * or /sbin, which a user's PATH may not hold. */
-static const char *tool(const char *const *paths)
-{
-	for (; *paths != NULL; paths++)
-		if (access(*paths, X_OK) == 0)
-			return *paths;
-	return NULL;
-}
-
-/* `argv` run, its stdout and stderr on a pipe: 0, or -1 with what it said
- * in `why`. As the core, which is root for (network bridge). */
-static int run_tool(const char *const *argv, char *why, size_t cap)
-{
-	int     said[2];
-	int     status;
-	pid_t   pid;
-	ssize_t got;
-
-	if (argv[0] == NULL) {
-		snprintf(why, cap, "ip or nft, which (network bridge) needs, is not installed");
-		return -1;
-	}
-	if (pipe2(said, O_CLOEXEC) != 0) {
-		snprintf(why, cap, "%s: %s", argv[0], strerror(errno));
-		return -1;
-	}
-	pid = fork();
-	if (pid == 0) {
-		int null = open("/dev/null", O_RDWR);
-
-		if (null < 0 || dup2(null, 0) < 0 || dup2(said[1], 1) < 0 || dup2(said[1], 2) < 0)
-			_exit(126);
-		syscall(SYS_close_range, 3u, ~0u, 0u);
-		execv(argv[0], (char *const *)argv);
-		_exit(127);
-	}
-	close(said[1]);
-	if (pid < 0) {
-		close(said[0]);
-		snprintf(why, cap, "%s: %s", argv[0], strerror(errno));
-		return -1;
-	}
-	got = read(said[0], why, cap - 1u);
-	close(said[0]);
-	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
-		;
-	if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
-		return 0;
-	if (got <= 0)
-		snprintf(why, cap, "%s failed", argv[0]);
-	else {
-		why[got] = '\0';
-		while (got > 0 && (why[got - 1] == '\n' || why[got - 1] == '\r'))
-			why[--got] = '\0';
-	}
-	return -1;
-}
-
 /*
- * The machine's network on a bridge, as the root core: hull's own made
- * where it is not there yet, as docker makes docker0 -- the bridge, its
- * gateway address, forwarding, and nft's masquerade of its network going
- * anywhere but itself -- then a veth whose far end is the machine's eth0,
- * moved into the init's namespace, and whose near end is on the bridge.
- * The near end goes with the namespace, so nothing is left to remove; the
- * bridge stays, as docker0 does. Before the init goes on, which then sets
- * eth0's address on hull's own. NULL, or why in `why`.
+ * The machine's network on a bridge, as the root core: hull0 made first
+ * where it is its (hostnet.c), then a veth whose far end is the machine's
+ * eth0, moved into the init's namespace, and whose near end is on the
+ * bridge. The near end goes with the namespace, so nothing is left to
+ * remove. Before the init goes on, which then sets eth0's address on
+ * hull's own. NULL, or why in `why`.
  */
 static const char *start_bridge(const hull_machine *m, char *why, size_t cap)
 {
-	static pthread_mutex_t     made = PTHREAD_MUTEX_INITIALIZER;
-	static const char *const   ips[] = { "/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip", NULL };
-	static const char *const   nfts[] = { "/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft", NULL };
-	const char                *ip = tool(ips);
-	char                       near[16];
-	char                       pid_text[24];
+	const char *ip = hull_hostnet_ip();
+	char        near[16];
+	char        pid_text[24];
 
+	if (m->bridge_own && hull_hostnet_bridge(why, cap) != NULL)
+		return why;
 	snprintf(near, sizeof near, "hb%ld", (long)m->pid);
 	snprintf(pid_text, sizeof pid_text, "%ld", (long)m->pid);
-	if (m->bridge_own) {
-		const char *nft = tool(nfts);
-		int         failed = 0;
-
-		pthread_mutex_lock(&made);
-		if (if_nametoindex(HULL_BRIDGE) == 0) {
-			const char *add[] = { ip, "link", "add", HULL_BRIDGE, "type", "bridge", NULL };
-			const char *addr[] = { ip, "addr", "add", BRIDGE_GATEWAY "/15", "dev", HULL_BRIDGE, NULL };
-			const char *up[] = { ip, "link", "set", HULL_BRIDGE, "up", NULL };
-
-			failed = run_tool(add, why, cap) != 0 || run_tool(addr, why, cap) != 0 ||
-			         run_tool(up, why, cap) != 0;
-		}
-		if (!failed) {
-			const char *listed[] = { nft, "list", "table", "ip", "hull", NULL };
-			char        quiet[200];
-
-			if (run_tool(listed, quiet, sizeof quiet) != 0) {
-				const char *table[] = { nft, "add", "table", "ip", "hull", NULL };
-				const char *chain[] = { nft, "add", "chain", "ip", "hull", "post",
-				                        "{ type nat hook postrouting priority 100 ; }", NULL };
-				const char *rule[] = { nft, "add", "rule", "ip", "hull", "post", "ip", "saddr",
-				                       BRIDGE_NETWORK, "oifname", "!=", HULL_BRIDGE, "masquerade",
-				                       NULL };
-
-				failed = run_tool(table, why, cap) != 0 || run_tool(chain, why, cap) != 0 ||
-				         run_tool(rule, why, cap) != 0;
-			}
-		}
-		if (!failed) {
-			int fd = open("/proc/sys/net/ipv4/ip_forward", O_WRONLY | O_CLOEXEC);
-
-			if (fd < 0 || write(fd, "1", 1u) != 1) {
-				snprintf(why, cap, "forwarding cannot be turned on: %s", strerror(errno));
-				failed = 1;
-			}
-			if (fd >= 0)
-				close(fd);
-		}
-		pthread_mutex_unlock(&made);
-		if (failed)
-			return why;
-	}
 	{
 		const char *pair[] = { ip, "link", "add", near, "type", "veth", "peer", "name", "eth0",
 		                       "netns", pid_text, NULL };
 		const char *on[] = { ip, "link", "set", near, "master", m->bridge_name, "up", NULL };
 
-		if (run_tool(pair, why, cap) != 0 || run_tool(on, why, cap) != 0)
+		if (hull_hostnet_run(pair, why, cap) != 0 || hull_hostnet_run(on, why, cap) != 0)
 			return why;
 	}
 	return NULL;

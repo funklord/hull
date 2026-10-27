@@ -66,11 +66,13 @@
 #include <unistd.h>
 
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <netinet/in.h>
 
 #include <linux/vm_sockets.h>
 
 #include "access.h"
+#include "hostnet.h"
 #include "usage.h"
 #include "stack.h"
 #include "builtin.h"
@@ -142,6 +144,12 @@ struct hull_machine {
 	char             dir[4096];    /* the machine's files: initrd, console */
 	int              network;      /* qemu's end of passt's socket, or -1 */
 	int              no_network;   /* (network none): no NIC, no passt */
+	int              bridge;       /* (network bridge): a tap on a host bridge, its core root */
+	int              bridge_own;   /* on HULL_BRIDGE, hull addressing it, not (bridge NAME) */
+	char             bridge_name[16];
+	char             bridge_address[16];   /* its address on HULL_BRIDGE, or "" */
+	char             tap[16];      /* the tap's name on the bridge, once made, or "" */
+	char             append[512];  /* the kernel's command line */
 	char            *segment[MAX_SEGMENTS];     /* Appendix D's, by name */
 	int              segment_fd[MAX_SEGMENTS];  /* their ports, until qemu has them */
 	unsigned         segment_count;
@@ -350,6 +358,13 @@ static const char *read_secrets(hull_machine *m, const hull_sexpr_doc *doc,
 
 static void release(hull_machine *m)
 {
+	/* A bridge's tap is persistent, so it goes with the machine here. */
+	if (m->bridge && m->tap[0] != '\0' && if_nametoindex(m->tap) != 0) {
+		const char *del[] = { hull_hostnet_ip(), "link", "del", m->tap, NULL };
+		char        quiet[200];
+
+		hull_hostnet_run(del, quiet, sizeof quiet);
+	}
 	free(m->root);
 	for (unsigned i = 0u; i < m->volume_count; i++)
 		free(m->volume_host[i]);
@@ -579,7 +594,24 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	 * vm shares no host network to give (network host). */
 	text = hull_access_value(doc, &machine, "network");
 	m->no_network = text != NULL && strcmp(text, "none") == 0;
+	m->bridge     = text != NULL && strcmp(text, "bridge") == 0;
 	free(text);
+	/* (network bridge): a tap on a host bridge, which only root may put
+	 * there, so only a core run as root takes it, as chroot's veth. */
+	if (m->bridge) {
+		char *name = hull_access_value(doc, &machine, "bridge");
+
+		if (getuid() != 0) {
+			free(name);
+			return "(network bridge) needs hull's core to run as root: (network nat) gives a "
+			       "network of the machine's own without it";
+		}
+		m->bridge_own = name == NULL;
+		snprintf(m->bridge_name, sizeof m->bridge_name, "%s", name != NULL ? name : HULL_BRIDGE);
+		free(name);
+		if (!m->bridge_own && if_nametoindex(m->bridge_name) == 0)
+			return "(bridge NAME) names no interface on the host";
+	}
 	if (m->no_network && hull_access_find(doc, &machine, "ports", &entry))
 		return "ports need the machine's network, which (network none) has not";
 
@@ -604,6 +636,17 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	free(text);
 	if (m->segment_count != 0u && m->address_text[0] == '\0')
 		return "the plan gives its segments no address to draw a MAC from";
+	/* Its tap is named for its 127.107.x.y, which the core keeps unique,
+	 * and on hull0 its address is drawn from it as chroot's is. */
+	if (m->bridge) {
+		unsigned a, b, x, y;
+
+		if (sscanf(m->address_text, "%u.%u.%u.%u", &a, &b, &x, &y) != 4)
+			return "the plan gives the machine no address to name its tap for";
+		snprintf(m->tap, sizeof m->tap, "hv%u.%u", x, y);
+		if (m->bridge_own && hull_hostnet_address(m->address_text, m->bridge_address) != 0)
+			return "the plan gives the machine no 127.107 address to draw its bridge's from";
+	}
 	if (hull_access_find(doc, &machine, "ports", &entry)) {
 		if (m->address_text[0] == '\0')
 			return "the plan gives its ports no address";
@@ -991,6 +1034,37 @@ static const char *start_network(hull_machine *m)
 		m->passt = 0;
 		return NULL;
 	}
+	/* On a bridge, a tap the core makes as root, owned by the uid qemu runs
+	 * as so that qemu, in a user namespace of its own, may open it; on the
+	 * bridge, up. Persistent, so it is removed with the machine (release).
+	 * Made once, a retry's qemu taking the same. */
+	if (m->bridge) {
+		const char *ip = hull_hostnet_ip();
+		char        owner[24];
+
+		m->network = -1;
+		m->passt = 0;
+		if (if_nametoindex(m->tap) != 0)
+			return NULL;
+		snprintf(owner, sizeof owner, "%ld", (long)getuid());
+		if (m->bridge_own && hull_hostnet_bridge(m->detail, sizeof m->detail) != NULL)
+			return m->detail;
+		{
+			const char *add[] = { ip, "tuntap", "add", m->tap, "mode", "tap", "user", owner, NULL };
+			const char *on[] = { ip, "link", "set", m->tap, "master", m->bridge_name, "up", NULL };
+
+			if (hull_hostnet_run(add, m->detail, sizeof m->detail) != 0)
+				return m->detail;
+			if (hull_hostnet_run(on, m->detail, sizeof m->detail) != 0) {
+				const char *del[] = { ip, "link", "del", m->tap, NULL };
+				char        quiet[200];
+
+				hull_hostnet_run(del, quiet, sizeof quiet);
+				return m->detail;
+			}
+		}
+		return NULL;
+	}
 
 	snprintf(log, sizeof log, "%s/passt.log", m->dir);
 	argv[n++] = "passt";
@@ -1202,7 +1276,10 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int
 	snprintf(memory, sizeof memory, "%lu", m->memory_mib);
 	snprintf(cpus, sizeof cpus, "%u", m->cpus);
 	snprintf(vsock, sizeof vsock, "vhost-vsock-pci,guest-cid=%u", cid);
-	snprintf(netdev, sizeof netdev, "stream,id=net,addr.type=fd,addr.str=%d", NETWORK_FD);
+	if (m->bridge)
+		snprintf(netdev, sizeof netdev, "tap,id=net,ifname=%s,script=no,downscript=no", m->tap);
+	else
+		snprintf(netdev, sizeof netdev, "stream,id=net,addr.type=fd,addr.str=%d", NETWORK_FD);
 	/* The share is the directory, or with layers, an upper or owners the
 	 * overlay qemu's child mounts in its runtime directory, its merged tree.
 	 * It is read-only under (mutable overlay) whenever the guest lays its
@@ -1243,8 +1320,34 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int
 	argv[n++] = "-append";
 	/* hull.passt says eth0 is passt's, so the agent gives it passt's
 	 * address: under (network none) eth0 is a segment's (Appendix D). */
-	argv[n++] = m->no_network ? "console=hvc0 quiet panic=-1" :
-	                            "console=hvc0 quiet panic=-1 hull.passt=1";
+	/* hull.bridge, on a bridge: its address, its prefix and the gateway on
+	 * hull0, with the host's resolvers that are not its loopback in
+	 * hull.dns; "self" on a bridge its owner named, the workload's to
+	 * address. */
+	if (m->bridge && m->bridge_own) {
+		char  *resolvers = hull_hostnet_resolvers();
+		size_t at = (size_t)snprintf(m->append, sizeof m->append,
+		                             "console=hvc0 quiet panic=-1 hull.bridge=%s/%u,%s",
+		                             m->bridge_address, BRIDGE_PREFIX, BRIDGE_GATEWAY);
+		char  *line = resolvers;
+
+		for (int first = 1; line != NULL && *line != '\0' && at < sizeof m->append; first = 0) {
+			char  server[64];
+			char *end = strchr(line, '\n');
+
+			if (sscanf(line, "nameserver %63s", server) == 1)
+				at += (size_t)snprintf(m->append + at, sizeof m->append - at, "%s%s",
+				                       first ? " hull.dns=" : ",", server);
+			line = end != NULL ? end + 1 : NULL;
+		}
+		free(resolvers);
+	} else if (m->bridge) {
+		snprintf(m->append, sizeof m->append, "console=hvc0 quiet panic=-1 hull.bridge=self");
+	} else {
+		snprintf(m->append, sizeof m->append, "%s", m->no_network ?
+		         "console=hvc0 quiet panic=-1" : "console=hvc0 quiet panic=-1 hull.passt=1");
+	}
+	argv[n++] = m->append;
 	argv[n++] = "-device";
 	argv[n++] = "virtio-serial-pci";
 	argv[n++] = "-chardev";
@@ -3212,10 +3315,12 @@ static const hull_cap_entry entries[] = {
 	{ "network.host",       HULL_SUP_REJECTED,
 	  "a vm shares no network namespace with the host: use ports", NULL },
 	{ "network.nat",        HULL_SUP_NATIVE,   "passt's, as no network key gives", NULL },
-	{ "network.bridge",     HULL_SUP_REJECTED,
-	  "not yet: a vm on a host bridge needs a tap on it, which is not written", NULL },
-	{ "bridge",             HULL_SUP_REJECTED,
-	  "not yet: a vm on a host bridge needs a tap on it, which is not written", NULL },
+	{ "network.bridge",     HULL_SUP_NATIVE,
+	  "a tap on hull's own bridge, hull0, NATed out, or on the host bridge (bridge NAME) "
+	  "names; only with hull's core run as root, refused at create otherwise", NULL },
+	{ "bridge",             HULL_SUP_NATIVE,
+	  "the host bridge (network bridge) joins, there already; the guest addresses itself",
+	  NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   "no NIC: lo alone in the guest", NULL },
 	{ "ssh",                HULL_SUP_NATIVE,
 	  "the agent supervises the image's own sshd on the guest's port 22, with a host key, "
