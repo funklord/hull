@@ -149,6 +149,7 @@ struct hull_machine {
 	char             bridge_name[16];
 	char             bridge_address[16];   /* its address on HULL_BRIDGE, or "" */
 	char             tap[16];      /* the tap's name on the bridge, once made, or "" */
+	int              bridge_relay; /* asking hull0's DNS relay, the host's resolvers loopback */
 	char             append[512];  /* the kernel's command line */
 	char            *segment[MAX_SEGMENTS];     /* Appendix D's, by name */
 	int              segment_fd[MAX_SEGMENTS];  /* their ports, until qemu has them */
@@ -1049,6 +1050,15 @@ static const char *start_network(hull_machine *m)
 		snprintf(owner, sizeof owner, "%ld", (long)getuid());
 		if (m->bridge_own && hull_hostnet_bridge(m->detail, sizeof m->detail) != NULL)
 			return m->detail;
+		/* Where the host's resolvers are all its loopback, hull0's relay. */
+		if (m->bridge_own) {
+			char *resolvers = hull_hostnet_resolvers();
+
+			m->bridge_relay = resolvers == NULL;
+			free(resolvers);
+			if (m->bridge_relay && hull_hostnet_relay(m->detail, sizeof m->detail) != NULL)
+				return m->detail;
+		}
 		{
 			const char *add[] = { ip, "tuntap", "add", m->tap, "mode", "tap", "user", owner, NULL };
 			const char *on[] = { ip, "link", "set", m->tap, "master", m->bridge_name, "up", NULL };
@@ -1341,6 +1351,8 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int
 			line = end != NULL ? end + 1 : NULL;
 		}
 		free(resolvers);
+		if (m->bridge_relay && at < sizeof m->append)
+			snprintf(m->append + at, sizeof m->append - at, " hull.dns=%s", BRIDGE_GATEWAY);
 	} else if (m->bridge) {
 		snprintf(m->append, sizeof m->append, "console=hvc0 quiet panic=-1 hull.bridge=self");
 	} else {

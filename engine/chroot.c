@@ -142,6 +142,7 @@ struct hull_machine {
 	int              bridge_own; /* on HULL_BRIDGE, hull addressing it, not (bridge NAME) */
 	char             bridge_name[16];
 	char             bridge_address[16];  /* its address on HULL_BRIDGE, or "" */
+	int              bridge_relay;  /* asking hull0's DNS relay, the host's resolvers loopback */
 	unsigned         port_count; /* (ports ...), forwarded by pasta on the address */
 	int              port_udp[MAX_PORTS];
 	unsigned         port_host[MAX_PORTS];
@@ -509,8 +510,13 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	/* On hull's bridge, the host's own resolvers that are not its loopback,
 	 * which the machine could not reach; a machine on a bridge of its
 	 * owner's naming keeps its tree's, its addressing being its own. */
-	if (m->bridge_own && (m->resolver = hull_hostnet_resolvers()) == NULL && errno == ENOMEM)
-		return "out of memory";
+	if (m->bridge_own && (m->resolver = hull_hostnet_resolvers()) == NULL) {
+		/* None but the host's loopback: hull0's relay, at its gateway. */
+		if (errno == ENOMEM ||
+		    (m->resolver = strdup("nameserver " BRIDGE_GATEWAY "\n")) == NULL)
+			return "out of memory";
+		m->bridge_relay = 1;
+	}
 
 	/* (segments ...): a NIC on each in the machine's own network namespace,
 	 * which (network none) and NAT give it and (network host) does not: a
@@ -1856,6 +1862,8 @@ static const char *start_bridge(const hull_machine *m, char *why, size_t cap)
 	char        pid_text[24];
 
 	if (m->bridge_own && hull_hostnet_bridge(why, cap) != NULL)
+		return why;
+	if (m->bridge_relay && hull_hostnet_relay(why, cap) != NULL)
 		return why;
 	snprintf(near, sizeof near, "hb%ld", (long)m->pid);
 	snprintf(pid_text, sizeof pid_text, "%ld", (long)m->pid);

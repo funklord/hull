@@ -43,4 +43,11 @@ int hull_hostnet_address(const char *address, char out[16]);
  * out. */
 char *hull_hostnet_resolvers(void);
 
+/* A DNS relay on hull0's gateway, BRIDGE_GATEWAY port 53, for machines on
+ * hull0 where the host's resolvers are all its loopback, which a bridge
+ * cannot reach: each UDP question passed to the first of the host's
+ * resolv.conf's nameservers, its answer back. A thread of the core's,
+ * started once, after hull0 is made. NULL, or why in `why`. */
+const char *hull_hostnet_relay(char *why, size_t cap);
+
 #endif /* HULL_HOSTNET_H */

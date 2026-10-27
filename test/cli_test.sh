@@ -2217,7 +2217,7 @@ print("172.30.%d.%d" % (h // 254, h % 254 + 1))' "$1"
 }
 bdb_at=$(bridge_at bdb)
 printf '(machines (bweb %s) (bdb %s))\n' \
-	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network bridge) (command \"/probe\" \"addr\" \"eth0\" \"sleep\" \"1\" \"dial\" \"$bdb_at\" \"80\" \"dial\" \"172.31.0.1\" \"9\" \"dial\" \"10.200.0.1\" \"8081\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network bridge) (command \"/probe\" \"addr\" \"eth0\" \"sleep\" \"1\" \"dial\" \"$bdb_at\" \"80\" \"dial\" \"172.31.0.1\" \"9\" \"dial\" \"10.200.0.1\" \"8081\" \"read\" \"/etc/resolv.conf\" \"dns\" \"anything.example\")" \
 	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network bridge) (command \"/probe\" \"addr\" \"eth0\" \"serve\" \"tcp\" \"80\")" \
 	> "$root/bridge2.conf"
 printf '(machine (source "dir:./rootfs") (backend chroot) (network bridge) (bridge "brtest") (command "/probe" "addr" "eth0"))\n' \
@@ -2242,6 +2242,28 @@ printf '(machine (source "dir:./brssh") (backend chroot) (hostname "bsshd") (net
 	> "$root/brsshd.conf"
 printf '(machine (source "dir:./rootfs") (backend chroot) (hostname "bport") (network bridge) (ports (port (host 18096) (guest 80))) (command "/probe" "serve" "tcp" "80"))\n' \
 	> "$root/brserve.conf"
+# A resolver of the test's own on the namespace's loopback, which is all a
+# host with systemd-resolved gives: hull0's relay is what reaches it. It
+# answers every question with one A, 192.0.2.7.
+printf 'nameserver 127.0.0.53\n' > "$root/relay-resolv.conf"
+cat > "$root/fakedns.py" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.53", 53))
+s.settimeout(float(sys.argv[1]))
+while True:
+    try:
+        q, a = s.recvfrom(4096)
+    except socket.timeout:
+        break
+    end = 12
+    while q[end] != 0:
+        end += 1 + q[end]
+    end += 5
+    r = q[:2] + b"\x81\x80" + q[4:6] + b"\x00\x01\x00\x00\x00\x00" + q[12:end]
+    r += b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x05\x00\x04" + bytes([192, 0, 2, 7])
+    s.sendto(r, a)
+PY
 rm -rf "${root:?}/brrun"
 mkdir -p "$root/brrun"
 chmod 700 "$root/brrun"
@@ -2250,6 +2272,8 @@ bridge_out=$(timeout 120 unshare -rmn --kill-child sh -c '
 export XDG_RUNTIME_DIR="$2/brrun" HULL_CORE_IDLE=1
 ip=$(command -v ip || echo /usr/sbin/ip)
 [ -x "$ip" ] || ip=/sbin/ip
+mount --bind "$2/relay-resolv.conf" /etc/resolv.conf
+timeout 100 python3 "$2/fakedns.py" 90 &
 "$ip" link set lo up
 # Beyond the bridge, reached only by the route out through the gateway
 # that the machine is given: an address of this namespace, a listener.
@@ -2307,6 +2331,8 @@ printf '%s\n' "$bridge_out" | grep -q "^bweb *| addr=eth0 $(printf '%s' "$bweb_a
 	printf '%s\n' "$bridge_out" | grep -q "^bweb *| dial $(printf '%s' "$bdb_at" | sed 's/\./\\./g'):80=hello from the machine\$" &&
 	printf '%s\n' "$bridge_out" | grep -q '^bweb *| dial 172\.31\.0\.1:9=Connection refused$' &&
 	printf '%s\n' "$bridge_out" | grep -q '^bweb *| dial 10\.200\.0\.1:8081=hello from beyond the bridge$' &&
+	printf '%s\n' "$bridge_out" | grep -q '^bweb *| read=nameserver 172\.31\.0\.1$' &&
+	printf '%s\n' "$bridge_out" | grep -q '^bweb *| dns=anything\.example 192\.0\.2\.7$' &&
 	printf '%s\n' "$bridge_out" | grep -Eq '^hull0 +UP +172\.31\.0\.1/15' &&
 	printf '%s\n' "$bridge_out" | grep -q 'ip saddr 172\.30\.0\.0/15 oifname != "hull0" masquerade' &&
 	printf '%s\n' "$bridge_out" | grep -q '^== forward=1$' ||

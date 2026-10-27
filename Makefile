@@ -162,7 +162,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  natports.out hostports.conf noneports.conf natexec.conf natexec.out natseg.conf \
                  natsaid.conf natplan.conf bridged.conf bridge2.conf brnamed.conf brnone.conf \
                  brports.conf brdocker.conf brserve.conf brserve.out brsshd.conf brssh/probe \
-                 brssh/usr/sbin/sshd) \
+                 brssh/usr/sbin/sshd relay-resolv.conf fakedns.py) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
 # What test/docker_test.sh writes.
@@ -178,7 +178,7 @@ DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf vol
 QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.conf write.conf \
                   readonly.conf vol.conf volro.conf trap.conf trap.out wait.conf kept.conf \
                   emu.conf execd.conf held.out xtrap.out xstop.out net.conf listen.out brief.conf \
-                  ports.conf ports.out client.out vbridged.conf vbridge2.conf vbrnamed.conf taken.conf udp.conf udp.out dial.conf dial.out sshed.conf sshed.out home/.ssh/config keep.conf \
+                  ports.conf ports.out client.out vbridged.conf vbridge2.conf vbrnamed.conf relay-resolv.conf fakedns.py taken.conf udp.conf udp.out dial.conf dial.out sshed.conf sshed.out home/.ssh/config keep.conf \
                   overlay.conf overro.conf rootfs/srv/kept adopt.conf brief2.conf ended.conf secret.conf norun.conf pw.txt secret/probe \
                   searched.conf netnone.conf netports.conf rootfs/probe rootfs/bin/sh rootfs/written rootfs/etc/resolv.conf \
                   data/in data/out modules.conf inplace.conf hearer.conf hearer.out shouter.conf loner.conf loner.out keptseg.conf anchor.conf anchor.out vnamed.conf mixed.conf \

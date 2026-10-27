@@ -7,13 +7,18 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <arpa/inet.h>
 #include <net/if.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "hostnet.h"
@@ -177,4 +182,170 @@ char *hull_hostnet_resolvers(void)
 	if (text == NULL)
 		errno = 0;
 	return text;
+}
+
+/* --- the relay ------------------------------------------------------------ */
+
+#define RELAY_PENDING 64u    /* questions in flight at once */
+#define RELAY_WAIT_MS 5000   /* how long one waits for its answer */
+
+typedef struct pending {
+	int                     fd;      /* to the upstream, or -1 */
+	struct sockaddr_storage asker;
+	socklen_t               asker_length;
+	uint64_t                deadline;
+} pending;
+
+static int                     relay_fd = -1;
+static struct sockaddr_storage upstream;
+static socklen_t               upstream_length;
+
+static uint64_t relay_now(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
+}
+
+/* The first nameserver of the host's resolv.conf, any, its loopback too:
+ * the relay is on the host, where that is reachable. 0, or -1. */
+static int first_resolver(void)
+{
+	FILE *conf = fopen("/etc/resolv.conf", "r");
+	char  line[256];
+	char  server[64];
+	int   found = 0;
+
+	while (conf != NULL && !found && fgets(line, sizeof line, conf) != NULL) {
+		struct sockaddr_in  *v4 = (struct sockaddr_in *)&upstream;
+		struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&upstream;
+
+		if (sscanf(line, "nameserver %63s", server) != 1)
+			continue;
+		memset(&upstream, 0, sizeof upstream);
+		if (inet_pton(AF_INET, server, &v4->sin_addr) == 1) {
+			v4->sin_family  = AF_INET;
+			v4->sin_port    = htons(53);
+			upstream_length = sizeof *v4;
+			found = 1;
+		} else if (inet_pton(AF_INET6, server, &v6->sin6_addr) == 1) {
+			v6->sin6_family = AF_INET6;
+			v6->sin6_port   = htons(53);
+			upstream_length = sizeof *v6;
+			found = 1;
+		}
+	}
+	if (conf != NULL)
+		fclose(conf);
+	return found ? 0 : -1;
+}
+
+/* Questions in on relay_fd, each passed up on a socket of its own, so its
+ * answer comes back on that one and goes to whoever asked; one unanswered
+ * in RELAY_WAIT_MS is dropped, as a lost datagram is, and the asker's
+ * resolver asks again. */
+static void *relay(void *arg)
+{
+	pending table[RELAY_PENDING];
+	uint8_t packet[4096];
+
+	(void)arg;
+	for (unsigned i = 0u; i < RELAY_PENDING; i++)
+		table[i].fd = -1;
+	for (;;) {
+		struct pollfd fds[1u + RELAY_PENDING];
+		unsigned      which[1u + RELAY_PENDING];
+		nfds_t        n = 1u;
+		uint64_t      now = relay_now();
+
+		fds[0].fd     = relay_fd;
+		fds[0].events = POLLIN;
+		for (unsigned i = 0u; i < RELAY_PENDING; i++) {
+			if (table[i].fd < 0)
+				continue;
+			if (now >= table[i].deadline) {
+				close(table[i].fd);
+				table[i].fd = -1;
+				continue;
+			}
+			fds[n].fd     = table[i].fd;
+			fds[n].events = POLLIN;
+			which[n++]    = i;
+		}
+		if (poll(fds, n, 1000) <= 0)
+			continue;
+		for (nfds_t k = 1u; k < n; k++) {
+			pending *p = &table[which[k]];
+			ssize_t  got;
+
+			if ((fds[k].revents & (POLLIN | POLLERR | POLLHUP)) == 0)
+				continue;
+			got = recv(p->fd, packet, sizeof packet, 0);
+			if (got > 0)
+				sendto(relay_fd, packet, (size_t)got, 0, (struct sockaddr *)&p->asker,
+				       p->asker_length);
+			close(p->fd);
+			p->fd = -1;
+		}
+		if ((fds[0].revents & POLLIN) != 0) {
+			pending *p = NULL;
+			ssize_t  got;
+			struct sockaddr_storage asker;
+			socklen_t               length = sizeof asker;
+
+			got = recvfrom(relay_fd, packet, sizeof packet, 0, (struct sockaddr *)&asker, &length);
+			if (got < 12)
+				continue;
+			for (unsigned i = 0u; i < RELAY_PENDING && p == NULL; i++)
+				if (table[i].fd < 0)
+					p = &table[i];
+			if (p == NULL)
+				continue;    /* full: dropped, and asked again */
+			p->fd = socket(upstream.ss_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+			if (p->fd < 0)
+				continue;
+			if (connect(p->fd, (struct sockaddr *)&upstream, upstream_length) != 0 ||
+			    send(p->fd, packet, (size_t)got, 0) != got) {
+				close(p->fd);
+				p->fd = -1;
+				continue;
+			}
+			p->asker        = asker;
+			p->asker_length = length;
+			p->deadline     = relay_now() + RELAY_WAIT_MS;
+		}
+	}
+	return NULL;
+}
+
+const char *hull_hostnet_relay(char *why, size_t cap)
+{
+	static pthread_mutex_t started = PTHREAD_MUTEX_INITIALIZER;
+	struct sockaddr_in     at = { .sin_family = AF_INET, .sin_port = htons(53) };
+	const char            *reason = NULL;
+	pthread_t              thread;
+	int                    one = 1;
+
+	pthread_mutex_lock(&started);
+	if (relay_fd < 0) {
+		inet_pton(AF_INET, BRIDGE_GATEWAY, &at.sin_addr);
+		if (first_resolver() != 0) {
+			snprintf(why, cap, "the host's resolv.conf names no nameserver for hull0's relay");
+			reason = why;
+		} else if ((relay_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)) < 0 ||
+		           setsockopt(relay_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0 ||
+		           bind(relay_fd, (struct sockaddr *)&at, sizeof at) != 0 ||
+		           pthread_create(&thread, NULL, relay, NULL) != 0) {
+			snprintf(why, cap, "hull0's DNS relay: %s", strerror(errno));
+			if (relay_fd >= 0)
+				close(relay_fd);
+			relay_fd = -1;
+			reason = why;
+		} else {
+			pthread_detach(thread);
+		}
+	}
+	pthread_mutex_unlock(&started);
+	return reason;
 }

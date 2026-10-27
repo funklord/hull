@@ -498,11 +498,33 @@ for b in sys.argv[1].encode():
 h %= 256 * 254
 print("172.30.%d.%d" % (h // 254, h % 254 + 1))' vcdb)
 printf '(machines (vbweb %s) (vcdb %s))\n' \
-	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network bridge) (command \"/probe\" \"addr\" \"eth0\" \"dial\" \"172.31.0.1\" \"9\" \"dial\" \"10.200.0.1\" \"8081\" \"dial\" \"$vcdb_at\" \"80\")" \
+	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network bridge) (command \"/probe\" \"addr\" \"eth0\" \"dial\" \"172.31.0.1\" \"9\" \"dial\" \"10.200.0.1\" \"8081\" \"dial\" \"$vcdb_at\" \"80\" \"read\" \"/etc/resolv.conf\" \"dns\" \"anything.example\")" \
 	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network bridge) (command \"/probe\" \"serve\" \"tcp\" \"80\")" \
 	> "$root/vbridge2.conf"
 printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) (network bridge) (bridge "brtest") (command "/probe" "addr" "eth0"))\n' \
 	> "$root/vbrnamed.conf"
+# A resolver of the test's own on the namespace's loopback, which is all a
+# host with systemd-resolved gives: hull0's relay is what reaches it. It
+# answers every question with one A, 192.0.2.7.
+printf 'nameserver 127.0.0.53\n' > "$root/relay-resolv.conf"
+cat > "$root/fakedns.py" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.53", 53))
+s.settimeout(float(sys.argv[1]))
+while True:
+    try:
+        q, a = s.recvfrom(4096)
+    except socket.timeout:
+        break
+    end = 12
+    while q[end] != 0:
+        end += 1 + q[end]
+    end += 5
+    r = q[:2] + b"\x81\x80" + q[4:6] + b"\x00\x01\x00\x00\x00\x00" + q[12:end]
+    r += b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x05\x00\x04" + bytes([192, 0, 2, 7])
+    s.sendto(r, a)
+PY
 rm -rf "${root:?}/vbrrun"
 mkdir -p "$root/vbrrun"
 chmod 700 "$root/vbrrun"
@@ -511,6 +533,8 @@ vbridge_out=$(timeout 300 unshare -rmn --kill-child sh -c '
 export XDG_RUNTIME_DIR="$2/vbrrun" HULL_CORE_IDLE=1
 ip=/usr/sbin/ip
 [ -x "$ip" ] || ip=/sbin/ip
+mount --bind "$2/relay-resolv.conf" /etc/resolv.conf
+timeout 260 python3 "$2/fakedns.py" 250 &
 "$ip" link set lo up
 "$ip" addr add 10.200.0.1/32 dev lo
 timeout 200 python3 -c "
@@ -541,6 +565,8 @@ print("172.30.%d.%d" % (h // 254, h % 254 + 1))' vbweb)
 printf '%s\n' "$vbridge_out" | grep -q "^vbweb *| addr=eth0 $(printf '%s' "$vbweb_at" | sed 's/\./\\./g')/15 up\$" &&
 	printf '%s\n' "$vbridge_out" | grep -q '^vbweb *| dial 172\.31\.0\.1:9=Connection refused$' &&
 	printf '%s\n' "$vbridge_out" | grep -q '^vbweb *| dial 10\.200\.0\.1:8081=hello from beyond the bridge$' &&
+	printf '%s\n' "$vbridge_out" | grep -q '^vbweb *| read=nameserver 172\.31\.0\.1$' &&
+	printf '%s\n' "$vbridge_out" | grep -q '^vbweb *| dns=anything\.example 192\.0\.2\.7$' &&
 	printf '%s\n' "$vbridge_out" | grep -q "^vbweb *| dial $(printf '%s' "$vcdb_at" | sed 's/\./\\./g'):80=hello from the machine\$" ||
 	fail "a vm on hull0, as root, was not addressed, routed out and on one wire with a chroot machine" "$vbridge_out"
 cases=$((cases + 1))
