@@ -1598,8 +1598,10 @@ wait "$core_holder" 2>/dev/null
 # starts takes it back: what the workload wrote while no core held it,
 # an exec, and its exit; then its file and directory gone. It writes
 # `during` two seconds in, while no core holds it, as the test waits
-# three after the kill, and ends four seconds after that.
-conf adopt '(command "/probe" "say" "before" "sleep" "2" "say" "during" "sleep" "4" "say" "after" "exit" "6")' \
+# three after the kill, and ends eight seconds after that: four failed
+# once on a loaded host, the core that took it back started after it
+# had already ended, so it was taken back exited.
+conf adopt '(command "/probe" "say" "before" "sleep" "2" "say" "during" "sleep" "8" "say" "after" "exit" "6")' \
 	'(hostname "cadopt") (on_disconnect keep)'
 (cd / && exec timeout -k 2 30 "$hull_abs" run -f "$root/adopt.conf" > /dev/null 2>&1) &
 keeper=$!
