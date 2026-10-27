@@ -1375,6 +1375,29 @@ cases=$((cases + 1))
 grep -q "/cutin\\.conf: shouter: segment $cutin impaired on the way out from the first frame; hull segment $cutin counts it\$" "$root/cutin.out" &&
 	! grep -q '/cutin\.conf: hearer: segment' "$root/cutin.out" ||
 	fail "a spec's impairment was not noticed for its machine alone" "$(cat "$root/cutin.out")"
+# A spec's gemodel given only its p takes netem's defaults: r 1-p and a
+# bad state's loss 1. With p 1 the first frame finds the good state and
+# passes, the link goes bad and r 0 keeps it there, so every frame after
+# it is lost: counted while the machine runs, its kernel's own frames
+# being enough. A wrong r alternates, a wrong bad_loss loses none.
+gem="gem-$$"
+conf gemodel "(network none) (segments \"$gem\") (impair ($gem (out (gemodel (p 1))))) (command \"/probe\" \"link\" \"eth0\" \"sleep\" \"6\")"
+(cd / && exec timeout 60 "$whole_hull" run -f "$root/gemodel.conf" > "$root/gemodel.out" 2>&1) &
+gemrun=$!
+tries=0
+until "$hull" segment "$gem" > "$root/gemodel.counts" 2>&1 &&
+	grep -Eq '^[a-z0-9]+ +out +frames=([3-9]|[1-9][0-9]+) ' "$root/gemodel.counts"; do
+	tries=$((tries + 1))
+	[ "$tries" -lt 80 ] || break
+	sleep 0.25
+done
+gem_frames=$(sed -n 's/^[a-z0-9]* *out *frames=\([0-9]*\) .*/\1/p' "$root/gemodel.counts")
+gem_lost=$(sed -n 's/^[a-z0-9]* *out .* lost=\([0-9]*\).*/\1/p' "$root/gemodel.counts")
+wait "$gemrun"
+cases=$((cases + 1))
+[ -n "$gem_frames" ] && [ -n "$gem_lost" ] && [ "$gem_frames" -ge 3 ] &&
+	[ "$gem_lost" -eq $((gem_frames - 1)) ] ||
+	fail "a spec's gemodel of p alone did not take netem's defaults" "$(cat "$root/gemodel.counts")"
 # One for a segment the machine is not on is refused before it runs, and
 # docker has no link of the core's to impair.
 conf offwire "(network none) (segments \"on-$$\") (impair (off-$$ (out (loss 0.5)))) (command \"/probe\" \"say\" \"ran\")"
