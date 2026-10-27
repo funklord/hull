@@ -698,6 +698,53 @@ static const char *place_ssh(const hull_sexpr_doc *doc, const hull_sexpr_form *g
 }
 
 /*
+ * `text` written to `staged` in /hull and bound read-only over `target`,
+ * a file of the machine's: made where it is absent or a link and the
+ * root's writes are a tmpfs's, and refused where they would be the user's
+ * own tree. A reason, or NULL.
+ */
+static const char *bind_named(const char *text, const char *staged, const char *target,
+                              int made)
+{
+	static char reason[200];
+	struct stat file;
+	FILE       *out = fopen(staged, "w");
+	int         fd;
+
+	if (out == NULL || fputs(text, out) == EOF || fclose(out) != 0) {
+		snprintf(reason, sizeof reason, "%s cannot be written", staged);
+		return reason;
+	}
+	if (lstat(target, &file) != 0 || !S_ISREG(file.st_mode)) {
+		if (lstat(target, &file) == 0 && !S_ISLNK(file.st_mode)) {
+			snprintf(reason, sizeof reason, "an addressed segment's names go over %s, which "
+			         "is not a file", target + strlen("/machine"));
+			return reason;
+		}
+		if (!made) {
+			snprintf(reason, sizeof reason, "an addressed segment's names go over %s, which "
+			         "is not in the machine, and is made only above an overlay",
+			         target + strlen("/machine"));
+			return reason;
+		}
+		mkdir("/machine/etc", 0755);
+		if ((unlink(target) != 0 && errno != ENOENT) ||
+		    (fd = open(target, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0) {
+			snprintf(reason, sizeof reason, "%s cannot be made", target + strlen("/machine"));
+			return reason;
+		}
+		close(fd);
+	}
+	if (mount(staged, target, NULL, MS_BIND, NULL) != 0 ||
+	    mount(NULL, target, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) != 0) {
+		snprintf(reason, sizeof reason, "the names cannot be bound over %s",
+		         target + strlen("/machine"));
+		return reason;
+	}
+	return NULL;
+}
+
+/*
  * The segments hull addresses, the spec's `(names ...)` (Appendix D): the
  * address on each one's NIC, which is up, and every sibling's name in
  * /hull/hosts, bound over the machine's /etc/hosts as resolv.conf is --
@@ -709,16 +756,17 @@ static const char *place_names(const hull_sexpr_doc *doc, const hull_sexpr_form 
 {
 	hull_sexpr_form segments;
 	hull_sexpr_form item;
-	struct stat     file;
 	unsigned        nic = 0u;
 	char           *hosts;
 	char           *network = hull_access_value(doc, machine, "network");
-	FILE           *out;
+	const char     *reason;
+	int             uplinked;
 	int             fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 
 	/* A segment's NIC follows passt's, which (network none) has not. */
 	if (network == NULL || strcmp(network, "none") != 0)
 		nic = 1u;
+	uplinked = nic != 0u;
 	free(network);
 	if (fd < 0)
 		return "a segment's NIC cannot be set";
@@ -755,26 +803,23 @@ static const char *place_names(const hull_sexpr_doc *doc, const hull_sexpr_form 
 	close(fd);
 	if ((hosts = hull_access_hosts(doc, names)) == NULL)
 		return "the spec's names cannot be read";
-	out = fopen("/hull/hosts", "w");
-	if (out == NULL || fputs(hosts, out) == EOF || fclose(out) != 0) {
-		free(hosts);
-		return "/hull/hosts cannot be written";
-	}
+	reason = bind_named(hosts, "/hull/hosts", "/machine/etc/hosts", made);
 	free(hosts);
-	if (lstat("/machine/etc/hosts", &file) != 0) {
-		if (!made)
-			return "an addressed segment's names go over /etc/hosts, which is not in the "
-			       "machine, and is made only above an overlay";
-		mkdir("/machine/etc", 0755);
-		if ((fd = open("/machine/etc/hosts", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0)
-			return "/etc/hosts cannot be made";
-		close(fd);
-	} else if (!S_ISREG(file.st_mode)) {
-		return "an addressed segment's names go over /etc/hosts, which is not a file";
+	if (reason != NULL)
+		return reason;
+	/* With no passt, its segments are its only network, and hull at their
+	 * .1 the one to ask; with passt, passt's DNS stays, and the file's
+	 * siblings are named by /etc/hosts. */
+	if (!uplinked) {
+		char *resolver = hull_access_resolver(doc, names);
+
+		if (resolver == NULL)
+			return "the spec's names cannot be read";
+		reason = bind_named(resolver, "/hull/resolv.conf", "/machine/etc/resolv.conf", made);
+		free(resolver);
+		if (reason != NULL)
+			return reason;
 	}
-	if (mount("/hull/hosts", "/machine/etc/hosts", NULL, MS_BIND, NULL) != 0 ||
-	    mount(NULL, "/machine/etc/hosts", NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) != 0)
-		return "the names cannot be bound over /etc/hosts";
 	return NULL;
 }
 
@@ -875,11 +920,12 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	}
 	/* The machine's resolv.conf names passt's DNS, as docker writes
 	 * its own; only over a file, since a link would be followed here,
-	 * outside the machine. */
+	 * outside the machine, and only where passt is, which wrote it. */
 	{
 		struct stat file;
 
-		if (lstat("/machine/etc/resolv.conf", &file) == 0 && S_ISREG(file.st_mode) &&
+		if (access("/hull/resolv.conf", F_OK) == 0 &&
+		    lstat("/machine/etc/resolv.conf", &file) == 0 && S_ISREG(file.st_mode) &&
 		    (mount("/hull/resolv.conf", "/machine/etc/resolv.conf", NULL, MS_BIND, NULL) != 0 ||
 		     (readonly_root && mount(NULL, "/machine/etc/resolv.conf", NULL,
 		                             MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) != 0)))

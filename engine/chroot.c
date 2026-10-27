@@ -129,6 +129,7 @@ struct hull_machine {
 	char             segment_address[MAX_SEGMENTS][16];  /* hull's on it, or "" (Appendix D) */
 	unsigned         segment_prefix[MAX_SEGMENTS];
 	char            *hosts;      /* the /etc/hosts its addressed segments give it, or NULL */
+	char            *resolver;   /* the /etc/resolv.conf naming hull at their .1, or NULL */
 	int              adopted;    /* taken back: the init is not this process's child */
 	int              pidfd;      /* the init's, when adopted, else -1 */
 	char             dir[4096];  /* the machine's directory, for init.sock, or "" */
@@ -157,6 +158,7 @@ static void release(hull_machine *m)
 	free(m->secrets);
 	free(m->ssh_dir);
 	free(m->hosts);
+	free(m->resolver);
 	free(m->export);
 	free(m->owners);
 	for (unsigned i = 0u; i < m->layer_count; i++)
@@ -436,7 +438,10 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			for (unsigned i = 0u; i < m->segment_count; i++)
 				hull_access_named(doc, &entry, m->segment[i], m->segment_address[i],
 				                  &m->segment_prefix[i]);
-			if ((m->hosts = hull_access_hosts(doc, &entry)) == NULL)
+			/* A machine on segments has no network but theirs, so hull at
+			 * their .1 is the one to ask. */
+			if ((m->hosts = hull_access_hosts(doc, &entry)) == NULL ||
+			    (m->resolver = hull_access_resolver(doc, &entry)) == NULL)
 				return "the plan's names cannot be read";
 		}
 	}
@@ -512,6 +517,61 @@ static void child_fail(int report, const char *step)
 	if (write(report, message, length) < 0)
 		_exit(127);
 	_exit(127);
+}
+
+/* `text` as `name` in `dir`, the machine's staging tmpfs, cloned as a
+ * read-only tree to place once the root is the machine's. */
+static int stage_named(const char *dir, const char *name, const char *text, int report)
+{
+	struct mount_attr readonly = { .attr_set = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID |
+	                                           MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC };
+	char              path[4300];
+	size_t            length = strlen(text);
+	int               fd;
+	int               tree;
+
+	snprintf(path, sizeof path, "%s/%s", dir, name);
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0444);
+	if (fd < 0 || write(fd, text, length) != (ssize_t)length || close(fd) != 0)
+		child_fail(report, "the segments' names");
+	tree = open_tree(AT_FDCWD, path, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+	if (tree < 0 || mount_setattr(tree, "", AT_EMPTY_PATH, &readonly, sizeof readonly) != 0)
+		child_fail(report, "the segments' names");
+	return tree;
+}
+
+/* `tree` over `path`, a file of the machine's: made where it is absent or
+ * a link and the root's writes are an overlay's, which a link's target
+ * outside the machine would not be, and refused where the tree is the
+ * user's own. */
+static void place_named(int tree, const char *path, int overlay, int report)
+{
+	struct stat place;
+	char        step[200];
+
+	if (lstat(path, &place) != 0 || !S_ISREG(place.st_mode)) {
+		int fd;
+
+		if (lstat(path, &place) == 0 && !S_ISLNK(place.st_mode)) {
+			errno = EISDIR;
+			snprintf(step, sizeof step, "an addressed segment's names go over %s, which is not "
+			         "a file", path);
+			child_fail(report, step);
+		}
+		if (!overlay) {
+			errno = ENOENT;
+			snprintf(step, sizeof step, "an addressed segment's names go over %s, which is not "
+			         "in the machine, and is made only above an overlay", path);
+			child_fail(report, step);
+		}
+		if (make_path("/etc") != 0 || (unlink(path) != 0 && errno != ENOENT) ||
+		    (fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0)
+			child_fail(report, path);
+		close(fd);
+	}
+	snprintf(step, sizeof step, "the segments' names over %s", path);
+	if (move_mount(tree, "", AT_FDCWD, path, MOVE_MOUNT_F_EMPTY_PATH) != 0)
+		child_fail(report, step);
 }
 
 static int write_file(const char *path, const char *text)
@@ -1092,6 +1152,7 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	int              secrets = -1;
 	int              ssh_tree = -1;
 	int              hosts_tree = -1;
+	int              resolver_tree = -1;
 	const char      *ssh_bin = NULL;  /* the image's sshd, once found after the pivot */
 	int              null = open("/dev/null", O_RDWR | O_CLOEXEC);
 	int              out[2];
@@ -1189,24 +1250,13 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	 * outlives the old root it is staged under. */
 	if ((m->staged || m->hosts != NULL) && mount("tmpfs", m->dir, "tmpfs", 0u, "mode=0700") != 0)
 		child_fail(report, "the volumes' staging");
-	/* The names of its addressed segments, staged beside the volumes and
-	 * placed over /etc/hosts once the root is the machine's: the tree is
-	 * not written, so a read-only or stored root takes it too. */
+	/* The names of its addressed segments, and hull at their .1 to ask,
+	 * staged beside the volumes and placed over /etc/hosts and
+	 * /etc/resolv.conf once the root is the machine's: the tree is not
+	 * written, so a read-only or stored root takes them too. */
 	if (m->hosts != NULL) {
-		struct mount_attr readonly = { .attr_set = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID |
-		                                           MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC };
-		char              path[4300];
-		size_t            length = strlen(m->hosts);
-		int               fd;
-
-		snprintf(path, sizeof path, "%s/hosts", m->dir);
-		fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0444);
-		if (fd < 0 || write(fd, m->hosts, length) != (ssize_t)length || close(fd) != 0)
-			child_fail(report, "the segments' names");
-		hosts_tree = open_tree(AT_FDCWD, path, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
-		if (hosts_tree < 0 ||
-		    mount_setattr(hosts_tree, "", AT_EMPTY_PATH, &readonly, sizeof readonly) != 0)
-			child_fail(report, "the segments' names");
+		hosts_tree    = stage_named(m->dir, "hosts", m->hosts, report);
+		resolver_tree = stage_named(m->dir, "resolv.conf", m->resolver, report);
 	}
 	for (unsigned i = 0u; i < m->volume_count; i++) {
 		struct mount_attr readonly = { .attr_set = MOUNT_ATTR_RDONLY };
@@ -1346,26 +1396,12 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		               MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_SYMLINKS) != 0)
 			child_fail(report, step);
 	}
-	/* Its siblings' names over /etc/hosts, made where the root's writes
-	 * are the overlay's, and refused where they would be the user's own. */
+	/* Its siblings' names over /etc/hosts, and hull's .1 over
+	 * /etc/resolv.conf, made where the root's writes are the overlay's,
+	 * and refused where they would be the user's own. */
 	if (hosts_tree >= 0) {
-		struct stat place;
-
-		if (stat("/etc/hosts", &place) != 0 && errno == ENOENT) {
-			int fd;
-
-			if (!m->overlay) {
-				errno = ENOENT;
-				child_fail(report, "an addressed segment's names go over /etc/hosts, which is "
-				           "not in the machine, and is made only above an overlay");
-			}
-			if (make_path("/etc") != 0 ||
-			    (fd = open("/etc/hosts", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0)
-				child_fail(report, "/etc/hosts");
-			close(fd);
-		}
-		if (move_mount(hosts_tree, "", AT_FDCWD, "/etc/hosts", MOVE_MOUNT_F_EMPTY_PATH) != 0)
-			child_fail(report, "the segments' names over /etc/hosts");
+		place_named(hosts_tree, "/etc/hosts", m->overlay, report);
+		place_named(resolver_tree, "/etc/resolv.conf", m->overlay, report);
 	}
 	/* The secrets at /run/hull/secrets, J.3's place, on a tmpfs at /run:
 	 * the dir's /run, which FHS has emptied at every boot, is hidden, and

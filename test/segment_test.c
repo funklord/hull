@@ -151,6 +151,162 @@ static void expect(const char *what, int fd, char want)
 	}
 }
 
+/* --- hull at .1 ------------------------------------------------------------ */
+
+static const uint8_t hull_mac[6] = { 0x02, 'h', 'u', 'l', 'l', 0x01 };
+
+static void put16(uint8_t *at, unsigned value)
+{
+	at[0] = (uint8_t)(value >> 8);
+	at[1] = (uint8_t)value;
+}
+
+static unsigned get16(const uint8_t *at)
+{
+	return (unsigned)(at[0] << 8 | at[1]);
+}
+
+/* The ones' complement sum, folded: 0xffff over data whose sum is right. */
+static unsigned sum16(uint32_t sum, const uint8_t *data, size_t length)
+{
+	for (size_t i = 0u; i + 1u < length; i += 2u)
+		sum += get16(data + i);
+	if (length % 2u != 0u)
+		sum += (uint32_t)data[length - 1u] << 8;
+	while (sum >> 16)
+		sum = (sum & 0xffffu) + (sum >> 16);
+	return sum;
+}
+
+/* `frame`, `length` bytes, framed onto `fd`. */
+static void send_raw(int fd, const uint8_t *frame, size_t length)
+{
+	uint8_t data[4u + 1514u];
+
+	data[0] = 0u;
+	data[1] = 0u;
+	put16(data + 2, (unsigned)length);
+	memcpy(data + 4, frame, length);
+	if (write(fd, data, 4u + length) != (ssize_t)(4u + length))
+		fail("a write", strerror(errno));
+}
+
+/* The next frame `fd` is given within `ms`, into `out`: its length, or 0. */
+static size_t next_raw(int fd, uint8_t *out, size_t cap, int ms)
+{
+	struct pollfd p = { fd, POLLIN, 0 };
+	uint8_t       head[4];
+	size_t        got = 0u;
+	size_t        length;
+
+	while (got < 4u) {
+		ssize_t n;
+
+		if (poll(&p, 1u, ms) <= 0 || (n = read(fd, head + got, 4u - got)) <= 0)
+			return 0u;
+		got += (size_t)n;
+	}
+	length = (size_t)head[2] << 8 | head[3];
+	if (length > cap)
+		return 0u;
+	for (got = 0u; got < length;) {
+		ssize_t n;
+
+		if (poll(&p, 1u, ms) <= 0 || (n = read(fd, out + got, length - got)) <= 0)
+			return 0u;
+		got += (size_t)n;
+	}
+	return length;
+}
+
+/* An ARP request from MAC ...:`me`, address 10.55.0.`me`, for 10.55.0.`whom`. */
+static void send_arp(int fd, uint8_t me, uint8_t whom)
+{
+	uint8_t f[60] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x52, 0x54, 0, 0, 0, me, 0x08, 0x06,
+	                  0, 1, 0x08, 0, 6, 4, 0, 1, 0x52, 0x54, 0, 0, 0, me, 10, 55, 0, me,
+	                  0, 0, 0, 0, 0, 0, 10, 55, 0, whom };
+
+	send_raw(fd, f, sizeof f);
+}
+
+/* A DNS question for `name` of `type`, from MAC and address ...`me` to
+ * hull's .1, from UDP port 4000. */
+static void send_dns(int fd, uint8_t me, const char *name, unsigned type)
+{
+	uint8_t f[300] = { 0 };
+	size_t  at = 14u + 28u + 12u;
+	size_t  dns;
+
+	memcpy(f, hull_mac, 6u);
+	f[6] = 0x52;
+	f[7] = 0x54;
+	f[11] = me;
+	put16(f + 12, 0x0800u);
+	for (const char *label = name; *label != '\0';) {
+		size_t length = strcspn(label, ".");
+
+		f[at++] = (uint8_t)length;
+		memcpy(f + at, label, length);
+		at += length;
+		label += length + (label[length] == '.');
+	}
+	f[at++] = 0u;
+	put16(f + at, type);
+	put16(f + at + 2u, 1u);
+	at += 4u;
+	dns = at - 14u - 28u;
+	f[42] = 0x12;
+	f[43] = 0x34;
+	f[44] = 0x01;   /* recursion desired */
+	put16(f + 46, 1u);
+	f[14] = 0x45;
+	put16(f + 16, (unsigned)(28u + dns));
+	f[22] = 64u;
+	f[23] = 17u;
+	f[26] = 10;
+	f[27] = 55;
+	f[29] = me;
+	f[30] = 10;
+	f[31] = 55;
+	f[33] = 1;
+	put16(f + 24, ~sum16(0u, f + 14, 20u) & 0xffffu);
+	put16(f + 34, 4000u);
+	put16(f + 36, 53u);
+	put16(f + 38, (unsigned)(8u + dns));
+	send_raw(fd, f, at);
+}
+
+/* The answer to a send_dns() on `fd`: its rcode, and where it has one,
+ * its data into `data`; -1 where none came or its sums or addressing are
+ * wrong. */
+static int dns_reply(int fd, uint8_t me, uint8_t *data, size_t *data_length)
+{
+	uint8_t  f[1514];
+	size_t   length = next_raw(fd, f, sizeof f, 1000);
+	size_t   udp;
+	size_t   at;
+	uint32_t sum;
+
+	if (length < 14u + 28u + 12u || memcmp(f + 6, hull_mac, 6u) != 0 || f[5] != me ||
+	    get16(f + 12) != 0x0800u || sum16(0u, f + 14, 20u) != 0xffffu || f[29] != 1u ||
+	    f[33] != me || get16(f + 34) != 53u || get16(f + 36) != 4000u)
+		return -1;
+	udp = get16(f + 38);
+	sum = sum16(0u, f + 26, 8u) + 17u + (uint32_t)udp;
+	if (sum16(sum, f + 34, udp) != 0xffffu || get16(f + 42) != 0x1234u || (f[44] & 0x81u) != 0x81u)
+		return -1;
+	*data_length = 0u;
+	if (get16(f + 48) == 1u) {
+		/* The question, then a pointer, type, class, TTL and the data. */
+		for (at = 14u + 28u + 12u; f[at] != 0u; at += 1u + f[at])
+			;
+		at += 5u + 10u;
+		*data_length = get16(f + at);
+		memcpy(data, f + at + 2u, *data_length);
+	}
+	return f[45] & 0x0f;
+}
+
 /* Which of `n` frames from `from` reach `to` with `seed` and `loss`, as a
  * pattern of bits, on a segment of their own. */
 static uint64_t pattern(const char *key, uint64_t seed, double loss, unsigned n)
@@ -626,6 +782,74 @@ int main(void)
 			close(db);
 		if (raw >= 0)
 			close(raw);
+	}
+	{
+		/* hull at .1 of a segment it addresses, 10.55.0.0/24: ARP for .1
+		 * answered to its asker alone; A for an addressed machine's id and
+		 * id.hull, PTR for its address, NXDOMAIN for a name or address it
+		 * has not, REFUSED for one outside, each with right sums; a machine
+		 * joining later named, and one gone not. */
+		char    why[256] = "";
+		int     web = hull_segment_port_addressed("dnsd", "web", 0x0a37000au, 24u, why,
+		                                          sizeof why);
+		int     db = hull_segment_port_addressed("dnsd", "db", 0x0a370014u, 24u, why, sizeof why);
+		int     late;
+		int     bare = port_of("dnsb", "x");
+		int     peer = port_of("dnsb", "y");
+		uint8_t f[1514];
+		uint8_t data[300];
+		size_t  length;
+		int     rcode;
+
+		send_arp(web, 10u, 1u);
+		length = next_raw(web, f, sizeof f, 1000);
+		check("ARP for .1 answered by hull's MAC",
+		      length >= 42u && get16(f + 12) == 0x0806u && get16(f + 20) == 2u &&
+		      memcmp(f + 22, hull_mac, 6u) == 0 && f[28] == 10u && f[31] == 1u &&
+		      f[5] == 10u && f[41] == 10u);
+		check("ARP for .1, not to another port", next_raw(db, f, sizeof f, 100) == 0u);
+		send_dns(web, 10u, "db", 1u);
+		rcode = dns_reply(web, 10u, data, &length);
+		check("A for an addressed machine's id", rcode == 0 && length == 4u && data[0] == 10u &&
+		                                         data[1] == 55u && data[3] == 20u);
+		send_dns(web, 10u, "DB.hull", 1u);
+		rcode = dns_reply(web, 10u, data, &length);
+		check("A for id.hull, in any case", rcode == 0 && length == 4u && data[3] == 20u);
+		send_dns(web, 10u, "20.0.55.10.in-addr.arpa", 12u);
+		rcode = dns_reply(web, 10u, data, &length);
+		check("PTR for an addressed machine's address",
+		      rcode == 0 && length == 9u && memcmp(data, "\2db\4hull", 9u) == 0);
+		send_dns(web, 10u, "db", 28u);
+		rcode = dns_reply(web, 10u, data, &length);
+		check("AAAA for a named machine, no data", rcode == 0 && length == 0u);
+		send_dns(web, 10u, "nobody", 1u);
+		check("a name it has not, NXDOMAIN", dns_reply(web, 10u, data, &length) == 3);
+		send_dns(web, 10u, "99.0.55.10.in-addr.arpa", 12u);
+		check("an address it has not, NXDOMAIN", dns_reply(web, 10u, data, &length) == 3);
+		send_dns(web, 10u, "example.com", 1u);
+		check("a name outside, REFUSED", dns_reply(web, 10u, data, &length) == 5);
+		send_dns(web, 10u, "9.9.9.9.in-addr.arpa", 12u);
+		check("an address outside, REFUSED", dns_reply(web, 10u, data, &length) == 5);
+		check("the questions, not to another port", next_raw(db, f, sizeof f, 100) == 0u);
+		late = hull_segment_port_addressed("dnsd", "late", 0x0a37001eu, 24u, why, sizeof why);
+		send_dns(web, 10u, "late", 1u);
+		rcode = dns_reply(web, 10u, data, &length);
+		check("a machine joining later, named", rcode == 0 && length == 4u && data[3] == 30u);
+		close(db);
+		rcode = 0;
+		for (uint64_t until = ms_now() + 2000u; rcode != 3 && ms_now() < until;) {
+			send_dns(web, 10u, "db", 1u);
+			rcode = dns_reply(web, 10u, data, &length);
+		}
+		check("a machine gone, no longer named", rcode == 3);
+		/* A bare segment has no hull at .1: its ARP floods as any other. */
+		send_arp(bare, 10u, 1u);
+		check("no .1 on a bare segment", next_raw(bare, f, sizeof f, 200) == 0u &&
+		                                 next_raw(peer, f, sizeof f, 1000) == 60u);
+		close(web);
+		close(late);
+		close(bare);
+		close(peer);
 	}
 	{
 		/* Inject onto a segment no machine is on is refused. */

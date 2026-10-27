@@ -42,6 +42,9 @@
  *   ask N P     N looked up as hosts does, a datagram to its port P each
  *               200 ms until one comes back, or 60 s pass, as a sibling vm
  *               may still be booting; and the reply
+ *   dns N       N's A record from resolv.conf's first nameserver, asked
+ *               as a stub resolver asks; or the rcode
+ *   ptr A       the name a PTR lookup of address A gives there
  *   stdin       the first line of its stdin
  *   count       all of its stdin: how many bytes, and their FNV-1a hash
  *   spew N      N bytes on stdout, from a xorshift that does not repeat
@@ -405,6 +408,103 @@ static void resolve(const char *server, const char *name)
 	else
 		printf("resolve=rcode %d answers %d\n", answer[3] & 0x0f, answer[6] << 8 | answer[7]);
 	close(fd);
+}
+
+/* The first nameserver /etc/resolv.conf names, into `out`: 1, or 0. */
+static int nameserver(char out[16])
+{
+	FILE *conf = fopen("/etc/resolv.conf", "r");
+	char  line[256];
+	int   found = 0;
+
+	while (conf != NULL && !found && fgets(line, sizeof line, conf) != NULL)
+		found = sscanf(line, "nameserver %15s", out) == 1;
+	if (conf != NULL)
+		fclose(conf);
+	return found;
+}
+
+/* Ask resolv.conf's nameserver for `name`'s A (`type` 1) or PTR (12),
+ * three tries two seconds apart, as a stub resolver does; print the
+ * answer's address or name, or its rcode. */
+static void ask_dns(const char *step, const char *shown, const char *name, unsigned type)
+{
+	int                fd = socket(AF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in to;
+	struct pollfd      p;
+	char               server[16];
+	uint8_t            query[300] = { 0x68, 0x76, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0 };
+	uint8_t            answer[1500];
+	size_t             n = 12u;
+	ssize_t            got = -1;
+
+	if (!nameserver(server)) {
+		printf("%s=%s no nameserver\n", step, shown);
+		close(fd);
+		return;
+	}
+	for (const char *label = name; *label != '\0' && n < sizeof query - 70u;) {
+		size_t length = strcspn(label, ".");
+
+		query[n++] = (uint8_t)length;
+		memcpy(query + n, label, length);
+		n += length;
+		label += length;
+		if (*label == '.')
+			label++;
+	}
+	query[n++] = 0;
+	query[n++] = 0;
+	query[n++] = (uint8_t)type;
+	query[n++] = 0;
+	query[n++] = 1;
+	memset(&to, 0, sizeof to);
+	to.sin_family = AF_INET;
+	to.sin_port   = htons(53);
+	inet_pton(AF_INET, server, &to.sin_addr);
+	p.fd     = fd;
+	p.events = POLLIN;
+	for (int tries = 0; tries < 3 && got < 0; tries++) {
+		if (sendto(fd, query, n, 0, (struct sockaddr *)&to, sizeof to) == (ssize_t)n &&
+		    poll(&p, 1u, 2000) == 1)
+			got = recv(fd, answer, sizeof answer, 0);
+	}
+	close(fd);
+	if (got < 12 || answer[0] != 0x68 || answer[1] != 0x76) {
+		printf("%s=%s no answer from %s\n", step, shown, server);
+		return;
+	}
+	/* One answer after the question echoed: a pointer, type, class, TTL,
+	 * then its data. */
+	if ((answer[6] << 8 | answer[7]) == 0 || (size_t)got < n + 12u) {
+		printf("%s=%s rcode %d\n", step, shown, answer[3] & 0x0f);
+		return;
+	}
+	{
+		const uint8_t *data = answer + n + 12u;
+		size_t         length = (size_t)(answer[n + 10u] << 8 | answer[n + 11u]);
+
+		if ((size_t)got < n + 12u + length) {
+			printf("%s=%s short answer\n", step, shown);
+		} else if (type == 1u && length == 4u) {
+			printf("%s=%s %u.%u.%u.%u\n", step, shown, data[0], data[1], data[2], data[3]);
+		} else {
+			char   text[256];
+			size_t at = 0u;
+
+			for (size_t i = 0u; i < length && data[i] != 0u && at + 64u < sizeof text;) {
+				size_t label = data[i];
+
+				if (at != 0u)
+					text[at++] = '.';
+				memcpy(text + at, data + i + 1u, label);
+				at += label;
+				i += 1u + label;
+			}
+			text[at] = '\0';
+			printf("%s=%s %s\n", step, shown, text);
+		}
+	}
 }
 
 /* Until this process has used `ms` of CPU time. */
@@ -1014,6 +1114,20 @@ int main(int argc, char **argv)
 		} else if (strcmp(step, "dial") == 0 && i + 2 < argc) {
 			dial(arg, argv[i + 2]);
 			i += 2;
+		} else if (strcmp(step, "dns") == 0) {
+			ask_dns("dns", arg, arg, 1u);
+			i++;
+		} else if (strcmp(step, "ptr") == 0) {
+			unsigned a, b, c, d;
+			char     reverse[64];
+
+			if (sscanf(arg, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+				snprintf(reverse, sizeof reverse, "%u.%u.%u.%u.in-addr.arpa", d, c, b, a);
+				ask_dns("ptr", arg, reverse, 12u);
+			} else {
+				printf("ptr=%s not an address\n", arg);
+			}
+			i++;
 		} else if (strcmp(step, "resolve") == 0 && i + 2 < argc) {
 			resolve(arg, argv[i + 2]);
 			i += 2;

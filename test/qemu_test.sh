@@ -475,7 +475,7 @@ cases=$((cases + 1))
 # datagram sent by name is answered by the sibling's own hostname.
 vnamed="vnamed-$$"
 printf '(machines (vweb %s) (vdb %s))\n' \
-	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (segments ($vnamed (subnet \"10.86.0.0/24\"))) (command \"/probe\" \"addr\" \"eth1\" \"hosts\" \"vdb\" \"ask\" \"vdb\" \"7000\")" \
+	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (segments ($vnamed (subnet \"10.86.0.0/24\"))) (command \"/probe\" \"addr\" \"eth1\" \"hosts\" \"vdb\" \"read\" \"/etc/resolv.conf\" \"ask\" \"vdb\" \"7000\")" \
 	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (segments ($vnamed (subnet \"10.86.0.0/24\"))) (command \"/probe\" \"addr\" \"eth1\" \"answer\" \"7000\")" \
 	> "$root/vnamed.conf"
 name=vnamed
@@ -485,6 +485,11 @@ vdb_at=$(printf '%s\n' "$out" | sed -n 's#^vdb *| addr=eth1 \(10\.86\.0\.[0-9]*\
 cases=$((cases + 1))
 [ -n "$vdb_at" ] && printf '%s\n' "$out" | grep -q "^vweb *| hosts=vdb $vdb_at\$" ||
 	fail "a vm was not named to its sibling at the sibling's own address" "$out"
+# With passt, passt's DNS stays the vm's: its uplink is passt's, and the
+# file's siblings are named by /etc/hosts.
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^vweb *| read=nameserver 10\.0\.2\.3$' ||
+	fail "a vm with passt was not left asking passt's DNS" "$out"
 # A chroot machine and a vm, both of (network none), so the vm's eth0 is
 # its segment's and not passt's: each named to the other across the
 # core's switch, and the chroot's datagram answered by the vm. A third, a
@@ -494,7 +499,7 @@ cases=$((cases + 1))
 mixed="mixed-$$"
 printf '(machines (cweb %s) (vdb %s) (vraw %s))\n' \
 	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments ($mixed (subnet \"10.87.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"ask\" \"vdb\" \"7000\")" \
-	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network none) (segments ($mixed (subnet \"10.87.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"hosts\" \"cweb\" \"answer\" \"7000\")" \
+	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network none) (segments ($mixed (subnet \"10.87.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"hosts\" \"cweb\" \"read\" \"/etc/resolv.conf\" \"dns\" \"cweb\" \"ptr\" \"10.87.0.0\" \"answer\" \"7000\")" \
 	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network none) (segments \"vraw-$$\") (command \"/probe\" \"addr\" \"eth0\")" \
 	> "$root/mixed.conf"
 name=mixed
@@ -507,6 +512,14 @@ cases=$((cases + 1))
 [ -n "$cweb_at" ] && printf '%s\n' "$out" | grep -q "^vdb *| hosts=cweb $cweb_at\$" &&
 	printf '%s\n' "$out" | grep -q "^vdb *| answer=from $cweb_at\$" ||
 	fail "a vm and a chroot machine were not named to each other across the switch" "$out"
+# A vm of (network none) asks hull at its segment's .1, which names the
+# chroot machine there; a reverse lookup of the subnet's own network is
+# a name hull has not.
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^vdb *| read=nameserver 10\.87\.0\.1$' &&
+	printf '%s\n' "$out" | grep -q "^vdb *| dns=cweb $cweb_at\$" &&
+	printf '%s\n' "$out" | grep -q '^vdb *| ptr=10\.87\.0\.0 rcode 3$' ||
+	fail "a vm of (network none) was not named its sibling by hull at .1" "$out"
 timeout 10 "$hull" kill -s TERM anchor > /dev/null 2>&1
 wait "$anchored"
 # (init PATH): PID 1 is the image's init, here the probe as one, which

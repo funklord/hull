@@ -25,6 +25,7 @@
 
 #define _GNU_SOURCE
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -33,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -528,11 +530,276 @@ static void cross(segment *s, unsigned at, int direction, const uint8_t *framed,
 	}
 }
 
+/* --- hull at .1 ------------------------------------------------------------ */
+
+/* Where a machine of the segment hull addresses asks .1, the switch is
+ * the one answering (Appendix D): ARP for .1, and DNS on its port 53, the
+ * names those of the ports hull addresses, so a machine that joins later
+ * is named as soon as its port is. Its MAC is a locally administered
+ * one, "hull" in it, which qemu's prefix is not. */
+static const uint8_t hull_mac[6] = { 0x02, 'h', 'u', 'l', 'l', 0x01 };
+
+#define DNS_TTL 5u   /* seconds: a name goes with its port */
+
+static uint16_t get16(const uint8_t *at)
+{
+	return (uint16_t)(at[0] << 8 | at[1]);
+}
+
+static uint32_t get32(const uint8_t *at)
+{
+	return (uint32_t)at[0] << 24 | (uint32_t)at[1] << 16 | (uint32_t)at[2] << 8 | at[3];
+}
+
+static void put16(uint8_t *at, uint32_t value)
+{
+	at[0] = (uint8_t)(value >> 8);
+	at[1] = (uint8_t)value;
+}
+
+static void put32(uint8_t *at, uint32_t value)
+{
+	put16(at, value >> 16);
+	put16(at + 2, value);
+}
+
+/* The ones' complement sum RFC 791 and 768 take, folded. */
+static uint32_t sum16(uint32_t sum, const uint8_t *data, size_t length)
+{
+	for (size_t i = 0u; i + 1u < length; i += 2u)
+		sum += get16(data + i);
+	if (length % 2u != 0u)
+		sum += (uint32_t)data[length - 1u] << 8;
+	while (sum >> 16)
+		sum = (sum & 0xffffu) + (sum >> 16);
+	return sum;
+}
+
+/* The subnet hull addresses `s` in, from any port it addresses: 0 where
+ * it addresses none, the segment then bare. */
+static int subnet_of(const segment *s, uint32_t *network, unsigned *prefix)
+{
+	for (unsigned i = 0u; i < s->port_count; i++) {
+		const port *p = s->ports[i];
+
+		if (p->prefix != 0u) {
+			*prefix  = p->prefix;
+			*network = p->address & 0xffffffffu << (32u - p->prefix);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* The addressed port whose machine is `name`, or whose address is
+ * `address` where `name` is NULL. */
+static const port *named(const segment *s, const char *name, uint32_t address)
+{
+	for (unsigned i = 0u; i < s->port_count; i++) {
+		const port *p = s->ports[i];
+
+		if (p->prefix != 0u && (name != NULL ? strcasecmp(p->machine, name) == 0 :
+		                                       p->address == address))
+			return p;
+	}
+	return NULL;
+}
+
+#define DNS_A    1u
+#define DNS_PTR  12u
+#define DNS_ANY  255u
+
+/* The answer to DNS `query` from the names `s` holds, into `out`: its
+ * length, or 0 for none. Only the names hull gives, ID and ID.hull, and
+ * the subnet's reverse names; the rest is refused, there being nothing
+ * here to ask on to. */
+static size_t dns_answer(const segment *s, uint32_t network, unsigned prefix,
+                         const uint8_t *query, size_t length, uint8_t *out, size_t cap)
+{
+	char        name[256];
+	size_t      at = 12u;
+	size_t      used = 0u;
+	size_t      n;
+	unsigned    type;
+	unsigned    rcode = 0u;
+	uint8_t     data[80];
+	size_t      data_length = 0u;
+	unsigned    answer_type = 0u;
+	const port *p = NULL;
+	uint32_t    mask = 0xffffffffu << (32u - prefix);
+
+	if (length < 12u || (query[2] & 0x80u) != 0u || (query[2] & 0x78u) != 0u ||
+	    get16(query + 4) != 1u)
+		return 0u;
+	/* The question's name, lowercased, its labels joined by dots; no
+	 * pointer, since a question has nothing earlier to point at. */
+	while (at < length && query[at] != 0u) {
+		unsigned label = query[at];
+
+		if (label > 63u || at + 1u + label >= length || used + label + 1u >= sizeof name)
+			return 0u;
+		if (used != 0u)
+			name[used++] = '.';
+		for (unsigned i = 0u; i < label; i++)
+			name[used++] = (char)tolower(query[at + 1u + i]);
+		at += 1u + label;
+	}
+	if (at + 5u > length)
+		return 0u;
+	name[used] = '\0';
+	at++;
+	type = get16(query + at);
+	if (get16(query + at + 2u) != 1u)
+		rcode = 5u;   /* not IN */
+	at += 4u;
+	n = used;
+	if (rcode == 0u && n > 13u && strcmp(name + n - 13u, ".in-addr.arpa") == 0) {
+		unsigned octet[4];
+		char     tail;
+
+		name[n - 13u] = '\0';
+		if (sscanf(name, "%u.%u.%u.%u%c", &octet[3], &octet[2], &octet[1], &octet[0], &tail) != 4 ||
+		    octet[0] > 255u || octet[1] > 255u || octet[2] > 255u || octet[3] > 255u) {
+			rcode = 5u;
+		} else {
+			uint32_t address = octet[0] << 24 | octet[1] << 16 | octet[2] << 8 | octet[3];
+
+			if ((address & mask) != network)
+				rcode = 5u;
+			else if ((p = named(s, NULL, address)) == NULL)
+				rcode = 3u;
+			else if (type == DNS_PTR || type == DNS_ANY) {
+				size_t id = strlen(p->machine);
+
+				data[0] = (uint8_t)id;
+				memcpy(data + 1, p->machine, id);
+				memcpy(data + 1u + id, "\4hull", 6u);
+				data_length = 1u + id + 6u;
+				answer_type = DNS_PTR;
+			}
+		}
+	} else if (rcode == 0u) {
+		if (n > 5u && strcmp(name + n - 5u, ".hull") == 0)
+			name[n - 5u] = '\0';
+		if (strchr(name, '.') != NULL || name[0] == '\0')
+			rcode = 5u;
+		else if ((p = named(s, name, 0u)) == NULL)
+			rcode = 3u;
+		else if (type == DNS_A || type == DNS_ANY) {
+			put32(data, p->address);
+			data_length = 4u;
+			answer_type = DNS_A;
+		}
+	}
+	if (at + 16u + data_length > cap)
+		return 0u;
+	/* The query's id and question back, as an authority's answer, the
+	 * recursion it asked for echoed and none offered. */
+	memcpy(out, query, at);
+	out[2] = (uint8_t)(0x84u | (query[2] & 0x01u));
+	out[3] = (uint8_t)rcode;
+	put16(out + 6, data_length != 0u ? 1u : 0u);
+	put16(out + 8, 0u);
+	put16(out + 10, 0u);
+	if (data_length == 0u)
+		return at;
+	put16(out + at, 0xc00cu);   /* the question's name */
+	put16(out + at + 2u, answer_type);
+	put16(out + at + 4u, 1u);
+	put32(out + at + 6u, DNS_TTL);
+	put16(out + at + 10u, (uint32_t)data_length);
+	memcpy(out + at + 12u, data, data_length);
+	return at + 12u + data_length;
+}
+
+/* A frame from port `from` that is for hull at .1, answered back through
+ * the port's way in: 1 where it was, and goes no further. */
+static int answer(segment *s, unsigned from, const uint8_t *framed, size_t length)
+{
+	const uint8_t *frame = framed + 4;
+	size_t         size = length - 4u;
+	uint8_t        reply[4u + 1514u];
+	uint8_t       *out = reply + 4;
+	uint32_t       network;
+	uint32_t       self;
+	unsigned       prefix;
+	size_t         total;
+
+	if (!subnet_of(s, &network, &prefix))
+		return 0;
+	self = network + 1u;
+	memset(reply, 0, sizeof reply);
+	memcpy(out, frame + 6, 6u);
+	memcpy(out + 6, hull_mac, 6u);
+	/* ARP: who has .1. */
+	if (size >= 42u && get16(frame + 12) == 0x0806u && get16(frame + 14) == 1u &&
+	    get16(frame + 16) == 0x0800u && frame[18] == 6u && frame[19] == 4u &&
+	    get16(frame + 20) == 1u && get32(frame + 38) == self) {
+		put16(out + 12, 0x0806u);
+		put16(out + 14, 1u);
+		put16(out + 16, 0x0800u);
+		out[18] = 6u;
+		out[19] = 4u;
+		put16(out + 20, 2u);
+		memcpy(out + 22, hull_mac, 6u);
+		put32(out + 28, self);
+		memcpy(out + 32, frame + 22, 10u);   /* the asker's MAC and address */
+		total = 60u;
+	} else if (memcmp(frame, hull_mac, 6u) == 0) {
+		const uint8_t *ip = frame + 14;
+		size_t         header;
+		size_t         datagram;
+		size_t         dns;
+		uint32_t       sum;
+
+		/* For .1 and not ARP or DNS: nothing else answers there. */
+		if (size < 14u + 20u + 8u || get16(frame + 12) != 0x0800u || ip[0] >> 4 != 4u)
+			return 1;
+		header = (size_t)(ip[0] & 0x0fu) * 4u;
+		datagram = get16(ip + 2);
+		if (header < 20u || datagram < header + 8u || 14u + datagram > size || ip[9] != 17u ||
+		    (get16(ip + 6) & 0x3fffu) != 0u || get32(ip + 16) != self ||
+		    get16(ip + header + 2) != 53u)
+			return 1;
+		dns = dns_answer(s, network, prefix, ip + header + 8u, datagram - header - 8u,
+		                 out + 14u + 28u, sizeof reply - 4u - 14u - 28u);
+		if (dns == 0u)
+			return 1;
+		put16(out + 12, 0x0800u);
+		out[14] = 0x45u;
+		put16(out + 16, (uint32_t)(28u + dns));
+		put16(out + 20, 0x4000u);   /* don't fragment */
+		out[22] = 64u;
+		out[23] = 17u;
+		put32(out + 26, self);
+		memcpy(out + 30, ip + 12, 4u);   /* to the asker */
+		put16(out + 24, ~sum16(0u, out + 14, 20u) & 0xffffu);
+		put16(out + 34, 53u);
+		memcpy(out + 36, ip + header, 2u);   /* to the port it asked from */
+		put16(out + 38, (uint32_t)(8u + dns));
+		/* The UDP sum over its pseudo-header, as a checking stack wants. */
+		sum = sum16(0u, out + 26, 8u);
+		sum += 17u + 8u + (uint32_t)dns;
+		sum = sum16(sum, out + 34, 8u + dns);
+		put16(out + 40, (~sum & 0xffffu) == 0u ? 0xffffu : ~sum & 0xffffu);
+		total = 14u + 28u + dns;
+		if (total < 60u)
+			total = 60u;
+	} else {
+		return 0;
+	}
+	put32(reply, (uint32_t)total);
+	cross(s, from, HULL_SEGMENT_IN, reply, 4u + total);
+	return 1;
+}
+
 static void forward(segment *s, unsigned from, const uint8_t *framed, size_t length)
 {
 	int to;
 
 	if (length < 4u + 14u)
+		return;
+	if (answer(s, from, framed, length))
 		return;
 	to = lookup(s, framed + 4, from);
 	if (to == -2)

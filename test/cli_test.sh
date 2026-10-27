@@ -1213,9 +1213,9 @@ grep -q '^hear=nothing$' "$root/cloner.out" ||
 # in the same file is left as it was: down, no address, no hosts.
 named="named-$$"
 printf '(machines (web %s) (db %s) (raw %s))\n' \
-	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments ($named (subnet \"10.77.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"hosts\" \"db\" \"hosts\" \"db.hull\" \"hosts\" \"web\" \"ask\" \"db\" \"7000\")" \
-	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments ($named (subnet \"10.77.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"answer\" \"7000\")" \
-	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments \"raw-$$\") (command \"/probe\" \"addr\" \"eth0\" \"read\" \"/etc/hosts\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments ($named (subnet \"10.77.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"hosts\" \"db\" \"hosts\" \"db.hull\" \"hosts\" \"web\" \"ask\" \"db\" \"7000\" \"read\" \"/etc/resolv.conf\" \"dns\" \"db\" \"dns\" \"db.hull\" \"dns\" \"nobody\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments ($named (subnet \"10.77.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"answer\" \"7000\" \"sleep\" \"4\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments \"raw-$$\") (command \"/probe\" \"addr\" \"eth0\" \"read\" \"/etc/hosts\" \"read\" \"/etc/resolv.conf\")" \
 	> "$root/named.conf"
 limit=60
 from_root 0 '^web +\| ask=db at 10\.77\.0\.[0-9]+: db$' -f "$root/named.conf"
@@ -1229,9 +1229,17 @@ cases=$((cases + 1))
 	printf '%s\n' "$named_out" | grep -q "^web *| hosts=web $web_at\$" &&
 	printf '%s\n' "$named_out" | grep -q "^db *| answer=from $web_at\$" ||
 	fail "addressed siblings were not named to each other at their own addresses" "$named_out"
+# hull answers at the segment's .1, which resolv.conf names: the sibling by
+# id and by id.hull, and a name it has not refused as one it has not.
+cases=$((cases + 1))
+printf '%s\n' "$named_out" | grep -q '^web *| read=nameserver 10\.77\.0\.1$' &&
+	printf '%s\n' "$named_out" | grep -q "^web *| dns=db $db_at\$" &&
+	printf '%s\n' "$named_out" | grep -q "^web *| dns=db.hull $db_at\$" &&
+	printf '%s\n' "$named_out" | grep -q '^web *| dns=nobody rcode 3$' ||
+	fail "hull at an addressed segment's .1 did not name the siblings" "$named_out"
 cases=$((cases + 1))
 printf '%s\n' "$named_out" | grep -q '^raw *| addr=eth0 none/0 down$' &&
-	printf '%s\n' "$named_out" | grep -q '^raw *| read=No such file or directory$' ||
+	[ "$(printf '%s\n' "$named_out" | grep -c '^raw *| read=No such file or directory$')" -eq 2 ] ||
 	fail "a bare segment beside an addressed one was addressed" "$named_out"
 # The same file drawn again gives the same addresses: the draw is the
 # machine's id and the segment's name, not the run's.
@@ -1278,6 +1286,32 @@ from_root 0 '^ran$' -f "$root/barejoin.conf"
 cases=$((cases + 1))
 wait "$fullrun" ||
 	fail "a file holding a segment's addresses did not run whole" "$(cat "$root/full.out")"
+# A machine joining a running segment is named by hull at .1 as soon as
+# its port is, though no file put it in another's /etc/hosts: one file's
+# early, another's late, each looking the other up by name.
+dyn="dyn-$$"
+conf early "(hostname \"early\") (mutable overlay) (network none) (segments ($dyn (subnet \"10.83.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"sleep\" \"5\" \"dns\" \"late\" \"hosts\" \"late\")"
+conf late "(hostname \"late\") (mutable overlay) (network none) (segments ($dyn (subnet \"10.83.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"dns\" \"early\" \"sleep\" \"8\")"
+(cd / && exec timeout 60 "$whole_hull" run -f "$root/early.conf" > "$root/early.out" 2>&1) &
+earlyrun=$!
+tries=0
+until "$hull" segment "$dyn" > "$root/dyn.counts" 2>&1 && grep -Eq '^early +out ' "$root/dyn.counts"; do
+	tries=$((tries + 1))
+	[ "$tries" -lt 60 ] || break
+	sleep 0.25
+done
+limit=30
+from_root 0 '^dns=early 10\.83\.0\.[0-9]+$' -f "$root/late.conf"
+late_out=$out
+wait "$earlyrun"
+early_at=$(sed -n 's#^addr=eth0 \(10\.83\.0\.[0-9]*\)/24 up$#\1#p' "$root/early.out")
+late_at=$(printf '%s\n' "$late_out" | sed -n 's#^addr=eth0 \(10\.83\.0\.[0-9]*\)/24 up$#\1#p')
+cases=$((cases + 1))
+[ -n "$early_at" ] && [ -n "$late_at" ] &&
+	printf '%s\n' "$late_out" | grep -q "^dns=early $early_at\$" &&
+	grep -q "^dns=late $late_at\$" "$root/early.out" &&
+	grep -q '^hosts=late none$' "$root/early.out" ||
+	fail "a machine joining a running segment was not named both ways" "$(cat "$root/early.out"; printf '%s\n' "$late_out")"
 # Impairment in the switch, changed during a run: a hearer and a shouter
 # on one segment, the shouter's way out cut before it shouts, its frames
 # counted lost, then healed, so a later shout is heard and answered.

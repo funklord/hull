@@ -67,6 +67,12 @@ char *hull_access_segment_name(const hull_sexpr_doc *doc, const hull_sexpr_form 
 int hull_access_named(const hull_sexpr_doc *doc, const hull_sexpr_form *names,
                       const char *segment, char address[16], unsigned *prefix);
 
+/* The /etc/resolv.conf `names` gives a machine whose only network is its
+ * segments: a nameserver at .1 of each addressed segment, hull's (Appendix
+ * D), at most three, and `search hull`; as a C string the caller frees, or
+ * NULL where it addresses none or memory ran out. */
+char *hull_access_resolver(const hull_sexpr_doc *doc, const hull_sexpr_form *names);
+
 /* The /etc/hosts `names` gives the machine: localhost, then a line for
  * each machine on each segment, `ADDRESS ID ID.hull`, as a C string the
  * caller frees; NULL if memory ran out or `names` is not one. */

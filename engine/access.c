@@ -399,3 +399,40 @@ char *hull_access_hosts(const hull_sexpr_doc *doc, const hull_sexpr_form *names)
 	}
 	return text;
 }
+
+char *hull_access_resolver(const hull_sexpr_doc *doc, const hull_sexpr_form *names)
+{
+	hull_sexpr_form segment;
+	char           *text = malloc(3u * 32u + 16u);
+	size_t          at = 0u;
+	unsigned        servers = 0u;
+
+	if (text == NULL || !hull_sexpr_child(doc, names, &segment)) {
+		free(text);
+		return NULL;
+	}
+	/* Three, as many as a resolver reads (resolv.conf(5)). */
+	while (servers < 3u && hull_sexpr_next(doc, &segment, &segment)) {
+		char        *address = hull_access_value(doc, &segment, "address");
+		char        *bits = hull_access_value(doc, &segment, "prefix");
+		unsigned     a, b, c, d;
+		unsigned     prefix = bits != NULL ? (unsigned)strtoul(bits, NULL, 10) : 0u;
+		unsigned     self;
+
+		if (address != NULL && prefix >= 1u && prefix <= 30u &&
+		    sscanf(address, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+			self = ((a << 24 | b << 16 | c << 8 | d) & 0xffffffffu << (32u - prefix)) + 1u;
+			at += (size_t)snprintf(text + at, 32u, "nameserver %u.%u.%u.%u\n", self >> 24,
+			                       self >> 16 & 0xffu, self >> 8 & 0xffu, self & 0xffu);
+			servers++;
+		}
+		free(address);
+		free(bits);
+	}
+	if (servers == 0u) {
+		free(text);
+		return NULL;
+	}
+	memcpy(text + at, "search hull\n", sizeof "search hull\n");
+	return text;
+}
