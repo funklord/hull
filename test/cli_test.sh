@@ -1382,6 +1382,47 @@ from_root 125 'impair names a segment the machine is not on' -f "$root/offwire.c
 expect 1 'impair: rejected: not yet: a link is impaired' "$hull" plan --backend docker -f "$root/offwire.conf"
 expect 1 'no machine is on that segment' "$hull" segment "nowhere-$$"
 
+# A capture of the shouter's way out, started by hull segment during the
+# run with a path relative to where it is asked, the core writing it whole:
+# a pcap file of Ethernet whose frames include the shout, the probe's
+# EtherType and its text; and one asked of a segment no machine is on
+# refused.
+capseg="capseg-$$"
+printf '(machines (hearer %s) (shouter %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (network none) (segments \"$capseg\") (command \"/probe\" \"link\" \"eth0\" \"hear\" \"eth0\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (network none) (segments \"$capseg\") (command \"/probe\" \"link\" \"eth0\" \"sleep\" \"3\" \"shout\" \"eth0\" \"captured\")" \
+	> "$root/capseg.conf"
+rm -f "$root/capseg.pcap"
+(cd / && exec timeout 60 "$whole_hull" run -f "$root/capseg.conf" > "$root/capseg.out" 2>&1) &
+caprun=$!
+tries=0
+until (cd "$root" && "$hull" segment "$capseg" capture shouter out capseg.pcap frames=50) 2> "$root/capseg.err"; do
+	tries=$((tries + 1))
+	[ "$tries" -lt 40 ] || break
+	sleep 0.25
+done
+wait "$caprun"
+cases=$((cases + 1))
+shouts=$(timeout 30 python3 - "$root/capseg.pcap" <<'PY' 2>&1
+import struct, sys
+data = open(sys.argv[1], "rb").read()
+magic, major, minor, _, _, snap, link = struct.unpack("<IHHiIII", data[:24])
+assert (magic, major, minor, link) == (0xa1b23c4d, 2, 4, 1), "not pcap of Ethernet, ns"
+at, shouts = 24, 0
+while at < len(data):
+    sec, ns, size, whole = struct.unpack("<IIII", data[at:at + 16])
+    frame = data[at + 16:at + 16 + size]
+    assert size == whole == len(frame) and ns < 10**9, "a record not whole"
+    shouts += frame[12:14] == b"\x88\xb5" and b"captured" in frame
+    at += 16 + size
+print(shouts)
+PY
+)
+[ "$tries" -lt 40 ] && [ "$shouts" -ge 1 ] 2>/dev/null &&
+	grep -q '^hearer  | hear=captured from 52:54:00:' "$root/capseg.out" ||
+	fail "a capture of a machine's way out did not hold its shout" "$shouts $(cat "$root/capseg.err" "$root/capseg.out")"
+expect 1 'no machine is on that segment' "$hull" segment "nowhere-$$" capture all in "$root/none.pcap"
+
 # A targeted fault set at runtime: the shouter's frames whose payload has
 # 'o' (its text's first byte) at offset 1 dropped, so the hearer hears
 # nothing and the shouter's way out counts them matched and tampered.

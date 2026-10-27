@@ -106,6 +106,7 @@ static void usage(FILE *out)
 	      "       hull segment NAME [impair MACHINE|all in|out|both [KEY=VALUE|down]...]\n"
 	      "       hull segment NAME tamper MACHINE|all in|out|both [KEY=VALUE]...\n"
 	      "       hull segment NAME inject MACHINE|all frame=HEX|size=N [count=N] [every=MS]\n"
+	      "       hull segment NAME capture MACHINE|all in|out FILE [frames=N] | capture stop\n"
 	      "       hull ssh ID | hull proxy-ssh HOST\n"
 	      "       hull ssh-config [--remove] | hull gc\n"
 	      "       hull systemd [-f FILE] [NAME]\n"
@@ -4293,6 +4294,57 @@ static int segment_command(int argc, char **argv)
 
 	int tamper = argc > 3 && strcmp(argv[3], "tamper") == 0;
 	int inject = argc > 3 && strcmp(argv[3], "inject") == 0;
+	int capture = argc > 3 && strcmp(argv[3], "capture") == 0;
+
+	/* capture NAME MACHINE|all in|out FILE [frames=N], or capture stop: the
+	 * core writes the file, so it is named to it whole. */
+	if (capture) {
+		hull_msg m = { 0 };
+		char     whole[4096];
+		int      stop = argc == 5 && strcmp(argv[4], "stop") == 0;
+
+		if (!stop && (argc < 7 || argc > 8 ||
+		              (strcmp(argv[5], "in") != 0 && strcmp(argv[5], "out") != 0) ||
+		              (argc == 8 && strncmp(argv[7], "frames=", 7u) != 0))) {
+			usage(stderr);
+			return 2;
+		}
+		if (!stop) {
+			char here[4096];
+
+			if (argv[6][0] == '/')
+				snprintf(whole, sizeof whole, "%s", argv[6]);
+			else if (getcwd(here, sizeof here) == NULL ||
+			         snprintf(whole, sizeof whole, "%s/%s", here, argv[6]) >= (int)sizeof whole) {
+				fprintf(stderr, "hull: segment: %s cannot be named whole\n", argv[6]);
+				return 2;
+			}
+		}
+		if ((status = connect_core(&wire, 0)) != 0) {
+			if (status == 1)
+				fprintf(stderr, "hull: no core is running, so no machine is on a segment\n");
+			return status == 1 ? 1 : 2;
+		}
+		hull_msg_raw(&m, "(7:capture");
+		hull_msg_channel(&m, 1u);
+		if (stop) {
+			msg_entry(&m, "frames", "0");
+		} else {
+			if (argc == 8)
+				msg_entry(&m, "frames", argv[7] + 7);
+			msg_entry(&m, "machine", strcmp(argv[4], "all") == 0 ? "*" : argv[4]);
+		}
+		msg_entry(&m, "name", argv[2]);
+		if (!stop) {
+			msg_entry(&m, "path", whole);
+			msg_entry(&m, "way", argv[5]);
+		}
+		hull_msg_raw(&m, ")");
+		status = m.failed || hull_wire_send(wire.fd, &m) != 0 ? 1 : answered(&wire);
+		hull_msg_free(&m);
+		hull_wire_close(&wire);
+		return status;
+	}
 
 	/* inject NAME MACHINE|all KEY=VALUE...: the switch's own frames, no
 	 * direction. Sent on its own, outside the impair/tamper shape. */

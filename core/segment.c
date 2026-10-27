@@ -36,6 +36,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -120,6 +121,16 @@ typedef struct source {
 	int      used;
 } source;
 
+/* A capture of one way of a segment's ports, or one machine's, into a pcap
+ * file: `left` more frames before it closes. */
+typedef struct capture {
+	int      on;
+	int      fd;
+	char     machine[64];   /* empty = every port */
+	int      direction;
+	uint64_t left;
+} capture;
+
 typedef struct segment {
 	char     key[512];
 	port    *ports[MAX_PORTS];
@@ -128,6 +139,7 @@ typedef struct segment {
 	unsigned next;    /* the entry a new address replaces, round the table */
 	rule     rules[MAX_RULES];
 	source   sources[MAX_SOURCES];
+	capture  capture;
 } segment;
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -286,9 +298,47 @@ static void drain(port *p)
 	}
 }
 
+/* `s`'s capture closed, its file left as written. */
+static void end_capture(segment *s)
+{
+	if (s->capture.on)
+		close(s->capture.fd);
+	s->capture.on = 0;
+}
+
+/* The frame, as it crosses `p`'s way `direction`, recorded where `s` is
+ * capturing that way of that port: a pcap record, the time to the
+ * nanosecond, then the frame whole. A write that fails ends the capture,
+ * as its last frame does. */
+static void capture_frame(segment *s, const port *p, int direction, const uint8_t *framed,
+                          size_t length)
+{
+	capture        *c = &s->capture;
+	uint8_t         head[16];
+	struct timespec now;
+	struct iovec    record[2];
+	uint32_t        size = (uint32_t)(length - 4u);
+
+	if (!c->on || c->direction != direction ||
+	    (c->machine[0] != '\0' && strcmp(c->machine, p->machine) != 0))
+		return;
+	clock_gettime(CLOCK_REALTIME, &now);
+	/* pcap's fields are the writer's order, which the magic tells. */
+	memcpy(head, &(uint32_t){ (uint32_t)now.tv_sec }, 4u);
+	memcpy(head + 4, &(uint32_t){ (uint32_t)now.tv_nsec }, 4u);
+	memcpy(head + 8, &size, 4u);
+	memcpy(head + 12, &size, 4u);
+	record[0].iov_base = head;
+	record[0].iov_len  = sizeof head;
+	record[1].iov_base = (void *)(framed + 4);
+	record[1].iov_len  = size;
+	if (writev(c->fd, record, 2) != (ssize_t)(sizeof head + size) || --c->left == 0u)
+		end_capture(s);
+}
+
 /* The frame, its length before it, written to `p`'s socket, or dropped
  * where `p` has not taken the last. */
-static void write_port(port *p, const uint8_t *framed, size_t length)
+static void write_port(segment *s, port *p, const uint8_t *framed, size_t length)
 {
 	way    *w = &p->way[HULL_SEGMENT_IN];
 	ssize_t n;
@@ -297,6 +347,7 @@ static void write_port(port *p, const uint8_t *framed, size_t length)
 		w->count.full++;
 		return;
 	}
+	capture_frame(s, p, HULL_SEGMENT_IN, framed, length);
 	n = send(p->fd, framed, length, MSG_DONTWAIT | MSG_NOSIGNAL);
 	if (n < 0)
 		n = 0;
@@ -310,12 +361,13 @@ static void write_port(port *p, const uint8_t *framed, size_t length)
 
 /* A frame the switch injects, written to `p`'s socket, counted apart
  * from what crosses the link: dropped where the socket will not take it. */
-static void inject_to(port *p, const uint8_t *framed, size_t length)
+static void inject_to(segment *s, port *p, const uint8_t *framed, size_t length)
 {
 	ssize_t n;
 
 	if (p->out_length != 0u)
 		return;
+	capture_frame(s, p, HULL_SEGMENT_IN, framed, length);
 	n = send(p->fd, framed, length, MSG_DONTWAIT | MSG_NOSIGNAL);
 	if (n < 0)
 		n = 0;
@@ -351,7 +403,7 @@ static uint64_t fire_sources(segment *s, uint64_t now)
 				memcpy(frame + 4u, src->frame, src->length);
 			for (unsigned i = 0u; i < s->port_count; i++)
 				if (src->machine[0] == '\0' || strcmp(s->ports[i]->machine, src->machine) == 0)
-					inject_to(s->ports[i], frame, length);
+					inject_to(s, s->ports[i], frame, length);
 			if (--src->left == 0u) {
 				src->used = 0;
 				break;
@@ -441,6 +493,9 @@ static void cross(segment *s, unsigned at, int direction, const uint8_t *framed,
 
 	w->count.frames++;
 	w->count.bytes += length - 4u;
+	/* What a machine sent, before its link does anything to it. */
+	if (direction == HULL_SEGMENT_OUT)
+		capture_frame(s, p, direction, framed, length);
 	/* A targeted fault first: it may drop the frame, or hand on a
 	 * rewritten one, and schedule its replays. */
 	if (w->tampering && tamper(w, now, &framed, work, length))
@@ -451,7 +506,7 @@ static void cross(segment *s, unsigned at, int direction, const uint8_t *framed,
 			w->count.passed_bytes += length - 4u;
 			forward(s, at, framed, length);
 		} else {
-			write_port(p, framed, length);
+			write_port(s, p, framed, length);
 		}
 		return;
 	}
@@ -517,7 +572,7 @@ static void cross(segment *s, unsigned at, int direction, const uint8_t *framed,
 				w->count.passed_bytes += length - 4u;
 				forward(s, at, copy, length);
 			} else {
-				write_port(p, copy, length);
+				write_port(s, p, copy, length);
 			}
 			continue;
 		}
@@ -832,7 +887,7 @@ static uint64_t release(segment *s, unsigned i, uint64_t now)
 				w->count.passed_bytes += h->length - 4u;
 				forward(s, i, h->framed, h->length);
 			} else {
-				write_port(s->ports[i], h->framed, h->length);
+				write_port(s, s->ports[i], h->framed, h->length);
 			}
 			free(h);
 		}
@@ -978,6 +1033,7 @@ static void *serve(void *arg)
 		}
 		for (unsigned k = 0u; k < MAX_SEGMENTS; k++) {
 			if (segments[k] != NULL && segments[k]->port_count == 0u) {
+				end_capture(segments[k]);
 				free(segments[k]);
 				segments[k] = NULL;
 			}
@@ -1315,4 +1371,49 @@ int hull_segment_counts_of(const char *key, hull_segment_counts *out, unsigned c
 	}
 	pthread_mutex_unlock(&lock);
 	return (int)n;
+}
+
+int hull_segment_capture(const char *key, const char *machine, int direction, const char *path,
+                         uint64_t frames, char *why, size_t cap)
+{
+	/* pcap 2.4 with nanosecond times, as the magic says, of Ethernet. */
+	static const uint32_t header[6] = { 0xa1b23c4du, 2u | 4u << 16, 0u, 0u, 65535u, 1u };
+	segment              *s;
+	int                   fd = -1;
+
+	if (machine != NULL && strlen(machine) >= sizeof s->capture.machine) {
+		say(why, cap, "a port's machine is named by its id");
+		return -1;
+	}
+	if (frames != 0u && (path == NULL || path[0] != '/')) {
+		say(why, cap, "a capture's file is named by its whole path");
+		return -1;
+	}
+	pthread_mutex_lock(&lock);
+	s = find(key);
+	if (s == NULL || s->port_count == 0u) {
+		pthread_mutex_unlock(&lock);
+		say(why, cap, "no machine is on that segment");
+		return -1;
+	}
+	if (frames != 0u) {
+		fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
+		if (fd < 0 || write(fd, header, sizeof header) != (ssize_t)sizeof header) {
+			pthread_mutex_unlock(&lock);
+			snprintf(why, cap, "%s: %s", path, strerror(errno));
+			if (fd >= 0)
+				close(fd);
+			return -1;
+		}
+	}
+	end_capture(s);
+	if (frames != 0u) {
+		s->capture.on        = 1;
+		s->capture.fd        = fd;
+		s->capture.direction = direction;
+		s->capture.left      = frames;
+		snprintf(s->capture.machine, sizeof s->capture.machine, "%s", machine != NULL ? machine : "");
+	}
+	pthread_mutex_unlock(&lock);
+	return 0;
 }

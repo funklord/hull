@@ -2811,6 +2811,51 @@ static void handle_inject(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	send_simple(c, "(4:done", ch);
 }
 
+/* A capture of a segment's frames into a pcap file the core writes, as
+ * the user, by its whole path (Appendix D): `frames` of them, at most a
+ * million, ten thousand where none is given, and 0 to end one. */
+static void handle_capture(client *c, uint32_t ch, const hull_sexpr_doc *body)
+{
+	hull_sexpr_form value;
+	char            name[512];
+	char            machine[64] = "*";
+	char            way[8] = "out";
+	char            path[4096] = "";
+	long long       frames = 10000;
+	char            why[300];
+
+	if (!hull_msg_find(body, "name", &value) || !hull_msg_string(body, &value, name, sizeof name)) {
+		send_error(c, ch, "capture names a segment");
+		return;
+	}
+	if ((hull_msg_find(body, "machine", &value) &&
+	     (!hull_msg_string(body, &value, machine, sizeof machine) ||
+	      (strcmp(machine, "*") != 0 && !is_label(machine)))) ||
+	    (hull_msg_find(body, "way", &value) &&
+	     (!hull_msg_string(body, &value, way, sizeof way) ||
+	      (strcmp(way, "in") != 0 && strcmp(way, "out") != 0)))) {
+		send_error(c, ch, "capture names a machine or *, and in or out");
+		return;
+	}
+	if ((hull_msg_find(body, "frames", &value) && !hull_msg_long(body, &value, &frames)) ||
+	    frames < 0 || frames > 1000000) {
+		send_error(c, ch, "a capture's frames are 0 to 1000000");
+		return;
+	}
+	if (frames != 0 && (!hull_msg_find(body, "path", &value) ||
+	                    !hull_msg_string(body, &value, path, sizeof path))) {
+		send_error(c, ch, "a capture names its file");
+		return;
+	}
+	if (hull_segment_capture(name, strcmp(machine, "*") == 0 ? NULL : machine,
+	                         strcmp(way, "in") == 0 ? HULL_SEGMENT_IN : HULL_SEGMENT_OUT,
+	                         frames != 0 ? path : NULL, (uint64_t)frames, why, sizeof why) != 0) {
+		send_error(c, ch, why);
+		return;
+	}
+	send_simple(c, "(4:done", ch);
+}
+
 static void handle_segment(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
 	static const char *const names[] = { "bytes", "corrupted", "duplicated", "frames", "full",
@@ -3036,6 +3081,8 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		handle_tamper(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "inject")) {
 		handle_inject(c, (uint32_t)ch, body);
+	} else if (hull_msg_is(body, "capture")) {
+		handle_capture(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "impair")) {
 		handle_impair(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "stats")) {

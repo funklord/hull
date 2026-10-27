@@ -156,6 +156,19 @@ int hull_segment_inject(const char *key, const char *machine, const unsigned cha
                         size_t length, int randomize, unsigned size, uint64_t count,
                         unsigned every_ms, uint64_t seed, char *why, size_t cap);
 
+/*
+ * The frames crossing `direction` of every port `machine` has on `key`, or
+ * every port's where `machine` is NULL, written to `path` as pcap, until
+ * `frames` have been; one capture a segment, replacing the last. `out` is
+ * what a machine sent, before its link's impairment and tamper; `in` what
+ * it was given, after them, the switch's injected frames and hull's .1
+ * answers among it. A `frames` of 0 ends the capture. The file is the
+ * core's to write, by its whole path; it closes with its last frame, the
+ * segment's last port, or a write that fails. 0, or -1 and why.
+ */
+int hull_segment_capture(const char *key, const char *machine, int direction, const char *path,
+                         uint64_t frames, char *why, size_t cap);
+
 /* The counts of each port on `key`, at most `cap` of them: how many there
  * are, or -1 where no machine is on it. */
 int hull_segment_counts_of(const char *key, hull_segment_counts *out, unsigned cap);

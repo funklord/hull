@@ -12,6 +12,7 @@
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -305,6 +306,37 @@ static int dns_reply(int fd, uint8_t me, uint8_t *data, size_t *data_length)
 		memcpy(data, f + at + 2u, *data_length);
 	}
 	return f[45] & 0x0f;
+}
+
+/* The frames in pcap file `path`, their tags (each frame's 15th byte) into
+ * `tags`: how many, or -1 where its header is not pcap's of Ethernet with
+ * nanosecond times, or a record is not whole. */
+static int captured(const char *path, char *tags, int cap)
+{
+	FILE    *file = fopen(path, "rb");
+	uint32_t header[6];
+	uint32_t record[4];
+	uint8_t  frame[65536];
+	int      n = 0;
+
+	if (file == NULL || fread(header, sizeof header, 1u, file) != 1u || header[0] != 0xa1b23c4du ||
+	    header[1] != (2u | 4u << 16) || header[5] != 1u) {
+		if (file != NULL)
+			fclose(file);
+		return -1;
+	}
+	while (fread(record, sizeof record, 1u, file) == 1u) {
+		if (record[1] >= 1000000000u || record[2] != record[3] || record[2] > sizeof frame ||
+		    fread(frame, record[2], 1u, file) != 1u) {
+			n = -1;
+			break;
+		}
+		if (n < cap)
+			tags[n] = record[2] > 14u ? (char)frame[14] : 0;
+		n++;
+	}
+	fclose(file);
+	return n;
 }
 
 /* Which of `n` frames from `from` reach `to` with `seed` and `loss`, as a
@@ -850,6 +882,71 @@ int main(void)
 		close(late);
 		close(bare);
 		close(peer);
+	}
+	{
+		/* A capture: x's way out, what it sent before its link's loss, and
+		 * y's way in, what it was given after it, each a pcap file of the
+		 * frames whole; one machine's alone; a count that closes it; and
+		 * a capture ended, or asked of a segment no machine is on or of a
+		 * path not whole, refused. */
+		char            why[256] = "";
+		char            tags[16];
+		char            out_path[] = "/tmp/hull-capture-XXXXXX";
+		char            in_path[] = "/tmp/hull-capture-XXXXXX";
+		hull_impairment lossy = { 0 };
+		int             x = port_of("cap", "x");
+		int             y = port_of("cap", "y");
+		int             z = port_of("cap", "z");
+		int             fd = mkstemp(out_path);
+		int             n;
+
+		/* Two files of this test's own, removed by name at its end. */
+		if (fd >= 0)
+			close(fd);
+		if ((fd = mkstemp(in_path)) >= 0)
+			close(fd);
+		check("a capture of x's way out started",
+		      hull_segment_capture("cap", "x", HULL_SEGMENT_OUT, out_path, 2u, why, sizeof why) == 0);
+		/* Each awaited before the next: two ports' frames have no order
+		 * between them. */
+		send_frame(x, 2u, 1u, 'a');
+		expect("a captured frame still reaches y", y, 'a');
+		send_frame(z, 2u, 3u, 'z');   /* another machine's, not x's */
+		expect("z's frame reaches y", y, 'z');
+		lossy.loss = 1.0;
+		impair("cap", "x", HULL_SEGMENT_OUT, &lossy);
+		send_frame(x, 2u, 1u, 'b');
+		expect("x's lost frame, not to y", y, 0);
+		send_frame(x, 2u, 1u, 'c');   /* past the capture's two */
+		expect("x's next lost frame, not to y", y, 0);
+		n = captured(out_path, tags, 16);
+		check("x's way out captured its two frames, lost or not, and not z's",
+		      n == 2 && tags[0] == 'a' && tags[1] == 'b');
+		check("a capture of y's way in started",
+		      hull_segment_capture("cap", NULL, HULL_SEGMENT_IN, in_path, 10u, why, sizeof why) == 0);
+		send_frame(x, 2u, 1u, 'd');   /* lost on x's way out */
+		send_frame(z, 2u, 3u, 'e');
+		expect("z's frame reaches y again", y, 'e');
+		check("a capture ended", hull_segment_capture("cap", NULL, HULL_SEGMENT_IN, NULL, 0u, why,
+		                                              sizeof why) == 0);
+		send_frame(z, 2u, 3u, 'f');
+		expect("z's last frame reaches y", y, 'f');
+		n = captured(in_path, tags, 16);
+		/* y has sent nothing, so z's frame is flooded: x and y are each
+		 * given it, and each port's way in is captured. */
+		check("every port's way in captured what it was given, not what was lost, until ended",
+		      n == 2 && tags[0] == 'e' && tags[1] == 'e');
+		check("a capture of a segment no machine is on refused",
+		      hull_segment_capture("nocap", NULL, HULL_SEGMENT_OUT, out_path, 1u, why,
+		                           sizeof why) != 0);
+		check("a capture's path not whole refused",
+		      hull_segment_capture("cap", NULL, HULL_SEGMENT_OUT, "relative.pcap", 1u, why,
+		                           sizeof why) != 0);
+		unlink(out_path);
+		unlink(in_path);
+		close(x);
+		close(y);
+		close(z);
 	}
 	{
 		/* Inject onto a segment no machine is on is refused. */

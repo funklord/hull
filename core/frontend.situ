@@ -36,6 +36,7 @@ const UNPAUSE  = ('7' << 24) | (':' << 16) | ('u' << 8) | 'n';
 const IMPAIR   = ('6' << 24) | (':' << 16) | ('i' << 8) | 'm';
 const TAMPER   = ('6' << 24) | (':' << 16) | ('t' << 8) | 'a';
 const INJECT   = ('6' << 24) | (':' << 16) | ('i' << 8) | 'n';
+const CAPTURE  = ('7' << 24) | (':' << 16) | ('c' << 8) | 'a';
 const STARTED  = ('7' << 24) | (':' << 16) | ('s' << 8) | 't';
 const DATA     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'a';
 const EXITED   = ('6' << 24) | (':' << 16) | ('e' << 8) | 'x';
@@ -72,6 +73,7 @@ struct client_message {
 		case IMPAIR:  impair        impair;
 		case TAMPER:  tamper        tamper;
 		case INJECT:  inject        inject;
+		case CAPTURE: capture       capture;
 		case DATA:    client_data   data;
 		case EOF:     eof           eof;
 		case CREDIT:  credit        credit;
@@ -326,6 +328,16 @@ struct tamper {
 // The core reads the entries by key; answered `done`.
 struct inject {
 	preamble u8[8] = "6:inject";
+	channel  ch;
+	form  entries[]  until ")";
+}
+
+// A segment's frames one way, every machine's or one's (`*` or its id),
+// written by the core to `path`, a whole path, as pcap, until `frames`
+// have been; `frames` 0 ends the capture and needs no path. The core
+// reads the entries by key; answered `done`.
+struct capture {
+	preamble u8[9] = "7:capture";
 	channel  ch;
 	form  entries[]  until ")";
 }
