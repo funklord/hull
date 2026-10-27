@@ -37,7 +37,6 @@
 #include <dirent.h>
 #include <errno.h>
 #include <pwd.h>
-#include <grp.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <linux/if_tun.h>
@@ -1157,8 +1156,14 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 			}
 		}
 		if (said == 'M') {
-			/* The user's own groups, unmapped here and so nobody's, go. */
-			if (setgroups(0u, NULL) != 0)
+			/* The user's own groups, unmapped here and so nobody's, go:
+			 * by the system call, not glibc's setgroups(), which tells
+			 * every thread glibc knows of and waits for each to answer.
+			 * This child is a raw clone of the multithreaded core, so
+			 * glibc still lists the core's threads -- the switch's among
+			 * them -- which are not here to answer, and it waited for
+			 * ever: found 2026-10-27, a core hung making a machine. */
+			if (syscall(SYS_setgroups, 0, NULL) != 0)
 				child_fail(report, "setgroups");
 		} else {
 			snprintf(map, sizeof map, "0 %u 1", (unsigned)uid);
