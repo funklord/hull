@@ -862,7 +862,8 @@ static int finish_commit(hull_store *store, walk *wp, const char *arch, const ch
 	/* A tree not read whole is no tree to name. */
 	if (w.failed)
 		goto done;
-	qsort(w.items, w.count, sizeof w.items[0], path_order);
+	if (w.count > 1u)
+		qsort(w.items, w.count, sizeof w.items[0], path_order);
 	digests = malloc(32u * (w.count + 1u));
 	if (digests == NULL)
 		goto done;
@@ -2335,7 +2336,8 @@ int hull_store_list(hull_store *store, void (*each)(void *context, const char *r
 	(void)why;
 	(void)cap;
 	find_refs(store, "", &list);
-	qsort(list.items, list.count, sizeof list.items[0], ref_order);
+	if (list.count > 1u)
+		qsort(list.items, list.count, sizeof list.items[0], ref_order);
 	for (size_t i = 0u; i < list.count; i++)
 		each(context, list.items[i].ref, list.items[i].manifest);
 	free(list.items);
@@ -2371,7 +2373,8 @@ static int hex_order(const void *a, const void *b)
 
 static int set_has(const hex_set *set, const char *hex)
 {
-	return bsearch(hex, set->items, set->count, sizeof set->items[0], hex_order) != NULL;
+	return set->count != 0u &&
+	       bsearch(hex, set->items, set->count, sizeof set->items[0], hex_order) != NULL;
 }
 
 int hull_store_gc(hull_store *store, uint64_t *manifests, uint64_t *objects,
@@ -2424,8 +2427,13 @@ int hull_store_gc(hull_store *store, uint64_t *manifests, uint64_t *objects,
 		}
 		free(data);
 	}
-	qsort(kept_manifests.items, kept_manifests.count, sizeof kept_manifests.items[0], hex_order);
-	qsort(kept_objects.items, kept_objects.count, sizeof kept_objects.items[0], hex_order);
+	/* Only with two or more: an empty list's items are NULL, which qsort
+	 * may not be given. */
+	if (kept_manifests.count > 1u)
+		qsort(kept_manifests.items, kept_manifests.count, sizeof kept_manifests.items[0],
+		      hex_order);
+	if (kept_objects.count > 1u)
+		qsort(kept_objects.items, kept_objects.count, sizeof kept_objects.items[0], hex_order);
 	snprintf(path, sizeof path, "%s/manifests/sha256", store->root);
 	if ((dir = opendir(path)) != NULL) {
 		while ((entry = readdir(dir)) != NULL)

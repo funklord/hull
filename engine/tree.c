@@ -374,7 +374,7 @@ static int walk(writer *w, int dir, size_t base, unsigned depth)
 		count++;
 	}
 	closedir(listing);
-	if (status == 0)
+	if (status == 0 && count > 1u)
 		qsort(names, count, sizeof *names, by_name);
 	for (size_t i = 0u; i < count && status == 0; i++)
 		status = entry(w, dir, names[i], base, depth);
