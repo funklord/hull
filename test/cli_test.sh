@@ -182,6 +182,20 @@ services:
     command: ["postgres", "-c", "max_connections=50"]
     build: ./db
     networks: [backend]
+  cache:
+    image: redis:7
+    network_mode: bridge
+  agent:
+    image: busybox:1.36
+    network_mode: host
+    ports:
+      - "9100:9100"
+  sealed:
+    image: busybox:1.36
+    network_mode: none
+  sidecar:
+    image: busybox:1.36
+    network_mode: "service:web"
 networks:
   backend:
 YML
@@ -208,6 +222,18 @@ gbc '\(restart always\)'
 gbc '; depends_on: db'
 gbc '; build not translated'
 gbc '; top-level key not translated: networks'
+# network_mode: bridge, docker's own network, is hull's nat; host and none
+# are hull's as they are, a port under either dropped and said, as docker
+# discards or refuses it; another container's network is noted.
+gbc '\(cache \(source "redis:7"\) \(network nat\)'
+gbc '; network_mode bridge mapped to nat'
+gbc '\(agent \(source "busybox:1\.36"\) \(network host\)'
+gbc '; ports not translated: network_mode host is the host.s network'
+gbc '\(sealed \(source "busybox:1\.36"\) \(network none\)'
+gbc '; network_mode not translated: service:web'
+cases=$((cases + 1))
+! grep -A3 '^  (agent ' "$dir/compose.machines" | grep -q '(ports' ||
+	fail "import compose: a port was kept under network_mode host" "$(cat "$dir/compose.machines")"
 printf 'version: "3"\n' > "$dir/noservices.yml"
 expect 2 'no services' "$hull" import "$dir/noservices.yml"
 

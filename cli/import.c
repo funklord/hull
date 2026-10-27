@@ -497,6 +497,7 @@ typedef struct svc {
 	char workdir[512];
 	char hostname[256];
 	char restart[32];
+	char network[8];       /* from network_mode: host, nat or none, or "" */
 	sb   command;          /* a (command ...) word list, or empty */
 	sb   env;              /* (NAME "value") entries */
 	sb   ports;            /* (port ...) entries */
@@ -685,9 +686,21 @@ static void svc_flush(svc *s, sb *out)
 		sb_add(out, s->env.data, s->env.len);
 		sb_str(out, ")");
 	}
-	if (s->ports.len > 0u) {
+	/* docker discards published ports under host, and refuses them under
+	 * none; hull refuses both, so they go, said, rather than leave a file
+	 * that does not plan. */
+	if (s->ports.len > 0u && (strcmp(s->network, "host") == 0 || strcmp(s->network, "none") == 0)) {
+		svc_note(s, "ports not translated", strcmp(s->network, "host") == 0 ?
+		         "network_mode host is the host's network, where a port is the host's own" :
+		         "network_mode none has no network to put a port on");
+	} else if (s->ports.len > 0u) {
 		sb_str(out, " (ports");
 		sb_add(out, s->ports.data, s->ports.len);
+		sb_str(out, ")");
+	}
+	if (s->network[0] != '\0') {
+		sb_str(out, " (network ");
+		sb_str(out, s->network);
 		sb_str(out, ")");
 	}
 	if (s->volumes.len > 0u) {
@@ -868,6 +881,23 @@ static int import_compose(FILE *file)
 			svc_note(&s, key, scalar(value));
 		else if (strcmp(key, "user") == 0)
 			svc_note(&s, "user not translated", scalar(value));
+		else if (strcmp(key, "network_mode") == 0) {
+			/* bridge is docker's own network, which hull's nat names on
+			 * every engine; host and none are hull's as they are. Another
+			 * container's network, service: or container:, hull has no
+			 * way to share. */
+			char *mode = scalar(value);
+
+			if (strcmp(mode, "bridge") == 0) {
+				snprintf(s.network, sizeof s.network, "nat");
+				svc_note(&s, "network_mode bridge mapped to nat",
+				         "(network bridge) is hull's own bridge, its core run as root");
+			}
+			else if (strcmp(mode, "host") == 0 || strcmp(mode, "none") == 0)
+				snprintf(s.network, sizeof s.network, "%s", mode);
+			else
+				svc_note(&s, "network_mode not translated", mode);
+		}
 		else
 			svc_note(&s, "key not translated", key);
 	}
