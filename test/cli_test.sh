@@ -2199,9 +2199,11 @@ wait "$natexec" 2>/dev/null
 # are made there and not on the host: two machines on hull's own bridge,
 # each at 172.30.x.y for its 127.107.x.y, one dialling the other's port
 # and both the gateway; the bridge, its nft table and forwarding left as
-# docker leaves docker0; a machine on a bridge of its owner's naming, up
-# and unaddressed; one naming none refused; and ports and (ssh true) not
-# yet taken on a bridge.
+# docker leaves docker0; a port of a machine on hull0 reached from its
+# 127.107 address, pasta splicing it to the machine's bridge address; a
+# machine on a bridge of its owner's naming, up and unaddressed; one
+# naming none refused; and ports on a named bridge refused, the machine's
+# address there being its own.
 conf bridged '(mutable overlay) (network bridge) (command "/probe" "say" "never")'
 from_root 125 '\(network bridge\) needs hull.s core to run as root: \(network nat\)' -f "$root/bridged.conf"
 bridge_at() { # ID: the address hull's bridge gives it, from its 127.107 one
@@ -2222,8 +2224,24 @@ printf '(machine (source "dir:./rootfs") (backend chroot) (network bridge) (brid
 	> "$root/brnamed.conf"
 printf '(machine (source "dir:./rootfs") (backend chroot) (network bridge) (bridge "nosuch") (command "/probe"))\n' \
 	> "$root/brnone.conf"
-printf '(machine (source "dir:./rootfs") (backend chroot) (network bridge) (ports (port (host 8080) (guest 80))) (command "/probe"))\n' \
+printf '(machine (source "dir:./rootfs") (backend chroot) (network bridge) (bridge "brtest") (ports (port (host 8080) (guest 80))) (command "/probe"))\n' \
 	> "$root/brports.conf"
+bport_at=$(python3 -c '
+import sys
+h = 2166136261
+for b in sys.argv[1].encode():
+	h = ((h ^ b) * 16777619) & 0xffffffff
+h %= 256 * 254
+print("127.107.%d.%d" % (h // 254, h % 254 + 1))' bport)
+# The image's sshd, the probe standing in for it, on hull0: reached from
+# the machine's 127.107 address at its port, as under NAT.
+mkdir -p "$root/brssh/run" "$root/brssh/proc" "$root/brssh/usr/sbin"
+cp "$root/rootfs/probe" "$root/brssh/probe"
+cp "$root/rootfs/probe" "$root/brssh/usr/sbin/sshd"
+printf '(machine (source "dir:./brssh") (backend chroot) (hostname "bsshd") (network bridge) (ssh true) (command "/probe" "sleep" "8"))\n' \
+	> "$root/brsshd.conf"
+printf '(machine (source "dir:./rootfs") (backend chroot) (hostname "bport") (network bridge) (ports (port (host 18096) (guest 80))) (command "/probe" "serve" "tcp" "80"))\n' \
+	> "$root/brserve.conf"
 rm -rf "${root:?}/brrun"
 mkdir -p "$root/brrun"
 chmod 700 "$root/brrun"
@@ -2252,10 +2270,36 @@ echo "== bridge"; "$ip" -br addr show hull0
 echo "== nft"; /usr/sbin/nft list table ip hull 2>&1 | grep masquerade
 echo "== forward=$(cat /proc/sys/net/ipv4/ip_forward)"
 "$ip" link add brtest type bridge && "$ip" link set brtest up
+echo "== served"
+(timeout 30 "$1" run -f "$2/brserve.conf" > "$2/brserve.out" 2>&1 &)
+timeout 25 python3 -c "
+import socket, sys, time
+deadline = time.time() + 20
+while time.time() < deadline:
+    try:
+        s = socket.create_connection((sys.argv[1], 18096), 2)
+        s.sendall(b\"hello\\n\")
+        print(\"bridged port:\", s.recv(100).decode().strip())
+        break
+    except OSError:
+        time.sleep(0.2)
+" "$3"
+sleep 1
+cat "$2/brserve.out"
+echo "== sshd"
+mkdir -p "$2/brrun/shm" && mount -t tmpfs none "$2/brrun/shm" && chmod 700 "$2/brrun/shm"
+(XDG_RUNTIME_DIR="$2/brrun/shm" timeout 30 "$1" run -f "$2/brsshd.conf" > /dev/null 2>&1 &)
+tries=0
+until XDG_RUNTIME_DIR="$2/brrun/shm" "$1" ps 2>/dev/null | grep -q "^bsshd .*running" || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+XDG_RUNTIME_DIR="$2/brrun/shm" timeout 10 "$1" proxy-ssh bsshd < /dev/null 2>&1 | head -1
+XDG_RUNTIME_DIR="$2/brrun/shm" timeout 10 "$1" kill -s KILL bsshd > /dev/null 2>&1
 echo "== named"; timeout 30 "$1" run -f "$2/brnamed.conf" 2>&1
 echo "== none"; timeout 30 "$1" run -f "$2/brnone.conf" 2>&1
 echo "== ports"; timeout 30 "$1" run -f "$2/brports.conf" 2>&1
-' sh "$hull_abs" "$root" 2>&1)
+' sh "$hull_abs" "$root" "$bport_at" 2>&1)
 rm -rf "${root:?}/brrun"
 bweb_at=$(bridge_at bweb)
 printf '%s\n' "$bridge_out" | grep -q "^bweb *| addr=eth0 $(printf '%s' "$bweb_at" | sed 's/\./\\./g')/15 up\$" &&
@@ -2270,8 +2314,15 @@ printf '%s\n' "$bridge_out" | grep -q "^bweb *| addr=eth0 $(printf '%s' "$bweb_a
 cases=$((cases + 1))
 printf '%s\n' "$bridge_out" | grep -q '^addr=eth0 none/0 up$' &&
 	printf '%s\n' "$bridge_out" | grep -q '(bridge NAME) names no interface on the host' &&
-	printf '%s\n' "$bridge_out" | grep -q 'ports on (network bridge) are not forwarded yet' ||
-	fail "a named bridge, a missing one, or ports on a bridge were not as said" "$bridge_out"
+	printf '%s\n' "$bridge_out" | grep -q 'ports on a bridge (bridge NAME) names are not forwarded' ||
+	fail "a named bridge, a missing one, or ports on a named bridge were not as said" "$bridge_out"
+cases=$((cases + 1))
+printf '%s\n' "$bridge_out" | grep -q '^bridged port: hello from the machine$' &&
+	printf '%s\n' "$bridge_out" | grep -q '^served=hello$' ||
+	fail "a port of a machine on hull0 was not reached at its 127.107 address" "$bridge_out"
+cases=$((cases + 1))
+printf '%s\n' "$bridge_out" | grep -A1 '^== sshd$' | grep -q '^SSH-2\.0-hull-stub' ||
+	fail "an sshd on hull0 was not reached at the machine's 127.107 address" "$bridge_out"
 conf brdocker '(mutable overlay) (network bridge) (bridge "mynet") (command "/probe")'
 expect 0 'machine on docker \(ns\): ok' "$hull" plan -f "$root/brdocker.conf" --backend docker
 expect 1 'network\.bridge: rejected: not yet: a vm on a host bridge' "$hull" plan -f "$root/brdocker.conf" --backend vm

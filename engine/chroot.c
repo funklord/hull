@@ -474,10 +474,13 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	if (hull_access_find(doc, &machine, "ports", &entry)) {
 		hull_sexpr_form top;
 
-		if (m->bridge)
-			return "ports on (network bridge) are not forwarded yet: the machine is reached at its "
-			       "address on the bridge";
-		if (!m->nat)
+		/* On hull's own bridge pasta forwards them to the machine's address
+		 * there; on one its owner named the address is the workload's, so
+		 * there is nothing hull knows to forward to. */
+		if (m->bridge && !m->bridge_own)
+			return "ports on a bridge (bridge NAME) names are not forwarded: the machine's address "
+			       "there is its own, and it is reached at it";
+		if (!m->nat && !m->bridge)
 			return m->no_network ? "ports need the machine's network, which (network none) has not"
 			                     : "ports need a network of the machine's own: (network host) is "
 			                       "the host's, where a port is the host's own";
@@ -595,8 +598,9 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 
 		if (m->no_network)
 			return "(ssh true) needs a network to be reached on: not with (network none)";
-		if (m->bridge)
-			return "(ssh true) on (network bridge) is not forwarded yet";
+		if (m->bridge && !m->bridge_own)
+			return "(ssh true) on a bridge (bridge NAME) names is not forwarded: the machine's "
+			       "address there is its own";
 		hull_sexpr_first(doc, &top);
 		m->ssh_dir = hull_access_value(doc, &top, "ssh_dir");
 		if (m->ssh_dir == NULL)
@@ -1626,7 +1630,7 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		             "Port %d\nListenAddress %s\nHostKey /run/hull/ssh/host_key\n"
 		             "AuthorizedKeysFile /run/hull/ssh/authorized_keys\n"
 		             "PasswordAuthentication no\nPermitRootLogin prohibit-password\nUsePAM no\n",
-		             HULL_SSH_PORT, m->nat ? "0.0.0.0" : m->address_text);
+		             HULL_SSH_PORT, m->nat || m->bridge ? "0.0.0.0" : m->address_text);
 		fd = open("/run/hull/ssh.conf", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0400);
 		if (n <= 0 || n >= (int)sizeof config || fd < 0 || write(fd, config, (size_t)n) != n)
 			child_fail(report, "the ssh config");
@@ -2050,19 +2054,33 @@ static const char *start_pasta(const hull_machine *m, char *why, size_t cap)
 
 	argv[n++] = "pasta";
 	argv[n++] = "--quiet";
-	argv[n++] = "--config-net";
-	argv[n++] = "--ns-ifname";
-	argv[n++] = "eth0";
-	argv[n++] = "--ipv4-only";
-	argv[n++] = "--address";
-	argv[n++] = GUEST_ADDRESS;
-	argv[n++] = "--netmask";
-	argv[n++] = "24";
-	argv[n++] = "--gateway";
-	argv[n++] = GATEWAY_ADDRESS;
-	argv[n++] = "--no-map-gw";
-	argv[n++] = "--dns-forward";
-	argv[n++] = DNS_ADDRESS;
+	if (m->bridge) {
+		/* On hull's bridge, its ports alone: pasta's loopback path splices
+		 * a connection to the machine's address there, and its tap, which
+		 * this pasta cannot do without, is left down and unaddressed, the
+		 * machine's network being the bridge's. */
+		argv[n++] = "--ns-ifname";
+		argv[n++] = "hp0";
+		argv[n++] = "--ipv4-only";
+		argv[n++] = "--address";
+		argv[n++] = m->bridge_address;
+		argv[n++] = "--netmask";
+		argv[n++] = "15";
+	} else {
+		argv[n++] = "--config-net";
+		argv[n++] = "--ns-ifname";
+		argv[n++] = "eth0";
+		argv[n++] = "--ipv4-only";
+		argv[n++] = "--address";
+		argv[n++] = GUEST_ADDRESS;
+		argv[n++] = "--netmask";
+		argv[n++] = "24";
+		argv[n++] = "--gateway";
+		argv[n++] = GATEWAY_ADDRESS;
+		argv[n++] = "--no-map-gw";
+		argv[n++] = "--dns-forward";
+		argv[n++] = DNS_ADDRESS;
+	}
 	for (unsigned i = 0u; i <= m->port_count; i++) {
 		int udp_port = i < m->port_count && m->port_udp[i];
 
@@ -2287,6 +2305,11 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	if (m->nat && (net = start_pasta(m, net_why, sizeof net_why)) != NULL)
 		kill(m->pid, SIGKILL);
 	if (m->bridge && (net = start_bridge(m, net_why, sizeof net_why)) != NULL)
+		kill(m->pid, SIGKILL);
+	/* Its ports and sshd on hull's bridge, forwarded by pasta from its
+	 * 127.107 address as under NAT. */
+	if (net == NULL && m->bridge_own && (m->port_count != 0u || m->ssh) &&
+	    (net = start_pasta(m, net_why, sizeof net_why)) != NULL)
 		kill(m->pid, SIGKILL);
 	if (write(mapped[1], m->many ? "M" : wanted ? "O" : "S", 1u) != 1) {
 		/* The child reads its end closed and says so on the report. */
@@ -3233,8 +3256,9 @@ static const hull_cap_entry entries[] = {
 	  "the host's own network, asked for: no key is a network of the machine's own, pasta's "
 	  "NAT out", NULL },
 	{ "network.bridge",         HULL_SUP_NATIVE,
-	  "a veth on hull's own bridge, hull0, NATed out, or on the host bridge (bridge NAME) "
-	  "names; only with hull's core run as root, refused at create otherwise", NULL },
+	  "a veth on hull's own bridge, hull0, NATed out, its ports forwarded by pasta from its "
+	  "127.107 address, or on the host bridge (bridge NAME) names; only with hull's core run "
+	  "as root, refused at create otherwise", NULL },
 	{ "bridge",                 HULL_SUP_NATIVE,
 	  "the host bridge (network bridge) joins, there already; the machine addresses itself",
 	  NULL },
