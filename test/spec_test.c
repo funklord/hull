@@ -135,6 +135,11 @@ static void test_values(void)
 	OK(M("(security (allow CAP_NET_ADMIN 0000:01:00.0))"));
 	OK(M("(mutable overlay) (restart on-failure) (on_disconnect keep)"));
 	NO(M("(mutable sometimes)"), VALUE, "sometimes", "machine.mutable");
+	/* (network nat) names the default, a network of the machine's own. */
+	OK(M("(network nat)"));
+	OK(M("(network host)"));
+	OK(M("(network none)"));
+	NO(M("(network bridge)"), VALUE, "bridge", "machine.network");
 	NO(M("(restart)"), SHAPE, "(restart)", "machine.restart");
 
 	/* Booleans. */

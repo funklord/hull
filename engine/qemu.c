@@ -3211,6 +3211,7 @@ static const hull_cap_entry entries[] = {
 	  "tcp and udp, forwarded over vsock from the machine's address", NULL },
 	{ "network.host",       HULL_SUP_REJECTED,
 	  "a vm shares no network namespace with the host: use ports", NULL },
+	{ "network.nat",        HULL_SUP_NATIVE,   "passt's, as no network key gives", NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   "no NIC: lo alone in the guest", NULL },
 	{ "ssh",                HULL_SUP_NATIVE,
 	  "the agent supervises the image's own sshd on the guest's port 22, with a host key, "

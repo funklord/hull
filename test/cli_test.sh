@@ -1870,6 +1870,17 @@ else
 fi
 kill "$nat_listener" 2>/dev/null
 wait "$nat_listener" 2>/dev/null
+# (network nat) says the default outright: on chroot the same network of
+# the machine's own, pasta's eth0 and its own loopback; and every engine
+# takes it, as passt's on a vm and docker's bridge.
+conf natsaid "(network nat) (command \"/probe\" \"addr\" \"eth0\" \"dial\" \"127.0.0.1\" \"$listen_port\")"
+from_root 0 '^addr=eth0 10\.0\.2\.15/24 up$' -f "$root/natsaid.conf"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q "^dial 127\\.0\\.0\\.1:$listen_port=Connection refused\$" ||
+	fail "(network nat) on chroot was not a network of the machine's own" "$out"
+conf natplan '(network nat) (mutable overlay) (ports (port (host 8080) (guest 80))) (command "/probe")'
+expect 0 'machine on docker \(ns\): ok' "$hull" plan -f "$root/natplan.conf" --backend docker
+expect 0 'machine on qemu \(vm\): ok' "$hull" plan -f "$root/natplan.conf" --backend vm
 # Its ports, forwarded by pasta from the machine's own 127.107 address into
 # its network: a connection from the host answered by what serves inside;
 # and ports refused with (network host), where a port is the host's own,

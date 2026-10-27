@@ -414,13 +414,13 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			       "a root that is not read-only";
 	}
 
-	/* No (network ...) is a namespace of the machine's own with pasta's NAT
-	 * out, as passt's is a vm's and docker's bridge a container's (section
-	 * 8); (network host) is the host's own, asked for; (network none) a
-	 * namespace of its own with lo alone. */
+	/* (network nat), or no (network ...), is a namespace of the machine's
+	 * own with pasta's NAT out, as passt's is a vm's and docker's bridge a
+	 * container's (section 8); (network host) is the host's own, asked
+	 * for; (network none) a namespace of its own with lo alone. */
 	source = hull_access_value(doc, &machine, "network");
 	m->no_network = source != NULL && strcmp(source, "none") == 0;
-	m->nat        = source == NULL;
+	m->nat        = source == NULL || strcmp(source, "nat") == 0;
 	free(source);
 	if (hull_access_find(doc, &machine, "ports", &entry)) {
 		hull_sexpr_form top;
@@ -2959,6 +2959,9 @@ static const hull_cap_entry entries[] = {
 	{ "network.host",           HULL_SUP_NATIVE,
 	  "the host's own network, asked for: no key is a network of the machine's own, pasta's "
 	  "NAT out", NULL },
+	{ "network.nat",            HULL_SUP_NATIVE,
+	  "a network namespace of the machine's own, pasta's NAT out, as no network key gives",
+	  NULL },
 	{ "network.none",           HULL_SUP_NATIVE,
 	  "a network namespace of the machine's own, with lo alone", NULL },
 	{ "ssh",                    HULL_SUP_NATIVE,

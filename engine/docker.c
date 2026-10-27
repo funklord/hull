@@ -847,7 +847,8 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	 * there would sit through stop's SIGTERM, and nothing would reap. */
 	add_text(&body, ",\"HostConfig\":{\"Init\":true,\"CapDrop\":[\"ALL\"]");
 	/* (network none) is docker's none, lo alone; (network host) its host;
-	 * none given, its own bridge, as it always was. Ports need one. */
+	 * (network nat), or none given, its own bridge, as it always was.
+	 * Ports need one. */
 	if ((value = hull_access_value(doc, machine, "network")) != NULL) {
 		int ported = hull_access_find(doc, machine, "ports", &entry);
 
@@ -1670,6 +1671,7 @@ static const hull_cap_entry entries[] = {
 	{ "workdir",            HULL_SUP_NATIVE,   NULL, NULL },
 	{ "env",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "network.host",       HULL_SUP_NATIVE,   NULL, NULL },
+	{ "network.nat",        HULL_SUP_NATIVE,   "docker's own bridge, as no network key gives", NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   NULL, NULL },
 	{ "export",             HULL_SUP_REJECTED,
 	  "not yet: docker export does it, and the adapter does not call it", NULL },
