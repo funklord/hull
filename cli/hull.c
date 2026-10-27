@@ -1378,6 +1378,79 @@ static int add_names(hull_plan *plan, const hull_names *names, const char *id)
 	return 0;
 }
 
+/* Whether `machine` names `segment` in its (segments ...). */
+static int on_segment(const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
+                      const char *segment)
+{
+	hull_sexpr_form segments;
+	hull_sexpr_form item;
+	int             on = 0;
+
+	if (!hull_access_find(doc, machine, "segments", &segments))
+		return 0;
+	hull_sexpr_child(doc, &segments, &item);
+	while (!on && hull_sexpr_next(doc, &item, &item)) {
+		char *name = hull_access_segment_name(doc, &item);
+
+		on = name != NULL && strcmp(name, segment) == 0;
+		free(name);
+	}
+	return on;
+}
+
+/* A notice on stderr for each link the spec impairs or tampers with, as
+ * for what a plan emulates: the core applies it from the machine's first
+ * frame, which nothing in the machine's own output shows, and only
+ * `hull segment` counts what it does (Appendix D). */
+static void link_notices(const options *o, const char *shown, const uint8_t *plan, size_t length)
+{
+	static const char *const which[2] = { "impair", "tamper" };
+	static const char *const done[2]  = { "impaired", "tampered with" };
+	hull_sexpr_doc           doc;
+	hull_sexpr_form          machine;
+
+	if (!hull_access_machine(&doc, plan, length, &machine))
+		return;
+	for (int kind = 0; kind < 2; kind++) {
+		hull_sexpr_form group;
+		hull_sexpr_form link;
+
+		if (!hull_access_find(&doc, &machine, which[kind], &group))
+			continue;
+		hull_sexpr_child(&doc, &group, &link);
+		while (hull_sexpr_next(&doc, &link, &link)) {
+			hull_sexpr_form name;
+			hull_sexpr_form way;
+			char            segment[64];
+			size_t          size;
+			int             out = 0;
+			int             in  = 0;
+
+			if (link.kind != HULL_SEXPR_LIST || !hull_sexpr_child(&doc, &link, &name) ||
+			    hull_sexpr_value(&doc, &name, (uint8_t *)segment, sizeof segment - 1u,
+			                     &size) != HULL_SEXPR_OK)
+				continue;
+			segment[size] = '\0';
+			for (way = name; hull_sexpr_next(&doc, &way, &way);) {
+				hull_sexpr_form head;
+
+				if (way.kind == HULL_SEXPR_LIST && hull_sexpr_child(&doc, &way, &head)) {
+					in  |= hull_sexpr_is(&doc, &head, "in");
+					out |= hull_sexpr_is(&doc, &head, "out");
+				}
+			}
+			/* A link of a segment the machine is not on, the core refuses. */
+			if ((in || out) && on_segment(&doc, &machine, segment))
+				fprintf(stderr,
+				        "%s: %s: segment %s %s %s from the first frame; hull segment %s "
+				        "counts it\n",
+				        o->file, shown, segment, done[kind],
+				        in && out ? "both ways" : out ? "on the way out" : "on the way in",
+				        segment);
+		}
+	}
+}
+
 /* One machine planned, and its run's request built on channel `ch`: the
  * plan, the names of its addressed segments, and the secrets it asks
  * for, which may prompt. 0, else 125 having said why; nothing is started. */
@@ -1432,6 +1505,7 @@ static int prepare_run(options *o, const hull_registry *registry, hull_spec *spe
 		        shown);
 		return 125;
 	}
+	link_notices(o, shown, plan.canonical, plan.canonical_length);
 
 	/* Before the core is reached, and before SIGINT would stop a machine:
 	 * a command asked for a secret may prompt, and ^C there ends this. */

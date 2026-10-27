@@ -1335,6 +1335,12 @@ wait "$cutinrun"
 cases=$((cases + 1))
 grep -q '^shouter | shout=answered$' "$root/cutin.out" ||
 	fail "a spec's impairment healed at runtime was not heard across" "$(cat "$root/cutin.out")"
+# The run says so on stderr, for the machine whose spec gives it alone,
+# since nothing in a machine's own output shows its link impaired.
+cases=$((cases + 1))
+grep -q "/cutin\\.conf: shouter: segment $cutin impaired on the way out from the first frame; hull segment $cutin counts it\$" "$root/cutin.out" &&
+	! grep -q '/cutin\.conf: hearer: segment' "$root/cutin.out" ||
+	fail "a spec's impairment was not noticed for its machine alone" "$(cat "$root/cutin.out")"
 # One for a segment the machine is not on is refused before it runs, and
 # docker has no link of the core's to impair.
 conf offwire "(network none) (segments \"on-$$\") (impair (off-$$ (out (loss 0.5)))) (command \"/probe\" \"say\" \"ran\")"
