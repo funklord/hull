@@ -68,6 +68,13 @@ fail() {
 	printf '%s\n' "$2" | sed 's/^/    /'
 }
 
+# The agent names the commit it was built from, as hull does, so a result
+# resting on a vm can name the agent it ran under.
+cases=$((cases + 1))
+agent_version=$(timeout 5 "$(dirname "$hull")/hull-agent" --version 2>&1)
+printf '%s\n' "$agent_version" | grep -Eq '^commit ([0-9a-f]{12}(-dirty)?|unknown)$' ||
+	fail "hull-agent --version did not name its commit" "$agent_version"
+
 conf() { # NAME ENTRIES...
 	name=$1
 	shift

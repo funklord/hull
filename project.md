@@ -616,7 +616,7 @@ Open, each for the planner's next step:
 - **docker** has no `fidelity.odirect` and no media.
 - **qemu** offers `fidelity.inotify` only with `--accept vm:inotify-poll`.
 
-Their operations were not written then: every slot was NULL, which was enough for planning and nothing else. Both run machines now (§4.9, §4.11), and each declaration shrank to what its engine does. `hull --version` prints `VERSION` and the copyright line.
+Their operations were not written then: every slot was NULL, which was enough for planning and nothing else. Both run machines now (§4.9, §4.11), and each declaration shrank to what its engine does. `hull --version` prints `VERSION` and the copyright line. **`hull-agent --version` names its commit too, since 2026-10-27,** from the same `commit.h`, its object rebuilt when the commit moves: fmake, checking which binaries its run rested on, found hull's commit and no agent's, so a vm's result could name the hull it ran under but not the agent. Only as its one argument, since the kernel hands PID 1 the boot line's leftovers; outside PID 1 it refuses as before.
 
 **The host's arch comes from `uname`**, in the spec's spelling: `x86_64` is `amd64` and `aarch64` is `arm64`.
 

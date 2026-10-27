@@ -85,6 +85,16 @@
 #include "access.h"
 #include "wire.h"
 
+/* The commit, where the build that made this one wrote it, as hull's. */
+#if defined(__has_include)
+#if __has_include("commit.h")
+#include "commit.h"
+#endif
+#endif
+#ifndef HULL_COMMIT
+#define HULL_COMMIT "unknown"
+#endif
+
 #define AGENT_VERSION "0.1"
 #define AGENT_PORT    1u
 #define MAX_ARGS      256u
@@ -1852,13 +1862,19 @@ static void finish(void)
 	farewell();
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
 	sigset_t       mask;
 	int            children;
 	int            listener;
 	hull_wire_status wire_status;
 
+	/* The commit it was built from, as hull's own --version says it, so a
+	 * result resting on a vm can name the agent it ran under too. */
+	if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+		printf("hull agent\ncommit %s\n", HULL_COMMIT);
+		return 0;
+	}
 	if (getpid() != 1) {
 		fprintf(stderr, "hull agent: runs as a machine's init, PID 1\n");
 		return 2;
