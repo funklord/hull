@@ -1260,6 +1260,34 @@ printf '(machines (a %s) (b %s))\n' \
 	"(source \"dir:./rootfs\") (backend chroot) (network none) (segments \"half-$$\") (command \"/probe\" \"say\" \"ran\")" \
 	> "$root/half.conf"
 from_root 125 "names it without its subnet" -f "$root/half.conf"
+# Segments beside NAT, as a vm has them beside passt: pasta's eth0 first,
+# the segments' NICs from eth1; an addressed segment's siblings named by
+# /etc/hosts and reached by name across the core's switch, the machine
+# keeping pasta's resolver; and a bare segment's eth1 left down and given
+# no address, as under (network none).
+natseg="natseg-$$"
+printf '(machines (nweb %s) (ndb %s) (nraw %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (segments ($natseg (subnet \"10.84.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"addr\" \"eth1\" \"read\" \"/etc/resolv.conf\" \"hosts\" \"ndb\" \"ask\" \"ndb\" \"7000\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (segments ($natseg (subnet \"10.84.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"addr\" \"eth1\" \"answer\" \"7000\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (segments \"natraw-$$\") (command \"/probe\" \"addr\" \"eth0\" \"addr\" \"eth1\")" \
+	> "$root/natseg.conf"
+limit=60
+from_root 0 '^nweb +\| ask=ndb at 10\.84\.0\.[0-9]+: ndb$' -f "$root/natseg.conf"
+natseg_out=$out
+ndb_at=$(printf '%s\n' "$natseg_out" | sed -n 's#^ndb *| addr=eth1 \(10\.84\.0\.[0-9]*\)/24 up$#\1#p')
+cases=$((cases + 1))
+[ -n "$ndb_at" ] &&
+	printf '%s\n' "$natseg_out" | grep -q '^nweb *| addr=eth0 10\.0\.2\.15/24 up$' &&
+	printf '%s\n' "$natseg_out" | grep -q '^ndb *| addr=eth0 10\.0\.2\.15/24 up$' &&
+	printf '%s\n' "$natseg_out" | grep -q '^nweb *| addr=eth1 10\.84\.0\.[0-9]*/24 up$' &&
+	printf '%s\n' "$natseg_out" | grep -q '^nweb *| read=nameserver 10\.0\.2\.3$' &&
+	printf '%s\n' "$natseg_out" | grep -q "^nweb *| hosts=ndb $ndb_at\$" &&
+	printf '%s\n' "$natseg_out" | grep -q '^ndb *| answer=from 10\.84\.0\.[0-9]*$' ||
+	fail "addressed siblings beside NAT were not on eth1, named and reached, with pasta's eth0 and resolver" "$natseg_out"
+cases=$((cases + 1))
+printf '%s\n' "$natseg_out" | grep -q '^nraw *| addr=eth0 10\.0\.2\.15/24 up$' &&
+	printf '%s\n' "$natseg_out" | grep -q '^nraw *| addr=eth1 none/0 down$' ||
+	fail "a bare segment beside NAT was not eth1, down and unaddressed" "$natseg_out"
 # Each file draws only its own machines' addresses, so the switch is where
 # two files on one addressed segment meet: with a /29's five hosts all held
 # by one file, a machine of another file on the same subnet is refused,
@@ -1561,8 +1589,8 @@ cases=$((cases + 1))
 expect 1 'no such machine' "$hull" pause nobody
 expect 2 'is not an impairment' "$hull" segment "nowhere-$$" impair all in wobble=1
 expect 2 'a direction is in, out or both' "$hull" segment "nowhere-$$" impair all sideways
-conf csegment "(segments \"$wire\")" '(command "/probe" "say" "never")'
-from_root 125 'a chroot machine on a segment has a network of its own' -f "$root/csegment.conf"
+conf csegment "(network host) (segments \"$wire\")" '(command "/probe" "say" "never")'
+from_root 125 'a chroot machine on a segment needs a network namespace of its own: not \(network host\)' -f "$root/csegment.conf"
 # Where the host gives the user no subordinate range, one uid is mapped
 # and said once, with its way round: root in a user namespace of the
 # user's own has none here, so hull run there, with a core of its own in

@@ -159,7 +159,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  full.conf full.out full.counts another.conf widened.conf barejoin.conf \
                  early.conf early.out late.conf dyn.counts capseg.conf capseg.out capseg.err capseg.pcap \
                  gemodel.conf gemodel.out gemodel.counts natlisten.out netnat.conf natports.conf \
-                 natports.out hostports.conf noneports.conf natexec.conf natexec.out) \
+                 natports.out hostports.conf noneports.conf natexec.conf natexec.out natseg.conf) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
 # What test/docker_test.sh writes.

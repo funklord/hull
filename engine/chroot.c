@@ -464,11 +464,12 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	if (m->nat && (m->resolver = strdup("nameserver " DNS_ADDRESS "\n")) == NULL)
 		return "out of memory";
 
-	/* (segments ...): a NIC on each, eth0, eth1, ..., in the machine's own
-	 * network namespace, which only (network none) gives it: a tap needs a
-	 * namespace the user's own, and the host's is not. So named, a spec
-	 * keeps its NICs' names on a vm of (network none), where no passt NIC
-	 * comes first. A segment is the core's switch, which goes with it. */
+	/* (segments ...): a NIC on each in the machine's own network namespace,
+	 * which (network none) and NAT give it and (network host) does not: a
+	 * tap needs a namespace the user's own, and the host's is not. Named
+	 * as a vm's are, after pasta's eth0 under NAT, eth1 on, and from eth0
+	 * under (network none), where no uplink comes first. A segment is the
+	 * core's switch, which goes with it. */
 	if (hull_access_find(doc, &machine, "segments", &entry)) {
 		hull_sexpr_form top;
 
@@ -480,9 +481,9 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			if ((m->segment[m->segment_count++] = hull_access_segment_name(doc, &item)) == NULL)
 				return "a segment's name is not text";
 		}
-		if (m->segment_count != 0u && !m->no_network)
-			return "a chroot machine on a segment has a network of its own: (network none) "
-			       "beside (segments ...)";
+		if (m->segment_count != 0u && !m->no_network && !m->nat)
+			return "a chroot machine on a segment needs a network namespace of its own: not "
+			       "(network host) beside (segments ...)";
 		if (m->segment_count != 0u && m->keep)
 			return "a machine on a segment cannot outlive the core, whose switch the segment "
 			       "is: (on_disconnect keep) and (segments ...) do not go together";
@@ -500,10 +501,12 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			for (unsigned i = 0u; i < m->segment_count; i++)
 				hull_access_named(doc, &entry, m->segment[i], m->segment_address[i],
 				                  &m->segment_prefix[i]);
-			/* A machine on segments has no network but theirs, so hull at
-			 * their .1 is the one to ask. */
+			/* Under (network none) its segments are its only network, so
+			 * hull at their .1 is the one to ask; under NAT pasta's
+			 * resolver stays, as passt's does a vm's, the siblings named
+			 * by /etc/hosts. */
 			if ((m->hosts = hull_access_hosts(doc, &entry)) == NULL ||
-			    (m->resolver = hull_access_resolver(doc, &entry)) == NULL)
+			    (m->no_network && (m->resolver = hull_access_resolver(doc, &entry)) == NULL))
 				return "the plan's names cannot be read";
 		}
 	}
@@ -1169,7 +1172,8 @@ static void join_segments(const hull_machine *m, int report)
 		struct ifreq request = { 0 };
 		int          fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 
-		snprintf(request.ifr_name, sizeof request.ifr_name, "eth%u", i);
+		/* After pasta's eth0 under NAT, as after passt's on a vm. */
+		snprintf(request.ifr_name, sizeof request.ifr_name, "eth%u", i + (m->nat ? 1u : 0u));
 		request.ifr_flags = IFF_TAP | IFF_NO_PI;
 		if (fd < 0 || (tap[i] = open("/dev/net/tun", O_RDWR | O_CLOEXEC)) < 0 ||
 		    ioctl(tap[i], TUNSETIFF, &request) != 0)
@@ -2962,8 +2966,9 @@ static const hull_cap_entry entries[] = {
 	  "bound there on the host network and forwarded there by pasta under NAT; refused with "
 	  "(network none) and at start if the image has no sshd", NULL },
 	{ "segments",               HULL_SUP_NATIVE,
-	  "a tap each, eth0 and on, in the machine's own network namespace, relayed to the core's "
-	  "switch; with (network none)", NULL },
+	  "a tap each in the machine's own network namespace, relayed to the core's switch: eth1 "
+	  "on after pasta's eth0 under NAT, eth0 on with (network none); refused with (network "
+	  "host)", NULL },
 	{ "impair",                 HULL_SUP_NATIVE,
 	  "in the core's switch, each way of the machine's port on a segment, in netem's terms", NULL },
 	{ "tamper",                 HULL_SUP_NATIVE,
