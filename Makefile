@@ -140,7 +140,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  sdunit.conf sdnore.conf sdmulti.conf Dockerfile.in imported.build nofrom.in \
                  docker-compose.yml compose.machines noservices.yml \
                  home/.ssh/config ssh-config.before foreign.conf machines.conf build.conf bad.conf example.conf run.conf \
-                 writable.conf readonly.conf die.conf wait.conf ports.conf noargs.conf nope.conf \
+                 writable.conf readonly.conf die.conf wait.conf noargs.conf nope.conf \
                  pair.conf rootfs/written rootfs/bin/sh vol.conf volro.conf vollink.conf \
                  onemap.conf chearer.conf chearer.out cshouter.conf cloner.conf cloner.out csegment.conf \
                  volmissing.conf volmade.conf volhost.conf volstack.conf volrestack.conf \
@@ -158,7 +158,8 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  named.conf inplace.conf twosub.conf half.conf \
                  full.conf full.out full.counts another.conf widened.conf barejoin.conf \
                  early.conf early.out late.conf dyn.counts capseg.conf capseg.out capseg.err capseg.pcap \
-                 gemodel.conf gemodel.out gemodel.counts) \
+                 gemodel.conf gemodel.out gemodel.counts natlisten.out netnat.conf natports.conf \
+                 natports.out hostports.conf noneports.conf natexec.conf natexec.out) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
 # What test/docker_test.sh writes.

@@ -75,6 +75,12 @@
 #define MAX_ENV     256u
 #define MAX_VOLUMES 64u
 #define MAX_SEGMENTS 8u
+#define MAX_PORTS    64u
+/* What pasta gives a machine under NAT, as passt gives a vm (engine/qemu.c):
+ * its address, the gateway, and the host's resolver through DNS_ADDRESS. */
+#define GUEST_ADDRESS   "10.0.2.15"
+#define GATEWAY_ADDRESS "10.0.2.2"
+#define DNS_ADDRESS     "10.0.2.3"
 #define HELD_LIMIT  (256u * 1024u)  /* output an init holds for no core */
 /* How long an init may take to reach its workload: the core waits for it
  * on its own thread, every frontend with it, so a hang is bounded rather
@@ -129,6 +135,11 @@ struct hull_machine {
 	int              conn;       /* the init's frames, or -1 */
 	int              keep;       /* (on_disconnect keep) */
 	int              no_network; /* (network none): a namespace with only lo */
+	int              nat;        /* no (network ...): its own namespace, pasta's NAT out */
+	unsigned         port_count; /* (ports ...), forwarded by pasta on the address */
+	int              port_udp[MAX_PORTS];
+	unsigned         port_host[MAX_PORTS];
+	unsigned         port_guest[MAX_PORTS];
 	char            *segment[MAX_SEGMENTS];     /* Appendix D's, by name */
 	int              segment_fd[MAX_SEGMENTS];  /* their ports, until the init has them */
 	unsigned         segment_count;
@@ -403,11 +414,55 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			       "a root that is not read-only";
 	}
 
-	/* (network host), or none given, is the host's own, as it always was;
-	 * (network none) is a namespace of the machine's own, lo alone. */
+	/* No (network ...) is a namespace of the machine's own with pasta's NAT
+	 * out, as passt's is a vm's and docker's bridge a container's (section
+	 * 8); (network host) is the host's own, asked for; (network none) a
+	 * namespace of its own with lo alone. */
 	source = hull_access_value(doc, &machine, "network");
 	m->no_network = source != NULL && strcmp(source, "none") == 0;
+	m->nat        = source == NULL;
 	free(source);
+	if (hull_access_find(doc, &machine, "ports", &entry)) {
+		hull_sexpr_form top;
+
+		if (!m->nat)
+			return m->no_network ? "ports need the machine's network, which (network none) has not"
+			                     : "ports need a network of the machine's own: (network host) is "
+			                       "the host's, where a port is the host's own";
+		hull_sexpr_first(doc, &top);
+		source = hull_access_value(doc, &top, "address");
+		if (source == NULL || source[0] == '\0' || strlen(source) >= sizeof m->address_text) {
+			free(source);
+			return "the plan gives its ports no address";
+		}
+		snprintf(m->address_text, sizeof m->address_text, "%s", source);
+		free(source);
+		hull_sexpr_child(doc, &entry, &item);
+		for (more = hull_sexpr_next(doc, &item, &item); more;
+		     more = hull_sexpr_next(doc, &item, &item)) {
+			char         *host_port = hull_access_value(doc, &item, "host");
+			char         *guest     = hull_access_value(doc, &item, "guest");
+			char         *proto     = hull_access_value(doc, &item, "proto");
+			unsigned long h = host_port != NULL ? strtoul(host_port, NULL, 10) : 0u;
+			unsigned long g = guest != NULL ? strtoul(guest, NULL, 10) : 0u;
+			int           udp = proto != NULL && strcmp(proto, "udp") == 0;
+
+			free(host_port);
+			free(guest);
+			free(proto);
+			if (m->port_count == MAX_PORTS)
+				return "there are too many ports";
+			if (h < 1u || h > 65535u || g < 1u || g > 65535u)
+				return "a port is a host and a guest port of 1 to 65535";
+			m->port_udp[m->port_count]     = udp;
+			m->port_host[m->port_count]    = (unsigned)h;
+			m->port_guest[m->port_count++] = (unsigned)g;
+		}
+	}
+	/* Under NAT the machine asks pasta's forwarder, at DNS_ADDRESS, over
+	 * its /etc/resolv.conf, as the agent has a vm ask passt's. */
+	if (m->nat && (m->resolver = strdup("nameserver " DNS_ADDRESS "\n")) == NULL)
+		return "out of memory";
 
 	/* (segments ...): a NIC on each, eth0, eth1, ..., in the machine's own
 	 * network namespace, which only (network none) gives it: a tap needs a
@@ -469,17 +524,17 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	}
 
 	/* (ssh true): the image's sshd, which the engine supervises on the
-	 * machine's own 127.107 address, since chroot shares the host network
-	 * (section 8.1). The address is where it binds and where hull reaches
-	 * it, so (network none) -- which has no host-reachable address -- is
-	 * refused. */
+	 * machine's own 127.107 address (section 8.1): bound there on the host
+	 * network, and under NAT bound in the machine and forwarded there by
+	 * pasta. The address is where hull reaches it, so (network none) --
+	 * which has no host-reachable address -- is refused. */
 	m->ssh = hull_access_true(doc, &machine, "ssh");
 	if (m->ssh) {
 		hull_sexpr_form top;
 		char           *addr;
 
 		if (m->no_network)
-			return "(ssh true) needs the host network to be reached: not with (network none)";
+			return "(ssh true) needs a network to be reached on: not with (network none)";
 		hull_sexpr_first(doc, &top);
 		m->ssh_dir = hull_access_value(doc, &top, "ssh_dir");
 		if (m->ssh_dir == NULL)
@@ -563,8 +618,8 @@ static int stage_named(const char *dir, const char *name, const char *text, int 
 /* `tree` over `path`, a file of the machine's: made where it is absent or
  * a link and the root's writes are an overlay's, which a link's target
  * outside the machine would not be, and refused where the tree is the
- * user's own. */
-static void place_named(int tree, const char *path, int overlay, int report)
+ * user's own -- or, where it is not `required`, left as it is. */
+static void place_named(int tree, const char *path, int overlay, int required, int report)
 {
 	struct stat place;
 	char        step[200];
@@ -572,6 +627,10 @@ static void place_named(int tree, const char *path, int overlay, int report)
 	if (lstat(path, &place) != 0 || !S_ISREG(place.st_mode)) {
 		int fd;
 
+		if (!overlay && !required) {
+			close(tree);
+			return;
+		}
 		if (lstat(path, &place) == 0 && !S_ISLNK(place.st_mode)) {
 			errno = EISDIR;
 			snprintf(step, sizeof step, "an addressed segment's names go over %s, which is not "
@@ -1268,16 +1327,17 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	 * tmpfs of this namespace's, so that on the host it stays empty; the
 	 * stack holds its own clones of the layers and the upper, and so
 	 * outlives the old root it is staged under. */
-	if ((m->staged || m->hosts != NULL) && mount("tmpfs", m->dir, "tmpfs", 0u, "mode=0700") != 0)
+	if ((m->staged || m->hosts != NULL || m->resolver != NULL) &&
+	    mount("tmpfs", m->dir, "tmpfs", 0u, "mode=0700") != 0)
 		child_fail(report, "the volumes' staging");
 	/* The names of its addressed segments, and hull at their .1 to ask,
 	 * staged beside the volumes and placed over /etc/hosts and
 	 * /etc/resolv.conf once the root is the machine's: the tree is not
 	 * written, so a read-only or stored root takes them too. */
-	if (m->hosts != NULL) {
-		hosts_tree    = stage_named(m->dir, "hosts", m->hosts, report);
+	if (m->hosts != NULL)
+		hosts_tree = stage_named(m->dir, "hosts", m->hosts, report);
+	if (m->resolver != NULL)
 		resolver_tree = stage_named(m->dir, "resolv.conf", m->resolver, report);
-	}
 	for (unsigned i = 0u; i < m->volume_count; i++) {
 		struct mount_attr readonly = { .attr_set = MOUNT_ATTR_RDONLY };
 		char              staged[4300];
@@ -1330,7 +1390,7 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		child_fail(report, "sethostname");
 	/* A namespace of its own starts with lo down: up, so that a dial to a
 	 * port nothing holds is refused rather than unreachable. */
-	if (m->no_network) {
+	if (m->no_network || m->nat) {
 		struct ifreq lo = { 0 };
 		int          fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 
@@ -1419,10 +1479,13 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	/* Its siblings' names over /etc/hosts, and hull's .1 over
 	 * /etc/resolv.conf, made where the root's writes are the overlay's,
 	 * and refused where they would be the user's own. */
-	if (hosts_tree >= 0) {
-		place_named(hosts_tree, "/etc/hosts", m->overlay, report);
-		place_named(resolver_tree, "/etc/resolv.conf", m->overlay, report);
-	}
+	if (hosts_tree >= 0)
+		place_named(hosts_tree, "/etc/hosts", m->overlay, 1, report);
+	/* Under NAT a tree used in place with no resolv.conf keeps none, as
+	 * docker's run does not write one into a bind: the machine has its
+	 * network, and only its names are the host's resolver's to give. */
+	if (resolver_tree >= 0)
+		place_named(resolver_tree, "/etc/resolv.conf", m->overlay, !m->nat, report);
 	/* The secrets at /run/hull/secrets, J.3's place, on a tmpfs at /run:
 	 * the dir's /run, which FHS has emptied at every boot, is hidden, and
 	 * nothing is created in the user's dir. A dir with no /run cannot
@@ -1460,7 +1523,7 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		             "Port %d\nListenAddress %s\nHostKey /run/hull/ssh/host_key\n"
 		             "AuthorizedKeysFile /run/hull/ssh/authorized_keys\n"
 		             "PasswordAuthentication no\nPermitRootLogin prohibit-password\nUsePAM no\n",
-		             HULL_SSH_PORT, m->address_text);
+		             HULL_SSH_PORT, m->nat ? "0.0.0.0" : m->address_text);
 		fd = open("/run/hull/ssh.conf", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0400);
 		if (n <= 0 || n >= (int)sizeof config || fd < 0 || write(fd, config, (size_t)n) != n)
 			child_fail(report, "the ssh config");
@@ -1683,6 +1746,119 @@ static void sweep(const char *parent)
 		closedir(list);
 }
 
+/*
+ * The machine's network under NAT: pasta, as the user, attached to the
+ * init's user and network namespaces by its pid, configuring eth0 there
+ * as passt does a vm's -- GUEST_ADDRESS, the gateway, the host's resolver
+ * at DNS_ADDRESS -- with --no-map-gw, so the machine cannot reach what
+ * listens on the host's loopback only for the user. Each port, and an
+ * sshd's, is forwarded in from the machine's 127.107 address; pasta's
+ * loopback path, which passt lacks, carries a connection from the host's
+ * loopback in (section 8.1). Nothing goes the other way, -T and -U none.
+ * pasta's parent exits once it is set up, 0 or with its reason on the
+ * pipe; the daemon it leaves ends when the init's /proc entry goes, so it
+ * needs no supervising and outlives a core under keep with its machine.
+ * NULL, or why in `why`.
+ */
+static const char *start_pasta(const hull_machine *m, char *why, size_t cap)
+{
+	char        pid_text[24];
+	char        forward[MAX_PORTS + 1u][96];
+	const char *argv[40 + 2u * (MAX_PORTS + 1u)];
+	unsigned    n = 0u;
+	unsigned    tcp = 0u;
+	unsigned    udp = 0u;
+	int         said[2];
+	int         status;
+	pid_t       pid;
+	ssize_t     got;
+
+	argv[n++] = "pasta";
+	argv[n++] = "--quiet";
+	argv[n++] = "--config-net";
+	argv[n++] = "--ns-ifname";
+	argv[n++] = "eth0";
+	argv[n++] = "--ipv4-only";
+	argv[n++] = "--address";
+	argv[n++] = GUEST_ADDRESS;
+	argv[n++] = "--netmask";
+	argv[n++] = "24";
+	argv[n++] = "--gateway";
+	argv[n++] = GATEWAY_ADDRESS;
+	argv[n++] = "--no-map-gw";
+	argv[n++] = "--dns-forward";
+	argv[n++] = DNS_ADDRESS;
+	for (unsigned i = 0u; i <= m->port_count; i++) {
+		int udp_port = i < m->port_count && m->port_udp[i];
+
+		if (i == m->port_count && !m->ssh)
+			break;
+		snprintf(forward[i], sizeof forward[i], "%s/%u:%u", m->address_text,
+		         i < m->port_count ? m->port_host[i] : (unsigned)HULL_SSH_PORT,
+		         i < m->port_count ? m->port_guest[i] : (unsigned)HULL_SSH_PORT);
+		argv[n++] = udp_port ? "-u" : "-t";
+		argv[n++] = forward[i];
+		if (udp_port)
+			udp++;
+		else
+			tcp++;
+	}
+	if (tcp == 0u) {
+		argv[n++] = "-t";
+		argv[n++] = "none";
+	}
+	if (udp == 0u) {
+		argv[n++] = "-u";
+		argv[n++] = "none";
+	}
+	argv[n++] = "-T";
+	argv[n++] = "none";
+	argv[n++] = "-U";
+	argv[n++] = "none";
+	snprintf(pid_text, sizeof pid_text, "%ld", (long)m->pid);
+	argv[n++] = pid_text;
+	argv[n] = NULL;
+
+	if (pipe2(said, O_CLOEXEC) != 0) {
+		snprintf(why, cap, "the machine's network: %s", strerror(errno));
+		return why;
+	}
+	pid = fork();
+	if (pid == 0) {
+		int null = open("/dev/null", O_RDWR);
+
+		if (null < 0 || dup2(null, 0) < 0 || dup2(said[1], 1) < 0 || dup2(said[1], 2) < 0)
+			_exit(126);
+		syscall(SYS_close_range, 3u, ~0u, 0u);
+		execvp(argv[0], (char *const *)argv);
+		fprintf(stderr, "pasta, which a chroot machine's network needs: %s", strerror(errno));
+		_exit(127);
+	}
+	close(said[1]);
+	if (pid < 0) {
+		close(said[0]);
+		snprintf(why, cap, "pasta cannot be started: %s", strerror(errno));
+		return why;
+	}
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+		;
+	/* What it said, without waiting on the daemon, which may hold the
+	 * pipe's other end. */
+	fcntl(said[0], F_SETFL, O_NONBLOCK);
+	got = read(said[0], why, cap - 1u);
+	close(said[0]);
+	if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+		return NULL;
+	if (got <= 0)
+		snprintf(why, cap, "pasta could not give the machine its network");
+	else {
+		why[got] = '\0';
+		while (got > 0 && (why[got - 1] == '\n' || why[got - 1] == '\r'))
+			why[--got] = '\0';
+	}
+	return why;
+}
+
 static const char *make_dir(hull_machine *m)
 {
 	static unsigned counter;
@@ -1753,11 +1929,13 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	gid_t       gid = getgid();
 	ssize_t     n;
 	const char *reason;
+	const char *net = NULL;
+	char        net_why[300];
 
 	if (m->started)
 		return fail(error, HULL_ERR_BUSY, "the machine has been started already");
 	/* A kept machine's directory, for its init.sock. */
-	if ((m->keep || m->staged || m->hosts != NULL) &&
+	if ((m->keep || m->staged || m->hosts != NULL || m->resolver != NULL) &&
 	    ((reason = make_dir(m)) != NULL ||
 	     (m->keep && (dir_fd = open(m->dir, O_PATH | O_DIRECTORY | O_CLOEXEC)) < 0))) {
 		snprintf(m->detail, sizeof m->detail, "%s",
@@ -1798,7 +1976,7 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	 * of its own. The ids are read first, since in the child's new user
 	 * namespace they are unmapped until it maps them. */
 	m->pid = (pid_t)syscall(SYS_clone, CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWUTS |
-	                        CLONE_NEWPID | (m->no_network ? CLONE_NEWNET : 0) | SIGCHLD, NULL,
+	                        CLONE_NEWPID | (m->no_network || m->nat ? CLONE_NEWNET : 0) | SIGCHLD, NULL,
 	                        NULL, NULL, 0L);
 	if (m->pid < 0)
 		return fail(error, HULL_ERR_RUNTIME, "clone");
@@ -1828,6 +2006,11 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 		wanted = m->overlay && !m->readonly_root && !kept;
 		m->many = wanted && hull_map_many(m->pid, uid, gid);
 	}
+	/* Its network before the init goes on, so the workload starts with
+	 * one; an init whose network cannot be had is killed, and the report
+	 * read below then says why. */
+	if (m->nat && (net = start_pasta(m, net_why, sizeof net_why)) != NULL)
+		kill(m->pid, SIGKILL);
 	if (write(mapped[1], m->many ? "M" : wanted ? "O" : "S", 1u) != 1) {
 		/* The child reads its end closed and says so on the report. */
 	}
@@ -1853,6 +2036,10 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 			n = (ssize_t)strlen(m->detail);
 		} else {
 			n = read(report[0], m->detail, sizeof m->detail - 1u);
+		}
+		if (net != NULL) {
+			snprintf(m->detail, sizeof m->detail, "%s", net);
+			n = (ssize_t)strlen(m->detail);
 		}
 	}
 	close(report[0]);
@@ -2404,7 +2591,7 @@ static hull_status chroot_exec(hull_core *core, hull_machine *m, hull_buf spec,
 		return fail(error, HULL_ERR_UNSUPPORTED, "an exec names a command");
 	}
 	tty = size.ws_col != 0u;
-	for (unsigned i = 0u; i < (m->no_network ? 5u : 4u); i++) {
+	for (unsigned i = 0u; i < (m->no_network || m->nat ? 5u : 4u); i++) {
 		snprintf(path, sizeof path, "/proc/%ld/ns/%s", (long)m->pid, kinds[i]);
 		ns[i] = open(path, O_RDONLY | O_CLOEXEC);
 	}
@@ -2413,7 +2600,7 @@ static hull_status chroot_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	st = calloc(1u, sizeof *st);
 	opened = tty ? open_terminal(&size, in, o, e) : pipe2(in, O_CLOEXEC) == 0 &&
 	         pipe2(o, O_CLOEXEC) == 0 && pipe2(e, O_CLOEXEC) == 0;
-	if (ns[0] < 0 || ns[1] < 0 || ns[2] < 0 || ns[3] < 0 || (m->no_network && ns[4] < 0) ||
+	if (ns[0] < 0 || ns[1] < 0 || ns[2] < 0 || ns[3] < 0 || ((m->no_network || m->nat) && ns[4] < 0) ||
 	    root < 0 || st == NULL ||
 	    !opened || pipe2(report, O_CLOEXEC) != 0 || pipe2(status, O_CLOEXEC) != 0) {
 		const int ends[] = { ns[0], ns[1], ns[2], ns[3], ns[4], root, in[0], in[1], o[0],
@@ -2762,15 +2949,18 @@ static const hull_cap_entry entries[] = {
 	{ "on_disconnect.keep",     HULL_SUP_NATIVE,
 	  "kept, and taken back by a core that comes after one that went; its init holds "
 	  "the workload's last 256 KiB meanwhile", NULL },
-	{ "ports",                  HULL_SUP_REJECTED,
-	  "chroot shares the host's network, so a port is the host's own", NULL },
-	{ "network.host",           HULL_SUP_NATIVE,   NULL, NULL },
+	{ "ports",                  HULL_SUP_NATIVE,
+	  "forwarded by pasta from the machine's 127.107 address into its own network; refused "
+	  "with (network host) or (network none)", NULL },
+	{ "network.host",           HULL_SUP_NATIVE,
+	  "the host's own network, asked for: no key is a network of the machine's own, pasta's "
+	  "NAT out", NULL },
 	{ "network.none",           HULL_SUP_NATIVE,
 	  "a network namespace of the machine's own, with lo alone", NULL },
 	{ "ssh",                    HULL_SUP_NATIVE,
-	  "the image's own sshd, supervised on the machine's 127.107 address at a high port "
-	  "(the user is unprivileged on the shared host net); needs the host network, refused "
-	  "at start if the image has no sshd", NULL },
+	  "the image's own sshd, supervised at a high port on the machine's 127.107 address, "
+	  "bound there on the host network and forwarded there by pasta under NAT; refused with "
+	  "(network none) and at start if the image has no sshd", NULL },
 	{ "segments",               HULL_SUP_NATIVE,
 	  "a tap each, eth0 and on, in the machine's own network namespace, relayed to the core's "
 	  "switch; with (network none)", NULL },

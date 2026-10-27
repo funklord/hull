@@ -1751,8 +1751,6 @@ grep -q '^slow$' "$root/slow.out" ||
 	fail "the going core's machine did not end as it chose" "$(cat "$root/slow.out")"
 
 # What cannot be planned or started is 125, and says why.
-conf ports '(command "/probe") (ports (port (host 8080) (guest 80)))'
-from_root 125 'ports: rejected: chroot shares the host.s network' -f "$root/ports.conf"
 conf noargs '(workdir "/srv")'
 from_root 125 'needs \(command \.\.\.\)' -f "$root/noargs.conf"
 conf nope '(command "/nope")'
@@ -1771,7 +1769,7 @@ from_root 125 'searchme: Permission denied' -f "$root/denied.conf"
 conf unfound '(command "nowhere-at-all")'
 from_root 125 'nowhere-at-all: No such file or directory' -f "$root/unfound.conf"
 
-# (network host) is the host's, as no key is: a listener on the host's
+# (network host) is the host's, asked for: a listener on the host's
 # loopback is reached. (network none) is a namespace of the machine's own,
 # lo up and nothing else, so the same dial is refused, and an exec in it
 # joins it. A vm cannot share the host's network.
@@ -1799,6 +1797,90 @@ conf nethost "(command \"/probe\" \"dial\" \"127.0.0.1\" \"$listen_port\") (netw
 from_root 0 "^dial 127\\.0\\.0\\.1:$listen_port=the host loopback\$" -f "$root/nethost.conf"
 conf netnone "(command \"/probe\" \"dial\" \"127.0.0.1\" \"$listen_port\") (network none)"
 from_root 0 "^dial 127\\.0\\.0\\.1:$listen_port=Connection refused\$" -f "$root/netnone.conf"
+# No (network ...) is a network of the machine's own, pasta's NAT out, as a
+# vm's is passt's (section 8): its own lo, so a dial to its loopback is
+# refused; the host's loopback reached neither directly nor through the
+# gateway, --no-map-gw; the host's own address reached; and the host's
+# resolver at 10.0.2.3, which its resolv.conf names. A second listener, on
+# the host's own address, takes one connection and says who came.
+hostaddr=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
+[ -n "$hostaddr" ] || hostaddr=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -m1 -E '^[0-9.]+$')
+rm -f "$root/natlisten.out"
+(timeout -k 2 40 python3 -c '
+import socket, sys
+s = socket.socket()
+s.bind((sys.argv[1], 0))
+s.listen(1)
+s.settimeout(30)
+print(s.getsockname()[1], flush=True)
+c, _ = s.accept()
+c.sendall(b"hello from the host\n")
+c.close()
+' "${hostaddr:-127.0.0.1}" > "$root/natlisten.out" 2>&1) &
+nat_listener=$!
+tries=0
+until [ -s "$root/natlisten.out" ] || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.1
+done
+outside_port=$(head -1 "$root/natlisten.out")
+conf netnat "(mutable overlay) (command \"/probe\" \"read\" \"/etc/resolv.conf\" \"dial\" \"127.0.0.1\" \"$listen_port\" \"dial\" \"10.0.2.2\" \"$listen_port\" \"dial\" \"${hostaddr:-127.0.0.1}\" \"$outside_port\" \"resolve\" \"10.0.2.3\" \"hull-test.invalid\" \"addr\" \"eth0\")"
+from_root 0 "^dial 127\\.0\\.0\\.1:$listen_port=Connection refused\$" -f "$root/netnat.conf"
+nat_out=$out
+cases=$((cases + 1))
+printf '%s\n' "$nat_out" | grep -q '^read=nameserver 10\.0\.2\.3$' &&
+	printf '%s\n' "$nat_out" | grep -q '^resolve=rcode [0-9]* answers [0-9]*$' &&
+	printf '%s\n' "$nat_out" | grep -q '^addr=eth0 10\.0\.2\.15/24 up$' &&
+	! printf '%s\n' "$nat_out" | grep -q '=the host loopback$' ||
+	fail "a chroot machine of no network key was not given pasta's NAT, or reached the host's loopback" "$nat_out"
+if [ -n "$hostaddr" ]; then
+	cases=$((cases + 1))
+	printf '%s\n' "$nat_out" | grep -q "^dial ${hostaddr}:${outside_port}=hello from the host\$" ||
+		fail "a chroot machine under NAT did not reach the host's own address" "$nat_out"
+else
+	printf 'cli: the host has no address but loopback; the dial out under NAT is not tried\n'
+fi
+kill "$nat_listener" 2>/dev/null
+wait "$nat_listener" 2>/dev/null
+# Its ports, forwarded by pasta from the machine's own 127.107 address into
+# its network: a connection from the host answered by what serves inside;
+# and ports refused with (network host), where a port is the host's own,
+# and with (network none), which has no network to put one on.
+nat_port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+nat_at=$(python3 -c '
+import sys
+h = 2166136261
+for b in sys.argv[1].encode():
+	h = ((h ^ b) * 16777619) & 0xffffffff
+h %= 256 * 254
+print("127.107.%d.%d" % (h // 254, h % 254 + 1))' natports)
+conf natports "(hostname \"natports\") (ports (port (host $nat_port) (guest 80))) (command \"/probe\" \"serve\" \"tcp\" \"80\")"
+rm -f "$root/natports.out"
+(cd / && exec timeout -k 2 40 "$hull_abs" run -f "$root/natports.conf" > "$root/natports.out" 2>&1) &
+natrun=$!
+cases=$((cases + 1))
+answer=$(timeout 30 python3 -c '
+import socket, sys, time
+deadline = time.time() + 25
+while time.time() < deadline:
+    try:
+        s = socket.create_connection((sys.argv[1], int(sys.argv[2])), 2)
+        s.sendall(b"hello\n")
+        s.settimeout(5)
+        got = s.recv(200)
+        if got:
+            print(got.decode().strip())
+            break
+    except OSError:
+        time.sleep(0.2)
+' "$nat_at" "$nat_port")
+wait "$natrun"
+[ "$answer" = "hello from the machine" ] && grep -q '^served=hello$' "$root/natports.out" ||
+	fail "a chroot machine's port under NAT was not reached at its address" "$answer $(cat "$root/natports.out")"
+conf hostports '(network host) (command "/probe") (ports (port (host 8080) (guest 80)))'
+from_root 125 'ports need a network of the machine.s own: \(network host\) is the host.s' -f "$root/hostports.conf"
+conf noneports '(network none) (command "/probe") (ports (port (host 8080) (guest 80)))'
+from_root 125 'ports need the machine.s network, which \(network none\) has not' -f "$root/noneports.conf"
 # Where neither the spec nor the image names a PATH, the workload is
 # given the one it was searched for on, sbins and all, as docker gives a
 # container one: a shell's own is not exported, and gcc, which finds cc1
@@ -2031,6 +2113,20 @@ expect 0 "^dial 127\\.0\\.0\\.1:$listen_port=Connection refused\$" \
 expect 0 '^nest=ok$' "$hull" exec netexec /probe nest
 expect 0 '' "$hull" kill -s KILL netexec
 wait "$netexec" 2>/dev/null
+# An exec in a machine under NAT joins its network namespace too: it sees
+# the machine's eth0 at pasta's address, not the host's interfaces.
+conf natexec '(command "/probe" "say" "ready" "wait") (hostname "natexec") (on_disconnect stop)'
+rm -f "$root/natexec.out"
+(cd / && exec timeout -k 2 30 "$hull_abs" run -f "$root/natexec.conf" > "$root/natexec.out" 2>&1) &
+natexec=$!
+tries=0
+until grep -q '^ready$' "$root/natexec.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+expect 0 '^addr=eth0 10\.0\.2\.15/24 up$' "$hull" exec natexec /probe addr eth0
+expect 0 '' "$hull" kill -s KILL natexec
+wait "$natexec" 2>/dev/null
 kill "$host_listener" 2>/dev/null
 wait "$host_listener" 2>/dev/null
 printf '(machine (source "dir:./rootfs") (backend vm) (network host) (command "/probe"))\n' \
@@ -2260,7 +2356,7 @@ kill -KILL "$csshder" 2>/dev/null
 wait "$csshder" 2>/dev/null
 printf '(machine (source "dir:./sshroot") (backend chroot) (hostname "cnossh") (network none) (ssh true) (command "/probe" "wait"))\n' \
 	> "$root/cnossh.conf"
-expect 125 '\(ssh true\) needs the host network to be reached: not with \(network none\)' \
+expect 125 '\(ssh true\) needs a network to be reached on: not with \(network none\)' \
 	env XDG_RUNTIME_DIR="$shm" sh -c 'cd / && exec "$0" run -f "$1"' "$hull_abs" "$root/cnossh.conf"
 tries=0
 while [ -S "$shm/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
