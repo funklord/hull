@@ -448,6 +448,21 @@ static int bring_up(int fd, const char *name)
 	return ioctl(fd, SIOCSIFFLAGS, &request);
 }
 
+/* Whether the kernel's command line has hull.passt=1. */
+static int passt_given(void)
+{
+	char  line[1024];
+	FILE *cmdline = fopen("/proc/cmdline", "r");
+	int   given = 0;
+
+	if (cmdline != NULL && fgets(line, sizeof line, cmdline) != NULL)
+		for (char *word = strtok(line, " \n"); word != NULL && !given; word = strtok(NULL, " \n"))
+			given = strcmp(word, "hull.passt=1") == 0;
+	if (cmdline != NULL)
+		fclose(cmdline);
+	return given;
+}
+
 static void network(void)
 {
 	int          fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
@@ -461,8 +476,10 @@ static void network(void)
 	}
 	if (bring_up(fd, "lo") != 0)
 		say("lo", strerror(errno));
-	/* A machine of (network none) has no NIC: lo alone, said nowhere. */
-	if (if_nametoindex("eth0") == 0) {
+	/* A machine of (network none) has no passt NIC: lo alone, said
+	 * nowhere, and eth0 is its first segment's, if it has one, which the
+	 * engine says by leaving hull.passt off the command line. */
+	if (if_nametoindex("eth0") == 0 || !passt_given()) {
 		close(fd);
 		return;
 	}
@@ -680,8 +697,90 @@ static const char *place_ssh(const hull_sexpr_doc *doc, const hull_sexpr_form *g
 	return NULL;
 }
 
+/*
+ * The segments hull addresses, the spec's `(names ...)` (Appendix D): the
+ * address on each one's NIC, which is up, and every sibling's name in
+ * /hull/hosts, bound over the machine's /etc/hosts as resolv.conf is --
+ * made where the root's writes are a tmpfs's, and refused where they
+ * would be the user's own tree. Before the pivot. A reason, or NULL.
+ */
+static const char *place_names(const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
+                               const hull_sexpr_form *names, int made)
+{
+	hull_sexpr_form segments;
+	hull_sexpr_form item;
+	struct stat     file;
+	unsigned        nic = 0u;
+	char           *hosts;
+	char           *network = hull_access_value(doc, machine, "network");
+	FILE           *out;
+	int             fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+
+	/* A segment's NIC follows passt's, which (network none) has not. */
+	if (network == NULL || strcmp(network, "none") != 0)
+		nic = 1u;
+	free(network);
+	if (fd < 0)
+		return "a segment's NIC cannot be set";
+	if (hull_access_find(doc, machine, "segments", &segments) &&
+	    hull_sexpr_child(doc, &segments, &item))
+		for (; hull_sexpr_next(doc, &item, &item); nic++) {
+			struct ifreq        request;
+			struct sockaddr_in *mask;
+			char               *segment = hull_access_segment_name(doc, &item);
+			char                address[16];
+			unsigned            prefix = 0u;
+			int                 named = segment != NULL &&
+			                            hull_access_named(doc, names, segment, address, &prefix);
+
+			free(segment);
+			if (!named)
+				continue;
+			memset(&request, 0, sizeof request);
+			snprintf(request.ifr_name, sizeof request.ifr_name, "eth%u", nic);
+			set_address(&request.ifr_addr, address);
+			if (ioctl(fd, SIOCSIFADDR, &request) != 0) {
+				close(fd);
+				return "a segment's NIC's IPv4 address cannot be set";
+			}
+			mask = (struct sockaddr_in *)&request.ifr_netmask;
+			memset(&request.ifr_netmask, 0, sizeof request.ifr_netmask);
+			mask->sin_family = AF_INET;
+			mask->sin_addr.s_addr = htonl(0xffffffffu << (32u - prefix));
+			if (ioctl(fd, SIOCSIFNETMASK, &request) != 0 || bring_up(fd, request.ifr_name) != 0) {
+				close(fd);
+				return "a segment's NIC cannot be brought up";
+			}
+		}
+	close(fd);
+	if ((hosts = hull_access_hosts(doc, names)) == NULL)
+		return "the spec's names cannot be read";
+	out = fopen("/hull/hosts", "w");
+	if (out == NULL || fputs(hosts, out) == EOF || fclose(out) != 0) {
+		free(hosts);
+		return "/hull/hosts cannot be written";
+	}
+	free(hosts);
+	if (lstat("/machine/etc/hosts", &file) != 0) {
+		if (!made)
+			return "an addressed segment's names go over /etc/hosts, which is not in the "
+			       "machine, and is made only above an overlay";
+		mkdir("/machine/etc", 0755);
+		if ((fd = open("/machine/etc/hosts", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0)
+			return "/etc/hosts cannot be made";
+		close(fd);
+	} else if (!S_ISREG(file.st_mode)) {
+		return "an addressed segment's names go over /etc/hosts, which is not a file";
+	}
+	if (mount("/hull/hosts", "/machine/etc/hosts", NULL, MS_BIND, NULL) != 0 ||
+	    mount(NULL, "/machine/etc/hosts", NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) != 0)
+		return "the names cannot be bound over /etc/hosts";
+	return NULL;
+}
+
 static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
-                         const hull_sexpr_form *secrets, const hull_sexpr_form *ssh)
+                         const hull_sexpr_form *secrets, const hull_sexpr_form *ssh,
+                         const hull_sexpr_form *names)
 {
 	hull_sexpr_form entry;
 	hull_sexpr_form item;
@@ -812,6 +911,9 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 				return "a volume could not be mounted";
 		}
 	}
+	if (names != NULL &&
+	    (reason = place_names(doc, machine, names, layered && !readonly_root)) != NULL)
+		return reason;
 	/* The host's modules, which are this kernel's, where modprobe looks,
 	 * read-only. Their place is made only above an overlay, whose upper
 	 * is a tmpfs: in a directory used in place it would be made in the
@@ -1530,6 +1632,7 @@ static void handle(const hull_sexpr_doc *body)
 		hull_sexpr_form machine;
 		hull_sexpr_form secrets;
 		hull_sexpr_form ssh;
+		hull_sexpr_form names;
 
 		if (applied)
 			reason = "the spec has been applied already";
@@ -1538,7 +1641,8 @@ static void handle(const hull_sexpr_doc *body)
 		else
 			reason = apply(body, &machine,
 			               hull_access_find(body, &message, "secrets", &secrets) ? &secrets : NULL,
-			               hull_access_find(body, &message, "ssh", &ssh) ? &ssh : NULL);
+			               hull_access_find(body, &message, "ssh", &ssh) ? &ssh : NULL,
+			               hull_access_find(body, &message, "names", &names) ? &names : NULL);
 		if (reason != NULL)
 			send_error(0u, reason);
 		else

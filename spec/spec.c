@@ -33,6 +33,7 @@ typedef enum value_type {
 	RECORD,    /* (key (entry ...) ...), held to `record` */
 	ENTRIES,   /* a plural key holding (singular ...) records */
 	MAP,       /* names the user chooses: (name ...) records, or (name "value") */
+	NAMES,     /* names the user chooses, each a string or a (name ...) record */
 	RESERVED,  /* named by Appendix J, defined with its adapter */
 } value_type;
 
@@ -177,6 +178,39 @@ static const char *label(const uint8_t *text, uint32_t length)
 		if (!is_lower(text[i]) && !is_digit(text[i]) && text[i] != '-')
 			return reason;
 	return NULL;
+}
+
+/* An IPv4 network, "10.99.0.0/24": a dotted quad with its host bits
+ * clear, and a prefix from 8 to 29, so that a segment holds the network,
+ * the broadcast, hull's .1 and at least five machines (Appendix D). */
+static const char *subnet(const uint8_t *text, uint32_t length)
+{
+	static const char reason[] = "must be an IPv4 network, a.b.c.d/n with n from 8 to 29 "
+	                             "and the host bits clear";
+	uint32_t address = 0u;
+	uint32_t i = 0u;
+
+	for (unsigned part = 0u; part < 5u; part++) {
+		uint32_t value = 0u;
+		uint32_t digits = 0u;
+
+		while (i < length && is_digit(text[i]) && digits < 3u) {
+			value = value * 10u + (uint32_t)(text[i++] - '0');
+			digits++;
+		}
+		if (digits == 0u || (digits > 1u && text[i - digits] == '0') || value > 255u)
+			return reason;
+		if (part == 4u) {
+			if (i != length || value < 8u || value > 29u ||
+			    (address & ~(0xffffffffu << (32u - value))) != 0u)
+				return reason;
+			return NULL;
+		}
+		address = address << 8 | value;
+		if (i == length || text[i++] != (part == 3u ? '/' : '.'))
+			return reason;
+	}
+	return reason;
 }
 
 static const char *env_name(const uint8_t *text, uint32_t length)
@@ -431,6 +465,13 @@ static const key fault_link_keys[] = {
 };
 static const schema fault_link = TABLE(fault_link_keys);
 
+/* A segment hull addresses (Appendix D): its machines given an address
+ * each in the subnet, and each other's names. */
+static const key segment_keys[] = {
+	{ .name = "subnet", .type = STRING, .required = 1, .value = subnet },
+};
+static const schema segment = TABLE(segment_keys);
+
 /* J.1 */
 static const key machine_keys[] = {
 	{ .name = "source",        .type = STRING, .required = 1, .value = nonempty },
@@ -452,7 +493,7 @@ static const key machine_keys[] = {
 	{ .name = "restart",       .type = CHOICE, .choices = restart_values },
 	{ .name = "on_disconnect", .type = CHOICE, .choices = disconnect_values },
 	{ .name = "network",       .type = CHOICE, .choices = network_values },
-	{ .name = "segments",      .type = STRINGS, .value = label },
+	{ .name = "segments",      .type = NAMES, .record = &segment, .names = label },
 	{ .name = "impair",        .type = MAP, .record = &link, .names = label },
 	{ .name = "tamper",        .type = MAP, .record = &fault_link, .names = label },
 	{ .name = "init",          .type = STRING, .value = absolute },
@@ -725,6 +766,49 @@ static hull_spec_status check_map(walk *w, const hull_sexpr_form *entry,
 	return HULL_SPEC_OK;
 }
 
+/* (key "name" (name ...) ...): each a name alone, as a string, or a name
+ * with a record; no name twice, whichever its form. */
+static hull_spec_status check_names(walk *w, const hull_sexpr_form *head, const key *k)
+{
+	hull_sexpr_form  item;
+	hull_spec_status status;
+	int              more = hull_sexpr_next(w->doc, head, &item);
+
+	for (; more; more = hull_sexpr_next(w->doc, &item, &item)) {
+		hull_sexpr_form earlier;
+		hull_sexpr_form name = item;
+		hull_sexpr_form earlier_name;
+		size_t          saved;
+
+		if (item.kind == HULL_SEXPR_LIST &&
+		    (!hull_sexpr_child(w->doc, &item, &name) || name.kind != HULL_SEXPR_SYMBOL))
+			return fail(w, HULL_SPEC_ERR_SHAPE, item.offset,
+			            "holds names, each a string or a list opening with its name");
+		if (item.kind != HULL_SEXPR_LIST && item.kind != HULL_SEXPR_STRING)
+			return fail(w, HULL_SPEC_ERR_SHAPE, item.offset,
+			            "holds names, each a string or a list opening with its name");
+		status = apply(w, k->names, &name);
+		if (status != HULL_SPEC_OK)
+			return status;
+		hull_sexpr_next(w->doc, head, &earlier);
+		for (; earlier.offset != item.offset; hull_sexpr_next(w->doc, &earlier, &earlier)) {
+			earlier_name = earlier;
+			if (earlier.kind == HULL_SEXPR_LIST)
+				hull_sexpr_child(w->doc, &earlier, &earlier_name);
+			if (same_name(w->doc, &earlier_name, &name))
+				return fail(w, HULL_SPEC_ERR_DUPLICATE, item.offset, "is named twice");
+		}
+		if (item.kind != HULL_SEXPR_LIST)
+			continue;
+		saved = push_form(w, &name);
+		status = check_record(w, &item, &name, k->record);
+		if (status != HULL_SPEC_OK)
+			return status;
+		pop(w, saved);
+	}
+	return HULL_SPEC_OK;
+}
+
 /* The values of `entry`, whose key `head` is `k`. */
 static hull_spec_status check_value(walk *w, const hull_sexpr_form *entry,
                                     const hull_sexpr_form *head, const key *k)
@@ -794,6 +878,8 @@ static hull_spec_status check_value(walk *w, const hull_sexpr_form *entry,
 		return check_list(w, entry, head, k);
 	case MAP:
 		return check_map(w, entry, head, k);
+	case NAMES:
+		return check_names(w, head, k);
 	case RESERVED:
 		return fail(w, HULL_SPEC_ERR_UNKNOWN, head->offset,
 		            "is reserved, and defined with its engine's adapter");

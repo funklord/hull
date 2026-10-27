@@ -89,7 +89,7 @@ AGENT_OBJS = $(BUILD_DIR)/agent/framing.o $(GEN_DIR)/message.o
 # and a checked machine resolved against an engine's capabilities.
 SPEC_OBJS = $(BUILD_DIR)/spec/spec.o
 PLAN_OBJS = $(BUILD_DIR)/plan/matrix.o $(BUILD_DIR)/plan/registry.o \
-            $(BUILD_DIR)/plan/plan.o
+            $(BUILD_DIR)/plan/plan.o $(BUILD_DIR)/plan/names.o
 
 # The engines that ship with the core, as declarations so far, and the
 # command line that plans with them. VERSION is the one place the number
@@ -154,7 +154,8 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  stored.conf stored-direct.conf unstored.conf idle/hull/core.log idle/hull/core.lock \
                  searched.conf denied.conf unfound.conf rootfs/srv/searchme rootfs/bin/searchme \
                  listen.out nethost.conf netnone.conf netexec.conf netexec.out vmhost.conf tools/squashfuse segmented.conf nested.conf nestover.conf inited.conf pathless.conf pathed.conf owned.conf ownedin.conf exported.conf exported.tar exported.view exportin.conf owners.list owned_back.conf rootfs/given ownedin_back.conf ownedrun.tar ownedrun.conf layered.conf relayered.conf layeredin.conf sharedupper.conf \
-                 whole.conf quit.conf refused.conf devs.conf devroot/probe hostdev.conf cut.conf cut.out counts.out impair.err pausing.conf pausing.out cutin.conf cutin.out cutin.counts offwire.conf tam.conf tam.out tam.err tam.counts badtam.conf injhear.conf injhear.out inj.err) \
+                 whole.conf quit.conf refused.conf devs.conf devroot/probe hostdev.conf cut.conf cut.out counts.out impair.err pausing.conf pausing.out cutin.conf cutin.out cutin.counts offwire.conf tam.conf tam.out tam.err tam.counts badtam.conf injhear.conf injhear.out inj.err \
+                 named.conf inplace.conf twosub.conf half.conf) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
 # What test/docker_test.sh writes.
@@ -173,7 +174,7 @@ QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.co
                   ports.conf ports.out client.out taken.conf udp.conf udp.out dial.conf dial.out sshed.conf sshed.out home/.ssh/config keep.conf \
                   overlay.conf overro.conf rootfs/srv/kept adopt.conf brief2.conf ended.conf secret.conf norun.conf pw.txt secret/probe \
                   searched.conf netnone.conf netports.conf rootfs/probe rootfs/bin/sh rootfs/written rootfs/etc/resolv.conf \
-                  data/in data/out modules.conf inplace.conf hearer.conf hearer.out shouter.conf loner.conf loner.out keptseg.conf anchor.conf anchor.out \
+                  data/in data/out modules.conf inplace.conf hearer.conf hearer.out shouter.conf loner.conf loner.out keptseg.conf anchor.conf anchor.out vnamed.conf mixed.conf \
                   inited.conf initexec.conf initexec.out initbare.conf noinit.conf suid.conf rootfs/suid vlayered.conf vrelayered.conf \
                   vstack.conf vstackmem.conf vstackro.conf lowport.conf mixhear.conf mixhear.out \
                   initroot/probe initroot/sbin/init initroot/sbin/poweroff initbare/probe initbare/sbin/init \

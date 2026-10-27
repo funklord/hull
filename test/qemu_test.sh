@@ -469,6 +469,44 @@ cases=$((cases + 1))
 [ -d "/proc/$core" ] && [ "$fds_after" -eq "$fds_before" ] ||
 	fail "the core kept descriptors of a chroot machine's segment" \
 		"core ${core:-none}: $fds_before before, $fds_after after"
+# Appendix D's sibling names on a vm: a segment given a subnet is hull's
+# to address, the agent setting the drawn address on the segment's NIC,
+# eth1 after passt's, and binding every sibling's name over /etc/hosts; a
+# datagram sent by name is answered by the sibling's own hostname.
+vnamed="vnamed-$$"
+printf '(machines (vweb %s) (vdb %s))\n' \
+	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (segments ($vnamed (subnet \"10.86.0.0/24\"))) (command \"/probe\" \"addr\" \"eth1\" \"hosts\" \"vdb\" \"ask\" \"vdb\" \"7000\")" \
+	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (segments ($vnamed (subnet \"10.86.0.0/24\"))) (command \"/probe\" \"addr\" \"eth1\" \"answer\" \"7000\")" \
+	> "$root/vnamed.conf"
+name=vnamed
+boot vnamed 150
+has 0 '^vweb +\| ask=vdb at 10\.86\.0\.[0-9]+: vdb$'
+vdb_at=$(printf '%s\n' "$out" | sed -n 's#^vdb *| addr=eth1 \(10\.86\.0\.[0-9]*\)/24 up$#\1#p')
+cases=$((cases + 1))
+[ -n "$vdb_at" ] && printf '%s\n' "$out" | grep -q "^vweb *| hosts=vdb $vdb_at\$" ||
+	fail "a vm was not named to its sibling at the sibling's own address" "$out"
+# A chroot machine and a vm, both of (network none), so the vm's eth0 is
+# its segment's and not passt's: each named to the other across the
+# core's switch, and the chroot's datagram answered by the vm. A third, a
+# vm of (network none) on a bare segment, has its eth0 left as the
+# workload's: no address, not passt's, which the agent gave every eth0
+# before the engine said on the command line whether passt's was there.
+mixed="mixed-$$"
+printf '(machines (cweb %s) (vdb %s) (vraw %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments ($mixed (subnet \"10.87.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"ask\" \"vdb\" \"7000\")" \
+	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network none) (segments ($mixed (subnet \"10.87.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"hosts\" \"cweb\" \"answer\" \"7000\")" \
+	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network none) (segments \"vraw-$$\") (command \"/probe\" \"addr\" \"eth0\")" \
+	> "$root/mixed.conf"
+name=mixed
+boot mixed 150
+has 0 '^cweb +\| ask=vdb at 10\.87\.0\.[0-9]+: vdb$'
+has 0 '^vdb +\| addr=eth0 10\.87\.0\.[0-9]+/24 up$'
+has 0 '^vraw +\| addr=eth0 none/0 down$'
+cweb_at=$(printf '%s\n' "$out" | sed -n 's#^cweb *| addr=eth0 \(10\.87\.0\.[0-9]*\)/24 up$#\1#p')
+cases=$((cases + 1))
+[ -n "$cweb_at" ] && printf '%s\n' "$out" | grep -q "^vdb *| hosts=cweb $cweb_at\$" &&
+	printf '%s\n' "$out" | grep -q "^vdb *| answer=from $cweb_at\$" ||
+	fail "a vm and a chroot machine were not named to each other across the switch" "$out"
 timeout 10 "$hull" kill -s TERM anchor > /dev/null 2>&1
 wait "$anchored"
 # (init PATH): PID 1 is the image's init, here the probe as one, which

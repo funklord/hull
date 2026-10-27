@@ -127,6 +127,9 @@ struct hull_machine {
 	int              segment_fd[MAX_SEGMENTS];  /* their ports, until the init has them */
 	unsigned         segment_count;
 	char             address_text[64];          /* the plan's, for each NIC's MAC */
+	char             segment_address[MAX_SEGMENTS][16];  /* hull's on it, or "" (Appendix D) */
+	unsigned         segment_prefix[MAX_SEGMENTS];
+	char            *hosts;      /* the /etc/hosts its addressed segments give it, or NULL */
 	int              adopted;    /* taken back: the init is not this process's child */
 	int              pidfd;      /* the init's, when adopted, else -1 */
 	char             dir[4096];  /* the machine's directory, for init.sock, or "" */
@@ -154,6 +157,7 @@ static void release(hull_machine *m)
 	free(m->hostname);
 	free(m->secrets);
 	free(m->ssh_dir);
+	free(m->hosts);
 	free(m->export);
 	free(m->owners);
 	for (unsigned i = 0u; i < m->layer_count; i++)
@@ -410,7 +414,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		     more = hull_sexpr_next(doc, &item, &item)) {
 			if (m->segment_count == MAX_SEGMENTS)
 				return "there are too many segments";
-			if ((m->segment[m->segment_count++] = hull_access_text(doc, &item)) == NULL)
+			if ((m->segment[m->segment_count++] = hull_access_segment_name(doc, &item)) == NULL)
 				return "a segment's name is not text";
 		}
 		if (m->segment_count != 0u && !m->no_network)
@@ -427,6 +431,15 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		}
 		snprintf(m->address_text, sizeof m->address_text, "%s", source != NULL ? source : "");
 		free(source);
+		/* The segments hull addresses, the plan's (names ...): an address
+		 * on each NIC, and every sibling's name in /etc/hosts. */
+		if (hull_access_find(doc, &top, "names", &entry)) {
+			for (unsigned i = 0u; i < m->segment_count; i++)
+				hull_access_named(doc, &entry, m->segment[i], m->segment_address[i],
+				                  &m->segment_prefix[i]);
+			if ((m->hosts = hull_access_hosts(doc, &entry)) == NULL)
+				return "the plan's names cannot be read";
+		}
 	}
 
 	/* The secrets the core wrote (J.3), and those to be in the env. */
@@ -1028,6 +1041,24 @@ static void join_segments(const hull_machine *m, int report)
 		                        (unsigned char *)request.ifr_hwaddr.sa_data);
 		if (ioctl(fd, SIOCSIFHWADDR, &request) != 0)
 			child_fail(report, "a segment's NIC's address");
+		/* Hull's address, where it addresses the segment, and the NIC up:
+		 * the segment owns it, as it names it to the siblings. */
+		if (m->segment_address[i][0] != '\0') {
+			struct sockaddr_in *at = (struct sockaddr_in *)&request.ifr_addr;
+			uint32_t            mask = 0xffffffffu << (32u - m->segment_prefix[i]);
+
+			memset(&request.ifr_addr, 0, sizeof request.ifr_addr);
+			at->sin_family = AF_INET;
+			if (inet_pton(AF_INET, m->segment_address[i], &at->sin_addr) != 1 ||
+			    ioctl(fd, SIOCSIFADDR, &request) != 0)
+				child_fail(report, "a segment's NIC's IPv4 address");
+			at->sin_addr.s_addr = htonl(mask);
+			if (ioctl(fd, SIOCSIFNETMASK, &request) != 0 || ioctl(fd, SIOCGIFFLAGS, &request) != 0)
+				child_fail(report, "a segment's NIC's netmask");
+			request.ifr_flags |= IFF_UP;
+			if (ioctl(fd, SIOCSIFFLAGS, &request) != 0)
+				child_fail(report, "a segment's NIC up");
+		}
 		close(fd);
 	}
 	relayer = fork();
@@ -1061,6 +1092,7 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	int              volumes[MAX_VOLUMES];
 	int              secrets = -1;
 	int              ssh_tree = -1;
+	int              hosts_tree = -1;
 	const char      *ssh_bin = NULL;  /* the image's sshd, once found after the pivot */
 	int              null = open("/dev/null", O_RDWR | O_CLOEXEC);
 	int              out[2];
@@ -1150,8 +1182,27 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	 * tmpfs of this namespace's, so that on the host it stays empty; the
 	 * stack holds its own clones of the layers and the upper, and so
 	 * outlives the old root it is staged under. */
-	if (m->staged && mount("tmpfs", m->dir, "tmpfs", 0u, "mode=0700") != 0)
+	if ((m->staged || m->hosts != NULL) && mount("tmpfs", m->dir, "tmpfs", 0u, "mode=0700") != 0)
 		child_fail(report, "the volumes' staging");
+	/* The names of its addressed segments, staged beside the volumes and
+	 * placed over /etc/hosts once the root is the machine's: the tree is
+	 * not written, so a read-only or stored root takes it too. */
+	if (m->hosts != NULL) {
+		struct mount_attr readonly = { .attr_set = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID |
+		                                           MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC };
+		char              path[4300];
+		size_t            length = strlen(m->hosts);
+		int               fd;
+
+		snprintf(path, sizeof path, "%s/hosts", m->dir);
+		fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0444);
+		if (fd < 0 || write(fd, m->hosts, length) != (ssize_t)length || close(fd) != 0)
+			child_fail(report, "the segments' names");
+		hosts_tree = open_tree(AT_FDCWD, path, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+		if (hosts_tree < 0 ||
+		    mount_setattr(hosts_tree, "", AT_EMPTY_PATH, &readonly, sizeof readonly) != 0)
+			child_fail(report, "the segments' names");
+	}
 	for (unsigned i = 0u; i < m->volume_count; i++) {
 		struct mount_attr readonly = { .attr_set = MOUNT_ATTR_RDONLY };
 		char              staged[4300];
@@ -1289,6 +1340,27 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		if (move_mount(volumes[i], "", AT_FDCWD, m->volume_guest[i],
 		               MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_SYMLINKS) != 0)
 			child_fail(report, step);
+	}
+	/* Its siblings' names over /etc/hosts, made where the root's writes
+	 * are the overlay's, and refused where they would be the user's own. */
+	if (hosts_tree >= 0) {
+		struct stat place;
+
+		if (stat("/etc/hosts", &place) != 0 && errno == ENOENT) {
+			int fd;
+
+			if (!m->overlay) {
+				errno = ENOENT;
+				child_fail(report, "an addressed segment's names go over /etc/hosts, which is "
+				           "not in the machine, and is made only above an overlay");
+			}
+			if (make_path("/etc") != 0 ||
+			    (fd = open("/etc/hosts", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0)
+				child_fail(report, "/etc/hosts");
+			close(fd);
+		}
+		if (move_mount(hosts_tree, "", AT_FDCWD, "/etc/hosts", MOVE_MOUNT_F_EMPTY_PATH) != 0)
+			child_fail(report, "the segments' names over /etc/hosts");
 	}
 	/* The secrets at /run/hull/secrets, J.3's place, on a tmpfs at /run:
 	 * the dir's /run, which FHS has emptied at every boot, is hidden, and
@@ -1624,7 +1696,7 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	if (m->started)
 		return fail(error, HULL_ERR_BUSY, "the machine has been started already");
 	/* A kept machine's directory, for its init.sock. */
-	if ((m->keep || m->staged) &&
+	if ((m->keep || m->staged || m->hosts != NULL) &&
 	    ((reason = make_dir(m)) != NULL ||
 	     (m->keep && (dir_fd = open(m->dir, O_PATH | O_DIRECTORY | O_CLOEXEC)) < 0))) {
 		snprintf(m->detail, sizeof m->detail, "%s",

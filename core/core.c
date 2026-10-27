@@ -1654,8 +1654,14 @@ static const char *links_of(slot *s, const hull_sexpr_doc *doc, const hull_sexpr
 			segment[length] = '\0';
 			if (has_segments) {
 				hull_sexpr_child(doc, &segments, &joined);
-				while (!on && hull_sexpr_next(doc, &joined, &joined))
-					on = hull_sexpr_is(doc, &joined, segment);
+				while (!on && hull_sexpr_next(doc, &joined, &joined)) {
+					hull_sexpr_form named = joined;
+
+					/* A segment hull addresses is (NAME (subnet ...)). */
+					if (joined.kind == HULL_SEXPR_LIST)
+						hull_sexpr_child(doc, &joined, &named);
+					on = hull_sexpr_is(doc, &named, segment);
+				}
 			}
 			if (!on)
 				return kind == 0 ? "impair names a segment the machine is not on"

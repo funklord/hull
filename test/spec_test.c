@@ -199,6 +199,23 @@ static void test_records(void)
 	NO(M("(impair (wire (out (gemodel (r 0.3)))))"), MISSING, "(gemodel ",
 	   "machine.impair.wire.out.gemodel.p");
 	NO(M("(impair (wire (sideways (loss 0.5))))"), UNKNOWN, "sideways", "machine.impair.wire.sideways");
+	/* A segment hull addresses, beside one it does not (Appendix D). */
+	OK(M("(segments \"bare\" (wire (subnet \"10.99.0.0/24\")))"));
+	OK(M("(segments (wide (subnet \"10.0.0.0/8\")) (narrow (subnet \"192.168.7.248/29\")))"));
+	NO(M("(segments (wire (subnet \"10.99.0.1/24\")))"), VALUE, "\"10.99.0.1/24\"",
+	   "machine.segments.wire.subnet");
+	NO(M("(segments (wire (subnet \"10.99.0.0/30\")))"), VALUE, "\"10.99.0.0/30\"",
+	   "machine.segments.wire.subnet");
+	NO(M("(segments (wire (subnet \"10.99.0/24\")))"), VALUE, "\"10.99.0/24\"",
+	   "machine.segments.wire.subnet");
+	NO(M("(segments (wire (subnet \"10.299.0.0/24\")))"), VALUE, "\"10.299.0.0/24\"",
+	   "machine.segments.wire.subnet");
+	NO(M("(segments (wire))"), MISSING, "(wire)", "machine.segments.wire.subnet");
+	NO(M("(segments (wire (mask \"x\")))"), UNKNOWN, "mask", "machine.segments.wire.mask");
+	NO(M("(segments \"wire\" (wire (subnet \"10.99.0.0/24\")))"), DUPLICATE, "(wire (",
+	   "machine.segments");
+	NO(M("(segments \"Wire\")"), VALUE, "\"Wire\"", "machine.segments");
+	NO(M("(segments wire)"), SHAPE, "wire)", "machine.segments");
 	/* A link given a targeted fault, Appendix D. */
 	OK(M("(segments \"wire\") (tamper (wire (out (match \"0:deadbeef\") (drop 0.5) "
 	     "(replay 1) (copies 3) (every 20)) (in (set \"4:00\") (rewrite 1) (flip 0.1))))"));

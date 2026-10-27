@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -311,4 +312,90 @@ void hull_access_segment_mac(const char *address, const char *segment, unsigned 
 	mac[3] = (unsigned char)(hash >> 16);
 	mac[4] = (unsigned char)(hash >> 8);
 	mac[5] = (unsigned char)hash;
+}
+
+char *hull_access_segment_name(const hull_sexpr_doc *doc, const hull_sexpr_form *item)
+{
+	hull_sexpr_form name;
+
+	if (item->kind != HULL_SEXPR_LIST)
+		return hull_access_text(doc, item);
+	return hull_sexpr_child(doc, item, &name) ? hull_access_text(doc, &name) : NULL;
+}
+
+int hull_access_named(const hull_sexpr_doc *doc, const hull_sexpr_form *names,
+                      const char *segment, char address[16], unsigned *prefix)
+{
+	hull_sexpr_form record;
+	char           *text;
+	char           *bits;
+	int             found;
+
+	if (!hull_access_find(doc, names, segment, &record))
+		return 0;
+	text  = hull_access_value(doc, &record, "address");
+	bits  = hull_access_value(doc, &record, "prefix");
+	found = text != NULL && bits != NULL && strlen(text) < 16u;
+	if (found) {
+		strcpy(address, text);
+		*prefix = (unsigned)strtoul(bits, NULL, 10);
+	}
+	free(text);
+	free(bits);
+	return found;
+}
+
+char *hull_access_hosts(const hull_sexpr_doc *doc, const hull_sexpr_form *names)
+{
+	static const char opening[] = "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n";
+	hull_sexpr_form   segment;
+	size_t            cap = sizeof opening;
+	size_t            at;
+	char             *text;
+
+	/* Its size first: a line is at most the address, two ids and ".hull". */
+	if (!hull_sexpr_child(doc, names, &segment))
+		return NULL;
+	for (hull_sexpr_form s = segment; hull_sexpr_next(doc, &s, &s);) {
+		hull_sexpr_form hosts;
+		hull_sexpr_form host;
+
+		if (hull_access_find(doc, &s, "hosts", &hosts) && hull_sexpr_child(doc, &hosts, &host))
+			while (hull_sexpr_next(doc, &host, &host))
+				cap += 2u * (size_t)host.extent + 16u;
+	}
+	if ((text = malloc(cap)) == NULL)
+		return NULL;
+	memcpy(text, opening, sizeof opening);
+	at = sizeof opening - 1u;
+	while (hull_sexpr_next(doc, &segment, &segment)) {
+		hull_sexpr_form hosts;
+		hull_sexpr_form host;
+
+		if (!hull_access_find(doc, &segment, "hosts", &hosts) || !hull_sexpr_child(doc, &hosts, &host))
+			continue;
+		while (hull_sexpr_next(doc, &host, &host)) {
+			hull_sexpr_form id_form;
+			hull_sexpr_form address_form;
+			char           *id = NULL;
+			char           *address = NULL;
+			int             n = -1;
+
+			if (hull_sexpr_child(doc, &host, &id_form) &&
+			    hull_sexpr_next(doc, &id_form, &address_form)) {
+				id      = hull_access_text(doc, &id_form);
+				address = hull_access_text(doc, &address_form);
+			}
+			if (id != NULL && address != NULL)
+				n = snprintf(text + at, cap - at, "%s\t%s %s.hull\n", address, id, id);
+			free(id);
+			free(address);
+			if (n < 0 || (size_t)n >= cap - at) {
+				free(text);
+				return NULL;
+			}
+			at += (size_t)n;
+		}
+	}
+	return text;
 }

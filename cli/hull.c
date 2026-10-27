@@ -56,6 +56,7 @@
 #include "doctor.h"
 #include "import.h"
 #include "matrix.h"
+#include "names.h"
 #include "plan.h"
 #include "registry.h"
 #include "runtime.h"
@@ -1309,12 +1310,81 @@ static int add_secrets(hull_msg *m, const uint8_t *plan, size_t length)
 	return result;
 }
 
+/* Appendix D's names, drawn over the whole file, which a run of one of
+ * its machines needs as much as a run of all: each sibling on a segment
+ * hull addresses is named to it, whether or not this run starts it. 0,
+ * else 125 having said why. */
+static int draw_names(options *o, const hull_spec *spec, hull_names *names)
+{
+	static hull_sexpr_form machines[HULL_NAMES_MEMBERS];
+	static char            id_text[HULL_NAMES_MEMBERS][64];
+	const char            *ids[HULL_NAMES_MEMBERS];
+	unsigned               count = 0u;
+
+	if (spec->has_machine) {
+		machines[count] = spec->machine;
+		if (!machine_id(spec, &machines[count], NULL, o->base, id_text[count], sizeof id_text[0]))
+			id_text[count][0] = '\0';
+		ids[count] = id_text[count];
+		count++;
+	} else if (spec->has_machines) {
+		hull_sexpr_form entry;
+
+		hull_sexpr_child(&spec->doc, &spec->machines, &entry);
+		while (hull_sexpr_next(&spec->doc, &entry, &entry) && count < HULL_NAMES_MEMBERS) {
+			hull_sexpr_form key;
+			char            name[64];
+			size_t          length;
+
+			hull_sexpr_child(&spec->doc, &entry, &key);
+			if (hull_sexpr_value(&spec->doc, &key, (uint8_t *)name, sizeof name - 1u,
+			                     &length) != HULL_SEXPR_OK)
+				continue;
+			name[length] = '\0';
+			machines[count] = entry;
+			if (!machine_id(spec, &entry, name, o->base, id_text[count], sizeof id_text[0]))
+				id_text[count][0] = '\0';
+			ids[count] = id_text[count];
+			count++;
+		}
+	}
+	if (hull_names_draw(names, spec, machines, ids, count) != 0) {
+		fprintf(stderr, "%s: %s\n", o->file, names->reason);
+		return 125;
+	}
+	return 0;
+}
+
+/* `plan` with the plan's `(names ...)` for machine `id` from `names`
+ * added: "names" sorts after "machine" and before what the core adds, so
+ * it goes last. 0, or -1 where the plan has no room for it. */
+static int add_names(hull_plan *plan, const hull_names *names, const char *id)
+{
+	unsigned member;
+	long     n;
+
+	for (member = 0u; member < HULL_NAMES_MEMBERS && strcmp(names->ids[member], id) != 0; member++)
+		;
+	if (member == HULL_NAMES_MEMBERS || plan->canonical_length == 0u)
+		return 0;
+	n = hull_names_entry(names, member, plan->canonical + plan->canonical_length - 1u,
+	                     sizeof plan->canonical - plan->canonical_length);
+	if (n < 0)
+		return -1;
+	if (n > 0) {
+		plan->canonical_length += (uint32_t)n;
+		plan->canonical[plan->canonical_length - 1u] = ')';
+	}
+	return 0;
+}
+
 /* One machine planned, and its run's request built on channel `ch`: the
- * plan, and the secrets it asks for, which may prompt. 0, else 125 having
- * said why; nothing is started. */
+ * plan, the names of its addressed segments, and the secrets it asks
+ * for, which may prompt. 0, else 125 having said why; nothing is started. */
 static int prepare_run(options *o, const hull_registry *registry, hull_spec *spec,
-                       const hull_sexpr_form *machine, const char *name, uint32_t ch,
-                       hull_msg *request, char *id, size_t id_cap)
+                       const hull_sexpr_form *machine, const char *name,
+                       const hull_names *names, uint32_t ch, hull_msg *request, char *id,
+                       size_t id_cap)
 {
 	static hull_plan plan;
 	hull_choice      choice;
@@ -1355,6 +1425,12 @@ static int prepare_run(options *o, const hull_registry *registry, hull_spec *spe
 			        shown, choice.engine->caps->engine_name);
 			return 125;
 		}
+	}
+
+	if (add_names(&plan, names, id) != 0) {
+		fprintf(stderr, "%s: %s: not run: its segments' names do not fit in its plan\n", o->file,
+		        shown);
+		return 125;
 	}
 
 	/* Before the core is reached, and before SIGINT would stop a machine:
@@ -1420,6 +1496,8 @@ static void member_write(member *m, int width, int stream, const uint8_t *data, 
  * of the first that did not. */
 static int run_all(options *o, const hull_registry *registry, hull_spec *spec, uint8_t *data)
 {
+	static hull_names names_drawn;
+	const hull_names *names = &names_drawn;
 	static member   members[64];
 	hull_msg        requests[64];
 	hull_sexpr_form entry;
@@ -1433,6 +1511,10 @@ static int run_all(options *o, const hull_registry *registry, hull_spec *spec, u
 
 	memset(requests, 0, sizeof requests);
 	memset(members, 0, sizeof members);
+	if (draw_names(o, spec, &names_drawn) != 0) {
+		free(data);
+		return 125;
+	}
 	hull_sexpr_child(&spec->doc, &spec->machines, &entry);
 	while (hull_sexpr_next(&spec->doc, &entry, &entry)) {
 		hull_sexpr_form key;
@@ -1452,8 +1534,8 @@ static int run_all(options *o, const hull_registry *registry, hull_spec *spec, u
 			break;
 		}
 		m->name[length] = '\0';
-		if (prepare_run(o, registry, spec, &entry, m->name, 1u + 2u * count, &requests[count],
-		                m->id, sizeof m->id) != 0) {
+		if (prepare_run(o, registry, spec, &entry, m->name, names, 1u + 2u * count,
+		                &requests[count], m->id, sizeof m->id) != 0) {
 			status = 125;
 			break;
 		}
@@ -1673,6 +1755,7 @@ static int run(options *o, const hull_registry *registry, const char *name)
 	hull_wire            wire;
 	hull_msg             request = { 0 };
 	struct sigaction     action;
+	static hull_names    names;
 	uint8_t             *data;
 	size_t               length;
 	char                 id[64];
@@ -1702,7 +1785,10 @@ static int run(options *o, const hull_registry *registry, const char *name)
 		        name != NULL ? "a single machine takes no name" : "there is no machine to run");
 		return 125;
 	}
-	status = prepare_run(o, registry, &spec, &machine, name, 1u, &request, id, sizeof id);
+	status = draw_names(o, &spec, &names);
+	if (status == 0)
+		status = prepare_run(o, registry, &spec, &machine, name, &names, 1u, &request, id,
+		                     sizeof id);
 	free(data);
 	if (status != 0) {
 		hull_msg_free(&request);

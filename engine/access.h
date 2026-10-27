@@ -57,6 +57,21 @@ const char *hull_access_stack(const hull_sexpr_doc *doc, const hull_sexpr_form *
 void hull_access_segment_mac(const char *address, const char *segment, unsigned index,
                              unsigned char mac[6]);
 
+/* A (segments ...) element's name: the element, or the head of a
+ * `(NAME (subnet ...))`, as hull_access_text() gives it. */
+char *hull_access_segment_name(const hull_sexpr_doc *doc, const hull_sexpr_form *item);
+
+/* The machine's address on `segment` from `names`, a plan's `(names ...)`
+ * (Appendix D), into `address` with its prefix: 1, or 0 where hull does
+ * not address that segment. */
+int hull_access_named(const hull_sexpr_doc *doc, const hull_sexpr_form *names,
+                      const char *segment, char address[16], unsigned *prefix);
+
+/* The /etc/hosts `names` gives the machine: localhost, then a line for
+ * each machine on each segment, `ADDRESS ID ID.hull`, as a C string the
+ * caller frees; NULL if memory ran out or `names` is not one. */
+char *hull_access_hosts(const hull_sexpr_doc *doc, const hull_sexpr_form *names);
+
 /* The secrets the plan's machine puts in its environment, `(expose env)`
  * (J.3), each as `NAME=VALUE`, VALUE read from the file the core wrote in
  * the plan's `(secrets DIR)`: `each` is called with one, which it does

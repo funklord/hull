@@ -1206,6 +1206,52 @@ grep -q '^hear=over the wire from 52:54:00:' "$root/chearer.out" ||
 cases=$((cases + 1))
 grep -q '^hear=nothing$' "$root/cloner.out" ||
 	fail "a chroot machine on another segment heard something" "$(cat "$root/cloner.out")"
+# Appendix D's sibling names on chroot: a segment given a subnet is
+# hull's to address, each machine's NIC up at its drawn address, every
+# sibling named in an /etc/hosts bound over the tree's, and a datagram
+# sent by that name answered by the sibling's own hostname. A bare segment
+# in the same file is left as it was: down, no address, no hosts.
+named="named-$$"
+printf '(machines (web %s) (db %s) (raw %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments ($named (subnet \"10.77.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"hosts\" \"db\" \"hosts\" \"db.hull\" \"hosts\" \"web\" \"ask\" \"db\" \"7000\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments ($named (subnet \"10.77.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"answer\" \"7000\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments \"raw-$$\") (command \"/probe\" \"addr\" \"eth0\" \"read\" \"/etc/hosts\")" \
+	> "$root/named.conf"
+limit=60
+from_root 0 '^web +\| ask=db at 10\.77\.0\.[0-9]+: db$' -f "$root/named.conf"
+named_out=$out
+web_at=$(printf '%s\n' "$named_out" | sed -n 's#^web *| addr=eth0 \(10\.77\.0\.[0-9]*\)/24 up$#\1#p')
+db_at=$(printf '%s\n' "$named_out" | sed -n 's#^db *| addr=eth0 \(10\.77\.0\.[0-9]*\)/24 up$#\1#p')
+cases=$((cases + 1))
+[ -n "$web_at" ] && [ -n "$db_at" ] && [ "$web_at" != "$db_at" ] &&
+	printf '%s\n' "$named_out" | grep -q "^web *| hosts=db $db_at\$" &&
+	printf '%s\n' "$named_out" | grep -q "^web *| hosts=db.hull $db_at\$" &&
+	printf '%s\n' "$named_out" | grep -q "^web *| hosts=web $web_at\$" &&
+	printf '%s\n' "$named_out" | grep -q "^db *| answer=from $web_at\$" ||
+	fail "addressed siblings were not named to each other at their own addresses" "$named_out"
+cases=$((cases + 1))
+printf '%s\n' "$named_out" | grep -q '^raw *| addr=eth0 none/0 down$' &&
+	printf '%s\n' "$named_out" | grep -q '^raw *| read=No such file or directory$' ||
+	fail "a bare segment beside an addressed one was addressed" "$named_out"
+# The same file drawn again gives the same addresses: the draw is the
+# machine's id and the segment's name, not the run's.
+limit=60
+from_root 0 "^web +\| addr=eth0 $web_at/24 up\$" -f "$root/named.conf"
+# A tree used in place has no /etc/hosts to bind over, and is not written
+# to make one; a subnet for one segment twice, and a segment addressed
+# for one machine and bare for another, are refused before anything runs.
+conf inplace "(network none) (segments (inplace-$$ (subnet \"10.78.0.0/24\"))) (command \"/probe\" \"say\" \"ran\")"
+from_root 125 'names go over /etc/hosts, which is not in the machine' -f "$root/inplace.conf"
+printf '(machines (a %s) (b %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (network none) (segments (two-$$ (subnet \"10.79.0.0/24\"))) (command \"/probe\" \"say\" \"ran\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (network none) (segments (two-$$ (subnet \"10.80.0.0/24\"))) (command \"/probe\" \"say\" \"ran\")" \
+	> "$root/twosub.conf"
+from_root 125 "segment two-$$ is given two subnets" -f "$root/twosub.conf"
+printf '(machines (a %s) (b %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (network none) (segments (half-$$ (subnet \"10.81.0.0/24\"))) (command \"/probe\" \"say\" \"ran\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (network none) (segments \"half-$$\") (command \"/probe\" \"say\" \"ran\")" \
+	> "$root/half.conf"
+from_root 125 "names it without its subnet" -f "$root/half.conf"
 # Impairment in the switch, changed during a run: a hearer and a shouter
 # on one segment, the shouter's way out cut before it shouts, its frames
 # counted lost, then healed, so a later shout is heard and answered.

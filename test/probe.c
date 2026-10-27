@@ -34,6 +34,14 @@
  *               or until a frame of that type is heard back
  *   hear IF     the text of the first such frame IF is given in 20 s,
  *               and its source; then one back, so a shout ends
+ *   addr IF     IF's IPv4 address and prefix, and whether it is up
+ *   hosts N     N's address in /etc/hosts, read as nss_files reads it:
+ *               the probe is static, so it has no resolver of glibc's
+ *   answer P    the first UDP datagram to port P in 60 s, and where from;
+ *               the machine's hostname sent back to it
+ *   ask N P     N looked up as hosts does, a datagram to its port P each
+ *               200 ms until one comes back, or 60 s pass, as a sibling vm
+ *               may still be booting; and the reply
  *   stdin       the first line of its stdin
  *   count       all of its stdin: how many bytes, and their FNV-1a hash
  *   spew N      N bytes on stdout, from a xorshift that does not repeat
@@ -524,6 +532,114 @@ static void hear(const char *name)
 	shout(name, "heard", 1);
 }
 
+static void show_address(const char *name)
+{
+	struct ifreq request;
+	char         address[INET_ADDRSTRLEN] = "none";
+	unsigned     prefix = 0u;
+	int          fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	int          up = 0;
+
+	memset(&request, 0, sizeof request);
+	snprintf(request.ifr_name, sizeof request.ifr_name, "%s", name);
+	if (fd >= 0 && ioctl(fd, SIOCGIFADDR, &request) == 0) {
+		inet_ntop(AF_INET, &((struct sockaddr_in *)&request.ifr_addr)->sin_addr, address,
+		          sizeof address);
+		if (ioctl(fd, SIOCGIFNETMASK, &request) == 0)
+			prefix = (unsigned)__builtin_popcount(
+			        ((struct sockaddr_in *)&request.ifr_addr)->sin_addr.s_addr);
+	}
+	if (fd >= 0 && ioctl(fd, SIOCGIFFLAGS, &request) == 0)
+		up = (request.ifr_flags & IFF_UP) != 0;
+	printf("addr=%s %s/%u %s\n", name, address, prefix, up ? "up" : "down");
+	if (fd >= 0)
+		close(fd);
+}
+
+/* `name`'s address in /etc/hosts into `out`: the first line naming it
+ * among its names, as nss_files answers. 0 where none does. */
+static int lookup(const char *name, char *out, size_t cap)
+{
+	FILE *hosts = fopen("/etc/hosts", "r");
+	char  line[512];
+	int   found = 0;
+
+	while (hosts != NULL && !found && fgets(line, sizeof line, hosts) != NULL) {
+		char *save = NULL;
+		char *address;
+		char *alias;
+
+		*strchrnul(line, '#') = '\0';
+		if ((address = strtok_r(line, " \t\n", &save)) == NULL)
+			continue;
+		while (!found && (alias = strtok_r(NULL, " \t\n", &save)) != NULL)
+			if (strcmp(alias, name) == 0) {
+				snprintf(out, cap, "%s", address);
+				found = 1;
+			}
+	}
+	if (hosts != NULL)
+		fclose(hosts);
+	return found;
+}
+
+static void answer(const char *port)
+{
+	struct sockaddr_in at = { .sin_family = AF_INET, .sin_port = htons((uint16_t)atoi(port)) };
+	struct sockaddr_in from;
+	socklen_t          from_length = sizeof from;
+	struct pollfd      p;
+	char               text[256];
+	char               host[64] = "";
+	int                fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+
+	p.fd = fd;
+	p.events = POLLIN;
+	if (fd < 0 || bind(fd, (struct sockaddr *)&at, sizeof at) != 0) {
+		printf("answer=%s\n", strerror(errno));
+	} else if (poll(&p, 1u, 60000) <= 0 ||
+	           recvfrom(fd, text, sizeof text, 0, (struct sockaddr *)&from, &from_length) < 0) {
+		printf("answer=nothing\n");
+	} else {
+		gethostname(host, sizeof host - 1u);
+		inet_ntop(AF_INET, &from.sin_addr, text, sizeof text);
+		printf("answer=from %s\n", text);
+		sendto(fd, host, strlen(host), 0, (struct sockaddr *)&from, from_length);
+	}
+	if (fd >= 0)
+		close(fd);
+}
+
+static void ask(const char *name, const char *port)
+{
+	struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons((uint16_t)atoi(port)) };
+	char               address[64];
+	char               reply[256];
+	int                fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+
+	if (!lookup(name, address, sizeof address) || inet_pton(AF_INET, address, &to.sin_addr) != 1) {
+		printf("ask=%s unresolved\n", name);
+	} else if (fd < 0) {
+		printf("ask=%s\n", strerror(errno));
+	} else {
+		ssize_t n = -1;
+
+		for (int tries = 0; tries < 300 && n < 0; tries++) {
+			struct pollfd p = { fd, POLLIN, 0 };
+
+			sendto(fd, "ask", 3u, 0, (struct sockaddr *)&to, sizeof to);
+			if (poll(&p, 1u, 200) > 0)
+				n = recv(fd, reply, sizeof reply - 1u, 0);
+		}
+		if (n < 0)
+			printf("ask=%s at %s: no reply\n", name, address);
+		else
+			printf("ask=%s at %s: %.*s\n", name, address, (int)n, reply);
+	}
+	if (fd >= 0)
+		close(fd);
+}
+
 int main(int argc, char **argv)
 {
 	char text[256];
@@ -946,6 +1062,20 @@ int main(int argc, char **argv)
 		} else if (strcmp(step, "hear") == 0) {
 			hear(arg);
 			i++;
+		} else if (strcmp(step, "addr") == 0) {
+			show_address(arg);
+			i++;
+		} else if (strcmp(step, "hosts") == 0) {
+			char address[64];
+
+			printf("hosts=%s %s\n", arg, lookup(arg, address, sizeof address) ? address : "none");
+			i++;
+		} else if (strcmp(step, "answer") == 0) {
+			answer(arg);
+			i++;
+		} else if (strcmp(step, "ask") == 0 && i + 2 < argc) {
+			ask(arg, argv[i + 2]);
+			i += 2;
 		} else if (strcmp(step, "wait") == 0) {
 			printf("waiting\n");
 			alarm(20);

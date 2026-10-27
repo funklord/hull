@@ -90,8 +90,10 @@ struct host_hello {
 // The resolved machine spec, `(machine ...)` as in hull.conf (section 4),
 // applied before `start`. After the machine come zero or more trailing
 // forms the core adds: `(secrets (NAME VALUE) ...)` (J.3), which the agent
-// places at /run/hull/secrets, and `(ssh (host_key V)(authorized_keys
-// V)(config V))` for (ssh true), which it places at /run/hull/ssh. Each is
+// places at /run/hull/secrets, `(ssh (host_key V)(authorized_keys
+// V)(config V))` for (ssh true), which it places at /run/hull/ssh, and the
+// plan's `(names ...)` for the segments hull addresses (Appendix D), whose
+// addresses it sets and whose names it binds over /etc/hosts. Each is
 // optional; the agent reads them by name, so they are forms here and the
 // agent's own checks are what refuse a malformed one.
 struct spec {
@@ -109,11 +111,17 @@ struct spec {
 		case '(':  tail_entry  has_second;
 		default:   absent      no_second;
 	}
+	peek u8  after_second;
+	variant third switch (after_second) {
+		case '(':  tail_entry  has_third;
+		default:   absent      no_third;
+	}
 	u8  close  [must_eq = ')'];
 }
 
-// One trailing form after the machine: `(secrets (NAME VALUE) ...)` or
-// `(ssh (host_key V) ...)`, in that order, each optional. A list, so the
+// One trailing form after the machine: `(secrets (NAME VALUE) ...)`,
+// `(ssh (host_key V) ...)` or `(names (SEGMENT ...) ...)`, in that order,
+// each optional. A list, so the
 // leading `(` is required and a bare atom after the machine is refused by
 // the close that follows. The agent reads each by name.
 struct tail_entry {

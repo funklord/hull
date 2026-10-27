@@ -14,6 +14,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "names.h"
 #include "plan.h"
 
 static unsigned cases;
@@ -377,6 +378,154 @@ static void test_canonical(void)
 		FAIL("emu: %.*s", (int)plan.canonical_length, (const char *)plan.canonical);
 }
 
+/* --- Appendix D's names ---------------------------------------------------- */
+
+/* `text`'s machines drawn with their names as ids, into `names`: what
+ * hull_names_draw returned, or -2 where the file does not open. */
+static int draw_file(const char *text, hull_names *names)
+{
+	static hull_spec spec;
+	hull_spec_error  error;
+	hull_sexpr_form  machines[HULL_NAMES_MEMBERS];
+	hull_sexpr_form  entry;
+	static char      id_text[HULL_NAMES_MEMBERS][64];
+	const char      *ids[HULL_NAMES_MEMBERS];
+	unsigned         count = 0u;
+
+	if (hull_spec_open(&spec, (const uint8_t *)text, strlen(text), &error) != HULL_SPEC_OK) {
+		printf("  %s: %s\n", error.path, error.reason);
+		return -2;
+	}
+	hull_sexpr_child(&spec.doc, &spec.machines, &entry);
+	while (hull_sexpr_next(&spec.doc, &entry, &entry)) {
+		hull_sexpr_form key;
+		size_t          length;
+
+		hull_sexpr_child(&spec.doc, &entry, &key);
+		hull_sexpr_value(&spec.doc, &key, (uint8_t *)id_text[count], 63u, &length);
+		id_text[count][length] = '\0';
+		ids[count] = id_text[count];
+		machines[count++] = entry;
+	}
+	return hull_names_draw(names, &spec, machines, ids, count);
+}
+
+/* Machine `member`'s plan entry, as text, or "" for none. */
+static const char *entry_of(const hull_names *names, unsigned member)
+{
+	static char text[4096];
+	long        n = hull_names_entry(names, member, (uint8_t *)text, sizeof text - 1u);
+
+	text[n > 0 ? n : 0] = '\0';
+	return text;
+}
+
+#define SEG(name, segments) "(" name " (source \"dir:.\") (segments " segments "))"
+
+static void test_names(void)
+{
+	static hull_names names;
+	static hull_names again;
+	char              want[512];
+
+	/* Two on a /24: each the drawn host of FNV-1a(id/segment) past .1, and
+	 * each given both; a bare segment beside it given nothing. */
+	cases++;
+	if (draw_file("(machines " SEG("web", "(lan (subnet \"10.99.0.0/24\")) \"raw\"")
+	              SEG("db", "(lan (subnet \"10.99.0.0/24\"))") ")", &names) != 0 ||
+	    names.count != 1u || names.segment[0].count != 2u) {
+		FAIL("two machines on one addressed segment: %s", names.reason);
+	} else {
+		uint32_t web = names.segment[0].address[names.segment[0].member[0] == 0u ? 0 : 1];
+		uint32_t db  = names.segment[0].address[names.segment[0].member[0] == 0u ? 1 : 0];
+
+		cases++;
+		if (web >> 8 != (10u << 16 | 99u << 8) || (web & 255u) < 2u || (web & 255u) > 254u ||
+		    (db & 255u) < 2u || (db & 255u) > 254u || web == db)
+			FAIL("the addresses are not two hosts of 10.99.0.0/24 past .1");
+		{
+			char w[16];
+			char d[16];
+
+			snprintf(w, sizeof w, "10.99.0.%u", web & 255u);
+			snprintf(d, sizeof d, "10.99.0.%u", db & 255u);
+			snprintf(want, sizeof want,
+			         "(5:names(3:lan(7:address%zu:%s)(5:hosts(2:db%zu:%s)(3:web%zu:%s))"
+			         "(6:prefix2:24)))", strlen(w), w, strlen(d), d, strlen(w), w);
+		}
+		cases++;
+		if (strcmp(entry_of(&names, 0u), want) != 0)
+			FAIL("web's entry is\n  %s\nnot\n  %s", entry_of(&names, 0u), want);
+		/* The same membership in the other order draws the same. */
+		cases++;
+		if (draw_file("(machines " SEG("db", "(lan (subnet \"10.99.0.0/24\"))")
+		              SEG("web", "(lan (subnet \"10.99.0.0/24\"))") ")", &again) != 0 ||
+		    strcmp(entry_of(&again, 1u), want) != 0)
+			FAIL("the file's order changed web's entry");
+	}
+
+	/* A bare segment alone is left to its machines. */
+	cases++;
+	if (draw_file("(machines " SEG("a", "\"raw\"") SEG("b", "\"raw\"") ")", &names) != 0 ||
+	    names.count != 0u || entry_of(&names, 0u)[0] != '\0')
+		FAIL("a bare segment was addressed");
+
+	/* A /29 holds five past .1, and so five machines all apart, which
+	 * forces clashes to be re-drawn; a sixth has none to take. */
+	cases++;
+	if (draw_file("(machines " SEG("a", "(n (subnet \"10.1.0.0/29\"))")
+	              SEG("b", "(n (subnet \"10.1.0.0/29\"))") SEG("c", "(n (subnet \"10.1.0.0/29\"))")
+	              SEG("d", "(n (subnet \"10.1.0.0/29\"))") SEG("e", "(n (subnet \"10.1.0.0/29\"))")
+	              ")", &names) != 0) {
+		FAIL("five on a /29: %s", names.reason);
+	} else {
+		unsigned seen = 0u;
+
+		for (unsigned k = 0u; k < names.segment[0].count; k++) {
+			uint32_t host = names.segment[0].address[k] & 7u;
+
+			if (host < 2u || host > 6u)
+				FAIL("a /29's host %u is not 2 to 6", host);
+			seen |= 1u << host;
+		}
+		cases++;
+		if (seen != 0x7cu)
+			FAIL("five on a /29 do not take its five hosts: %#x", seen);
+	}
+	cases++;
+	if (draw_file("(machines " SEG("a", "(n (subnet \"10.1.0.0/29\"))")
+	              SEG("b", "(n (subnet \"10.1.0.0/29\"))") SEG("c", "(n (subnet \"10.1.0.0/29\"))")
+	              SEG("d", "(n (subnet \"10.1.0.0/29\"))") SEG("e", "(n (subnet \"10.1.0.0/29\"))")
+	              SEG("f", "(n (subnet \"10.1.0.0/29\"))") ")", &names) != -1 ||
+	    strstr(names.reason, "holds no address") == NULL)
+		FAIL("six on a /29 were not refused: %s", names.reason);
+
+	/* Refused: one segment two subnets, two segments one subnet, and a
+	 * segment addressed for one machine and bare for another. */
+	cases++;
+	if (draw_file("(machines " SEG("a", "(n (subnet \"10.1.0.0/24\"))")
+	              SEG("b", "(n (subnet \"10.2.0.0/24\"))") ")", &names) != -1 ||
+	    strstr(names.reason, "two subnets") == NULL)
+		FAIL("two subnets for one segment: %s", names.reason);
+	cases++;
+	if (draw_file("(machines " SEG("a", "(n (subnet \"10.1.0.0/16\"))")
+	              SEG("b", "(m (subnet \"10.1.7.0/24\"))") ")", &names) != -1 ||
+	    strstr(names.reason, "overlap") == NULL)
+		FAIL("two segments, overlapping subnets: %s", names.reason);
+	cases++;
+	if (draw_file("(machines " SEG("a", "(n (subnet \"10.1.0.0/24\"))") SEG("b", "\"n\"") ")",
+	              &names) != -1 || strstr(names.reason, "without its subnet") == NULL)
+		FAIL("a segment addressed and bare: %s", names.reason);
+
+	/* Two segments, sorted in the entry, and a machine on neither has none. */
+	cases++;
+	if (draw_file("(machines " SEG("a", "(z (subnet \"10.2.0.0/24\")) (y (subnet \"10.1.0.0/24\"))")
+	              "(c (source \"dir:.\"))" ")", &names) != 0 ||
+	    strncmp(entry_of(&names, 0u), "(5:names(1:y(", 13u) != 0 ||
+	    strstr(entry_of(&names, 0u), ")(1:z(") == NULL || entry_of(&names, 1u)[0] != '\0')
+		FAIL("two segments' entry: %s", entry_of(&names, 0u));
+}
+
 int main(void)
 {
 	alarm(60);
@@ -386,6 +535,7 @@ int main(void)
 	test_writeback();
 	test_offsets();
 	test_canonical();
+	test_names();
 	printf("plan: %u cases, %u failed\n", cases, failures);
 	return failures == 0u ? 0 : 1;
 }

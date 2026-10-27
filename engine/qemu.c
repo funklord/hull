@@ -136,6 +136,8 @@ struct hull_machine {
 	size_t           spec_length;
 	hull_msg         secrets;      /* `(secrets (NAME VALUE) ...)` for it, or empty */
 	hull_msg         ssh;          /* `(ssh (host_key V)(authorized_keys V)(config V))`, or empty */
+	uint8_t         *names;        /* the plan's `(names ...)`, for the agent (Appendix D), or NULL */
+	size_t           names_length;
 
 	char             dir[4096];    /* the machine's files: initrd, console */
 	int              network;      /* qemu's end of passt's socket, or -1 */
@@ -362,6 +364,7 @@ static void release(hull_machine *m)
 	free(m->owners);
 	free(m->kernel_path);
 	free(m->spec);
+	free(m->names);
 	forget_secrets(m);
 	forget_ssh(m);
 	if (m->pidfd >= 0)
@@ -587,7 +590,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		     more = hull_sexpr_next(doc, &item, &item)) {
 			if (m->segment_count == MAX_SEGMENTS)
 				return "there are too many segments";
-			if ((m->segment[m->segment_count++] = hull_access_text(doc, &item)) == NULL)
+			if ((m->segment[m->segment_count++] = hull_access_segment_name(doc, &item)) == NULL)
 				return "a segment's name is not text";
 		}
 	}
@@ -644,6 +647,14 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	if (m->spec == NULL)
 		return "out of memory";
 	memcpy(m->spec, doc->data + machine.offset, m->spec_length);
+	/* The segments hull addresses, and their names, which the agent
+	 * places in the guest as the engine is given them. */
+	if (hull_access_find(doc, &top, "names", &entry)) {
+		m->names_length = entry.extent;
+		if ((m->names = malloc(m->names_length)) == NULL)
+			return "out of memory";
+		memcpy(m->names, doc->data + entry.offset, m->names_length);
+	}
 	{
 		const char *reason = read_secrets(m, doc, &machine);
 
@@ -1230,7 +1241,10 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int
 	argv[n++] = "-initrd";
 	argv[n++] = initrd;
 	argv[n++] = "-append";
-	argv[n++] = "console=hvc0 quiet panic=-1";
+	/* hull.passt says eth0 is passt's, so the agent gives it passt's
+	 * address: under (network none) eth0 is a segment's (Appendix D). */
+	argv[n++] = m->no_network ? "console=hvc0 quiet panic=-1" :
+	                            "console=hvc0 quiet panic=-1 hull.passt=1";
 	argv[n++] = "-device";
 	argv[n++] = "virtio-serial-pci";
 	argv[n++] = "-chardev";
@@ -2136,6 +2150,8 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 			hull_msg_bytes(&msg, m->secrets.data, m->secrets.length);
 		if (m->ssh.data != NULL)
 			hull_msg_bytes(&msg, m->ssh.data, m->ssh.length);
+		if (m->names != NULL)
+			hull_msg_bytes(&msg, m->names, m->names_length);
 		hull_msg_raw(&msg, ")");
 		forget_secrets(m);
 		forget_ssh(m);
