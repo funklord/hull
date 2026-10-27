@@ -17,7 +17,7 @@
 #include "spec.h"
 
 /* The most keys one record has, which bounds the walk's bookkeeping. */
-#define MAX_KEYS 32u
+#define MAX_KEYS 64u  /* a schema's keys, each a bit of a uint64_t present */
 
 typedef enum value_type {
 	STRING,    /* one string */
@@ -61,7 +61,7 @@ typedef struct schema {
 	unsigned    count;
 	/* Rules across keys, run once every key has passed on its own. */
 	hull_spec_status (*across)(walk *w, const hull_sexpr_form *record,
-	                           const hull_sexpr_form *found, uint32_t present);
+	                           const hull_sexpr_form *found, uint64_t present);
 } schema;
 
 struct walk {
@@ -177,6 +177,18 @@ static const char *label(const uint8_t *text, uint32_t length)
 	for (uint32_t i = 0u; i < length; i++)
 		if (!is_lower(text[i]) && !is_digit(text[i]) && text[i] != '-')
 			return reason;
+	return NULL;
+}
+
+/* A Linux interface's name, a host bridge's: 1 to 15 bytes, none of them
+ * `/`, `:`, a space or a control, as the kernel takes one (IFNAMSIZ). */
+static const char *interface(const uint8_t *text, uint32_t length)
+{
+	if (length == 0u || length > 15u)
+		return "must be an interface's name: 1 to 15 characters";
+	for (uint32_t i = 0u; i < length; i++)
+		if (text[i] <= ' ' || text[i] == '/' || text[i] == ':' || text[i] >= 0x7fu)
+			return "must be an interface's name: no `/`, `:`, space or control";
 	return NULL;
 }
 
@@ -306,7 +318,7 @@ static const char *const writeback_values[]  = { "none", "sync-on-stop", NULL };
 static const char *const projection_values[] = { "auto", "bind", "passthrough", "block", NULL };
 static const char *const restart_values[]    = { "no", "on-failure", "always", NULL };
 static const char *const disconnect_values[] = { "stop", "keep", NULL };
-static const char *const network_values[]    = { "host", "nat", "none", NULL };
+static const char *const network_values[]    = { "bridge", "host", "nat", "none", NULL };
 static const char *const proto_values[]      = { "tcp", "udp", NULL };
 static const char *const mode_values[]       = { "rw", "ro", NULL };
 static const char *const expose_values[]     = { "env", NULL };
@@ -326,7 +338,7 @@ static const key port_keys[] = {
 static const schema port = TABLE(port_keys);
 
 static hull_spec_status volume_across(walk *w, const hull_sexpr_form *record,
-                                      const hull_sexpr_form *found, uint32_t present);
+                                      const hull_sexpr_form *found, uint64_t present);
 
 /* (volume (host "./data") (guest "/var/data") (mode rw)), or a stack of
  * directories in place of the one: (volume (guest "/etc") (layers
@@ -506,8 +518,16 @@ static const key machine_keys[] = {
 	{ .name = "secrets",       .type = MAP, .record = &secret, .names = secret_name },
 	{ .name = "media",         .type = ENTRIES, .record = &medium, .entry = "medium" },
 	{ .name = "tuning",        .type = RECORD, .record = &tuning },
+	{ .name = "bridge",        .type = STRING, .value = interface },
 };
-static const schema machine = TABLE(machine_keys);
+static hull_spec_status machine_across(walk *w, const hull_sexpr_form *record,
+                                       const hull_sexpr_form *found, uint64_t present);
+static const schema machine = TABLE_ACROSS(machine_keys, machine_across);
+
+/* Where these sit in machine_keys, for machine_across; spec_test holds
+ * both, a key moved making (network bridge) (bridge NAME) refused. */
+#define MACHINE_NETWORK 18u
+#define MACHINE_BRIDGE  32u
 
 /* J.6: (path (from "./src") (to "/app")), what a step copies in. */
 static const key path_keys[] = {
@@ -517,7 +537,7 @@ static const key path_keys[] = {
 static const schema path = TABLE(path_keys);
 
 static hull_spec_status step_across(walk *w, const hull_sexpr_form *record,
-                                    const hull_sexpr_form *found, uint32_t present);
+                                    const hull_sexpr_form *found, uint64_t present);
 
 static const key step_keys[] = {
 	{ .name = "name",    .type = STRING, .required = 1, .value = nonempty },
@@ -559,7 +579,7 @@ static const key build_keys[] = {
 static const schema build = TABLE(build_keys);
 
 static hull_spec_status file_across(walk *w, const hull_sexpr_form *record,
-                                    const hull_sexpr_form *found, uint32_t present);
+                                    const hull_sexpr_form *found, uint64_t present);
 
 /* The top of a file (J.7): one machine, or several by name, and a build. */
 static const key file_keys[] = {
@@ -581,7 +601,7 @@ _Static_assert(sizeof machine_keys / sizeof machine_keys[0] <= MAX_KEYS,
 static hull_spec_status check_entries(walk *w, const hull_sexpr_form *first, int has_first,
                                       const hull_sexpr_form *record, uint32_t missing_at,
                                       const schema *s, hull_sexpr_form *found,
-                                      uint32_t *present);
+                                      uint64_t *present);
 
 /* The one value of `entry`, whose key is `head`, which must be of `kind`. */
 static hull_spec_status one_value(walk *w, const hull_sexpr_form *entry,
@@ -687,7 +707,7 @@ static hull_spec_status check_record(walk *w, const hull_sexpr_form *record,
 {
 	hull_sexpr_form found[MAX_KEYS];
 	hull_sexpr_form first;
-	uint32_t        present = 0u;
+	uint64_t        present = 0u;
 	int             has     = hull_sexpr_next(w->doc, head, &first);
 
 	return check_entries(w, &first, has, record, record->offset, s, found, &present);
@@ -897,7 +917,7 @@ static hull_spec_status check_value(walk *w, const hull_sexpr_form *entry,
 static hull_spec_status check_entries(walk *w, const hull_sexpr_form *first, int has_first,
                                       const hull_sexpr_form *record, uint32_t missing_at,
                                       const schema *s, hull_sexpr_form *found,
-                                      uint32_t *present)
+                                      uint64_t *present)
 {
 	hull_sexpr_form  entry = *first;
 	hull_sexpr_form  head;
@@ -919,9 +939,9 @@ static hull_spec_status check_entries(walk *w, const hull_sexpr_form *first, int
 				break;
 		if (i == s->count)
 			return fail(w, HULL_SPEC_ERR_UNKNOWN, head.offset, "is not a key here");
-		if (*present & (1u << i))
+		if (*present & ((uint64_t)1 << i))
 			return fail(w, HULL_SPEC_ERR_DUPLICATE, entry.offset, "is given twice");
-		*present |= 1u << i;
+		*present |= (uint64_t)1 << i;
 		found[i] = entry;
 		status = check_value(w, &entry, &head, &s->keys[i]);
 		if (status != HULL_SPEC_OK)
@@ -929,7 +949,7 @@ static hull_spec_status check_entries(walk *w, const hull_sexpr_form *first, int
 		pop(w, saved);
 	}
 	for (unsigned i = 0u; i < s->count; i++) {
-		if (s->keys[i].required && !(*present & (1u << i))) {
+		if (s->keys[i].required && !(*present & ((uint64_t)1 << i))) {
 			size_t saved = push_text(w, s->keys[i].name);
 
 			status = fail(w, HULL_SPEC_ERR_MISSING, missing_at, "is required");
@@ -940,18 +960,44 @@ static hull_spec_status check_entries(walk *w, const hull_sexpr_form *first, int
 	return s->across == NULL ? HULL_SPEC_OK : s->across(w, record, found, *present);
 }
 
-/* J.6: refresh dates a step's cache, which is only dated with a network. */
-static hull_spec_status step_across(walk *w, const hull_sexpr_form *record,
-                                    const hull_sexpr_form *found, uint32_t present)
+/* (bridge NAME) names the host bridge (network bridge) joins, and means
+ * nothing on another network. */
+static hull_spec_status machine_across(walk *w, const hull_sexpr_form *record,
+                                       const hull_sexpr_form *found, uint64_t present)
 {
 	hull_sexpr_form head;
 	hull_sexpr_form value;
 	size_t          saved;
 
 	(void)record;
-	if (!(present & (1u << STEP_REFRESH)))
+	if (!(present & ((uint64_t)1 << MACHINE_BRIDGE)))
 		return HULL_SPEC_OK;
-	if (present & (1u << STEP_NETWORK)) {
+	if (present & ((uint64_t)1 << MACHINE_NETWORK)) {
+		hull_sexpr_child(w->doc, &found[MACHINE_NETWORK], &head);
+		hull_sexpr_next(w->doc, &head, &value);
+		if (hull_sexpr_is(w->doc, &value, "bridge"))
+			return HULL_SPEC_OK;
+	}
+	hull_sexpr_child(w->doc, &found[MACHINE_BRIDGE], &head);
+	hull_sexpr_next(w->doc, &head, &value);
+	saved = push_text(w, "bridge");
+	fail(w, HULL_SPEC_ERR_VALUE, value.offset, "needs (network bridge)");
+	pop(w, saved);
+	return HULL_SPEC_ERR_VALUE;
+}
+
+/* J.6: refresh dates a step's cache, which is only dated with a network. */
+static hull_spec_status step_across(walk *w, const hull_sexpr_form *record,
+                                    const hull_sexpr_form *found, uint64_t present)
+{
+	hull_sexpr_form head;
+	hull_sexpr_form value;
+	size_t          saved;
+
+	(void)record;
+	if (!(present & ((uint64_t)1 << STEP_REFRESH)))
+		return HULL_SPEC_OK;
+	if (present & ((uint64_t)1 << STEP_NETWORK)) {
 		hull_sexpr_child(w->doc, &found[STEP_NETWORK], &head);
 		hull_sexpr_next(w->doc, &head, &value);
 		if (hull_sexpr_is(w->doc, &value, "true"))
@@ -964,10 +1010,10 @@ static hull_spec_status step_across(walk *w, const hull_sexpr_form *record,
 }
 
 static hull_spec_status file_across(walk *w, const hull_sexpr_form *record,
-                                    const hull_sexpr_form *found, uint32_t present)
+                                    const hull_sexpr_form *found, uint64_t present)
 {
 	(void)record;
-	if ((present & (1u << FILE_MACHINE)) && (present & (1u << FILE_MACHINES))) {
+	if ((present & ((uint64_t)1 << FILE_MACHINE)) && (present & ((uint64_t)1 << FILE_MACHINES))) {
 		size_t saved = push_text(w, "machines");
 
 		fail(w, HULL_SPEC_ERR_SHAPE, found[FILE_MACHINES].offset,
@@ -981,21 +1027,21 @@ static hull_spec_status file_across(walk *w, const hull_sexpr_form *record,
 }
 
 static hull_spec_status volume_across(walk *w, const hull_sexpr_form *record,
-                                      const hull_sexpr_form *found, uint32_t present)
+                                      const hull_sexpr_form *found, uint64_t present)
 {
 	const char *why = NULL;
 	unsigned    at = VOLUME_LAYERS;
 	size_t      saved;
 
-	if (!(present & (1u << VOLUME_HOST)) && !(present & (1u << VOLUME_LAYERS)))
+	if (!(present & ((uint64_t)1 << VOLUME_HOST)) && !(present & ((uint64_t)1 << VOLUME_LAYERS)))
 		return fail(w, HULL_SPEC_ERR_MISSING, record->offset,
 		            "a volume is a host directory or a stack of layers: host or layers");
-	if ((present & (1u << VOLUME_HOST)) && (present & (1u << VOLUME_LAYERS))) {
+	if ((present & ((uint64_t)1 << VOLUME_HOST)) && (present & ((uint64_t)1 << VOLUME_LAYERS))) {
 		why = "cannot stand beside host: a volume is one directory or a stack of them";
-	} else if ((present & (1u << VOLUME_UPPER)) && !(present & (1u << VOLUME_LAYERS))) {
+	} else if ((present & ((uint64_t)1 << VOLUME_UPPER)) && !(present & ((uint64_t)1 << VOLUME_LAYERS))) {
 		at = VOLUME_UPPER;
 		why = "is a stack's: it needs layers";
-	} else if ((present & (1u << VOLUME_UPPER)) && (present & (1u << VOLUME_MODE))) {
+	} else if ((present & ((uint64_t)1 << VOLUME_UPPER)) && (present & ((uint64_t)1 << VOLUME_MODE))) {
 		hull_sexpr_form head;
 		hull_sexpr_form value;
 
@@ -1023,7 +1069,7 @@ hull_spec_status hull_spec_open(hull_spec *spec, const uint8_t *data, size_t len
 	hull_sexpr_form   found[MAX_KEYS];
 	hull_sexpr_form   first;
 	hull_spec_status  status;
-	uint32_t          present = 0u;
+	uint64_t          present = 0u;
 	walk              w;
 
 	memset(spec, 0, sizeof *spec);
@@ -1047,9 +1093,9 @@ hull_spec_status hull_spec_open(hull_spec *spec, const uint8_t *data, size_t len
 	                       &file, found, &present);
 	if (status != HULL_SPEC_OK)
 		return status;
-	spec->has_machine  = !!(present & (1u << FILE_MACHINE));
-	spec->has_machines = !!(present & (1u << FILE_MACHINES));
-	spec->has_build    = !!(present & (1u << FILE_BUILD));
+	spec->has_machine  = !!(present & ((uint64_t)1 << FILE_MACHINE));
+	spec->has_machines = !!(present & ((uint64_t)1 << FILE_MACHINES));
+	spec->has_build    = !!(present & ((uint64_t)1 << FILE_BUILD));
 	if (spec->has_machine)
 		spec->machine = found[FILE_MACHINE];
 	if (spec->has_machines)

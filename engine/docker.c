@@ -847,8 +847,9 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	 * there would sit through stop's SIGTERM, and nothing would reap. */
 	add_text(&body, ",\"HostConfig\":{\"Init\":true,\"CapDrop\":[\"ALL\"]");
 	/* (network none) is docker's none, lo alone; (network host) its host;
-	 * (network nat), or none given, its own bridge, as it always was.
-	 * Ports need one. */
+	 * (network nat), or none given, its own bridge, as it always was;
+	 * (network bridge) that bridge said, or the docker network (bridge
+	 * NAME) names, the daemon being root already. Ports need one. */
 	if ((value = hull_access_value(doc, machine, "network")) != NULL) {
 		int ported = hull_access_find(doc, machine, "ports", &entry);
 
@@ -860,6 +861,17 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 				       "put them on, and (network host) is the host's";
 			}
 			addf(&body, ",\"NetworkMode\":\"%s\"", value);
+		} else if (strcmp(value, "bridge") == 0) {
+			char *name = hull_access_value(doc, machine, "bridge");
+
+			if (name != NULL && strpbrk(name, "\"\\") != NULL) {
+				free(name);
+				free(value);
+				free(body.data);
+				return "a bridge's name cannot hold a quote or a backslash";
+			}
+			addf(&body, ",\"NetworkMode\":\"%s\"", name != NULL ? name : "bridge");
+			free(name);
 		}
 		free(value);
 	}
@@ -1672,6 +1684,9 @@ static const hull_cap_entry entries[] = {
 	{ "env",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "network.host",       HULL_SUP_NATIVE,   NULL, NULL },
 	{ "network.nat",        HULL_SUP_NATIVE,   "docker's own bridge, as no network key gives", NULL },
+	{ "network.bridge",     HULL_SUP_NATIVE,
+	  "docker's own bridge, or the docker network (bridge NAME) names", NULL },
+	{ "bridge",             HULL_SUP_NATIVE,   "a docker network, by its name", NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   NULL, NULL },
 	{ "export",             HULL_SUP_REJECTED,
 	  "not yet: docker export does it, and the adapter does not call it", NULL },

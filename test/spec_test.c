@@ -139,7 +139,16 @@ static void test_values(void)
 	OK(M("(network nat)"));
 	OK(M("(network host)"));
 	OK(M("(network none)"));
-	NO(M("(network bridge)"), VALUE, "bridge", "machine.network");
+	/* (network bridge), hull's own bridge or the host bridge (bridge NAME)
+	 * names; the name only beside it, and an interface's. */
+	OK(M("(network bridge)"));
+	OK(M("(network bridge) (bridge \"br0\")"));
+	NO(M("(network wired)"), VALUE, "wired", "machine.network");
+	NO(M("(bridge \"br0\")"), VALUE, "\"br0\"", "machine.bridge");
+	NO(M("(network nat) (bridge \"br0\")"), VALUE, "\"br0\"", "machine.bridge");
+	NO(M("(network bridge) (bridge \"a/b\")"), VALUE, "\"a/b\"", "machine.bridge");
+	NO(M("(network bridge) (bridge \"sixteen-chars-xx\")"), VALUE, "\"sixteen-chars-xx\"",
+	   "machine.bridge");
 	NO(M("(restart)"), SHAPE, "(restart)", "machine.restart");
 
 	/* Booleans. */
