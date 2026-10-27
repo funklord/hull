@@ -63,9 +63,14 @@ for kind, what in sorted(ordered, key=lambda i: i[0] != "dir"):
     elif kind == "fifo":
         os.mkfifo(os.path.join(root, what))
     else:
+        # Bound by its name from its own directory, since a socket's
+        # path is at most 108 bytes and a build directory may be deeper.
+        here = os.getcwd()
+        os.chdir(os.path.dirname(os.path.join(root, what)))
         s = socket.socket(socket.AF_UNIX)
-        s.bind(os.path.join(root, what))
+        s.bind(os.path.basename(what))
         s.close()
+        os.chdir(here)
 os.chmod(os.path.join(root, "a"), 0o750)
 for top, subdirs, names in os.walk(root, topdown=False):
     for name in names + subdirs:
