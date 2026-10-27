@@ -49,6 +49,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
 #include <linux/magic.h>
 
 #include "access.h"
@@ -150,6 +151,15 @@ struct slot {
 		hull_tamper     fault[2];
 	}                  links[8];
 	unsigned           link_count;
+	/* The plan's (names ...): hull's address for it on each segment it
+	 * addresses, so that the switch can refuse another file's machine
+	 * drawing the same (Appendix D). */
+	struct {
+		char     segment[64];
+		uint32_t address;
+		unsigned prefix;
+	}                  named[8];
+	unsigned           named_count;
 	int                exited;
 	int                code;
 	int                signal;
@@ -354,8 +364,18 @@ static void on_log(hull_core *core, int level, const char *message)
  * it by and an impairment is asked for. */
 static int on_segment(hull_core *core, const char *key, char *why, size_t cap)
 {
-	const slot *s = core->slot;
-	int         fd = hull_segment_port(key, s->id, why, cap);
+	const slot *s       = core->slot;
+	uint32_t    address = 0u;
+	unsigned    prefix  = 0u;
+	int         fd;
+
+	for (unsigned i = 0u; i < s->named_count; i++) {
+		if (strcmp(s->named[i].segment, key) == 0) {
+			address = s->named[i].address;
+			prefix  = s->named[i].prefix;
+		}
+	}
+	fd = hull_segment_port_addressed(key, s->id, address, prefix, why, cap);
 
 	/* Before the machine runs, so that its first frame meets its link. */
 	for (unsigned i = 0u; fd >= 0 && i < s->link_count; i++) {
@@ -1698,6 +1718,47 @@ static const char *links_of(slot *s, const hull_sexpr_doc *doc, const hull_sexpr
 	return NULL;
 }
 
+/* The plan's (names ...) into `s`, for each segment the machine is on:
+ * NULL, or why it cannot be read. */
+static const char *named_of(slot *s, const hull_sexpr_doc *doc, const hull_sexpr_form *machine)
+{
+	hull_sexpr_form top;
+	hull_sexpr_form names;
+	hull_sexpr_form segments;
+	hull_sexpr_form item;
+
+	hull_sexpr_first(doc, &top);
+	if (!hull_access_find(doc, &top, "names", &names) ||
+	    !hull_access_find(doc, machine, "segments", &segments))
+		return NULL;
+	hull_sexpr_child(doc, &segments, &item);
+	while (hull_sexpr_next(doc, &item, &item)) {
+		char          *segment = hull_access_segment_name(doc, &item);
+		char           address[16];
+		unsigned       prefix;
+		struct in_addr parsed;
+
+		if (segment == NULL)
+			return "a segment is a name";
+		if (!hull_access_named(doc, &names, segment, address, &prefix)) {
+			free(segment);
+			continue;
+		}
+		if (s->named_count == sizeof s->named / sizeof s->named[0] ||
+		    strlen(segment) >= sizeof s->named[0].segment ||
+		    inet_pton(AF_INET, address, &parsed) != 1 || prefix == 0u || prefix > 32u) {
+			free(segment);
+			return "the plan's names cannot be read";
+		}
+		snprintf(s->named[s->named_count].segment, sizeof s->named[0].segment, "%s", segment);
+		s->named[s->named_count].address = ntohl(parsed.s_addr);
+		s->named[s->named_count].prefix  = prefix;
+		s->named_count++;
+		free(segment);
+	}
+	return NULL;
+}
+
 static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
 	hull_sexpr_form    value;
@@ -1839,6 +1900,9 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	free(on_disconnect);
 	{
 		const char *wrong = links_of(s, &plan_doc, &machine);
+
+		if (wrong == NULL)
+			wrong = named_of(s, &plan_doc, &machine);
 
 		if (wrong != NULL) {
 			send_error(c, ch, wrong);

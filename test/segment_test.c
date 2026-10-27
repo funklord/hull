@@ -575,6 +575,59 @@ int main(void)
 		close(b);
 	}
 	{
+		/* Addressed joins (Appendix D): each file draws its own machines'
+		 * addresses, so the switch refuses a machine of another id taking
+		 * one already held, or another subnet for the segment. 10.99.0.0/24
+		 * is 0x0a630000. */
+		char     why[256] = "";
+		int      web = hull_segment_port_addressed("named", "web", 0x0a630045u, 24u, why,
+		                                           sizeof why);
+		int      db = hull_segment_port_addressed("named", "db", 0x0a63001fu, 24u, why,
+		                                          sizeof why);
+		int      raw = hull_segment_port("named", "raw", why, sizeof why);
+		int      again = hull_segment_port_addressed("named", "web", 0x0a630045u, 24u, why,
+		                                             sizeof why);
+		int      taken;
+		int      wider;
+		int      later = -1;
+		uint64_t until;
+
+		check("two machines addressed apart, and a bare one, on one segment",
+		      web >= 0 && db >= 0 && raw >= 0);
+		check("a machine's own address again, a vm's second attempt", again >= 0);
+		why[0] = '\0';
+		taken = hull_segment_port_addressed("named", "other", 0x0a630045u, 24u, why, sizeof why);
+		check("another file's machine on a held address refused", taken < 0);
+		check("its reason names the holder",
+		      strcmp(why, "its address on segment named, 10.99.0.69, is machine web's") == 0);
+		why[0] = '\0';
+		wider = hull_segment_port_addressed("named", "other", 0x0a620007u, 16u, why, sizeof why);
+		check("another subnet for the segment refused", wider < 0);
+		check("its reason names both subnets",
+		      strcmp(why, "segment named is 10.99.0.0/24, as machine web has it, and this "
+		                  "machine gives it 10.98.0.0/16") == 0);
+		/* Once the holder's ports have gone, the address is free. */
+		close(web);
+		close(again);
+		for (until = ms_now() + 2000u; later < 0 && ms_now() < until;) {
+			later = hull_segment_port_addressed("named", "other", 0x0a630045u, 24u, why,
+			                                    sizeof why);
+			if (later < 0)
+				usleep(10000u);
+		}
+		check("an address free once its holder has gone", later >= 0);
+		if (taken >= 0)
+			close(taken);
+		if (wider >= 0)
+			close(wider);
+		if (later >= 0)
+			close(later);
+		if (db >= 0)
+			close(db);
+		if (raw >= 0)
+			close(raw);
+	}
+	{
 		/* Inject onto a segment no machine is on is refused. */
 		char why[256] = "";
 

@@ -73,6 +73,8 @@ typedef struct way {
 typedef struct port {
 	int      fd;
 	char     machine[64];
+	uint32_t address;   /* hull's address for it, host order (Appendix D) */
+	unsigned prefix;    /* its subnet's; 0 where the machine sets its own */
 	uint8_t  in[4u + MAX_FRAME];
 	size_t   in_length;
 	uint8_t  out[4u + MAX_FRAME];
@@ -726,7 +728,55 @@ static segment *find(const char *key)
 	return NULL;
 }
 
+/* `address` as a.b.c.d. */
+static void dotted(uint32_t address, char out[16])
+{
+	snprintf(out, 16u, "%u.%u.%u.%u", address >> 24, address >> 16 & 0xffu, address >> 8 & 0xffu,
+	         address & 0xffu);
+}
+
+/* Where `p` cannot join `s` as hull addresses it, why: another file's
+ * machine already on it with another subnet, or with p's address. Each
+ * file's draw sees only its own machines, so this is where two meet. A
+ * port of p's own machine is passed over, being a vm's earlier attempt
+ * whose end the switch has not yet seen close. */
+static int addressed_apart(const segment *s, const port *p, char *why, size_t cap)
+{
+	uint32_t mask = p->prefix == 0u ? 0u : 0xffffffffu << (32u - p->prefix);
+
+	for (unsigned i = 0u; p->prefix != 0u && i < s->port_count; i++) {
+		const port *q = s->ports[i];
+		char        theirs[16];
+		char        ours[16];
+
+		if (q->prefix == 0u || strcmp(q->machine, p->machine) == 0)
+			continue;
+		if (q->prefix != p->prefix || ((q->address ^ p->address) & mask) != 0u) {
+			dotted(q->address & (0xffffffffu << (32u - q->prefix)), theirs);
+			dotted(p->address & mask, ours);
+			snprintf(why, cap,
+			         "segment %s is %s/%u, as machine %s has it, and this machine gives it "
+			         "%s/%u",
+			         s->key, theirs, q->prefix, q->machine, ours, p->prefix);
+			return 0;
+		}
+		if (q->address == p->address) {
+			dotted(p->address, ours);
+			snprintf(why, cap, "its address on segment %s, %s, is machine %s's", s->key, ours,
+			         q->machine);
+			return 0;
+		}
+	}
+	return 1;
+}
+
 int hull_segment_port(const char *key, const char *machine, char *why, size_t cap)
+{
+	return hull_segment_port_addressed(key, machine, 0u, 0u, why, cap);
+}
+
+int hull_segment_port_addressed(const char *key, const char *machine, uint32_t address,
+                                unsigned prefix, char *why, size_t cap)
 {
 	int      pair[2];
 	segment *s = NULL;
@@ -738,6 +788,10 @@ int hull_segment_port(const char *key, const char *machine, char *why, size_t ca
 	}
 	if (machine == NULL || strlen(machine) >= sizeof p->machine) {
 		say(why, cap, "a port's machine is named by its id");
+		return -1;
+	}
+	if (prefix > 32u) {
+		say(why, cap, "a subnet's prefix is at most 32");
 		return -1;
 	}
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) {
@@ -753,6 +807,8 @@ int hull_segment_port(const char *key, const char *machine, char *why, size_t ca
 	}
 	p->fd = pair[0];
 	snprintf(p->machine, sizeof p->machine, "%s", machine);
+	p->address = address;
+	p->prefix  = prefix;
 	fcntl(p->fd, F_SETFL, O_NONBLOCK);
 	pthread_mutex_lock(&lock);
 	if (!running) {
@@ -783,6 +839,13 @@ int hull_segment_port(const char *key, const char *machine, char *why, size_t ca
 		close(pair[0]);
 		close(pair[1]);
 		say(why, cap, s == NULL ? "too many segments" : "too many machines on the segment");
+		return -1;
+	}
+	if (!addressed_apart(s, p, why, cap)) {
+		pthread_mutex_unlock(&lock);
+		free(p);
+		close(pair[0]);
+		close(pair[1]);
 		return -1;
 	}
 	apply_rule(s, p, HULL_SEGMENT_OUT);

@@ -1252,6 +1252,32 @@ printf '(machines (a %s) (b %s))\n' \
 	"(source \"dir:./rootfs\") (backend chroot) (network none) (segments \"half-$$\") (command \"/probe\" \"say\" \"ran\")" \
 	> "$root/half.conf"
 from_root 125 "names it without its subnet" -f "$root/half.conf"
+# Each file draws only its own machines' addresses, so the switch is where
+# two files on one addressed segment meet: with a /29's five hosts all held
+# by one file, a machine of another file on the same subnet is refused,
+# as is another subnet for the segment; a bare machine joins as before.
+full="full-$$"
+held='(source "dir:./rootfs") (backend chroot) (mutable overlay) (network none) (segments ('"$full"' (subnet "10.82.0.0/29"))) (command "/probe" "sleep" "8")'
+printf '(machines (h1 %s) (h2 %s) (h3 %s) (h4 %s) (h5 %s))\n' "$held" "$held" "$held" "$held" "$held" \
+	> "$root/full.conf"
+(cd / && exec timeout 60 "$whole_hull" run -f "$root/full.conf" > "$root/full.out" 2>&1) &
+fullrun=$!
+tries=0
+until "$hull" segment "$full" > "$root/full.counts" 2>&1 &&
+	[ "$(grep -Ec '^h[1-5] +out ' "$root/full.counts")" -eq 5 ]; do
+	tries=$((tries + 1))
+	[ "$tries" -lt 60 ] || break
+	sleep 0.25
+done
+conf another "(mutable overlay) (network none) (segments ($full (subnet \"10.82.0.0/29\"))) (command \"/probe\" \"say\" \"ran\")"
+from_root 125 "its address on segment $full, 10\\.82\\.0\\.[2-6], is machine h[1-5]'s" -f "$root/another.conf"
+conf widened "(mutable overlay) (network none) (segments ($full (subnet \"10.82.0.0/24\"))) (command \"/probe\" \"say\" \"ran\")"
+from_root 125 "segment $full is 10\\.82\\.0\\.0/29, as machine h[1-5] has it, and this machine gives it 10\\.82\\.0\\.0/24" -f "$root/widened.conf"
+conf barejoin "(network none) (segments \"$full\") (command \"/probe\" \"say\" \"ran\")"
+from_root 0 '^ran$' -f "$root/barejoin.conf"
+cases=$((cases + 1))
+wait "$fullrun" ||
+	fail "a file holding a segment's addresses did not run whole" "$(cat "$root/full.out")"
 # Impairment in the switch, changed during a run: a hearer and a shouter
 # on one segment, the shouter's way out cut before it shouts, its frames
 # counted lost, then healed, so a later shout is heard and answered.

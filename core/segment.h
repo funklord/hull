@@ -117,6 +117,16 @@ typedef struct hull_segment_counts {
 int hull_segment_port(const char *key, const char *machine, char *why, size_t cap);
 
 /*
+ * hull_segment_port for a machine hull gives `address` on `key`, in a
+ * subnet of `prefix` bits, both host order (Appendix D); a `prefix` of 0
+ * is a segment the machine addresses itself, as hull_segment_port. Also
+ * refused: a machine of another id on `key` whose subnet is another, or
+ * whose address is this one -- each file draws its own machines' only.
+ */
+int hull_segment_port_addressed(const char *key, const char *machine, uint32_t address,
+                                unsigned prefix, char *why, size_t cap);
+
+/*
  * `impairment` for `direction` of every port `machine` has on `key`, or
  * every machine's where `machine` is NULL, replacing what it had; a port
  * the machine joins later takes it too, for as long as the segment lasts.
