@@ -519,6 +519,19 @@ static void child_fail(int report, const char *step)
 	_exit(127);
 }
 
+/* fork() for the machine's init, which is a raw clone of the core and so
+ * still looks to glibc like a process with the core's threads: glibc's
+ * fork() takes every malloc arena's lock and stdio's list lock first,
+ * and one held by a core thread at the clone -- the switch's, a stop's,
+ * an exec's stdin writer -- is held for ever here, hanging the init and
+ * the core waiting on it. The system call takes none, and what it starts
+ * only execs or relays. Found 2026-10-27, with a core thread churning
+ * malloc: the first machine's init stuck in __malloc_fork_lock_parent. */
+static pid_t bare_fork(void)
+{
+	return (pid_t)syscall(SYS_clone, SIGCHLD, NULL, NULL, NULL, 0L);
+}
+
 /* `text` as `name` in `dir`, the machine's staging tmpfs, cloned as a
  * read-only tree to place once the root is the machine's. */
 static int stage_named(const char *dir, const char *name, const char *text, int report)
@@ -1120,7 +1133,7 @@ static void join_segments(const hull_machine *m, int report)
 		}
 		close(fd);
 	}
-	relayer = fork();
+	relayer = bare_fork();
 	if (relayer < 0)
 		child_fail(report, "the segments' relay");
 	if (relayer == 0) {
@@ -1470,7 +1483,7 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	 * config; its own stdio goes nowhere, since it is supervised, not a
 	 * stream. */
 	if (ssh_bin != NULL) {
-		pid_t sshd = fork();
+		pid_t sshd = bare_fork();
 
 		if (sshd == 0) {
 			action.sa_handler = SIG_DFL;
@@ -1488,7 +1501,7 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 			_exit(127);
 		}
 	}
-	workload = fork();
+	workload = bare_fork();
 	if (workload < 0)
 		child_fail(report, "fork");
 	if (workload == 0) {
