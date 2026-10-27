@@ -76,6 +76,13 @@
 #define MAX_VOLUMES 64u
 #define MAX_SEGMENTS 8u
 #define HELD_LIMIT  (256u * 1024u)  /* output an init holds for no core */
+/* How long an init may take to reach its workload: the core waits for it
+ * on its own thread, every frontend with it, so a hang is bounded rather
+ * than for ever. A large tree's owners given on a loaded host are the
+ * slow part, well inside it. */
+#ifndef START_LIMIT_MS
+#define START_LIMIT_MS 600000
+#endif
 /* (ssh true)'s sshd port: a high one, since the chroot user is unprivileged
  * on the shared host net and cannot bind 22; the machine's 127.107 address
  * makes it unique per machine (section 8.1). */
@@ -1830,8 +1837,24 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	m->conn = pair[0];
 
 	/* The report pipe closes on exec; anything written on it is why the
-	 * child could not get that far. */
-	n = read(report[0], m->detail, sizeof m->detail - 1u);
+	 * child could not get that far, and nothing in START_LIMIT_MS is an
+	 * init that never will, killed and said so. */
+	{
+		struct pollfd waiting = { .fd = report[0], .events = POLLIN };
+		int           ready;
+
+		while ((ready = poll(&waiting, 1u, START_LIMIT_MS)) < 0 && errno == EINTR)
+			;
+		if (ready == 0) {
+			kill(m->pid, SIGKILL);
+			snprintf(m->detail, sizeof m->detail,
+			         "the machine's init did not reach its workload in %d s, and was killed",
+			         START_LIMIT_MS / 1000);
+			n = (ssize_t)strlen(m->detail);
+		} else {
+			n = read(report[0], m->detail, sizeof m->detail - 1u);
+		}
+	}
 	close(report[0]);
 	if (n > 0) {
 		m->detail[n] = '\0';
