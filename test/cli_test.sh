@@ -315,7 +315,7 @@ expect 1 'machine on docker \(ns\): rejected, 1 field$' "$hull" plan -f "$dir/di
 printf '%s\n' '(machine (source "dir:./rootfs") (segments "wire"))' > "$dir/segmented.conf"
 expect 0 'segments: native: a tap each' \
 	"$hull" plan --explain -f "$dir/segmented.conf" --backend chroot
-expect 1 'segments: rejected: not yet: a container.s NIC on the core.s switch' \
+expect 1 'segments: rejected: a container.s NIC is the daemon.s, never on the core.s switch' \
 	"$hull" plan -f "$dir/segmented.conf" --backend docker
 expect 0 'machine on qemu \(vm\): ok|segments: native' \
 	"$hull" plan --explain -f "$dir/segmented.conf" --backend vm
@@ -1456,7 +1456,7 @@ cases=$((cases + 1))
 # docker has no link of the core's to impair.
 conf offwire "(network none) (segments \"on-$$\") (impair (off-$$ (out (loss 0.5)))) (command \"/probe\" \"say\" \"ran\")"
 from_root 125 'impair names a segment the machine is not on' -f "$root/offwire.conf"
-expect 1 'impair: rejected: not yet: a link is impaired' "$hull" plan --backend docker -f "$root/offwire.conf"
+expect 1 'impair: rejected: a link is impaired in the core.s switch, which a container is never on' "$hull" plan --backend docker -f "$root/offwire.conf"
 expect 1 'no machine is on that segment' "$hull" segment "nowhere-$$"
 
 # A capture of the shouter's way out, started by hull segment during the
