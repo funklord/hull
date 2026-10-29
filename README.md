@@ -36,13 +36,20 @@ always the processor and memory underneath -- and every one of those is
 a way through. The software that draws the line has faults of its own,
 and ways out of containers, virtual machines and emulators alike are
 found every year. In practice, containers, virtual machines and
-emulators alike often make matters worse: one host carrying many
+emulators often make matters worse: one host carrying many
 machines is a single point of failure for all of them, and machines on
 one host are joined to each other by more I/O -- virtual networks,
 shared storage, the container runtime, hypervisor or emulator itself --
 than programs on separate hardware, or even programs side by side on
 one computer, each running as its own ordinary user rather than as
 root.
+
+The difference is in the interfaces. An operating system's interfaces,
+and the line between one user and another, were designed for security
+from the start. Virtual hardware was not: it began as a copy of devices
+that only ever had to trust the driver talking to them, and over time
+it is pulled between that legacy, the speed people want from it, and
+whatever security can be fitted in around the two.
 
 Part of the claim is true: a machine given no host files and no network
 leaves a program less to reach, and a virtual machine's kernel keeps
