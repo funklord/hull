@@ -35,7 +35,12 @@ with its host to be useful -- a directory, a network, a device, and
 always the processor and memory underneath -- and every one of those is
 a way through. The software that draws the line has faults of its own,
 and ways out of containers, virtual machines and emulators alike are
-found every year.
+found every year. In practice, virtualizing often makes matters worse:
+one host carrying many machines is a single point of failure for all of
+them, and machines on one host are joined to each other by more I/O --
+virtual networks, shared storage, the hypervisor itself -- than
+programs on separate hardware, or even programs side by side on one
+computer, each running as its own ordinary user rather than as root.
 
 Part of the claim is true: a machine given no host files and no network
 leaves a program less to reach, and a virtual machine's kernel keeps
