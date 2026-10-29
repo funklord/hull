@@ -115,7 +115,7 @@ the same address, reached the same way.
 hull run                    # in namespaces of its own, on the host's kernel
 hull run --backend vm       # the same machine, in a KVM guest
 hull run --backend emu      # the same, under TCG, with no KVM at all
-curl web.hull:8080          # the same address on each (vm and emu; chroot shares the host's ports)
+curl web.hull:8080          # the same address on each
 hull ssh web                # a shell in it, whichever it runs on
 ```
 
@@ -160,24 +160,42 @@ reason, and where one exists, the `--accept` token that takes it anyway).
 ## chroot — namespaces, as the user
 
 The reference engine. A machine is a set of Linux namespaces of its own --
-user, mount, pid, uts, and optionally network -- over its directory,
-entered with `pivot_root`, run by an init of hull's that reaps and passes
-signals. It is a process tree on the host's kernel, so it costs almost
-nothing to start.
+user, mount, pid, uts, and network unless it asks for the host's -- over
+its directory, entered with `pivot_root`, run by an init of hull's that
+reaps and passes signals, or under the image's own init. It is a process
+tree on the host's kernel, so it costs almost nothing to start.
 
 **When you want it:** running a build, a test suite or a tool from a
 directory or an image, quickly and often; `hull build`'s steps, which run
-on it; a machine that should see the host's network as its own; any host
+on it; several machines on a network of their own, cheaply; any host
 where nothing else is available, since it needs only user namespaces.
 
 **Pros**
 - Starts in milliseconds, with no guest to boot and no memory reserved.
-- Needs nothing installed and no device opened: user namespaces, on by
-  default on Debian and Fedora, are the whole requirement.
+- Needs little: user namespaces, on by default on Debian and Fedora, and
+  pasta, passt's own package, for a network of the machine's own.
+- A network of its own by default, `(network nat)`: `eth0` behind pasta's
+  NAT, the host's resolver, and `ports` forwarded from the machine's
+  stable address, as a vm's are. `(network host)` shares the host's
+  instead, and `(network none)` gives `lo` alone.
+- On `(segments …)` beside NAT or `(network none)`, a NIC on each, so
+  chroot machines and vms share one wire, with addresses and names where
+  the segment has a subnet.
 - Files in the machine are the files on disk: no protocol in between, so
   inotify, locks and mmap behave exactly as on the host.
-- Writes in place, `(mutable direct)`, or into an overlay held in memory,
-  `(mutable overlay)`, which leaves the directory untouched.
+- Writes in place, `(mutable direct)`, or into an overlay,
+  `(mutable overlay)`, which leaves the directory untouched; its writes
+  are held in memory, or kept in a directory of yours with
+  `(upper PATH)`, and `(layers …)` stacks more directories beneath.
+- Many uids where the host gives the user a subordinate range: a
+  package's own system users work, apt needs nothing special, and a
+  stored image's owners are given back in the machine.
+- The image's own init as PID 1 with `(init PATH)`, hull's init going on
+  as its child.
+- Host devices with `(devices …)`, bound in by their nodes, at the host's
+  own timing.
+- `cpus` and `memory` as ceilings, by a systemd scope from the user's
+  manager.
 - Nested namespaces work inside it: `unshare -rn` and rootless tools run
   in a machine.
 
@@ -186,25 +204,23 @@ where nothing else is available, since it needs only user namespaces.
   sysctl, and a kernel fault in it is the host's.
 - The host kernel's faults are the machine's too: whatever a user
   namespace can reach, the machine can.
-- One network, the host's or none: `(network host)` shares the host's,
-  and `(network none)` gives `lo` alone. There is no network of its own to
-  forward ports into, so `ports` and `segments` are refused.
 
 **Caveats**
-- **One uid is mapped today**, the user's, as root. A package whose
-  install script gives a file to its own system user, `dnsmasq-base` for
-  one, fails in a machine and in a build step; apt itself needs
-  `-o APT::Sandbox::User=root`. Mapping the user's subordinate range, with
-  an image's owners kept, is decided and being written.
-- **Writes under `(mutable overlay)` are memory**: installing a gigabyte
-  of packages in a run holds a gigabyte. Put them in the image with
-  `hull build`, whose steps are stored on disk.
+- **Without a subordinate range, one uid is mapped**, the user's, as
+  root, and the machine says so on its stderr with the way round: a
+  chown to another of its users fails, and apt wants
+  `-o APT::Sandbox::User=root`. `hull doctor` gives the line that adds a
+  range.
+- **Writes under `(mutable overlay)` are memory unless kept**: installing
+  a gigabyte of packages in a run holds a gigabyte. Keep them with
+  `(upper PATH)`, or put them in the image with `hull build`, whose steps
+  are stored on disk.
+- `cpus` and `memory` are refused, not run unlimited, where the user's
+  systemd manager gives no scope; a host without systemd has none yet.
+- `(network bridge)` needs a core run as root, and `(segments …)` cannot
+  go with `(network host)`, a NIC needing a namespace of the user's own.
 - A machine whose root is the host's own `/` cannot nest a user
   namespace; any other root can.
-- No `(init …)`: PID 1 is hull's.
-- No `(cpus …)` or `(memory …)` yet: a machine asking for either is
-  refused on chroot, since a limit needs cgroup v2 delegated to the user,
-  which `hull doctor` reports, and the engine does not yet use it.
 
 ## qemu as vm — a KVM machine of its own
 
@@ -319,7 +335,8 @@ machine on docker with the same machine on chroot or vm.
   `runs as root`, and capabilities beyond docker's default are refused.
 - A directory cannot run in place: `(mutable direct)` is refused, and an
   overlay is a `docker import` of the tree, kept by its hash.
-- No `(init …)` or `(segments …)` yet.
+- No `(init …)` yet, and no `(segments …)`: decided 2026-10-28, since
+  chroot gives a container a wire of its own without a root daemon.
 
 **Caveats**
 - `/` in a container is root's, as docker makes every image's, while the
