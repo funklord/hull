@@ -228,13 +228,19 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all check check-docker check-qemu check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all nss check check-docker check-qemu check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
 
-all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL) $(AGENT_BIN) $(NSS_LIB)
+# The software: hull, and the agent its vm and emu engines boot. The NSS
+# module is a helper beside it, which nothing in hull needs to run and
+# which is installed apart, as root: `make nss`, or `make install-nss`.
+all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL) $(AGENT_BIN)
+
+nss: $(NSS_LIB)
 
 help:
 	@echo 'Targets:'
-	@echo '  all       build the libraries and build/hull (the default)'
+	@echo '  all       build the libraries, build/hull and its agent (the default)'
+	@echo '  nss       build the NSS module, libnss_hull.so.2, for *.hull names'
 	@echo '  check     style, the situ contracts, then the tests'
 	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
 	@echo '  check-qemu    hull run on the qemu engine, as the user, with KVM'

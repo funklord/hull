@@ -489,7 +489,7 @@ A C11 compiler, Python 3, and OpenSSL's and zlib's development files,
 `libssl-dev` and `zlib1g-dev` on Debian, which `hull pull` links.
 
 ```sh
-make         # build/hull, its agent and its NSS module; fetches vendor/situ the first time
+make         # build/hull and its agent; fetches vendor/situ the first time
 fmake        # ./hull, ./hull-agent and ./libnss_hull.so, as fmake.toml describes
 make check   # the style gate, the situ contracts, then the tests
 make check-qemu    # the vm and emu engines, booting real guests
@@ -499,8 +499,8 @@ make hooks   # install the commit-msg hook
 ```
 
 `web.hull` and every other machine's name resolve, for any program on
-the host, once `build/libnss_hull.so.2` is installed. That is the one step
-that needs root:
+the host, once `build/libnss_hull.so.2`, which `make nss` builds, is
+installed. That is the one step that needs root:
 
 ```sh
 sudo make install-nss   # into /usr/lib/<multiarch>/
