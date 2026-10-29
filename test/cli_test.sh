@@ -1398,6 +1398,18 @@ printf '%s\n' "$named_out" | grep -q '^raw *| addr=eth0 none/0 down$' &&
 # machine's id and the segment's name, not the run's.
 limit=60
 from_root 0 "^web +\| addr=eth0 $web_at/24 up\$" -f "$root/named.conf"
+# hull at .1 names a sibling whose port is not on the switch yet: the
+# asker's first step, as a daemon's lookup at start is, and the other
+# only sleeping, so nothing orders them. /etc/hosts named it from the
+# start; DNS answered NXDOMAIN until it had joined.
+printf '(machines (first %s) (later %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (early-$$ (subnet \"10.84.0.0/24\"))) (command \"/probe\" \"dns\" \"later\" \"dns\" \"later.hull\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (early-$$ (subnet \"10.84.0.0/24\"))) (command \"/probe\" \"sleep\" \"1\")" \
+	> "$root/dnsfirst.conf"
+from_root 0 '^first +\| dns=later\.hull 10\.84\.0\.[0-9]+$' -f "$root/dnsfirst.conf"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^first *| dns=later 10\.84\.0\.[0-9]*$' ||
+	fail "hull at .1 did not name a sibling not yet on the segment" "$out"
 # A segment of 40 machines, past the 32 a segment took before, each
 # up at its own address and all on the switch at once, each staying a
 # while: a network of a /24's size, not a handful.

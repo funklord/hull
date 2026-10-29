@@ -160,6 +160,8 @@ struct slot {
 		char     segment[64];
 		uint32_t address;
 		unsigned prefix;
+		hull_segment_host *hosts;   /* the plan's, every machine it names there */
+		unsigned           host_count;
 	}                  named[8];
 	unsigned           named_count;
 	/* A network out besides its segments, so that hull at .1 forwards
@@ -400,18 +402,23 @@ static void on_log(hull_core *core, int level, const char *message)
  * it by and an impairment is asked for. */
 static int on_segment(hull_core *core, const char *key, char *why, size_t cap)
 {
-	const slot *s       = core->slot;
-	uint32_t    address = 0u;
-	unsigned    prefix  = 0u;
-	int         fd;
+	const slot              *s          = core->slot;
+	uint32_t                 address    = 0u;
+	unsigned                 prefix     = 0u;
+	const hull_segment_host *hosts      = NULL;
+	unsigned                 host_count = 0u;
+	int                      fd;
 
 	for (unsigned i = 0u; i < s->named_count; i++) {
 		if (strcmp(s->named[i].segment, key) == 0) {
-			address = s->named[i].address;
-			prefix  = s->named[i].prefix;
+			address    = s->named[i].address;
+			prefix     = s->named[i].prefix;
+			hosts      = s->named[i].hosts;
+			host_count = s->named[i].host_count;
 		}
 	}
-	fd = hull_segment_port_addressed(key, s->id, address, prefix, s->forwards, why, cap);
+	fd = hull_segment_port_named(key, s->id, address, prefix, s->forwards, hosts, host_count,
+	                             why, cap);
 
 	/* Before the machine runs, so that its first frame meets its link. */
 	for (unsigned i = 0u; fd >= 0 && i < s->link_count; i++) {
@@ -1766,6 +1773,63 @@ static const char *links_of(slot *s, const hull_sexpr_doc *doc, const hull_sexpr
 	return NULL;
 }
 
+/* The `(hosts (ID A) ...)` the plan's `names` gives `segment`, onto the
+ * heap: 0, or -1 where one cannot be read or memory ran out. */
+static int hosts_of(const hull_sexpr_doc *doc, const hull_sexpr_form *names, const char *segment,
+                    hull_segment_host **out, unsigned *count)
+{
+	hull_sexpr_form entry;
+	hull_sexpr_form hosts;
+	hull_sexpr_form host;
+	unsigned        n = 0u;
+	int             found = 0;
+
+	*out   = NULL;
+	*count = 0u;
+	hull_sexpr_child(doc, names, &entry);
+	while (!found && hull_sexpr_next(doc, &entry, &entry)) {
+		hull_sexpr_form head;
+		char           *name;
+
+		hull_sexpr_child(doc, &entry, &head);
+		name = hull_access_text(doc, &head);
+		found = name != NULL && strcmp(name, segment) == 0;
+		free(name);
+	}
+	if (!found || !hull_access_find(doc, &entry, "hosts", &hosts))
+		return 0;
+	hull_sexpr_child(doc, &hosts, &host);
+	for (hull_sexpr_form h = host; hull_sexpr_next(doc, &h, &h);)
+		n++;
+	if (n == 0u || (*out = calloc(n, sizeof **out)) == NULL)
+		return n == 0u ? 0 : -1;
+	while (hull_sexpr_next(doc, &host, &host)) {
+		hull_sexpr_form id_form;
+		hull_sexpr_form address_form;
+		char           *id = NULL;
+		char           *address = NULL;
+		struct in_addr  parsed;
+		int             ok;
+
+		if (hull_sexpr_child(doc, &host, &id_form) &&
+		    hull_sexpr_next(doc, &id_form, &address_form)) {
+			id      = hull_access_text(doc, &id_form);
+			address = hull_access_text(doc, &address_form);
+		}
+		ok = id != NULL && address != NULL && strlen(id) < sizeof (*out)->id &&
+		     inet_pton(AF_INET, address, &parsed) == 1;
+		if (ok) {
+			snprintf((*out)[*count].id, sizeof (*out)->id, "%s", id);
+			(*out)[(*count)++].address = ntohl(parsed.s_addr);
+		}
+		free(id);
+		free(address);
+		if (!ok)
+			return -1;
+	}
+	return 0;
+}
+
 /* The plan's (names ...) into `s`, for each segment the machine is on:
  * NULL, or why it cannot be read. */
 static const char *named_of(slot *s, const hull_sexpr_doc *doc, const hull_sexpr_form *machine)
@@ -1804,6 +1868,12 @@ static const char *named_of(slot *s, const hull_sexpr_doc *doc, const hull_sexpr
 		snprintf(s->named[s->named_count].segment, sizeof s->named[0].segment, "%s", segment);
 		s->named[s->named_count].address = ntohl(parsed.s_addr);
 		s->named[s->named_count].prefix  = prefix;
+		if (hosts_of(doc, &names, segment, &s->named[s->named_count].hosts,
+		             &s->named[s->named_count].host_count) != 0) {
+			free(s->named[s->named_count].hosts);
+			free(segment);
+			return "the plan's names cannot be read";
+		}
 		s->named_count++;
 		free(segment);
 	}
@@ -1933,6 +2003,8 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 			send_exited(f->client, f->ch, s);
 	}
 	drop_log(s);
+	for (unsigned i = 0u; i < s->named_count; i++)
+		free(s->named[i].hosts);
 	generation = s->generation + 1u;
 	memset(s, 0, sizeof *s);
 	s->used            = 1;

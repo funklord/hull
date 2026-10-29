@@ -130,6 +130,24 @@ int hull_segment_port(const char *key, const char *machine, char *why, size_t ca
 int hull_segment_port_addressed(const char *key, const char *machine, uint32_t address,
                                 unsigned prefix, int forwards, char *why, size_t cap);
 
+/* A machine hull names on a segment: its id and its address, host order. */
+typedef struct hull_segment_host {
+	char     id[64];
+	uint32_t address;
+} hull_segment_host;
+
+/*
+ * hull_segment_port_addressed, with the names the machine's plan gives
+ * the segment, `hosts`, `count` of them, which the switch copies: what its
+ * /etc/hosts holds, every machine of its file. hull at .1 answers for
+ * them while the port is there, as well as for the machines whose ports
+ * are, so that a sibling not yet started, or already gone, is named by
+ * DNS as by /etc/hosts.
+ */
+int hull_segment_port_named(const char *key, const char *machine, uint32_t address,
+                            unsigned prefix, int forwards, const hull_segment_host *hosts,
+                            unsigned count, char *why, size_t cap);
+
 /*
  * The resolvers .1 asks on to, `count` of them, at most three: IPv4
  * addresses and their UDP ports, in place of /etc/resolv.conf's, for a

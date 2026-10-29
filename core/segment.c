@@ -81,6 +81,8 @@ typedef struct port {
 	uint32_t address;   /* hull's address for it, host order (Appendix D) */
 	unsigned prefix;    /* its subnet's; 0 where the machine sets its own */
 	int      forwards;  /* its machine has a way out, so .1 asks on for it */
+	hull_segment_host *hosts;   /* the names its plan gives the segment */
+	unsigned           host_count;
 	uint8_t  in[4u + MAX_FRAME];
 	size_t   in_length;
 	uint8_t  out[4u + MAX_FRAME];
@@ -676,16 +678,33 @@ static int subnet_of(const segment *s, uint32_t *network, unsigned *prefix)
 	return 0;
 }
 
-/* The addressed port whose machine is `name`, or whose address is
- * `address` where `name` is NULL. */
-static const port *named(const segment *s, const char *name, uint32_t address)
+/* The machine named `name`, or at `address` where `name` is NULL: an
+ * addressed port's, or else one a port's plan names, which may not be on
+ * the segment yet or any longer. Its id and address, or NULL. */
+static const hull_segment_host *named(const segment *s, const char *name, uint32_t address,
+                                      hull_segment_host *found)
 {
 	for (unsigned i = 0u; i < s->port_count; i++) {
 		const port *p = s->ports[i];
 
 		if (p->prefix != 0u && (name != NULL ? strcasecmp(p->machine, name) == 0 :
-		                                       p->address == address))
-			return p;
+		                                       p->address == address)) {
+			snprintf(found->id, sizeof found->id, "%s", p->machine);
+			found->address = p->address;
+			return found;
+		}
+	}
+	for (unsigned i = 0u; i < s->port_count; i++) {
+		const port *p = s->ports[i];
+
+		for (unsigned k = 0u; k < p->host_count; k++) {
+			const hull_segment_host *h = &p->hosts[k];
+
+			if (name != NULL ? strcasecmp(h->id, name) == 0 : h->address == address) {
+				*found = *h;
+				return found;
+			}
+		}
 	}
 	return NULL;
 }
@@ -715,7 +734,8 @@ static size_t dns_answer(const segment *s, uint32_t network, unsigned prefix,
 	uint8_t     data[80];
 	size_t      data_length = 0u;
 	unsigned    answer_type = 0u;
-	const port *p = NULL;
+	const hull_segment_host *p = NULL;
+	hull_segment_host        found;
 	uint32_t    mask = 0xffffffffu << (32u - prefix);
 
 	if (length < 12u || (query[2] & 0x80u) != 0u || (query[2] & 0x78u) != 0u ||
@@ -756,13 +776,13 @@ static size_t dns_answer(const segment *s, uint32_t network, unsigned prefix,
 
 			if ((address & mask) != network)
 				rcode = 5u;
-			else if ((p = named(s, NULL, address)) == NULL)
+			else if ((p = named(s, NULL, address, &found)) == NULL)
 				rcode = 3u;
 			else if (type == DNS_PTR || type == DNS_ANY) {
-				size_t id = strlen(p->machine);
+				size_t id = strlen(p->id);
 
 				data[0] = (uint8_t)id;
-				memcpy(data + 1, p->machine, id);
+				memcpy(data + 1, p->id, id);
 				memcpy(data + 1u + id, "\4hull", 6u);
 				data_length = 1u + id + 6u;
 				answer_type = DNS_PTR;
@@ -777,7 +797,7 @@ static size_t dns_answer(const segment *s, uint32_t network, unsigned prefix,
 			rcode = 3u;
 		else if (strchr(name, '.') != NULL || name[0] == '\0')
 			rcode = 5u;
-		else if ((p = named(s, name, 0u)) == NULL)
+		else if ((p = named(s, name, 0u, &found)) == NULL)
 			rcode = ours || !forwards ? 3u : 5u;
 		else if (type == DNS_A || type == DNS_ANY) {
 			put32(data, p->address);
@@ -1140,6 +1160,7 @@ static void free_port(port *p)
 		}
 	}
 	close(p->fd);
+	free(p->hosts);
 	free(p);
 }
 
@@ -1371,6 +1392,13 @@ void hull_segment_resolvers(const char *const *servers, const unsigned *ports, u
 int hull_segment_port_addressed(const char *key, const char *machine, uint32_t address,
                                 unsigned prefix, int forwards, char *why, size_t cap)
 {
+	return hull_segment_port_named(key, machine, address, prefix, forwards, NULL, 0u, why, cap);
+}
+
+int hull_segment_port_named(const char *key, const char *machine, uint32_t address,
+                            unsigned prefix, int forwards, const hull_segment_host *hosts,
+                            unsigned count, char *why, size_t cap)
+{
 	int      pair[2];
 	segment *s = NULL;
 	port    *p;
@@ -1392,6 +1420,10 @@ int hull_segment_port_addressed(const char *key, const char *machine, uint32_t a
 		return -1;
 	}
 	p = calloc(1u, sizeof *p);
+	if (p != NULL && count != 0u && (p->hosts = malloc(count * sizeof *hosts)) == NULL) {
+		free(p);
+		p = NULL;
+	}
 	if (p == NULL) {
 		close(pair[0]);
 		close(pair[1]);
@@ -1403,6 +1435,9 @@ int hull_segment_port_addressed(const char *key, const char *machine, uint32_t a
 	p->address = address;
 	p->prefix  = prefix;
 	p->forwards = forwards;
+	if (count != 0u)
+		memcpy(p->hosts, hosts, count * sizeof *hosts);
+	p->host_count = count;
 	fcntl(p->fd, F_SETFL, O_NONBLOCK);
 	pthread_mutex_lock(&lock);
 	if (!running) {
@@ -1411,6 +1446,7 @@ int hull_segment_port_addressed(const char *key, const char *machine, uint32_t a
 		if (pipe2(wake, O_CLOEXEC | O_NONBLOCK) != 0 ||
 		    pthread_create(&thread, NULL, serve, NULL) != 0) {
 			pthread_mutex_unlock(&lock);
+			free(p->hosts);
 			free(p);
 			close(pair[0]);
 			close(pair[1]);
@@ -1429,6 +1465,7 @@ int hull_segment_port_addressed(const char *key, const char *machine, uint32_t a
 	}
 	if (s == NULL || s->port_count == MAX_PORTS) {
 		pthread_mutex_unlock(&lock);
+		free(p->hosts);
 		free(p);
 		close(pair[0]);
 		close(pair[1]);
@@ -1437,6 +1474,7 @@ int hull_segment_port_addressed(const char *key, const char *machine, uint32_t a
 	}
 	if (!addressed_apart(s, p, why, cap)) {
 		pthread_mutex_unlock(&lock);
+		free(p->hosts);
 		free(p);
 		close(pair[0]);
 		close(pair[1]);
