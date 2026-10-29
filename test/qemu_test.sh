@@ -1514,6 +1514,48 @@ out=$(cat "$root/held.out")
 got=0
 has 0 '^20000000$'
 
+# The workload's own output on the same credit, since 2026-10-29: a run
+# read seven seconds late gets all 8 MB, eight times the log, with
+# nothing said lost, where it had lost all but the last MiB or so; and
+# while a run is held, the machine answers an exec, the agent reading
+# every other channel, and a stop ends it at once.
+conf vheld '(backend vm) (mutable overlay) (network none) (command "/probe" "spew" "8000000")'
+want=$("$probe" spew 8000000 | "$probe" count)
+cases=$((cases + 1))
+got_held=$(timeout -k 2 120 "$hull" run -f "$root/vheld.conf" 2> "$root/vheld.err" |
+	(sleep 7; "$probe" count))
+[ "$got_held" = "$want" ] && ! grep -q 'output lost' "$root/vheld.err" ||
+	fail "a vm's run read late lost its output" "$got_held, not $want: $(cat "$root/vheld.err")"
+conf vstuck '(backend vm) (mutable overlay) (network none) (hostname "vstuck") (command "/probe" "spew" "50000000")'
+# Into a fifo opened here and never read, then closed: the run's next
+# write fails, and it ends then, rather than when a reader would.
+rm -f "$root/vstuck.fifo"
+mkfifo "$root/vstuck.fifo"
+(timeout -k 2 90 "$hull" run -f "$root/vstuck.conf" > "$root/vstuck.fifo" 2> /dev/null) &
+vstuckrun=$!
+exec 8< "$root/vstuck.fifo"
+tries=0
+until "$hull" ps 2>/dev/null | grep -q '^vstuck .*running$' || [ "$tries" -ge 120 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+sleep 2
+cases=$((cases + 1))
+started=$(date +%s)
+out=$(timeout 20 "$hull" exec vstuck /probe say answered 2>&1)
+took=$(($(date +%s) - started))
+[ "$out" = answered ] && [ "$took" -lt 5 ] ||
+	fail "a vm whose run was held did not answer an exec" "$out after ${took}s"
+cases=$((cases + 1))
+started=$(date +%s)
+"$hull" stop --timeout 5 vstuck > /dev/null 2>&1
+took=$(($(date +%s) - started))
+[ "$took" -lt 4 ] && ! "$hull" ps 2>/dev/null | grep -q '^vstuck .*running$' ||
+	fail "a vm held by a run that never read was not stopped at once" "${took}s"
+exec 8<&-
+wait "$vstuckrun" 2> /dev/null
+rm -f "$root/vstuck.fifo"
+
 # A terminal of the size asked, resized; spoken by hand, as a frontend not
 # ours might, so that the sizes are the test's own.
 cases=$((cases + 1))

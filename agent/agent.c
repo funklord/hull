@@ -36,7 +36,8 @@
  * blocks writing, as on a pipe. Its stdin flows the other way: the agent
  * gives the host 64 KiB and gives credit back as bytes reach the command,
  * and says `eof` once the command's input has closed. The workload's
- * output, on channel 0, has no credit: the host never holds it back.
+ * output, on channel 0, flows on the same credit since 2026-10-29, so the
+ * run that started the machine holds it back as a pipe would.
  *
  * `connect` forwards one of the machine's ports: a TCP connection to the
  * machine's own address, on a channel the host allocated, flowing on the
@@ -1337,7 +1338,7 @@ static const char *spawn(uint32_t ch, char *const *argv, const char *cwd, char *
 	}
 	if (c->in >= 0)
 		fcntl(c->in, F_SETFL, fcntl(c->in, F_GETFL) | O_NONBLOCK);
-	c->credited = ch != 0u;
+	c->credited = 1;
 	c->credit   = WINDOW;
 	if (c->in >= 0 && (c->input = malloc(WINDOW)) == NULL)
 		close_input(c);

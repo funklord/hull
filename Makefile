@@ -156,7 +156,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  searched.conf denied.conf unfound.conf rootfs/srv/searchme rootfs/bin/searchme \
                  listen.out nethost.conf netnone.conf netexec.conf netexec.out vmhost.conf tools/squashfuse segmented.conf nested.conf nestover.conf inited.conf pathless.conf pathed.conf owned.conf ownedin.conf exported.conf exported.tar exported.view exportin.conf owners.list owned_back.conf rootfs/given ownedin_back.conf ownedrun.tar ownedrun.conf layered.conf relayered.conf layeredin.conf sharedupper.conf \
                  whole.conf quit.conf refused.conf devs.conf devroot/probe hostdev.conf cut.conf cut.out counts.out impair.err pausing.conf pausing.out cutin.conf cutin.out cutin.counts offwire.conf tam.conf tam.out tam.err tam.counts badtam.conf injhear.conf injhear.out inj.err \
-                 named.conf inplace.conf placed.conf $(foreach n,1 2 3 4 5 6 7 8,lines$(n).conf lines$(n).want lines$(n).out) grouped.conf grouproot/probe grouproot/etc/motd grouproot/etc/resolv.conf groupdata/given twosub.conf half.conf \
+                 named.conf inplace.conf held.conf held.err stuck.conf placed.conf $(foreach n,1 2 3 4 5 6 7 8,lines$(n).conf lines$(n).want lines$(n).out) grouped.conf grouproot/probe grouproot/etc/motd grouproot/etc/resolv.conf groupdata/given twosub.conf half.conf \
                  full.conf full.out full.counts another.conf widened.conf barejoin.conf \
                  early.conf early.out late.conf dyn.counts capseg.conf capseg.out capseg.err capseg.pcap \
                  gemodel.conf gemodel.out gemodel.counts natlisten.out netnat.conf natports.conf \
@@ -178,7 +178,7 @@ DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf vol
 # What test/qemu_test.sh writes.
 QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.conf write.conf \
                   readonly.conf vol.conf volro.conf trap.conf trap.out wait.conf kept.conf \
-                  emu.conf execd.conf held.out xtrap.out xstop.out net.conf listen.out brief.conf \
+                  emu.conf execd.conf held.out vheld.conf vheld.err vstuck.conf xtrap.out xstop.out net.conf listen.out brief.conf \
                   ports.conf ports.out client.out vbridged.conf vbridge2.conf vbrnamed.conf relay-resolv.conf fakedns.py taken.conf udp.conf udp.out dial.conf dial.out sshed.conf sshed.out home/.ssh/config keep.conf \
                   overlay.conf overro.conf rootfs/srv/kept adopt.conf brief2.conf ended.conf secret.conf norun.conf pw.txt secret/probe \
                   searched.conf netnone.conf netports.conf rootfs/probe rootfs/bin/sh rootfs/written rootfs/etc/resolv.conf \

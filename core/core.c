@@ -81,6 +81,7 @@
 #define DATA_CHUNK       65536u
 #define INPUT_WINDOW     65536u  /* an exec's stdin the core holds, at most */
 #define OUTPUT_WINDOW    65536u  /* an exec's output a frontend has unasked */
+#define RUN_WINDOW       262144u /* a machine's output its own run has not been sent */
 #define FEED_LOW         65536u  /* a follower is fed while less than this waits */
 #define OUTBOX_LIMIT     (8u << 20)  /* answers a frontend leaves unread, at most */
 #define FOLLOW_ON        UINT64_MAX
@@ -108,6 +109,7 @@ typedef struct follower {
 	uint32_t  ch;
 	uint64_t  at;
 	uint64_t  until;
+	int       holds;  /* the run that started the machine: it holds it back */
 } follower;
 
 /* One record of output: which stream, and its bytes. */
@@ -171,6 +173,14 @@ struct slot {
 	unsigned           follower_count;
 	follower           stops[MAX_STOPS];  /* answered `done` at the exit */
 	unsigned           stop_count;
+	/* The run that started the machine holds it back, as a pipe holds the
+	 * command writing into it (section 4.10): under flow_lock, the output
+	 * the machine has made and how much of it that run has been sent,
+	 * and whether it still holds -- until it is gone, the machine is
+	 * stopped, or the core goes. */
+	uint64_t           made;
+	uint64_t           hold_at;
+	int                holding;
 	record            *log;
 	record            *log_tail;
 	size_t             log_size;
@@ -233,6 +243,15 @@ static hull_registry registry;
  * entry knows is the one under way, which `adopting` is. */
 static pthread_mutex_t flow_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  flow_room = PTHREAD_COND_INITIALIZER;
+
+/* The machine `s` no longer held back by its run: woken if it waits. */
+static void release_hold(slot *s)
+{
+	pthread_mutex_lock(&flow_lock);
+	s->holding = 0;
+	pthread_cond_broadcast(&flow_room);
+	pthread_mutex_unlock(&flow_lock);
+}
 static exec_entry     *adopting;
 
 static exec_entry *exec_of(hull_stream *stream);
@@ -313,6 +332,19 @@ static void on_data(hull_core *core, hull_stream *stream, int fd, const uint8_t 
 			pthread_cond_wait(&flow_room, &flow_lock);
 		if (x != NULL)
 			x->held += n;
+		pthread_mutex_unlock(&flow_lock);
+	}
+	/* The machine's own output waits while its run is a window behind,
+	 * so a run read slowly holds the machine back as a pipe would, and is
+	 * never lapped by the log: the engine's reader stops reading, and the
+	 * workload blocks writing. */
+	if (stream == NULL && e->generation == e->slot->generation) {
+		slot *s = e->slot;
+
+		pthread_mutex_lock(&flow_lock);
+		while (s->holding && s->made + n - s->hold_at > RUN_WINDOW)
+			pthread_cond_wait(&flow_room, &flow_lock);
+		s->made += n;
 		pthread_mutex_unlock(&flow_lock);
 	}
 	e->stream = stream;
@@ -691,7 +723,7 @@ static void keep_log(slot *s, int fd, const uint8_t *bytes, size_t length)
 static void add_follower(slot *s, client *c, uint32_t ch, uint64_t at, uint64_t until)
 {
 	if (s->follower_count < MAX_ATTACHED)
-		s->followers[s->follower_count++] = (follower){ c, ch, at, until };
+		s->followers[s->follower_count++] = (follower){ c, ch, at, until, 0 };
 	else
 		send_error(c, ch, "the machine has as many followers as it can");
 }
@@ -723,6 +755,12 @@ static int feed_one(slot *s, follower *f, int *done)
 					n = DATA_CHUNK;
 				send_data(f->client, f->ch, r->fd, r->bytes + into, (size_t)n);
 				f->at += n;
+				if (f->holds) {
+					pthread_mutex_lock(&flow_lock);
+					s->hold_at = f->at;
+					pthread_cond_broadcast(&flow_room);
+					pthread_mutex_unlock(&flow_lock);
+				}
 				return 1;
 			}
 		}
@@ -763,6 +801,8 @@ static int feed(client *c)
 			fed |= done;
 			if (!done)
 				s->followers[kept++] = *one;
+			else if (one->holds)
+				release_hold(s);
 		}
 		s->follower_count = kept;
 	}
@@ -829,6 +869,10 @@ static void stop_machine(slot *s, int timeout_ms)
 {
 	stop_job *job = malloc(sizeof *job);
 	pthread_t thread;
+
+	/* A stop is not held up by a run that is not reading: the engine's
+	 * reader takes the rest, so the machine can end. */
+	release_hold(s);
 
 	wake_machine(s);
 
@@ -1982,6 +2026,14 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		return;
 	}
 	add_follower(s, c, ch, 0u, FOLLOW_ON);
+	if (s->follower_count != 0u && s->followers[s->follower_count - 1u].client == c) {
+		s->followers[s->follower_count - 1u].holds = 1;
+		pthread_mutex_lock(&flow_lock);
+		s->made    = 0u;
+		s->hold_at = 0u;
+		s->holding = 1;
+		pthread_mutex_unlock(&flow_lock);
+	}
 	if (engine->ops->start(&s->core, s->handle, &error) != HULL_OK) {
 		send_error(c, ch, error.detail != NULL ? error.detail : "start failed");
 		engine->ops->destroy(&s->core, s->handle, &error);
@@ -2053,7 +2105,7 @@ static void handle_stop(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		return;
 	}
 	if (s->stop_count < MAX_STOPS)
-		s->stops[s->stop_count++] = (follower){ c, ch, 0u, 0u };
+		s->stops[s->stop_count++] = (follower){ c, ch, 0u, 0u, 0 };
 	stop_machine(s, timeout < 0 ? 0 : timeout > 600000 ? 600000 : (int)timeout);
 }
 
@@ -3114,9 +3166,12 @@ static void disconnect(client *c)
 
 		if (!s->used)
 			continue;
-		for (unsigned f = 0u; f < s->follower_count; f++)
+		for (unsigned f = 0u; f < s->follower_count; f++) {
 			if (s->followers[f].client != c)
 				s->followers[kept++] = s->followers[f];
+			else if (s->followers[f].holds)
+				release_hold(s);
+		}
 		s->follower_count = kept;
 		kept = 0u;
 		for (unsigned f = 0u; f < s->stop_count; f++)
@@ -3563,6 +3618,11 @@ int hull_core_run(const char *host_arch)
 	unlink(path);
 	close(listener);
 
+	/* Every machine still running is stopped, and waited for: let go of
+	 * first, since no run will read what they write now. */
+	for (unsigned i = 0u; i < MAX_MACHINES; i++)
+		if (machines[i].used)
+			release_hold(&machines[i]);
 	/* Every machine still running is stopped, and waited for. */
 	for (unsigned i = 0u; i < MAX_MACHINES; i++)
 		if (machines[i].used && !machines[i].exited)

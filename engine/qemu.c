@@ -171,6 +171,16 @@ struct hull_machine {
 	int              connected;
 	pthread_t        reader;
 	int              started;
+	/* The workload's output, channel 0, on the agent's credit since
+	 * 2026-10-29: read_agent queues it and never waits, and a deliverer
+	 * hands it to on_data, which may wait while the run that started the
+	 * machine is behind, and gives the agent credit back after. Under
+	 * `lock`. */
+	piece           *work_head;
+	piece           *work_tail;
+	size_t           work_bytes;   /* queued, at most WORK_LIMIT */
+	pthread_cond_t   work_changed;
+	int              work_ended;
 	pthread_mutex_t  lock;         /* `done`, and signalling qemu */
 	pthread_mutex_t  send_lock;    /* one message at a time to the agent */
 	pthread_cond_t   done_cond;
@@ -1969,9 +1979,51 @@ static void for_stream(hull_machine *m, const hull_sexpr_doc *body, long long ch
 	pthread_mutex_unlock(&m->lock);
 }
 
+static void send_credit(hull_machine *m, uint32_t ch, size_t bytes);
+
+/* The most of the workload's output queued for the deliverer: credit keeps
+ * it to 64 KiB, so this is reached only by an agent that ignores credit on
+ * channel 0, one from before it was given, whose machine a core took back.
+ * read_agent waits for the deliverer then, as it once waited in on_data,
+ * rather than queue without end. */
+#define WORK_LIMIT (1u << 20)
+
+/* The workload's output, handed to on_data a piece at a time, each given
+ * back to the agent as credit once on_data has taken it: so a run that
+ * reads slowly holds the workload back, as a pipe would, and nothing
+ * else of the machine's. Ends once read_agent says the output has. */
+static void *deliver_workload(void *arg)
+{
+	hull_machine *m = arg;
+
+	for (;;) {
+		piece *p;
+
+		pthread_mutex_lock(&m->lock);
+		while (m->work_head == NULL && !m->work_ended)
+			pthread_cond_wait(&m->work_changed, &m->lock);
+		p = m->work_head;
+		if (p != NULL) {
+			if ((m->work_head = p->next) == NULL)
+				m->work_tail = NULL;
+			m->work_bytes -= p->length;
+			pthread_cond_broadcast(&m->work_changed);
+		}
+		pthread_mutex_unlock(&m->lock);
+		if (p == NULL)
+			break;
+		host->on_data(m->core, NULL, p->fd, p->bytes, p->length);
+		send_credit(m, 0u, p->length);
+		free(p);
+	}
+	return NULL;
+}
+
 static void *read_agent(void *arg)
 {
 	hull_machine *m = arg;
+	pthread_t     deliverer;
+	int           delivering = pthread_create(&deliverer, NULL, deliver_workload, m) == 0;
 
 	for (;;) {
 		hull_sexpr_doc   body;
@@ -2011,9 +2063,33 @@ static void *read_agent(void *arg)
 			hull_sexpr_form buf;
 			hull_sexpr_form fd;
 
-			if (hull_msg_find(&body, "buf", &buf) && hull_msg_find(&body, "fd", &fd))
-				host->on_data(m->core, NULL, hull_sexpr_is(&body, &fd, "2") ? 2 : 1,
-				              body.data + buf.content, buf.content_length);
+			if (hull_msg_find(&body, "buf", &buf) && hull_msg_find(&body, "fd", &fd)) {
+				int    to = hull_sexpr_is(&body, &fd, "2") ? 2 : 1;
+				piece *p  = delivering ? malloc(sizeof *p + buf.content_length) : NULL;
+
+				if (p == NULL) {
+					/* Without the deliverer, here: this thread waits. */
+					host->on_data(m->core, NULL, to, body.data + buf.content,
+					              buf.content_length);
+					send_credit(m, 0u, buf.content_length);
+				} else {
+					p->next   = NULL;
+					p->fd     = to;
+					p->length = buf.content_length;
+					memcpy(p->bytes, body.data + buf.content, buf.content_length);
+					pthread_mutex_lock(&m->lock);
+					while (m->work_bytes > WORK_LIMIT)
+						pthread_cond_wait(&m->work_changed, &m->lock);
+					if (m->work_tail != NULL)
+						m->work_tail->next = p;
+					else
+						m->work_head = p;
+					m->work_tail = p;
+					m->work_bytes += p->length;
+					pthread_cond_broadcast(&m->work_changed);
+					pthread_mutex_unlock(&m->lock);
+				}
+			}
 		} else if (hull_msg_is(&body, "exited")) {
 			m->exited = 1;
 			if (hull_msg_find(&body, "code", &value) && hull_msg_long(&body, &value, &number))
@@ -2023,6 +2099,15 @@ static void *read_agent(void *arg)
 		} else if (hull_msg_is(&body, "bye")) {
 			break;
 		}
+	}
+	/* The workload's output handed on before its end is said, as the
+	 * agent says the end only once that output has been read. */
+	if (delivering) {
+		pthread_mutex_lock(&m->lock);
+		m->work_ended = 1;
+		pthread_cond_broadcast(&m->work_changed);
+		pthread_mutex_unlock(&m->lock);
+		pthread_join(deliverer, NULL);
 	}
 	/* Closed on bye, which the agent waits for before it powers off:
 	 * what it sent before bye has all been read. */
@@ -2093,6 +2178,7 @@ static hull_status qemu_create(hull_core *core, hull_buf plan, hull_machine **ou
 	pthread_cond_init(&m->done_cond, NULL);
 	pthread_cond_init(&m->quiet, NULL);
 	pthread_cond_init(&m->guest_cond, NULL);
+	pthread_cond_init(&m->work_changed, NULL);
 	if ((reason = read_plan(m, &doc)) != NULL) {
 		release(m);
 		return fail(error, HULL_ERR_UNSUPPORTED, reason);
@@ -2661,6 +2747,7 @@ static hull_status qemu_adopt(hull_core *core, hull_buf state, hull_machine **ou
 	pthread_cond_init(&m->done_cond, NULL);
 	pthread_cond_init(&m->quiet, NULL);
 	pthread_cond_init(&m->guest_cond, NULL);
+	pthread_cond_init(&m->work_changed, NULL);
 	if ((reason = read_state(m, state)) != NULL) {
 		m->dir[0] = '\0';
 		release(m);

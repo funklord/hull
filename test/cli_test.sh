@@ -994,6 +994,43 @@ while eofs < 12:
 total = sum(int(n) for n in re.findall(rb"\(4:data\(3:buf(\d+):", got))
 print("eofs=%d bytes=%d" % (eofs, total))
 '
+# The run that started a machine holds it back, as a pipe holds the
+# command writing into it: a run read seven seconds late still gets every
+# byte of a machine's 8 MB, eight times the log, and is told of nothing
+# lost; where `logs -f` above, a follower and no more, lost what left the
+# log. And a stop is not held up by a run that never reads: the machine
+# ends at once, its output taken and dropped.
+conf held '(command "/probe" "spew" "8000000")' '(hostname "held") (network none)'
+want=$("$probe" spew 8000000 | "$probe" count)
+cases=$((cases + 1))
+got=$(cd / && timeout -k 2 60 "$hull_abs" run -f "$root/held.conf" 2> "$root/held.err" |
+	(sleep 7; "$root/rootfs/probe" count))
+[ "$got" = "$want" ] && ! grep -q 'output lost' "$root/held.err" ||
+	fail "a run read late lost the machine's output" "$got, not $want: $(cat "$root/held.err")"
+conf stuck '(command "/probe" "spew" "50000000")' '(hostname "stuck") (network none)'
+# Into a fifo opened here and never read, then closed: the run's next
+# write fails, and it ends then, rather than when a reader would.
+rm -f "$root/stuck.fifo"
+mkfifo "$root/stuck.fifo"
+(cd / && exec timeout -k 2 40 "$hull_abs" run -f "$root/stuck.conf" > "$root/stuck.fifo" \
+	2> /dev/null) &
+stuckrun=$!
+exec 8< "$root/stuck.fifo"
+tries=0
+until "$hull" ps 2>/dev/null | grep -q '^stuck .*running$' || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+sleep 1
+started=$(date +%s)
+"$hull" stop --timeout 5 stuck > /dev/null 2>&1
+took=$(($(date +%s) - started))
+cases=$((cases + 1))
+[ "$took" -lt 3 ] && ! "$hull" ps 2>/dev/null | grep -q '^stuck .*running$' ||
+	fail "a machine held by a run that never read was not stopped at once" "${took}s"
+exec 8<&-
+wait "$stuckrun" 2> /dev/null
+rm -f "$root/stuck.fifo"
 # Eight machines writing at once, each a line per write, so each line is
 # a frame of its own through its machine's reader thread in the engine:
 # every run gets its own lines, whole and in order. The readers once
