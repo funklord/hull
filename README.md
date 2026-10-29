@@ -356,8 +356,8 @@ machine on docker with the same machine on chroot or vm.
   root to the user instead.
 - A directory cannot run in place: `(mutable direct)` is refused, and an
   overlay is a `docker import` of the tree, kept by its hash.
-- No `(init …)` yet, and no `(segments …)`: decided 2026-10-28, since
-  chroot gives a container a wire of its own without a root daemon.
+- No `(init …)` yet, and no `(segments …)`: chroot gives a container a
+  wire of its own without a root daemon.
 
 **Caveats**
 - `/` in a container is root's, as docker makes every image's, while the
