@@ -319,10 +319,10 @@ expect 1 'segments: rejected: a container.s NIC is the daemon.s, never on the co
 	"$hull" plan -f "$dir/segmented.conf" --backend docker
 expect 0 'machine on qemu \(vm\): ok|segments: native' \
 	"$hull" plan --explain -f "$dir/segmented.conf" --backend vm
-# So is handing PID 1 to the image's init.
+# Handing PID 1 to the image's init is chroot's and qemu's, not docker's.
 printf '%s\n' '(machine (source "dir:./rootfs") (init "/sbin/init"))' > "$dir/inited.conf"
-expect 1 'init: rejected: not yet: the machine.s PID 1 is the engine.s own' \
-	"$hull" plan -f "$dir/inited.conf" --backend chroot
+expect 0 'init: native: the image.s init is PID 1, the engine.s a child of it' \
+	"$hull" plan --explain -f "$dir/inited.conf" --backend chroot
 expect 1 'init: rejected: not yet: a container.s PID 1 is docker.s init' \
 	"$hull" plan -f "$dir/inited.conf" --backend docker
 expect 2 'plan takes one backend' "$hull" plan -f "$dir/ref.conf" --backend ns,vm
@@ -1144,6 +1144,62 @@ for want in '^kind=chr 1:3$' '^kind=chr 1:5$' '^kind=chr 1:7$' '^kind=chr 1:9$' 
 	'^owner=0:0 1777$' '^write=ok$'; do
 	from_root 0 "$want" -f "$root/devs.conf"
 done
+# (init PATH) on chroot, as on a vm: PID 1 is the image's init, here the
+# probe as one, which reaps for ever, and hull's init goes on as its
+# child; the workload is not PID 1, and when it ends the image's
+# /sbin/poweroff, the probe as one, ends the machine at once. A stop
+# reaches the workload by hull's init, as without the key, not after the
+# kill. Without a poweroff the machine ends after the grace; an init that
+# is not there is refused.
+mkdir -p "$root/initroot/sbin" "$root/initroot/proc" "$root/initroot/dev" \
+	"$root/initbare/sbin" "$root/initbare/proc" "$root/initbare/dev"
+for d in initroot initbare; do
+	cp "$probe" "$root/$d/probe"
+	cp "$probe" "$root/$d/sbin/init"
+done
+cp "$probe" "$root/initroot/sbin/poweroff"
+printf '(machine (source "dir:./initroot") (backend chroot) (init "/sbin/init") %s)\n' \
+	'(command "/probe" "target" "/proc/1/exe" "pid")' > "$root/inited.conf"
+started=$(date +%s)
+from_root 0 '^target=/sbin/init$' -f "$root/inited.conf"
+took=$(( $(date +%s) - started ))
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -Eq '^pid=([2-9]|[1-9][0-9]+)$' ||
+	fail "a machine handed to its init ran its workload as PID 1" "$out"
+cases=$((cases + 1))
+[ "$took" -lt 10 ] || fail "a machine handed to its init took ${took}s to end, its poweroff unused" "$out"
+printf '(machine (source "dir:./initroot") (backend chroot) (init "/sbin/init") %s)\n' \
+	'(hostname "initexec") (command "/probe" "say" "ready" "wait")' > "$root/initexec.conf"
+rm -f "$root/initexec.out"
+init_hull=$(cd "$(dirname "$hull")" && pwd)/$(basename "$hull")
+(cd / && exec timeout 60 "$init_hull" run -f "$root/initexec.conf" > "$root/initexec.out" 2>&1) &
+initexec=$!
+tries=0
+until grep -q '^ready$' "$root/initexec.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+expect 0 '^target=/sbin/init$' "$hull" exec initexec /probe target /proc/1/exe
+started=$(date +%s)
+timeout 30 "$hull" stop --timeout 8 initexec > /dev/null 2>&1
+took=$(( $(date +%s) - started ))
+wait "$initexec"
+cases=$((cases + 1))
+[ "$took" -lt 6 ] || fail "a stop of a machine handed to its init took ${took}s: its TERM missed the workload" \
+	"$(cat "$root/initexec.out")"
+rm -f "$root/initexec.out"
+printf '(machine (source "dir:./initbare") (backend chroot) (init "/sbin/init") %s)\n' \
+	'(command "/probe" "say" "bare")' > "$root/initbare.conf"
+started=$(date +%s)
+limit=60
+from_root 0 '^bare$' -f "$root/initbare.conf"
+took=$(( $(date +%s) - started ))
+cases=$((cases + 1))
+[ "$took" -ge 18 ] && [ "$took" -lt 45 ] ||
+	fail "a machine with no poweroff ended in ${took}s, not after the grace" "$out"
+printf '(machine (source "dir:./initroot") (backend chroot) (init "/sbin/nothing") %s)\n' \
+	'(command "/probe" "say" "never")' > "$root/noinit.conf"
+from_root 125 'no init it can run' -f "$root/noinit.conf"
 cases=$((cases + 1))
 [ -z "$(ls -A "$root/devroot/dev")" ] || fail "a write to a machine's /dev reached its tree" "$(ls -A "$root/devroot/dev")"
 # A machine whose root is the host's own / keeps the host's /dev, whose

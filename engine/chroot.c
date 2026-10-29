@@ -54,6 +54,7 @@
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/reboot.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -112,6 +113,7 @@ struct hull_machine {
 	char            *root;       /* the dir source, without "dir:" */
 	char            *workdir;
 	char            *hostname;   /* or NULL */
+	char            *init;       /* (init PATH): the image's init, PID 1 once handed to */
 	char            *argv[MAX_ARGS + 1u];
 	char            *envp[MAX_ENV + 1u];
 	int              readonly_root;
@@ -187,6 +189,7 @@ static void release(hull_machine *m)
 	free(m->root);
 	free(m->workdir);
 	free(m->hostname);
+	free(m->init);
 	free(m->secrets);
 	free(m->ssh_dir);
 	free(m->hosts);
@@ -280,6 +283,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	free(source);
 	m->workdir  = hull_access_value(doc, &machine, "workdir");
 	m->hostname = hull_access_value(doc, &machine, "hostname");
+	m->init = hull_access_value(doc, &machine, "init");
 	if (m->root == NULL || m->workdir == NULL)
 		return "the plan is missing its source or workdir";
 
@@ -1115,6 +1119,101 @@ static int export_sink(void *context, const uint8_t *data, size_t n)
 	return 0;
 }
 
+/* Seconds the image's own shutdown is given before the namespace is
+ * ended regardless, as a vm's agent gives it (agent/agent.c). */
+#define SHUTDOWN_GRACE 20
+
+/* The name hull's init goes by once it is PID 1's child, which is how the
+ * engine finds it to signal (signal_init). */
+#define HANDED_NAME "hull-init"
+
+static int handed;  /* this init is PID 1's child, the image's init PID 1 */
+
+/*
+ * (init PATH), as on a vm (section 4.11): PID 1 becomes the image's init
+ * and this one goes on in a child of it, the reaper of what it starts,
+ * relaying the workload as it did. PID 1's signals are given back and
+ * every descriptor of this one's closed on its exec, so the image's init
+ * holds nothing of hull's; should the exec fail, PID 1 reaps for ever
+ * rather than end the machine under its workload. Before any handler is
+ * set, so none is given to the image's init.
+ */
+static void hand_over(const hull_machine *m, int report)
+{
+	pid_t   agent;
+	int     execed[2];
+	char    failed;
+	ssize_t got;
+
+	if (access(m->init, X_OK) != 0)
+		child_fail(report, "the machine has no init it can run at its (init ...) path");
+	if (pipe2(execed, O_CLOEXEC) != 0)
+		child_fail(report, "pipe");
+	agent = bare_fork();
+	if (agent < 0)
+		child_fail(report, "fork");
+	if (agent > 0) {
+		char *const argv[] = { m->init, NULL };
+		sigset_t    none;
+
+		close(execed[0]);
+		sigemptyset(&none);
+		sigprocmask(SIG_SETMASK, &none, NULL);
+		syscall(SYS_close_range, 3u, ~0u, CLOSE_RANGE_CLOEXEC);
+		execv(m->init, argv);
+		if (write(execed[1], "x", 1u) != 1) {
+			/* hull's init reads the pipe's end alone, and goes on */
+		}
+		close(execed[1]);
+		for (;;)
+			if (wait(NULL) < 0)
+				pause();
+	}
+	/* Not before the image's init is PID 1: its exec closes the pipe,
+	 * and a failed one says so on it. Without the wait the workload ran
+	 * while PID 1 was still hull's, and saw it there. */
+	close(execed[1]);
+	while ((got = read(execed[0], &failed, 1u)) < 0 && errno == EINTR)
+		;
+	close(execed[0]);
+	if (got > 0)
+		child_fail(report, "the image's init could not be run as PID 1");
+	handed = 1;
+	prctl(PR_SET_CHILD_SUBREAPER, 1L, 0L, 0L, 0L);
+	prctl(PR_SET_NAME, HANDED_NAME, 0L, 0L, 0L);
+}
+
+/*
+ * The workload has ended and said so: the machine goes. Handed over, the
+ * image's own shutdown is asked for, /sbin/poweroff, which every init of
+ * note answers, so what it started ends as it would; after the grace the
+ * namespace is ended regardless, reboot() from inside a PID namespace
+ * ending its PID 1.
+ */
+static void finish(void)
+{
+	if (handed) {
+		pid_t asked = bare_fork();
+
+		if (asked == 0) {
+			char *const argv[] = { "poweroff", NULL };
+			sigset_t    none;
+
+			sigemptyset(&none);
+			sigprocmask(SIG_SETMASK, &none, NULL);
+			execv("/sbin/poweroff", argv);
+			_exit(127);
+		}
+		for (int i = 0; i < SHUTDOWN_GRACE * 4; i++) {
+			struct timespec quarter = { 0, 250000000L };
+
+			nanosleep(&quarter, NULL);
+		}
+		reboot(RB_POWER_OFF);
+	}
+	_exit(0);
+}
+
 /* The merged root as engine/tree.c's tar, its own mount alone, so no
  * /proc, volume or secret, each owner as this namespace sees it, which
  * is what keeps an owner of the subordinate range off the user's disk.
@@ -1175,9 +1274,9 @@ static void relay(int conn, int listener, int out, int err, pid_t workload)
 				export_tree(conn, &status, workload);
 			if (idle && conn >= 0 &&
 			    send_frame(conn, 'x', 0, &status, sizeof status, workload) == 0)
-				_exit(0);
+				finish();
 			if (idle && listener < 0)
-				_exit(0);
+				finish();
 		}
 		if (poll(fds, 4u, ended ? 200 : -1) < 0) {
 			if (errno == EINTR)
@@ -1728,6 +1827,8 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		child_fail(report, "workdir");
 	if (m->no_new_privs && prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) != 0)
 		child_fail(report, "no_new_privs");
+	if (m->init != NULL)
+		hand_over(m, report);
 
 	memset(&action, 0, sizeof action);
 	action.sa_handler = hold;
@@ -2435,10 +2536,50 @@ static int wait_done(hull_machine *m, int timeout_ms)
 }
 
 /* `signal` to the init, unless it has been reaped and its pid freed. */
+/*
+ * hull's init where (init PATH) handed PID 1 to the image's: PID 1's child
+ * named HANDED_NAME, which relays the workload and takes its signals; 0
+ * where there is none. The children are the kernel's list, of a process
+ * the reader has not reaped, under the machine's lock.
+ */
+static pid_t handed_init(const hull_machine *m)
+{
+	char  path[64];
+	FILE *list;
+	long  child;
+	pid_t found = 0;
+
+	snprintf(path, sizeof path, "/proc/%ld/task/%ld/children", (long)m->pid, (long)m->pid);
+	list = fopen(path, "re");
+	while (list != NULL && found == 0 && fscanf(list, "%ld", &child) == 1) {
+		char  comm[32] = "";
+		FILE *name;
+
+		snprintf(path, sizeof path, "/proc/%ld/comm", child);
+		if ((name = fopen(path, "re")) != NULL) {
+			if (fgets(comm, sizeof comm, name) != NULL)
+				comm[strcspn(comm, "\n")] = '\0';
+			fclose(name);
+		}
+		if (strcmp(comm, HANDED_NAME) == 0)
+			found = (pid_t)child;
+	}
+	if (list != NULL)
+		fclose(list);
+	return found;
+}
+
 static void signal_init(hull_machine *m, int signal)
 {
+	pid_t to;
+
 	pthread_mutex_lock(&m->lock);
-	if (!m->done && m->adopted)
+	/* Handed over, a signal is the workload's, by hull's init, as without
+	 * the key; a KILL is PID 1's, which ends the namespace whole. */
+	to = m->init != NULL && !m->adopted && signal != SIGKILL && !m->done ? handed_init(m) : 0;
+	if (to > 0)
+		kill(to, signal);
+	else if (!m->done && m->adopted)
 		syscall(SYS_pidfd_send_signal, m->pidfd, signal, NULL, 0u);
 	else if (!m->done)
 		kill(m->pid, signal);
@@ -3346,8 +3487,8 @@ static const hull_cap_entry entries[] = {
 	  NULL },
 	{ "owners",                 HULL_SUP_NATIVE,
 	  "given in the overlay before the workload, where many uids are mapped", NULL },
-	{ "init",                   HULL_SUP_REJECTED,
-	  "not yet: the machine's PID 1 is the engine's own, which reaps and forwards signals",
+	{ "init",                   HULL_SUP_NATIVE,
+	  "the image's init is PID 1, the engine's a child of it, and its poweroff ends the machine",
 	  NULL },
 	{ NULL,                     HULL_SUP_NATIVE,   NULL, NULL },
 };
