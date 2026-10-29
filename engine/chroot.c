@@ -2029,7 +2029,9 @@ static int read_full(int fd, void *bytes, size_t n)
 
 static void *read_workload(void *arg)
 {
-	static uint8_t buffer[65536];
+	/* The thread's own: one runs per machine, and a buffer they shared
+	 * was overwritten by one while the other's on_data copied it out. */
+	uint8_t        buffer[65536];
 	hull_machine  *m = arg;
 	frame          f;
 	int            status = 0;

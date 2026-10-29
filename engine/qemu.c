@@ -3339,7 +3339,7 @@ out:
  * and dropped, as udp is, where the machine has no channel left. */
 static void forward_datagram(hull_machine *m, unsigned port)
 {
-	static uint8_t     datagram[65536];
+	uint8_t            datagram[65536];   /* forwarders, one a machine, run at once */
 	struct sockaddr_in from;
 	socklen_t          length = sizeof from;
 	ssize_t            n = recvfrom(m->listeners[port], datagram, sizeof datagram, MSG_DONTWAIT,

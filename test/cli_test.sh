@@ -994,6 +994,38 @@ while eofs < 12:
 total = sum(int(n) for n in re.findall(rb"\(4:data\(3:buf(\d+):", got))
 print("eofs=%d bytes=%d" % (eofs, total))
 '
+# Eight machines writing at once, each a line per write, so each line is
+# a frame of its own through its machine's reader thread in the engine:
+# every run gets its own lines, whole and in order. The readers once
+# shared a static buffer, and one machine's lines landed in another's
+# output, 15 of 40 runs here. Under the log's MiB, so nothing is lost by
+# design, and twice over, since a round can miss the race. (network
+# none), so that no pasta staggers the starts and they write together:
+# with one each, the same case on the broken build crossed nothing.
+for n in 1 2 3 4 5 6 7 8; do
+	conf "lines$n" "(command \"/probe\" \"lines\" \"20000\" \"machine-$n\")" \
+		"(hostname \"lines$n\") (network none)"
+	"$probe" lines 20000 "machine-$n" > "$root/lines$n.want"
+done
+cases=$((cases + 1))
+crossed=0
+for round in 1 2; do
+	writers=
+	for n in 1 2 3 4 5 6 7 8; do
+		(cd / && exec timeout -k 2 60 "$hull_abs" run -f "$root/lines$n.conf" \
+			> "$root/lines$n.out" 2> /dev/null) &
+		writers="$writers $!"
+	done
+	for writer in $writers; do
+		wait "$writer"
+	done
+	for n in 1 2 3 4 5 6 7 8; do
+		cmp -s "$root/lines$n.out" "$root/lines$n.want" || crossed=$((crossed + 1))
+	done
+done
+[ "$crossed" -eq 0 ] ||
+	fail "machines writing at once got each other's output, $crossed of 16 runs" \
+		"$(diff "$root/lines1.want" "$root/lines1.out" | head -5)"
 # A frontend that sends and never reads what it is answered is dropped once
 # 8 MiB of answers wait for it, and nobody else waits meanwhile. Queueing
 # them took 10 seconds and more with the host's CPUs oversubscribed, so

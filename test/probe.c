@@ -49,6 +49,8 @@
  *   count       all of its stdin: how many bytes, and their FNV-1a hash
  *   spew N      N bytes on stdout, from a xorshift that does not repeat
  *               in any window a ring or a buffer would have
+ *   lines N T   N lines on stdout, `T NNNNNN`, each written by itself, so
+ *               each crosses to the engine as a frame of its own
  *   sleep N     sleep N seconds
  *   nnp         whether no_new_privs is set
  *   session     whether it leads a session of its own
@@ -992,6 +994,12 @@ int main(int argc, char **argv)
 			if (!spew_to(1, strtoull(arg, NULL, 10)))
 				return 1;
 			i++;
+		} else if (strcmp(step, "lines") == 0 && i + 2 < argc) {
+			unsigned long count = strtoul(arg, NULL, 10);
+
+			for (unsigned long k = 1u; k <= count; k++)
+				printf("%s %06lu\n", argv[i + 2], k);
+			i += 2;
 		} else if (strcmp(step, "pour") == 0 && i + 2 < argc) {
 			int peer = accept_one(arg);
 
