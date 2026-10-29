@@ -997,8 +997,8 @@ int main(void)
 		 * the switch's, and its answer given back under the machine's own;
 		 * hull's own names still answered by it, and asked of nobody, and
 		 * so anything under .hull it has not; an answer from another than
-		 * the one asked, not taken; one past a frame cut to its question
-		 * and marked truncated; and a machine of (network none) on the
+		 * the one asked, not taken; one past a frame sent in IP fragments
+		 * that make it whole; and a machine of (network none) on the
 		 * same segment still refused, asking nobody; and once the segment
 		 * is gone, the socket it asked on from gone with it. */
 		int                before = settled_descriptors();
@@ -1053,10 +1053,38 @@ int main(void)
 		got = asked_of(resolver, q, sizeof q, &from, 1000);
 		if (got != 0u)
 			answer_from(resolver, q, got, &from, 1800u);
-		length = next_raw(web, f, sizeof f, 1000);
-		check("an answer past a frame, its question alone and truncated",
-		      length == 14u + 28u + got && get16(f + 42) == 0x1234u && (f[44] & 0x02u) != 0u &&
-		      get16(f + 48) == 0u && memcmp(f + 54, "\3big\7example", 13u) == 0);
+		{
+			/* Two IP fragments, the first full and saying more come,
+			 * the second at its offset: put back together, the whole
+			 * answer, its UDP sum right over all of it, under the
+			 * machine's id. */
+			uint8_t  second[1514];
+			uint8_t  whole[4096];
+			size_t   first_length = next_raw(web, f, sizeof f, 1000);
+			size_t   second_length = next_raw(web, second, sizeof second, 1000);
+			size_t   n = 0u;
+			uint32_t sum;
+			int      shaped = first_length == 1514u && second_length > 34u &&
+			                  (get16(f + 20) & 0x2000u) != 0u && (get16(f + 20) & 0x1fffu) == 0u &&
+			                  (get16(second + 20) & 0x2000u) == 0u &&
+			                  (get16(second + 20) & 0x1fffu) == 1480u / 8u &&
+			                  get16(f + 18) == get16(second + 18) &&
+			                  sum16(0u, f + 14, 20u) == 0xffffu &&
+			                  sum16(0u, second + 14, 20u) == 0xffffu;
+
+			if (shaped) {
+				size_t tail = get16(second + 16) - 20u;
+
+				memcpy(whole, f + 34, 1480u);
+				memcpy(whole + 1480u, second + 34, tail);
+				n = 1480u + tail;
+			}
+			sum = sum16(0u, f + 26, 8u) + 17u + (uint32_t)n;
+			check("an answer past a frame, in fragments that make it whole",
+			      shaped && get16(whole + 4) == n && sum16(sum, whole, n) == 0xffffu &&
+			      get16(whole + 8) == 0x1234u && get16(whole + 14) == 2u &&
+			      n == 8u + got + 16u + 12u + 1800u);
+		}
 		send_dns(db, 20u, "example.com", 1u);
 		check("a machine of (network none), refused",
 		      dns_reply(db, 20u, data, &length) == 5 &&

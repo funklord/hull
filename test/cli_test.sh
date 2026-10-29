@@ -1364,7 +1364,7 @@ grep -q '^hear=nothing$' "$root/cloner.out" ||
 # in the same file is left as it was: down, no address, no hosts.
 named="named-$$"
 printf '(machines (web %s) (db %s) (raw %s))\n' \
-	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments ($named (subnet \"10.77.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"hosts\" \"db\" \"hosts\" \"db.hull\" \"hosts\" \"web\" \"ask\" \"db\" \"7000\" \"read\" \"/etc/resolv.conf\" \"dns\" \"db\" \"dns\" \"db.hull\" \"dns\" \"nobody\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments ($named (subnet \"10.77.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"hosts\" \"db\" \"hosts\" \"db.hull\" \"hosts\" \"web\" \"ask\" \"db\" \"7000\" \"read\" \"/etc/resolv.conf\" \"line\" \"/etc/resolv.conf\" \"options edns0\" \"dns\" \"db\" \"dns\" \"db.hull\" \"dns\" \"nobody\")" \
 	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments ($named (subnet \"10.77.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"answer\" \"7000\" \"sleep\" \"4\")" \
 	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments \"raw-$$\") (command \"/probe\" \"addr\" \"eth0\" \"read\" \"/etc/hosts\" \"read\" \"/etc/resolv.conf\")" \
 	> "$root/named.conf"
@@ -1380,10 +1380,12 @@ cases=$((cases + 1))
 	printf '%s\n' "$named_out" | grep -q "^web *| hosts=web $web_at\$" &&
 	printf '%s\n' "$named_out" | grep -q "^db *| answer=from $web_at\$" ||
 	fail "addressed siblings were not named to each other at their own addresses" "$named_out"
-# hull answers at the segment's .1, which resolv.conf names: the sibling by
-# id and by id.hull, and a name it has not refused as one it has not.
+# hull answers at the segment's .1, which resolv.conf names, with edns0 so
+# glibc asks with room for 1200 bytes: the sibling by id and by id.hull,
+# and a name it has not refused as one it has not.
 cases=$((cases + 1))
 printf '%s\n' "$named_out" | grep -q '^web *| read=nameserver 10\.77\.0\.1$' &&
+	printf '%s\n' "$named_out" | grep -q '^web *| line=yes$' &&
 	printf '%s\n' "$named_out" | grep -q "^web *| dns=db $db_at\$" &&
 	printf '%s\n' "$named_out" | grep -q "^web *| dns=db.hull $db_at\$" &&
 	printf '%s\n' "$named_out" | grep -q '^web *| dns=nobody rcode 3$' ||

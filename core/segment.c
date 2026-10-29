@@ -148,8 +148,7 @@ typedef struct segment {
 /* A question .1 asked on for a machine, until its answer or MAX_ASKED_NS:
  * the id it went with, and where its answer goes back to -- the port, by
  * its segment, machine and socket, since either may be gone by then, and
- * the asker's MAC, address and UDP port, and the question's length, for a
- * truncated answer. */
+ * the asker's MAC, address and UDP port. */
 #define MAX_ASKED    256u
 #define MAX_ASKED_NS 5000000000u
 
@@ -165,7 +164,6 @@ typedef struct asked {
 	uint8_t            mac[6];
 	uint32_t           address;
 	uint8_t            udp_port[2];
-	size_t             question;
 } asked;
 
 static pthread_mutex_t    lock = PTHREAD_MUTEX_INITIALIZER;
@@ -813,42 +811,68 @@ static size_t dns_answer(const segment *s, uint32_t network, unsigned prefix,
 
 /* DNS `dns` from hull at .1, `self`, to `asker` at `mac` and its UDP
  * `udp_port`, sent back through `s`'s port `to`'s way in, so the port's
- * impairment holds for it too. `length` is at most MAX_DNS. */
+ * impairment holds for it too. One past a frame goes as IP fragments,
+ * which the asker's kernel puts back together: so an answer up to the
+ * asker's EDNS size arrives whole, with no TCP at .1 to ask again on. */
 static void send_answer(segment *s, unsigned to, const uint8_t mac[6], uint32_t self,
                         uint32_t asker, const uint8_t udp_port[2], const uint8_t *dns,
                         size_t length)
 {
-	uint8_t  reply[4u + 1514u];
-	uint8_t *out = reply + 4;
-	uint32_t sum;
-	size_t   total;
+	static uint8_t  datagram[8u + 65535u];
+	static uint16_t ip_id;
+	uint8_t         reply[4u + 1514u];
+	uint8_t        *out = reply + 4;
+	size_t          whole = 8u + length;
+	uint32_t        sum;
 
-	memset(reply, 0, sizeof reply);
-	memcpy(out, mac, 6u);
-	memcpy(out + 6, hull_mac, 6u);
-	put16(out + 12, 0x0800u);
-	out[14] = 0x45u;
-	put16(out + 16, (uint32_t)(28u + length));
-	put16(out + 20, 0x4000u);   /* don't fragment */
-	out[22] = 64u;
-	out[23] = 17u;
-	put32(out + 26, self);
-	put32(out + 30, asker);
-	put16(out + 24, ~sum16(0u, out + 14, 20u) & 0xffffu);
-	put16(out + 34, 53u);
-	memcpy(out + 36, udp_port, 2u);
-	put16(out + 38, (uint32_t)(8u + length));
-	memcpy(out + 42, dns, length);
-	/* The UDP sum over its pseudo-header, as a checking stack wants. */
-	sum = sum16(0u, out + 26, 8u);
-	sum += 17u + 8u + (uint32_t)length;
-	sum = sum16(sum, out + 34, 8u + length);
-	put16(out + 40, (~sum & 0xffffu) == 0u ? 0xffffu : ~sum & 0xffffu);
-	total = 14u + 28u + length;
-	if (total < 60u)
-		total = 60u;
-	put32(reply, (uint32_t)total);
-	cross(s, to, HULL_SEGMENT_IN, reply, 4u + total);
+	if (whole > 65535u - 20u)
+		return;
+	put16(datagram, 53u);
+	memcpy(datagram + 2, udp_port, 2u);
+	put16(datagram + 4, (uint32_t)whole);
+	put16(datagram + 6, 0u);
+	memcpy(datagram + 8, dns, length);
+	/* The UDP sum over its pseudo-header and the whole datagram, as a
+	 * checking stack wants, before any of it is cut into fragments. */
+	put32(reply, self);
+	put32(reply + 4, asker);
+	sum = sum16(0u, reply, 8u);
+	sum += 17u + (uint32_t)whole;
+	sum = sum16(sum, datagram, whole);
+	put16(datagram + 6, (~sum & 0xffffu) == 0u ? 0xffffu : ~sum & 0xffffu);
+	ip_id++;
+	for (size_t at = 0u; at < whole;) {
+		size_t piece = whole - at;
+		int    more  = 0;
+		size_t total;
+
+		if (piece > 1480u) {
+			piece = 1480u;   /* a multiple of 8, as every fragment but the last is */
+			more  = 1;
+		}
+		memset(reply, 0, sizeof reply);
+		memcpy(out, mac, 6u);
+		memcpy(out + 6, hull_mac, 6u);
+		put16(out + 12, 0x0800u);
+		out[14] = 0x45u;
+		put16(out + 16, (uint32_t)(20u + piece));
+		put16(out + 18, ip_id);
+		/* Don't fragment where it is whole; else more-fragments and the
+		 * offset, in 8-byte units. */
+		put16(out + 20, at == 0u && !more ? 0x4000u : (more ? 0x2000u : 0u) | (uint32_t)(at / 8u));
+		out[22] = 64u;
+		out[23] = 17u;
+		put32(out + 26, self);
+		put32(out + 30, asker);
+		put16(out + 24, ~sum16(0u, out + 14, 20u) & 0xffffu);
+		memcpy(out + 34, datagram + at, piece);
+		total = 14u + 20u + piece;
+		if (total < 60u)
+			total = 60u;
+		put32(reply, (uint32_t)total);
+		cross(s, to, HULL_SEGMENT_IN, reply, 4u + total);
+		at += piece;
+	}
 }
 
 /* The host's resolvers, IPv4, at most three: those a test gave, else
@@ -886,7 +910,7 @@ static unsigned resolvers(struct sockaddr_in out[3])
  * finds it. A question with nowhere to wait is dropped, as a full queue
  * drops a frame, and its asker asks again. */
 static void ask_on(segment *s, unsigned from, const uint8_t *frame, const uint8_t *ip,
-                   size_t header, const uint8_t *query, size_t length, size_t question,
+                   size_t header, const uint8_t *query, size_t length,
                    const struct sockaddr_in *server)
 {
 	uint64_t now = now_ns();
@@ -930,15 +954,13 @@ static void ask_on(segment *s, unsigned from, const uint8_t *frame, const uint8_
 	memcpy(a->mac, frame + 6, 6u);
 	a->address  = get32(ip + 12);
 	memcpy(a->udp_port, ip + header, 2u);
-	a->question = question;
 }
 
 static segment *find(const char *key);
 
 /* What the host's resolvers answered, each sent back to the machine that
- * asked, under its own id, where its port is still there; one too long
- * for a frame cut to its question and marked truncated, as a server does
- * past what UDP carries. */
+ * asked, under its own id, where its port is still there, in fragments
+ * where it is longer than a frame. */
 static void answered(void)
 {
 	static uint8_t reply[65536];
@@ -971,15 +993,6 @@ static void answered(void)
 		if ((s = find(a->key)) == NULL || !subnet_of(s, &network, &prefix))
 			continue;
 		length = (size_t)n;
-		if (length > MAX_DNS) {
-			if (a->question > MAX_DNS || a->question > length)
-				continue;
-			length = a->question;
-			reply[2] |= 0x02u;
-			put16(reply + 6, 0u);
-			put16(reply + 8, 0u);
-			put16(reply + 10, 0u);
-		}
 		put16(reply, a->their_id);
 		for (unsigned i = 0u; i < s->port_count; i++) {
 			if (s->ports[i]->fd == a->fd && strcmp(s->ports[i]->machine, a->machine) == 0) {
@@ -1059,7 +1072,7 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 		                 count != 0u, dns_out, sizeof dns_out, &question);
 		if (dns == ASK_ON)
 			ask_on(s, from, frame, ip, header, ip + header + 8u, datagram - header - 8u,
-			       question, &servers[asking_next++ % count]);
+			       &servers[asking_next++ % count]);
 		else if (dns != 0u)
 			send_answer(s, from, frame + 6, self, get32(ip + 12), ip + header, dns_out, dns);
 		return 1;

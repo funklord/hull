@@ -51,6 +51,7 @@
  *               in any window a ring or a buffer would have
  *   lines N T   N lines on stdout, `T NNNNNN`, each written by itself, so
  *               each crosses to the engine as a frame of its own
+ *   line F T    whether file F holds a line that is exactly T: yes or no
  *   sleep N     sleep N seconds
  *   nnp         whether no_new_privs is set
  *   session     whether it leads a session of its own
@@ -994,6 +995,18 @@ int main(int argc, char **argv)
 			if (!spew_to(1, strtoull(arg, NULL, 10)))
 				return 1;
 			i++;
+		} else if (strcmp(step, "line") == 0 && i + 2 < argc) {
+			FILE *file = fopen(arg, "r");
+			int   found = 0;
+
+			while (file != NULL && !found && fgets(text, sizeof text, file) != NULL) {
+				text[strcspn(text, "\n")] = '\0';
+				found = strcmp(text, argv[i + 2]) == 0;
+			}
+			if (file != NULL)
+				fclose(file);
+			printf("line=%s\n", found ? "yes" : "no");
+			i += 2;
 		} else if (strcmp(step, "lines") == 0 && i + 2 < argc) {
 			unsigned long count = strtoul(arg, NULL, 10);
 

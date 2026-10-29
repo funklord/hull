@@ -403,7 +403,7 @@ char *hull_access_hosts(const hull_sexpr_doc *doc, const hull_sexpr_form *names)
 char *hull_access_resolver(const hull_sexpr_doc *doc, const hull_sexpr_form *names)
 {
 	hull_sexpr_form segment;
-	char           *text = malloc(3u * 32u + 16u);
+	char           *text = malloc(3u * 32u + 40u);
 	size_t          at = 0u;
 	unsigned        servers = 0u;
 
@@ -433,7 +433,10 @@ char *hull_access_resolver(const hull_sexpr_doc *doc, const hull_sexpr_form *nam
 		free(text);
 		return NULL;
 	}
-	memcpy(text + at, "search hull\n", sizeof "search hull\n");
+	/* edns0, so glibc asks with room for 1200 bytes, not 512, and an
+	 * answer the host's resolver would cut for UDP comes whole, .1
+	 * sending one past a frame in fragments; there is no TCP at .1. */
+	memcpy(text + at, "search hull\noptions edns0\n", sizeof "search hull\noptions edns0\n");
 	return text;
 }
 
