@@ -35,18 +35,24 @@ with its host to be useful -- a directory, a network, a device, and
 always the processor and memory underneath -- and every one of those is
 a way through. The software that draws the line has faults of its own,
 and ways out of containers, virtual machines and emulators alike are
-found every year. Part of the claim is true: a machine given no host
-files and no network leaves a program less to reach, and a virtual
-machine's kernel keeps some of its own faults from the host's. But that
-part comes with upkeep that is easy to underestimate: a second system
-to keep patched, kernel included, the program running it to keep
-patched as well, and settings that undo the arrangement if one of them
-is wrong. The simpler measures usually do more for less: not running
-what you do not trust, running a service as its own user that can read
-only what it needs, keeping software up to date, and putting what truly
-matters on a computer of its own. Use hull to test and to simulate, and
-if you use it to keep something out, know which of these properties
-you are relying on and what it costs to keep it true.
+found every year.
+
+Part of the claim is true: a machine given no host files and no network
+leaves a program less to reach, and a virtual machine's kernel keeps
+some of its own faults from the host's. But that part comes with upkeep
+that is easy to underestimate: a second system to keep patched, kernel
+included, the program running it to keep patched as well, and settings
+that undo the arrangement if one of them is wrong. The simpler measures
+usually do more for less:
+
+- not running what you do not trust;
+- running a service as its own user that can read only what it needs;
+- keeping software up to date;
+- putting what truly matters on a computer of its own.
+
+Use hull to test and to simulate, and if you use it to keep something
+out, know which of these properties you are relying on and what it
+costs to keep it true.
 
 It is not one more container runtime. Docker and Podman run containers;
 Incus runs containers and virtual machines from images, through a
