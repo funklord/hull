@@ -9,6 +9,7 @@
 #include <fnmatch.h>
 #include <grp.h>
 #include <limits.h>
+#include <pthread.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -268,4 +269,77 @@ int hull_hostdev_usb_drivers(const char *sysfs, const char *port, const char *al
 	}
 	fclose(in);
 	return (int)found;
+}
+
+/* --- held ---------------------------------------------------------------- */
+
+#define MAX_CLAIMS 64u
+
+static struct {
+	const void *owner;
+	char        node[256];
+} claims[MAX_CLAIMS];
+static pthread_mutex_t claims_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int exclusive(const hull_device *device)
+{
+	return device->kind != HULL_DEVICE_NODE;
+}
+
+const char *hull_hostdev_claim(const void *owner, const hull_device *devices, unsigned count,
+                               char *why, size_t cap)
+{
+	unsigned wanted = 0u;
+	unsigned free_slots = 0u;
+
+	pthread_mutex_lock(&claims_lock);
+	for (unsigned i = 0u; i < count; i++) {
+		if (!exclusive(&devices[i]))
+			continue;
+		for (unsigned c = 0u; c < MAX_CLAIMS; c++) {
+			if (claims[c].owner == NULL || strcmp(claims[c].node, devices[i].host.node) != 0)
+				continue;
+			if (claims[c].owner != owner) {
+				pthread_mutex_unlock(&claims_lock);
+				snprintf(why, cap,
+				         "%s is another running machine's: a USB device, serial or parallel "
+				         "port is one machine's at a time",
+				         devices[i].host.node);
+				return why;
+			}
+		}
+		wanted++;
+	}
+	for (unsigned c = 0u; c < MAX_CLAIMS; c++)
+		free_slots += claims[c].owner == NULL;
+	if (wanted > free_slots) {
+		pthread_mutex_unlock(&claims_lock);
+		snprintf(why, cap, "the core holds %u devices for its machines already", MAX_CLAIMS);
+		return why;
+	}
+	for (unsigned i = 0u; i < count; i++) {
+		int held = 0;
+
+		if (!exclusive(&devices[i]))
+			continue;
+		for (unsigned c = 0u; c < MAX_CLAIMS && !held; c++)
+			held = claims[c].owner == owner && strcmp(claims[c].node, devices[i].host.node) == 0;
+		for (unsigned c = 0u; c < MAX_CLAIMS && !held; c++)
+			if (claims[c].owner == NULL) {
+				claims[c].owner = owner;
+				memcpy(claims[c].node, devices[i].host.node, sizeof claims[c].node);
+				held = 1;
+			}
+	}
+	pthread_mutex_unlock(&claims_lock);
+	return NULL;
+}
+
+void hull_hostdev_unclaim(const void *owner)
+{
+	pthread_mutex_lock(&claims_lock);
+	for (unsigned c = 0u; c < MAX_CLAIMS; c++)
+		if (claims[c].owner == owner)
+			claims[c].owner = NULL;
+	pthread_mutex_unlock(&claims_lock);
 }

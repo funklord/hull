@@ -84,4 +84,19 @@ const char *hull_hostdev_find(hull_device *device, char *why, size_t cap);
 int hull_hostdev_usb_drivers(const char *sysfs, const char *port, const char *aliases,
                              char *names, size_t name_cap, unsigned count);
 
+/*
+ * `owner`'s devices held for it alone while it runs: a USB device, which
+ * qemu takes from the host's driver, and a serial or parallel port, whose
+ * bytes two machines would share. A node of (node ...) may be shared,
+ * /dev/net/tun or a gpiochip being opened by many at once. All the
+ * engines are in the one core, so one table holds them. Taken all or
+ * none: NULL, or why in `why`, naming the device another owner holds.
+ * Taking again what `owner` holds already is no change.
+ */
+const char *hull_hostdev_claim(const void *owner, const hull_device *devices, unsigned count,
+                               char *why, size_t cap);
+
+/* Everything `owner` holds, let go. */
+void hull_hostdev_unclaim(const void *owner);
+
 #endif

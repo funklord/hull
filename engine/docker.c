@@ -799,6 +799,8 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	for (unsigned i = 0u; i < device_count; i++)
 		if (hull_hostdev_find(&device[i], create_detail, sizeof create_detail) != NULL)
 			return create_detail;
+	if (hull_hostdev_claim(m, device, device_count, create_detail, sizeof create_detail) != NULL)
+		return create_detail;
 	add_text(&body, "{\"Image\":");
 	add_json(&body, image);
 
@@ -1029,6 +1031,7 @@ static void *read_workload(void *arg)
 
 static void release(hull_machine *m)
 {
+	hull_hostdev_unclaim(m);
 	free(m->body);
 	pthread_mutex_destroy(&m->lock);
 	pthread_cond_destroy(&m->done_cond);

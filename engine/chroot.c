@@ -183,6 +183,7 @@ static const hull_host_ops *host;
 
 static void release(hull_machine *m)
 {
+	hull_hostdev_unclaim(m);
 	free(m->root);
 	free(m->workdir);
 	free(m->hostname);
@@ -2268,6 +2269,8 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 			return fail(error, HULL_ERR_RUNTIME, m->detail);
 		}
 	}
+	if (hull_hostdev_claim(m, m->device, m->device_count, m->detail, sizeof m->detail) != NULL)
+		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	/* A kept machine's directory, for its init.sock. */
 	if ((m->keep || m->staged || m->hosts != NULL || m->resolver != NULL) &&
 	    ((reason = make_dir(m)) != NULL ||

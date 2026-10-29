@@ -420,7 +420,7 @@ $(BUILD_DIR)/test/segment_test: $(TEST_SEGMENT_OBJS) $(BUILD_DIR)/core/segment.o
 	$(CC) $(CFLAGS) -o $@ $^ -pthread
 
 $(BUILD_DIR)/test/hostdev_test: $(TEST_HOSTDEV_OBJS) $(BUILD_DIR)/engine/hostdev.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ -pthread
 
 -include $(SEXPR_OBJS:.o=.d) $(AGENT_OBJS:.o=.d) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS:.o=.d) \
          $(ENGINE_OBJS:.o=.d) $(STORE_OBJS:.o=.d) $(OCI_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(CORE_OBJS:.o=.d) \

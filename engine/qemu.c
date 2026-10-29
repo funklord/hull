@@ -363,6 +363,7 @@ static const char *read_secrets(hull_machine *m, const hull_sexpr_doc *doc,
 
 static void release(hull_machine *m)
 {
+	hull_hostdev_unclaim(m);
 	/* A bridge's tap is persistent, so it goes with the machine here. */
 	if (m->bridge && m->tap[0] != '\0' && if_nametoindex(m->tap) != 0) {
 		const char *del[] = { hull_hostnet_ip(), "link", "del", m->tap, NULL };
@@ -2353,6 +2354,8 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	for (unsigned i = 0u; i < m->device_count; i++)
 		if (hull_hostdev_find(&m->device[i], m->detail, sizeof m->detail) != NULL)
 			return fail(error, HULL_ERR_RUNTIME, m->detail);
+	if (hull_hostdev_claim(m, m->device, m->device_count, m->detail, sizeof m->detail) != NULL)
+		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	if ((reason = make_dir(m)) != NULL ||
 	    (reason = write_initramfs(m, release, load_modules)) != NULL ||
 	    (reason = open_listeners(m)) != NULL) {

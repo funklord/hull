@@ -2270,6 +2270,28 @@ if [ -r /dev/net/tun ] && [ -w /dev/net/tun ]; then
 		from_root 0 '^read=File descriptor in bad state$' -f "$root/devlink.conf"
 		from_root 0 '^kind=lnk$' -f "$root/devlink.conf"
 	fi
+	# One machine's at a time: a port named (serial ...) is held while its
+	# machine runs, a second refused, and given once the first is gone;
+	# the same node as (node ...) is shared.
+	devconf devheld '(hostname "held") (devices (serial "/dev/net/tun")) (command "/probe" "say" "holding" "sleep" "4")'
+	devconf devsecond '(hostname "second") (devices (serial "/dev/net/tun")) (command "/probe" "say" "second")'
+	devconf devshared '(hostname "shared") (devices (node "/dev/net/tun")) (command "/probe" "say" "shared")'
+	(cd / && timeout 20 "$hull" run -f "$root/devheld.conf" > "$root/devheld.out" 2>&1 &)
+	tries=0
+	until grep -q '^holding$' "$root/devheld.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+	from_root 125 '/dev/net/tun is another running machine.s: a USB device, serial or parallel port is one machine.s at a time' \
+		-f "$root/devsecond.conf"
+	from_root 0 '^shared$' -f "$root/devshared.conf"
+	tries=0
+	until ! "$hull" ps 2>/dev/null | grep -q '^held ' || [ "$tries" -ge 40 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+	from_root 0 '^second$' -f "$root/devsecond.conf"
+	rm -f "$root/devheld.out"
 	# Refused, not dropped, where the tree has no /dev to bind them into.
 	from_root 125 '\(devices \.\.\.\) are bound into the machine.s /dev, and its tree has no /dev' \
 		-f "$root/devbare.conf"

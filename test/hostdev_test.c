@@ -212,6 +212,46 @@ int main(void)
 			fail("a node the user may not write", why);
 	}
 
+	/* Held for one machine at a time: a serial port and a USB device a
+	 * second owner is refused, all or none, and a plain node shared. */
+	{
+		hull_device mine[2];
+		hull_device theirs[2];
+		int         a = 0;
+		int         b = 0;
+
+		memset(mine, 0, sizeof mine);
+		memset(theirs, 0, sizeof theirs);
+		mine[0].kind = HULL_DEVICE_SERIAL;
+		snprintf(mine[0].host.node, sizeof mine[0].host.node, "/dev/ttyUSB0");
+		mine[1].kind = HULL_DEVICE_NODE;
+		snprintf(mine[1].host.node, sizeof mine[1].host.node, "/dev/net/tun");
+		theirs[0].kind = HULL_DEVICE_USB;
+		snprintf(theirs[0].host.node, sizeof theirs[0].host.node, "/dev/bus/usb/001/007");
+		theirs[1] = mine[0];
+		cases++;
+		if (hull_hostdev_claim(&a, mine, 2u, why, sizeof why) != NULL)
+			fail("a first machine's devices", why);
+		cases++;
+		if (hull_hostdev_claim(&a, mine, 2u, why, sizeof why) != NULL)
+			fail("its own devices taken again", why);
+		cases++;
+		if (hull_hostdev_claim(&b, theirs, 2u, why, sizeof why) == NULL ||
+		    strstr(why, "/dev/ttyUSB0 is another running machine's") == NULL)
+			fail("a held serial port given to a second machine", why);
+		cases++;
+		if (hull_hostdev_claim(&b, &mine[1], 1u, why, sizeof why) != NULL)
+			fail("a plain node shared", why);
+		cases++;
+		if (hull_hostdev_claim(&a, &theirs[0], 1u, why, sizeof why) != NULL)
+			fail("a refused claim left its USB device held", why);
+		hull_hostdev_unclaim(&a);
+		cases++;
+		if (hull_hostdev_claim(&b, theirs, 2u, why, sizeof why) != NULL)
+			fail("devices let go not taken by another", why);
+		hull_hostdev_unclaim(&b);
+	}
+
 	{
 		char command[1100];
 
