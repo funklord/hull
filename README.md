@@ -148,7 +148,7 @@ reason, and where one exists, the `--accept` token that takes it anyway).
 
 | Engine | Class | Runs as | Kernel | Needs | Status |
 |---|---|---|---|---|---|
-| `chroot` | ns | namespaces | the host's | user namespaces | written |
+| `chroot` | ns | namespaces | the host's | user namespaces; pasta for its own network | written |
 | `qemu` | vm | hardware virtualization | its own | `/dev/kvm`, `/dev/vhost-vsock`, qemu, passt | written |
 | `qemu` | emu | software emulation | its own | `/dev/vhost-vsock`, qemu, passt | written |
 | `docker` | ns | namespaces | the host's | a Docker daemon | written, optional |
@@ -410,8 +410,10 @@ job can run it first.
   runs sshd. `hull ssh-config` adds a `Host *.hull` block to
   `~/.ssh/config`, so `ssh`, `scp`, `rsync` and an editor's remote mode
   reach `web.hull` directly.
-- **exec, logs, attach, stats, stop, kill.** The same commands on every
-  backend.
+- **ps, exec, logs, attach, stats, pause, unpause, stop, kill.** The
+  same commands on every backend.
+- **A service.** `hull systemd` writes a user unit that runs a machine
+  under the user's own systemd.
 
 # Images, when you want them
 
@@ -426,8 +428,15 @@ hull push app/1 registry.example/app:1
 hull materialize app/1 ./rootfs      # a stored tree back to a plain directory
 hull commit ./rootfs app/2
 hull diff app/1 app/2
+hull images                          # what the store holds
+hull tag app/2 app/latest
+hull manifest show app/2             # a tree as readable text, an entry a line
 hull gc
 ```
+
+`hull import Dockerfile` prints the same image as a `(build …)` form, and
+`hull import docker-compose.yml` a `(machines …)` file, each saying what
+it could not translate.
 
 A machine whose source names a stored tree runs it, taking the image's
 command, workdir and environment where the machine gives none of its own.
@@ -454,10 +463,11 @@ A C11 compiler, Python 3, and OpenSSL's and zlib's development files,
 `libssl-dev` and `zlib1g-dev` on Debian, which `hull pull` links.
 
 ```sh
-make         # build/hull; fetches vendor/situ the first time
+make         # build/hull, its agent and its NSS module; fetches vendor/situ the first time
 fmake        # ./hull, ./hull-agent and ./libnss_hull.so, as fmake.toml describes
 make check   # the style gate, the situ contracts, then the tests
 make check-qemu    # the vm and emu engines, booting real guests
+make check-flip    # one project, unchanged, on docker, vm and emu
 make check-docker  # the docker adapter, against the daemon
 make hooks   # install the commit-msg hook
 ```
