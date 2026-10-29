@@ -575,17 +575,31 @@ expect 0 '^kept +127\.107\.[0-9.]+ +chroot +ns +running$' "$hull" ps
 expect 0 '^gone +127\.107\.[0-9.]+ +chroot +ns +exited$' "$hull" ps
 # Section 8.1's address, from the id alone: FNV-1a of its bytes, modulo
 # 256 * 254, as x * 254 + y - 1. Worked here in Python rather than taken
-# from the core, and clash110098 is an id that comes to the same one.
-address=$(python3 -c '
+# from the core, and clash110098 is an id that comes to the same one: it
+# takes the next address, says so, and keeps it in its machine state, so
+# that it has it again on the next run without a word.
+addresses=$(python3 -c '
 import sys
 h = 2166136261
 for b in sys.argv[1].encode():
 	h = ((h ^ b) * 16777619) & 0xffffffff
 h %= 256 * 254
-print("127.107.%d.%d" % (h // 254, h % 254 + 1))' kept)
+for n in (h, (h + 1) % (256 * 254)):
+	print("127.107.%d.%d" % (n // 254, n % 254 + 1))' kept)
+address=$(printf '%s\n' "$addresses" | sed -n 1p)
+moved=$(printf '%s\n' "$addresses" | sed -n 2p)
 expect 0 "^kept +$address +chroot" "$hull" ps
+# A suite run before this one kept it; it begins from its own here.
+rm -f "$XDG_DATA_HOME/hull/machines/clash110098/address"
 conf clash '(command "/probe" "say" "clash")' '(hostname "clash110098")'
-from_root 125 "its address, $address, is machine kept's" -f "$root/clash.conf"
+from_root 0 "^clash110098 *\| hull: clash110098's address is machine kept's, so it takes $moved, and keeps it\$|^hull: clash110098's address is machine kept's, so it takes $moved, and keeps it\$" -f "$root/clash.conf"
+cases=$((cases + 1))
+[ "$(cat "$XDG_DATA_HOME/hull/machines/clash110098/address" 2>/dev/null)" = "$moved" ] ||
+	fail "a moved address was not kept as machine state" "$(ls -R "$XDG_DATA_HOME/hull/machines" 2>&1 | head)"
+from_root 0 '^clash$' -f "$root/clash.conf"
+cases=$((cases + 1))
+! printf '%s\n' "$out" | grep -q 'takes' ||
+	fail "a kept address was said moved again" "$out"
 expect 0 '^kept$' "$hull" logs kept
 (timeout 30 "$hull" attach kept > "$root/attach.out" 2>&1; echo "status=$?" >> "$root/attach.out") &
 attacher=$!

@@ -1063,15 +1063,26 @@ static void send_started(client *c, uint32_t ch, const slot *s)
  * the id's bytes, taken modulo 256 * 254, is x * 254 + y - 1, which keeps
  * y from 1 to 254. Changing this changes every machine's address.
  */
-static void address_of(const char *id, char out[16])
+#define ADDRESSES (256u * 254u)
+
+static uint32_t address_slot(const char *id)
 {
 	uint32_t h = 2166136261u;
 
 	for (const unsigned char *p = (const unsigned char *)id; *p != '\0'; p++)
 		h = (h ^ *p) * 16777619u;
-	h %= 256u * 254u;
-	snprintf(out, 16, "127.107.%u.%u", h / 254u, h % 254u + 1u);
+	return h % ADDRESSES;
 }
+
+static void address_at(uint32_t slot_number, char out[16])
+{
+	snprintf(out, 16, "127.107.%u.%u", slot_number / 254u, slot_number % 254u + 1u);
+}
+
+/* The address `id` is given when it starts or is adopted: the one kept
+ * for it, then its own, and else the next free after its own, kept so
+ * that it has it again. */
+static void address_of(const char *id, char out[16]);
 
 /*
  * The plan the engine gets is the frontend's with the address added. It
@@ -1268,6 +1279,25 @@ static void forget_secrets(slot *s)
  * data home says where to keep it.
  */
 static char ssh_root[4200];
+
+/* `path` and the directories above it, each 0700 where it is made: 0, or
+ * -1 where one cannot be. */
+static int make_dirs(const char *path)
+{
+	char  copy[4096];
+	char *at;
+
+	if ((size_t)snprintf(copy, sizeof copy, "%s", path) >= sizeof copy)
+		return -1;
+	for (at = copy + 1; *at != '\0'; at++)
+		if (*at == '/') {
+			*at = '\0';
+			if (mkdir(copy, 0700) != 0 && errno != EEXIST)
+				return -1;
+			*at = '/';
+		}
+	return mkdir(copy, 0700) != 0 && errno != EEXIST ? -1 : 0;
+}
 
 /* The persistent per-machine host keys live here, keyed by the stable id,
  * so a machine's SSH identity survives a restart and (once more than qemu
@@ -1880,6 +1910,100 @@ static const char *named_of(slot *s, const hull_sexpr_doc *doc, const hull_sexpr
 	return NULL;
 }
 
+/* Where `id`'s address is kept when a clash moved it: hull/machines/ID/
+ * address, beside its host key. 0 where no data home says where. */
+static int address_path(const char *id, char *out, size_t cap)
+{
+	return host_key_root[0] != '\0' &&
+	       (size_t)snprintf(out, cap, "%s/%s/address", host_key_root, id) < cap;
+}
+
+/* The address kept for `id`, into `out`: 1, or 0 where none is. */
+static int address_kept(const char *id, char out[16])
+{
+	char     path[4300];
+	char     text[32] = "";
+	unsigned x;
+	unsigned y;
+	char     tail;
+	FILE    *file;
+
+	if (!address_path(id, path, sizeof path) || (file = fopen(path, "re")) == NULL)
+		return 0;
+	if (fgets(text, sizeof text, file) == NULL)
+		text[0] = '\0';
+	fclose(file);
+	if (sscanf(text, "127.107.%u.%u%c", &x, &y, &tail) < 2 || x > 255u || y < 1u || y > 254u)
+		return 0;
+	snprintf(out, 16, "127.107.%u.%u", x, y);
+	return 1;
+}
+
+/* Whether a live machine of another id has `address`: who, or NULL. */
+static const slot *holding(const char *id, const char *address)
+{
+	for (unsigned i = 0u; i < MAX_MACHINES; i++) {
+		const slot *other = &machines[i];
+
+		if (other->used && !other->exited && strcmp(other->id, id) != 0 &&
+		    strcmp(other->address, address) == 0)
+			return other;
+	}
+	return NULL;
+}
+
+/*
+ * Two ids may come to one address -- FNV-1a's modulus maps ids that
+ * differ regularly onto each other, as a89 and b55 -- and the second
+ * takes the next address free after its own, decided by the holder
+ * 2026-10-29 over refusing it, which a network of hundreds met. So that
+ * the moved address is as stable as an id's own, it is kept in
+ * hull/machines/ID/address and taken first while free, and the file goes
+ * once the id's own address is what it gets. Into `out`; `moved_from` is
+ * the machine whose address it would have had, or "".
+ */
+static void address_choose(const char *id, char out[16], char moved_from[64])
+{
+	uint32_t own = address_slot(id);
+	char     path[4300];
+	char     kept[16];
+
+	moved_from[0] = '\0';
+	if (address_kept(id, kept) && holding(id, kept) == NULL) {
+		snprintf(out, 16, "%s", kept);
+		return;
+	}
+	for (uint32_t step = 0u; step < ADDRESSES; step++) {
+		const slot *other;
+
+		address_at((own + step) % ADDRESSES, out);
+		if ((other = holding(id, out)) == NULL)
+			break;
+		if (step == 0u)
+			snprintf(moved_from, 64, "%s", other->id);
+	}
+	if (!address_path(id, path, sizeof path))
+		return;
+	if (moved_from[0] == '\0') {
+		unlink(path);
+	} else {
+		char  dir[4300];
+		FILE *file;
+
+		snprintf(dir, sizeof dir, "%s/%s", host_key_root, id);
+		if ((mkdir(dir, 0700) == 0 || errno == EEXIST) && (file = fopen(path, "we")) != NULL) {
+			fprintf(file, "%s\n", out);
+			fclose(file);
+		}
+	}
+}
+
+static void address_of(const char *id, char out[16])
+{
+	if (!address_kept(id, out))
+		address_at(address_slot(id), out);
+}
+
 static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
 	hull_sexpr_form    value;
@@ -1890,6 +2014,7 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	const hull_engine *engine = NULL;
 	char               id[64];
 	char               address[16];
+	char               moved_from[64];
 	char              *engine_name;
 	char              *class_name;
 	char              *given;
@@ -1941,24 +2066,7 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		free(class_name);
 		return;
 	}
-	/* Two ids may come to one address; the second is refused while the
-	 * first runs, rather than given another, which would not be stable. */
-	address_of(id, address);
-	for (unsigned i = 0u; i < MAX_MACHINES; i++) {
-		const slot *other = &machines[i];
-
-		if (other->used && !other->exited && strcmp(other->id, id) != 0 &&
-		    strcmp(other->address, address) == 0) {
-			char reason[128];
-
-			snprintf(reason, sizeof reason, "its address, %s, is machine %s's", address,
-			         other->id);
-			free(engine_name);
-			free(class_name);
-			send_error(c, ch, reason);
-			return;
-		}
-	}
+	address_choose(id, address, moved_from);
 	for (uint32_t i = 0u; engine_name != NULL && i < registry.count; i++)
 		if (strcmp(registry.engines[i]->caps->engine_name, engine_name) == 0)
 			engine = registry.engines[i];
@@ -2118,6 +2226,16 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	}
 	keep_machine(s);
 	send_started(c, ch, s);
+	if (moved_from[0] != '\0') {
+		char notice[200];
+		int  n = snprintf(notice, sizeof notice, "hull: %s's address is machine %s's, so it "
+		                  "takes %s, and keeps it\n", s->id, moved_from, s->address);
+
+		/* On the run's stderr, said once, and in the log. */
+		send_data(c, ch, 2, (const uint8_t *)notice, (size_t)n);
+		notice[n - 1] = '\0';
+		on_log(NULL, 2, notice + 6);
+	}
 }
 
 static slot *named(client *c, uint32_t ch, const hull_sexpr_doc *body)
@@ -3578,9 +3696,11 @@ int hull_core_run(const char *host_arch)
 			snprintf(base, sizeof base, "%s/hull", data);
 		else if (home != NULL && home[0] == '/')
 			snprintf(base, sizeof base, "%s/.local/share/hull", home);
-		/* mkdir is not recursive, so make the data home and its machines
-		 * directory now; empty host_key_root means ephemeral host keys. */
-		if (base[0] == '\0' || (mkdir(base, 0700) != 0 && errno != EEXIST))
+		/* The data home and its machines directory, made whole, the data
+		 * home's parents too, as the XDG spec has a program do where they
+		 * are not there yet; empty host_key_root means ephemeral host keys
+		 * and moved addresses kept for the run only. */
+		if (base[0] == '\0' || make_dirs(base) != 0)
 			host_key_root[0] = '\0';
 		else {
 			snprintf(host_key_root, sizeof host_key_root, "%s/machines", base);
