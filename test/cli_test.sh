@@ -1561,8 +1561,13 @@ wait "$fullrun" ||
 	fail "a file holding a segment's addresses did not run whole" "$(cat "$root/full.out")"
 # A machine joining a running segment is named by hull at .1 as soon as
 # its port is, though no file put it in another's /etc/hosts: one file's
-# early, another's late, each looking the other up by name.
-dyn="dyn-$$"
+# early, another's late, each looking the other up by name. The segment's
+# name is fixed, not this run's pid: each file draws its own machine's
+# address from its id and the name, and under dyn-$$ one run in 253 drew
+# both the same and was refused, as two files that clash are. Under "dyn"
+# early draws .237 and late .227; the suite's core is its own, so the
+# name meets no other run's.
+dyn="dyn"
 conf early "(hostname \"early\") (mutable overlay) (network none) (segments ($dyn (subnet \"10.83.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"sleep\" \"5\" \"dns\" \"late\" \"hosts\" \"late\")"
 conf late "(hostname \"late\") (mutable overlay) (network none) (segments ($dyn (subnet \"10.83.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"dns\" \"early\" \"sleep\" \"8\")"
 (cd / && exec timeout 60 "$whole_hull" run -f "$root/early.conf" > "$root/early.out" 2>&1) &
