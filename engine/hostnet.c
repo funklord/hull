@@ -54,7 +54,7 @@ int hull_hostnet_run(const char *const *argv, char *why, size_t cap)
 		if (null < 0 || dup2(null, 0) < 0 || dup2(said[1], 1) < 0 || dup2(said[1], 2) < 0)
 			_exit(126);
 		syscall(SYS_close_range, 3u, ~0u, 0u);
-		execv(argv[0], (char *const *)argv);
+		execvp(argv[0], (char *const *)argv);
 		_exit(127);
 	}
 	close(said[1]);

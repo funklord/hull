@@ -23,8 +23,8 @@
 const char *hull_hostnet_ip(void);
 const char *hull_hostnet_nft(void);
 
-/* `argv` run, its stdout and stderr on a pipe: 0, or -1 with what it said
- * in `why`. */
+/* `argv` run, by PATH where argv[0] has no slash, its stdout and stderr
+ * on a pipe: 0, or -1 with what it said in `why`. */
 int hull_hostnet_run(const char *const *argv, char *why, size_t cap);
 
 /* hull0 made where it is not there yet: the bridge, its gateway address,

@@ -2192,6 +2192,45 @@ done
 expect 0 '^addr=eth0 10\.0\.2\.15/24 up$' "$hull" exec natexec /probe addr eth0
 expect 0 '' "$hull" kill -s KILL natexec
 wait "$natexec" 2>/dev/null
+# cpus and memory: a systemd scope the init is moved into before its
+# workload, asked of the manager by busctl. Faked here, with a core of its
+# own so that it sees the fake on its PATH: what it is asked, a manager
+# that refuses, and one that says yes and never moves the init, which is
+# refused rather than run unlimited. Measured for real where a manager
+# answers on the user's bus.
+conf limited '(cpus 2) (memory "64M") (command "/probe" "read" "/proc/self/cgroup")'
+expect 0 'cpus: native: a systemd scope.s CPUQuota' \
+	"$hull" plan --explain -f "$root/limited.conf"
+expect 0 'memory: native: a ceiling, a systemd scope.s MemoryMax' \
+	"$hull" plan --explain -f "$root/limited.conf"
+rm -rf "${root:?}/limrun" "${root:?}/limtools"
+mkdir -p "$root/limrun" "$root/limtools"
+chmod 700 "$root/limrun"
+printf '#!/bin/sh\necho "Failed to connect to bus: No such file or directory" >&2\nexit 1\n' \
+	> "$root/limtools/busctl"
+chmod +x "$root/limtools/busctl"
+limit=20
+expect 125 'cpus and memory are a systemd scope, and the user.s manager gave none: Failed to connect to bus' \
+	env PATH="$root/limtools:$PATH" XDG_RUNTIME_DIR="$root/limrun" "$hull" run -f "$root/limited.conf"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" > "%s/busctl.args"\necho "o \\"/org/freedesktop/systemd1/job/1\\""\n' \
+	"$root" > "$root/limtools/busctl"
+limit=20
+expect 125 'cpus and memory: the scope hull-[0-9]+\.scope did not take the machine.s init in 5 s' \
+	env PATH="$root/limtools:$PATH" XDG_RUNTIME_DIR="$root/limrun" "$hull" run -f "$root/limited.conf"
+cases=$((cases + 1))
+grep -Eq '^--user call org\.freedesktop\.systemd1 /org/freedesktop/systemd1 org\.freedesktop\.systemd1\.Manager StartTransientUnit ssa\(sv\)a\(sa\(sv\)\) hull-[0-9]+\.scope fail 3 PIDs au 1 [0-9]+ CPUQuotaPerSecUSec t 2000000 MemoryMax t 67108864 0$' \
+	"$root/busctl.args" 2>/dev/null ||
+	fail "cpus and memory: the manager asked for something else" "$(cat "$root/busctl.args" 2>&1)"
+# The probe reads a file's first line, which is the unified hierarchy's
+# only where no v1 controller is mounted beside it.
+if busctl --user status > /dev/null 2>&1 && [ "$(wc -l < /proc/self/cgroup)" = 1 ]; then
+	from_root 0 '^read=0::/.*hull-[0-9]+\.scope$' -f "$root/limited.conf"
+else
+	printf 'cli: cpus and memory not measured for real: no systemd manager on the user.s bus, or cgroup v1 beside v2\n' >&2
+fi
+sleep 2
+rm -rf "${root:?}/limrun" "${root:?}/limtools" "${root:?}/busctl.args"
+
 # (network bridge): a veth on a host bridge, which only root may put
 # there, so only a core run as root takes it; as this user, refused. The
 # root case runs as root in a user namespace of its own, `unshare -rmn`,

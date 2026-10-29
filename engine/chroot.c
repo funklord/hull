@@ -90,6 +90,8 @@
  * slow part, well inside it. */
 #ifndef START_LIMIT_MS
 #define START_LIMIT_MS 600000
+/* Reads of the init's cgroup, 10 ms apart, for its scope to take it. */
+#define LIMITS_TRIES 500
 #endif
 /* (ssh true)'s sshd port: a high one, since the chroot user is unprivileged
  * on the shared host net and cannot bind 22; the machine's 127.107 address
@@ -143,6 +145,8 @@ struct hull_machine {
 	char             bridge_name[16];
 	char             bridge_address[16];  /* its address on HULL_BRIDGE, or "" */
 	int              bridge_relay;  /* asking hull0's DNS relay, the host's resolvers loopback */
+	unsigned         cpus;       /* (cpus N): N CPUs' time a second, by its scope, or 0 */
+	unsigned long long memory;   /* (memory SIZE): its scope's ceiling in bytes, or 0 */
 	unsigned         port_count; /* (ports ...), forwarded by pasta on the address */
 	int              port_udp[MAX_PORTS];
 	unsigned         port_host[MAX_PORTS];
@@ -236,6 +240,22 @@ static void add_exposed(void *context, const char *pair)
 }
 
 /* The plan's machine, read into `m`. Returns a reason, or NULL. */
+/* "2G" in bytes, as J.1 writes a size. */
+static unsigned long long bytes_of(const char *size)
+{
+	char              *unit;
+	unsigned long long n = strtoull(size, &unit, 10);
+
+	switch (*unit) {
+	case 'T': n <<= 10; /* fall through */
+	case 'G': n <<= 10; /* fall through */
+	case 'M': n <<= 10; /* fall through */
+	case 'K': n <<= 10; break;
+	default:  break;
+	}
+	return n;
+}
+
 static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 {
 	hull_sexpr_form machine;
@@ -419,6 +439,17 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		if (!m->overlay)
 			return "owners are given above an overlay: (owners ...) needs (mutable overlay) and "
 			       "a root that is not read-only";
+	}
+
+	/* (cpus N) and (memory SIZE), section 6's ceiling, given by the
+	 * scope start_limits() makes. */
+	if ((source = hull_access_value(doc, &machine, "cpus")) != NULL) {
+		m->cpus = (unsigned)strtoul(source, NULL, 10);
+		free(source);
+	}
+	if ((source = hull_access_value(doc, &machine, "memory")) != NULL) {
+		m->memory = bytes_of(source);
+		free(source);
 	}
 
 	/* (network nat), or no (network ...), is a namespace of the machine's
@@ -1879,6 +1910,93 @@ static const char *start_bridge(const hull_machine *m, char *why, size_t cap)
 }
 
 /*
+ * cpus and memory, section 6's ceiling for ns, as a systemd scope the init
+ * is moved into before its workload starts: CPUQuota of N CPUs' time and
+ * MemoryMax. A cgroup the user may write is one systemd delegates, so its
+ * manager is the rootless way there -- the user's for a core run as the
+ * user, the system's for one run as root -- and a host with none on the
+ * bus is refused rather than run unlimited. The scope is the init's and
+ * what it forks, and ends with the last of them. It is asked for by
+ * busctl, and the init's own cgroup read until it is there, since the
+ * manager moves it once the call has returned. NULL, or why in `why`.
+ */
+static const char *start_limits(const hull_machine *m, char *why, size_t cap)
+{
+	char        unit[40];
+	char        pid_text[24];
+	char        count[4];
+	char        quota[24];
+	char        memory[24];
+	char        said[160];
+	const char *argv[24];
+	unsigned    n = 0u;
+	unsigned    properties = 1u;
+
+	snprintf(unit, sizeof unit, "hull-%ld.scope", (long)m->pid);
+	snprintf(pid_text, sizeof pid_text, "%ld", (long)m->pid);
+	argv[n++] = "busctl";
+	argv[n++] = getuid() == 0 ? "--system" : "--user";
+	argv[n++] = "call";
+	argv[n++] = "org.freedesktop.systemd1";
+	argv[n++] = "/org/freedesktop/systemd1";
+	argv[n++] = "org.freedesktop.systemd1.Manager";
+	argv[n++] = "StartTransientUnit";
+	argv[n++] = "ssa(sv)a(sa(sv))";
+	argv[n++] = unit;
+	argv[n++] = "fail";
+	argv[n++] = count;
+	argv[n++] = "PIDs";
+	argv[n++] = "au";
+	argv[n++] = "1";
+	argv[n++] = pid_text;
+	if (m->cpus != 0u) {
+		snprintf(quota, sizeof quota, "%llu", (unsigned long long)m->cpus * 1000000ull);
+		argv[n++] = "CPUQuotaPerSecUSec";
+		argv[n++] = "t";
+		argv[n++] = quota;
+		properties++;
+	}
+	if (m->memory != 0u) {
+		snprintf(memory, sizeof memory, "%llu", m->memory);
+		argv[n++] = "MemoryMax";
+		argv[n++] = "t";
+		argv[n++] = memory;
+		properties++;
+	}
+	argv[n++] = "0";
+	argv[n] = NULL;
+	snprintf(count, sizeof count, "%u", properties);
+	if (hull_hostnet_run(argv, said, sizeof said) != 0) {
+		snprintf(why, cap, "cpus and memory are a systemd scope, and the %s manager gave none: %s",
+		         getuid() == 0 ? "system's" : "user's", said);
+		return why;
+	}
+	{
+		char path[48];
+
+		snprintf(path, sizeof path, "/proc/%ld/cgroup", (long)m->pid);
+		for (int tries = 0; tries < LIMITS_TRIES; tries++) {
+			struct timespec step = { 0, 10000000L };
+			char            line[512];
+			FILE           *file = fopen(path, "re");
+			int             there = 0;
+
+			if (file != NULL) {
+				while (fgets(line, sizeof line, file) != NULL)
+					there = there || (strncmp(line, "0::", 3u) == 0 && strstr(line, unit) != NULL);
+				fclose(file);
+			}
+			if (there)
+				return NULL;
+			nanosleep(&step, NULL);
+		}
+	}
+	snprintf(why, cap, "cpus and memory: the scope %s did not take the machine's init in %d s",
+	         unit, LIMITS_TRIES / 100);
+	return why;
+}
+
+/*
  * The machine's network under NAT: pasta, as the user, attached to the
  * init's user and network namespaces by its pid, configuring eth0 there
  * as passt does a vm's -- GUEST_ADDRESS, the gateway, the host's resolver
@@ -2163,6 +2281,10 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	 * 127.107 address as under NAT. */
 	if (net == NULL && m->bridge_own && (m->port_count != 0u || m->ssh) &&
 	    (net = start_pasta(m, net_why, sizeof net_why)) != NULL)
+		kill(m->pid, SIGKILL);
+	/* Its limits too, so nothing it runs is ever outside them. */
+	if (net == NULL && (m->cpus != 0u || m->memory != 0u) &&
+	    (net = start_limits(m, net_why, sizeof net_why)) != NULL)
 		kill(m->pid, SIGKILL);
 	if (write(mapped[1], m->many ? "M" : wanted ? "O" : "S", 1u) != 1) {
 		/* The child reads its end closed and says so on the report. */
@@ -3120,6 +3242,10 @@ static const hull_cap_entry entries[] = {
 	  NULL },
 	{ "network.none",           HULL_SUP_NATIVE,
 	  "a network namespace of the machine's own, with lo alone", NULL },
+	{ "cpus",                   HULL_SUP_NATIVE,
+	  "a systemd scope's CPUQuota, N CPUs' time a second", NULL },
+	{ "memory",                 HULL_SUP_NATIVE,
+	  "a ceiling, a systemd scope's MemoryMax", NULL },
 	{ "ssh",                    HULL_SUP_NATIVE,
 	  "the image's own sshd, supervised at a high port on the machine's 127.107 address, "
 	  "bound there on the host network and forwarded there by pasta under NAT; refused with "
