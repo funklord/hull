@@ -476,6 +476,47 @@ cases=$((cases + 1))
 [ -d "/proc/$core" ] && [ "$fds_after" -eq "$fds_before" ] ||
 	fail "the core kept descriptors of a chroot machine's segment" \
 		"core ${core:-none}: $fds_before before, $fds_after after"
+# (devices (serial ...)): a host serial port behind the guest's ttyS0. A
+# pty stands in for the port, its far end held here: the guest's line
+# reaches it through qemu, as a board's console would. And a device no
+# host has, refused before qemu starts.
+cat > "$root/serialpty.py" <<'PY'
+import os, pty, select, sys, time
+master, slave = pty.openpty()
+with open(sys.argv[1], "w") as f:
+    f.write(os.ttyname(slave) + "\n")
+heard = b""
+end = time.time() + float(sys.argv[3])
+while time.time() < end and b"hello from ttyS0" not in heard:
+    r, _, _ = select.select([master], [], [], 0.5)
+    if r:
+        try:
+            heard += os.read(master, 1024)
+        except OSError:
+            break
+with open(sys.argv[2], "wb") as f:
+    f.write(heard)
+PY
+rm -f "$root/serialpty.name" "$root/serialpty.heard"
+timeout 100 python3 "$root/serialpty.py" "$root/serialpty.name" "$root/serialpty.heard" 90 &
+serial_pid=$!
+tries=0
+until [ -s "$root/serialpty.name" ] || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+conf vmserial "(backend vm) (devices (serial \"$(cat "$root/serialpty.name" 2>/dev/null)\")) (command \"/probe\" \"tell\" \"/dev/ttyS0\" \"hello from ttyS0\")"
+boot vmserial 90
+has 0 '^tell=ok$'
+wait "$serial_pid"
+cases=$((cases + 1))
+grep -q 'hello from ttyS0' "$root/serialpty.heard" 2>/dev/null ||
+	fail "a vm's ttyS0 did not reach the host's serial port" "$(cat "$root/serialpty.heard" 2>&1)"
+rm -f "$root/serialpty.name" "$root/serialpty.heard" "$root/serialpty.py"
+conf vmusb '(backend vm) (devices (usb (device (vendor "ffff") (product "fffe")))) (command "/probe")'
+boot vmusb
+has 125 'no USB device ffff:fffe is plugged in'
+
 # (network bridge) on a vm: a tap on a host bridge, which only root may
 # put there, so only a core run as root takes it; as this user, refused.
 # As root in a user namespace of its own, unshare -rmn, whose network is

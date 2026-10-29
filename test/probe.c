@@ -877,6 +877,21 @@ int main(int argc, char **argv)
 			if (fd >= 0)
 				close(fd);
 			i++;
+		} else if (strcmp(step, "tell") == 0 && i + 2 < argc) {
+			/* A line to a device, a serial port's say: no create, no
+			 * controlling terminal taken. */
+			int     fd = open(arg, O_WRONLY | O_NOCTTY | O_CLOEXEC);
+			ssize_t put = -1;
+
+			if (fd >= 0) {
+				char line[256];
+				int  length = snprintf(line, sizeof line, "%s\n", argv[i + 2]);
+
+				put = write(fd, line, (size_t)length);
+				close(fd);
+			}
+			printf("tell=%s\n", put > 0 ? "ok" : strerror(errno));
+			i += 2;
 		} else if (strcmp(step, "remove") == 0) {
 			printf("remove=%s\n", unlink(arg) == 0 ? "ok" : strerror(errno));
 			i++;

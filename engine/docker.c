@@ -1722,6 +1722,10 @@ static const hull_cap_entry entries[] = {
 	 * not root, which is docker's rule and not ours to bend. */
 	{ "security.readonly_root", HULL_SUP_NATIVE, NULL, NULL },
 	{ "security.no_new_privs",  HULL_SUP_NATIVE, NULL, NULL },
+	{ "devices.usb",            HULL_SUP_REJECTED,  "not yet: docker's --device", NULL },
+	{ "devices.serial",         HULL_SUP_REJECTED,  "not yet: docker's --device", NULL },
+	{ "devices.parallel",       HULL_SUP_REJECTED,  "not yet: docker's --device", NULL },
+	{ "devices.node",           HULL_SUP_REJECTED,  "not yet: docker's --device", NULL },
 	{ "security.allow",         HULL_SUP_REJECTED,
 	  "docker grants capabilities only to root, and its root is the host's", NULL },
 

@@ -1369,6 +1369,50 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 
 **Open, and the holder's:** the broker above; whether a software pool's budget counts a plan's `memory` as declared or as measured; whether a lease that ends stops its machine or only refuses the next run; how a board's power and console are named, `pdu:7/1` above being a placeholder; and the names `pool`, `slot` and `lease` themselves, which become a J key, CLI words and a directory, and cannot easily be renamed later. Prior art: LAVA, Linaro's hardware test lab, for boards, health checks and queues; GitHub's and GitLab's runners for leases by label; Kubernetes' resource quotas for budgets.
 
+### 4.13 Devices passed through, `(devices …)`
+
+**Written 2026-10-29, at the holder's asking, its key's shape the holder's:** a machine is given host devices for testing against real hardware and for compatibility, by kind, each named by what survives a re-plug rather than by a bus address:
+
+    (devices
+      (usb (device (vendor "0403") (product "6001") (serial "A10K"))
+           (device (port "1-4.2")))
+      (serial "/dev/serial/by-id/usb-FTDI_…")
+      (parallel "/dev/parport0")
+      (node "/dev/gpiochip0" "/dev/i2c-1"))
+
+- **A USB device** is its `vendor` and `product`, four hex digits as lsusb prints them, with a `serial` to tell two of one part apart, or the `port` it is plugged into as sysfs names it, or both. A port follows whatever is in it, so a probe that re-enumerates under another id, into DFU or a bootloader, is still the machine's.
+- **`serial`, `parallel` and `node`** are absolute paths, links followed: a `/dev/serial/by-id` name is the stable one for a port.
+- **Found when the machine starts, not when it is planned** (`engine/hostdev.c`), since a board is plugged in, reset and plugged in again between the two: the USB device among sysfs's, refused where none or two match; its node, `/dev/bus/usb/BBB/DDD`, or the path's, a character or block device under `/dev` that **the user may read and write**, refused naming its owner, group and mode otherwise, since a udev rule or the group is the fix. Nothing is passed as root: this is the rootless form, and a device the user cannot open is the host's to give.
+- **At most 16 devices a machine.**
+
+**By engine:**
+
+| | chroot | vm / emu (qemu) | docker |
+|---|---|---|---|
+| `usb` | its usbfs node bound into `/dev/bus/usb/…` | `usb-host` on a `qemu-xhci` of the guest's, by the host's bus and port, so a device that resets and comes back at a new address is followed | not yet |
+| `serial` | the node bound in at its path | an ISA serial port, `ttyS0` to `ttyS3` in turn, the host's node behind it as qemu's `serial` chardev | not yet |
+| `parallel` | the node bound in | an ISA parallel port, `parport0` to `parport2`, by qemu's `parallel` chardev, which is ppdev | not yet |
+| `node` | the node bound in | refused: a host's node has no device of a guest's to be | not yet |
+
+- **chroot** binds each node at its own path in the machine's `/dev`, as it does null, a user namespace being able to bind a device but not make one, and a path the spec gave under `/dev` that is a link to it is made a link there too, so a program finds the device where it would on the host. A host pty is refused: its node is under `/dev/pts`, the machine's own devpts.
+- **vm and emu** load the guest's drivers from the host's modules, as udev would on the host: `xhci_pci` and whatever `modules.alias` matches each of the USB device's interfaces' modalias, and `parport_pc` and `ppdev` for a parallel port; serial is 8250's, built in. The agent links each serial and parallel port's host path to the guest's own, from `/hull/devices` in the initramfs, so `/dev/ttyUSB0` in the guest is its `ttyS0`; devtmpfs is one for every mount of it, so the machine's `/dev` has them. A path under `/dev/pts` is skipped, being the guest's devpts. A vm has the PC's ports, four serial and three parallel, and a spec naming more is refused.
+- **docker** declares every kind rejected, *not yet*: its `--device` is the natural form and its daemon is root, which makes it easy there; it waits on whether it is wanted.
+
+**Timing, which decides the engine for a device that cares** (isochronous USB, debug probes, bit-banged ports):
+
+- **chroot is the host's own timing**: the bound node is the host's driver, nothing between. A device whose timing matters runs there first.
+- **A vm's USB is qemu's usb-host over libusb**, every transfer a host transfer re-issued, with the guest's xHCI emulated. Bulk and interrupt devices work, a debug probe among them, slower in round trips, which is what a probe's speed is made of; isochronous transfers, audio and video, work with more latency and jitter, and a high-bandwidth one, an HD webcam, may not keep up. **emu** adds TCG's cost to every guest instruction, worse again. The answer for native timing in a vm is the whole USB controller by VFIO, its own PCI function, step 2 below.
+- **A vm's serial port** is fine for a console or a protocol at a line rate; its modem lines are qemu's. **A vm's parallel port** is ppdev, every port access a trap and an ioctl, so a bit-banged parport device, a JTAG cable, is slow there and may not work at all; a program on chroot reaches ppdev directly.
+
+**Said before it fails, at the holder's asking:** a device whose timing a vm does not keep is warned of where the machine is planned and where it is run, without being asked for.
+- **By kind, in the matrix:** `devices.usb` and `devices.parallel` are declared **emulated** on qemu rather than native, their notes saying what suffers and that chroot is the host's own timing, so `hull plan`, `hull check` and `hull run` print them as they print every emulated field, before anything starts. `devices.serial` stays native; chroot's devices are native and say nothing.
+- **By device, when it is found:** a USB device with an isochronous endpoint, sysfs's `ep_NN/type` of `Isoc` on any of its interfaces, is named on the workload's stderr before it runs, as chroot says its one uid is mapped: *hull: USB device 046d:0825 on port 1-2 has isochronous endpoints, audio or video: through a vm's usb-host they keep time less well than on the host, and a high-bandwidth one may drop data; chroot gives the host's own timing*. The engine writes it into the initramfs as `/hull/notices`, and the agent writes it to channel 0's stderr alone, not an exec's.
+- **Not told apart:** a debug probe from any other bulk device. Its vendor-specific class says nothing of timing, so the matrix's note covers it; a list of probe ids would be a guess kept current by hand.
+
+**Not yet:** PCI by VFIO (step 2, a vm's whole USB controller among what it gives); docker's `--device`; re-binding a chroot machine's USB node when the device re-enumerates while the machine runs, where qemu follows by port and chroot holds the node it found; holding a device for one machine at a time, which is §4.12's lease; GPIO, I2C and SPI to a vm by rust-vmm's vhost-device daemons; and a device on another host, by usbredir or USB/IP.
+
+- **Measured** in `test/hostdev_test.c`, over a sysfs tree of its own: no device, two of one part, one by its serial, a serial no device has, ids in upper case, one by its port, a port and ids that are not its, an empty port, no sysfs, and a root hub and an interface carrying a device's ids not taken for one; a node only root may write refused, naming its owner, group and mode; each interface's drivers by `modules.alias`, each once, and a port that is a prefix of another's given none; a bulk endpoint, an isochronous one, and another port's; a node, a link to one, a file, a path not there, and a node the user may not write. In `test/spec_test.c`: the forms above taken, and each half of a pair alone, a serial without ids, an empty device, ids not four hex digits, ports malformed three ways, a relative path, an empty kind and an unknown one refused with their paths. In `test/cli_test.sh`, on chroot: `/dev/net/tun` bound in, read inside giving EBADFD, which a plain file cannot, and its `kind` its own `10:200`; `/dev/char/10:200`, a link under `/dev`, made a link inside and read through; a tree with no `/dev` refused; a file, a missing path, `/dev/ttyS0` the user may not write, no USB device of the ids, and a real USB device of the host's this user may not write each refused with its reason; the plan's kinds on chroot, vm and emu, the vm's USB and the emu's parallel port warned of by a plain `hull plan`, chroot's not, and docker's refusal. In `test/qemu_test.sh`: a host pty as a vm's serial port, the guest's `ttyS0` line reaching the far end held by the test; and a USB device not plugged in refused before qemu starts. **Sabotage,** in a scratch copy: the bind into `/dev` removed failed four named cases, the refusal of a tree with no `/dev` removed one, `devices.usb` declared native one, and isochronous endpoints never seen one. **Not measured here,** for want of a device this user may write: a USB device given to either engine, its drivers loaded in a guest, and the per-device notice reaching a workload; a parallel port; and the agent's links in the guest, whose only port here is a pty, skipped as under the guest's devpts.
+
 ## 5. Engines
 
 ### 5.0 Engines are plugins — the backend set is open
@@ -1447,7 +1491,7 @@ The matrix is data, not documentation: assembled at load time from each engine's
 | own network with NAT out, `(network nat)` or no key | native (pasta, since 2026-10-27) | native (passt) | native (passt) |
 | a host bridge, `(network bridge)` | native with the core as root (a veth; hull0 or `(bridge NAME)`), since 2026-10-27 | native with the core as root (a tap), since 2026-10-27 | native with the core as root (a tap) |
 | no network, `(network none)` | native (an empty netns, lo up) | native (no NIC) | native (no NIC) |
-| device passthrough | rejected in rootless (no nodes) | emulated: virtio/VFIO/USB where permitted | emulated: QEMU-emulated devices only |
+| device passthrough, `(devices …)` | native on chroot, the node bound in (§4.13); docker not yet | native: USB, serial, parallel; VFIO not yet | native: the same, at TCG's cost |
 | custom kernel / modules | rejected: shared host kernel | native (`kernel` key; `full` profile for distro kernels) | native |
 | inotify on volumes | native | rejected-by-default: virtiofs event gaps → poll option offered | rejected-by-default: same |
 | startup latency (informational) | ~10 ms | ~100–300 ms (micro), seconds (full) | seconds; workload 5–20× slower |
@@ -2040,6 +2084,7 @@ with the same schema per machine (machines in one file form a segment, Appendix 
 | `volumes` | `(volume …)` entries | empty | `(volume (host "<path>") (guest "<path>") (mode rw\|ro))` |
 | `cpus` | integer | engine default | ns: cgroup quota (chroot: a systemd scope) · vm/emu: vCPUs |
 | `memory` | string | engine default | `"2G"`; ns: cgroup ceiling · vm/emu: hard allocation (§6) |
+| `devices` | record | none | `(usb (device (vendor "0403") (product "6001")))`, `(serial "/dev/…")`, `(parallel …)`, `(node …)`; ns: bound in · vm/emu: on a bus of the guest's, `node` rejected (§4.13) |
 | `backend` | symbol | `ns` | Class (`ns`/`vm`/`emu` → host default engine of class) or engine (`chroot`, `docker`, `qemu`, `virtualbox`, `vmware`, reserved: `hyperv`, `dosbox`, …) (§5.0). **ns's default engine is `chroot`, decided by the holder 2026-10-22**: it had been whichever engine was registered first, docker, so a file naming no backend reached for root first, against §7, and a plain directory was refused, docker running none in place. An image not in the store is refused on chroot with `hull pull` it first, where docker pulled it itself. Set in the frontend, which chooses, and in the core, which then agrees; a sabotage leaving the core's unset survives, the plan naming its engine |
 | `ssh` | boolean | `false` | Provision + supervise minimal sshd with user's authorized_keys, all backends (§8.1.3) |
 | `restart` | `no` \| `on-failure` \| `always` | `no` | Consumed by the systemd generator (§9), not by a daemon |

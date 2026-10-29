@@ -429,6 +429,61 @@ static void load_modules(void)
 		fclose(list);
 }
 
+/*
+ * The links the engine lists in /hull/devices, `HOST GUEST` a line: each
+ * serial or parallel port of (devices ...) at the path it has on the host,
+ * linked to the guest's own, ttyS0 or parport0, so a program finds it
+ * where it would there. devtmpfs is one for every mount of it, so the
+ * machine's /dev has them too. A path that is the guest's own already, or
+ * a host pty's, under the guest's own devpts, is left as it is.
+ */
+/* What the engine says to the workload, /hull/notices: said on its
+ * stderr, channel 0's, before it runs, and not to an exec. Read at boot,
+ * while /hull is there. */
+static char notices[4096];
+
+static void read_notices(void)
+{
+	FILE  *file = fopen("/hull/notices", "r");
+	size_t got;
+
+	if (file == NULL)
+		return;
+	got = fread(notices, 1u, sizeof notices - 1u, file);
+	notices[got] = '\0';
+	fclose(file);
+}
+
+static void link_devices(void)
+{
+	FILE *list = fopen("/hull/devices", "r");
+	char  line[600];
+
+	while (list != NULL && fgets(line, sizeof line, list) != NULL) {
+		char  target[64];
+		char *host = line;
+		char *guest = strrchr(line, ' ');
+
+		line[strcspn(line, "\n")] = '\0';
+		if (guest == NULL || strncmp(host, "/dev/", 5u) != 0)
+			continue;
+		*guest++ = '\0';
+		snprintf(target, sizeof target, "/dev/%s", guest);
+		/* A host pty's path is in the guest's own devpts. */
+		if (strcmp(host, target) == 0 || strncmp(host, "/dev/pts/", 9u) == 0)
+			continue;
+		for (char *slash = strchr(host + 5, '/'); slash != NULL; slash = strchr(slash + 1, '/')) {
+			*slash = '\0';
+			mkdir(host, 0755);
+			*slash = '/';
+		}
+		if (symlink(target, host) != 0 && errno != EEXIST)
+			say(host, strerror(errno));
+	}
+	if (list != NULL)
+		fclose(list);
+}
+
 /* The network, as the engine's passt gives it (engine/qemu.c): lo, and
  * eth0 at GUEST_ADDRESS/24 routed through GATEWAY_ADDRESS. A machine's
  * resolv.conf is /hull/resolv.conf, naming passt's DNS. */
@@ -1243,6 +1298,9 @@ static const char *spawn(uint32_t ch, char *const *argv, const char *cwd, char *
 		}
 		if (no_new_privs)
 			prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+		if (ch == 0u && notices[0] != '\0' && write(2, notices, strlen(notices)) < 0) {
+			/* its stderr is gone; nothing to tell */
+		}
 		hull_access_execute(argv, envp);
 		fprintf(stderr, "hull agent: %s: %s\n", argv[0], strerror(errno));
 		_exit(127);
@@ -1969,6 +2027,8 @@ int main(int argc, char **argv)
 		}
 	}
 	load_modules();
+	link_devices();
+	read_notices();
 	network();
 
 	sigemptyset(&mask);

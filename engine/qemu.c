@@ -81,7 +81,9 @@
 
 #define MAX_VOLUMES  64u
 #define MAX_PORTS    64u
-#define MAX_MODULES  32u
+#define MAX_MODULES  64u
+#define MAX_SERIAL   4u   /* isa-serial's indices, ttyS0 to ttyS3 */
+#define MAX_PARALLEL 3u   /* isa-parallel's, parport0 to parport2 */
 #define AGENT_PORT   1u
 #define BOOT_LIMIT   60   /* seconds for the agent to answer, TCG included */
 #define CID_TRIES    4
@@ -150,6 +152,8 @@ struct hull_machine {
 	char             bridge_address[16];   /* its address on HULL_BRIDGE, or "" */
 	char             tap[16];      /* the tap's name on the bridge, once made, or "" */
 	int              bridge_relay; /* asking hull0's DNS relay, the host's resolvers loopback */
+	hull_device      device[HULL_MAX_DEVICES];  /* (devices ...), found on the host at start */
+	unsigned         device_count;
 	char             append[512];  /* the kernel's command line */
 	char            *segment[MAX_SEGMENTS];     /* Appendix D's, by name */
 	int              segment_fd[MAX_SEGMENTS];  /* their ports, until qemu has them */
@@ -527,6 +531,23 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		}
 	}
 
+	/* A guest has the PC's ports: four serial and three parallel. */
+	{
+		const char *why = hull_access_devices(doc, &machine, m->device, &m->device_count);
+		unsigned    serial = 0u;
+		unsigned    parallel = 0u;
+
+		if (why != NULL)
+			return why;
+		for (unsigned i = 0u; i < m->device_count; i++) {
+			serial += m->device[i].kind == HULL_DEVICE_SERIAL;
+			parallel += m->device[i].kind == HULL_DEVICE_PARALLEL;
+		}
+		if (serial > MAX_SERIAL)
+			return "a vm has four serial ports: (devices (serial ...)) names more";
+		if (parallel > MAX_PARALLEL)
+			return "a vm has three parallel ports: (devices (parallel ...)) names more";
+	}
 	m->memory_mib = 512u;
 	if ((text = hull_access_value(doc, &machine, "memory")) != NULL) {
 		m->memory_mib = mebibytes(text);
@@ -788,10 +809,26 @@ static int add_module(module_list *list, const char *path)
 	return 1;
 }
 
-static const char *find_modules(const char *release, module_list *list)
+/* A module's name as modules.alias and modules.dep's path each spell it,
+ * which differ in `-` and `_`: whether they are the same. */
+static int same_module(const char *a, size_t length, const char *b)
 {
-	static const char *const wanted[] = { "9p", "9pnet_virtio", "vmw_vsock_virtio_transport",
-	                                      "virtio_net", "overlay" };
+	size_t i = 0u;
+
+	for (; i < length && b[i] != '\0'; i++)
+		if (a[i] != b[i] && !((a[i] == '-' || a[i] == '_') && (b[i] == '-' || b[i] == '_')))
+			return 0;
+	return i == length && b[i] == '\0';
+}
+
+/* The agent's modules, then `extra`'s, a machine's devices' drivers. */
+static const char *find_modules(const char *release, const char *const *extra,
+                                unsigned extra_count, module_list *list)
+{
+	static const char *const base[] = { "9p", "9pnet_virtio", "vmw_vsock_virtio_transport",
+	                                    "virtio_net", "overlay" };
+	const char *wanted[sizeof base / sizeof base[0] + MAX_MODULES];
+	unsigned    wanted_count = 0u;
 	char        path[512];
 	char       *dep;
 	char       *lines[8192];
@@ -806,7 +843,11 @@ static const char *find_modules(const char *release, module_list *list)
 	dep[length] = '\0';
 	for (char *line = strtok(dep, "\n"); line != NULL && count < 8192u; line = strtok(NULL, "\n"))
 		lines[count++] = line;
-	for (unsigned w = 0u; w < sizeof wanted / sizeof wanted[0] && reason == NULL; w++) {
+	for (unsigned i = 0u; i < sizeof base / sizeof base[0]; i++)
+		wanted[wanted_count++] = base[i];
+	for (unsigned i = 0u; i < extra_count && wanted_count < sizeof wanted / sizeof wanted[0]; i++)
+		wanted[wanted_count++] = extra[i];
+	for (unsigned w = 0u; w < wanted_count && reason == NULL; w++) {
 		unsigned i;
 
 		/* A line is `path: dependency...`; the module's name is the
@@ -814,17 +855,20 @@ static const char *find_modules(const char *release, module_list *list)
 		for (i = 0u; i < count; i++) {
 			const char *colon = strchr(lines[i], ':');
 			const char *name;
-			size_t      stem = strlen(wanted[w]);
+			const char *ko;
 
 			if (colon == NULL)
 				continue;
 			for (name = colon; name > lines[i] && name[-1] != '/'; name--)
 				;
-			if (strncmp(name, wanted[w], stem) == 0 && strncmp(name + stem, ".ko", 3u) == 0)
+			ko = strstr(name, ".ko");
+			if (ko != NULL && ko < colon && same_module(name, (size_t)(ko - name), wanted[w]))
 				break;
 		}
 		if (i == count) {
-			reason = "the host kernel has no 9p, vsock, virtio_net or overlay module for the guest";
+			reason = w < sizeof base / sizeof base[0] ?
+			         "the host kernel has no 9p, vsock, virtio_net or overlay module for the guest" :
+			         "the host kernel has no module a device of (devices ...) needs";
 			break;
 		}
 		{
@@ -901,8 +945,16 @@ static int kernel_release(const char *image, char *out, size_t cap)
 	return i > 0u;
 }
 
-static const char *write_initramfs(const char *dir, const char *release, int load_modules)
+static const char *write_initramfs(const hull_machine *m, const char *release, int load_modules)
 {
+	const char *dir = m->dir;
+	const char *extra[MAX_MODULES];
+	char        drivers[MAX_MODULES][64];
+	unsigned    extra_count = 0u;
+	char        links[HULL_MAX_DEVICES * 520u] = "";
+	char        notices[HULL_MAX_DEVICES * 400u] = "";
+	unsigned    serial = 0u;
+	unsigned    parallel = 0u;
 	char        path[4200];
 	char        agent[PATH_MAX];
 	module_list list = { { NULL }, 0u };
@@ -916,7 +968,64 @@ static const char *write_initramfs(const char *dir, const char *release, int loa
 		return "the guest agent, hull-agent beside hull, cannot be read";
 	/* A path kernel whose modules the host does not have is taken to have
 	 * its guest drivers built in (Appendix F): no module list, no share. */
-	if (load_modules && (reason = find_modules(release, &list)) != NULL) {
+	/* Its devices' drivers: xhci for a USB device and what modules.alias
+	 * says drives each of its interfaces, as udev would load on the host;
+	 * parport_pc and ppdev for a parallel port. A serial port is 8250's,
+	 * built in. And the links the agent makes in the guest's /dev, from
+	 * each serial or parallel port's path on the host to the guest's own,
+	 * so a program finds it where it would on the host. */
+	for (unsigned i = 0u; i < m->device_count; i++) {
+		const hull_device *d = &m->device[i];
+		const char        *guest = NULL;
+		char               own[16];
+
+		/* What the matrix says of every USB device, said of this one
+		 * where it is so: the workload's stderr has it, once. */
+		if (d->kind == HULL_DEVICE_USB && d->host.isochronous) {
+			size_t at = strlen(notices);
+
+			snprintf(notices + at, sizeof notices - at,
+			         "hull: USB device %s on port %s has isochronous endpoints, audio or video: "
+			         "through %s's usb-host they keep time less well than on the host, and a "
+			         "high-bandwidth one may drop data; chroot gives the host's own timing\n",
+			         d->host.ids, d->host.port, m->emu ? "emu" : "a vm");
+		}
+		if (d->kind == HULL_DEVICE_USB && load_modules) {
+			char aliases[600];
+			int  got;
+
+			if (extra_count == 0u || strcmp(extra[0], "xhci_pci") != 0) {
+				memmove(extra + 1, extra, extra_count * sizeof extra[0]);
+				extra[0] = "xhci_pci";
+				extra_count++;
+			}
+			snprintf(aliases, sizeof aliases, "/lib/modules/%s/modules.alias", release);
+			got = hull_hostdev_usb_drivers(HULL_SYSFS_USB, d->host.port, aliases,
+			                               &drivers[extra_count][0], sizeof drivers[0],
+			                               MAX_MODULES - extra_count);
+			for (int k = 0; k < got; k++, extra_count++)
+				extra[extra_count] = drivers[extra_count];
+		} else if (d->kind == HULL_DEVICE_SERIAL) {
+			snprintf(own, sizeof own, "ttyS%u", serial++);
+			guest = own;
+		} else if (d->kind == HULL_DEVICE_PARALLEL) {
+			if (parallel == 0u && load_modules && extra_count + 2u <= MAX_MODULES) {
+				extra[extra_count++] = "parport_pc";
+				extra[extra_count++] = "ppdev";
+			}
+			snprintf(own, sizeof own, "parport%u", parallel++);
+			guest = own;
+		}
+		if (guest != NULL) {
+			size_t at = strlen(links);
+
+			snprintf(links + at, sizeof links - at, "%s %s\n", d->host.node, guest);
+			at = strlen(links);
+			if (d->host.named[0] != '\0')
+				snprintf(links + at, sizeof links - at, "%s %s\n", d->host.named, guest);
+		}
+	}
+	if (load_modules && (reason = find_modules(release, extra, extra_count, &list)) != NULL) {
 		free(data);
 		return reason;
 	}
@@ -952,6 +1061,8 @@ static const char *write_initramfs(const char *dir, const char *release, int loa
 		strcat(names, "\n");
 	}
 	entry(&a, "hull/modules", 0100644u, 0u, 0u, (const uint8_t *)names, strlen(names));
+	entry(&a, "hull/devices", 0100644u, 0u, 0u, (const uint8_t *)links, strlen(links));
+	entry(&a, "hull/notices", 0100644u, 0u, 0u, (const uint8_t *)notices, strlen(notices));
 	entry(&a, "TRAILER!!!", 0u, 0u, 0u, NULL, 0u);
 	for (unsigned i = 0u; i < list.count; i++)
 		free(list.path[i]);
@@ -1275,7 +1386,12 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int
 	char        fsdev[MAX_VOLUMES][9000];
 	char        device[MAX_VOLUMES][96];
 	char        path[8500];
-	const char *argv[64 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS];
+	char        device_chardev[HULL_MAX_DEVICES][600];
+	char        device_device[HULL_MAX_DEVICES][96];
+	const char *argv[64 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS + 4u * HULL_MAX_DEVICES + 2u];
+	unsigned    serial = 0u;
+	unsigned    parallel = 0u;
+	int         usb = 0;
 	unsigned    n = 0u;
 	pid_t       pid;
 
@@ -1366,6 +1482,49 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int
 	argv[n++] = console;
 	argv[n++] = "-device";
 	argv[n++] = "virtconsole,chardev=console";
+	/* Its devices (section 4.13). A USB device on an xHCI controller of
+	 * the guest's, by the host's bus and port, so it is followed when it
+	 * resets and comes back at a new address, as a board does; a serial or
+	 * parallel port the host's node behind an ISA port of the guest's,
+	 * ttySN and parportN in turn, which the agent links from the host's
+	 * path. */
+	for (unsigned i = 0u; i < m->device_count; i++) {
+		const hull_device *d = &m->device[i];
+		char               node[520];
+
+		escaped(node, sizeof node, d->host.node);
+		if (d->kind == HULL_DEVICE_USB) {
+			const char *ports = strchr(d->host.port, '-');
+
+			if (!usb) {
+				argv[n++] = "-device";
+				argv[n++] = "qemu-xhci,id=usb";
+				usb = 1;
+			}
+			snprintf(device_device[i], sizeof device_device[i],
+			         "usb-host,bus=usb.0,hostbus=%u,hostport=%s", d->host.bus,
+			         ports != NULL ? ports + 1 : d->host.port);
+			argv[n++] = "-device";
+			argv[n++] = device_device[i];
+		} else if (d->kind == HULL_DEVICE_SERIAL) {
+			snprintf(device_chardev[i], sizeof device_chardev[i], "serial,id=d%u,path=%s", i, node);
+			snprintf(device_device[i], sizeof device_device[i], "isa-serial,chardev=d%u,index=%u",
+			         i, serial++);
+			argv[n++] = "-chardev";
+			argv[n++] = device_chardev[i];
+			argv[n++] = "-device";
+			argv[n++] = device_device[i];
+		} else if (d->kind == HULL_DEVICE_PARALLEL) {
+			snprintf(device_chardev[i], sizeof device_chardev[i], "parallel,id=d%u,path=%s", i,
+			         node);
+			snprintf(device_device[i], sizeof device_device[i],
+			         "isa-parallel,chardev=d%u,index=%u", i, parallel++);
+			argv[n++] = "-chardev";
+			argv[n++] = device_chardev[i];
+			argv[n++] = "-device";
+			argv[n++] = device_device[i];
+		}
+	}
 	argv[n++] = "-fsdev";
 	argv[n++] = root;
 	argv[n++] = "-device";
@@ -2189,8 +2348,13 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		load_modules = 1;
 	}
 
+	/* Its devices as the host has them now: a board is plugged in, reset
+	 * and plugged in again between a plan and a start. */
+	for (unsigned i = 0u; i < m->device_count; i++)
+		if (hull_hostdev_find(&m->device[i], m->detail, sizeof m->detail) != NULL)
+			return fail(error, HULL_ERR_RUNTIME, m->detail);
 	if ((reason = make_dir(m)) != NULL ||
-	    (reason = write_initramfs(m->dir, release, load_modules)) != NULL ||
+	    (reason = write_initramfs(m, release, load_modules)) != NULL ||
 	    (reason = open_listeners(m)) != NULL) {
 		if (reason != m->detail)
 			snprintf(m->detail, sizeof m->detail, "%s", reason);
@@ -3327,6 +3491,19 @@ static const hull_cap_entry entries[] = {
 	{ "network.host",       HULL_SUP_REJECTED,
 	  "a vm shares no network namespace with the host: use ports", NULL },
 	{ "network.nat",        HULL_SUP_NATIVE,   "passt's, as no network key gives", NULL },
+	{ "devices.usb",        HULL_SUP_EMULATED,
+	  "usb-host on the guest's xHCI, every transfer re-issued by qemu on the host: an "
+	  "isochronous device, audio or video, and one whose round trips are its speed, a debug "
+	  "probe, fare worse than on the host, and worse again under emu; chroot is the host's own "
+	  "timing", NULL },
+	{ "devices.serial",     HULL_SUP_NATIVE,
+	  "an ISA serial port of the guest's, ttyS0 on, linked from the host's path", NULL },
+	{ "devices.parallel",   HULL_SUP_EMULATED,
+	  "an ISA parallel port of the guest's by ppdev, every port access a trap and an ioctl: "
+	  "a bit-banged device, a JTAG cable, may not work; chroot reaches ppdev directly", NULL },
+	{ "devices.node",       HULL_SUP_REJECTED,
+	  "a host's device node has no device of a guest's to be: (usb ...), (serial ...) or "
+	  "(parallel ...) gives one", NULL },
 	{ "network.bridge",     HULL_SUP_NATIVE,
 	  "a tap on hull's own bridge, hull0, NATed out, or on the host bridge (bridge NAME) "
 	  "names; only with hull's core run as root, refused at create otherwise", NULL },

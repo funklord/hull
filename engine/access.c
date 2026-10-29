@@ -436,3 +436,74 @@ char *hull_access_resolver(const hull_sexpr_doc *doc, const hull_sexpr_form *nam
 	memcpy(text + at, "search hull\n", sizeof "search hull\n");
 	return text;
 }
+
+/* A string copied into `out`, `cap` long: 0 where it is not given, -1
+ * where it is too long. */
+static int copy_value(const hull_sexpr_doc *doc, const hull_sexpr_form *record, const char *key,
+                      char *out, size_t cap)
+{
+	char *text = hull_access_value(doc, record, key);
+	int   result = 0;
+
+	out[0] = '\0';
+	if (text != NULL) {
+		result = strlen(text) < cap ? 1 : -1;
+		if (result > 0)
+			memcpy(out, text, strlen(text) + 1u);
+	}
+	free(text);
+	return result;
+}
+
+const char *hull_access_devices(const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
+                                hull_device out[HULL_MAX_DEVICES], unsigned *count)
+{
+	static const struct {
+		const char      *key;
+		hull_device_kind kind;
+	} kinds[] = {
+		{ "usb", HULL_DEVICE_USB }, { "serial", HULL_DEVICE_SERIAL },
+		{ "parallel", HULL_DEVICE_PARALLEL }, { "node", HULL_DEVICE_NODE },
+	};
+	hull_sexpr_form devices;
+
+	*count = 0u;
+	if (!hull_access_find(doc, machine, "devices", &devices))
+		return NULL;
+	for (size_t k = 0u; k < sizeof kinds / sizeof kinds[0]; k++) {
+		hull_sexpr_form entry;
+		hull_sexpr_form item;
+		int             more;
+
+		if (!hull_access_find(doc, &devices, kinds[k].key, &entry))
+			continue;
+		hull_sexpr_child(doc, &entry, &item);
+		for (more = hull_sexpr_next(doc, &item, &item); more;
+		     more = hull_sexpr_next(doc, &item, &item)) {
+			hull_device *d = &out[*count];
+
+			if (*count == HULL_MAX_DEVICES)
+				return "a machine is given at most 16 devices";
+			memset(d, 0, sizeof *d);
+			d->kind = kinds[k].kind;
+			if (d->kind == HULL_DEVICE_USB) {
+				if (copy_value(doc, &item, "vendor", d->vendor, sizeof d->vendor) < 0 ||
+				    copy_value(doc, &item, "product", d->product, sizeof d->product) < 0 ||
+				    copy_value(doc, &item, "serial", d->serial, sizeof d->serial) < 0 ||
+				    copy_value(doc, &item, "port", d->port, sizeof d->port) < 0)
+					return "a USB device's serial or port is too long";
+			} else {
+				char *text = hull_access_text(doc, &item);
+
+				if (text == NULL || strlen(text) >= sizeof d->path) {
+					free(text);
+					return "a device's path is too long";
+				}
+				memcpy(d->path, text, strlen(text) + 1u);
+				free(text);
+			}
+			(*count)++;
+		}
+	}
+	return NULL;
+}

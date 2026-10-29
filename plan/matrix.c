@@ -392,6 +392,10 @@ hull_matrix_status hull_matrix_resolve(const hull_spec *spec, const hull_sexpr_f
 			resolve_tuning(&r, &entry);
 		else if (hull_sexpr_is(&spec->doc, &key, "security"))
 			resolve_record(&r, "security", &entry);
+		/* devices.usb, devices.serial and the rest: each kind an engine
+		 * may pass or not, whatever the devices it names. */
+		else if (hull_sexpr_is(&spec->doc, &key, "devices"))
+			resolve_record(&r, "devices", &entry);
 		else if (hull_sexpr_is(&spec->doc, &key, "backend") ||
 		         hull_sexpr_is(&spec->doc, &key, "restart") ||
 		         hull_sexpr_is(&spec->doc, &key, "env_file")) {

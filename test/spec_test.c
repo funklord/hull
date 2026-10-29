@@ -149,6 +149,33 @@ static void test_values(void)
 	NO(M("(network bridge) (bridge \"a/b\")"), VALUE, "\"a/b\"", "machine.bridge");
 	NO(M("(network bridge) (bridge \"sixteen-chars-xx\")"), VALUE, "\"sixteen-chars-xx\"",
 	   "machine.bridge");
+	/* (devices ...), section 4.13: a USB device by its ids, its serial
+	 * beside them, or its port; nodes by an absolute path. */
+	OK(M("(devices (usb (device (vendor \"0403\") (product \"6001\"))))"));
+	OK(M("(devices (usb (device (vendor \"0403\") (product \"6001\") (serial \"A10K\"))"
+	     " (device (port \"1-4.2\"))))"));
+	OK(M("(devices (usb (device (vendor \"0483\") (product \"374B\") (port \"3-1\"))))"));
+	OK(M("(devices (serial \"/dev/ttyUSB0\" \"/dev/serial/by-id/x\") (parallel \"/dev/parport0\")"
+	     " (node \"/dev/gpiochip0\"))"));
+	NO(M("(devices (usb (device (vendor \"0403\"))))"), SHAPE, "(vendor ",
+	   "machine.devices.usb.device.vendor");
+	NO(M("(devices (usb (device (product \"6001\"))))"), SHAPE, "(product ",
+	   "machine.devices.usb.device.product");
+	NO(M("(devices (usb (device (port \"1-2\") (serial \"A\"))))"), SHAPE, "(serial ",
+	   "machine.devices.usb.device.serial");
+	NO(M("(devices (usb (device)))"), MISSING, "(device)", "machine.devices.usb.device");
+	NO(M("(devices (usb (device (vendor \"403\") (product \"6001\"))))"), VALUE, "\"403\"",
+	   "machine.devices.usb.device.vendor");
+	NO(M("(devices (usb (device (vendor \"04g3\") (product \"6001\"))))"), VALUE, "\"04g3\"",
+	   "machine.devices.usb.device.vendor");
+	NO(M("(devices (usb (device (port \"1\"))))"), VALUE, "\"1\"", "machine.devices.usb.device.port");
+	NO(M("(devices (usb (device (port \"1-\"))))"), VALUE, "\"1-\"", "machine.devices.usb.device.port");
+	NO(M("(devices (usb (device (port \"1-2.\"))))"), VALUE, "\"1-2.\"",
+	   "machine.devices.usb.device.port");
+	NO(M("(devices (serial \"ttyUSB0\"))"), VALUE, "\"ttyUSB0\"", "machine.devices.serial");
+	NO(M("(devices (node))"), SHAPE, "(node)", "machine.devices.node");
+	NO(M("(devices (usb))"), SHAPE, "(usb)", "machine.devices.usb");
+	NO(M("(devices (pci \"0000:01:00.0\"))"), UNKNOWN, "pci", "machine.devices.pci");
 	NO(M("(restart)"), SHAPE, "(restart)", "machine.restart");
 
 	/* Booleans. */

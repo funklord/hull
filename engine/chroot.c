@@ -147,6 +147,8 @@ struct hull_machine {
 	int              bridge_relay;  /* asking hull0's DNS relay, the host's resolvers loopback */
 	unsigned         cpus;       /* (cpus N): N CPUs' time a second, by its scope, or 0 */
 	unsigned long long memory;   /* (memory SIZE): its scope's ceiling in bytes, or 0 */
+	hull_device      device[HULL_MAX_DEVICES];  /* (devices ...), found on the host at start */
+	unsigned         device_count;
 	unsigned         port_count; /* (ports ...), forwarded by pasta on the address */
 	int              port_udp[MAX_PORTS];
 	unsigned         port_host[MAX_PORTS];
@@ -239,7 +241,6 @@ static void add_exposed(void *context, const char *pair)
 	m->env_count++;
 }
 
-/* The plan's machine, read into `m`. Returns a reason, or NULL. */
 /* "2G" in bytes, as J.1 writes a size. */
 static unsigned long long bytes_of(const char *size)
 {
@@ -256,6 +257,7 @@ static unsigned long long bytes_of(const char *size)
 	return n;
 }
 
+/* The plan's machine, read into `m`. Returns a reason, or NULL. */
 static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 {
 	hull_sexpr_form machine;
@@ -441,6 +443,12 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			       "a root that is not read-only";
 	}
 
+	{
+		const char *reason = hull_access_devices(doc, &machine, m->device, &m->device_count);
+
+		if (reason != NULL)
+			return reason;
+	}
 	/* (cpus N) and (memory SIZE), section 6's ceiling, given by the
 	 * scope start_limits() makes. */
 	if ((source = hull_access_value(doc, &machine, "cpus")) != NULL) {
@@ -789,7 +797,50 @@ static unsigned long locked_flags(const char *path)
  * the first `>/dev/null` made a regular file, what was written to it was
  * read back, and a build committed it into its tree.
  */
-static void make_dev(int report)
+/* `path`'s directories below the root, as `mkdir -p` makes them. */
+static int make_parents(const char *path)
+{
+	char copy[300];
+
+	if (snprintf(copy, sizeof copy, "%s", path) >= (int)sizeof copy)
+		return -1;
+	for (char *slash = strchr(copy, '/'); slash != NULL; slash = strchr(slash + 1, '/')) {
+		*slash = '\0';
+		if (mkdir(copy, 0755) != 0 && errno != EEXIST)
+			return -1;
+		*slash = '/';
+	}
+	return 0;
+}
+
+/*
+ * The host's devices the machine is given, (devices ...): each node bound
+ * at its own path in the machine's /dev, as null is, and a path the spec
+ * gave under /dev that is a link to it, as /dev/serial/by-id is, made a
+ * link there too, so a program finds the device where it would on the
+ * host.
+ */
+static void bind_devices(const hull_machine *m, int report)
+{
+	for (unsigned i = 0u; i < m->device_count; i++) {
+		const hull_hostdev *host = &m->device[i].host;
+		char                path[300];
+		int                 fd;
+
+		snprintf(path, sizeof path, "dev/%s", host->node + 5);
+		if (make_parents(path) != 0 ||
+		    (fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0600)) < 0 || close(fd) != 0 ||
+		    mount(host->node, path, NULL, MS_BIND, NULL) != 0)
+			child_fail(report, "binding a device of (devices ...) into /dev");
+		if (strncmp(host->named, "/dev/", 5u) == 0) {
+			snprintf(path, sizeof path, "dev/%s", host->named + 5);
+			if (make_parents(path) != 0 || symlink(host->node, path) != 0)
+				child_fail(report, "a link in /dev to a device of (devices ...)");
+		}
+	}
+}
+
+static void make_dev(const hull_machine *m, int report)
 {
 	static const char *const nodes[] = { "null", "zero", "full", "random", "urandom", "tty" };
 	static const char *const links[][2] = {
@@ -825,6 +876,7 @@ static void make_dev(int report)
 		errno = 0;
 	if (mount("tmpfs", "dev/shm", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777") != 0)
 		child_fail(report, "mounting /dev/shm");
+	bind_devices(m, report);
 }
 
 /*
@@ -1570,7 +1622,12 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		 * host's /dev, which is already its tree's. */
 		if (!(now.st_dev == new_root.st_dev && now.st_ino == new_root.st_ino) &&
 		    stat("dev", &st) == 0 && S_ISDIR(st.st_mode))
-			make_dev(report);
+			make_dev(m, report);
+		/* Devices with nowhere to go are refused, not dropped. */
+		else if (!(now.st_dev == new_root.st_dev && now.st_ino == new_root.st_ino) &&
+		         m->device_count != 0u)
+			child_fail(report, "(devices ...) are bound into the machine's /dev, and its tree has "
+			                   "no /dev");
 		/* A machine of the host's own / has nothing to pivot to: its root
 		 * is the bind stacked over /, which it is put on, so that its root
 		 * is still the namespace's. */
@@ -2198,6 +2255,19 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 
 	if (m->started)
 		return fail(error, HULL_ERR_BUSY, "the machine has been started already");
+	/* Its devices as the host has them now: a board is plugged in, reset
+	 * and plugged in again between a plan and a start. */
+	for (unsigned i = 0u; i < m->device_count; i++) {
+		if (hull_hostdev_find(&m->device[i], m->detail, sizeof m->detail) != NULL)
+			return fail(error, HULL_ERR_RUNTIME, m->detail);
+		/* Its /dev/pts is a devpts of its own, where nothing is bound. */
+		if (strncmp(m->device[i].host.node, "/dev/pts/", 9u) == 0) {
+			snprintf(m->detail, sizeof m->detail,
+			         "%s is a pty of the host's, and a machine's /dev/pts is its own",
+			         m->device[i].host.node);
+			return fail(error, HULL_ERR_RUNTIME, m->detail);
+		}
+	}
 	/* A kept machine's directory, for its init.sock. */
 	if ((m->keep || m->staged || m->hosts != NULL || m->resolver != NULL) &&
 	    ((reason = make_dir(m)) != NULL ||
@@ -3242,6 +3312,11 @@ static const hull_cap_entry entries[] = {
 	  NULL },
 	{ "network.none",           HULL_SUP_NATIVE,
 	  "a network namespace of the machine's own, with lo alone", NULL },
+	{ "devices.usb",            HULL_SUP_NATIVE,
+	  "its usbfs node, found by sysfs at start and bound into /dev", NULL },
+	{ "devices.serial",         HULL_SUP_NATIVE,   "the host's node, bound into /dev", NULL },
+	{ "devices.parallel",       HULL_SUP_NATIVE,   "the host's node, bound into /dev", NULL },
+	{ "devices.node",           HULL_SUP_NATIVE,   "the host's node, bound into /dev", NULL },
 	{ "cpus",                   HULL_SUP_NATIVE,
 	  "a systemd scope's CPUQuota, N CPUs' time a second", NULL },
 	{ "memory",                 HULL_SUP_NATIVE,

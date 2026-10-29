@@ -2231,6 +2231,75 @@ fi
 sleep 2
 rm -rf "${root:?}/limrun" "${root:?}/limtools" "${root:?}/busctl.args"
 
+devconf() { # NAME ENTRIES...: a machine of devroot, whose tree has a /dev
+	name=$1
+	shift
+	printf '(machine (source "dir:./devroot") (backend chroot) %s)\n' "$*" > "$root/$name.conf"
+}
+# (devices ...): the host's nodes bound into the machine's /dev, found
+# when it starts. /dev/net/tun is a device every user may open, and read
+# with no interface attached says EBADFD, which a plain file cannot; and
+# /dev/char/10:200 a link to it, as /dev/serial/by-id is to a port.
+devconf devnode '(devices (node "/dev/net/tun")) (command "/probe" "read" "/dev/net/tun" "kind" "/dev/net/tun")'
+expect 0 'devices.node: native: the host.s node, bound into /dev' \
+	"$hull" plan --explain -f "$root/devnode.conf"
+expect 1 'devices.node: rejected: not yet: docker.s --device' \
+	"$hull" plan -f "$root/devnode.conf" --backend docker
+expect 1 'devices.node: rejected: a host.s device node has no device of a guest.s to be' \
+	"$hull" plan -f "$root/devnode.conf" --backend vm
+conf devserial '(devices (serial "/dev/ttyS0") (parallel "/dev/parport0") (usb (device (vendor "0403") (product "6001")))) (command "/probe")'
+expect 0 'devices.serial: native: an ISA serial port' \
+	"$hull" plan --explain -f "$root/devserial.conf" --backend vm
+# What may not work is said where it is planned and run, without asking:
+# a vm's USB and parallel port are qemu's, their timing not the host's.
+expect 0 'devices.usb: emulated: usb-host on the guest.s xHCI, every transfer re-issued by qemu.*chroot is the host.s own timing$' \
+	"$hull" plan -f "$root/devserial.conf" --backend vm
+expect 0 'devices.parallel: emulated: .*a bit-banged device, a JTAG cable, may not work; chroot reaches ppdev directly$' \
+	"$hull" plan -f "$root/devserial.conf" --backend emu
+cases=$((cases + 1))
+"$hull" plan -f "$root/devnode.conf" 2>&1 | grep -q 'devices' &&
+	fail "chroot's devices, the host's own timing, warned of" "$("$hull" plan -f "$root/devnode.conf" 2>&1)"
+conf devbare '(devices (node "/dev/net/tun")) (command "/probe")'
+if [ -r /dev/net/tun ] && [ -w /dev/net/tun ]; then
+	from_root 0 '^read=File descriptor in bad state$' -f "$root/devnode.conf"
+	from_root 0 '^kind=chr 10:200$' -f "$root/devnode.conf"
+	if [ -L /dev/char/10:200 ]; then
+		devconf devlink '(devices (node "/dev/char/10:200")) (command "/probe" "read" "/dev/char/10:200" "kind" "/dev/char/10:200")'
+		from_root 0 '^read=File descriptor in bad state$' -f "$root/devlink.conf"
+		from_root 0 '^kind=lnk$' -f "$root/devlink.conf"
+	fi
+	# Refused, not dropped, where the tree has no /dev to bind them into.
+	from_root 125 '\(devices \.\.\.\) are bound into the machine.s /dev, and its tree has no /dev' \
+		-f "$root/devbare.conf"
+fi
+conf devfile "(devices (node \"$root/devnode.conf\")) (command \"/probe\")"
+from_root 125 'devnode.conf is not a device under /dev' -f "$root/devfile.conf"
+conf devnone '(devices (serial "/dev/hull-none")) (command "/probe")'
+from_root 125 '/dev/hull-none: No such file or directory' -f "$root/devnone.conf"
+if [ "$(id -u)" != 0 ] && [ -e /dev/ttyS0 ] && [ ! -w /dev/ttyS0 ]; then
+	conf devlocked '(devices (serial "/dev/ttyS0")) (command "/probe")'
+	from_root 125 '/dev/ttyS0 is root:[a-z]+ [0-7]+, which the user may not read and write' \
+		-f "$root/devlocked.conf"
+fi
+conf devusb '(devices (usb (device (vendor "ffff") (product "fffe")))) (command "/probe")'
+from_root 125 'no USB device ffff:fffe is plugged in' -f "$root/devusb.conf"
+# A USB device of the host's that only root, or a group, may write.
+locked_usb=
+for d in /sys/bus/usb/devices/[0-9]*; do
+	case $d in *:*) continue ;; esac
+	[ -r "$d/busnum" ] && [ -r "$d/devnum" ] || continue
+	n=$(printf '/dev/bus/usb/%03d/%03d' "$(cat "$d/busnum")" "$(cat "$d/devnum")")
+	if [ -e "$n" ] && [ ! -w "$n" ]; then
+		locked_usb=${d##*/}
+		break
+	fi
+done < /dev/null
+if [ -n "$locked_usb" ] && [ "$(id -u)" != 0 ]; then
+	conf devusblocked "(devices (usb (device (port \"$locked_usb\")))) (command \"/probe\")"
+	from_root 125 '/dev/bus/usb/[0-9]+/[0-9]+ is root:[a-z]+ [0-7]+, which the user may not read and write' \
+		-f "$root/devusblocked.conf"
+fi
+
 # (network bridge): a veth on a host bridge, which only root may put
 # there, so only a core run as root takes it; as this user, refused. The
 # root case runs as root in a user namespace of its own, `unshare -rmn`,

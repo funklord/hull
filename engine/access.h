@@ -12,6 +12,7 @@
 
 #include "sexpr.h"
 #include "stack.h"
+#include "hostdev.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,6 +30,11 @@ char *hull_access_text(const hull_sexpr_doc *doc, const hull_sexpr_form *form);
  * or NULL where there is none. */
 char *hull_access_value(const hull_sexpr_doc *doc, const hull_sexpr_form *record,
                         const char *key);
+
+/* `machine`'s (devices ...), each kind's in the order written, into
+ * `out`, `*count` of them: NULL, or why it cannot be had. */
+const char *hull_access_devices(const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
+                                hull_device out[HULL_MAX_DEVICES], unsigned *count);
 
 /* Whether `(key true)` is in `record`. */
 int hull_access_true(const hull_sexpr_doc *doc, const hull_sexpr_form *record, const char *key);

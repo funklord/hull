@@ -155,6 +155,42 @@ static const char *absolute(const uint8_t *text, uint32_t length)
 	return length != 0u && text[0] == '/' ? NULL : "must be an absolute path";
 }
 
+/* A USB vendor or product id: four hex digits, as lsusb prints them. */
+static const char *usb_id(const uint8_t *text, uint32_t length)
+{
+	if (length != 4u)
+		return "must be four hex digits, as lsusb prints them: \"0403\"";
+	for (uint32_t i = 0u; i < length; i++)
+		if (!is_digit(text[i]) && !(text[i] >= 'a' && text[i] <= 'f') &&
+		    !(text[i] >= 'A' && text[i] <= 'F'))
+			return "must be four hex digits, as lsusb prints them: \"0403\"";
+	return NULL;
+}
+
+/* A USB port path, as sysfs names a device: a bus, then the ports from
+ * its root hub, "1-4.2". */
+static const char *usb_port(const uint8_t *text, uint32_t length)
+{
+	uint32_t i = 0u;
+	int      ports = 0;
+
+	while (i < length && is_digit(text[i]))
+		i++;
+	if (i == 0u || i == length || text[i] != '-')
+		return "must be a bus and its ports, as sysfs names them: \"1-4.2\"";
+	while (i < length && (text[i] == '-' || text[i] == '.')) {
+		uint32_t start = ++i;
+
+		while (i < length && is_digit(text[i]))
+			i++;
+		if (i == start)
+			return "must be a bus and its ports, as sysfs names them: \"1-4.2\"";
+		ports++;
+	}
+	return i == length && ports != 0 ? NULL :
+	       "must be a bus and its ports, as sysfs names them: \"1-4.2\"";
+}
+
 /* Lowercase words: an arch, an engine, a medium's type, a fidelity need. */
 static const char *identifier(const uint8_t *text, uint32_t length)
 {
@@ -358,6 +394,32 @@ static const schema volume = TABLE_ACROSS(volume_keys, volume_across);
 #define VOLUME_LAYERS 3u
 #define VOLUME_UPPER  4u
 
+/* Devices passed through (section 4.13): one USB device, by its ids, by
+ * the port it is plugged into, or both. */
+static hull_spec_status usb_across(walk *w, const hull_sexpr_form *record,
+                                   const hull_sexpr_form *found, uint64_t present);
+static const key usb_keys[] = {
+	{ .name = "vendor",  .type = STRING, .value = usb_id },
+	{ .name = "product", .type = STRING, .value = usb_id },
+	{ .name = "serial",  .type = STRING, .value = nonempty },
+	{ .name = "port",    .type = STRING, .value = usb_port },
+};
+static const schema usb_device = TABLE_ACROSS(usb_keys, usb_across);
+
+/* Where these sit in usb_keys, for usb_across. */
+#define USB_VENDOR  0u
+#define USB_PRODUCT 1u
+#define USB_SERIAL  2u
+#define USB_PORT    3u
+
+static const key device_keys[] = {
+	{ .name = "usb",      .type = ENTRIES, .nonempty = 1, .record = &usb_device, .entry = "device" },
+	{ .name = "serial",   .type = STRINGS, .nonempty = 1, .value = absolute },
+	{ .name = "parallel", .type = STRINGS, .nonempty = 1, .value = absolute },
+	{ .name = "node",     .type = STRINGS, .nonempty = 1, .value = absolute },
+};
+static const schema devices = TABLE(device_keys);
+
 /* J.2 */
 static const key security_keys[] = {
 	{ .name = "readonly_root", .type = BOOLEAN },
@@ -519,6 +581,7 @@ static const key machine_keys[] = {
 	{ .name = "media",         .type = ENTRIES, .record = &medium, .entry = "medium" },
 	{ .name = "tuning",        .type = RECORD, .record = &tuning },
 	{ .name = "bridge",        .type = STRING, .value = interface },
+	{ .name = "devices",       .type = RECORD, .record = &devices },
 };
 static hull_spec_status machine_across(walk *w, const hull_sexpr_form *record,
                                        const hull_sexpr_form *found, uint64_t present);
@@ -1024,6 +1087,36 @@ static hull_spec_status file_across(walk *w, const hull_sexpr_form *record,
 	if (present == 0u)
 		return fail(w, HULL_SPEC_ERR_MISSING, 0u, "a file holds machine, machines or build");
 	return HULL_SPEC_OK;
+}
+
+/* A device is its ids, both, or its port; a serial number tells apart
+ * two of one vendor's and product's, so it needs them. */
+static hull_spec_status usb_across(walk *w, const hull_sexpr_form *record,
+                                   const hull_sexpr_form *found, uint64_t present)
+{
+	int         vendor  = (present & ((uint64_t)1 << USB_VENDOR)) != 0u;
+	int         product = (present & ((uint64_t)1 << USB_PRODUCT)) != 0u;
+	const char *why;
+	unsigned    at;
+	size_t      saved;
+
+	if (!vendor && !product && !(present & ((uint64_t)1 << USB_PORT)))
+		return fail(w, HULL_SPEC_ERR_MISSING, record->offset,
+		            "a USB device is its vendor and product, or the port it is plugged into");
+	if (vendor != product) {
+		at = vendor ? USB_VENDOR : USB_PRODUCT;
+		why = vendor ? "needs product beside it: a device is both ids" :
+		               "needs vendor beside it: a device is both ids";
+	} else if ((present & ((uint64_t)1 << USB_SERIAL)) && !vendor) {
+		at = USB_SERIAL;
+		why = "tells apart devices of one vendor and product: it needs both";
+	} else {
+		return HULL_SPEC_OK;
+	}
+	saved = push_text(w, usb_keys[at].name);
+	fail(w, HULL_SPEC_ERR_SHAPE, found[at].offset, why);
+	pop(w, saved);
+	return HULL_SPEC_ERR_SHAPE;
 }
 
 static hull_spec_status volume_across(walk *w, const hull_sexpr_form *record,
