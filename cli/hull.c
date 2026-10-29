@@ -511,7 +511,7 @@ static int rewrite_order(const void *a, const void *b)
 static int store_sources(const char *file, uint8_t *data, size_t *length, int create)
 {
 	static rewrite  rewrites[MAX_REWRITES];
-	hull_sexpr_form machines[64];
+	static hull_sexpr_form machines[HULL_NAMES_MEMBERS];
 	unsigned        machine_count = 0u;
 	unsigned        count = 0u;
 	hull_spec       spec;
@@ -529,7 +529,7 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 		int             more;
 
 		hull_sexpr_child(&spec.doc, &spec.machines, &entry);
-		for (more = hull_sexpr_next(&spec.doc, &entry, &entry); more && machine_count < 64u;
+		for (more = hull_sexpr_next(&spec.doc, &entry, &entry); more && machine_count < HULL_NAMES_MEMBERS;
 		     more = hull_sexpr_next(&spec.doc, &entry, &entry))
 			machines[machine_count++] = entry;
 	}
@@ -1574,8 +1574,8 @@ static int run_all(options *o, const hull_registry *registry, hull_spec *spec, u
 {
 	static hull_names names_drawn;
 	const hull_names *names = &names_drawn;
-	static member   members[64];
-	hull_msg        requests[64];
+	static member   members[HULL_NAMES_MEMBERS];
+	static hull_msg requests[HULL_NAMES_MEMBERS];
 	hull_sexpr_form entry;
 	hull_wire       wire;
 	struct sigaction action;

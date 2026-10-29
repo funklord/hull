@@ -45,8 +45,8 @@
 #include "segment.h"
 
 #define MAX_SEGMENTS 64u
-#define MAX_PORTS    32u
-#define MAX_LEARNED  256u
+#define MAX_PORTS    256u    /* a /24's 253 machines, and room */
+#define MAX_LEARNED  1024u
 #define MAX_RULES    32u
 #define MAX_SOURCES  16u
 #define MAX_FRAME    (65536u + 64u)
@@ -1199,10 +1199,13 @@ static void *serve(void *arg)
 	uint64_t first = UINT64_MAX;
 
 	(void)arg;
+	/* Static, the switch being this one thread: every port of every
+	 * segment is a third of a megabyte, too much for a stack. */
+	static struct pollfd fds[2u + MAX_SEGMENTS * MAX_PORTS];
+	static segment      *of[MAX_SEGMENTS * MAX_PORTS];
+	static unsigned      at[MAX_SEGMENTS * MAX_PORTS];
+
 	for (;;) {
-		struct pollfd fds[2u + MAX_SEGMENTS * MAX_PORTS];
-		segment      *of[MAX_SEGMENTS * MAX_PORTS];
-		unsigned      at[MAX_SEGMENTS * MAX_PORTS];
 		nfds_t        base;
 		nfds_t        n;
 		int           wait_ms = -1;

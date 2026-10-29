@@ -1398,6 +1398,21 @@ printf '%s\n' "$named_out" | grep -q '^raw *| addr=eth0 none/0 down$' &&
 # machine's id and the segment's name, not the run's.
 limit=60
 from_root 0 "^web +\| addr=eth0 $web_at/24 up\$" -f "$root/named.conf"
+# A segment of 40 machines, past the 32 a segment took before, each
+# up at its own address and all on the switch at once, each staying a
+# while: a network of a /24's size, not a handful.
+{
+	printf '(machines'
+	for n in $(seq 1 40); do
+		printf ' (m%u (source "dir:./rootfs") (backend chroot) (mutable overlay) (network none) (segments (wide-%s (subnet "10.85.0.0/24"))) (command "/probe" "addr" "eth0" "sleep" "5"))' "$n" "$$"
+	done
+	printf ')\n'
+} > "$root/wide.conf"
+limit=120
+from_root 0 '^m40 +\| addr=eth0 10\.85\.0\.[0-9]+/24 up$' -f "$root/wide.conf"
+cases=$((cases + 1))
+[ "$(printf '%s\n' "$out" | grep -E '^m[0-9]+ +\| addr=eth0 10\.85\.0\.[0-9]+/24 up$' | sed 's/.*addr=eth0 //' | sort -u | wc -l)" -eq 40 ] ||
+	fail "a segment of 40 machines was not 40 at 40 addresses" "$out"
 # A tree whose /etc has a group the machine's namespace does not map --
 # one of the user's own others, which neither the one-id map nor the
 # subordinate range covers, as a setgid shared directory gives -- with no

@@ -29,7 +29,7 @@ extern "C" {
 #endif
 
 #define HULL_NAMES_SEGMENTS 64u
-#define HULL_NAMES_MEMBERS  64u
+#define HULL_NAMES_MEMBERS  256u  /* a file's machines: a /24 segment's 253 and more */
 
 typedef struct hull_names_segment {
 	char     name[64];

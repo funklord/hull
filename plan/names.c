@@ -254,7 +254,7 @@ long hull_names_entry(const hull_names *names, unsigned member, uint8_t *data, s
 				put_atom(&o, text);
 				put(&o, ")", 1u);
 			}
-		/* The hosts, by id: insertion, as there are at most 64. */
+		/* The hosts, by id: insertion, as there are at most 256. */
 		for (unsigned k = 0u; k < s->count; k++) {
 			unsigned j = k;
 

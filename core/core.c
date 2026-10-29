@@ -73,7 +73,7 @@
 #endif
 
 #define MAX_CLIENTS      32u
-#define MAX_MACHINES     64u
+#define MAX_MACHINES     512u   /* the user's, every file's together */
 #define MAX_ATTACHED     16u
 #define MAX_STOPS        16u
 #define MAX_EXECS        64u
