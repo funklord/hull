@@ -1353,10 +1353,15 @@ static const char *spawn(uint32_t ch, char *const *argv, const char *cwd, char *
  * kernel. */
 static const char *hand_over(void)
 {
-	pid_t agent;
+	pid_t   agent;
+	int     execed[2];
+	char    failed;
+	ssize_t got;
 
 	if (access(init_, X_OK) != 0)
 		return "the machine has no init it can run at its (init ...) path";
+	if (pipe2(execed, O_CLOEXEC) != 0)
+		return "the agent could not make a pipe";
 	agent = fork();
 	if (agent < 0)
 		return "the agent could not be forked";
@@ -1364,16 +1369,30 @@ static const char *hand_over(void)
 		char *const argv[] = { init_, NULL };
 		sigset_t    none;
 
+		close(execed[0]);
 		sigemptyset(&none);
 		sigprocmask(SIG_SETMASK, &none, NULL);
 		signal(SIGCHLD, SIG_DFL);
 		signal(SIGPIPE, SIG_DFL);
 		execv(init_, argv);
 		say("init", strerror(errno));
+		if (write(execed[1], "x", 1u) != 1) {
+			/* the agent reads the pipe's end alone, and goes on */
+		}
+		close(execed[1]);
 		for (;;)
 			if (wait(NULL) < 0)
 				pause();
 	}
+	/* Not before the image's init is PID 1, as chroot's init waits: the
+	 * exec closes the pipe, and a failed one says so on it. Without the
+	 * wait the workload could run, and look, while PID 1 was the agent. */
+	close(execed[1]);
+	while ((got = read(execed[0], &failed, 1u)) < 0 && errno == EINTR)
+		;
+	close(execed[0]);
+	if (got > 0)
+		return "the image's init could not be run as PID 1";
 	handed = 1;
 	if (prctl(PR_SET_CHILD_SUBREAPER, 1L, 0L, 0L, 0L) != 0)
 		say("subreaper", strerror(errno));
