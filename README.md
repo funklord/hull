@@ -28,6 +28,8 @@ to lose, delay, reorder or damage traffic on purpose, and watched frame
 by frame. None of it needs root or a daemon kept running, and published
 container images can be used as they are, though a directory is enough.
 
+# Emulators, virtual machines and containers are *not* for security
+
 Hull is not a security tool. Containers, virtual machines and emulators
 are often offered as a safe place to run a program you do not trust,
 and the promise mostly does not hold. A machine has to share things
@@ -68,7 +70,9 @@ Use hull to test and to simulate, and if you use it to keep something
 out, know which of these properties you are relying on and what it
 costs to keep it true.
 
-It is not one more container runtime. Docker and Podman run containers;
+# How hull differs from its neighbours
+
+Hull is not one more container runtime. Docker and Podman run containers;
 Incus runs containers and virtual machines from images, through a
 daemon running as root; Vagrant and libvirt set up virtual machines;
 containerlab and Mininet build test networks, as root. Hull brings
@@ -115,6 +119,8 @@ them has:
   run`'s, and a killed `hull run`, `SIGKILL` included, takes its machine
   with it, where a Docker container belongs to the daemon and outlives
   the job that started it.
+
+# A first machine
 
 A rootless runtime for machines to test against, built on plain files. One
 `hull.conf` describes a machine, and changing one line moves it between a
