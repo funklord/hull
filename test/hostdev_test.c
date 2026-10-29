@@ -88,6 +88,20 @@ int main(void)
 			return 1;
 		}
 	}
+	/* Absolute, since the fixture's links name their targets by it, and a
+	 * relative target is read from the link's own directory: under make's
+	 * BUILD_DIR=build every group member's driver went unread. */
+	{
+		char *whole = realpath(root, NULL);
+
+		if (whole == NULL || strlen(whole) >= sizeof root) {
+			printf("hostdev: %s cannot be made absolute\n", root);
+			free(whole);
+			return 1;
+		}
+		snprintf(root, sizeof root, "%s", whole);
+		free(whole);
+	}
 	/* Two of one FTDI part, told apart by their serials, a third part on
 	 * a hub's port, and what sysfs lists beside devices: a root hub and an
 	 * interface, carrying the same ids, which are not devices. */

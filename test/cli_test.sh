@@ -1529,7 +1529,7 @@ rm -f "$root/capseg.pcap"
 (cd / && exec timeout 60 "$whole_hull" run -f "$root/capseg.conf" > "$root/capseg.out" 2>&1) &
 caprun=$!
 tries=0
-until (cd "$root" && "$hull" segment "$capseg" capture shouter out capseg.pcap frames=50) 2> "$root/capseg.err"; do
+until (cd "$root" && "$whole_hull" segment "$capseg" capture shouter out capseg.pcap frames=50) 2> "$root/capseg.err"; do
 	tries=$((tries + 1))
 	[ "$tries" -lt 40 ] || break
 	sleep 0.25
@@ -2332,7 +2332,7 @@ if [ -r /dev/net/tun ] && [ -w /dev/net/tun ]; then
 	devconf devheld '(hostname "held") (devices (serial "/dev/net/tun")) (command "/probe" "say" "holding" "sleep" "4")'
 	devconf devsecond '(hostname "second") (devices (serial "/dev/net/tun")) (command "/probe" "say" "second")'
 	devconf devshared '(hostname "shared") (devices (node "/dev/net/tun")) (command "/probe" "say" "shared")'
-	(cd / && timeout 20 "$hull" run -f "$root/devheld.conf" > "$root/devheld.out" 2>&1 &)
+	(cd / && timeout 20 "$whole_hull" run -f "$root/devheld.conf" > "$root/devheld.out" 2>&1 &)
 	tries=0
 	until grep -q '^holding$' "$root/devheld.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
 		tries=$((tries + 1))
