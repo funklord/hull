@@ -705,6 +705,16 @@ static void answer(const char *port)
 		inet_ntop(AF_INET, &from.sin_addr, text, sizeof text);
 		printf("answer=from %s\n", text);
 		sendto(fd, host, strlen(host), 0, (struct sockaddr *)&from, from_length);
+		/* And again to an asker that asks again, until a second passes
+		 * with none: an answer still in the tap when the machine's init
+		 * exits goes with its namespace, and the asker, retrying, then
+		 * found nobody, 2 runs in 28 of three chroot machines. */
+		from_length = sizeof from;
+		while (poll(&p, 1u, 1000) > 0 &&
+		       recvfrom(fd, text, sizeof text, 0, (struct sockaddr *)&from, &from_length) >= 0) {
+			sendto(fd, host, strlen(host), 0, (struct sockaddr *)&from, from_length);
+			from_length = sizeof from;
+		}
 	}
 	if (fd >= 0)
 		close(fd);
