@@ -1,7 +1,7 @@
 # Hull
 
 **Status:** in development; usable for testing single machines since 2026-10-22, on the terms in §12's *Adopting hull for testing*. Designed from August 2026, written from October.
-**Name:** Hull — the hull is the vessel's isolation boundary. (Prior "Hull" CDP by hull.io was acquired by MessageBird in 2021 and discontinued; name considered safe for an open-source systems tool. Formerly working-titled "Crate".)
+**Name:** Hull — the body of a vessel, which carries what is put in it. (Prior "Hull" CDP by hull.io was acquired by MessageBird in 2021 and discontinued; name considered safe for an open-source systems tool. Formerly working-titled "Crate".)
 
 ---
 
@@ -11,12 +11,14 @@ Docker got the developer experience right and almost everything underneath it wr
 
 - **Opaque formats.** Images are stacks of gzipped tarballs glued together by JSON manifests and a daemon-managed overlayfs graph. You cannot `ls` an image, diff two images with standard tools, dedupe files across images, or back up the store incrementally without Docker-specific tooling.
 - **Root everywhere.** `dockerd` runs as root, owns a root-equivalent socket (`docker` group membership *is* root), and is a single point of failure for every container on the host.
-- **Backend lock-in.** The isolation mechanism (shared-kernel namespaces) is baked into the product. When you need a real kernel boundary — untrusted code, kernel modules, a different kernel version — you leave the ecosystem entirely (Vagrant, raw QEMU, cloud VMs) and lose all your configuration.
+- **Backend lock-in.** The way a machine runs (shared-kernel namespaces) is baked into the product. When you need a kernel of your own — kernel modules, a different kernel version, an init or a kernel under test — you leave the ecosystem entirely (Vagrant, raw QEMU, cloud VMs) and lose all your configuration.
 - **Images where none are needed.** In the typical CI/deployment pipeline the image is pure ceremony: the build already produced the files, which get tarred into layers, pushed to a registry, pulled back down, and unpacked — five steps to move a directory. The image adds a second versioning system (with its own auth, GC policy, and layer-cache folklore) on top of the one you already have in VCS and CI artifacts.
 
 Hull is a design for a runtime that fixes all four: a **files-first model** where a plain directory is the deployable unit and images are an optional module; a **rootless model with no privileged daemon** (the resident component is a per-user, unprivileged, socket-activated core — §2); and an **open, pluggable backend layer** where the same spec — and, crucially, the same files — runs under namespaces (`ns`), a hardware-virtualized machine (`vm`), full software emulation (`emu`), or any further engine that implements the driver interface, by changing one line.
 
 Beneath all four sits one mechanism, Hull's core idea: **every image-shaped artifact — container image, filesystem image, disk, disc — is decomposed into plain structured files plus a verified binary patch** (§3.11). Opacity is never load-bearing; it is quarantined into patch files and measured.
+
+**What it is for, the holder's word, 2026-10-29:** testing and simulating environments, from a single machine to large networks of them, which is testing that cannot be done any other way; and running legacy software on the system it was written for. **Not security.** Calling virtualization or emulation a trust boundary is a myth hull does not propagate: a machine shares I/O with its host -- a folder, a network, a device, and always the processor and memory -- and ways out of containers, VMs and emulators alike are found every year. The part that holds is narrow, a machine given no host files and no network leaves less to reach, a guest kernel keeps some of its own faults from the host's, and it costs upkeep easily underestimated: a second system and its runtime kept patched, and settings that undo it if one is wrong. The simpler and more direct measures usually do more for less -- not running what is not trusted, a service as its own unprivileged user, software kept updated, a separate computer for what matters. So hull's design never sells a machine as a safety measure, the README says this to its readers (`cb21fe6`), and §7 is about the privilege hull itself takes, which is the security property it does have.
 
 ### Goals
 
@@ -34,6 +36,7 @@ Beneath all four sits one mechanism, Hull's core idea: **every image-shaped arti
 - Windows containers.
 - Swarm-style multi-host orchestration.
 - Reimplementing low-level runtimes: Hull orchestrates Docker, QEMU, VirtualBox, VMware, and crun; it does not replace them.
+- Being a security boundary, on any backend (above).
 
 ---
 
@@ -1442,7 +1445,7 @@ The driver interface is not internal plumbing; it is Hull's **stable plugin API*
 - **virtualbox** — full-profile vm-class via `VBoxManage`: block projection (§3.9) for the rootfs, vboxsf for volumes, NAT rules for ports, agent via seed ISO.
 - **vmware** — full-profile vm-class for Workstation/Fusion via `vmrun`/VIX (ESXi/vCenter is enterprise-tier territory, Appendix I): generated `.vmx` + VMDK via block projection, HGFS shared folders for volumes, agent via seed ISO. Live migration on desktop VMware: none (vMotion is vCenter's, and that's fine — it maps to the paid tier anyway).
 
-**Second wave — native engines:** the crun-based rootless ns engine and the microVM profile with bundled kernel (§5.2, Appendix F) — these deliver the security-model promises the adapters can't, and slot in without any spec change precisely because classes, not engines, define the contract.
+**Second wave — native engines:** the crun-based rootless ns engine and the microVM profile with bundled kernel (§5.2, Appendix F) — these deliver the rootless promise the adapters can't, and slot in without any spec change precisely because classes, not engines, define the contract.
 
 **Reserved pigeonholes:** the abstraction target is deliberately broader than "a Linux machine" — it is *an isolated execution environment over a directory of files*. Declared engine-name slots are reserved (name, class, expected capability shape) even before any implementation exists, so specs and docs can reference them stably:
 
@@ -1509,7 +1512,7 @@ The matrix is data, not documentation: assembled at load time from each engine's
 | custom kernel / modules | rejected: shared host kernel | native (`kernel` key; `full` profile for distro kernels) | native |
 | inotify on volumes | native | rejected-by-default: virtiofs event gaps → poll option offered | rejected-by-default: same |
 | startup latency (informational) | ~10 ms | ~100–300 ms (micro), seconds (full) | seconds; workload 5–20× slower |
-| kernel isolation boundary (informational) | none (namespaces) | hardware VM | full guest stack, software boundary |
+| kernel (informational) | the host's, shared | its own, on the CPU by KVM | its own, every instruction emulated |
 
 Two rules keep this honest:
 
@@ -1520,7 +1523,10 @@ Two rules keep this honest:
 
 ---
 
-## 7. Security model
+## 7. Privilege model
+
+**What this section is, since 2026-10-29:** the privilege hull itself takes from the host, which is the one security property hull has -- installing and running it adds no root daemon, no setuid helper and no privileged socket. It is not a promise about what a machine keeps in, which hull does not make (§1, *What it is for*): the defaults below keep a test from changing its host by accident and show software what a real host would, and they are not a wall against a program set on getting out.
+
 
 **Decided 2026-10-15, by the holder: hull does everything it can as the user, and asks for root only at the very end of the line.** In the holder's words, "our basic ideology is that docker is broken precisely because it needs root for everything". So root is never a convenience or a default. Where something can be done as the user, through a user namespace, a user-owned socket or a file the user owns, it is. A design that reaches for root has not yet found the user's way, and the engines that inherit root from what they wrap say so in their declarations. How a spec asks for root at the end of the line is designed below, as root mode, and not built.
 
@@ -1558,13 +1564,13 @@ Two rules keep this honest:
 - **It is the host owner's, then the user's, then each run's.** The host's root lists in `/etc/hull/root.conf` which users may ask, for which machines by their plan's hash, and for which fields; a user not listed is refused. The user, then, accepts it on each run by the plan's hash, `hull run --accept root:SHA256`, never by a flag that outlives the run: a changed plan is a new hash, and must be accepted again. There is no environment variable and no user config that accepts it.
 - **It is loud, and it is never surprising.** A root machine is marked ROOT in `hull ps`, at the head of its log and in the plan's report; every start, exec and stop of one is written to the host's audit log, `/var/log/hull/root.log`, with the user and the plan's hash, and a run whose audit line cannot be written is refused rather than run unrecorded. It ends with its run, as any machine does: a root machine left running by accident is prevented by `(on_disconnect stop)`, its default, not by a timer that would stop a long job without its asking (§4.12's scripted-use rules).
 - **It is scriptable without being easy.** A pipeline carries the acceptance as a value, `hull plan --root-hash` printing the hash to accept, so a CI job runs root mode the same each time and a changed plan fails loudly, status 77, with the new hash and the line of `/etc/hull/root.conf` it would need, rather than being accepted by an old token. Nothing about it prompts.
-- **It is offered with its alternatives.** Before root, the planner says what would do instead: the vm class for a kernel boundary or modules, a `(security (allow …))` capability in a user namespace, a device passed to a vm, a volume instead of a mount. A user reaches root only having been told what else would serve.
+- **It is offered with its alternatives.** Before root, the planner says what would do instead: the vm class for a kernel of its own or modules, a `(security (allow …))` capability in a user namespace, a device passed to a vm, a volume instead of a mount. A user reaches root only having been told what else would serve.
 
 **Tried as designed, the holder's word, 2026-10-22: "maybe that is too extreme, but let's try it for now and see if it flies"**, under the scripted-use rules of §4.12; what proves too much in use is to be cut back, not worked around. **Open, and the holder's:** whether the helper is setuid, a root service the host starts, or both; what fields root mode grants at all, a device node, a capability outside the user namespace, a host mount, the host's network; and whether an engine that already rides a root daemon, docker, counts as root mode, which today it is not called, though its declaration says what it inherits.
 
 - No root daemon, no setuid helpers, no privileged socket. The resident component is the per-user core (§2), an unprivileged service owned by the invoking user; the attack surface of "Hull installed" is user-owned processes and a user-owned socket. Adapter engines inherit the wrapped runtime's posture — the docker adapter rides dockerd's root daemon, and its matrix column declares it — while native engines carry the full rootless model.
-- ns backend: user namespaces map root-in-container to an unprivileged subordinate uid; seccomp default profile (crun's) + `no_new_privs` on by default; capabilities are empty-by-default and additive via `(security (allow …))` — there is deliberately **no `--privileged`**. Workloads that need it are told to use the vm backend, which is the correct tool.
-- vm/emu backends: the kernel boundary is the headline feature. The guest agent treats the vsock channel as the only control plane; no host filesystem is visible except declared volumes.
+- ns backend: user namespaces map root-in-container to an unprivileged subordinate uid; seccomp default profile (crun's) + `no_new_privs` on by default; capabilities are empty-by-default and additive via `(security (allow …))` — there is deliberately **no `--privileged`**. These keep a test from reaching what it did not ask for by mistake; they are not a boundary against one meant to. Workloads that need privilege are told to use the vm backend, where root is a kernel's own and needs nothing of the host's.
+- vm/emu backends: a kernel of its own is the point -- modules, sysctls, an init, a kernel a test may crash on purpose. The guest agent treats the vsock channel as its only control plane, and no host filesystem is visible except declared volumes: that is how a machine is driven and what it is given, not a promise that it can reach nothing else.
 - Image integrity: fs-verity on objects + signed manifests (§3.5); `hull pull` can require signatures per-registry via policy in `~/.config/hull/policy.conf`.
 
 ## 8. Networking
@@ -1652,7 +1658,7 @@ hull engines                          # list installed engines + their capabilit
   - **Blocked here, 2026-10-29:** `VBoxManage` is installed, but its `vboxdrv` module is not loaded, loading it needs root, and VirtualBox and KVM conflict on one host; so the virtualbox engine can be neither built against a running VirtualBox nor verified on this machine until the holder sets one up.
 - **Phase 3 — Optional store & OCI border:** CAS + manifests, commit/diff/gc, composefs mounting, fs-verity, OCI pull/push (any Docker Hub image becomes runnable or `materialize`-able to a directory), `hull build` with content-hash caching. *Exit: pull, unpack-to-dir, build, and publish images with correct caching — all still optional.*
   - **Met, 2026-10-22:** pull, unpack-to-dir and publish by `hull pull`, `hull materialize` and `hull push` (§3.1, §3.5), a pulled image run as a machine's source, and a pushed one pulled back as the tree it was; and build with caching by `hull build` (§3.6), a step cached by its parent, its form and its inputs. Composefs mounting and fs-verity, listed in the phase, are not written.
-- **Phase 4 — Native engines & polish:** the rootless crun-based ns engine (delivering §7's security model natively; pasta networking) and the microVM profile with bundled kernel pipeline (Appendix F), systemd generator, Dockerfile/compose importers. *Exit: the rootless promise holds without Docker installed; the multi-engine story is conformance-tested across adapters and native engines alike.*
+- **Phase 4 — Native engines & polish:** the rootless crun-based ns engine (delivering §7's rootless model natively; pasta networking) and the microVM profile with bundled kernel pipeline (Appendix F), systemd generator, Dockerfile/compose importers. *Exit: the rootless promise holds without Docker installed; the multi-engine story is conformance-tested across adapters and native engines alike.*
 
 ### Adopting hull for testing — as of 2026-10-29
 
@@ -1836,7 +1842,7 @@ A multi-machine file defines a **segment**: a private L2/L3 scope where machines
 
 Semantics, tested by the conformance suite: every machine resolves every sibling by name (`db` → its segment IP); DNS is served by Hull itself (a stub resolver injected via `/etc/resolv.conf`), not by patching `/etc/hosts`; only `ports`-declared endpoints are reachable from the host; nothing in the segment is reachable from the LAN.
 
-Per-backend mapping: **ns** — one shared user network namespace per segment (pasta attached once), machines join it, DNS stub listens inside. **vm** — one vhost-user/user-net virtual switch process per segment, VMs attach as NICs; the same DNS stub listens on the switch. **emu** — the same virtual-switch mechanism as vm (the switch doesn't care whether its NICs' guests are accelerated); the virtualbox engine maps segments to VirtualBox internal networks. Mixed-backend segments (web on ns, db in vm) are explicitly supported — this is the payoff of the whole design: put only the scary machine behind a hardware boundary — implemented by bridging pasta's segment socket to the VM switch.
+Per-backend mapping: **ns** — one shared user network namespace per segment (pasta attached once), machines join it, DNS stub listens inside. **vm** — one vhost-user/user-net virtual switch process per segment, VMs attach as NICs; the same DNS stub listens on the switch. **emu** — the same virtual-switch mechanism as vm (the switch doesn't care whether its NICs' guests are accelerated); the virtualbox engine maps segments to VirtualBox internal networks. Mixed-backend segments (web on ns, db in vm) are explicitly supported — this is the payoff of the whole design: each machine on the backend its test needs, a kernel of its own only where one is wanted — implemented by bridging pasta's segment socket to the VM switch.
 
 Cross-file/segment communication is out of scope: publish a port. That rule is what keeps the model auditable.
 
@@ -1928,7 +1934,7 @@ Where Hull still differentiates: Incus is a **system-daemon architecture** (incu
 
 ## G.2 libkrun / crun-krun — validation of the vm backend
 
-Podman can already run a container in a microVM by swapping the OCI runtime to `krun` (libkrun) — same image, same invocation, hardware isolation — which is precisely Hull's `(backend vm)` concept expressed at the OCI-runtime layer. Red Hat is pushing it for AI-workload isolation (RamaLama). Current state: early-stage, Linux-only, GPU enablement still in progress, and the isolation choice is a runtime *flag* rather than a first-class, capability-checked spec field — `podman exec` support in krun was, notably, a tracked issue rather than a given, which is exactly the class of drift Hull's conformance suite exists to prevent. Verdict: **adopt, don't fork** — evaluate libkrun as the vm driver's hypervisor library (it would replace bespoke QEMU-microvm orchestration and possibly the bundled-kernel burden, since libkrun ships its own), with cloud-hypervisor as fallback. This could materially shrink Phase 4's native-microVM work and de-risk §11.1.
+Podman can already run a container in a microVM by swapping the OCI runtime to `krun` (libkrun) — same image, same invocation, a kernel of its own — which is precisely Hull's `(backend vm)` concept expressed at the OCI-runtime layer. Red Hat is pushing it for AI-workload isolation (RamaLama). Current state: early-stage, Linux-only, GPU enablement still in progress, and the choice of a VM is a runtime *flag* rather than a first-class, capability-checked spec field — `podman exec` support in krun was, notably, a tracked issue rather than a given, which is exactly the class of drift Hull's conformance suite exists to prevent. Verdict: **adopt, don't fork** — evaluate libkrun as the vm driver's hypervisor library (it would replace bespoke QEMU-microvm orchestration and possibly the bundled-kernel burden, since libkrun ships its own), with cloud-hypervisor as fallback. This could materially shrink Phase 4's native-microVM work and de-risk §11.1.
 
 ## G.3 composefs / podman store — the tide is with us
 
@@ -1953,12 +1959,12 @@ vmspawn (boot the same directory tree/image as a VM that nspawn boots as a conta
 
 ## G.6 Positioning vs. podman — on paper
 
-Podman is the strongest sibling, so the differentiation must be stated precisely. Where the ground is shared: rootless, no root daemon, OCI interop, systemd generation (quadlets), even microVM isolation via krun. Any pitch that ignores this loses.
+Podman is the strongest sibling, so the differentiation must be stated precisely. Where the ground is shared: rootless, no root daemon, OCI interop, systemd generation (quadlets), even microVMs via krun. Any pitch that ignores this loses.
 
 Where Hull is a different *kind* of thing:
 
 1. **Files-first vs. image-first.** Podman is Docker-shaped: the image/registry pipeline is the primary object and `--rootfs` is an edge case. Hull inverts this: the directory is the primary object, the store optional (§3.7–3.8). Podman cannot delete the registry from a CI pipeline; Hull's main workflow never had one.
-2. **Machines vs. containers.** Podman runs Linux containers; `podman machine` exists to *host* containers, and krun is an isolation flag. Hull's unit is *the machine*, with containers as one engine class among several — VMware, VirtualBox, Hyper-V, QEMU-full, TCG cross-arch machines, and the retro/media tier are not on podman's map at all, nor is running *your workload itself* as a VM with identical UX.
+2. **Machines vs. containers.** Podman runs Linux containers; `podman machine` exists to *host* containers, and krun is a runtime flag. Hull's unit is *the machine*, with containers as one engine class among several — VMware, VirtualBox, Hyper-V, QEMU-full, TCG cross-arch machines, and the retro/media tier are not on podman's map at all, nor is running *your workload itself* as a VM with identical UX.
 3. **The contract vs. the flag.** Podman's behavior varies quietly across rootless/rootful, driver, and runtime; discovering the differences is the user's job. Hull's capability matrix + conformance suite make behavioral equivalence a *tested product feature* with plan-time refusals (§6). This is the deepest difference: Hull sells a guarantee, podman sells a toolset.
 4. **Identity.** No podman equivalent of ingress identity (§8.1): stable per-machine address, DNS name, and SSH host key that survive backend *and host* switches.
 5. **The decomposition law.** Nothing in podman's universe corresponds to §3.11/§3.13: foreign VM images, media, canonical packs, quirk patches, provable lossless import. `podman save` emits a non-canonical tarball; `hull pack` emits a content-addressed identity.
