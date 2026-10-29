@@ -2,7 +2,45 @@
 
 Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>
 
-A rootless runtime for isolated machines, built on plain files. One
+Hull gives you computers to test against without the hardware: a single
+machine, or many of them wired together into a network, each made from
+an ordinary folder of files and described in a short text file. It is
+for the testing that needs whole systems rather than one program --
+software that sets up a network, installs itself, starts when a
+computer boots, or talks to other computers -- and for running older
+software on the system it was written for. The same description can be
+run in several ways: one that shares your computer's own core and
+starts almost at once, a virtual machine with a core of its own, or a
+full simulation that can stand in for a different kind of computer, at
+the cost of speed. You choose by changing one line, the machines are
+reached the same way whichever you choose, and where one way cannot do
+what another can, hull tells you before anything runs. Machines run
+without administrator rights, and the ready-made images many projects
+already publish can be used as they are, though none is needed. Hull
+runs on Linux, and it is not a security tool.
+
+Containers, virtual machines and emulators are often offered as a safe
+place to run a program you do not trust. Hull makes no such promise,
+because the promise mostly does not hold. A machine has to share things
+with the computer it runs on to be useful -- a folder, a network, a
+device, and always the processor and memory underneath -- and every
+one of those is a way through. The software that draws the line has
+faults of its own, and ways out of containers, virtual machines and
+emulators alike are found every year. Part of the claim is true: a
+machine given no folder of yours and no network leaves a program less
+to reach, and a virtual machine's own core keeps some of the faults in
+that core from reaching yours. But that part comes with work that is
+easy to underestimate: a second system to keep updated, core included, the
+program running it to keep updated as well, and settings that undo the
+whole arrangement if one of them is wrong. The simpler measures usually
+do more for less: not running what you do not trust, running a service
+as its own user account that can read only what it needs, keeping
+software up to date, and putting what truly matters on a computer of
+its own. Use hull to test and to simulate, and if you use it to keep
+something out, know which of these properties you are relying on and
+what it costs to keep it true.
+
+A rootless runtime for machines to test against, built on plain files. One
 `hull.conf` describes a machine, and changing one line moves it between a
 namespace on the host's kernel, a KVM virtual machine, and full software
 emulation. The machine runs from the same directory of files on each, at
@@ -41,9 +79,10 @@ hull ssh web                # a shell in it, whichever it runs on
 
 # Backends
 
-A backend is a **class**, which says what kind of isolation a machine has,
-implemented by one or more **engines**. `(backend vm)` asks for a class
-and lets hull choose the engine; `(backend chroot)` names one. With
+A backend is a **class**, which says how a machine is run -- on the
+host's kernel, on a kernel of its own, or emulated -- implemented by one
+or more **engines**. `(backend vm)` asks for a class and lets hull
+choose the engine; `(backend chroot)` names one. With
 neither, a machine is on the ns class, whose default engine is chroot,
 hull's own and rootless; docker is used only when a file names it. `hull
 engines` prints every engine's declared capabilities, and `hull plan`
@@ -51,7 +90,7 @@ shows what a given file would get on a given backend, field by field, as
 `native`, `emulated` (honoured, at a stated cost) or `rejected` (with the
 reason, and where one exists, the `--accept` token that takes it anyway).
 
-| Engine | Class | Isolation | Kernel | Needs | Status |
+| Engine | Class | Runs as | Kernel | Needs | Status |
 |---|---|---|---|---|---|
 | `chroot` | ns | namespaces | the host's | user namespaces | written |
 | `qemu` | vm | hardware virtualization | its own | `/dev/kvm`, `/dev/vhost-vsock`, qemu, passt | written |
@@ -89,8 +128,8 @@ where nothing else is available, since it needs only user namespaces.
 **Cons**
 - The host's kernel, shared: a machine can load no module, set no global
   sysctl, and a kernel fault in it is the host's.
-- The weakest isolation of the three: a kernel bug reachable from a user
-  namespace is reachable from the machine.
+- The host kernel's faults are the machine's too: whatever a user
+  namespace can reach, the machine can.
 - One network, the host's or none: `(network host)` shares the host's,
   and `(network none)` gives `lo` alone. There is no network of its own to
   forward ports into, so `ports` and `segments` are refused.
@@ -124,7 +163,7 @@ or root is involved. It boots in about two seconds.
 or cannot be: loading modules (`mac80211_hwsim` radios, `hci_vhci`,
 `pppoe`), changing sysctls, building network topologies with netns and
 bridges as the guest's real root, testing an init system, or running
-something you do not trust with your kernel. Several machines on a wire
+software that needs a kernel other than the host's. Several machines on a wire
 of their own, `(segments …)`, for testing network software against real
 layer 2.
 
@@ -134,7 +173,8 @@ layer 2.
   `nftables` and raw sockets all work as on hardware.
 - The host's modules are the guest's, shared read-only at
   `/lib/modules/<release>`, so a workload's own `modprobe` finds them.
-- Hardware isolation: a guest kernel fault stays in the guest.
+- A guest kernel that crashes ends the guest, not the host, so a test may
+  break the kernel on purpose.
 - Its own network, by passt, as the user, with ports forwarded from the
   machine's stable address and UDP as well as TCP.
 - `(segments "wire" …)`: a NIC per named segment, after passt's, on a
