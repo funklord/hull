@@ -931,7 +931,15 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	 * under /dev where that is a link to it, since docker makes nodes and
 	 * not links. */
 	if (device_count != 0u) {
+		int vfio = 0;
+
 		add_text(&body, ",\"Devices\":[");
+		/* A PCI device's group node wants VFIO's container node beside it. */
+		for (unsigned i = 0u; i < device_count; i++)
+			vfio = vfio || device[i].kind == HULL_DEVICE_PCI;
+		if (vfio)
+			add_text(&body, "{\"PathOnHost\":\"" HULL_VFIO "\",\"PathInContainer\":\""
+			                HULL_VFIO "\",\"CgroupPermissions\":\"rwm\"},");
 		for (unsigned i = 0u; i < device_count; i++) {
 			const hull_hostdev *host = &device[i].host;
 
@@ -1763,6 +1771,8 @@ static const hull_cap_entry entries[] = {
 	{ "devices.serial",         HULL_SUP_NATIVE,    "the host's node by --device", NULL },
 	{ "devices.parallel",       HULL_SUP_NATIVE,    "the host's node by --device", NULL },
 	{ "devices.node",           HULL_SUP_NATIVE,    "the host's node by --device", NULL },
+	{ "devices.pci",            HULL_SUP_NATIVE,
+	  "its VFIO group's node and /dev/vfio/vfio by --device", NULL },
 	{ "security.allow",         HULL_SUP_REJECTED,
 	  "docker grants capabilities only to root, and its root is the host's", NULL },
 

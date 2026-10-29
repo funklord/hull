@@ -175,7 +175,10 @@ static void test_values(void)
 	NO(M("(devices (serial \"ttyUSB0\"))"), VALUE, "\"ttyUSB0\"", "machine.devices.serial");
 	NO(M("(devices (node))"), SHAPE, "(node)", "machine.devices.node");
 	NO(M("(devices (usb))"), SHAPE, "(usb)", "machine.devices.usb");
-	NO(M("(devices (pci \"0000:01:00.0\"))"), UNKNOWN, "pci", "machine.devices.pci");
+	OK(M("(devices (pci \"0000:01:00.0\" \"0000:3b:00.1\"))"));
+	NO(M("(devices (pci \"01:00.0\"))"), VALUE, "\"01:00.0\"", "machine.devices.pci");
+	NO(M("(devices (pci \"0000:01:00.A\"))"), VALUE, "\"0000:01:00.A\"", "machine.devices.pci");
+	NO(M("(devices (gpio \"/dev/gpiochip0\"))"), UNKNOWN, "gpio", "machine.devices.gpio");
 	NO(M("(restart)"), SHAPE, "(restart)", "machine.restart");
 
 	/* Booleans. */

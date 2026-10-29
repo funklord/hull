@@ -464,6 +464,7 @@ const char *hull_access_devices(const hull_sexpr_doc *doc, const hull_sexpr_form
 	} kinds[] = {
 		{ "usb", HULL_DEVICE_USB }, { "serial", HULL_DEVICE_SERIAL },
 		{ "parallel", HULL_DEVICE_PARALLEL }, { "node", HULL_DEVICE_NODE },
+		{ "pci", HULL_DEVICE_PCI },
 	};
 	hull_sexpr_form devices;
 

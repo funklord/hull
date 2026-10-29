@@ -212,6 +212,86 @@ int main(void)
 			fail("a node the user may not write", why);
 	}
 
+	/* PCI by VFIO, over a sysfs and IOMMU groups of the test's own: a
+	 * device not there, in no group, bound to its host driver, sharing its
+	 * group with a device that is not given, and one whose group node the
+	 * host has not. */
+	{
+		char pci[600];
+		char groups[600];
+		char path[1300];
+		char target[1300];
+
+		snprintf(pci, sizeof pci, "%s/pci", root);
+		snprintf(groups, sizeof groups, "%s/groups", root);
+		mkdir(pci, 0755);
+		mkdir(groups, 0755);
+		snprintf(path, sizeof path, "%s/drivers", root);
+		mkdir(path, 0755);
+		for (unsigned i = 0u; i < 3u; i++) {
+			static const char *const drivers[] = { "vfio-pci", "e1000e", "pcieport" };
+
+			snprintf(path, sizeof path, "%s/drivers/%s", root, drivers[i]);
+			mkdir(path, 0755);
+		}
+		/* 0000:01:00.0, vfio-pci's in group 9998 with a pcieport bridge;
+		 * 0000:02:00.0, e1000e's; 0000:03:00.0, vfio-pci's in group 9997
+		 * beside 0000:03:00.1, e1000e's; 0000:04:00.0 in no group. */
+		static const struct {
+			const char *address;
+			const char *driver;
+			const char *group;
+		} devices[] = {
+			{ "0000:01:00.0", "vfio-pci", "9998" }, { "0000:00:1c.0", "pcieport", "9998" },
+			{ "0000:02:00.0", "e1000e", "9996" },   { "0000:03:00.0", "vfio-pci", "9997" },
+			{ "0000:03:00.1", "e1000e", "9997" },   { "0000:04:00.0", "vfio-pci", NULL },
+		};
+		for (unsigned i = 0u; i < sizeof devices / sizeof devices[0]; i++) {
+			snprintf(path, sizeof path, "%s/%s", pci, devices[i].address);
+			mkdir(path, 0755);
+			snprintf(path, sizeof path, "%s/%s/driver", pci, devices[i].address);
+			snprintf(target, sizeof target, "%s/drivers/%s", root, devices[i].driver);
+			if (symlink(target, path) != 0)
+				fail("a driver link", strerror(errno));
+			if (devices[i].group == NULL)
+				continue;
+			snprintf(path, sizeof path, "%s/%s", groups, devices[i].group);
+			mkdir(path, 0755);
+			snprintf(path, sizeof path, "%s/%s/devices", groups, devices[i].group);
+			mkdir(path, 0755);
+			snprintf(path, sizeof path, "%s/%s/devices/%s", groups, devices[i].group,
+			         devices[i].address);
+			snprintf(target, sizeof target, "%s/%s", pci, devices[i].address);
+			if (symlink(target, path) != 0)
+				fail("a group's member", strerror(errno));
+			snprintf(path, sizeof path, "%s/%s/iommu_group", pci, devices[i].address);
+			snprintf(target, sizeof target, "%s/%s", groups, devices[i].group);
+			if (symlink(target, path) != 0)
+				fail("a group link", strerror(errno));
+		}
+		static const struct {
+			const char *what;
+			const char *address;
+			const char *want;
+		} pci_cases[] = {
+			{ "a PCI device not there", "0000:09:00.0", "no PCI device 0000:09:00.0 is on the host" },
+			{ "a PCI device in no group", "0000:04:00.0", "is in no IOMMU group" },
+			{ "a PCI device of its host driver", "0000:02:00.0",
+			  "is bound to e1000e, not vfio-pci, which an administrator binds it to once" },
+			{ "a PCI device sharing its group", "0000:03:00.0",
+			  "shares IOMMU group 9997 with 0000:03:00.1, bound to e1000e" },
+			{ "a PCI device with no group node", "0000:01:00.0",
+			  "is vfio-pci's, and /dev/vfio/9998 is not there" },
+		};
+		for (unsigned i = 0u; i < sizeof pci_cases / sizeof pci_cases[0]; i++) {
+			cases++;
+			if (hull_hostdev_pci(pci, groups, pci_cases[i].address, &found, why, sizeof why) ==
+			        NULL ||
+			    strstr(why, pci_cases[i].want) == NULL)
+				fail(pci_cases[i].what, why);
+		}
+	}
+
 	/* Held for one machine at a time: a serial port and a USB device a
 	 * second owner is refused, all or none, and a plain node shared. */
 	{

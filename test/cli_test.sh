@@ -2361,6 +2361,24 @@ if [ "$(id -u)" != 0 ] && [ -e /dev/ttyS0 ] && [ ! -w /dev/ttyS0 ]; then
 	from_root 125 '/dev/ttyS0 is root:[a-z]+ [0-7]+, which the user may not read and write' \
 		-f "$root/devlocked.conf"
 fi
+# PCI by VFIO: planned on every engine; a device of the host's own bound
+# to its host driver refused, naming it, as nothing here is vfio-pci's.
+conf devpci '(devices (pci "0000:00:00.0")) (command "/probe")'
+expect 0 'devices.pci: native: its VFIO group.s node and /dev/vfio/vfio bound in' \
+	"$hull" plan --explain -f "$root/devpci.conf"
+expect 0 'devices.pci: native: vfio-pci: the device itself' \
+	"$hull" plan --explain -f "$root/devpci.conf" --backend vm
+bound_pci=
+for d in /sys/bus/pci/devices/*; do
+	driver=$(readlink "$d/driver" 2>/dev/null) || continue
+	[ "${driver##*/}" != vfio-pci ] && [ -L "$d/iommu_group" ] && { bound_pci=${d##*/}; break; }
+done < /dev/null
+if [ -n "$bound_pci" ]; then
+	devconf devpcibound "(devices (pci \"$bound_pci\")) (command \"/probe\")"
+	from_root 125 "PCI device $bound_pci is bound to ${driver##*/}, not vfio-pci" -f "$root/devpcibound.conf"
+fi
+conf devpcinone '(devices (pci "00ff:ff:1f.7")) (command "/probe")'
+from_root 125 'no PCI device 00ff:ff:1f.7 is on the host' -f "$root/devpcinone.conf"
 conf devusb '(devices (usb (device (vendor "ffff") (product "fffe")))) (command "/probe")'
 from_root 125 'no USB device ffff:fffe is plugged in' -f "$root/devusb.conf"
 # A USB device of the host's that only root, or a group, may write.

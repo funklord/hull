@@ -24,12 +24,19 @@ typedef enum hull_device_kind {
 	HULL_DEVICE_SERIAL,
 	HULL_DEVICE_PARALLEL,
 	HULL_DEVICE_NODE,
+	HULL_DEVICE_PCI,
 } hull_device_kind;
+
+/* Where sysfs lists PCI devices and IOMMU groups, and where VFIO's
+ * container node is, which every group's user opens too. */
+#define HULL_SYSFS_PCI    "/sys/bus/pci/devices"
+#define HULL_SYSFS_GROUPS "/sys/kernel/iommu_groups"
+#define HULL_VFIO         "/dev/vfio/vfio"
 
 typedef struct hull_hostdev {
 	char     node[256];   /* the host's node: its real path, under /dev */
 	char     named[256];  /* the path the spec gave, where it is not `node`, or "" */
-	char     port[32];    /* USB: the port path sysfs names it by, "1-4.2" */
+	char     port[32];    /* USB: the port path sysfs names it by, "1-4.2"; PCI: its address */
 	unsigned bus;         /* USB: its bus number */
 	char     ids[12];     /* USB: "0403:6001", as sysfs has them */
 	int      isochronous; /* USB: an endpoint of an interface's is, audio or video */
@@ -43,7 +50,7 @@ typedef struct hull_device {
 	char             product[8];
 	char             serial[128];
 	char             port[32];
-	char             path[256];  /* serial, parallel, node: the path given */
+	char             path[256];  /* serial, parallel, node: the path given; pci: the address */
 	hull_hostdev     host;
 } hull_device;
 
@@ -68,6 +75,19 @@ const char *hull_hostdev_node(const char *path, hull_hostdev *found, char *why, 
  * `sysfs` is isochronous, sysfs's `PORT:C.I/ep_NN/type` "Isoc": audio or
  * video, whose timing a vm's usb-host keeps less well than the host. */
 int hull_hostdev_usb_isochronous(const char *sysfs, const char *port);
+
+/*
+ * The PCI device at `address` below `sysfs`, for VFIO: bound to vfio-pci,
+ * which an administrator does once, as root, for a device the host is to
+ * give away; every other device of its IOMMU group, read below `groups`,
+ * bound to vfio-pci too or to nothing a guest could reach through, a
+ * bridge's pcieport or pci-stub, since the group is given whole; and its
+ * group's node, /dev/vfio/N, the user's to read and write, which a udev
+ * rule or chown gives. `found->node` is that node and `found->port` the
+ * address. NULL, or why in `why`.
+ */
+const char *hull_hostdev_pci(const char *sysfs, const char *groups, const char *address,
+                             hull_hostdev *found, char *why, size_t cap);
 
 /* `device` found on the host, into its `host`: its node, and a USB
  * device's port. NULL, or why in `why`. */

@@ -212,8 +212,104 @@ const char *hull_hostdev_usb(const char *sysfs, const char *vendor, const char *
 	return NULL;
 }
 
+/* The driver `dir/name` is bound to, the last part of its driver link,
+ * or "" for none. */
+static void driver_of(const char *dir, const char *name, char *out, size_t cap)
+{
+	char    link[600];
+	char    target[600];
+	ssize_t n;
+
+	out[0] = '\0';
+	snprintf(link, sizeof link, "%s/%s/driver", dir, name);
+	n = readlink(link, target, sizeof target - 1u);
+	if (n > 0) {
+		const char *base;
+
+		target[n] = '\0';
+		base = strrchr(target, '/');
+		base = base != NULL ? base + 1 : target;
+		if (strlen(base) < cap)
+			memcpy(out, base, strlen(base) + 1u);
+	}
+}
+
+const char *hull_hostdev_pci(const char *sysfs, const char *groups, const char *address,
+                             hull_hostdev *found, char *why, size_t cap)
+{
+	char           path[600];
+	char           target[600];
+	char           driver[64];
+	char           members[1300];
+	const char    *group;
+	ssize_t        n;
+	DIR           *dir;
+	struct dirent *entry;
+	struct stat    st;
+
+	memset(found, 0, sizeof *found);
+	snprintf(path, sizeof path, "%s/%s", sysfs, address);
+	if (access(path, F_OK) != 0) {
+		snprintf(why, cap, "no PCI device %s is on the host", address);
+		return why;
+	}
+	snprintf(path, sizeof path, "%s/%s/iommu_group", sysfs, address);
+	n = readlink(path, target, sizeof target - 1u);
+	if (n <= 0) {
+		snprintf(why, cap, "PCI device %s is in no IOMMU group: VFIO wants the IOMMU on, "
+		         "intel_iommu=on or amd_iommu=on", address);
+		return why;
+	}
+	target[n] = '\0';
+	group = strrchr(target, '/') != NULL ? strrchr(target, '/') + 1 : target;
+	driver_of(sysfs, address, driver, sizeof driver);
+	if (strcmp(driver, "vfio-pci") != 0) {
+		snprintf(why, cap, "PCI device %s is bound to %s, not vfio-pci, which an administrator "
+		         "binds it to once, as root", address, driver[0] != '\0' ? driver : "no driver");
+		return why;
+	}
+	/* The group is given whole: each other member vfio-pci's or no
+	 * guest's way to the host. */
+	snprintf(members, sizeof members, "%s/%s/devices", groups, group);
+	if ((dir = opendir(members)) == NULL) {
+		snprintf(why, cap, "%s cannot be read, which lists IOMMU group %s", members, group);
+		return why;
+	}
+	while ((entry = readdir(dir)) != NULL) {
+		if (entry->d_name[0] == '.' || strcmp(entry->d_name, address) == 0)
+			continue;
+		driver_of(members, entry->d_name, driver, sizeof driver);
+		if (driver[0] != '\0' && strcmp(driver, "vfio-pci") != 0 &&
+		    strcmp(driver, "pci-stub") != 0 && strcmp(driver, "pcieport") != 0) {
+			snprintf(why, cap, "PCI device %s shares IOMMU group %s with %s, bound to %s: the "
+			         "group is given whole, so it wants vfio-pci too", address, group,
+			         entry->d_name, driver);
+			closedir(dir);
+			return why;
+		}
+	}
+	closedir(dir);
+	if (strlen(group) > 16u) {
+		snprintf(why, cap, "PCI device %s's IOMMU group is not a number", address);
+		return why;
+	}
+	snprintf(path, sizeof path, "/dev/vfio/%.16s", group);
+	if (stat(path, &st) != 0) {
+		snprintf(why, cap, "PCI device %s is vfio-pci's, and %s is not there", address, path);
+		return why;
+	}
+	if (usable(path, &st, why, cap) != NULL)
+		return why;
+	snprintf(found->node, sizeof found->node, "/dev/vfio/%.16s", group);
+	snprintf(found->port, sizeof found->port, "%.12s", address);
+	return NULL;
+}
+
 const char *hull_hostdev_find(hull_device *device, char *why, size_t cap)
 {
+	if (device->kind == HULL_DEVICE_PCI)
+		return hull_hostdev_pci(HULL_SYSFS_PCI, HULL_SYSFS_GROUPS, device->path, &device->host,
+		                        why, cap);
 	if (device->kind != HULL_DEVICE_USB)
 		return hull_hostdev_node(device->path, &device->host, why, cap);
 	return hull_hostdev_usb(HULL_SYSFS_USB, device->vendor[0] != '\0' ? device->vendor : NULL,

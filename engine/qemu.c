@@ -57,6 +57,7 @@
 #include <sys/eventfd.h>
 #include <sys/prctl.h>
 #include <sys/random.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -1515,6 +1516,10 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int
 			argv[n++] = device_chardev[i];
 			argv[n++] = "-device";
 			argv[n++] = device_device[i];
+		} else if (d->kind == HULL_DEVICE_PCI) {
+			snprintf(device_device[i], sizeof device_device[i], "vfio-pci,host=%s", d->host.port);
+			argv[n++] = "-device";
+			argv[n++] = device_device[i];
 		} else if (d->kind == HULL_DEVICE_PARALLEL) {
 			snprintf(device_chardev[i], sizeof device_chardev[i], "parallel,id=d%u,path=%s", i,
 			         node);
@@ -2356,6 +2361,33 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 			return fail(error, HULL_ERR_RUNTIME, m->detail);
 	if (hull_hostdev_claim(m, m->device, m->device_count, m->detail, sizeof m->detail) != NULL)
 		return fail(error, HULL_ERR_RUNTIME, m->detail);
+	/* VFIO pins every page of the guest's memory for its device's DMA,
+	 * which is counted against the user's locked-memory limit: refused,
+	 * saying so, rather than left to fail in qemu's log. The soft limit is
+	 * raised to the hard where that is enough, as qemu inherits it. */
+	for (unsigned i = 0u; i < m->device_count; i++) {
+		struct rlimit       locked;
+		unsigned long long  wanted = ((unsigned long long)m->memory_mib + 64ull) << 20;
+
+		if (m->device[i].kind != HULL_DEVICE_PCI)
+			continue;
+		if (getrlimit(RLIMIT_MEMLOCK, &locked) != 0)
+			locked.rlim_cur = locked.rlim_max = 0;
+		if (locked.rlim_cur != RLIM_INFINITY && locked.rlim_cur < wanted) {
+			if (locked.rlim_max == RLIM_INFINITY || locked.rlim_max >= wanted) {
+				locked.rlim_cur = wanted;
+				setrlimit(RLIMIT_MEMLOCK, &locked);
+			} else {
+				snprintf(m->detail, sizeof m->detail,
+				         "a PCI device by VFIO pins the guest's %lu MiB, and the user may lock "
+				         "%llu MiB: memlock in limits.conf, or LimitMEMLOCK for the user's "
+				         "manager, raises it", m->memory_mib,
+				         (unsigned long long)(locked.rlim_max >> 20));
+				return fail(error, HULL_ERR_RUNTIME, m->detail);
+			}
+		}
+		break;
+	}
 	if ((reason = make_dir(m)) != NULL ||
 	    (reason = write_initramfs(m, release, load_modules)) != NULL ||
 	    (reason = open_listeners(m)) != NULL) {
@@ -3504,6 +3536,8 @@ static const hull_cap_entry entries[] = {
 	{ "devices.parallel",   HULL_SUP_EMULATED,
 	  "an ISA parallel port of the guest's by ppdev, every port access a trap and an ioctl: "
 	  "a bit-banged device, a JTAG cable, may not work; chroot reaches ppdev directly", NULL },
+	{ "devices.pci",        HULL_SUP_NATIVE,
+	  "vfio-pci: the device itself, its own timing, the guest's memory pinned for its DMA", NULL },
 	{ "devices.node",       HULL_SUP_REJECTED,
 	  "a host's device node has no device of a guest's to be: (usb ...), (serial ...) or "
 	  "(parallel ...) gives one", NULL },

@@ -827,6 +827,19 @@ static int make_parents(const char *path)
  */
 static void bind_devices(const hull_machine *m, int report)
 {
+	int vfio = 0;
+
+	for (unsigned i = 0u; i < m->device_count; i++)
+		vfio = vfio || m->device[i].kind == HULL_DEVICE_PCI;
+	/* A PCI device's group node wants VFIO's container node beside it. */
+	if (vfio) {
+		int fd;
+
+		if (make_parents("dev/vfio/vfio") != 0 ||
+		    (fd = open("dev/vfio/vfio", O_WRONLY | O_CREAT | O_CLOEXEC, 0600)) < 0 ||
+		    close(fd) != 0 || mount(HULL_VFIO, "dev/vfio/vfio", NULL, MS_BIND, NULL) != 0)
+			child_fail(report, "binding /dev/vfio/vfio into /dev");
+	}
 	for (unsigned i = 0u; i < m->device_count; i++) {
 		const hull_hostdev *host = &m->device[i].host;
 		char                path[300];
@@ -3461,6 +3474,8 @@ static const hull_cap_entry entries[] = {
 	{ "devices.serial",         HULL_SUP_NATIVE,   "the host's node, bound into /dev", NULL },
 	{ "devices.parallel",       HULL_SUP_NATIVE,   "the host's node, bound into /dev", NULL },
 	{ "devices.node",           HULL_SUP_NATIVE,   "the host's node, bound into /dev", NULL },
+	{ "devices.pci",            HULL_SUP_NATIVE,
+	  "its VFIO group's node and /dev/vfio/vfio bound in, for a driver in user space", NULL },
 	{ "cpus",                   HULL_SUP_NATIVE,
 	  "a systemd scope's CPUQuota, N CPUs' time a second", NULL },
 	{ "memory",                 HULL_SUP_NATIVE,

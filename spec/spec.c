@@ -191,6 +191,21 @@ static const char *usb_port(const uint8_t *text, uint32_t length)
 	       "must be a bus and its ports, as sysfs names them: \"1-4.2\"";
 }
 
+/* A PCI address as sysfs names a device, "0000:01:00.0": domain, bus,
+ * device and function, lowercase hex. */
+static const char *pci_address(const uint8_t *text, uint32_t length)
+{
+	static const char shape[] = "hhhh:hh:hh.h";
+
+	if (length != sizeof shape - 1u)
+		return "must be a PCI address as sysfs names it: \"0000:01:00.0\"";
+	for (uint32_t i = 0u; i < length; i++)
+		if (shape[i] == 'h' ? !(is_digit(text[i]) || (text[i] >= 'a' && text[i] <= 'f'))
+		                    : text[i] != (uint8_t)shape[i])
+			return "must be a PCI address as sysfs names it: \"0000:01:00.0\"";
+	return NULL;
+}
+
 /* Lowercase words: an arch, an engine, a medium's type, a fidelity need. */
 static const char *identifier(const uint8_t *text, uint32_t length)
 {
@@ -417,6 +432,7 @@ static const key device_keys[] = {
 	{ .name = "serial",   .type = STRINGS, .nonempty = 1, .value = absolute },
 	{ .name = "parallel", .type = STRINGS, .nonempty = 1, .value = absolute },
 	{ .name = "node",     .type = STRINGS, .nonempty = 1, .value = absolute },
+	{ .name = "pci",      .type = STRINGS, .nonempty = 1, .value = pci_address },
 };
 static const schema devices = TABLE(device_keys);
 
