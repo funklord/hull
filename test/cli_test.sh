@@ -1327,6 +1327,37 @@ printf '%s\n' "$named_out" | grep -q '^raw *| addr=eth0 none/0 down$' &&
 # machine's id and the segment's name, not the run's.
 limit=60
 from_root 0 "^web +\| addr=eth0 $web_at/24 up\$" -f "$root/named.conf"
+# A tree whose /etc has a group the machine's namespace does not map --
+# one of the user's own others, which neither the one-id map nor the
+# subordinate range covers, as a setgid shared directory gives -- with no
+# /etc/hosts and resolv.conf a link: hull's two files are made above the
+# overlay all the same, rather than copying /etc up with an owner it
+# cannot give, EOVERFLOW, and so is a volume's guest path below /srv,
+# which hull makes nothing else in;
+# /etc's own file still seen, and the tree not written.
+other_group=$(id -G | tr ' ' '\n' | grep -vx "$(id -g)" | head -1)
+if [ -n "$other_group" ]; then
+	mkdir -p "$root/grouproot/etc" "$root/grouproot/srv" "$root/groupdata"
+	cp "$probe" "$root/grouproot/probe"
+	printf 'shared\n' > "$root/groupdata/given"
+	printf 'kept\n' > "$root/grouproot/etc/motd"
+	ln -sfn ../run/resolv.conf "$root/grouproot/etc/resolv.conf"
+	chgrp "$other_group" "$root/grouproot/etc" "$root/grouproot/srv" &&
+		chmod 2775 "$root/grouproot/etc" "$root/grouproot/srv"
+	printf '(machines (gweb %s))\n' \
+		"(source \"dir:./grouproot\") (backend chroot) (mutable overlay) (network none) (segments (grouped-$$ (subnet \"10.83.0.0/24\"))) (volumes (volume (host \"$root/groupdata\") (guest \"/srv/data/in\"))) (command \"/probe\" \"hosts\" \"gweb\" \"read\" \"/etc/resolv.conf\" \"read\" \"/etc/motd\" \"read\" \"/srv/data/in/given\")" \
+		> "$root/grouped.conf"
+	from_root 0 '^gweb +\| hosts=gweb 10\.83\.0\.[0-9]+$' -f "$root/grouped.conf"
+	cases=$((cases + 1))
+	printf '%s\n' "$out" | grep -q '^gweb *| read=nameserver 10\.83\.0\.1$' &&
+		printf '%s\n' "$out" | grep -q '^gweb *| read=kept$' &&
+		printf '%s\n' "$out" | grep -q '^gweb *| read=shared$' &&
+		[ ! -e "$root/grouproot/etc/hosts" ] && [ ! -e "$root/grouproot/srv/data" ] &&
+		[ -L "$root/grouproot/etc/resolv.conf" ] ||
+		fail "a tree whose /etc's group is not mapped did not take hull's names and a volume, or was written" "$out"
+else
+	echo "cli: an unmapped group's /etc not measured: the user is in no group but their own"
+fi
 # A tree used in place has no /etc/hosts to bind over, and is not written
 # to make one; a subnet for one segment twice, and a segment addressed
 # for one machine and bare for another, are refused before anything runs.

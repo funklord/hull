@@ -906,6 +906,100 @@ static void make_dev(const hull_machine *m, int report)
 	bind_devices(m, report);
 }
 
+/* The topmost of the overlay's lower layers holding `relative`, as layer()
+ * has them in the working directory: what it is, in `st`; 0 where none
+ * does. */
+static int lower_entry(const hull_machine *m, const char *relative, struct stat *st)
+{
+	char path[4400];
+
+	for (unsigned i = m->layer_count + 1u; i > 0u; i--) {
+		if (i == 1u)
+			snprintf(path, sizeof path, "lower/%s", relative);
+		else
+			snprintf(path, sizeof path, "lower%u/%s", i - 1u, relative);
+		if (lstat(path, st) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * What hull makes at the guest path `path` -- an empty file where `file`,
+ * else a directory -- made in the overlay's upper layer `upper` before the
+ * overlay is mounted, where the lower layers do not hold it: so it is
+ * never made in the merged tree, which would copy the directory above it
+ * up with its owner, and fail EOVERFLOW where the namespace does not map
+ * that owner -- a tree in a setgid shared directory, its directories in
+ * the group of the directory. Each directory above it the lowers hold is
+ * made in the upper with their mode, so it is what it was but for the
+ * owner, which the namespace could not show anyway. A file is made over
+ * a link, as place_named() did; a directory never is, a link at a guest
+ * path being followed inside the machine. Where something stands in the
+ * way, or cannot be made, it is left to the merged tree as before.
+ */
+static void stage_upper(const hull_machine *m, const char *upper, const char *path, int file)
+{
+	char        relative[4200];
+	char        made[4400];
+	struct stat st;
+	size_t      end = 0u;
+
+	snprintf(relative, sizeof relative, "%s", path + strspn(path, "/"));
+	if (relative[0] == '\0')
+		return;
+	/* Up to the first the lowers do not hold as a directory: below a
+	 * directory the upper has, nothing is copied up. */
+	for (;;) {
+		char *slash = strchr(relative + end, '/');
+		int   last = slash == NULL;
+
+		if (!last)
+			*slash = '\0';
+		if (!lower_entry(m, relative, &st)) {
+			if (!last)
+				*slash = '/';
+			break;
+		}
+		if (last) {
+			if (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode) || !file || !S_ISLNK(st.st_mode))
+				return;
+			break;
+		}
+		if (!S_ISDIR(st.st_mode))
+			return;
+		*slash = '/';
+		end = (size_t)(slash - relative) + 1u;
+	}
+	/* Nothing the lowers hold above it: it is made at the root, which is
+	 * the upper's own. */
+	if (end == 0u)
+		return;
+	/* Each directory the lowers hold, then the rest as make_path() would. */
+	for (size_t at = 0u;;) {
+		char *slash = strchr(relative + at, '/');
+
+		if (slash != NULL)
+			*slash = '\0';
+		snprintf(made, sizeof made, "%s/%s", upper, relative);
+		if (slash == NULL) {
+			if (file)
+				close(open(made, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644));
+			else
+				mkdir(made, 0755);
+			return;
+		}
+		if (lower_entry(m, relative, &st) && S_ISDIR(st.st_mode)) {
+			if (mkdir(made, st.st_mode & 07777) == 0)
+				chmod(made, st.st_mode & 07777);
+		} else if (mkdir(made, 0755) != 0 && errno != EEXIST) {
+			return;
+		}
+		*slash = '/';
+		at = (size_t)(slash - relative) + 1u;
+	}
+}
+
 /*
  * The directory as an overlay, in the machine's own mount namespace: a
  * clone of it beneath, and above it a tmpfs, which goes with the machine.
@@ -990,6 +1084,14 @@ static void layer(const hull_machine *m, int report)
 		 * root's here already or are not mapped and cannot be given. */
 		child_fail(report, "the overlay's upper layer");
 	}
+	/* What hull makes in the tree: its siblings' names and its resolver
+	 * over /etc, and the volumes' guest paths. */
+	if (m->hosts != NULL)
+		stage_upper(m, upper_dir, "/etc/hosts", 1);
+	if (m->resolver != NULL)
+		stage_upper(m, upper_dir, "/etc/resolv.conf", 1);
+	for (unsigned i = 0u; i < m->volume_count; i++)
+		stage_upper(m, upper_dir, m->volume_guest[i], 0);
 	/* The topmost lower layer first: the last of (layers ...), down to the
 	 * source. */
 	at = (size_t)snprintf(options, sizeof options, "lowerdir=");
