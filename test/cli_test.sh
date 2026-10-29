@@ -2960,13 +2960,24 @@ done
 # HOME. The programs are a few bytes of 8086: HELLO prints a line by INT
 # 21h, EXIT3 ends with 3, LOOP jumps to itself. The lines end CR LF, as
 # DOS's do, so the patterns anchor at the start alone. What differs is
-# each shell's word for a command not there, and dosemu2 keeping D: and
-# E: for itself.
+# each shell's word for a command not there, and dosemu2 keeping D: to
+# F: for itself; and that C: is left holding what the test put there.
 mkdir -p "$root/dosroot" "$root/dosvol" "$root/home"
 printf '\264\011\272\014\001\315\041\270\000\114\315\041hello from dos\r\n$' > "$root/dosroot/HELLO.COM"
 printf '\270\003\114\315\041' > "$root/dosroot/EXIT3.COM"
 printf '\353\376' > "$root/dosroot/LOOP.COM"
 printf 'from a volume\r\n' > "$root/dosvol/IN.TXT"
+# CDCHK asks MSCDEX for the CD-ROM drives (INT 2Fh, AX 1500h) and prints
+# the first one's letter, or ends 1 where there is none: what a game's
+# installer asks before it looks for its disc. The disc is a collection,
+# its tree in files/, and an ISO image of the same, iso.py's.
+printf '\270\000\025\061\333\315\057\011\333\164\016\210\312\200\302\101\264\002\315\041\270\000\114\315\041\270\001\114\315\041' \
+	> "$root/dosroot/CDCHK.COM"
+mkdir -p "$root/doscd/files"
+# A tmp an older dosemu engine left in C:, which the check below looks for.
+[ ! -d "$root/dosroot/tmp" ] || rmdir "$root/dosroot/tmp"
+printf 'on a disc\r\n' > "$root/doscd/files/README.TXT"
+python3 -I "$(dirname "$0")/iso.py" "$root/doscd.iso" README.TXT "$(printf 'on a disc\r\n')"
 for dosengine in dosbox dosemu; do
 	if ! command -v "$dosengine" > /dev/null 2>&1; then
 		echo "cli: the dos class on $dosengine not measured: $dosengine is not installed"
@@ -3007,9 +3018,38 @@ for dosengine in dosbox dosemu; do
 	cases=$((cases + 1))
 	[ ! -e "$root/dosroot/NEW.COM" ] ||
 		fail "an overlay dos machine on $dosengine wrote the user's tree" "$(ls "$root/dosroot")"
+	# (media ...): a CD-ROM drive MSCDEX knows, at the first drive from D:
+	# nothing holds -- G: under dosemu2, which keeps D: to F: -- from a
+	# collection on both engines and from an image on DOSBox alone, which
+	# dosemu2 refuses in the plan.
+	case $dosengine in
+	dosbox) cd=D ;;
+	dosemu) cd=G ;;
+	esac
+	dosconf doscddir '(media (medium (type cdrom) (source "dir:./doscd"))) (command "CDCHK")'
+	dosconf doscdtype "(media (medium (type cdrom) (source \"dir:./doscd\"))) (command \"TYPE\" \"$cd:\\\\README.TXT\")"
+	dosconf doscdiso "(media (medium (type cdrom) (source \"image:./doscd.iso\"))) (command \"TYPE\" \"$cd:\\\\README.TXT\")"
+	dosconf doscdnone '(command "CDCHK")'
+	from_root 0 "^$cd" -f "$root/doscddir.conf"
+	# No disc: DOSBox's MSCDEX says none; dosemu2's answers with a stub at
+	# Z:, its own, so that a program sees MSCDEX there -- not the host's
+	# drive, whose driver it loads only where configured to.
+	case $dosengine in
+	dosbox) from_root 1 '' -f "$root/doscdnone.conf" ;;
+	dosemu) from_root 0 '^Z' -f "$root/doscdnone.conf" ;;
+	esac
+	from_root 0 '^on a disc' -f "$root/doscdtype.conf"
+	if [ "$dosengine" = dosbox ]; then
+		from_root 0 '^on a disc' -f "$root/doscdiso.conf"
+	else
+		expect 1 'media\.image: rejected: dosemu2 mounts no disc image' \
+			"$hull" plan -f "$root/doscdiso.conf"
+	fi
 	if [ "$dosengine" = dosemu ]; then
 		dosconf dosown '(volumes (volume (host "./dosvol") (guest "/d"))) (command "HELLO")'
 		from_root 125 'whose own commands and shell are D: and E:' -f "$root/dosown.conf"
+		dosconf dosbatch '(volumes (volume (host "./dosvol") (guest "/f"))) (command "HELLO")'
+		from_root 125 "mounts hull's batch directory as F:" -f "$root/dosbatch.conf"
 	fi
 	(cd / && exec timeout -k 2 60 "$hull_abs" run -f "$root/dosloop.conf" > /dev/null 2>&1) &
 	dosrun=$!
@@ -3029,6 +3069,9 @@ for dosengine in dosbox dosemu; do
 	cases=$((cases + 1))
 	[ ! -e "$HOME/.dosbox" ] && [ ! -e "$HOME/.dosemu" ] && [ ! -e "$HOME/.config/pulse" ] ||
 		fail "$dosengine wrote into the user's HOME" "$(ls -A "$HOME")"
+	cases=$((cases + 1))
+	[ -z "$(ls -A "$root/dosroot" | grep -vxE 'HELLO\.COM|EXIT3\.COM|LOOP\.COM|CDCHK\.COM')" ] ||
+		fail "$dosengine left something in the user's C:" "$(ls -A "$root/dosroot")"
 	cases=$((cases + 1))
 	left=$(ls -d "$XDG_RUNTIME_DIR"/hull/"$dosengine"-* 2> /dev/null)
 	[ -z "$left" ] || fail "$dosengine machines left their directories" "$left"

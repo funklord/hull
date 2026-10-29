@@ -266,11 +266,15 @@ static void resolve_fidelity(resolver *r, const hull_sexpr_form *entry)
 }
 
 /* `(media (medium (type cdrom) ...))`: the key, then each type against the
- * engine's media_types (J.4). */
+ * engine's media_types (J.4), and a listed medium's source by its scheme,
+ * `media.dir` or `media.image`, an engine able to mount one and not the
+ * other. */
 static void resolve_media(resolver *r, const hull_sexpr_form *entry)
 {
 	hull_sexpr_form medium;
 	hull_sexpr_form type;
+	hull_sexpr_form source;
+	char            id[ID_SIZE];
 	int             more;
 
 	hull_sexpr_child(&r->spec->doc, entry, &medium);
@@ -284,9 +288,24 @@ static void resolve_media(resolver *r, const hull_sexpr_form *entry)
 		hull_spec_find(r->spec, &medium, "type", &type);
 		hull_sexpr_child(&r->spec->doc, &type, &head);
 		hull_sexpr_next(&r->spec->doc, &head, &value);
-		if (!listed(r->caps->media_types, &r->spec->doc, &value))
+		if (!listed(r->caps->media_types, &r->spec->doc, &value)) {
 			emit(r, "media", HULL_OUTCOME_REJECTED,
 			     "the engine does not list this medium type", NULL, medium.offset);
+			continue;
+		}
+		/* The spec has held the source to a scheme and a colon. */
+		hull_spec_find(r->spec, &medium, "source", &source);
+		hull_sexpr_child(&r->spec->doc, &source, &head);
+		hull_sexpr_next(&r->spec->doc, &head, &value);
+		{
+			const uint8_t *text = r->spec->doc.data + value.content;
+			uint32_t       n = 0u;
+
+			while (n < value.content_length && text[n] != ':')
+				n++;
+			join(id, "media", text, n);
+		}
+		resolve(r, id, source.offset);
 	}
 }
 

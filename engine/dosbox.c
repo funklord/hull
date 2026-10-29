@@ -75,6 +75,9 @@ static int write_files(const hull_machine *m)
 	ADD("[autoexec]\nmount c \"%s\"\nmount h \"%s\"\n", m->root, m->dir);
 	for (unsigned i = 0u; i < m->volume_count; i++)
 		ADD("mount %c \"%s\"\n", m->volume_drive[i], m->volume_host[i]);
+	for (unsigned i = 0u; i < m->media_count; i++)
+		ADD(m->media_image[i] ? "imgmount %c \"%s\" -t iso\n" : "mount %c \"%s\" -t cdrom\n",
+		    m->media_drive[i], m->media_host[i]);
 	ADD("h:\\hull.bat\n");
 	snprintf(path, sizeof path, "%s/dosbox.conf", m->dir);
 	ok = ok && write_file(path, text) == 0;
@@ -128,6 +131,7 @@ static const hull_dos_engine flavour = {
 	.reserved_why = "",
 	.not_found    = "Illegal command: ",
 	.space_free   = 0,
+	.images       = 1,
 	.write_files  = write_files,
 	.exec_child   = exec_child,
 	.end_code     = end_code,
@@ -159,6 +163,15 @@ static const hull_cap_entry entries[] = {
 	  NULL },
 	{ "volumes",            HULL_SUP_NATIVE,
 	  "a drive each, its guest path the letter: /d is D:, and /h is hull's", NULL },
+	{ "media",              HULL_SUP_NATIVE,
+	  "a CD-ROM drive each, by DOSBox's own MSCDEX, at the first drive from D: no volume "
+	  "holds", NULL },
+	{ "media.dir",          HULL_SUP_EMULATED,
+	  "the collection's files/ as the disc's tree, mounted as a CD-ROM; its TOC, audio tracks "
+	  "and quirks are not yet replayed, so a copy-protection check will fail", NULL },
+	{ "media.image",        HULL_SUP_NATIVE,   "an ISO image, by imgmount", NULL },
+	{ "media.tar",          HULL_SUP_REJECTED, "not yet: a tar: collection", NULL },
+	{ "media.pack",         HULL_SUP_REJECTED, "not yet: a pack: collection", NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   "a DOS machine here has no network", NULL },
 	{ "security.no_new_privs", HULL_SUP_NATIVE, "set on the DOSBox process", NULL },
 	{ "on_disconnect.stop", HULL_SUP_NATIVE,   NULL, NULL },
@@ -170,6 +183,7 @@ static const hull_cap_entry entries[] = {
 };
 
 static const char *const classes[] = { "dos", NULL };
+static const char *const media[]   = { "cdrom", NULL };
 
 static const hull_capabilities caps = {
 	.struct_size    = sizeof (hull_capabilities),
@@ -177,6 +191,7 @@ static const hull_capabilities caps = {
 	.engine_version = "0.1",
 	.classes        = classes,
 	.entries        = entries,
+	.media_types    = media,
 	.migration      = HULL_MIG_PINNED,
 	.arches         = NULL,
 	.requires_root  = 0,

@@ -7,8 +7,9 @@
  * CPU, under the FreeDOS kernel fdpp and the comcom64 shell, and reaches
  * host directories by its own redirector, LREDIR -- the second engine
  * the dos class was made for. dosemu2 mounts the machine's directory as
- * C: (--Fdrive_c) and keeps D: and E: for its own commands and shell, so
- * a volume may not take those. It runs H:\HULL.BAT from the engine's own
+ * C: (--Fdrive_c) and keeps D: and E: for its own commands and shell,
+ * and F: for the directory -K names, the engine's own, so a volume may
+ * not take those. It runs H:\HULL.BAT from the engine's own
  * directory (-K, -E): LREDIR H: and each volume at its letter, read-only
  * where the volume is, SET for each env entry, C: and the workdir, the
  * command by CALL with its DOS output redirected to H:\OUT.TXT, then
@@ -64,6 +65,8 @@ static int write_files(const hull_machine *m)
 	for (unsigned i = 0u; i < m->volume_count; i++)
 		ADD("LREDIR%s %c: %s\r\n", m->volume_readonly[i] ? " -R" : "", m->volume_drive[i],
 		    m->volume_host[i]);
+	for (unsigned i = 0u; i < m->media_count; i++)
+		ADD("LREDIR -C %c: %s\r\n", m->media_drive[i], m->media_host[i]);
 	for (unsigned i = 0u; i < HULL_DOS_MAX_ENV && m->envp[i] != NULL; i++)
 		ADD("set %s\r\n", m->envp[i]);
 	ADD("C:\r\ncd \\");
@@ -94,6 +97,8 @@ static void exec_child(const hull_machine *m)
 	at = (size_t)snprintf(paths, sizeof paths, "%s", m->dir);
 	for (unsigned i = 0u; i < m->volume_count && at < sizeof paths; i++)
 		at += (size_t)snprintf(paths + at, sizeof paths - at, " %s", m->volume_host[i]);
+	for (unsigned i = 0u; i < m->media_count && at < sizeof paths; i++)
+		at += (size_t)snprintf(paths + at, sizeof paths - at, " %s", m->media_host[i]);
 	snprintf(setting, sizeof setting, "lredir_paths \"%s\"", paths);
 	snprintf(home, sizeof home, "HOME=%s", m->dir);
 	snprintf(path_entry, sizeof path_entry, "PATH=%s",
@@ -133,11 +138,13 @@ static int end_code(const hull_machine *m, int wstatus)
 
 static const hull_dos_engine flavour = {
 	.name         = "dosemu",
-	.reserved     = "DE",
-	.reserved_why = "a volume may not be /d or /e under dosemu2, whose own commands and shell "
-	                "are D: and E:",
+	.reserved     = "DEF",
+	.reserved_why = "a volume may not be /d, /e or /f under dosemu2, whose own commands and "
+	                "shell are D: and E:, and which mounts hull's batch directory as F:",
 	.not_found    = "Bad command or file name - ",
 	.space_free   = 1,
+	.images       = 0,
+	.makes        = "tmp",
 	.write_files  = write_files,
 	.exec_child   = exec_child,
 	.end_code     = end_code,
@@ -166,8 +173,18 @@ static const hull_cap_entry entries[] = {
 	{ "workdir",            HULL_SUP_NATIVE,   "a directory of C:", NULL },
 	{ "env",                HULL_SUP_NATIVE,   "SET in the batch", NULL },
 	{ "volumes",            HULL_SUP_NATIVE,
-	  "a drive each by LREDIR, its guest path the letter: /f is F:; /d and /e are dosemu2's, "
-	  "/h hull's, and no path may hold a space", NULL },
+	  "a drive each by LREDIR, its guest path the letter: /g is G:; /d, /e and /f are "
+	  "dosemu2's, /h hull's, and no path may hold a space", NULL },
+	{ "media",              HULL_SUP_NATIVE,
+	  "a CD-ROM drive each, by LREDIR -C, at the first drive from G: no volume holds; with "
+	  "none, dosemu2's MSCDEX answers with a stub drive at Z:", NULL },
+	{ "media.dir",          HULL_SUP_EMULATED,
+	  "the collection's files/ as the disc's tree, redirected as a CD-ROM; its TOC, audio "
+	  "tracks and quirks are not replayed, so a copy-protection check will fail", NULL },
+	{ "media.image",        HULL_SUP_REJECTED,
+	  "dosemu2 mounts no disc image; a dir: collection of the disc's files instead", NULL },
+	{ "media.tar",          HULL_SUP_REJECTED, "not yet: a tar: collection", NULL },
+	{ "media.pack",         HULL_SUP_REJECTED, "not yet: a pack: collection", NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   "a DOS machine here has no network", NULL },
 	{ "security.no_new_privs", HULL_SUP_NATIVE, "set on the dosemu2 process", NULL },
 	{ "on_disconnect.stop", HULL_SUP_NATIVE,   NULL, NULL },
@@ -179,6 +196,7 @@ static const hull_cap_entry entries[] = {
 };
 
 static const char *const classes[] = { "dos", NULL };
+static const char *const media[]   = { "cdrom", NULL };
 
 static const hull_capabilities caps = {
 	.struct_size    = sizeof (hull_capabilities),
@@ -186,6 +204,7 @@ static const hull_capabilities caps = {
 	.engine_version = "0.1",
 	.classes        = classes,
 	.entries        = entries,
+	.media_types    = media,
 	.migration      = HULL_MIG_PINNED,
 	.arches         = NULL,
 	.requires_root  = 0,

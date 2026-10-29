@@ -404,7 +404,8 @@ is a DOS command line, run from a batch of hull's.
 |---|---|---|
 | How | emulates a whole PC, sound and VGA included | runs DOS code on the host's CPU, under FreeDOS |
 | Suits | games, and software that wants the hardware | business software, tools, builds |
-| Volumes | `/d` to `/z` as drives, `/h` hull's | `/f` to `/z`, `D:` and `E:` being dosemu2's |
+| Volumes | `/d` to `/z` as drives, `/h` hull's | `/g` to `/z`, `D:` to `F:` being dosemu2's |
+| CD-ROM | a `dir:` collection or an ISO `image:` | a `dir:` collection |
 | Paths | no DOS syntax characters | no spaces either |
 | Needs | `dosbox` (Debian packages it) | `dosemu`, built from source on Debian |
 
@@ -416,6 +417,9 @@ from a directory and scripted like any other machine.
 - What a program writes through DOS is the machine's output, and its
   exit code is `hull run`'s status; a command DOS cannot find ends 127.
 - A volume is a drive: `(guest "/g")` is `G:`. `env` entries are `SET`.
+- A `(medium (type cdrom) …)` is a CD-ROM drive MSCDEX knows, at the
+  first drive from `D:` nothing else holds, so an installer that looks
+  for its disc finds it.
 - Stopped, paused and measured as any machine.
 
 **Cons**
@@ -430,6 +434,8 @@ from a directory and scripted like any other machine.
 - The directory is written in place, or with `(mutable overlay)` a copy
   of it is, thrown away after: a copy, so a large tree costs its size.
 - DOS lines end in CR LF, and the output keeps them.
+- A disc is its files: its TOC, audio tracks and copy-protection quirks
+  are not replayed yet, so a protection check fails.
 
 ## Designed, not written
 

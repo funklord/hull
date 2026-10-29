@@ -22,6 +22,7 @@ extern "C" {
 #define HULL_DOS_MAX_ARGS    64u
 #define HULL_DOS_MAX_ENV     64u
 #define HULL_DOS_MAX_VOLUMES 20u
+#define HULL_DOS_MAX_MEDIA   4u
 #define HULL_DOS_COMMAND_CAP 126u   /* what DOS takes on a command line */
 
 typedef struct hull_dos_engine hull_dos_engine;
@@ -39,6 +40,10 @@ struct hull_machine {
 	char             volume_drive[HULL_DOS_MAX_VOLUMES];
 	int              volume_readonly[HULL_DOS_MAX_VOLUMES];
 	unsigned         volume_count;
+	char            *media_host[HULL_DOS_MAX_MEDIA];   /* a collection's files/, or an image */
+	char             media_drive[HULL_DOS_MAX_MEDIA];
+	int              media_image[HULL_DOS_MAX_MEDIA];
+	unsigned         media_count;
 	char             detail[512];
 	pid_t            pid;
 	pthread_t        reader;
@@ -47,6 +52,7 @@ struct hull_machine {
 	pthread_cond_t   done_cond;
 	int              done;             /* the emulator has been reaped */
 	int              paused;
+	int              unmade;           /* C: had no `makes` before the emulator ran */
 };
 
 struct hull_dos_engine {
@@ -55,6 +61,8 @@ struct hull_dos_engine {
 	const char *reserved_why;  /* and why */
 	const char *not_found;     /* what the shell writes first for a command not there */
 	int         space_free;    /* paths may hold no space, the emulator splitting on one */
+	int         images;        /* it mounts a disc image, not only a directory as a disc */
+	const char *makes;         /* a directory it makes in C: for itself, or NULL */
 	/* The batch and anything else the emulator reads, in m->dir: 0, or -1. */
 	int (*write_files)(const hull_machine *m);
 	/* In the child, after fork: exec the emulator, or return to fail. */

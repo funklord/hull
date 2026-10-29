@@ -74,6 +74,8 @@ static void release(hull_machine *m)
 		free(m->envp[i]);
 	for (unsigned i = 0u; i < HULL_DOS_MAX_VOLUMES; i++)
 		free(m->volume_host[i]);
+	for (unsigned i = 0u; i < HULL_DOS_MAX_MEDIA; i++)
+		free(m->media_host[i]);
 	pthread_mutex_destroy(&m->lock);
 	pthread_cond_destroy(&m->done_cond);
 	free(m);
@@ -88,6 +90,85 @@ static char *real(char *path)
 
 	free(path);
 	return whole;
+}
+
+/* Whether `drive` is free for a medium: not hull's, not the emulator's,
+ * and not a volume's or an earlier medium's. */
+static int drive_free(const hull_machine *m, char drive)
+{
+	if (drive == 'H' || strchr(m->engine->reserved, drive) != NULL)
+		return 0;
+	for (unsigned k = 0u; k < m->volume_count; k++)
+		if (m->volume_drive[k] == drive)
+			return 0;
+	for (unsigned k = 0u; k < m->media_count; k++)
+		if (m->media_drive[k] == drive)
+			return 0;
+	return 1;
+}
+
+/*
+ * `(media (medium (type cdrom) (source ...)))`, after the volumes: each
+ * disc the first drive from D: nothing else holds, in order, as a DOS
+ * PC's CD-ROM follows its disks. A `dir:` collection's `files/` is the
+ * disc's tree (section 3.10); an `image:` an ISO the emulator mounts.
+ */
+static const char *read_media(hull_machine *m, const hull_sexpr_doc *doc,
+                              const hull_sexpr_form *machine)
+{
+	static char     why[200];
+	hull_sexpr_form entry;
+	hull_sexpr_form item;
+
+	if (!hull_access_find(doc, machine, "media", &entry))
+		return NULL;
+	hull_sexpr_child(doc, &entry, &item);
+	while (hull_sexpr_next(doc, &item, &item)) {
+		char    *type = hull_access_value(doc, &item, "type");
+		char    *source = hull_access_value(doc, &item, "source");
+		unsigned i = m->media_count;
+		int      cdrom = type != NULL && strcmp(type, "cdrom") == 0;
+		int      image = source != NULL && strncmp(source, "image:", 6u) == 0;
+		int      dir = source != NULL && strncmp(source, "dir:", 4u) == 0;
+		char     drive = 'D';
+		struct stat st;
+
+		free(type);
+		if (i == HULL_DOS_MAX_MEDIA || !cdrom || !(dir || (image && m->engine->images))) {
+			free(source);
+			return i == HULL_DOS_MAX_MEDIA ? "there are too many media" :
+			       "a dos machine's medium is a cdrom, from a dir: collection or, where the "
+			       "engine mounts one, an image:";
+		}
+		{
+			char  *path = hull_access_path(doc, source + (image ? 6 : 4));
+			char  *files = NULL;
+
+			if (path != NULL && dir && (files = malloc(strlen(path) + 7u)) != NULL)
+				sprintf(files, "%s/files", path);
+			m->media_host[i] = real(dir ? files : path);
+			if (dir)
+				free(path);
+		}
+		free(source);
+		m->media_image[i] = image;
+		m->media_count++;
+		while (drive <= 'Z' && !drive_free(m, drive))
+			drive++;
+		if (drive > 'Z')
+			return "no drive is left for a medium";
+		m->media_drive[i] = drive;
+		if (m->media_host[i] == NULL || !usable(m, m->media_host[i]) ||
+		    stat(m->media_host[i], &st) != 0 ||
+		    !(image ? S_ISREG(st.st_mode) : S_ISDIR(st.st_mode))) {
+			snprintf(why, sizeof why, "a medium is not there -- a dir: collection holds its "
+			         "disc's tree in files/ -- or its path holds a character %s cannot be "
+			         "given%s", m->engine->name,
+			         m->engine->space_free ? ", a space among them" : "");
+			return why;
+		}
+	}
+	return NULL;
 }
 
 /* What the plan asks, read into `m`: NULL, or why it cannot be run. */
@@ -201,7 +282,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 			}
 		}
 	}
-	return NULL;
+	return read_media(m, doc, machine);
 }
 
 int hull_dos_open(const hull_machine *m, const char *name)
@@ -424,6 +505,39 @@ static void last_line(const hull_machine *m, char *out, size_t cap)
 	fclose(log);
 }
 
+/* Whether C: holds `name`, in either case, as DOS would find it. */
+static int holds(const hull_machine *m, const char *name)
+{
+	char        path[4200];
+	struct stat st;
+	size_t      at = (size_t)snprintf(path, sizeof path, "%s/", m->root);
+
+	for (const char *c = name; *c != '\0' && at + 1u < sizeof path; c++)
+		path[at++] = (char)toupper((unsigned char)*c);
+	path[at] = '\0';
+	if (lstat(path, &st) == 0)
+		return 1;
+	snprintf(path, sizeof path, "%s/%s", m->root, name);
+	return lstat(path, &st) == 0;
+}
+
+/*
+ * The directory the emulator makes in C: for itself -- dosemu2's FreeDOS
+ * autoexec makes C:\TMP for its TEMP -- removed once it has gone, where C:
+ * had none before and it is still empty: the user's directory is left as
+ * the run found it but for what the command wrote. A command that makes
+ * that directory itself and leaves it empty loses it the same way.
+ */
+static void unmake(const hull_machine *m)
+{
+	char path[4200];
+
+	if (!m->unmade)
+		return;
+	snprintf(path, sizeof path, "%s/%s", m->root, m->engine->makes);
+	rmdir(path);
+}
+
 /* The emulator's output while it runs, and its end once it has gone. */
 static void *read_workload(void *arg)
 {
@@ -442,6 +556,7 @@ static void *read_workload(void *arg)
 		nanosleep(&pause, NULL);
 	}
 	hand_on(m, &sent);
+	unmake(m);
 	pthread_mutex_lock(&m->lock);
 	m->done = 1;
 	pthread_cond_broadcast(&m->done_cond);
@@ -475,6 +590,7 @@ hull_status hull_dos_start(hull_core *core, hull_machine *m, hull_error *error)
 
 	(void)core;
 	snprintf(log, sizeof log, "%s/emulator.log", m->dir);
+	m->unmade = m->engine->makes != NULL && !holds(m, m->engine->makes);
 	m->pid = fork();
 	if (m->pid < 0)
 		return fail(error, HULL_ERR_RUNTIME, "the emulator could not be started");

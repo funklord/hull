@@ -38,6 +38,7 @@ static const hull_cap_entry qemu_entries[] = {
 	{ "memory",                 HULL_SUP_NATIVE,   NULL, NULL },
 	{ "ssh",                    HULL_SUP_NATIVE,   NULL, NULL },
 	{ "media",                  HULL_SUP_NATIVE,   NULL, NULL },
+	{ "media.dir",              HULL_SUP_NATIVE,   NULL, NULL },
 	{ "projection.block",       HULL_SUP_REJECTED, "block projection writes nothing back", NULL },
 	{ "security.readonly_root", HULL_SUP_NATIVE,   NULL, NULL },
 	{ "fidelity.inotify",       HULL_SUP_REJECTED, "virtiofs misses events", "vm:inotify-poll" },
@@ -198,12 +199,15 @@ static void test_lists(void)
 	NO("(machine (source \"debian:13\") (arch arm64))", &docker, "ns",
 	   "source.ref.overlay:n arch:r");
 
-	/* Media: the key, then each type against media_types. */
+	/* Media: the key, then each type against media_types, then a listed
+	 * medium's source by its scheme, which an engine declares apart. */
 	OK("(machine (source \"dir:.\") (media (medium (type cdrom) (source \"dir:./cd\"))))",
-	   &qemu, "vm", "source.dir.direct:n media:n");
+	   &qemu, "vm", "source.dir.direct:n media:n media.dir:n");
 	NO("(machine (source \"dir:.\") (media (medium (type cdrom) (source \"dir:./cd\"))"
 	   " (medium (type tape) (source \"dir:./t\"))))", &qemu, "vm",
-	   "source.dir.direct:n media:n media:r");
+	   "source.dir.direct:n media:n media.dir:n media:r");
+	NO("(machine (source \"dir:.\") (media (medium (type cdrom) (source \"image:./cd.iso\"))))",
+	   &qemu, "vm", "source.dir.direct:n media:n media.image:r");
 	NO("(machine (source \"debian:13\") (media (medium (type cdrom) (source \"dir:./cd\"))))",
 	   &docker, "ns", "source.ref.overlay:n media:r media:r");
 }
