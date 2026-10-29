@@ -24,6 +24,7 @@ extern "C" {
 const hull_engine *hull_engine_docker(const hull_host_ops *host);
 const hull_engine *hull_engine_qemu(const hull_host_ops *host);
 const hull_engine *hull_engine_chroot(const hull_host_ops *host);
+const hull_engine *hull_engine_dosbox(const hull_host_ops *host);
 
 #ifdef __cplusplus
 }

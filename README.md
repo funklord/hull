@@ -178,6 +178,7 @@ reason, and where one exists, the `--accept` token that takes it anyway).
 | `qemu` | vm | hardware virtualization | its own | `/dev/kvm`, `/dev/vhost-vsock`, qemu, passt | written |
 | `qemu` | emu | software emulation | its own | `/dev/vhost-vsock`, qemu, passt | written |
 | `docker` | ns | namespaces | the host's | a Docker daemon | written, optional |
+| `dosbox` | dos | full PC emulation | DOS | dosbox | written |
 | crun | ns | namespaces | the host's | user namespaces | designed |
 | virtualbox, vmware | vm | hardware virtualization | its own | the hypervisor | designed |
 | hyperv | vm | hardware virtualization | its own | Windows | reserved |
@@ -391,6 +392,34 @@ machine on docker with the same machine on chroot or vm.
 - An exposed secret shows in `docker inspect`, as all container
   environment does.
 
+## dosbox — a DOS PC, for software written for one
+
+DOSBox, run as the user with no window, for the dos class: the machine's
+directory is drive `C:`, and the command is a DOS command line, run from
+a batch of hull's.
+
+**When you want it:** a DOS program, a build tool or a test of one, run
+from a directory and scripted like any other machine.
+
+**Pros**
+- Needs only `dosbox` installed; no root, no device, no window.
+- What a program writes through DOS is the machine's output, and its
+  `ERRORLEVEL` is `hull run`'s status; a command DOS cannot find ends 127.
+- A volume is a drive: `(guest "/d")` is `D:`. `env` entries are `SET`.
+- Stopped, paused and measured as any machine.
+
+**Cons**
+- What a program draws on the screen is not its output, and a batch's
+  own lines are not either: DOS redirects neither.
+- No network, ports, segments, devices or SSH.
+
+**Caveats**
+- `<`, `>`, `|`, `%` and quotes are refused in the command and in `env`,
+  being DOS syntax on a batch's line; a command line holds 126
+  characters.
+- The directory is written in place: an overlay is not yet.
+- DOS lines end in CR LF, and the output keeps them.
+
 ## Designed, not written
 
 - **crun**, ns: crun under user namespaces, with idmapped mounts for
@@ -418,6 +447,7 @@ machine on docker with the same machine on chroot or vm.
 | your own kernel, modules, sysctls, netns, an init system | vm |
 | several machines on a wire of their own | chroot or vm, with `(segments …)`, mixed freely |
 | the same, on a host with no KVM | emu |
+| software written for DOS | dos |
 | exactly what docker gives, on a host that has it | docker |
 | to keep a machine running after its terminal closes | any, with `(on_disconnect keep)` |
 

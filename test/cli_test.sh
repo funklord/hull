@@ -2953,5 +2953,63 @@ while [ -S "$shm/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
 	sleep 0.25
 done
 
+# The dos class, DOSBox's engine, where dosbox is installed: the directory
+# as C:, a program's output through DOS and its exit status by
+# ERRORLEVEL, a volume as the drive its guest path names, env by SET, a
+# command not there 127, and a stop at once. The programs are a few bytes
+# of 8086: HELLO prints a line by INT 21h, EXIT3 ends with 3, LOOP jumps
+# to itself. And DOSBox writes no configuration into the user's HOME. Its
+# lines end CR LF, as DOS's do, so the patterns anchor at the start alone.
+if command -v dosbox > /dev/null 2>&1; then
+	mkdir -p "$root/dosroot" "$root/dosvol" "$root/home"
+	printf '\264\011\272\014\001\315\041\270\000\114\315\041hello from dos\r\n$' > "$root/dosroot/HELLO.COM"
+	printf '\270\003\114\315\041' > "$root/dosroot/EXIT3.COM"
+	printf '\353\376' > "$root/dosroot/LOOP.COM"
+	printf 'from a volume\r\n' > "$root/dosvol/IN.TXT"
+	dosconf() { # NAME ENTRIES...
+		name=$1
+		shift
+		printf '(machine (source "dir:./dosroot") (backend dos) %s)\n' "$*" > "$root/$name.conf"
+	}
+	dosconf doshello '(command "HELLO")'
+	dosconf dosexit '(command "EXIT3")'
+	dosconf dosvol '(volumes (volume (host "./dosvol") (guest "/d"))) (command "TYPE" "D:\\IN.TXT")'
+	dosconf dosenv '(env (GREETING "hi")) (command "SET")'
+	dosconf dosnone '(command "NOSUCH")'
+	dosconf dosloop '(command "LOOP")'
+	dosconf dosmnt '(volumes (volume (host "./dosvol") (guest "/mnt"))) (command "HELLO")'
+	dosconf dosport '(ports (port (host 8080) (guest 80))) (command "HELLO")'
+	expect 0 '^.*source\.dir\.direct: native: the directory is drive C:$' \
+		"$hull" plan --explain -f "$root/doshello.conf"
+	expect 1 'ports: rejected' "$hull" plan -f "$root/dosport.conf"
+	limit=60
+	from_root 0 '^hello from dos' -f "$root/doshello.conf"
+	from_root 3 '' -f "$root/dosexit.conf"
+	from_root 0 '^from a volume' -f "$root/dosvol.conf"
+	from_root 0 '^GREETING=hi' -f "$root/dosenv.conf"
+	from_root 127 '^Illegal command: NOSUCH\.' -f "$root/dosnone.conf"
+	from_root 125 'guest path is its drive, /d to /z' -f "$root/dosmnt.conf"
+	(cd / && exec timeout -k 2 40 "$hull_abs" run -f "$root/dosloop.conf" > /dev/null 2>&1) &
+	dosrun=$!
+	tries=0
+	until "$hull" ps 2>/dev/null | grep -q ' dosbox +dos +running$' || [ "$tries" -ge 40 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+	dosid=$("$hull" ps 2>/dev/null | awk '$3 == "dosbox" && $5 == "running" { print $1; exit }')
+	started=$(date +%s)
+	"$hull" stop --timeout 3 "$dosid" > /dev/null 2>&1
+	took=$(($(date +%s) - started))
+	wait "$dosrun" 2> /dev/null
+	cases=$((cases + 1))
+	[ -n "$dosid" ] && [ "$took" -lt 3 ] && ! "$hull" ps 2>/dev/null | grep -q ' dosbox +dos +running$' ||
+		fail "a dos machine was not stopped at once" "'$dosid' after ${took}s"
+	cases=$((cases + 1))
+	[ ! -e "$HOME/.dosbox" ] || fail "DOSBox wrote its configuration into the user's HOME" \
+		"$(ls -A "$HOME/.dosbox")"
+else
+	echo "cli: the dos class not measured: dosbox is not installed"
+fi
+
 printf 'cli: %u cases, %u failed\n' "$cases" "$failures"
 [ "$failures" -eq 0 ]

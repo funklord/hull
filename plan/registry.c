@@ -3,7 +3,7 @@
  *
  * A declaration is checked once, here, so that the matrix and everything
  * after it may read it without checking it again: a name, at least one
- * class from the three section 5.0 defines, and an entry table, however
+ * class from the four section 5.0 defines, and an entry table, however
  * empty.
  */
 
@@ -11,9 +11,15 @@
 
 #include "registry.h"
 
-static const char *const classes[] = { "ns", "vm", "emu" };
+/* dos, since 2026-10-29, the holder's: a DOS machine shares almost none
+ * of the Linux classes' rows -- no kernel, no network, no ssh -- so it is
+ * a class of its own with no defaults, rather than emu's, whose vm
+ * defaults it could not honour. */
+static const char *const classes[] = { "ns", "vm", "emu", "dos" };
 
 #define CLASS_COUNT (sizeof classes / sizeof classes[0])
+
+_Static_assert(CLASS_COUNT == HULL_CLASS_COUNT, "registry.h's HULL_CLASS_COUNT is the classes here");
 
 static int set_reason(const char **reason, const char *text)
 {

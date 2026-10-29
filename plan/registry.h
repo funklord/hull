@@ -23,6 +23,7 @@ extern "C" {
 #endif
 
 #define HULL_REGISTRY_MAX 32u
+#define HULL_CLASS_COUNT  4u   /* ns, vm, emu, dos: registry.c's list, held to it */
 
 typedef enum hull_registry_status {
 	HULL_REGISTRY_OK = 0,
@@ -38,7 +39,8 @@ typedef struct hull_registry {
 	const char        *host_arch;  /* "amd64": what `(arch host)` means */
 	const hull_engine *engines[HULL_REGISTRY_MAX];
 	uint32_t           count;
-	const hull_engine *defaults[3];  /* by class: ns, vm, emu; NULL = first registered */
+	const hull_engine *defaults[HULL_CLASS_COUNT];  /* by class: ns, vm, emu, dos; NULL =
+	                                                  first registered */
 } hull_registry;
 
 /* What `(backend ...)` chose. `class_name` is static. */

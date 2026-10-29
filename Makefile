@@ -95,7 +95,8 @@ PLAN_OBJS = $(BUILD_DIR)/plan/matrix.o $(BUILD_DIR)/plan/registry.o \
 # command line that plans with them. VERSION is the one place the number
 # lives; `hull --version` prints it.
 ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
-              $(BUILD_DIR)/engine/chroot.o $(BUILD_DIR)/engine/access.o \
+              $(BUILD_DIR)/engine/chroot.o $(BUILD_DIR)/engine/dosbox.o \
+              $(BUILD_DIR)/engine/access.o \
               $(BUILD_DIR)/engine/usage.o $(BUILD_DIR)/engine/sha256.o \
               $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/idmap.o \
               $(BUILD_DIR)/engine/tree.o $(BUILD_DIR)/engine/hostnet.o \
@@ -156,7 +157,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  searched.conf denied.conf unfound.conf rootfs/srv/searchme rootfs/bin/searchme \
                  listen.out nethost.conf netnone.conf netexec.conf netexec.out vmhost.conf tools/squashfuse segmented.conf nested.conf nestover.conf inited.conf pathless.conf pathed.conf owned.conf ownedin.conf exported.conf exported.tar exported.view exportin.conf owners.list owned_back.conf rootfs/given ownedin_back.conf ownedrun.tar ownedrun.conf layered.conf relayered.conf layeredin.conf sharedupper.conf \
                  whole.conf quit.conf refused.conf devs.conf devroot/probe hostdev.conf cut.conf cut.out counts.out impair.err pausing.conf pausing.out cutin.conf cutin.out cutin.counts offwire.conf tam.conf tam.out tam.err tam.counts badtam.conf injhear.conf injhear.out inj.err \
-                 named.conf inplace.conf held.conf held.err stuck.conf placed.conf $(foreach n,1 2 3 4 5 6 7 8,lines$(n).conf lines$(n).want lines$(n).out) grouped.conf grouproot/probe grouproot/etc/motd grouproot/etc/resolv.conf groupdata/given twosub.conf half.conf \
+                 named.conf inplace.conf dosroot/HELLO.COM dosroot/EXIT3.COM dosroot/LOOP.COM dosvol/IN.TXT doshello.conf dosexit.conf dosvol.conf dosenv.conf dosnone.conf dosloop.conf dosmnt.conf dosport.conf held.conf held.err stuck.conf placed.conf $(foreach n,1 2 3 4 5 6 7 8,lines$(n).conf lines$(n).want lines$(n).out) grouped.conf grouproot/probe grouproot/etc/motd grouproot/etc/resolv.conf groupdata/given twosub.conf half.conf \
                  full.conf full.out full.counts another.conf widened.conf barejoin.conf \
                  early.conf early.out late.conf dyn.counts capseg.conf capseg.out capseg.err capseg.pcap \
                  gemodel.conf gemodel.out gemodel.counts natlisten.out netnat.conf natports.conf \
