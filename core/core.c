@@ -160,6 +160,10 @@ struct slot {
 		unsigned prefix;
 	}                  named[8];
 	unsigned           named_count;
+	/* A network out besides its segments, so that hull at .1 forwards
+	 * what it does not hold to the host's resolvers: not (network none),
+	 * whose machine must reach nothing beyond the segment, DNS included. */
+	int                forwards;
 	int                exited;
 	int                code;
 	int                signal;
@@ -375,7 +379,7 @@ static int on_segment(hull_core *core, const char *key, char *why, size_t cap)
 			prefix  = s->named[i].prefix;
 		}
 	}
-	fd = hull_segment_port_addressed(key, s->id, address, prefix, why, cap);
+	fd = hull_segment_port_addressed(key, s->id, address, prefix, s->forwards, why, cap);
 
 	/* Before the machine runs, so that its first frame meets its link. */
 	for (unsigned i = 0u; fd >= 0 && i < s->link_count; i++) {
@@ -1726,7 +1730,10 @@ static const char *named_of(slot *s, const hull_sexpr_doc *doc, const hull_sexpr
 	hull_sexpr_form names;
 	hull_sexpr_form segments;
 	hull_sexpr_form item;
+	char           *network = hull_access_value(doc, machine, "network");
 
+	s->forwards = network == NULL || strcmp(network, "none") != 0;
+	free(network);
 	hull_sexpr_first(doc, &top);
 	if (!hull_access_find(doc, &top, "names", &names) ||
 	    !hull_access_find(doc, machine, "segments", &segments))

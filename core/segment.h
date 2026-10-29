@@ -122,9 +122,20 @@ int hull_segment_port(const char *key, const char *machine, char *why, size_t ca
  * is a segment the machine addresses itself, as hull_segment_port. Also
  * refused: a machine of another id on `key` whose subnet is another, or
  * whose address is this one -- each file draws its own machines' only.
+ * Where `forwards`, the machine has a way out, and hull at .1 asks the
+ * host's resolvers what it does not hold itself; where not, it refuses
+ * that, so a machine of (network none) reaches nothing beyond, by DNS
+ * neither.
  */
 int hull_segment_port_addressed(const char *key, const char *machine, uint32_t address,
-                                unsigned prefix, char *why, size_t cap);
+                                unsigned prefix, int forwards, char *why, size_t cap);
+
+/*
+ * The resolvers .1 asks on to, `count` of them, at most three: IPv4
+ * addresses and their UDP ports, in place of /etc/resolv.conf's, for a
+ * test that cannot own port 53. A `count` of 0 goes back to the host's.
+ */
+void hull_segment_resolvers(const char *const *servers, const unsigned *ports, unsigned count);
 
 /*
  * `impairment` for `direction` of every port `machine` has on `key`, or

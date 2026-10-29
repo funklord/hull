@@ -620,7 +620,7 @@ printf '%s\n' "$vbridge_out" | grep -q '^addr=eth0 none/0 up$' &&
 # datagram sent by name is answered by the sibling's own hostname.
 vnamed="vnamed-$$"
 printf '(machines (vweb %s) (vdb %s))\n' \
-	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (segments ($vnamed (subnet \"10.86.0.0/24\"))) (command \"/probe\" \"addr\" \"eth1\" \"hosts\" \"vdb\" \"read\" \"/etc/resolv.conf\" \"ask\" \"vdb\" \"7000\")" \
+	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (segments ($vnamed (subnet \"10.86.0.0/24\"))) (command \"/probe\" \"addr\" \"eth1\" \"hosts\" \"vdb\" \"read\" \"/etc/resolv.conf\" \"ask\" \"vdb\" \"7000\" \"dns\" \"vdb\" \"dns\" \"hull-test.invalid\")" \
 	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (segments ($vnamed (subnet \"10.86.0.0/24\"))) (command \"/probe\" \"addr\" \"eth1\" \"answer\" \"7000\")" \
 	> "$root/vnamed.conf"
 name=vnamed
@@ -630,11 +630,13 @@ vdb_at=$(printf '%s\n' "$out" | sed -n 's#^vdb *| addr=eth1 \(10\.86\.0\.[0-9]*\
 cases=$((cases + 1))
 [ -n "$vdb_at" ] && printf '%s\n' "$out" | grep -q "^vweb *| hosts=vdb $vdb_at\$" ||
 	fail "a vm was not named to its sibling at the sibling's own address" "$out"
-# With passt, passt's DNS stays the vm's: its uplink is passt's, and the
-# file's siblings are named by /etc/hosts.
+# With passt too the vm asks hull at .1, which names its sibling and asks
+# the host's resolvers the rest: a name outside answered, not REFUSED.
 cases=$((cases + 1))
-printf '%s\n' "$out" | grep -q '^vweb *| read=nameserver 10\.0\.2\.3$' ||
-	fail "a vm with passt was not left asking passt's DNS" "$out"
+printf '%s\n' "$out" | grep -q '^vweb *| read=nameserver 10\.86\.0\.1$' &&
+	printf '%s\n' "$out" | grep -q "^vweb *| dns=vdb $vdb_at\$" &&
+	printf '%s\n' "$out" | grep -Eq '^vweb +\| dns=hull-test\.invalid rcode [0-4]$' ||
+	fail "a vm with passt did not ask .1, for its sibling and, asked on, for a name outside" "$out"
 # A chroot machine and a vm, both of (network none), so the vm's eth0 is
 # its segment's and not passt's: each named to the other across the
 # core's switch, and the chroot's datagram answered by the vm. A third, a

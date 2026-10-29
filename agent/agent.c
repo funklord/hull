@@ -899,15 +899,20 @@ static const char *place_names(const hull_sexpr_doc *doc, const hull_sexpr_form 
 	unsigned        nic = 0u;
 	char           *hosts;
 	char           *network = hull_access_value(doc, machine, "network");
+	char           *bridge = hull_access_value(doc, machine, "bridge");
 	const char     *reason;
 	int             uplinked;
+	int             owned;
 	int             fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 
 	/* A segment's NIC follows passt's, which (network none) has not. */
 	if (network == NULL || strcmp(network, "none") != 0)
 		nic = 1u;
 	uplinked = nic != 0u;
+	/* On a bridge its owner named, the machine's addressing is its own. */
+	owned = network != NULL && strcmp(network, "bridge") == 0 && bridge != NULL;
 	free(network);
+	free(bridge);
 	if (fd < 0)
 		return "a segment's NIC cannot be set";
 	if (hull_access_find(doc, machine, "segments", &segments) &&
@@ -947,15 +952,20 @@ static const char *place_names(const hull_sexpr_doc *doc, const hull_sexpr_form 
 	free(hosts);
 	if (reason != NULL)
 		return reason;
-	/* With no passt, its segments are its only network, and hull at their
-	 * .1 the one to ask; with passt, passt's DNS stays, and the file's
-	 * siblings are named by /etc/hosts. */
-	if (!uplinked) {
-		char *resolver = hull_access_resolver(doc, names);
+	/* hull at the segments' .1 is the one to ask, which names a sibling
+	 * that joins later and forwards the rest to the host's resolvers where
+	 * the machine has a way out (Appendix D). Over passt's resolv.conf
+	 * only where there is one to cover, or one can be made, as before. */
+	if (!owned) {
+		char       *resolver = hull_access_resolver(doc, names);
+		struct stat file;
 
 		if (resolver == NULL)
 			return "the spec's names cannot be read";
-		reason = bind_named(resolver, "/hull/resolv.conf", "/machine/etc/resolv.conf", made);
+		if (!uplinked || made ||
+		    (lstat("/machine/etc/resolv.conf", &file) == 0 && S_ISREG(file.st_mode)))
+			reason = bind_named(resolver, "/hull/resolv.conf", "/machine/etc/resolv.conf",
+			                    made);
 		free(resolver);
 		if (reason != NULL)
 			return reason;

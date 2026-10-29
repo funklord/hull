@@ -25,6 +25,7 @@
 
 #define _GNU_SOURCE
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -35,6 +36,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <time.h>
@@ -78,6 +80,7 @@ typedef struct port {
 	char     machine[64];
 	uint32_t address;   /* hull's address for it, host order (Appendix D) */
 	unsigned prefix;    /* its subnet's; 0 where the machine sets its own */
+	int      forwards;  /* its machine has a way out, so .1 asks on for it */
 	uint8_t  in[4u + MAX_FRAME];
 	size_t   in_length;
 	uint8_t  out[4u + MAX_FRAME];
@@ -142,10 +145,39 @@ typedef struct segment {
 	capture  capture;
 } segment;
 
-static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static segment        *segments[MAX_SEGMENTS];
-static int             wake[2] = { -1, -1 };
-static int             running;
+/* A question .1 asked on for a machine, until its answer or MAX_ASKED_NS:
+ * the id it went with, and where its answer goes back to -- the port, by
+ * its segment, machine and socket, since either may be gone by then, and
+ * the asker's MAC, address and UDP port, and the question's length, for a
+ * truncated answer. */
+#define MAX_ASKED    256u
+#define MAX_ASKED_NS 5000000000u
+
+typedef struct asked {
+	int                used;
+	uint64_t           at;
+	uint16_t           id;
+	uint16_t           their_id;
+	struct sockaddr_in server;
+	char               key[512];
+	char               machine[64];
+	int                fd;
+	uint8_t            mac[6];
+	uint32_t           address;
+	uint8_t            udp_port[2];
+	size_t             question;
+} asked;
+
+static pthread_mutex_t    lock = PTHREAD_MUTEX_INITIALIZER;
+static segment           *segments[MAX_SEGMENTS];
+static int                wake[2] = { -1, -1 };
+static int                running;
+static int                upstream = -1;   /* the socket .1 asks on from, while a segment is */
+static asked              asking[MAX_ASKED];
+static uint64_t           asking_random;
+static unsigned           asking_next;     /* the resolver the next question goes to */
+static struct sockaddr_in resolvers_given[3];
+static unsigned           resolvers_given_count;
 
 static void say(char *why, size_t cap, const char *reason)
 {
@@ -664,12 +696,17 @@ static const port *named(const segment *s, const char *name, uint32_t address)
 #define DNS_PTR  12u
 #define DNS_ANY  255u
 
+#define ASK_ON   SIZE_MAX
+#define MAX_DNS  (1514u - 14u - 28u)   /* what one frame carries of an answer */
+
 /* The answer to DNS `query` from the names `s` holds, into `out`: its
- * length, or 0 for none. Only the names hull gives, ID and ID.hull, and
- * the subnet's reverse names; the rest is refused, there being nothing
- * here to ask on to. */
+ * length, or 0 for none. hull's names are ID, ID.hull and the subnet's
+ * reverse names, and anything else under .hull is not there. The rest is
+ * ASK_ON where `forwards`, its question's end in `*question`, and refused
+ * where not, there being nothing to ask on to. */
 static size_t dns_answer(const segment *s, uint32_t network, unsigned prefix,
-                         const uint8_t *query, size_t length, uint8_t *out, size_t cap)
+                         const uint8_t *query, size_t length, int forwards, uint8_t *out,
+                         size_t cap, size_t *question)
 {
 	char        name[256];
 	size_t      at = 12u;
@@ -734,18 +771,25 @@ static size_t dns_answer(const segment *s, uint32_t network, unsigned prefix,
 			}
 		}
 	} else if (rcode == 0u) {
-		if (n > 5u && strcmp(name + n - 5u, ".hull") == 0)
+		int ours = n > 5u && strcmp(name + n - 5u, ".hull") == 0;
+
+		if (ours)
 			name[n - 5u] = '\0';
-		if (strchr(name, '.') != NULL || name[0] == '\0')
+		if (ours && strchr(name, '.') != NULL)
+			rcode = 3u;
+		else if (strchr(name, '.') != NULL || name[0] == '\0')
 			rcode = 5u;
 		else if ((p = named(s, name, 0u)) == NULL)
-			rcode = 3u;
+			rcode = ours || !forwards ? 3u : 5u;
 		else if (type == DNS_A || type == DNS_ANY) {
 			put32(data, p->address);
 			data_length = 4u;
 			answer_type = DNS_A;
 		}
 	}
+	*question = at;
+	if (rcode == 5u && forwards)
+		return ASK_ON;
 	if (at + 16u + data_length > cap)
 		return 0u;
 	/* The query's id and question back, as an authority's answer, the
@@ -767,6 +811,186 @@ static size_t dns_answer(const segment *s, uint32_t network, unsigned prefix,
 	return at + 12u + data_length;
 }
 
+/* DNS `dns` from hull at .1, `self`, to `asker` at `mac` and its UDP
+ * `udp_port`, sent back through `s`'s port `to`'s way in, so the port's
+ * impairment holds for it too. `length` is at most MAX_DNS. */
+static void send_answer(segment *s, unsigned to, const uint8_t mac[6], uint32_t self,
+                        uint32_t asker, const uint8_t udp_port[2], const uint8_t *dns,
+                        size_t length)
+{
+	uint8_t  reply[4u + 1514u];
+	uint8_t *out = reply + 4;
+	uint32_t sum;
+	size_t   total;
+
+	memset(reply, 0, sizeof reply);
+	memcpy(out, mac, 6u);
+	memcpy(out + 6, hull_mac, 6u);
+	put16(out + 12, 0x0800u);
+	out[14] = 0x45u;
+	put16(out + 16, (uint32_t)(28u + length));
+	put16(out + 20, 0x4000u);   /* don't fragment */
+	out[22] = 64u;
+	out[23] = 17u;
+	put32(out + 26, self);
+	put32(out + 30, asker);
+	put16(out + 24, ~sum16(0u, out + 14, 20u) & 0xffffu);
+	put16(out + 34, 53u);
+	memcpy(out + 36, udp_port, 2u);
+	put16(out + 38, (uint32_t)(8u + length));
+	memcpy(out + 42, dns, length);
+	/* The UDP sum over its pseudo-header, as a checking stack wants. */
+	sum = sum16(0u, out + 26, 8u);
+	sum += 17u + 8u + (uint32_t)length;
+	sum = sum16(sum, out + 34, 8u + length);
+	put16(out + 40, (~sum & 0xffffu) == 0u ? 0xffffu : ~sum & 0xffffu);
+	total = 14u + 28u + length;
+	if (total < 60u)
+		total = 60u;
+	put32(reply, (uint32_t)total);
+	cross(s, to, HULL_SEGMENT_IN, reply, 4u + total);
+}
+
+/* The host's resolvers, IPv4, at most three: those a test gave, else
+ * /etc/resolv.conf's, read each time, since the host's can change under
+ * a long-lived core -- its loopback ones too, the core being the host's. */
+static unsigned resolvers(struct sockaddr_in out[3])
+{
+	FILE    *conf;
+	char     line[256];
+	unsigned count = 0u;
+
+	if (resolvers_given_count != 0u) {
+		memcpy(out, resolvers_given, sizeof resolvers_given);
+		return resolvers_given_count;
+	}
+	if ((conf = fopen("/etc/resolv.conf", "re")) == NULL)
+		return 0u;
+	while (count < 3u && fgets(line, sizeof line, conf) != NULL) {
+		char server[64];
+
+		memset(&out[count], 0, sizeof out[count]);
+		if (sscanf(line, "nameserver %63s", server) == 1 &&
+		    inet_pton(AF_INET, server, &out[count].sin_addr) == 1) {
+			out[count].sin_family = AF_INET;
+			out[count].sin_port   = htons(53u);
+			count++;
+		}
+	}
+	fclose(conf);
+	return count;
+}
+
+/* `query`, which hull does not hold, asked on to a host resolver for the
+ * machine behind `s`'s port `from`, its answer to go back as `answered`
+ * finds it. A question with nowhere to wait is dropped, as a full queue
+ * drops a frame, and its asker asks again. */
+static void ask_on(segment *s, unsigned from, const uint8_t *frame, const uint8_t *ip,
+                   size_t header, const uint8_t *query, size_t length, size_t question,
+                   const struct sockaddr_in *server)
+{
+	uint64_t now = now_ns();
+	asked   *a = NULL;
+	uint8_t  sent[MAX_DNS];
+	uint16_t id;
+	int      taken;
+
+	if (length > sizeof sent)
+		return;
+	for (unsigned i = 0u; i < MAX_ASKED && a == NULL; i++)
+		if (!asking[i].used || now - asking[i].at > MAX_ASKED_NS)
+			a = &asking[i];
+	if (a == NULL)
+		return;
+	/* An id no question still waiting has, drawn, so an answer cannot be
+	 * guessed from the last. */
+	if (asking_random == 0u)
+		asking_random = now ^ (uint64_t)getpid() << 32;
+	do {
+		id = (uint16_t)splitmix(&asking_random);
+		taken = 0;
+		for (unsigned i = 0u; i < MAX_ASKED && !taken; i++)
+			taken = asking[i].used && &asking[i] != a && asking[i].id == id &&
+			        now - asking[i].at <= MAX_ASKED_NS;
+	} while (taken);
+	memcpy(sent, query, length);
+	put16(sent, id);
+	if (sendto(upstream, sent, length, MSG_DONTWAIT, (const struct sockaddr *)server,
+	           sizeof *server) != (ssize_t)length)
+		return;
+	memset(a, 0, sizeof *a);
+	a->used     = 1;
+	a->at       = now;
+	a->id       = id;
+	a->their_id = get16(query);
+	a->server   = *server;
+	snprintf(a->key, sizeof a->key, "%s", s->key);
+	snprintf(a->machine, sizeof a->machine, "%s", s->ports[from]->machine);
+	a->fd       = s->ports[from]->fd;
+	memcpy(a->mac, frame + 6, 6u);
+	a->address  = get32(ip + 12);
+	memcpy(a->udp_port, ip + header, 2u);
+	a->question = question;
+}
+
+static segment *find(const char *key);
+
+/* What the host's resolvers answered, each sent back to the machine that
+ * asked, under its own id, where its port is still there; one too long
+ * for a frame cut to its question and marked truncated, as a server does
+ * past what UDP carries. */
+static void answered(void)
+{
+	static uint8_t reply[65536];
+
+	for (;;) {
+		struct sockaddr_in from;
+		socklen_t          from_length = sizeof from;
+		ssize_t            n = recvfrom(upstream, reply, sizeof reply, MSG_DONTWAIT,
+		                                (struct sockaddr *)&from, &from_length);
+		uint64_t           now = now_ns();
+		asked             *a = NULL;
+		segment           *s;
+		uint32_t           network;
+		unsigned           prefix;
+		size_t             length;
+
+		if (n < 0)
+			break;
+		if (n < 12)
+			continue;
+		for (unsigned i = 0u; i < MAX_ASKED && a == NULL; i++)
+			if (asking[i].used && asking[i].id == get16(reply) &&
+			    now - asking[i].at <= MAX_ASKED_NS &&
+			    asking[i].server.sin_addr.s_addr == from.sin_addr.s_addr &&
+			    asking[i].server.sin_port == from.sin_port)
+				a = &asking[i];
+		if (a == NULL)
+			continue;
+		a->used = 0;
+		if ((s = find(a->key)) == NULL || !subnet_of(s, &network, &prefix))
+			continue;
+		length = (size_t)n;
+		if (length > MAX_DNS) {
+			if (a->question > MAX_DNS || a->question > length)
+				continue;
+			length = a->question;
+			reply[2] |= 0x02u;
+			put16(reply + 6, 0u);
+			put16(reply + 8, 0u);
+			put16(reply + 10, 0u);
+		}
+		put16(reply, a->their_id);
+		for (unsigned i = 0u; i < s->port_count; i++) {
+			if (s->ports[i]->fd == a->fd && strcmp(s->ports[i]->machine, a->machine) == 0) {
+				send_answer(s, i, a->mac, network + 1u, a->address, a->udp_port, reply,
+				            length);
+				break;
+			}
+		}
+	}
+}
+
 /* A frame from port `from` that is for hull at .1, answered back through
  * the port's way in: 1 where it was, and goes no further. */
 static int answer(segment *s, unsigned from, const uint8_t *framed, size_t length)
@@ -778,18 +1002,17 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 	uint32_t       network;
 	uint32_t       self;
 	unsigned       prefix;
-	size_t         total;
 
 	if (!subnet_of(s, &network, &prefix))
 		return 0;
 	self = network + 1u;
-	memset(reply, 0, sizeof reply);
-	memcpy(out, frame + 6, 6u);
-	memcpy(out + 6, hull_mac, 6u);
 	/* ARP: who has .1. */
 	if (size >= 42u && get16(frame + 12) == 0x0806u && get16(frame + 14) == 1u &&
 	    get16(frame + 16) == 0x0800u && frame[18] == 6u && frame[19] == 4u &&
 	    get16(frame + 20) == 1u && get32(frame + 38) == self) {
+		memset(reply, 0, sizeof reply);
+		memcpy(out, frame + 6, 6u);
+		memcpy(out + 6, hull_mac, 6u);
 		put16(out + 12, 0x0806u);
 		put16(out + 14, 1u);
 		put16(out + 16, 0x0800u);
@@ -799,13 +1022,19 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 		memcpy(out + 22, hull_mac, 6u);
 		put32(out + 28, self);
 		memcpy(out + 32, frame + 22, 10u);   /* the asker's MAC and address */
-		total = 60u;
-	} else if (memcmp(frame, hull_mac, 6u) == 0) {
-		const uint8_t *ip = frame + 14;
-		size_t         header;
-		size_t         datagram;
-		size_t         dns;
-		uint32_t       sum;
+		put32(reply, 60u);
+		cross(s, from, HULL_SEGMENT_IN, reply, 4u + 60u);
+		return 1;
+	}
+	if (memcmp(frame, hull_mac, 6u) == 0) {
+		const uint8_t     *ip = frame + 14;
+		size_t             header;
+		size_t             datagram;
+		size_t             dns;
+		size_t             question = 0u;
+		uint8_t            dns_out[MAX_DNS];
+		struct sockaddr_in servers[3];
+		unsigned           count = 0u;
 
 		/* For .1 and not ARP or DNS: nothing else answers there. */
 		if (size < 14u + 20u + 8u || get16(frame + 12) != 0x0800u || ip[0] >> 4 != 4u)
@@ -816,36 +1045,26 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 		    (get16(ip + 6) & 0x3fffu) != 0u || get32(ip + 16) != self ||
 		    get16(ip + header + 2) != 53u)
 			return 1;
+		/* Asked on only for a machine with a way out, and where there is a
+		 * resolver to ask, from a socket opened for the first question;
+		 * otherwise refused, as before there was one. */
+		if (s->ports[from]->forwards && (count = resolvers(servers)) != 0u && upstream < 0) {
+			upstream = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+			if (upstream < 0)
+				count = 0u;
+			else
+				(void)!write(wake[1], "", 1u);   /* for the poll() to take it */
+		}
 		dns = dns_answer(s, network, prefix, ip + header + 8u, datagram - header - 8u,
-		                 out + 14u + 28u, sizeof reply - 4u - 14u - 28u);
-		if (dns == 0u)
-			return 1;
-		put16(out + 12, 0x0800u);
-		out[14] = 0x45u;
-		put16(out + 16, (uint32_t)(28u + dns));
-		put16(out + 20, 0x4000u);   /* don't fragment */
-		out[22] = 64u;
-		out[23] = 17u;
-		put32(out + 26, self);
-		memcpy(out + 30, ip + 12, 4u);   /* to the asker */
-		put16(out + 24, ~sum16(0u, out + 14, 20u) & 0xffffu);
-		put16(out + 34, 53u);
-		memcpy(out + 36, ip + header, 2u);   /* to the port it asked from */
-		put16(out + 38, (uint32_t)(8u + dns));
-		/* The UDP sum over its pseudo-header, as a checking stack wants. */
-		sum = sum16(0u, out + 26, 8u);
-		sum += 17u + 8u + (uint32_t)dns;
-		sum = sum16(sum, out + 34, 8u + dns);
-		put16(out + 40, (~sum & 0xffffu) == 0u ? 0xffffu : ~sum & 0xffffu);
-		total = 14u + 28u + dns;
-		if (total < 60u)
-			total = 60u;
-	} else {
-		return 0;
+		                 count != 0u, dns_out, sizeof dns_out, &question);
+		if (dns == ASK_ON)
+			ask_on(s, from, frame, ip, header, ip + header + 8u, datagram - header - 8u,
+			       question, &servers[asking_next++ % count]);
+		else if (dns != 0u)
+			send_answer(s, from, frame + 6, self, get32(ip + 12), ip + header, dns_out, dns);
+		return 1;
 	}
-	put32(reply, (uint32_t)total);
-	cross(s, from, HULL_SEGMENT_IN, reply, 4u + total);
-	return 1;
+	return 0;
 }
 
 static void forward(segment *s, unsigned from, const uint8_t *framed, size_t length)
@@ -968,15 +1187,19 @@ static void *serve(void *arg)
 
 	(void)arg;
 	for (;;) {
-		struct pollfd fds[1u + MAX_SEGMENTS * MAX_PORTS];
+		struct pollfd fds[2u + MAX_SEGMENTS * MAX_PORTS];
 		segment      *of[MAX_SEGMENTS * MAX_PORTS];
 		unsigned      at[MAX_SEGMENTS * MAX_PORTS];
-		nfds_t        n = 1u;
+		nfds_t        base;
+		nfds_t        n;
 		int           wait_ms = -1;
 		uint64_t      now;
 
 		fds[0] = (struct pollfd){ wake[0], POLLIN, 0 };
 		pthread_mutex_lock(&lock);
+		fds[1] = (struct pollfd){ upstream, POLLIN, 0 };
+		base = upstream >= 0 ? 2u : 1u;
+		n = base;
 		for (unsigned k = 0u; k < MAX_SEGMENTS; k++) {
 			segment *s = segments[k];
 
@@ -984,8 +1207,8 @@ static void *serve(void *arg)
 				fds[n] = (struct pollfd){ s->ports[i]->fd,
 				                          (short)(POLLIN | (s->ports[i]->out_length != 0u ?
 				                                            POLLOUT : 0)), 0 };
-				of[n - 1u] = s;
-				at[n - 1u] = i;
+				of[n - base] = s;
+				at[n - base] = i;
 				n++;
 			}
 		}
@@ -1003,10 +1226,12 @@ static void *serve(void *arg)
 				;
 		}
 		pthread_mutex_lock(&lock);
+		if (base == 2u && fds[1].revents != 0 && fds[1].fd == upstream)
+			answered();
 		/* Backwards, since a port removed takes the last one's place. */
-		for (nfds_t k = n; k > 1u; k--) {
-			segment *s = of[k - 2u];
-			unsigned i = at[k - 2u];
+		for (nfds_t k = n; k > base; k--) {
+			segment *s = of[k - 1u - base];
+			unsigned i = at[k - 1u - base];
 
 			if (fds[k - 1u].revents == 0 || i >= s->port_count ||
 			    s->ports[i]->fd != fds[k - 1u].fd)
@@ -1031,11 +1256,23 @@ static void *serve(void *arg)
 			if (s != NULL && (due = fire_sources(s, now)) < first)
 				first = due;
 		}
-		for (unsigned k = 0u; k < MAX_SEGMENTS; k++) {
-			if (segments[k] != NULL && segments[k]->port_count == 0u) {
-				end_capture(segments[k]);
-				free(segments[k]);
-				segments[k] = NULL;
+		{
+			int left = 0;
+
+			for (unsigned k = 0u; k < MAX_SEGMENTS; k++) {
+				if (segments[k] != NULL && segments[k]->port_count == 0u) {
+					end_capture(segments[k]);
+					free(segments[k]);
+					segments[k] = NULL;
+				}
+				left |= segments[k] != NULL;
+			}
+			/* No segment left, no question to wait on: the core keeps no
+			 * descriptor its machines are gone from. */
+			if (!left && upstream >= 0) {
+				close(upstream);
+				upstream = -1;
+				memset(asking, 0, sizeof asking);
 			}
 		}
 		pthread_mutex_unlock(&lock);
@@ -1095,11 +1332,28 @@ static int addressed_apart(const segment *s, const port *p, char *why, size_t ca
 
 int hull_segment_port(const char *key, const char *machine, char *why, size_t cap)
 {
-	return hull_segment_port_addressed(key, machine, 0u, 0u, why, cap);
+	return hull_segment_port_addressed(key, machine, 0u, 0u, 0, why, cap);
+}
+
+void hull_segment_resolvers(const char *const *servers, const unsigned *ports, unsigned count)
+{
+	pthread_mutex_lock(&lock);
+	resolvers_given_count = 0u;
+	for (unsigned i = 0u; i < count && i < 3u; i++) {
+		struct sockaddr_in *at = &resolvers_given[resolvers_given_count];
+
+		memset(at, 0, sizeof *at);
+		if (inet_pton(AF_INET, servers[i], &at->sin_addr) != 1)
+			continue;
+		at->sin_family = AF_INET;
+		at->sin_port   = htons((uint16_t)ports[i]);
+		resolvers_given_count++;
+	}
+	pthread_mutex_unlock(&lock);
 }
 
 int hull_segment_port_addressed(const char *key, const char *machine, uint32_t address,
-                                unsigned prefix, char *why, size_t cap)
+                                unsigned prefix, int forwards, char *why, size_t cap)
 {
 	int      pair[2];
 	segment *s = NULL;
@@ -1132,6 +1386,7 @@ int hull_segment_port_addressed(const char *key, const char *machine, uint32_t a
 	snprintf(p->machine, sizeof p->machine, "%s", machine);
 	p->address = address;
 	p->prefix  = prefix;
+	p->forwards = forwards;
 	fcntl(p->fd, F_SETFL, O_NONBLOCK);
 	pthread_mutex_lock(&lock);
 	if (!running) {

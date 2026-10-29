@@ -1345,11 +1345,12 @@ from_root 125 "names it without its subnet" -f "$root/half.conf"
 # Segments beside NAT, as a vm has them beside passt: pasta's eth0 first,
 # the segments' NICs from eth1; an addressed segment's siblings named by
 # /etc/hosts and reached by name across the core's switch, the machine
-# keeping pasta's resolver; and a bare segment's eth1 left down and given
-# no address, as under (network none).
+# asking hull at .1, which names the sibling and asks the host's resolvers
+# the rest, so a name outside is answered rather than refused; and a bare
+# segment's eth1 left down and given no address, as under (network none).
 natseg="natseg-$$"
 printf '(machines (nweb %s) (ndb %s) (nraw %s))\n' \
-	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (segments ($natseg (subnet \"10.84.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"addr\" \"eth1\" \"read\" \"/etc/resolv.conf\" \"hosts\" \"ndb\" \"ask\" \"ndb\" \"7000\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (segments ($natseg (subnet \"10.84.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"addr\" \"eth1\" \"read\" \"/etc/resolv.conf\" \"hosts\" \"ndb\" \"ask\" \"ndb\" \"7000\" \"dns\" \"ndb\" \"dns\" \"hull-test.invalid\")" \
 	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (segments ($natseg (subnet \"10.84.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"addr\" \"eth1\" \"answer\" \"7000\")" \
 	"(source \"dir:./rootfs\") (backend chroot) (segments \"natraw-$$\") (command \"/probe\" \"addr\" \"eth0\" \"addr\" \"eth1\")" \
 	> "$root/natseg.conf"
@@ -1362,10 +1363,16 @@ cases=$((cases + 1))
 	printf '%s\n' "$natseg_out" | grep -q '^nweb *| addr=eth0 10\.0\.2\.15/24 up$' &&
 	printf '%s\n' "$natseg_out" | grep -q '^ndb *| addr=eth0 10\.0\.2\.15/24 up$' &&
 	printf '%s\n' "$natseg_out" | grep -q '^nweb *| addr=eth1 10\.84\.0\.[0-9]*/24 up$' &&
-	printf '%s\n' "$natseg_out" | grep -q '^nweb *| read=nameserver 10\.0\.2\.3$' &&
 	printf '%s\n' "$natseg_out" | grep -q "^nweb *| hosts=ndb $ndb_at\$" &&
 	printf '%s\n' "$natseg_out" | grep -q '^ndb *| answer=from 10\.84\.0\.[0-9]*$' ||
-	fail "addressed siblings beside NAT were not on eth1, named and reached, with pasta's eth0 and resolver" "$natseg_out"
+	fail "addressed siblings beside NAT were not on eth1, named and reached, with pasta's eth0" "$natseg_out"
+# REFUSED is what .1 gave before it asked on; .invalid is NXDOMAIN by RFC
+# 6761, but any answer of the host's resolver will do.
+cases=$((cases + 1))
+printf '%s\n' "$natseg_out" | grep -q '^nweb *| read=nameserver 10\.84\.0\.1$' &&
+	printf '%s\n' "$natseg_out" | grep -q "^nweb *| dns=ndb $ndb_at\$" &&
+	printf '%s\n' "$natseg_out" | grep -Eq '^nweb +\| dns=hull-test\.invalid rcode [0-4]$' ||
+	fail "a machine beside NAT did not ask .1, for its sibling and, asked on, for a name outside" "$natseg_out"
 cases=$((cases + 1))
 printf '%s\n' "$natseg_out" | grep -q '^nraw *| addr=eth0 10\.0\.2\.15/24 up$' &&
 	printf '%s\n' "$natseg_out" | grep -q '^nraw *| addr=eth1 none/0 down$' ||

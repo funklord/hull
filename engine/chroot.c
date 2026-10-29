@@ -599,13 +599,22 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			for (unsigned i = 0u; i < m->segment_count; i++)
 				hull_access_named(doc, &entry, m->segment[i], m->segment_address[i],
 				                  &m->segment_prefix[i]);
-			/* Under (network none) its segments are its only network, so
-			 * hull at their .1 is the one to ask; under NAT pasta's
-			 * resolver stays, as passt's does a vm's, the siblings named
-			 * by /etc/hosts. */
-			if ((m->hosts = hull_access_hosts(doc, &entry)) == NULL ||
-			    (m->no_network && (m->resolver = hull_access_resolver(doc, &entry)) == NULL))
+			/* hull at their .1 is the one to ask, which names a sibling
+			 * that joins later, and under NAT or on hull's bridge forwards
+			 * the rest to the host's resolvers (Appendix D); on a bridge
+			 * its owner named the tree's own stays, as above. */
+			if ((m->hosts = hull_access_hosts(doc, &entry)) == NULL)
 				return "the plan's names cannot be read";
+			if (!m->bridge || m->bridge_own) {
+				char *resolver = hull_access_resolver(doc, &entry);
+
+				if (resolver != NULL) {
+					free(m->resolver);
+					m->resolver = resolver;
+				} else if (m->no_network) {
+					return "the plan's names cannot be read";
+				}
+			}
 		}
 	}
 

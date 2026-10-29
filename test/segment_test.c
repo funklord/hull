@@ -8,12 +8,16 @@
 
 #define _GNU_SOURCE
 
+#include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -306,6 +310,109 @@ static int dns_reply(int fd, uint8_t me, uint8_t *data, size_t *data_length)
 		memcpy(data, f + at + 2u, *data_length);
 	}
 	return f[45] & 0x0f;
+}
+
+/* This process's open descriptors, which are the switch's too. */
+static int descriptors(void)
+{
+	DIR *dir = opendir("/proc/self/fd");
+	int  n = 0;
+
+	if (dir == NULL)
+		return -1;
+	while (readdir(dir) != NULL)
+		n++;
+	closedir(dir);
+	return n;
+}
+
+/* descriptors(), once it holds still: the cases before close their ports'
+ * ends, and the switch its own a moment later. Two seconds at most. */
+static int settled_descriptors(void)
+{
+	int last = descriptors();
+
+	for (uint64_t until = ms_now() + 2000u; ms_now() < until;) {
+		struct timespec pause = { 0, 200000000 };
+		int             now;
+
+		nanosleep(&pause, NULL);
+		if ((now = descriptors()) == last)
+			break;
+		last = now;
+	}
+	return last;
+}
+
+/* A resolver of the test's own on the loopback, for .1 to ask on to:
+ * its socket, its port in `*port`. */
+static int resolver_of(unsigned *port)
+{
+	struct sockaddr_in at = { .sin_family = AF_INET };
+	socklen_t          length = sizeof at;
+	int                fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+
+	at.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (fd < 0 || bind(fd, (struct sockaddr *)&at, sizeof at) != 0 ||
+	    getsockname(fd, (struct sockaddr *)&at, &length) != 0) {
+		fail("a resolver of the test's", strerror(errno));
+		return -1;
+	}
+	*port = ntohs(at.sin_port);
+	return fd;
+}
+
+/* The question the switch asked `fd`, within `ms`: its length, the
+ * datagram in `out` and who sent it in `from`; 0 where none came. */
+static size_t asked_of(int fd, uint8_t *out, size_t cap, struct sockaddr_in *from, int ms)
+{
+	struct pollfd p = { fd, POLLIN, 0 };
+	socklen_t     length = sizeof *from;
+	ssize_t       n;
+
+	if (fd < 0 || poll(&p, 1, ms) != 1)
+		return 0u;
+	n = recvfrom(fd, out, cap, 0, (struct sockaddr *)from, &length);
+	return n > 0 ? (size_t)n : 0u;
+}
+
+/* `question` answered from `fd` to `to`: an A of 192.0.2.7, or where
+ * `padding` is given, that many bytes of TXT besides, past a frame. */
+static void answer_from(int fd, const uint8_t *question, size_t length,
+                        const struct sockaddr_in *to, size_t padding)
+{
+	uint8_t reply[4096];
+	size_t  at = length;
+
+	memcpy(reply, question, length);
+	reply[2] = 0x81;   /* an answer, recursion desired */
+	reply[3] = 0x80;   /* recursion available, no error */
+	put16(reply + 6, padding != 0u ? 2u : 1u);
+	put16(reply + at, 0xc00cu);
+	put16(reply + at + 2u, 1u);
+	put16(reply + at + 4u, 1u);
+	put16(reply + at + 6u, 0u);
+	put16(reply + at + 8u, 60u);
+	put16(reply + at + 10u, 4u);
+	reply[at + 12u] = 192;
+	reply[at + 13u] = 0;
+	reply[at + 14u] = 2;
+	reply[at + 15u] = 7;
+	at += 16u;
+	if (padding != 0u) {
+		put16(reply + at, 0xc00cu);
+		put16(reply + at + 2u, 16u);
+		put16(reply + at + 4u, 1u);
+		put16(reply + at + 6u, 0u);
+		put16(reply + at + 8u, 60u);
+		put16(reply + at + 10u, (unsigned)padding);
+		at += 12u;
+		memset(reply + at, 'x', padding);
+		for (size_t i = 0u; i < padding; i += 200u)
+			reply[at + i] = (uint8_t)(padding - i < 200u ? padding - i - 1u : 199u);
+		at += padding;
+	}
+	sendto(fd, reply, at, 0, (const struct sockaddr *)to, sizeof *to);
 }
 
 /* The frames in pcap file `path`, their tags (each frame's 15th byte) into
@@ -768,12 +875,12 @@ int main(void)
 		 * one already held, or another subnet for the segment. 10.99.0.0/24
 		 * is 0x0a630000. */
 		char     why[256] = "";
-		int      web = hull_segment_port_addressed("named", "web", 0x0a630045u, 24u, why,
+		int      web = hull_segment_port_addressed("named", "web", 0x0a630045u, 24u, 0, why,
 		                                           sizeof why);
-		int      db = hull_segment_port_addressed("named", "db", 0x0a63001fu, 24u, why,
+		int      db = hull_segment_port_addressed("named", "db", 0x0a63001fu, 24u, 0, why,
 		                                          sizeof why);
 		int      raw = hull_segment_port("named", "raw", why, sizeof why);
-		int      again = hull_segment_port_addressed("named", "web", 0x0a630045u, 24u, why,
+		int      again = hull_segment_port_addressed("named", "web", 0x0a630045u, 24u, 0, why,
 		                                             sizeof why);
 		int      taken;
 		int      wider;
@@ -784,12 +891,12 @@ int main(void)
 		      web >= 0 && db >= 0 && raw >= 0);
 		check("a machine's own address again, a vm's second attempt", again >= 0);
 		why[0] = '\0';
-		taken = hull_segment_port_addressed("named", "other", 0x0a630045u, 24u, why, sizeof why);
+		taken = hull_segment_port_addressed("named", "other", 0x0a630045u, 24u, 0, why, sizeof why);
 		check("another file's machine on a held address refused", taken < 0);
 		check("its reason names the holder",
 		      strcmp(why, "its address on segment named, 10.99.0.69, is machine web's") == 0);
 		why[0] = '\0';
-		wider = hull_segment_port_addressed("named", "other", 0x0a620007u, 16u, why, sizeof why);
+		wider = hull_segment_port_addressed("named", "other", 0x0a620007u, 16u, 0, why, sizeof why);
 		check("another subnet for the segment refused", wider < 0);
 		check("its reason names both subnets",
 		      strcmp(why, "segment named is 10.99.0.0/24, as machine web has it, and this "
@@ -798,7 +905,7 @@ int main(void)
 		close(web);
 		close(again);
 		for (until = ms_now() + 2000u; later < 0 && ms_now() < until;) {
-			later = hull_segment_port_addressed("named", "other", 0x0a630045u, 24u, why,
+			later = hull_segment_port_addressed("named", "other", 0x0a630045u, 24u, 0, why,
 			                                    sizeof why);
 			if (later < 0)
 				usleep(10000u);
@@ -822,9 +929,9 @@ int main(void)
 		 * has not, REFUSED for one outside, each with right sums; a machine
 		 * joining later named, and one gone not. */
 		char    why[256] = "";
-		int     web = hull_segment_port_addressed("dnsd", "web", 0x0a37000au, 24u, why,
+		int     web = hull_segment_port_addressed("dnsd", "web", 0x0a37000au, 24u, 0, why,
 		                                          sizeof why);
-		int     db = hull_segment_port_addressed("dnsd", "db", 0x0a370014u, 24u, why, sizeof why);
+		int     db = hull_segment_port_addressed("dnsd", "db", 0x0a370014u, 24u, 0, why, sizeof why);
 		int     late;
 		int     bare = port_of("dnsb", "x");
 		int     peer = port_of("dnsb", "y");
@@ -863,7 +970,7 @@ int main(void)
 		send_dns(web, 10u, "9.9.9.9.in-addr.arpa", 12u);
 		check("an address outside, REFUSED", dns_reply(web, 10u, data, &length) == 5);
 		check("the questions, not to another port", next_raw(db, f, sizeof f, 100) == 0u);
-		late = hull_segment_port_addressed("dnsd", "late", 0x0a37001eu, 24u, why, sizeof why);
+		late = hull_segment_port_addressed("dnsd", "late", 0x0a37001eu, 24u, 0, why, sizeof why);
 		send_dns(web, 10u, "late", 1u);
 		rcode = dns_reply(web, 10u, data, &length);
 		check("a machine joining later, named", rcode == 0 && length == 4u && data[3] == 30u);
@@ -882,6 +989,92 @@ int main(void)
 		close(late);
 		close(bare);
 		close(peer);
+	}
+	{
+		/* hull at .1 asking on, for a machine with a way out: a name
+		 * outside, an address outside and a single label it has not each
+		 * asked of the host's resolver, here the test's, under an id of
+		 * the switch's, and its answer given back under the machine's own;
+		 * hull's own names still answered by it, and asked of nobody, and
+		 * so anything under .hull it has not; an answer from another than
+		 * the one asked, not taken; one past a frame cut to its question
+		 * and marked truncated; and a machine of (network none) on the
+		 * same segment still refused, asking nobody; and once the segment
+		 * is gone, the socket it asked on from gone with it. */
+		int                before = settled_descriptors();
+		int                after = -1;
+		char               why[256] = "";
+		unsigned           resolver_port = 0u;
+		int                resolver = resolver_of(&resolver_port);
+		int                stranger = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+		const char        *server = "127.0.0.1";
+		int                web = hull_segment_port_addressed("dnsf", "web", 0x0a37000au, 24u, 1,
+		                                                     why, sizeof why);
+		int                db = hull_segment_port_addressed("dnsf", "db", 0x0a370014u, 24u, 0,
+		                                                    why, sizeof why);
+		uint8_t            f[1514];
+		uint8_t            q[600];
+		uint8_t            data[300];
+		size_t             length;
+		size_t             got;
+		struct sockaddr_in from;
+		int                rcode;
+
+		hull_segment_resolvers(&server, &resolver_port, 1u);
+		send_dns(web, 10u, "example.com", 1u);
+		got = asked_of(resolver, q, sizeof q, &from, 1000);
+		check("a name outside, asked on",
+		      got == 12u + 13u + 4u && memcmp(q + 12, "\7example\3com", 13u) == 0);
+		if (got != 0u)
+			answer_from(resolver, q, got, &from, 0u);
+		rcode = dns_reply(web, 10u, data, &length);
+		check("its answer, back under the machine's id",
+		      rcode == 0 && length == 4u && data[0] == 192u && data[3] == 7u);
+		send_dns(web, 10u, "9.9.9.9.in-addr.arpa", 12u);
+		check("an address outside, asked on",
+		      asked_of(resolver, q, sizeof q, &from, 1000) != 0u);
+		send_dns(web, 10u, "nobody", 1u);
+		got = asked_of(resolver, q, sizeof q, &from, 1000);
+		check("a single label it has not, asked on", got != 0u);
+		if (got != 0u && stranger >= 0) {
+			sendto(stranger, q, got, 0, (struct sockaddr *)&from, sizeof from);
+			check("an answer from another than the one asked, not taken",
+			      next_raw(web, f, sizeof f, 200) == 0u);
+		}
+		send_dns(web, 10u, "db", 1u);
+		rcode = dns_reply(web, 10u, data, &length);
+		check("its own names, still its", rcode == 0 && length == 4u && data[3] == 20u &&
+		                                  asked_of(resolver, q, sizeof q, &from, 100) == 0u);
+		send_dns(web, 10u, "no.such.hull", 1u);
+		check("under .hull, NXDOMAIN and asked of nobody",
+		      dns_reply(web, 10u, data, &length) == 3 &&
+		      asked_of(resolver, q, sizeof q, &from, 100) == 0u);
+		send_dns(web, 10u, "big.example", 16u);
+		got = asked_of(resolver, q, sizeof q, &from, 1000);
+		if (got != 0u)
+			answer_from(resolver, q, got, &from, 1800u);
+		length = next_raw(web, f, sizeof f, 1000);
+		check("an answer past a frame, its question alone and truncated",
+		      length == 14u + 28u + got && get16(f + 42) == 0x1234u && (f[44] & 0x02u) != 0u &&
+		      get16(f + 48) == 0u && memcmp(f + 54, "\3big\7example", 13u) == 0);
+		send_dns(db, 20u, "example.com", 1u);
+		check("a machine of (network none), refused",
+		      dns_reply(db, 20u, data, &length) == 5 &&
+		      asked_of(resolver, q, sizeof q, &from, 100) == 0u);
+		hull_segment_resolvers(NULL, NULL, 0u);
+		close(web);
+		close(db);
+		if (resolver >= 0)
+			close(resolver);
+		if (stranger >= 0)
+			close(stranger);
+		for (uint64_t until = ms_now() + 2000u; after != before && ms_now() < until;) {
+			struct timespec pause = { 0, 50000000 };
+
+			nanosleep(&pause, NULL);
+			after = descriptors();
+		}
+		check("the socket asked on from, gone with the segment", before > 0 && after == before);
 	}
 	{
 		/* A capture: x's way out, what it sent before its link's loss, and
