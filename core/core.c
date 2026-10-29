@@ -3221,12 +3221,111 @@ static long long monotonic_ms(void)
 	return (long long)now.tv_sec * 1000LL + now.tv_nsec / 1000000L;
 }
 
+/* The socket a frontend dials, `path` in `dir`, listened on: the fd, or
+ * -1 with errno. A socket's path has 108 bytes, and a runtime directory
+ * can be deeper: then it is named through a descriptor on its directory,
+ * which the frontend does too. */
+static int listen_at(const char *dir, const char *path)
+{
+	struct sockaddr_un address;
+	int                listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	int                at = -1;
+	int                saved;
+
+	memset(&address, 0, sizeof address);
+	address.sun_family = AF_UNIX;
+	if (strlen(path) < sizeof address.sun_path) {
+		strcpy(address.sun_path, path);
+	} else if ((at = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC)) >= 0) {
+		snprintf(address.sun_path, sizeof address.sun_path, "/proc/self/fd/%d/core.sock", at);
+	}
+	if (listener >= 0 && address.sun_path[0] != '\0' &&
+	    bind(listener, (struct sockaddr *)&address, sizeof address) == 0 &&
+	    chmod(path, 0600) == 0 && listen(listener, 16) == 0) {
+		if (at >= 0)
+			close(at);
+		return listener;
+	}
+	saved = errno;
+	if (listener >= 0)
+		close(listener);
+	if (at >= 0)
+		close(at);
+	errno = saved;
+	return -1;
+}
+
+/*
+ * Whether this core still holds its place, checked about once a second:
+ * one core per user rests on the lock file being the one this core
+ * locked, and on the socket path naming this core's socket. Something
+ * outside that removes either -- a cleanup, a test, a hand -- lets a
+ * second core start beside this one, or leaves this one running its
+ * machines where no frontend can reach them; seen once, 2026-10-29, as a
+ * machine ticking in one core while `ps` and `pause` reached another.
+ * Each is said once in core.log, with this core's pid. A socket removed
+ * while the lock is still this core's is bound again, since no other core
+ * can hold that lock; a lock file replaced is only said, since another
+ * core may by now hold the new one, and two cannot both rebind.
+ */
+#define PLACE_CHECK_MS 1000LL
+
+static struct stat place_lock;
+static struct stat place_socket;
+static int         place_said_lock;
+static int         place_said_socket;
+
+static int same_file(const struct stat *a, const struct stat *b)
+{
+	return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
+static void check_place(const char *dir, const char *path, const char *lock_path, int *listener)
+{
+	struct stat now;
+	int         lock_ours = stat(lock_path, &now) == 0 && same_file(&now, &place_lock);
+
+	if (!lock_ours && !place_said_lock) {
+		fprintf(stderr, "hull core %ld: core.lock is no longer the file this core locked: "
+		        "another core can start beside this one\n", (long)getpid());
+		place_said_lock = 1;
+	}
+	if (stat(path, &now) == 0) {
+		if (!same_file(&now, &place_socket) && !place_said_socket) {
+			fprintf(stderr, "hull core %ld: core.sock is no longer this core's socket: "
+			        "frontends reach another core\n", (long)getpid());
+			place_said_socket = 1;
+		}
+		return;
+	}
+	if (errno != ENOENT)
+		return;
+	if (lock_ours) {
+		int fresh = listen_at(dir, path);
+
+		if (fresh >= 0 && stat(path, &place_socket) == 0) {
+			close(*listener);
+			*listener = fresh;
+			fprintf(stderr, "hull core %ld: core.sock was removed while this core ran; "
+			        "bound again\n", (long)getpid());
+			place_said_socket = 0;
+			return;
+		}
+		if (fresh >= 0)
+			close(fresh);
+	}
+	if (!place_said_socket) {
+		fprintf(stderr, "hull core %ld: core.sock was removed while this core ran, and "
+		        "cannot be bound again: no frontend can reach this core\n", (long)getpid());
+		place_said_socket = 1;
+	}
+}
+
 int hull_core_run(const char *host_arch)
 {
 	char               dir[4096];
 	char               path[4200];
 	char               lock_path[4200];
-	struct sockaddr_un address;
 	struct sigaction   action;
 	const char        *runtime = getenv("XDG_RUNTIME_DIR");
 	const char        *idle_text = getenv("HULL_CORE_IDLE");
@@ -3236,6 +3335,7 @@ int hull_core_run(const char *host_arch)
 	int                lock;
 	int                listener;
 	int                logged = 0;
+	long long          place_checked = monotonic_ms();
 
 	/* A started core's log, named by the frontend that started it, which
 	 * leaves its own output at /dev/null: appended to until this core
@@ -3306,21 +3406,8 @@ int hull_core_run(const char *host_arch)
 
 	unlink(path);  /* a socket left by a core that died; the lock is ours */
 	snprintf(hosts_path, sizeof hosts_path, "%s/hosts", dir);
-	listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-	memset(&address, 0, sizeof address);
-	address.sun_family = AF_UNIX;
-	/* A socket's path has 108 bytes, and a runtime directory can be
-	 * deeper: then it is named through a descriptor on its directory,
-	 * which the frontend does too. */
-	if (strlen(path) < sizeof address.sun_path) {
-		strcpy(address.sun_path, path);
-	} else {
-		int at = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
-
-		snprintf(address.sun_path, sizeof address.sun_path, "/proc/self/fd/%d/core.sock", at);
-	}
-	if (listener < 0 || bind(listener, (struct sockaddr *)&address, sizeof address) != 0 ||
-	    chmod(path, 0600) != 0 || listen(listener, 16) != 0) {
+	if ((listener = listen_at(dir, path)) < 0 || fstat(lock, &place_lock) != 0 ||
+	    stat(path, &place_socket) != 0) {
 		fprintf(stderr, "hull core: %s: %s\n", path, strerror(errno));
 		return 1;
 	}
@@ -3415,6 +3502,14 @@ int hull_core_run(const char *host_arch)
 				break;
 			timeout = (int)(idle - waited);
 		}
+		/* Woken at least once a second to see that its place is its. */
+		if (monotonic_ms() - place_checked >= PLACE_CHECK_MS) {
+			check_place(dir, path, lock_path, &listener);
+			fds[0].fd     = listener;
+			place_checked = monotonic_ms();
+		}
+		if (timeout < 0 || timeout > (int)PLACE_CHECK_MS)
+			timeout = (int)PLACE_CHECK_MS;
 		if (poll(fds, n, timeout) < 0) {
 			if (errno == EINTR)
 				continue;

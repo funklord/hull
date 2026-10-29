@@ -1892,6 +1892,55 @@ $(cat "$XDG_RUNTIME_DIR/hull/core.log")"
 kill "$stranger" 2> /dev/null
 wait "$stranger" 2> /dev/null
 
+# A core keeps its place: its socket removed while it runs a machine, it
+# binds it again within a second or two, so frontends still reach the
+# machine rather than starting a core of their own; its lock file
+# replaced, which would let a second core start beside it, it says so in
+# core.log. Seen once as a machine running in one core while ps and pause
+# reached another, from a cause not found (project.md section 4.10).
+conf placed '(command "/probe" "wait")' '(hostname "placed") (network none)'
+(cd / && exec timeout -k 2 30 "$hull_abs" run -f "$root/placed.conf" > /dev/null 2>&1) &
+placer=$!
+tries=0
+until "$hull" ps 2>/dev/null | grep -q '^placed .*running$' || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+rm -f "$XDG_RUNTIME_DIR/hull/core.sock"
+tries=0
+until "$hull" ps 2>/dev/null | grep -q '^placed .*running$' || [ "$tries" -ge 20 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+cases=$((cases + 1))
+"$hull" ps 2>/dev/null | grep -q '^placed .*running$' &&
+	grep -q '^hull core [0-9]*: core\.sock was removed while this core ran; bound again$' \
+		"$XDG_RUNTIME_DIR/hull/core.log" ||
+	fail "a core whose socket was removed was not reached again" \
+		"$("$hull" ps 2>&1); $(tail -5 "$XDG_RUNTIME_DIR/hull/core.log")"
+rm -f "$XDG_RUNTIME_DIR/hull/core.lock"
+: > "$XDG_RUNTIME_DIR/hull/core.lock"
+tries=0
+until grep -q '^hull core [0-9]*: core\.lock is no longer the file this core locked' \
+	"$XDG_RUNTIME_DIR/hull/core.log" || [ "$tries" -ge 20 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+cases=$((cases + 1))
+grep -q '^hull core [0-9]*: core\.lock is no longer the file this core locked' \
+	"$XDG_RUNTIME_DIR/hull/core.log" ||
+	fail "a core whose lock file was replaced did not say so" \
+		"$(tail -5 "$XDG_RUNTIME_DIR/hull/core.log")"
+"$hull" stop --timeout 2 placed > /dev/null 2>&1
+wait "$placer" 2>/dev/null
+# Its core, idle, goes, so the next starts on the new lock file and
+# writes its pid there, which the cases after read.
+tries=0
+while [ -S "$XDG_RUNTIME_DIR/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+
 # A core told to go stops its machines first, and their frontends hear
 # how each ended: the probe's 143 for the TERM, not "the core went away".
 cases=$((cases + 1))
