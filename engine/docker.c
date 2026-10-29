@@ -770,6 +770,10 @@ static void add_ports(text *exposed, text *bindings, const hull_sexpr_doc *doc,
 	}
 }
 
+/* A failed create returns no handle, so it keeps its reason where the
+ * caller can read it after the handle is gone. */
+static char create_detail[512];
+
 /* The create request's body, into `m->body`. Returns a reason, or NULL. */
 static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
                          const hull_sexpr_form *machine, const char *image)
@@ -784,7 +788,17 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	hull_sexpr_form entry;
 	const char     *reason   = NULL;
 	char           *value;
+	hull_device     device[HULL_MAX_DEVICES];
+	unsigned        device_count = 0u;
 
+	/* Its devices, found now: a container's are fixed when it is made.
+	 * Each must be the user's to open, as on the other engines, though
+	 * the daemon could open any: nothing is passed as root. */
+	if ((reason = hull_access_devices(doc, machine, device, &device_count)) != NULL)
+		return reason;
+	for (unsigned i = 0u; i < device_count; i++)
+		if (hull_hostdev_find(&device[i], create_detail, sizeof create_detail) != NULL)
+			return create_detail;
 	add_text(&body, "{\"Image\":");
 	add_json(&body, image);
 
@@ -911,6 +925,28 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 		addf(&body, ",\"Memory\":%llu", bytes_of(value));
 		free(value);
 	}
+	/* Each node at its own path, and again at the path the spec gave
+	 * under /dev where that is a link to it, since docker makes nodes and
+	 * not links. */
+	if (device_count != 0u) {
+		add_text(&body, ",\"Devices\":[");
+		for (unsigned i = 0u; i < device_count; i++) {
+			const hull_hostdev *host = &device[i].host;
+
+			for (int named = 0; named < 2; named++) {
+				const char *inside = named ? host->named : host->node;
+
+				if (named && strncmp(inside, "/dev/", 5u) != 0)
+					continue;
+				add_text(&body, i == 0u && !named ? "{\"PathOnHost\":" : ",{\"PathOnHost\":");
+				add_json(&body, host->node);
+				add_text(&body, ",\"PathInContainer\":");
+				add_json(&body, inside);
+				add_text(&body, ",\"CgroupPermissions\":\"rwm\"}");
+			}
+		}
+		add_text(&body, "]");
+	}
 	if (hull_access_find(doc, machine, "security", &entry)) {
 		if (hull_access_true(doc, &entry, "readonly_root"))
 			add_text(&body, ",\"ReadonlyRootfs\":true");
@@ -1010,9 +1046,6 @@ static void remove_container(const char *id)
 	free(answer);
 }
 
-/* A failed create returns no handle, so it keeps its reason where the
- * caller can read it after the handle is gone. */
-static char create_detail[512];
 
 /* The image the machine runs: its ref, or its dir's import. A reason, or
  * NULL. */
@@ -1722,10 +1755,11 @@ static const hull_cap_entry entries[] = {
 	 * not root, which is docker's rule and not ours to bend. */
 	{ "security.readonly_root", HULL_SUP_NATIVE, NULL, NULL },
 	{ "security.no_new_privs",  HULL_SUP_NATIVE, NULL, NULL },
-	{ "devices.usb",            HULL_SUP_REJECTED,  "not yet: docker's --device", NULL },
-	{ "devices.serial",         HULL_SUP_REJECTED,  "not yet: docker's --device", NULL },
-	{ "devices.parallel",       HULL_SUP_REJECTED,  "not yet: docker's --device", NULL },
-	{ "devices.node",           HULL_SUP_REJECTED,  "not yet: docker's --device", NULL },
+	{ "devices.usb",            HULL_SUP_NATIVE,
+	  "its usbfs node by --device, found when the container is made", NULL },
+	{ "devices.serial",         HULL_SUP_NATIVE,    "the host's node by --device", NULL },
+	{ "devices.parallel",       HULL_SUP_NATIVE,    "the host's node by --device", NULL },
+	{ "devices.node",           HULL_SUP_NATIVE,    "the host's node by --device", NULL },
 	{ "security.allow",         HULL_SUP_REJECTED,
 	  "docker grants capabilities only to root, and its root is the host's", NULL },
 

@@ -300,6 +300,24 @@ printf '%s\n' "$out" | grep -q '^dial 192\.0\.2\.1:9=Network is unreachable$' ||
 printf '(machine (source "dir:./rootfs") (mutable overlay) (backend docker) (hostname "dtest") %s)\n' \
 	'(network none) (ports (port (host 18099) (guest 80))) (command "/probe")' > "$root/netports.conf"
 expect 125 'ports need the machine.s own network' netports
+# (devices ...) by docker's --device: /dev/net/tun, which read with no
+# interface says EBADFD, and /dev/char/10:200, a link to it, a node at
+# that path in the container, docker making nodes and not links. A node
+# the user may not open is refused although the daemon could.
+if [ -r /dev/net/tun ] && [ -w /dev/net/tun ] && [ -L /dev/char/10:200 ]; then
+	printf '(machine (source "dir:./rootfs") (mutable overlay) (backend docker) (hostname "dtest") %s)\n' \
+		'(devices (node "/dev/char/10:200")) (command "/probe" "read" "/dev/char/10:200" "kind" "/dev/char/10:200")' \
+		> "$root/devnode.conf"
+	expect 0 '^read=File descriptor in bad state$' devnode
+	cases=$((cases + 1))
+	printf '%s\n' "$out" | grep -q '^kind=chr 10:200$' ||
+		fail "a link's device was not at its path in the container" "$out"
+fi
+if [ "$(id -u)" != 0 ] && [ -e /dev/ttyS0 ] && [ ! -w /dev/ttyS0 ]; then
+	printf '(machine (source "dir:./rootfs") (mutable overlay) (backend docker) (hostname "dtest") %s)\n' \
+		'(devices (serial "/dev/ttyS0")) (command "/probe")' > "$root/devlocked.conf"
+	expect 125 '/dev/ttyS0 is root:[a-z]+ [0-7]+, which the user may not read and write' devlocked
+fi
 cases=$((cases + 1))
 created=$(timeout 10 docker image inspect -f '{{.Created}}' "hull-dir:$digest" 2>&1) ||
 	fail "no image hull-dir:$digest" "$created"

@@ -2243,8 +2243,10 @@ devconf() { # NAME ENTRIES...: a machine of devroot, whose tree has a /dev
 devconf devnode '(devices (node "/dev/net/tun")) (command "/probe" "read" "/dev/net/tun" "kind" "/dev/net/tun")'
 expect 0 'devices.node: native: the host.s node, bound into /dev' \
 	"$hull" plan --explain -f "$root/devnode.conf"
-expect 1 'devices.node: rejected: not yet: docker.s --device' \
-	"$hull" plan -f "$root/devnode.conf" --backend docker
+# Rejected for its direct dir source, which docker cannot run, and not
+# for its device.
+expect 1 'devices.node: native: the host.s node by --device' \
+	"$hull" plan --explain -f "$root/devnode.conf" --backend docker
 expect 1 'devices.node: rejected: a host.s device node has no device of a guest.s to be' \
 	"$hull" plan -f "$root/devnode.conf" --backend vm
 conf devserial '(devices (serial "/dev/ttyS0") (parallel "/dev/parport0") (usb (device (vendor "0403") (product "6001")))) (command "/probe")'
