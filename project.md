@@ -1461,7 +1461,7 @@ An engine declares what it can do; the plan step enforces it; the conformance su
 
 ### 5.1 The `ns` class — namespaces (default)
 
-Wave one implements this class with the **docker adapter** (§5.0). The wave-two **native engine**: crun under user namespaces; idmapped mounts for volume ownership sanity; cgroups v2 limits via systemd user-session delegation; pasta for networking. Startup in tens of milliseconds. Shared host kernel — the fast path for trusted dev work, and the engine that delivers the rootless promise natively.
+Wave one implements this class with the **docker adapter** (§5.0). The wave-two **native engine**: crun under user namespaces; idmapped mounts for volume ownership sanity; cgroups v2 limits via systemd user-session delegation; pasta for networking. Startup in tens of milliseconds. Shared host kernel — the fast path for development and test work, and the engine that delivers the rootless promise natively.
 
 ### 5.2 The `vm` class — hardware-virtualized (reference engine: qemu)
 

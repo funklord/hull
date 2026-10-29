@@ -224,20 +224,21 @@ where nothing else is available, since it needs only user namespaces.
 
 ## qemu as vm — a KVM machine of its own
 
-A q35 virtual machine under KVM, booting the host's kernel with hull's
-agent as its init. The machine's directory and each volume are 9p shares
-of qemu's own, the agent mounts them, and everything hull asks of a
-machine -- exec, logs, stats, a terminal, a forwarded port -- goes to the
-agent over vsock. The network is passt, in user space, so no bridge, tap
-or root is involved. It boots in about two seconds.
+A q35 virtual machine under KVM, booting the host's kernel, or one given
+as a file or carried by the image, with hull's agent as its init. The
+machine's directory and each volume are 9p shares of qemu's own, the
+agent mounts them, and everything hull asks of a machine -- exec, logs,
+stats, a terminal, a forwarded port -- goes to the agent over vsock. By
+default the network is passt, in user space, so no bridge, tap or root
+is involved. It boots in about two seconds.
 
 **When you want it:** anything the host's kernel must not be shared for,
 or cannot be: loading modules (`mac80211_hwsim` radios, `hci_vhci`,
 `pppoe`), changing sysctls, building network topologies with netns and
 bridges as the guest's real root, testing an init system, or running
-software that needs a kernel other than the host's. Several machines on a wire
-of their own, `(segments …)`, for testing network software against real
-layer 2.
+software that needs a kernel other than the host's. Several machines on
+a wire of their own, `(segments …)`, vms and chroot machines together,
+for testing network software against real layer 2.
 
 **Pros**
 - A kernel of its own: root in the guest is real root of that kernel,
@@ -247,15 +248,27 @@ layer 2.
   `/lib/modules/<release>`, so a workload's own `modprobe` finds them.
 - A guest kernel that crashes ends the guest, not the host, so a test may
   break the kernel on purpose.
+- A kernel other than the host's: `(kernel "path:FILE")` boots one of
+  your own, and `(kernel image)` the image's `/hull/kernel`, so a guest
+  can run another kernel version, or one built without a feature.
 - Its own network, by passt, as the user, with ports forwarded from the
-  machine's stable address and UDP as well as TCP.
+  machine's stable address and UDP as well as TCP; `(network none)` for
+  no NIC but its segments', and `(network bridge)` from a core run as
+  root.
 - `(segments "wire" …)`: a NIC per named segment, after passt's, on a
-  learning switch in the user's core, for several vms on one layer 2
-  that nothing else is on. No address is given; the guest sets its own.
+  learning switch in the user's core, shared with chroot machines on the
+  same segment. Bare, the guest sets its own address; given a subnet,
+  hull addresses each machine, names them to each other, and answers DNS
+  at the segment's `.1`.
+- `(devices …)`: USB devices, serial and parallel ports, and PCI by VFIO,
+  each held by one machine at a time. USB and the parallel port are
+  passed by qemu, so their timing is not the host's, and the plan says
+  so.
 - `(init "/sbin/init")`: the image's own init, systemd or OpenRC, as PID
   1, with the agent going on beside it.
 - `(mutable overlay)` keeps every write in the guest's memory, so a
-  machine can be broken freely and starts clean.
+  machine can be broken freely and starts clean; `(upper PATH)` keeps
+  them in a directory of yours instead, through 9p.
 
 **Cons**
 - Memory is reserved: `(memory "1G")` is a gigabyte the host gives up
@@ -268,13 +281,15 @@ layer 2.
   `qemu-system-x86_64` installed. `hull doctor` checks each.
 
 **Caveats**
-- **The host's kernel, not the image's**: a distribution image boots on
-  the kernel the host runs, until hull ships one of its own.
+- **The host's kernel unless one is given**: a distribution image boots
+  on the kernel the host runs, unless the spec names another, until hull
+  ships a small kernel of its own as the default.
 - **The guest sees ids as a user namespace maps them**: qemu runs in
   one where you are root, so your files are root's in the guest and
   setuid-root programs work, and a file of any other owner or group is
-  nobody's, 65534, as on chroot. A chown to another id inside is not
-  kept on the host.
+  nobody's, 65534, as on chroot -- except in a stored image, whose owners
+  are given back where your subordinate id range holds them. A chown to
+  another id in a directory used in place is not kept on the host.
 - **`(mutable direct)` writes through 9p as the user**, so a chown in the
   guest fails, and an apt install with it; use `(mutable overlay)`, or
   put packages in the image.
@@ -325,14 +340,20 @@ machine on docker with the same machine on chroot or vm.
 
 **Pros**
 - Runs any image the daemon can, with docker's own exec, logs and
-  networking under hull's names.
+  networking under hull's names: `(network bridge)` is docker's own
+  bridge, or the docker network `(bridge NAME)` names.
+- `(devices …)` by docker's `--device`: USB, serial and parallel ports,
+  plain nodes, and PCI by its VFIO group.
 - A container is the daemon's, so it can be kept across a hull core's
   restart and taken back.
 
 **Cons**
-- **It inherits root**, from the daemon: a container's root is the
-  host's, which is the reason hull exists. Its declaration says
-  `runs as root`, and capabilities beyond docker's default are refused.
+- **It inherits root**, from the daemon: whoever may drive dockerd is
+  root by another name, which is the reason hull exists. Its declaration
+  says `runs as root`. The workload itself runs as the user, so
+  capabilities, which docker grants only to root, are refused, and an
+  image that needs root inside, an `apt-get` say, fails here; chroot maps
+  root to the user instead.
 - A directory cannot run in place: `(mutable direct)` is refused, and an
   overlay is a `docker import` of the tree, kept by its hash.
 - No `(init …)` yet, and no `(segments …)`: decided 2026-10-28, since
@@ -346,9 +367,9 @@ machine on docker with the same machine on chroot or vm.
 
 ## Designed, not written
 
-- **crun**, ns: the native rootless container engine, crun under user
-  namespaces with idmapped mounts and pasta networking, giving ns-class
-  machines a network of their own, and so ports.
+- **crun**, ns: crun under user namespaces, with idmapped mounts for
+  volume ownership, cgroup v2 limits and pasta networking, starting in
+  tens of milliseconds.
 - **A micro vm profile with its own kernel**: a minimal guest kernel
   bundled with hull, booting in a few hundred milliseconds and making a
   machine independent of the host's kernel version.
@@ -369,7 +390,7 @@ machine on docker with the same machine on chroot or vm.
 |---|---|
 | speed, a build step, a test of user-space code | chroot |
 | your own kernel, modules, sysctls, netns, an init system | vm |
-| several machines on a wire of their own | vm, with `(segments …)` |
+| several machines on a wire of their own | chroot or vm, with `(segments …)`, mixed freely |
 | the same, on a host with no KVM | emu |
 | exactly what docker gives, on a host that has it | docker |
 | to keep a machine running after its terminal closes | any, with `(on_disconnect keep)` |
@@ -418,12 +439,14 @@ Packages go into an image as a build step:
   (steps
     (step (name "tools")
           (network true)
-          (run "apt-get -o APT::Sandbox::User=root update && apt-get -o APT::Sandbox::User=root install -y --no-install-recommends iproute2 kmod"))))
+          (run "apt-get update && apt-get install -y --no-install-recommends iproute2 kmod"))))
 ```
 
 A build step has no network unless it says `(network true)`, and
 `apt-get update` exits 0 when it cannot fetch, so a step without it finds
-only the packages some earlier cache knew.
+only the packages some earlier cache knew. Steps map your subordinate id
+range, so packages keep their own system users; on a host that gives
+you none, apt wants `-o APT::Sandbox::User=root`.
 
 # Building
 
