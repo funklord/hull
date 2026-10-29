@@ -31,6 +31,7 @@ struct hull_machine {
 	hull_core       *core;
 	char             dir[4096];        /* the engine's own, under the runtime dir: H: */
 	char            *root;             /* drive C: */
+	int              overlay;          /* (mutable overlay): C: is a copy in `dir` */
 	char            *workdir;
 	char            *argv[HULL_DOS_MAX_ARGS];
 	char            *envp[HULL_DOS_MAX_ENV];

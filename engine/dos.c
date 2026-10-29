@@ -1,7 +1,9 @@
 /*
  * dos.c -- what the dos class's engines share. See dos.h.
  *
- * The machine's directory is drive C:, in place. Each engine writes a
+ * The machine's directory is drive C:, in place, or under (mutable
+ * overlay) a copy of it in the engine's own directory, its writes thrown
+ * away with the machine. Each engine writes a
  * batch of its own, HULL.BAT, into a directory of its own under the
  * user's runtime directory, which it gives the emulator as drive H:; the
  * batch runs the command by CALL, its DOS output redirected to
@@ -22,6 +24,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -105,6 +108,12 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 	m->root = real(hull_access_path(doc, source + 4));
 	free(source);
 	m->workdir = hull_access_value(doc, machine, "workdir");
+	{
+		char *mutability = hull_access_value(doc, machine, "mutable");
+
+		m->overlay = mutability != NULL && strcmp(mutability, "overlay") == 0;
+		free(mutability);
+	}
 	if (m->root == NULL || m->workdir == NULL)
 		return "the plan is missing its source or workdir, or the source is not there";
 	if (!usable(m, m->root) || !hull_dos_plain(m->workdir)) {
@@ -212,6 +221,61 @@ int hull_dos_open(const hull_machine *m, const char *name)
 	return open(path, O_RDONLY | O_CLOEXEC);
 }
 
+/* An overlay's copy, `dir`/C, removed whole: a tree this engine made by
+ * construction, so it may be cleared without naming its files, under
+ * the machine's own directory and never anything else. */
+static int remove_one(const char *path, const struct stat *st, int kind, struct FTW *at)
+{
+	(void)st;
+	(void)at;
+	return kind == FTW_DP ? rmdir(path) : unlink(path);
+}
+
+static void remove_copy(const hull_machine *m)
+{
+	char copy[4200];
+
+	if (!m->overlay || m->dir[0] != '/')
+		return;
+	snprintf(copy, sizeof copy, "%s/C", m->dir);
+	nftw(copy, remove_one, 16, FTW_DEPTH | FTW_PHYS | FTW_MOUNT);
+}
+
+/* The directory copied to `dir`/C for an overlay, owners and times kept,
+ * and C: pointed at the copy: 0, or -1. */
+static int make_copy(hull_machine *m)
+{
+	char  copy[4200];
+	char *source = m->root;
+	pid_t child;
+	int   status = 0;
+
+	snprintf(copy, sizeof copy, "%s/C", m->dir);
+	child = fork();
+	if (child == 0) {
+		char *const argv[] = { "cp", "-a", "--", source, copy, NULL };
+		char *const envp[] = { "PATH=/usr/local/bin:/usr/bin:/bin", NULL };
+		int         null = open("/dev/null", O_RDWR);
+
+		if (null >= 0) {
+			dup2(null, 0);
+			dup2(null, 1);
+			dup2(null, 2);
+		}
+		hull_access_execute(argv, envp);
+		_exit(127);
+	}
+	if (child < 0 || waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+	    WEXITSTATUS(status) != 0)
+		return -1;
+	if ((m->root = strdup(copy)) == NULL) {
+		m->root = source;
+		return -1;
+	}
+	free(source);
+	return 0;
+}
+
 static void remove_dir(hull_machine *m)
 {
 	/* The batch's own in either case, as an emulator's redirector may
@@ -223,6 +287,7 @@ static void remove_dir(hull_machine *m)
 
 	if (m->dir[0] == '\0')
 		return;
+	remove_copy(m);
 	for (unsigned i = 0u; i < sizeof files / sizeof files[0]; i++) {
 		snprintf(path, sizeof path, "%s/%s", m->dir, files[i]);
 		unlink(path);
@@ -291,8 +356,12 @@ hull_status hull_dos_create(const hull_dos_engine *engine, hull_core *core, hull
 	pthread_mutex_init(&m->lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
 	if ((reason = read_plan(m, &doc, &machine)) == NULL &&
-	    (reason = make_dir(m)) == NULL && engine->write_files(m) != 0)
-		reason = "the machine's batch cannot be written";
+	    (reason = make_dir(m)) == NULL) {
+		if (m->overlay && make_copy(m) != 0)
+			reason = "the directory cannot be copied for the overlay";
+		else if (engine->write_files(m) != 0)
+			reason = "the machine's batch cannot be written";
+	}
 	if (reason != NULL) {
 		/* The detail outlives the machine: the core reads it after. */
 		snprintf(said, sizeof said, "%s", reason);

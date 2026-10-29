@@ -3000,6 +3000,13 @@ for dosengine in dosbox dosemu; do
 	from_root 0 '^GREETING=hi' -f "$root/dosenv.conf"
 	from_root 127 "$dosnone" -f "$root/dosnone.conf"
 	from_root 125 'guest path is its drive, /d to /z' -f "$root/dosmnt.conf"
+	# (mutable overlay): C: a copy, which the command writes and the
+	# user's tree does not see.
+	dosconf doscopy '(mutable overlay) (command "COPY" "HELLO.COM" "NEW.COM")'
+	from_root 0 '[Cc]opied' -f "$root/doscopy.conf"
+	cases=$((cases + 1))
+	[ ! -e "$root/dosroot/NEW.COM" ] ||
+		fail "an overlay dos machine on $dosengine wrote the user's tree" "$(ls "$root/dosroot")"
 	if [ "$dosengine" = dosemu ]; then
 		dosconf dosown '(volumes (volume (host "./dosvol") (guest "/d"))) (command "HELLO")'
 		from_root 125 'whose own commands and shell are D: and E:' -f "$root/dosown.conf"

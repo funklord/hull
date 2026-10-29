@@ -151,8 +151,9 @@ static hull_status dosemu_create(hull_core *core, hull_buf plan, hull_machine **
 
 static const hull_cap_entry entries[] = {
 	{ "source.dir.direct",  HULL_SUP_NATIVE,   "the directory is drive C:", NULL },
-	{ "source.dir.overlay", HULL_SUP_REJECTED,
-	  "not yet: dosemu2 writes C: in place, and an overlay would be a copy of the tree", NULL },
+	{ "source.dir.overlay", HULL_SUP_EMULATED,
+	  "a copy of the tree in the machine's directory, made as it starts, its writes thrown "
+	  "away with it", NULL },
 	{ "source.ref.overlay", HULL_SUP_REJECTED,
 	  "not yet: a stored tree would be checked out to a directory first", NULL },
 	{ "projection.bind",    HULL_SUP_NATIVE,   "the directory mounted as a drive", NULL },

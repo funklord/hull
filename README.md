@@ -427,7 +427,8 @@ from a directory and scripted like any other machine.
 - `<`, `>`, `|`, `%` and quotes are refused in the command and in `env`,
   being DOS syntax on a batch's line; a command line holds 126
   characters.
-- The directory is written in place: an overlay is not yet.
+- The directory is written in place, or with `(mutable overlay)` a copy
+  of it is, thrown away after: a copy, so a large tree costs its size.
 - DOS lines end in CR LF, and the output keeps them.
 
 ## Designed, not written
