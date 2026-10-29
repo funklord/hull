@@ -166,7 +166,55 @@ typedef struct asked {
 	uint8_t            mac[6];
 	uint32_t           address;
 	uint8_t            udp_port[2];
+	int                conn;            /* the TCP connection it came on, or -1 */
+	uint64_t           conn_generation;
 } asked;
+
+/*
+ * DNS over TCP at .1 (RFC 7766): a connection a machine opened to .1's
+ * port 53, the queries on it each after its length as 16 bits, and each
+ * answer sent back the same way, on the connection it came on. Small
+ * enough for the switch to hold itself, as .1's UDP is: no window but the
+ * asker's, which a DNS answer fits, and unacknowledged bytes sent again
+ * when the asker shows it lacks them, so an impaired link still carries
+ * them. A connection idle MAX_CONN_NS goes.
+ */
+#define MAX_CONNS   64u
+#define MAX_CONN_NS 30000000000u
+#define CONN_IN     (2u + 4096u)     /* the queries not yet answered */
+#define CONN_OUT    (2u + 65535u)    /* the answers not yet acknowledged */
+#define TCP_MSS     1460u
+#define CONN_RTO_NS 200000000u       /* the first wait before sending again */
+#define CONN_TRIES  7u               /* doubling each time: about 50 s in all */
+
+#define TCP_FIN 0x01u
+#define TCP_SYN 0x02u
+#define TCP_RST 0x04u
+#define TCP_PSH 0x08u
+#define TCP_ACK 0x10u
+
+typedef struct conn {
+	int      used;
+	uint64_t generation;
+	uint64_t at;
+	char     key[512];
+	char     machine[64];
+	int      fd;
+	uint8_t  mac[6];
+	uint32_t address;        /* the asker's, host order */
+	uint16_t their_port;
+	uint32_t rcv_nxt;        /* the next byte the asker sends */
+	uint32_t out_seq;        /* the sequence of out[0] */
+	uint32_t snd_nxt;        /* the next byte .1 sends */
+	int      syn_acked;      /* the asker has acknowledged .1's SYN */
+	int      fin_sent;
+	uint64_t resend_at;      /* when what is unacknowledged goes again, or 0 */
+	unsigned backoff;
+	uint8_t  in[CONN_IN];
+	size_t   in_length;
+	uint8_t  out[CONN_OUT];
+	size_t   out_length;
+} conn;
 
 static pthread_mutex_t    lock = PTHREAD_MUTEX_INITIALIZER;
 static segment           *segments[MAX_SEGMENTS];
@@ -174,6 +222,8 @@ static int                wake[2] = { -1, -1 };
 static int                running;
 static int                upstream = -1;   /* the socket .1 asks on from, while a segment is */
 static asked              asking[MAX_ASKED];
+static conn              *conns[MAX_CONNS];
+static uint64_t           conn_generation;
 static uint64_t           asking_random;
 static unsigned           asking_next;     /* the resolver the next question goes to */
 static struct sockaddr_in resolvers_given[3];
@@ -895,6 +945,336 @@ static void send_answer(segment *s, unsigned to, const uint8_t mac[6], uint32_t 
 	}
 }
 
+static unsigned resolvers(struct sockaddr_in out[3]);
+static segment *find(const char *key);
+static void conn_arm(conn *c);
+static void ask_on(segment *s, unsigned from, const uint8_t *frame, const uint8_t *ip,
+                   size_t header, const uint8_t *query, size_t length,
+                   const struct sockaddr_in *server, int on);
+
+/* `s`'s port that `c` came on, or -1 where it has gone. */
+static int conn_port(const segment *s, const conn *c)
+{
+	for (unsigned i = 0u; i < s->port_count; i++)
+		if (s->ports[i]->fd == c->fd && strcmp(s->ports[i]->machine, c->machine) == 0)
+			return (int)i;
+	return -1;
+}
+
+/* One TCP segment from .1 to `c`'s asker: `flags`, at `seq`, with `data`. */
+static void tcp_send(segment *s, const conn *c, unsigned flags, uint32_t seq,
+                     const uint8_t *data, size_t length)
+{
+	uint8_t  reply[4u + 1514u];
+	uint8_t *out = reply + 4;
+	uint8_t *tcp = out + 34;
+	size_t   options = (flags & TCP_SYN) != 0u ? 4u : 0u;
+	size_t   segment_length = 20u + options + length;
+	uint32_t network;
+	unsigned prefix;
+	uint32_t sum;
+	int      to = conn_port(s, c);
+
+	if (to < 0 || length > TCP_MSS || !subnet_of(s, &network, &prefix))
+		return;
+	memset(reply, 0, sizeof reply);
+	memcpy(out, c->mac, 6u);
+	memcpy(out + 6, hull_mac, 6u);
+	put16(out + 12, 0x0800u);
+	out[14] = 0x45u;
+	put16(out + 16, (uint32_t)(20u + segment_length));
+	put16(out + 20, 0x4000u);
+	out[22] = 64u;
+	out[23] = 6u;
+	put32(out + 26, network + 1u);
+	put32(out + 30, c->address);
+	put16(out + 24, ~sum16(0u, out + 14, 20u) & 0xffffu);
+	put16(tcp, 53u);
+	put16(tcp + 2, c->their_port);
+	put32(tcp + 4, seq);
+	put32(tcp + 8, (flags & TCP_ACK) != 0u ? c->rcv_nxt : 0u);
+	tcp[12] = (uint8_t)((20u + options) / 4u << 4);
+	tcp[13] = (uint8_t)flags;
+	put16(tcp + 14, CONN_IN - c->in_length > 0xffffu ? 0xffffu : (uint32_t)(CONN_IN - c->in_length));
+	if (options != 0u) {
+		tcp[20] = 2u;     /* MSS */
+		tcp[21] = 4u;
+		put16(tcp + 22, TCP_MSS);
+	}
+	memcpy(tcp + 20 + options, data, length);
+	/* The pseudo-header's addresses, the IP header's own. */
+	sum = sum16(0u, out + 26, 8u);
+	sum += 6u + (uint32_t)segment_length;
+	sum = sum16(sum, tcp, segment_length);
+	put16(tcp + 16, ~sum & 0xffffu);
+	put32(reply, (uint32_t)(14u + 20u + segment_length < 60u ? 60u : 14u + 20u + segment_length));
+	cross(s, (unsigned)to, HULL_SEGMENT_IN, reply, 4u + get32(reply));
+}
+
+/* What of `c`'s answers it has not yet been sent, sent, in segments. */
+static void conn_flush(segment *s, conn *c)
+{
+	size_t sent = (size_t)(c->snd_nxt - c->out_seq);
+
+	while (sent < c->out_length) {
+		size_t piece = c->out_length - sent;
+
+		if (piece > TCP_MSS)
+			piece = TCP_MSS;
+		tcp_send(s, c, TCP_ACK | TCP_PSH, c->snd_nxt, c->out + sent, piece);
+		c->snd_nxt += (uint32_t)piece;
+		sent += piece;
+	}
+}
+
+/* Everything of `c`'s not yet acknowledged, sent again: its asker has
+ * shown that it lacks some of it. */
+static void conn_again(segment *s, conn *c)
+{
+	if (!c->syn_acked) {
+		tcp_send(s, c, TCP_SYN | TCP_ACK, c->out_seq - 1u, NULL, 0u);
+		return;
+	}
+	c->snd_nxt = c->out_seq;
+	conn_flush(s, c);
+	if (c->fin_sent)
+		tcp_send(s, c, TCP_FIN | TCP_ACK, c->snd_nxt++, NULL, 0u);
+}
+
+/* An answer for `c`, after its length, sent. Dropped where it would not
+ * fit what waits unacknowledged, as a full queue drops a frame. */
+static void conn_answer(segment *s, conn *c, const uint8_t *dns, size_t length)
+{
+	uint32_t unsent = c->snd_nxt - c->out_seq;
+
+	if (c->fin_sent || length > 0xffffu || c->out_length + 2u + length > sizeof c->out ||
+	    unsent != c->out_length)
+		return;
+	put16(c->out + c->out_length, (uint32_t)length);
+	memcpy(c->out + c->out_length + 2u, dns, length);
+	c->out_length += 2u + length;
+	conn_flush(s, c);
+	conn_arm(c);
+}
+
+static void conn_drop(int i)
+{
+	free(conns[i]);
+	conns[i] = NULL;
+}
+
+/* `c`'s resend time: none where the asker has all of .1's, and set where
+ * something is unacknowledged and none is, so that what an impaired link
+ * loses goes again whether or not the asker sends anything. */
+static void conn_arm(conn *c)
+{
+	if (c->syn_acked && c->out_length == 0u && !c->fin_sent) {
+		c->resend_at = 0u;
+		c->backoff   = 0u;
+	} else if (c->resend_at == 0u) {
+		c->resend_at = now_ns() + ((uint64_t)CONN_RTO_NS << c->backoff);
+	}
+}
+
+/* Each connection whose resend time has come sent again, or dropped
+ * after CONN_TRIES; when the next is due, UINT64_MAX for none. */
+static uint64_t conn_timers(uint64_t now)
+{
+	uint64_t first = UINT64_MAX;
+
+	for (unsigned i = 0u; i < MAX_CONNS; i++) {
+		conn    *c = conns[i];
+		segment *s;
+
+		if (c == NULL || c->resend_at == 0u)
+			continue;
+		if (c->resend_at <= now) {
+			if (c->backoff + 1u >= CONN_TRIES || (s = find(c->key)) == NULL) {
+				conn_drop((int)i);
+				continue;
+			}
+			conn_again(s, c);
+			c->backoff++;
+			c->resend_at = now + ((uint64_t)CONN_RTO_NS << c->backoff);
+		}
+		if (c->resend_at < first)
+			first = c->resend_at;
+	}
+	return first;
+}
+
+/* A TCP segment from port `from` for .1's port 53: a connection opened,
+ * fed, acknowledged or closed, and each whole query on it answered, by
+ * hull or asked on as a datagram's is. */
+static void tcp_in(segment *s, unsigned from, const uint8_t *frame, const uint8_t *ip,
+                   size_t header, size_t datagram, uint32_t network, unsigned prefix)
+{
+	const uint8_t *tcp = ip + header;
+	size_t         offset;
+	uint16_t       their_port;
+	uint32_t       seq;
+	uint32_t       ack;
+	unsigned       flags;
+	const uint8_t *data;
+	size_t         length;
+	uint64_t       now = now_ns();
+	conn          *c = NULL;
+	int            at = -1;
+
+	if (datagram < header + 20u)
+		return;
+	offset = (size_t)(tcp[12] >> 4) * 4u;
+	if (offset < 20u || datagram < header + offset)
+		return;
+	their_port = (uint16_t)get16(tcp);
+	seq = get32(tcp + 4);
+	ack = get32(tcp + 8);
+	flags = tcp[13];
+	data = tcp + offset;
+	length = datagram - header - offset;
+	for (unsigned i = 0u; i < MAX_CONNS; i++) {
+		if (conns[i] != NULL && now - conns[i]->at > MAX_CONN_NS)
+			conn_drop((int)i);
+		if (c == NULL && conns[i] != NULL && conns[i]->their_port == their_port &&
+		    conns[i]->address == get32(ip + 12) && conns[i]->fd == s->ports[from]->fd &&
+		    strcmp(conns[i]->key, s->key) == 0 &&
+		    strcmp(conns[i]->machine, s->ports[from]->machine) == 0) {
+			c = conns[i];
+			at = (int)i;
+		}
+	}
+	if ((flags & TCP_RST) != 0u) {
+		if (c != NULL)
+			conn_drop(at);
+		return;
+	}
+	if (c == NULL || ((flags & TCP_SYN) != 0u && (flags & TCP_ACK) == 0u && seq + 1u != c->rcv_nxt)) {
+		conn refused;
+
+		if (c != NULL) {
+			conn_drop(at);
+			c = NULL;
+		}
+		if ((flags & TCP_SYN) != 0u && (flags & TCP_ACK) == 0u)
+			for (unsigned i = 0u; i < MAX_CONNS && at < 0; i++)
+				if (conns[i] == NULL && (conns[i] = calloc(1u, sizeof *conns[i])) != NULL)
+					at = (int)i;
+		if (at < 0 || conns[at] == NULL) {
+			/* Not one .1 has, or no room: refused, as a host refuses. */
+			memset(&refused, 0, sizeof refused);
+			snprintf(refused.machine, sizeof refused.machine, "%s", s->ports[from]->machine);
+			refused.fd = s->ports[from]->fd;
+			memcpy(refused.mac, frame + 6, 6u);
+			refused.address = get32(ip + 12);
+			refused.their_port = their_port;
+			refused.rcv_nxt = seq + (uint32_t)length + ((flags & (TCP_SYN | TCP_FIN)) != 0u);
+			if ((flags & TCP_ACK) != 0u)
+				tcp_send(s, &refused, TCP_RST, ack, NULL, 0u);
+			else
+				tcp_send(s, &refused, TCP_RST | TCP_ACK, 0u, NULL, 0u);
+			return;
+		}
+		c = conns[at];
+		c->used = 1;
+		c->generation = ++conn_generation;
+		snprintf(c->key, sizeof c->key, "%s", s->key);
+		snprintf(c->machine, sizeof c->machine, "%s", s->ports[from]->machine);
+		c->fd = s->ports[from]->fd;
+		memcpy(c->mac, frame + 6, 6u);
+		c->address = get32(ip + 12);
+		c->their_port = their_port;
+		c->rcv_nxt = seq + 1u;
+		c->out_seq = (uint32_t)splitmix(&asking_random) + 1u;
+		c->snd_nxt = c->out_seq;
+	}
+	c->at = now;
+	if ((flags & TCP_SYN) != 0u) {
+		/* Its SYN, first or again: .1's SYN back, with its MSS. */
+		tcp_send(s, c, TCP_SYN | TCP_ACK, c->out_seq - 1u, NULL, 0u);
+		conn_arm(c);
+		return;
+	}
+	if ((flags & TCP_ACK) == 0u)
+		return;
+	/* What it has of .1's: the SYN, then answers, then the FIN. */
+	if (!c->syn_acked && ack == c->out_seq) {
+		c->syn_acked = 1;
+		c->resend_at = 0u;
+		c->backoff   = 0u;
+	}
+	if (c->syn_acked) {
+		uint32_t through = ack - c->out_seq;
+
+		if (through <= c->out_length) {
+			memmove(c->out, c->out + through, c->out_length - through);
+			c->out_length -= through;
+			c->out_seq = ack;
+			if (through != 0u) {
+				/* Progress: the wait starts again from its first. */
+				c->resend_at = 0u;
+				c->backoff   = 0u;
+			}
+		} else if (c->fin_sent && through == c->out_length + 1u) {
+			conn_drop(at);     /* .1's FIN acknowledged: closed */
+			return;
+		}
+	}
+	if (seq != c->rcv_nxt) {
+		/* Something it sent before, again: what .1 has, said again, and
+		 * what it has sent and the asker may lack, sent again. */
+		tcp_send(s, c, TCP_ACK, c->snd_nxt, NULL, 0u);
+		conn_again(s, c);
+		conn_arm(c);
+		return;
+	}
+	if (length != 0u) {
+		if (c->in_length + length > sizeof c->in) {
+			tcp_send(s, c, TCP_RST | TCP_ACK, c->snd_nxt, NULL, 0u);
+			conn_drop(at);
+			return;
+		}
+		memcpy(c->in + c->in_length, data, length);
+		c->in_length += length;
+		c->rcv_nxt += (uint32_t)length;
+	}
+	if ((flags & TCP_FIN) != 0u)
+		c->rcv_nxt++;
+	/* Each whole query, answered or asked on. */
+	while (c->in_length >= 2u && c->in_length >= 2u + get16(c->in)) {
+		size_t             query = get16(c->in);
+		uint8_t            dns_out[MAX_DNS];
+		size_t             question = 0u;
+		size_t             dns;
+		struct sockaddr_in servers[3];
+		unsigned           count = 0u;
+
+		if (s->ports[from]->forwards && (count = resolvers(servers)) != 0u && upstream < 0) {
+			upstream = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+			if (upstream < 0)
+				count = 0u;
+			else
+				(void)!write(wake[1], "", 1u);
+		}
+		dns = dns_answer(s, network, prefix, c->in + 2u, query, count != 0u, dns_out,
+		                 sizeof dns_out, &question);
+		if (dns == ASK_ON && query <= MAX_DNS)
+			ask_on(s, from, frame, ip, header, c->in + 2u, query,
+			       &servers[asking_next++ % count], at);
+		else if (dns != 0u && dns != ASK_ON)
+			conn_answer(s, c, dns_out, dns);
+		memmove(c->in, c->in + 2u + query, c->in_length - 2u - query);
+		c->in_length -= 2u + query;
+	}
+	if ((flags & TCP_FIN) != 0u && !c->fin_sent) {
+		/* Its end: .1's answers go first, then its own FIN. */
+		c->fin_sent = 1;
+		tcp_send(s, c, TCP_FIN | TCP_ACK, c->snd_nxt++, NULL, 0u);
+	} else if (length != 0u || (flags & TCP_FIN) != 0u) {
+		tcp_send(s, c, TCP_ACK, c->snd_nxt, NULL, 0u);
+	}
+	conn_arm(c);
+}
+
 /* The host's resolvers, IPv4, at most three: those a test gave, else
  * /etc/resolv.conf's, read each time, since the host's can change under
  * a long-lived core -- its loopback ones too, the core being the host's. */
@@ -931,7 +1311,7 @@ static unsigned resolvers(struct sockaddr_in out[3])
  * drops a frame, and its asker asks again. */
 static void ask_on(segment *s, unsigned from, const uint8_t *frame, const uint8_t *ip,
                    size_t header, const uint8_t *query, size_t length,
-                   const struct sockaddr_in *server)
+                   const struct sockaddr_in *server, int on)
 {
 	uint64_t now = now_ns();
 	asked   *a = NULL;
@@ -974,9 +1354,9 @@ static void ask_on(segment *s, unsigned from, const uint8_t *frame, const uint8_
 	memcpy(a->mac, frame + 6, 6u);
 	a->address  = get32(ip + 12);
 	memcpy(a->udp_port, ip + header, 2u);
+	a->conn     = on;
+	a->conn_generation = on >= 0 ? conns[on]->generation : 0u;
 }
-
-static segment *find(const char *key);
 
 /* What the host's resolvers answered, each sent back to the machine that
  * asked, under its own id, where its port is still there, in fragments
@@ -1014,6 +1394,12 @@ static void answered(void)
 			continue;
 		length = (size_t)n;
 		put16(reply, a->their_id);
+		if (a->conn >= 0) {
+			if (conns[a->conn] != NULL && conns[a->conn]->used &&
+			    conns[a->conn]->generation == a->conn_generation)
+				conn_answer(s, conns[a->conn], reply, length);
+			continue;
+		}
 		for (unsigned i = 0u; i < s->port_count; i++) {
 			if (s->ports[i]->fd == a->fd && strcmp(s->ports[i]->machine, a->machine) == 0) {
 				send_answer(s, i, a->mac, network + 1u, a->address, a->udp_port, reply,
@@ -1074,6 +1460,12 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 			return 1;
 		header = (size_t)(ip[0] & 0x0fu) * 4u;
 		datagram = get16(ip + 2);
+		if (header >= 20u && datagram >= header + 20u && 14u + datagram <= size &&
+		    ip[9] == 6u && (get16(ip + 6) & 0x3fffu) == 0u && get32(ip + 16) == self &&
+		    get16(ip + header + 2) == 53u) {
+			tcp_in(s, from, frame, ip, header, datagram, network, prefix);
+			return 1;
+		}
 		if (header < 20u || datagram < header + 8u || 14u + datagram > size || ip[9] != 17u ||
 		    (get16(ip + 6) & 0x3fffu) != 0u || get32(ip + 16) != self ||
 		    get16(ip + header + 2) != 53u)
@@ -1092,7 +1484,7 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 		                 count != 0u, dns_out, sizeof dns_out, &question);
 		if (dns == ASK_ON)
 			ask_on(s, from, frame, ip, header, ip + header + 8u, datagram - header - 8u,
-			       &servers[asking_next++ % count]);
+			       &servers[asking_next++ % count], -1);
 		else if (dns != 0u)
 			send_answer(s, from, frame + 6, self, get32(ip + 12), ip + header, dns_out, dns);
 		return 1;
@@ -1294,6 +1686,12 @@ static void *serve(void *arg)
 				first = due;
 		}
 		{
+			uint64_t due = conn_timers(now);
+
+			if (due < first)
+				first = due;
+		}
+		{
 			int left = 0;
 
 			for (unsigned k = 0u; k < MAX_SEGMENTS; k++) {
@@ -1311,6 +1709,9 @@ static void *serve(void *arg)
 				upstream = -1;
 				memset(asking, 0, sizeof asking);
 			}
+			for (unsigned i = 0u; !left && i < MAX_CONNS; i++)
+				if (conns[i] != NULL)
+					conn_drop((int)i);
 		}
 		pthread_mutex_unlock(&lock);
 	}

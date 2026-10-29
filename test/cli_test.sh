@@ -1424,6 +1424,19 @@ from_root 0 '^first +\| dns=later\.hull 10\.84\.0\.[0-9]+$' -f "$root/dnsfirst.c
 cases=$((cases + 1))
 printf '%s\n' "$out" | grep -q '^first *| dns=later 10\.84\.0\.[0-9]*$' ||
 	fail "hull at .1 did not name a sibling not yet on the segment" "$out"
+# DNS over TCP at .1, through the machine's own kernel, on a link that
+# loses three frames in ten each way: .1 sends again what the asker shows
+# it lacks, so each answer still comes, the sibling's and NXDOMAIN.
+printf '(machines (tcpasker %s) (tcpsib %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (tcpdns-$$ (subnet \"10.86.0.0/24\"))) (impair (tcpdns-$$ (out (loss 0.3)) (in (loss 0.3)))) (command \"/probe\" \"dnstcp\" \"tcpsib\" \"dnstcp\" \"tcpsib.hull\" \"dnstcp\" \"nobody\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (tcpdns-$$ (subnet \"10.86.0.0/24\"))) (command \"/probe\" \"sleep\" \"1\")" \
+	> "$root/dnstcp.conf"
+limit=90
+from_root 0 '^tcpasker +\| dnstcp=nobody rcode 3$' -f "$root/dnstcp.conf"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^tcpasker *| dnstcp=tcpsib 10\.86\.0\.[0-9]*$' &&
+	printf '%s\n' "$out" | grep -q '^tcpasker *| dnstcp=tcpsib\.hull 10\.86\.0\.[0-9]*$' ||
+	fail "hull at .1 did not answer over TCP on a lossy link" "$out"
 # A segment of 40 machines, past the 32 a segment took before, each
 # up at its own address and all on the switch at once, each staying a
 # while: a network of a /24's size, not a handful.

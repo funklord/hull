@@ -430,8 +430,45 @@ static int nameserver(char out[16])
 /* Ask resolv.conf's nameserver for `name`'s A (`type` 1) or PTR (12),
  * three tries two seconds apart, as a stub resolver does; print the
  * answer's address or name, or its rcode. */
+/* One answer to `query` from `to` over TCP, each after its length as 16
+ * bits (RFC 7766): its length, or -1. */
+static ssize_t ask_tcp(const struct sockaddr_in *to, const uint8_t *query, size_t n,
+                       uint8_t *answer, size_t cap)
+{
+	int           fd = socket(AF_INET, SOCK_STREAM, 0);
+	uint8_t       framed[2 + 300];
+	uint8_t       length[2];
+	size_t        want;
+	size_t        got = 0u;
+	struct pollfd p;
+
+	framed[0] = (uint8_t)(n >> 8);
+	framed[1] = (uint8_t)n;
+	memcpy(framed + 2, query, n);
+	p.fd     = fd;
+	p.events = POLLIN;
+	if (fd < 0 || connect(fd, (const struct sockaddr *)to, sizeof *to) != 0 ||
+	    write(fd, framed, n + 2u) != (ssize_t)(n + 2u) || poll(&p, 1u, 15000) != 1 ||
+	    read(fd, length, 2u) != 2) {
+		if (fd >= 0)
+			close(fd);
+		return -1;
+	}
+	want = (size_t)(length[0] << 8 | length[1]);
+	while (got < want && got < cap && poll(&p, 1u, 15000) == 1) {
+		ssize_t r = read(fd, answer + got, (want < cap ? want : cap) - got);
+
+		if (r <= 0)
+			break;
+		got += (size_t)r;
+	}
+	close(fd);
+	return got == want ? (ssize_t)got : -1;
+}
+
 static void ask_dns(const char *step, const char *shown, const char *name, unsigned type)
 {
+	int                tcp = strcmp(step, "dnstcp") == 0;
 	int                fd = socket(AF_INET, SOCK_DGRAM, 0);
 	struct sockaddr_in to;
 	struct pollfd      p;
@@ -467,9 +504,13 @@ static void ask_dns(const char *step, const char *shown, const char *name, unsig
 	inet_pton(AF_INET, server, &to.sin_addr);
 	p.fd     = fd;
 	p.events = POLLIN;
-	for (int tries = 0; tries < 3 && got < 0; tries++) {
-		if (sendto(fd, query, n, 0, (struct sockaddr *)&to, sizeof to) == (ssize_t)n &&
-		    poll(&p, 1u, 2000) == 1)
+	/* Over TCP one connection, as a resolver keeps one: what it loses is
+	 * the connection's to send again, not a fresh one's to hide. */
+	for (int tries = 0; tries < (tcp ? 1 : 3) && got < 0; tries++) {
+		if (tcp)
+			got = ask_tcp(&to, query, n, answer, sizeof answer);
+		else if (sendto(fd, query, n, 0, (struct sockaddr *)&to, sizeof to) == (ssize_t)n &&
+		         poll(&p, 1u, 2000) == 1)
 			got = recv(fd, answer, sizeof answer, 0);
 	}
 	close(fd);
@@ -1160,8 +1201,8 @@ int main(int argc, char **argv)
 		} else if (strcmp(step, "dial") == 0 && i + 2 < argc) {
 			dial(arg, argv[i + 2]);
 			i += 2;
-		} else if (strcmp(step, "dns") == 0) {
-			ask_dns("dns", arg, arg, 1u);
+		} else if (strcmp(step, "dns") == 0 || strcmp(step, "dnstcp") == 0) {
+			ask_dns(step, arg, arg, 1u);
 			i++;
 		} else if (strcmp(step, "ptr") == 0) {
 			unsigned a, b, c, d;

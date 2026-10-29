@@ -312,6 +312,109 @@ static int dns_reply(int fd, uint8_t me, uint8_t *data, size_t *data_length)
 	return f[45] & 0x0f;
 }
 
+/* A TCP segment from MAC and address ...`me`, port 4100, to .1's 53:
+ * `flags`, `seq`, `ack`, and `data`. */
+static void send_tcp(int fd, uint8_t me, unsigned flags, uint32_t seq, uint32_t ack,
+                     const uint8_t *data, size_t length)
+{
+	uint8_t  f[1514] = { 0 };
+	uint8_t  pseudo[12];
+	uint32_t sum;
+
+	memcpy(f, hull_mac, 6u);
+	f[6] = 0x52;
+	f[7] = 0x54;
+	f[11] = me;
+	put16(f + 12, 0x0800u);
+	f[14] = 0x45;
+	put16(f + 16, (unsigned)(40u + length));
+	f[22] = 64u;
+	f[23] = 6u;
+	f[26] = 10;
+	f[27] = 55;
+	f[29] = me;
+	f[30] = 10;
+	f[31] = 55;
+	f[33] = 1;
+	put16(f + 24, ~sum16(0u, f + 14, 20u) & 0xffffu);
+	put16(f + 34, 4100u);
+	put16(f + 36, 53u);
+	put16(f + 38, seq >> 16);
+	put16(f + 40, seq & 0xffffu);
+	put16(f + 42, ack >> 16);
+	put16(f + 44, ack & 0xffffu);
+	f[46] = 5u << 4;
+	f[47] = (uint8_t)flags;
+	put16(f + 48, 65535u);
+	memcpy(f + 54, data, length);
+	memcpy(pseudo, f + 26, 8u);
+	pseudo[8] = 0u;
+	pseudo[9] = 6u;
+	put16(pseudo + 10, (unsigned)(20u + length));
+	sum = sum16(0u, pseudo, 12u);
+	put16(f + 50, ~sum16(sum, f + 34, 20u + length) & 0xffffu);
+	send_raw(fd, f, 54u + length < 60u ? 60u : 54u + length);
+}
+
+/* The next TCP segment .1 sends `fd` within `ms`: its flags, or -1 where
+ * none came or its sums or ports are wrong; its sequence, acknowledgment
+ * and data into the rest. */
+static int next_tcp(int fd, uint8_t me, uint32_t *seq, uint32_t *ack, uint8_t *data,
+                    size_t *length, int ms)
+{
+	uint8_t  f[1514];
+	uint8_t  pseudo[12];
+	size_t   got = next_raw(fd, f, sizeof f, ms);
+	size_t   segment;
+	size_t   offset;
+	uint32_t sum;
+
+	if (got < 54u || f[0] != 0x52 || f[5] != me || memcmp(f + 6, hull_mac, 6u) != 0 ||
+	    get16(f + 12) != 0x0800u || f[23] != 6u || f[33] != me ||
+	    sum16(0u, f + 14, 20u) != 0xffffu || get16(f + 34) != 53u || get16(f + 36) != 4100u)
+		return -1;
+	segment = get16(f + 16) - 20u;
+	memcpy(pseudo, f + 26, 8u);
+	pseudo[8] = 0u;
+	pseudo[9] = 6u;
+	put16(pseudo + 10, (unsigned)segment);
+	sum = sum16(0u, pseudo, 12u);
+	if (sum16(sum, f + 34, segment) != 0xffffu)
+		return -1;
+	offset = (size_t)(f[46] >> 4) * 4u;
+	*seq = (uint32_t)get16(f + 38) << 16 | get16(f + 40);
+	*ack = (uint32_t)get16(f + 42) << 16 | get16(f + 44);
+	*length = segment - offset;
+	memcpy(data, f + 34 + offset, *length);
+	return f[47];
+}
+
+/* A DNS question for `name`, type A, as TCP carries it: after its length. */
+static size_t tcp_query(uint8_t *out, const char *name)
+{
+	size_t at = 2u + 12u;
+
+	memset(out, 0, 14u);
+	out[2] = 0x56;
+	out[3] = 0x78;
+	out[4] = 0x01;
+	out[7] = 1u;
+	for (const char *label = name; *label != '\0';) {
+		size_t length = strcspn(label, ".");
+
+		out[at++] = (uint8_t)length;
+		memcpy(out + at, label, length);
+		at += length;
+		label += length + (label[length] == '.');
+	}
+	out[at++] = 0u;
+	put16(out + at, 1u);
+	put16(out + at + 2u, 1u);
+	at += 4u;
+	put16(out, (unsigned)(at - 2u));
+	return at;
+}
+
 /* This process's open descriptors, which are the switch's too. */
 static int descriptors(void)
 {
@@ -1103,6 +1206,85 @@ int main(void)
 			after = descriptors();
 		}
 		check("the socket asked on from, gone with the segment", before > 0 && after == before);
+	}
+	{
+		/* DNS over TCP at .1: a connection opened by SYN and SYN-ACK, a
+		 * query after its length answered after its length, the query
+		 * sent again answered again, an end by FIN each way, a segment
+		 * for no connection refused by RST, and a name outside asked on
+		 * as a datagram's is, its answer back over TCP. */
+		char     why[256] = "";
+		unsigned resolver_port = 0u;
+		int      resolver = resolver_of(&resolver_port);
+		const char *server = "127.0.0.1";
+		int      web = hull_segment_port_addressed("dnst", "web", 0x0a37000au, 24u, 1, why,
+		                                           sizeof why);
+		int      db = hull_segment_port_addressed("dnst", "db", 0x0a370014u, 24u, 0, why,
+		                                          sizeof why);
+		uint8_t  data[1514];
+		uint8_t  query[300];
+		uint8_t  q[600];
+		struct sockaddr_in from;
+		size_t   length = 0u;
+		size_t   n;
+		size_t   first;
+		size_t   got;
+		uint32_t seq = 0u;
+		uint32_t ack = 0u;
+		uint32_t theirs;
+		int      flags;
+
+		hull_segment_resolvers(&server, &resolver_port, 1u);
+		send_tcp(web, 10u, 0x02u, 1000u, 0u, NULL, 0u);
+		flags = next_tcp(web, 10u, &seq, &ack, data, &length, 1000);
+		check("a SYN to .1:53, answered SYN-ACK", flags == 0x12 && ack == 1001u);
+		theirs = seq + 1u;
+		n = tcp_query(query, "db");
+		send_tcp(web, 10u, 0x18u, 1001u, theirs, query, n);
+		do
+			flags = next_tcp(web, 10u, &seq, &ack, data, &length, 1000);
+		while (flags >= 0 && length == 0u);
+		check("a query on it, answered after its length",
+		      flags >= 0 && seq == theirs && ack == 1001u + n && length == 2u + get16(data) &&
+		      get16(data + 2) == 0x5678u && (data[4] & 0x80u) != 0u && get16(data + 8) == 1u &&
+		      data[length - 1u] == 20u);
+		send_tcp(web, 10u, 0x18u, 1001u, theirs, query, n);
+		do
+			flags = next_tcp(web, 10u, &seq, &ack, data, &length, 1000);
+		while (flags >= 0 && length == 0u);
+		check("the query sent again, as on a lossy link: its answer sent again",
+		      flags >= 0 && seq == theirs && length == 2u + get16(data));
+		theirs += (uint32_t)length;
+		first = n;
+		n = tcp_query(query, "example.com");
+		send_tcp(web, 10u, 0x18u, 1001u + (uint32_t)first, theirs, query, n);
+		got = asked_of(resolver, q, sizeof q, &from, 1000);
+		check("a name outside, asked on from TCP", got != 0u);
+		if (got != 0u)
+			answer_from(resolver, q, got, &from, 0u);
+		do
+			flags = next_tcp(web, 10u, &seq, &ack, data, &length, 1000);
+		while (flags >= 0 && length == 0u);
+		check("its answer, back over TCP under the machine's id",
+		      flags >= 0 && seq == theirs && get16(data + 2) == 0x5678u &&
+		      data[length - 4u] == 192u && data[length - 1u] == 7u);
+		theirs += (uint32_t)length;
+		send_tcp(web, 10u, 0x11u, 1001u + (uint32_t)(first + n), theirs, NULL, 0u);
+		flags = next_tcp(web, 10u, &seq, &ack, data, &length, 1000);
+		check("its FIN, answered by .1's", flags == 0x11 && seq == theirs &&
+		                                    ack == 1002u + (uint32_t)(first + n));
+		send_tcp(web, 10u, 0x10u, 1002u + (uint32_t)(first + n), theirs + 1u, NULL, 0u);
+		send_tcp(web, 10u, 0x10u, 5000u, 77u, NULL, 0u);
+		flags = next_tcp(web, 10u, &seq, &ack, data, &length, 1000);
+		check("a segment for no connection, refused by RST", flags == 0x04 && seq == 77u);
+		send_tcp(db, 20u, 0x02u, 1000u, 0u, NULL, 0u);
+		check("hull's own names on TCP for a machine of (network none) too",
+		      next_tcp(db, 20u, &seq, &ack, data, &length, 1000) == 0x12);
+		hull_segment_resolvers(NULL, NULL, 0u);
+		close(web);
+		close(db);
+		if (resolver >= 0)
+			close(resolver);
 	}
 	{
 		/* A capture: x's way out, what it sent before its link's loss, and
