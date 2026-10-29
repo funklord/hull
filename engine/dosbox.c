@@ -52,6 +52,11 @@ static int write_files(const hull_machine *m)
 	if (text == NULL)
 		return -1;
 	ADD("@echo off\r\n");
+	/* DOSBox's mount sets no ERRORLEVEL, so each drive is asked after. */
+	for (unsigned i = 0u; i < m->volume_count; i++)
+		ADD("if not exist %c:\\NUL goto m%c\r\n", m->volume_drive[i], m->volume_drive[i]);
+	for (unsigned i = 0u; i < m->media_count; i++)
+		ADD("if not exist %c:\\NUL goto m%c\r\n", m->media_drive[i], m->media_drive[i]);
 	for (unsigned i = 0u; i < HULL_DOS_MAX_ENV && m->envp[i] != NULL; i++)
 		ADD("set %s\r\n", m->envp[i]);
 	ADD("C:\r\ncd \\");
@@ -67,6 +72,12 @@ static int write_files(const hull_machine *m)
 	ADD("echo S0>H:\\STATUS.TXT\r\ngoto end\r\n");
 	for (unsigned n = 255u; n > 0u; n--)
 		ADD(":s%u\r\necho S%u>H:\\STATUS.TXT\r\ngoto end\r\n", n, n);
+	for (unsigned i = 0u; i < m->volume_count; i++)
+		ADD(":m%c\r\necho M%c>H:\\STATUS.TXT\r\ngoto end\r\n", m->volume_drive[i],
+		    m->volume_drive[i]);
+	for (unsigned i = 0u; i < m->media_count; i++)
+		ADD(":m%c\r\necho M%c>H:\\STATUS.TXT\r\ngoto end\r\n", m->media_drive[i],
+		    m->media_drive[i]);
 	ADD(":end\r\nexit\r\n");
 	snprintf(path, sizeof path, "%s/HULL.BAT", m->dir);
 	ok = write_file(path, text) == 0;
@@ -106,23 +117,11 @@ static void exec_child(const hull_machine *m)
 	}
 }
 
-/* STATUS.TXT's `Sn`, the batch's word; -1 where it left none. */
+/* The batch's word in STATUS.TXT; DOSBox's own exit says nothing of it. */
 static int end_code(const hull_machine *m, int wstatus)
 {
-	char  said[16];
-	FILE *file = NULL;
-	int   fd = hull_dos_open(m, "STATUS.TXT");
-	int   code = -1;
-
 	(void)wstatus;
-	if (fd >= 0 && (file = fdopen(fd, "r")) == NULL)
-		close(fd);
-	if (file != NULL) {
-		if (fgets(said, sizeof said, file) != NULL && said[0] == 'S')
-			code = atoi(said + 1);
-		fclose(file);
-	}
-	return code;
+	return hull_dos_said(m);
 }
 
 static const hull_dos_engine flavour = {

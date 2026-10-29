@@ -417,6 +417,8 @@ from a directory and scripted like any other machine.
 - What a program writes through DOS is the machine's output, and its
   exit code is `hull run`'s status; a command DOS cannot find ends 127.
 - A volume is a drive: `(guest "/g")` is `G:`. `env` entries are `SET`.
+  A drive the emulator will not mount ends the run 125, naming it,
+  before the command runs.
 - A `(medium (type cdrom) …)` is a CD-ROM drive MSCDEX knows, at the
   first drive from `D:` nothing else holds, so an installer that looks
   for its disc finds it.

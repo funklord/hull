@@ -2967,6 +2967,7 @@ printf '\264\011\272\014\001\315\041\270\000\114\315\041hello from dos\r\n$' > "
 printf '\270\003\114\315\041' > "$root/dosroot/EXIT3.COM"
 printf '\353\376' > "$root/dosroot/LOOP.COM"
 printf 'from a volume\r\n' > "$root/dosvol/IN.TXT"
+printf 'not a directory\n' > "$root/dosfile"
 # CDCHK asks MSCDEX for the CD-ROM drives (INT 2Fh, AX 1500h) and prints
 # the first one's letter, or ends 1 where there is none: what a game's
 # installer asks before it looks for its disc. The disc is a collection,
@@ -3011,6 +3012,11 @@ for dosengine in dosbox dosemu; do
 	from_root 0 '^GREETING=hi' -f "$root/dosenv.conf"
 	from_root 127 "$dosnone" -f "$root/dosnone.conf"
 	from_root 125 'guest path is its drive, /d to /z' -f "$root/dosmnt.conf"
+	# A drive the emulator would not mount -- a volume that is a file --
+	# ends 125 with the drive named, where the command used to run
+	# without it.
+	dosconf dosfilevol '(volumes (volume (host "./dosfile") (guest "/g"))) (command "HELLO")'
+	from_root 125 "^$dosengine did not mount drive G:" -f "$root/dosfilevol.conf"
 	# (mutable overlay): C: a copy, which the command writes and the
 	# user's tree does not see.
 	dosconf doscopy '(mutable overlay) (command "COPY" "HELLO.COM" "NEW.COM")'

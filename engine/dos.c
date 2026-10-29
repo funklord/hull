@@ -285,6 +285,36 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 	return read_media(m, doc, machine);
 }
 
+int hull_dos_said(const hull_machine *m)
+{
+	char  said[16];
+	FILE *file = NULL;
+	int   fd = hull_dos_open(m, "STATUS.TXT");
+	int   code = -1;
+
+	if (fd >= 0 && (file = fdopen(fd, "r")) == NULL)
+		close(fd);
+	if (file == NULL)
+		return -1;
+	if (fgets(said, sizeof said, file) != NULL) {
+		if (said[0] == 'S' && said[1] >= '0' && said[1] <= '9') {
+			code = atoi(said + 1);
+		} else if (said[0] == 'M' && said[1] >= 'A' && said[1] <= 'Z') {
+			char message[160];
+			int  n = snprintf(message, sizeof message, "%s did not mount drive %c:, so the "
+			                  "command was not run\n", m->engine->name, said[1]);
+
+			/* On the machine's stderr, where the run sees it, and in the log. */
+			hull_dos_host->on_data(m->core, NULL, 2, (const uint8_t *)message, (size_t)n);
+			message[n - 1] = '\0';
+			hull_dos_host->log(m->core, 3, message);
+			code = 125;
+		}
+	}
+	fclose(file);
+	return code;
+}
+
 int hull_dos_open(const hull_machine *m, const char *name)
 {
 	char path[4200];

@@ -76,6 +76,10 @@ struct hull_dos_engine {
  * a redirector may have made it on the host: an fd, or -1. */
 int hull_dos_open(const hull_machine *m, const char *name);
 
+/* STATUS.TXT's word: `Sn` the command's ERRORLEVEL n; `Md`, drive d not
+ * mounted, logged and 125. -1 where the batch left none. */
+int hull_dos_said(const hull_machine *m);
+
 /* `text` holds nothing a batch line would read as syntax. */
 int hull_dos_plain(const char *text);
 
