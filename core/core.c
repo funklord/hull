@@ -3228,6 +3228,26 @@ int hull_core_run(const char *host_arch)
 	const char        *reason = NULL;
 	int                lock;
 	int                listener;
+	int                logged = 0;
+
+	/* A started core's log, named by the frontend that started it, which
+	 * leaves its own output at /dev/null: appended to until this core
+	 * holds the lock, so that a core that gives way, or one that fails
+	 * before it, adds its line after the live core's rather than erasing
+	 * them, as truncating it on opening once did. */
+	{
+		const char *log_path = getenv("HULL_CORE_LOG");
+		int         log = log_path != NULL ?
+		                  open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600) : -1;
+
+		if (log >= 0) {
+			dup2(log, 1);
+			dup2(log, 2);
+			close(log);
+			logged = 1;
+		}
+		unsetenv("HULL_CORE_LOG");
+	}
 
 	if (runtime == NULL || runtime[0] != '/') {
 		fprintf(stderr, "hull core: XDG_RUNTIME_DIR is not set\n");
@@ -3258,8 +3278,16 @@ int hull_core_run(const char *host_arch)
 		}
 		nanosleep(&pause, NULL);
 	}
-	if (lock < 0)
+	if (lock < 0) {
+		fprintf(stderr, "hull core %ld: another core holds the lock; giving way\n",
+		        (long)getpid());
 		return 0;  /* another core has it, which is what was wanted */
+	}
+	/* The log is this core's from here: what one before it said is gone. */
+	if (logged && ftruncate(2, 0) != 0) {
+		/* Appended to, then, which loses nothing. */
+	}
+	fprintf(stderr, "hull core %ld: started\n", (long)getpid());
 	if (ftruncate(lock, 0) == 0) {
 		char pid[24];
 		int  n = snprintf(pid, sizeof pid, "%ld\n", (long)getpid());
@@ -3426,6 +3454,7 @@ int hull_core_run(const char *host_arch)
 		flush_all();
 	}
 
+	fprintf(stderr, "hull core %ld: going\n", (long)getpid());
 	/* Going. A frontend that comes now must not reach a core that will
 	 * never answer it, so this one stops listening at once; one that
 	 * comes starts a core of its own, which waits for the lock. */

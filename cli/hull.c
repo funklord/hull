@@ -866,8 +866,10 @@ static int dial_core(void)
 }
 
 /* Start a core, as `hull core`, in a session of its own and reparented at
- * once, so it is never this process's zombie; its output goes to
- * core.log, truncated, beside the socket. */
+ * once, so it is never this process's zombie. Its output goes to core.log
+ * beside the socket, which the core opens, truncated, once it holds the
+ * lock: opened here, a core that then gave way truncated the live core's
+ * log, and what that core had said was gone. */
 static void start_core(void)
 {
 	char  dir[4096];
@@ -880,15 +882,14 @@ static void start_core(void)
 	child = fork();
 	if (child == 0) {
 		if (fork() == 0) {
-			int null = open("/dev/null", O_RDONLY);
-			int out  = open(log, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+			int null = open("/dev/null", O_RDWR);
 
+			setenv("HULL_CORE_LOG", log, 1);
 			setsid();
-			if (null >= 0)
+			if (null >= 0) {
 				dup2(null, 0);
-			if (out >= 0) {
-				dup2(out, 1);
-				dup2(out, 2);
+				dup2(null, 1);
+				dup2(null, 2);
 			}
 			execl("/proc/self/exe", "hull", "core", (char *)NULL);
 			_exit(127);
