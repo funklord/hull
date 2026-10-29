@@ -26,6 +26,12 @@ mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 mkdir -p "$dir/data"
 root=$(cd "$dir" && pwd)
+# And a store of its own, which `hull gc` collects: without it the suite
+# collected the user's real store, every other session's and project's,
+# and spent its 19 seconds there while the machine gc was to find in use
+# ended its 20-second wait.
+XDG_DATA_HOME=$root/data
+export XDG_DATA_HOME
 cases=0
 failures=0
 
