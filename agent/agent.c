@@ -1052,12 +1052,14 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	 * writes are fast and held in its own memory, for (mutable overlay)
 	 * whatever the share is: a directory in place, or the merged tree of a
 	 * host-side overlay where qemu runs (layers, or owners chowned there,
-	 * section 4.11), which the guest takes as a read-only lower. The one
-	 * exception is a kept (upper PATH): its writes must reach the host's
-	 * disk, so there the share is the guest's writable root and the writes
-	 * cross to the host-side overlay's kept upper, not a guest tmpfs. */
+	 * section 4.11), which the guest takes as a read-only lower. The
+	 * exceptions are a kept (upper PATH) and an (export PATH): their writes
+	 * must reach the host-side overlay, to be kept on the host's disk or
+	 * taken as the export's tar, so there the share is the guest's writable
+	 * root and the writes cross to it, not to a guest tmpfs. */
 	layered    = mutability != NULL && strcmp(mutability, "overlay") == 0 &&
-	             !hull_access_find(doc, machine, "upper", &entry);
+	             !hull_access_find(doc, machine, "upper", &entry) &&
+	             !hull_access_find(doc, machine, "export", &entry);
 	free(mutability);
 
 	/* A read-only root has nothing for an overlay to hold, so it is the

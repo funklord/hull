@@ -843,6 +843,35 @@ name=vownedno
 boot vownedno
 has 125 "owners are given in the overlay.s tmpfs"
 rm -rf "${root:?}/vowntmpl"
+# (export PATH) on a vm, by a build whose steps run on one: each step an
+# overlay qemu mounts host-side, the guest writing through to it, its tree
+# taken there as a tar once the step ends -- so an owner a step gives is
+# kept in the manifest, as on chroot, and given back to the next step on
+# a vm, with no file of it on the user's disk. Where the host gives the
+# user no range there is none to keep, as for owners above.
+rm -rf "${root:?}/vbase"
+mkdir -p "$root/vbase/bin" "$root/vbase/proc" "$root/vbase/dev" "$root/vbase/sys" \
+	"$root/vbase/tmp"
+cp "$probe" "$root/vbase/bin/sh"
+cat > "$root/vbuilt.conf" <<'BUILD'
+(build (base "dir:./vbase")
+  (steps (step (name "give") (backend vm) (run "probe write /given chown /given 101"))
+         (step (name "look") (backend vm) (run "probe owner /given"))))
+BUILD
+if [ "$vowned_owner" = '^owner=101:102 0[0-7]{3}$' ]; then
+	cases=$((cases + 1))
+	out=$(cd "$root" && timeout 300 "$hull" build -f vbuilt.conf app/vbuilt 2>&1)
+	got=$?
+	[ "$got" = 0 ] && printf '%s\n' "$out" | grep -q '^owner=101:101 ' ||
+		fail "a vm step's owner was not kept for the next" "$out"
+	cases=$((cases + 1))
+	out=$(timeout 30 "$hull" manifest show app/vbuilt 2>&1)
+	printf '%s\n' "$out" | grep -q '(owner (gid 101) (uid 101)) (path "given")' ||
+		fail "a vm step's owner is not in the manifest" "$out"
+else
+	printf 'qemu: this user has no subordinate range, so the vm export case is skipped\n'
+fi
+rm -rf "${root:?}/vbase"
 # A volume that is a stack of its own, at /stk, staged host-side as the
 # root's is and shared: the layer wins, writes and a whiteout in its upper
 # alone; with no upper its writes are memory; read-only, it is written to

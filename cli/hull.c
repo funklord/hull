@@ -2561,7 +2561,7 @@ next_pass:
 		char              backend[64] = "";
 		char              owners_path[4600];
 		char              tar_path[4600];
-		int               chrooted;
+		int               exported;
 		static char       drops[64][4096];
 		const char       *drop[66];
 		unsigned          dropping = 0u;
@@ -2581,9 +2581,12 @@ next_pass:
 		has_run = record_text(&spec, &step, "run", run_line, sizeof run_line);
 		record_text(&spec, &step, "backend", backend, sizeof backend);
 		/* Exported only where a machine runs: a step of copies alone gives
-		 * no owner, and its tree is the directory as it stands. */
-		chrooted = has_run && (backend[0] == '\0' || strcmp(backend, "ns") == 0 ||
-		                       strcmp(backend, "chroot") == 0);
+		 * no owner, and its tree is the directory as it stands. A step on
+		 * chroot or on qemu, vm or emu, is an overlay whose tree is taken
+		 * as a tar, owners and all; on docker it writes the copy in place. */
+		exported = has_run && (backend[0] == '\0' || strcmp(backend, "ns") == 0 ||
+		                       strcmp(backend, "chroot") == 0 || strcmp(backend, "vm") == 0 ||
+		                       strcmp(backend, "emu") == 0 || strcmp(backend, "qemu") == 0);
 		network = hull_spec_find(&spec, &step, "network", &entry) &&
 		          hull_sexpr_child(&spec.doc, &entry, &item) &&
 		          hull_sexpr_next(&spec.doc, &item, &item) &&
@@ -2698,13 +2701,13 @@ next_pass:
 			ok = hull_store_materialize(&store, named, root_path, &skipped, why, sizeof why) == 0 &&
 			     hull_store_runtime(&store, named, &runtime, &runtime_length, why, sizeof why) == 0 &&
 			     (root = open(root_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) >= 0;
-			/* On chroot, the step's machine is an overlay of that copy, the
+			/* Exported, the step's machine is an overlay of that copy, the
 			 * parent's owners given back in it and its tree exported, so an
 			 * owner it gives, a package's own user's, is kept with no file
 			 * of another owner on the user's disk (section 7). */
 			snprintf(owners_path, sizeof owners_path, "%s/owners.list", scratch);
 			snprintf(tar_path, sizeof tar_path, "%s/tree.tar", scratch);
-			if (ok && chrooted) {
+			if (ok && exported) {
 				int      list = open(owners_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
 				uint64_t owned = 0u;
 
@@ -2782,7 +2785,7 @@ next_pass:
 				add_text(&conf, "(machine (source ");
 				add_text(&conf, "\"dir:");
 				add_text(&conf, root_path);
-				if (chrooted) {
+				if (exported) {
 					add_text(&conf, "\") (mutable overlay) (owners ");
 					add_quoted(&conf, (const uint8_t *)owners_path, strlen(owners_path));
 					add_text(&conf, ") (export ");
@@ -2836,7 +2839,7 @@ next_pass:
 			/* What a step leaves that is not the tree's: /tmp's contents,
 			 * and what it says to discard; removed from a tree written in
 			 * place, or left out of an exported one's commit. */
-			if (chrooted) {
+			if (exported) {
 				dropping = 0u;
 				drop[dropping++] = "/tmp/";
 				if (ok && hull_spec_find(&spec, &step, "discard", &entry)) {
@@ -2857,7 +2860,7 @@ next_pass:
 				}
 				drop[dropping] = NULL;
 			}
-			if (ok && !chrooted) {
+			if (ok && !exported) {
 				char        copy[4096];
 				const char *leaf;
 				int         tmp = in_tree(root, "/tmp/x", copy, sizeof copy, &leaf, 0);
@@ -2922,7 +2925,7 @@ next_pass:
 				extra.provenance_length = provenance.length;
 				extra.runtime = runtime;
 				extra.runtime_length = runtime_length;
-				if (!provenance.failed && chrooted) {
+				if (!provenance.failed && exported) {
 					int tar = open(tar_path, O_RDONLY | O_CLOEXEC);
 
 					ok = tar >= 0 && hull_store_commit_tar(&store, tar, host_arch(), cache, drop,

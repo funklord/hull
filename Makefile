@@ -178,7 +178,7 @@ DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf vol
                     netnone.conf netports.conf)
 
 # What test/qemu_test.sh writes.
-QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf die.conf nope.conf write.conf \
+QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf vbuilt.conf die.conf nope.conf write.conf \
                   readonly.conf vol.conf volro.conf trap.conf trap.out wait.conf kept.conf \
                   emu.conf execd.conf held.out vheld.conf vheld.err vstuck.conf xtrap.out xstop.out net.conf listen.out brief.conf \
                   ports.conf ports.out client.out vbridged.conf vbridge2.conf vbrnamed.conf relay-resolv.conf fakedns.py taken.conf udp.conf udp.out dial.conf dial.out sshed.conf sshed.out home/.ssh/config keep.conf \

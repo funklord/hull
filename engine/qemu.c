@@ -79,6 +79,7 @@
 #include "builtin.h"
 #include "wire.h"
 #include "idmap.h"
+#include "tree.h"
 
 #define MAX_VOLUMES  64u
 #define MAX_PORTS    64u
@@ -120,6 +121,7 @@ struct hull_machine {
 	char            *upper_work;   /* overlayfs's work directory beside it, hidden */
 	int              host_overlay; /* layers or an upper: the overlay is qemu's, the share it */
 	char            *owners;       /* (owners PATH): a stored tree's owners, given back */
+	char            *export;       /* (export PATH): the merged tree's tar, once it ends */
 	int              many;         /* the user's subordinate range mapped, not one uid */
 	char            *kernel_path;  /* (kernel "path:FILE"): bring your own, else the host's */
 	int              kernel_image; /* (kernel image): the image's own /hull/kernel */
@@ -394,6 +396,7 @@ static void release(hull_machine *m)
 	free(m->upper);
 	free(m->upper_work);
 	free(m->owners);
+	free(m->export);
 	free(m->kernel_path);
 	free(m->spec);
 	free(m->names);
@@ -520,6 +523,22 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		 * host-side whenever owners are given, as it is with layers or an
 		 * upper: a share in place, or the guest's own overlay over a
 		 * read-only share, has no host tree to chown. */
+		m->host_overlay = 1;
+	}
+
+	/* (export PATH): what the machine made of its tree, as a tar, owners as
+	 * the guest gave them -- a 9p share of security_model=none chowns for
+	 * real in qemu's namespace. Taken host-side from the merged tree, so the
+	 * overlay is qemu's whenever there is an export, as with owners; in
+	 * place the tree is the user's own directory already. */
+	if ((text = hull_access_value(doc, &machine, "export")) != NULL) {
+		m->export = hull_access_path(doc, text);
+		free(text);
+		if (m->export == NULL)
+			return "the export's path cannot be read";
+		if (!m->overlay || m->readonly_root)
+			return "an export is of an overlay's tree: (export ...) needs (mutable overlay) and "
+			       "a root that is not read-only";
 		m->host_overlay = 1;
 	}
 
@@ -1422,8 +1441,9 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int
 	 * overlay qemu's child mounts in its runtime directory, its merged tree.
 	 * It is read-only under (mutable overlay) whenever the guest lays its
 	 * own overlay over it (a tmpfs upper, fast writes in its memory), which
-	 * is every case but a kept (upper PATH): there the guest writes through
-	 * the share to the host-side overlay's kept upper, so it is read-write. */
+	 * is every case but a kept (upper PATH) and an (export PATH): there the
+	 * guest writes through the share to the host-side overlay, where the
+	 * upper keeps them or the export takes them, so it is read-write. */
 	if (m->host_overlay) {
 		char merged[4200];
 
@@ -1433,7 +1453,8 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int
 		escaped(path, sizeof path, m->root);
 	}
 	snprintf(root, sizeof root, "local,id=root,path=%s,security_model=none%s", path,
-	         m->readonly_root || (m->overlay && m->upper == NULL) ? ",readonly=on" : "");
+	         m->readonly_root || (m->overlay && m->upper == NULL && m->export == NULL) ?
+	         ",readonly=on" : "");
 
 	argv[n++] = "qemu-system-x86_64";
 	argv[n++] = "-nodefaults";
@@ -1740,7 +1761,8 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int
 	}
 	/* The child unshared its user namespace and waits: map the user's
 	 * subordinate range into it from outside, where a stored tree's owners
-	 * are to be given back and the host grants the user a range, so a chown
+	 * are to be given back or an export is to keep what the guest gives,
+	 * and the host grants the user a range, so a chown
 	 * inside to one of those ids works; else let the child map its one uid.
 	 * A fork that failed, or a child gone before it said anything, leaves
 	 * nothing to map and the launch fails below. */
@@ -1750,7 +1772,8 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int
 		char hello = 0;
 
 		if (read(ready[0], &hello, 1u) == 1) {
-			char said = m->owners != NULL && hull_map_many(pid, uid, gid) ? 'M' : 'S';
+			char said = (m->owners != NULL || m->export != NULL) &&
+			            hull_map_many(pid, uid, gid) ? 'M' : 'S';
 
 			m->many = said == 'M';
 			if (write(decide[1], &said, 1u) != 1) {
@@ -2019,6 +2042,102 @@ static void *deliver_workload(void *arg)
 	return NULL;
 }
 
+static int export_sink(void *context, const uint8_t *data, size_t n)
+{
+	int fd = *(int *)context;
+
+	while (n > 0u) {
+		ssize_t wrote = write(fd, data, n);
+
+		if (wrote < 0 && errno == EINTR)
+			continue;
+		if (wrote <= 0)
+			return -1;
+		data += wrote;
+		n -= (size_t)wrote;
+	}
+	return 0;
+}
+
+/*
+ * (export PATH): the merged tree as engine/tree.c's tar, taken once the
+ * workload has ended and before the guest powers off, the agent waiting
+ * for the host to close after its bye. A child enters qemu's user and
+ * mount namespaces, where the overlay is mounted at merged/ and each
+ * owner is as the guest gave it, and writes the tar to the file opened
+ * here, as the user, beforehand: its own mount alone, so no volume. A
+ * failure empties the file, says why on the workload's stderr, and makes
+ * the end 125, as on chroot.
+ */
+static void export_tree(hull_machine *m)
+{
+	char  detail[512] = "";
+	char  merged[4200];
+	int   fd = open(m->export, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	int   said[2] = { -1, -1 };
+	pid_t child = -1;
+	int   status = 0;
+
+	snprintf(merged, sizeof merged, "%s/merged", m->dir);
+	if (fd < 0)
+		snprintf(detail, sizeof detail, "%s: %s", m->export, strerror(errno));
+	else if (pipe2(said, O_CLOEXEC) != 0 || (child = fork()) < 0)
+		snprintf(detail, sizeof detail, "a child to take it: %s", strerror(errno));
+	if (child == 0) {
+		char path[64];
+		int  user;
+		int  mount_ns;
+		int  ok;
+
+		close(said[0]);
+		snprintf(path, sizeof path, "/proc/%ld/ns/user", (long)m->qemu);
+		user = open(path, O_RDONLY | O_CLOEXEC);
+		snprintf(path, sizeof path, "/proc/%ld/ns/mnt", (long)m->qemu);
+		mount_ns = open(path, O_RDONLY | O_CLOEXEC);
+		ok = user >= 0 && mount_ns >= 0 && setns(user, CLONE_NEWUSER) == 0 &&
+		     setns(mount_ns, CLONE_NEWNS) == 0;
+		if (!ok)
+			snprintf(detail, sizeof detail, "qemu's namespaces: %s", strerror(errno));
+		else if (hull_tree_tar_fs(merged, 1, export_sink, &fd, detail, sizeof detail) != 0 ||
+		         fsync(fd) != 0)
+			ok = 0;
+		if (!ok && detail[0] == '\0')
+			snprintf(detail, sizeof detail, "%s", strerror(errno));
+		if (!ok)
+			(void)!write(said[1], detail, strlen(detail));
+		_exit(ok ? 0 : 1);
+	}
+	if (child > 0) {
+		ssize_t n;
+
+		close(said[1]);
+		said[1] = -1;
+		n = read(said[0], detail, sizeof detail - 1u);
+		detail[n > 0 ? (size_t)n : 0u] = '\0';
+		while (waitpid(child, &status, 0) < 0 && errno == EINTR)
+			;
+		if (detail[0] == '\0' && !(WIFEXITED(status) && WEXITSTATUS(status) == 0))
+			snprintf(detail, sizeof detail, "its child ended without a word");
+	}
+	if (said[0] >= 0)
+		close(said[0]);
+	if (said[1] >= 0)
+		close(said[1]);
+	if (detail[0] != '\0') {
+		char line[600];
+		int  n = snprintf(line, sizeof line, "hull: export: %s\n", detail);
+
+		if (fd >= 0 && ftruncate(fd, 0) != 0) {
+			/* nothing more can be done; the status says it */
+		}
+		host->on_data(m->core, NULL, 2, (const uint8_t *)line, (size_t)n);
+		m->code   = 125;
+		m->signal = 0;
+	}
+	if (fd >= 0)
+		close(fd);
+}
+
 static void *read_agent(void *arg)
 {
 	hull_machine *m = arg;
@@ -2096,6 +2215,8 @@ static void *read_agent(void *arg)
 				m->code = (int)number;
 			if (hull_msg_find(&body, "signal", &value) && hull_msg_long(&body, &value, &number))
 				m->signal = (int)number;
+			if (m->export != NULL)
+				export_tree(m);
 		} else if (hull_msg_is(&body, "bye")) {
 			break;
 		}
@@ -3639,8 +3760,9 @@ static const hull_cap_entry entries[] = {
 	  "the agent supervises the image's own sshd on the guest's port 22, with a host key, "
 	  "the user's authorized_keys and a config the core delivers; refused at start if the "
 	  "image has no sshd", NULL },
-	{ "export",             HULL_SUP_REJECTED,
-	  "not yet: the guest's tree is the agent's to write, and it does not", NULL },
+	{ "export",             HULL_SUP_EMULATED,
+	  "the merged tree taken host-side in qemu's namespaces once the workload ends, the "
+	  "overlay mounted there for it", NULL },
 	{ "layers",             HULL_SUP_NATIVE,
 	  "read-only, in an overlay qemu mounts host-side, the guest's share its merged tree", NULL },
 	{ "upper",              HULL_SUP_NATIVE,
