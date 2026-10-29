@@ -176,8 +176,9 @@ static const hull_cap_entry entries[] = {
 	  "a CD-ROM drive each, by LREDIR -C, at the first drive from G: no volume holds; with "
 	  "none, dosemu2's MSCDEX answers with a stub drive at Z:", NULL },
 	{ "media.dir",          HULL_SUP_EMULATED,
-	  "the collection's files/ as the disc's tree, redirected as a CD-ROM; its TOC, audio "
-	  "tracks and quirks are not replayed, so a copy-protection check will fail", NULL },
+	  "the collection's files/ as the disc's tree, redirected as a CD-ROM, its label not "
+	  "kept; one with audio tracks or quirks/ refused, dosemu2 playing no CD audio and "
+	  "reading no disc raw", NULL },
 	{ "media.image",        HULL_SUP_REJECTED,
 	  "dosemu2 mounts no disc image; a dir: collection of the disc's files instead", NULL },
 	{ "media.tar",          HULL_SUP_REJECTED, "not yet: a tar: collection", NULL },

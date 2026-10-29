@@ -405,7 +405,7 @@ is a DOS command line, run from a batch of hull's.
 | How | emulates a whole PC, sound and VGA included | runs DOS code on the host's CPU, under FreeDOS |
 | Suits | games, and software that wants the hardware | business software, tools, builds |
 | Volumes | `/d` to `/z` as drives, `/h` hull's | `/g` to `/z`, `D:` to `F:` being dosemu2's |
-| CD-ROM | a `dir:` collection or an ISO `image:` | a `dir:` collection |
+| CD-ROM | a `dir:` collection, with audio tracks, or an ISO `image:` | a `dir:` collection, data only |
 | Paths | no DOS syntax characters | no spaces either |
 | Needs | `dosbox` (Debian packages it) | `dosemu`, built from source on Debian |
 
@@ -436,8 +436,9 @@ from a directory and scripted like any other machine.
 - The directory is written in place, or with `(mutable overlay)` a copy
   of it is, thrown away after: a copy, so a large tree costs its size.
 - DOS lines end in CR LF, and the output keeps them.
-- A disc is its files: its TOC, audio tracks and copy-protection quirks
-  are not replayed yet, so a protection check fails.
+- A disc with a `media.conf` is projected: its files made an ISO image,
+  its audio tracks played from beside it, on DOSBox. Its copy-protection
+  quirks are not replayed by either emulator, so such a disc is refused.
 
 ## Designed, not written
 

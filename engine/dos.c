@@ -37,6 +37,7 @@
 
 #include "access.h"
 #include "dos.h"
+#include "iso.h"
 #include "usage.h"
 
 #define POLL_NS 100000000L
@@ -74,8 +75,13 @@ static void release(hull_machine *m)
 		free(m->envp[i]);
 	for (unsigned i = 0u; i < HULL_DOS_MAX_VOLUMES; i++)
 		free(m->volume_host[i]);
-	for (unsigned i = 0u; i < HULL_DOS_MAX_MEDIA; i++)
+	for (unsigned i = 0u; i < HULL_DOS_MAX_MEDIA; i++) {
 		free(m->media_host[i]);
+		free(m->media_files[i]);
+		free(m->media_volume[i]);
+		for (unsigned t = 0u; t < HULL_DOS_MAX_TRACKS; t++)
+			free(m->media_track[i][t]);
+	}
 	pthread_mutex_destroy(&m->lock);
 	pthread_cond_destroy(&m->done_cond);
 	free(m);
@@ -105,6 +111,108 @@ static int drive_free(const hull_machine *m, char drive)
 		if (m->media_drive[k] == drive)
 			return 0;
 	return 1;
+}
+
+/*
+ * A collection's media.conf, its TOC (section 3.10), read into medium `i`:
+ *
+ *     (disc (volume "GAME")
+ *           (tracks (track (number 2) (audio "tracks/02.ogg")) ...))
+ *
+ * the data track the collection's files/, track 1, and each audio track
+ * a file beside it, numbered from 2 without a gap, in order. NULL, or why
+ * it cannot be: a collection with quirks/ among them, which no emulator
+ * here replays, being read whole only by one that reads a disc raw.
+ */
+/* `(key VALUE)` of a readable record, a symbol or string decoded, as a C
+ * string the caller frees, or NULL: hull_access_value reads a canonical
+ * plan's atoms, and media.conf is written by hand. */
+static char *disc_value(const hull_sexpr_doc *doc, const hull_sexpr_form *record, const char *key)
+{
+	hull_sexpr_form entry;
+	hull_sexpr_form head;
+	hull_sexpr_form value;
+	char            text[4096];
+	size_t          length = 0u;
+
+	if (!hull_access_find(doc, record, key, &entry) || !hull_sexpr_child(doc, &entry, &head) ||
+	    !hull_sexpr_next(doc, &head, &value) ||
+	    hull_sexpr_value(doc, &value, (uint8_t *)text, sizeof text - 1u, &length) != HULL_SEXPR_OK ||
+	    length >= sizeof text || memchr(text, '\0', length) != NULL)
+		return NULL;
+	text[length] = '\0';
+	return strdup(text);
+}
+
+static const char *read_disc(hull_machine *m, unsigned i, const char *collection)
+{
+	static char     why[300];
+	char            path[4200];
+	uint8_t        *text;
+	struct stat     st;
+	hull_sexpr_doc  doc;
+	hull_sexpr_form top;
+	hull_sexpr_form entry;
+	hull_sexpr_form track;
+	int             fd;
+	ssize_t         n;
+	const char     *wrong = NULL;
+
+	snprintf(path, sizeof path, "%s/quirks", collection);
+	if (stat(path, &st) == 0)
+		return "the disc has quirks/, its copy protection, which neither DOSBox nor dosemu2 "
+		       "replays, reading no disc raw: a check of it would fail rather than be passed";
+	snprintf(path, sizeof path, "%s/media.conf", collection);
+	if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0)
+		return errno == ENOENT ? NULL : "the disc's media.conf cannot be read";
+	if ((text = malloc(65536u)) == NULL || (n = read(fd, text, 65536u)) < 0 || n == 65536) {
+		close(fd);
+		free(text);
+		return "the disc's media.conf cannot be read, or is past 64 KiB";
+	}
+	close(fd);
+	if (hull_sexpr_open(&doc, text, (size_t)n, HULL_SEXPR_READABLE, NULL) != HULL_SEXPR_OK ||
+	    !hull_sexpr_first(&doc, &top) || !hull_sexpr_child(&doc, &top, &entry) ||
+	    !hull_sexpr_is(&doc, &entry, "disc")) {
+		free(text);
+		return "the disc's media.conf is not a (disc ...)";
+	}
+	m->media_volume[i] = disc_value(&doc, &top, "volume");
+	if (m->media_volume[i] == NULL && (m->media_volume[i] = strdup("")) == NULL)
+		wrong = "out of memory";
+	if (wrong == NULL && hull_access_find(&doc, &top, "tracks", &entry)) {
+		hull_sexpr_child(&doc, &entry, &track);
+		while (wrong == NULL && hull_sexpr_next(&doc, &track, &track)) {
+			char    *number = disc_value(&doc, &track, "number");
+			char    *audio = disc_value(&doc, &track, "audio");
+			unsigned t = m->media_track_count[i];
+
+			if (number == NULL || audio == NULL || atoi(number) != (int)t + 2 ||
+			    t + 2u > HULL_DOS_MAX_TRACKS) {
+				snprintf(why, sizeof why, "the disc's tracks are numbered from 2, each "
+				         "(track (number N) (audio FILE)), in order and at most %u",
+				         HULL_DOS_MAX_TRACKS);
+				wrong = why;
+			} else {
+				snprintf(path, sizeof path, "%s/%s", collection, audio);
+				if ((m->media_track[i][t] = real(strdup(path))) == NULL ||
+				    !hull_dos_plain(m->media_track[i][t]) ||
+				    stat(m->media_track[i][t], &st) != 0 || !S_ISREG(st.st_mode)) {
+					snprintf(why, sizeof why, "the disc's track %u is not a file there, or its "
+					         "path holds what a cue sheet cannot", t + 2u);
+					wrong = why;
+				}
+				m->media_track_count[i]++;
+			}
+			free(number);
+			free(audio);
+		}
+	}
+	free(text);
+	if (wrong == NULL && m->media_track_count[i] != 0u && !m->engine->images)
+		wrong = "the disc has audio tracks, which dosemu2 does not play, redirecting the disc's "
+		        "files alone: run it on DOSBox";
+	return wrong;
 }
 
 /*
@@ -141,14 +249,22 @@ static const char *read_media(hull_machine *m, const hull_sexpr_doc *doc,
 			       "engine mounts one, an image:";
 		}
 		{
-			char  *path = hull_access_path(doc, source + (image ? 6 : 4));
-			char  *files = NULL;
+			char       *path = hull_access_path(doc, source + (image ? 6 : 4));
+			char       *files = NULL;
+			const char *wrong = NULL;
 
 			if (path != NULL && dir && (files = malloc(strlen(path) + 7u)) != NULL)
 				sprintf(files, "%s/files", path);
 			m->media_host[i] = real(dir ? files : path);
+			if (dir && path != NULL)
+				wrong = read_disc(m, i, path);
 			if (dir)
 				free(path);
+			if (wrong != NULL) {
+				free(source);
+				m->media_count++;
+				return wrong;
+			}
 		}
 		free(source);
 		m->media_image[i] = image;
@@ -403,6 +519,13 @@ static void remove_dir(hull_machine *m)
 		snprintf(path, sizeof path, "%s/%s", m->dir, files[i]);
 		unlink(path);
 	}
+	/* Each disc's projection, by its name. */
+	for (unsigned i = 0u; i < HULL_DOS_MAX_MEDIA; i++) {
+		snprintf(path, sizeof path, "%s/disc%u.iso", m->dir, i + 1u);
+		unlink(path);
+		snprintf(path, sizeof path, "%s/disc%u.cue", m->dir, i + 1u);
+		unlink(path);
+	}
 	/* What dosemu2 keeps under the HOME it is given, the machine's own
 	 * directory: boot.log, and stderr.log.PID where it was killed, a name
 	 * this engine cannot know, so the regular files of that one directory,
@@ -447,6 +570,52 @@ static const char *make_dir(hull_machine *m)
 	return NULL;
 }
 
+/*
+ * Each disc with a TOC projected, on an engine that mounts an image: its
+ * files/ as an ISO image and a cue sheet naming it as track 1 and each
+ * audio file as the next, in the machine's directory, the medium then
+ * that cue sheet. The image is derived and disposable, made as the
+ * machine starts and gone with it (section 3.10), so a large disc costs
+ * its size once a run. NULL, or why not.
+ */
+static const char *project_media(hull_machine *m)
+{
+	static char why[700];
+
+	for (unsigned i = 0u; i < m->media_count; i++) {
+		char  image[4200];
+		char  cue[4200];
+		char  detail[512];
+		FILE *sheet;
+		int   fd;
+
+		if (m->media_volume[i] == NULL || !m->engine->images)
+			continue;
+		snprintf(image, sizeof image, "%s/disc%u.iso", m->dir, i + 1u);
+		snprintf(cue, sizeof cue, "%s/disc%u.cue", m->dir, i + 1u);
+		if ((fd = open(image, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0)
+			return "the disc's image cannot be made in the machine's directory";
+		if (hull_iso_write(m->media_host[i], m->media_volume[i], fd, detail, sizeof detail) != 0 ||
+		    close(fd) != 0) {
+			snprintf(why, sizeof why, "the disc's image cannot be made: %s", detail);
+			return why;
+		}
+		if ((sheet = fopen(cue, "we")) == NULL)
+			return "the disc's cue sheet cannot be written";
+		fprintf(sheet, "FILE \"%s\" BINARY\n  TRACK 01 MODE1/2048\n    INDEX 01 00:00:00\n", image);
+		for (unsigned t = 0u; t < m->media_track_count[i]; t++)
+			fprintf(sheet, "FILE \"%s\" WAVE\n  TRACK %02u AUDIO\n%s    INDEX 01 00:00:00\n",
+			        m->media_track[i][t], t + 2u, t == 0u ? "    PREGAP 00:02:00\n" : "");
+		if (fclose(sheet) != 0)
+			return "the disc's cue sheet cannot be written";
+		m->media_files[i] = m->media_host[i];
+		if ((m->media_host[i] = strdup(cue)) == NULL)
+			return "out of memory";
+		m->media_image[i] = 1;
+	}
+	return NULL;
+}
+
 hull_status hull_dos_create(const hull_dos_engine *engine, hull_core *core, hull_buf plan,
                             hull_machine **out, hull_error *error)
 {
@@ -470,6 +639,8 @@ hull_status hull_dos_create(const hull_dos_engine *engine, hull_core *core, hull
 	    (reason = make_dir(m)) == NULL) {
 		if (m->overlay && make_copy(m) != 0)
 			reason = "the directory cannot be copied for the overlay";
+		else if ((reason = project_media(m)) != NULL)
+			;
 		else if (engine->write_files(m) != 0)
 			reason = "the machine's batch cannot be written";
 	}

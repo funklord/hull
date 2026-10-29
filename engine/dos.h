@@ -23,6 +23,7 @@ extern "C" {
 #define HULL_DOS_MAX_ENV     64u
 #define HULL_DOS_MAX_VOLUMES 20u
 #define HULL_DOS_MAX_MEDIA   4u
+#define HULL_DOS_MAX_TRACKS  99u   /* a CD's, the data track among them */
 #define HULL_DOS_COMMAND_CAP 126u   /* what DOS takes on a command line */
 
 typedef struct hull_dos_engine hull_dos_engine;
@@ -44,6 +45,12 @@ struct hull_machine {
 	char             media_drive[HULL_DOS_MAX_MEDIA];
 	int              media_image[HULL_DOS_MAX_MEDIA];
 	unsigned         media_count;
+	/* A collection with a media.conf, its disc projected (section 3.10):
+	 * its files/, label and audio tracks, the image made from them. */
+	char            *media_files[HULL_DOS_MAX_MEDIA];
+	char            *media_volume[HULL_DOS_MAX_MEDIA];
+	char            *media_track[HULL_DOS_MAX_MEDIA][HULL_DOS_MAX_TRACKS];
+	unsigned         media_track_count[HULL_DOS_MAX_MEDIA];
 	char             detail[512];
 	pid_t            pid;
 	pthread_t        reader;

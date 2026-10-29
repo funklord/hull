@@ -3038,6 +3038,25 @@ mkdir -p "$root/doscd/files"
 [ ! -d "$root/dosroot/tmp" ] || rmdir "$root/dosroot/tmp"
 printf 'on a disc\r\n' > "$root/doscd/files/README.TXT"
 python3 -I "$(dirname "$0")/iso.py" "$root/doscd.iso" README.TXT "$(printf 'on a disc\r\n')"
+# A collection with a TOC, projected (section 3.10): its files/ made an
+# ISO by hull, a subdirectory among them, and an audio track beside it, a
+# second of silence. AUDINFO asks MSCDEX for the disc's highest track
+# (IOCTL input, Audio Disk Info) and prints it, as a game finds its music.
+# Another with quirks/, its copy protection, which nothing here replays.
+printf '\270\000\025\061\333\315\057\214\310\216\300\243\066\001\270\020\025\273\046\001\315\057\212\026\102\001\200\302\060\264\002\315\041\270\000\114\315\041\032\000\003\000\000\000\000\000\000\000\000\000\000\000\100\001\000\000\007\000\000\000\000\000\000\000\012\000\000\000\000\000\000' \
+	> "$root/dosroot/AUDINFO.COM"
+mkdir -p "$root/doscdx/files/DATA" "$root/doscdx/tracks" "$root/doscdq/files" "$root/doscdq/quirks"
+printf 'on a disc\r\n' > "$root/doscdx/files/README.TXT"
+printf 'deeper\r\n' > "$root/doscdx/files/DATA/SUB.TXT"
+printf 'on a disc\r\n' > "$root/doscdq/files/README.TXT"
+python3 -I -c '
+import struct, sys
+data = bytes(44100 * 4)
+open(sys.argv[1], "wb").write(b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt " +
+	struct.pack("<IHHIIHH", 16, 1, 2, 44100, 44100 * 4, 4, 16) + b"data" +
+	struct.pack("<I", len(data)) + data)' "$root/doscdx/tracks/02.wav"
+printf '(disc (volume "HULLDISC") (tracks (track (number 2) (audio "tracks/02.wav"))))\n' \
+	> "$root/doscdx/media.conf"
 for dosengine in dosbox dosemu; do
 	if ! command -v "$dosengine" > /dev/null 2>&1; then
 		echo "cli: the dos class on $dosengine not measured: $dosengine is not installed"
@@ -3104,9 +3123,17 @@ for dosengine in dosbox dosemu; do
 	dosemu) from_root 0 '^Z' -f "$root/doscdnone.conf" ;;
 	esac
 	from_root 0 '^on a disc' -f "$root/doscdtype.conf"
+	dosconf doscdquirk "(media (medium (type cdrom) (source \"dir:./doscdq\"))) (command \"TYPE\" \"$cd:\\\\README.TXT\")"
+	from_root 125 'the disc has quirks/, its copy protection' -f "$root/doscdquirk.conf"
+	dosconf doscdaudio '(media (medium (type cdrom) (source "dir:./doscdx"))) (command "AUDINFO")'
+	dosconf doscdsub "(media (medium (type cdrom) (source \"dir:./doscdx\"))) (command \"TYPE\" \"$cd:\\\\DATA\\\\SUB.TXT\")"
 	if [ "$dosengine" = dosbox ]; then
 		from_root 0 '^on a disc' -f "$root/doscdiso.conf"
+		from_root 0 '^2' -f "$root/doscdaudio.conf"
+		from_root 0 '^deeper' -f "$root/doscdsub.conf"
 	else
+		from_root 125 'the disc has audio tracks, which dosemu2 does not play' \
+			-f "$root/doscdaudio.conf"
 		expect 1 'media\.image: rejected: dosemu2 mounts no disc image' \
 			"$hull" plan -f "$root/doscdiso.conf"
 	fi
@@ -3135,7 +3162,7 @@ for dosengine in dosbox dosemu; do
 	[ ! -e "$HOME/.dosbox" ] && [ ! -e "$HOME/.dosemu" ] && [ ! -e "$HOME/.config/pulse" ] ||
 		fail "$dosengine wrote into the user's HOME" "$(ls -A "$HOME")"
 	cases=$((cases + 1))
-	[ -z "$(ls -A "$root/dosroot" | grep -vxE 'HELLO\.COM|EXIT3\.COM|LOOP\.COM|CDCHK\.COM')" ] ||
+	[ -z "$(ls -A "$root/dosroot" | grep -vxE 'HELLO\.COM|EXIT3\.COM|LOOP\.COM|CDCHK\.COM|AUDINFO\.COM')" ] ||
 		fail "$dosengine left something in the user's C:" "$(ls -A "$root/dosroot")"
 	cases=$((cases + 1))
 	left=$(ls -d "$XDG_RUNTIME_DIR"/hull/"$dosengine"-* 2> /dev/null)

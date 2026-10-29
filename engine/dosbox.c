@@ -166,8 +166,9 @@ static const hull_cap_entry entries[] = {
 	  "a CD-ROM drive each, by DOSBox's own MSCDEX, at the first drive from D: no volume "
 	  "holds", NULL },
 	{ "media.dir",          HULL_SUP_EMULATED,
-	  "the collection's files/ as the disc's tree, mounted as a CD-ROM; its TOC, audio tracks "
-	  "and quirks are not yet replayed, so a copy-protection check will fail", NULL },
+	  "the collection's files/ as the disc's tree, mounted as a CD-ROM; with a media.conf, "
+	  "projected: files/ an ISO image hull makes, its audio tracks by a cue sheet; one with "
+	  "quirks/ refused, DOSBox reading no disc raw", NULL },
 	{ "media.image",        HULL_SUP_NATIVE,   "an ISO image, by imgmount", NULL },
 	{ "media.tar",          HULL_SUP_REJECTED, "not yet: a tar: collection", NULL },
 	{ "media.pack",         HULL_SUP_REJECTED, "not yet: a pack: collection", NULL },
