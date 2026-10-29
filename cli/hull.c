@@ -4772,6 +4772,7 @@ int main(int argc, char **argv)
 	    hull_registry_add(&registry, hull_engine_qemu(NULL), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_chroot(NULL), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_dosbox(NULL), &reason) != HULL_REGISTRY_OK ||
+	    hull_registry_add(&registry, hull_engine_dosemu(NULL), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_set_default(&registry, "ns", "chroot") != HULL_REGISTRY_OK) {
 		fprintf(stderr, "hull: a built-in engine is refused: %s\n", reason);
 		return 2;

@@ -179,6 +179,7 @@ reason, and where one exists, the `--accept` token that takes it anyway).
 | `qemu` | emu | software emulation | its own | `/dev/vhost-vsock`, qemu, passt | written |
 | `docker` | ns | namespaces | the host's | a Docker daemon | written, optional |
 | `dosbox` | dos | full PC emulation | DOS | dosbox | written |
+| `dosemu` | dos | DOS on the host's CPU | FreeDOS (fdpp) | dosemu2 | written |
 | crun | ns | namespaces | the host's | user namespaces | designed |
 | virtualbox, vmware | vm | hardware virtualization | its own | the hypervisor | designed |
 | hyperv | vm | hardware virtualization | its own | Windows | reserved |
@@ -392,20 +393,29 @@ machine on docker with the same machine on chroot or vm.
 - An exposed secret shows in `docker inspect`, as all container
   environment does.
 
-## dosbox — a DOS PC, for software written for one
+## dosbox and dosemu — a DOS PC, for software written for one
 
-DOSBox, run as the user with no window, for the dos class: the machine's
-directory is drive `C:`, and the command is a DOS command line, run from
-a batch of hull's.
+The dos class has two engines, run as the user with no window, and the
+same spec runs on either: `(backend dos)` takes DOSBox, `(backend
+dosemu)` dosemu2. The machine's directory is drive `C:`, and the command
+is a DOS command line, run from a batch of hull's.
+
+| | dosbox | dosemu |
+|---|---|---|
+| How | emulates a whole PC, sound and VGA included | runs DOS code on the host's CPU, under FreeDOS |
+| Suits | games, and software that wants the hardware | business software, tools, builds |
+| Volumes | `/d` to `/z` as drives, `/h` hull's | `/f` to `/z`, `D:` and `E:` being dosemu2's |
+| Paths | no DOS syntax characters | no spaces either |
+| Needs | `dosbox` (Debian packages it) | `dosemu`, built from source on Debian |
 
 **When you want it:** a DOS program, a build tool or a test of one, run
 from a directory and scripted like any other machine.
 
 **Pros**
-- Needs only `dosbox` installed; no root, no device, no window.
+- No root, no device, no window.
 - What a program writes through DOS is the machine's output, and its
-  `ERRORLEVEL` is `hull run`'s status; a command DOS cannot find ends 127.
-- A volume is a drive: `(guest "/d")` is `D:`. `env` entries are `SET`.
+  exit code is `hull run`'s status; a command DOS cannot find ends 127.
+- A volume is a drive: `(guest "/g")` is `G:`. `env` entries are `SET`.
 - Stopped, paused and measured as any machine.
 
 **Cons**

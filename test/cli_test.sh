@@ -2953,27 +2953,38 @@ while [ -S "$shm/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
 	sleep 0.25
 done
 
-# The dos class, DOSBox's engine, where dosbox is installed: the directory
-# as C:, a program's output through DOS and its exit status by
-# ERRORLEVEL, a volume as the drive its guest path names, env by SET, a
-# command not there 127, and a stop at once. The programs are a few bytes
-# of 8086: HELLO prints a line by INT 21h, EXIT3 ends with 3, LOOP jumps
-# to itself. And DOSBox writes no configuration into the user's HOME. Its
-# lines end CR LF, as DOS's do, so the patterns anchor at the start alone.
-if command -v dosbox > /dev/null 2>&1; then
-	mkdir -p "$root/dosroot" "$root/dosvol" "$root/home"
-	printf '\264\011\272\014\001\315\041\270\000\114\315\041hello from dos\r\n$' > "$root/dosroot/HELLO.COM"
-	printf '\270\003\114\315\041' > "$root/dosroot/EXIT3.COM"
-	printf '\353\376' > "$root/dosroot/LOOP.COM"
-	printf 'from a volume\r\n' > "$root/dosvol/IN.TXT"
+# The dos class, on each engine of it installed here, DOSBox and dosemu2:
+# the directory as C:, a program's output through DOS and its exit status,
+# a read-only volume as the drive its guest path names, env by SET, a
+# command not there 127, a stop at once, and nothing left in the user's
+# HOME. The programs are a few bytes of 8086: HELLO prints a line by INT
+# 21h, EXIT3 ends with 3, LOOP jumps to itself. The lines end CR LF, as
+# DOS's do, so the patterns anchor at the start alone. What differs is
+# each shell's word for a command not there, and dosemu2 keeping D: and
+# E: for itself.
+mkdir -p "$root/dosroot" "$root/dosvol" "$root/home"
+printf '\264\011\272\014\001\315\041\270\000\114\315\041hello from dos\r\n$' > "$root/dosroot/HELLO.COM"
+printf '\270\003\114\315\041' > "$root/dosroot/EXIT3.COM"
+printf '\353\376' > "$root/dosroot/LOOP.COM"
+printf 'from a volume\r\n' > "$root/dosvol/IN.TXT"
+for dosengine in dosbox dosemu; do
+	if ! command -v "$dosengine" > /dev/null 2>&1; then
+		echo "cli: the dos class on $dosengine not measured: $dosengine is not installed"
+		continue
+	fi
+	case $dosengine in
+	dosbox) dosnone='^Illegal command: NOSUCH\.' ;;
+	dosemu) dosnone='^Bad command or file name - NOSUCH' ;;
+	esac
 	dosconf() { # NAME ENTRIES...
 		name=$1
 		shift
-		printf '(machine (source "dir:./dosroot") (backend dos) %s)\n' "$*" > "$root/$name.conf"
+		printf '(machine (source "dir:./dosroot") (backend %s) %s)\n' "$dosengine" "$*" \
+			> "$root/$name.conf"
 	}
 	dosconf doshello '(command "HELLO")'
 	dosconf dosexit '(command "EXIT3")'
-	dosconf dosvol '(volumes (volume (host "./dosvol") (guest "/d"))) (command "TYPE" "D:\\IN.TXT")'
+	dosconf dosvol '(volumes (volume (host "./dosvol") (guest "/g") (mode ro))) (command "TYPE" "G:\\IN.TXT")'
 	dosconf dosenv '(env (GREETING "hi")) (command "SET")'
 	dosconf dosnone '(command "NOSUCH")'
 	dosconf dosloop '(command "LOOP")'
@@ -2982,34 +2993,39 @@ if command -v dosbox > /dev/null 2>&1; then
 	expect 0 '^.*source\.dir\.direct: native: the directory is drive C:$' \
 		"$hull" plan --explain -f "$root/doshello.conf"
 	expect 1 'ports: rejected' "$hull" plan -f "$root/dosport.conf"
-	limit=60
+	limit=90
 	from_root 0 '^hello from dos' -f "$root/doshello.conf"
 	from_root 3 '' -f "$root/dosexit.conf"
 	from_root 0 '^from a volume' -f "$root/dosvol.conf"
 	from_root 0 '^GREETING=hi' -f "$root/dosenv.conf"
-	from_root 127 '^Illegal command: NOSUCH\.' -f "$root/dosnone.conf"
+	from_root 127 "$dosnone" -f "$root/dosnone.conf"
 	from_root 125 'guest path is its drive, /d to /z' -f "$root/dosmnt.conf"
-	(cd / && exec timeout -k 2 40 "$hull_abs" run -f "$root/dosloop.conf" > /dev/null 2>&1) &
+	if [ "$dosengine" = dosemu ]; then
+		dosconf dosown '(volumes (volume (host "./dosvol") (guest "/d"))) (command "HELLO")'
+		from_root 125 'whose own commands and shell are D: and E:' -f "$root/dosown.conf"
+	fi
+	(cd / && exec timeout -k 2 60 "$hull_abs" run -f "$root/dosloop.conf" > /dev/null 2>&1) &
 	dosrun=$!
 	tries=0
-	until "$hull" ps 2>/dev/null | grep -q ' dosbox +dos +running$' || [ "$tries" -ge 40 ]; do
+	until "$hull" ps 2>/dev/null | grep -q " $dosengine +dos +running\$" || [ "$tries" -ge 80 ]; do
 		tries=$((tries + 1))
 		sleep 0.25
 	done
-	dosid=$("$hull" ps 2>/dev/null | awk '$3 == "dosbox" && $5 == "running" { print $1; exit }')
+	dosid=$("$hull" ps 2>/dev/null | awk -v e="$dosengine" '$3 == e && $5 == "running" { print $1; exit }')
 	started=$(date +%s)
 	"$hull" stop --timeout 3 "$dosid" > /dev/null 2>&1
 	took=$(($(date +%s) - started))
 	wait "$dosrun" 2> /dev/null
 	cases=$((cases + 1))
-	[ -n "$dosid" ] && [ "$took" -lt 3 ] && ! "$hull" ps 2>/dev/null | grep -q ' dosbox +dos +running$' ||
-		fail "a dos machine was not stopped at once" "'$dosid' after ${took}s"
+	[ -n "$dosid" ] && [ "$took" -lt 3 ] && ! "$hull" ps 2>/dev/null | grep -q " $dosengine +dos +running\$" ||
+		fail "a dos machine on $dosengine was not stopped at once" "'$dosid' after ${took}s"
 	cases=$((cases + 1))
-	[ ! -e "$HOME/.dosbox" ] || fail "DOSBox wrote its configuration into the user's HOME" \
-		"$(ls -A "$HOME/.dosbox")"
-else
-	echo "cli: the dos class not measured: dosbox is not installed"
-fi
+	[ ! -e "$HOME/.dosbox" ] && [ ! -e "$HOME/.dosemu" ] && [ ! -e "$HOME/.config/pulse" ] ||
+		fail "$dosengine wrote into the user's HOME" "$(ls -A "$HOME")"
+	cases=$((cases + 1))
+	left=$(ls -d "$XDG_RUNTIME_DIR"/hull/"$dosengine"-* 2> /dev/null)
+	[ -z "$left" ] || fail "$dosengine machines left their directories" "$left"
+done
 
 printf 'cli: %u cases, %u failed\n' "$cases" "$failures"
 [ "$failures" -eq 0 ]
