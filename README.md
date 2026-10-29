@@ -2,43 +2,99 @@
 
 Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>
 
-Hull gives you computers to test against without the hardware: a single
-machine, or many of them wired together into a network, each made from
-an ordinary folder of files and described in a short text file. It is
-for the testing that needs whole systems rather than one program --
-software that sets up a network, installs itself, starts when a
-computer boots, or talks to other computers -- and for running older
-software on the system it was written for. The same description can be
-run in several ways: one that shares your computer's own core and
-starts almost at once, a virtual machine with a core of its own, or a
-full simulation that can stand in for a different kind of computer, at
-the cost of speed. You choose by changing one line, the machines are
-reached the same way whichever you choose, and where one way cannot do
-what another can, hull tells you before anything runs. Machines run
-without administrator rights, and the ready-made images many projects
-already publish can be used as they are, though none is needed. Hull
-runs on Linux, and it is not a security tool.
+Some software can only be tested as part of a whole system: a daemon
+that configures network interfaces and routes, an installer, an init
+script, a program that loads kernel modules, a protocol that has to
+survive a lossy link between five hosts. Testing it means having those
+systems -- one machine, or a network of them, in a known state and
+rebuilt for every run -- and each usual way of getting them covers only
+part of the job. Containers start in milliseconds but share the host's
+kernel; virtual machines have a kernel of their own but are set up in a
+different tool; emulators reach other processors in a third; and wiring
+several of them into a network to test against is a project of its
+own, usually needing root. Older software has the same need from the
+other side: it runs only on the system it was written for.
 
-Containers, virtual machines and emulators are often offered as a safe
-place to run a program you do not trust. Hull makes no such promise,
-because the promise mostly does not hold. A machine has to share things
-with the computer it runs on to be useful -- a folder, a network, a
-device, and always the processor and memory underneath -- and every
-one of those is a way through. The software that draws the line has
-faults of its own, and ways out of containers, virtual machines and
-emulators alike are found every year. Part of the claim is true: a
-machine given no folder of yours and no network leaves a program less
-to reach, and a virtual machine's own core keeps some of the faults in
-that core from reaching yours. But that part comes with work that is
-easy to underestimate: a second system to keep updated, core included, the
-program running it to keep updated as well, and settings that undo the
-whole arrangement if one of them is wrong. The simpler measures usually
-do more for less: not running what you do not trust, running a service
-as its own user account that can read only what it needs, keeping
-software up to date, and putting what truly matters on a computer of
-its own. Use hull to test and to simulate, and if you use it to keep
-something out, know which of these properties you are relying on and
-what it costs to keep it true.
+Hull runs machines from one short description. A machine is an ordinary
+directory of files and a spec, and the same spec runs as a container on
+the host's kernel, as a virtual machine with a kernel of its own, or
+under full emulation, which can stand in for another processor or an
+older system -- chosen by changing one line. Whichever it runs on, a
+machine keeps the same address and the same way in, and where one way
+cannot honour something the spec asks for, hull says so before anything
+starts rather than letting the machine behave differently. Machines can
+be joined into networks hull switches itself, whose links can be made
+to lose, delay, reorder or damage traffic on purpose, and watched frame
+by frame. None of it needs root or a daemon kept running, and published
+container images can be used as they are, though a directory is enough.
+
+Hull is not a security tool. Containers, virtual machines and emulators
+are often offered as a safe place to run a program you do not trust,
+and the promise mostly does not hold. A machine has to share things
+with its host to be useful -- a directory, a network, a device, and
+always the processor and memory underneath -- and every one of those is
+a way through. The software that draws the line has faults of its own,
+and ways out of containers, virtual machines and emulators alike are
+found every year. Part of the claim is true: a machine given no host
+files and no network leaves a program less to reach, and a virtual
+machine's kernel keeps some of its own faults from the host's. But that
+part comes with upkeep that is easy to underestimate: a second system
+to keep patched, kernel included, the program running it to keep
+patched as well, and settings that undo the arrangement if one of them
+is wrong. The simpler measures usually do more for less: not running
+what you do not trust, running a service as its own user that can read
+only what it needs, keeping software up to date, and putting what truly
+matters on a computer of its own. Use hull to test and to simulate, and
+if you use it to keep something out, know which of these properties
+you are relying on and what it costs to keep it true.
+
+It is not one more container runtime. Docker and Podman run containers;
+Incus runs containers and virtual machines from images, through a
+daemon running as root; Vagrant and libvirt set up virtual machines;
+containerlab and Mininet build test networks, as root. Hull brings
+their testing uses together in one file, and today adds what none of
+them has:
+
+- **One file, three ways to run it.** `--backend vm` or `--backend emu`
+  moves a machine from namespaces on the host's kernel to a KVM guest or
+  to TCG emulation; `--backend docker` hands it to a Docker daemon where
+  one is wanted. A project copied with `rsync` runs unchanged on docker,
+  vm and emu, with the same output and its port at the same address,
+  which `make check-flip` holds it to.
+- **A directory is a machine.** Point the spec at a directory and run;
+  no image is built or stored. Images are there when wanted: `hull pull`
+  and `hull push` speak to any OCI registry, `hull build` caches each
+  step by its parent, its instructions and its inputs, and the store is
+  plain files and readable manifests, which `hull diff` compares entry
+  by entry.
+- **No root, and no daemon.** Each user gets a small core that starts
+  when needed and leaves when idle; the chroot and qemu engines run as
+  the user. Packages install inside a machine with their owners kept,
+  by the user's subordinate id range, and a stored image keeps them.
+  `hull doctor` names any one-time setting a host is missing and the
+  line that gives it.
+- **Differences reported, not discovered.** `hull plan` lists every
+  field of a spec as native, emulated at a stated cost, or rejected with
+  the reason, for the backend chosen, before anything runs.
+- **Networks to test against.** Machines on chroot and on vms join one
+  layer-2 segment, switched by hull, as the user. Given a subnet, they
+  are addressed, named to each other and answered by hull's own DNS.
+  Each link can lose, delay, reorder, duplicate, corrupt or rate-limit
+  traffic in netem's terms, changed while running; frames can be
+  dropped, rewritten or replayed by pattern, or injected; and any link
+  can be captured to a pcap file, with counts of what happened to every
+  frame.
+- **A kernel of its own when the test needs one.** A vm loads the host's
+  modules, `mac80211_hwsim` radios or `pppoe`, or boots a kernel given
+  as a file or carried by the image, and the image's own init can run
+  as PID 1 on a vm or on chroot.
+- **The host's devices.** USB by vendor and product or by port, serial
+  and parallel ports, and PCI by VFIO, each held by one machine at a
+  time.
+- **Built for scripts.** A machine's exit status and output are `hull
+  run`'s, and a killed `hull run`, `SIGKILL` included, takes its machine
+  with it, where a Docker container belongs to the daemon and outlives
+  the job that started it.
 
 A rootless runtime for machines to test against, built on plain files. One
 `hull.conf` describes a machine, and changing one line moves it between a
