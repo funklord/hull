@@ -13,6 +13,7 @@
  */
 
 #include <string.h>
+#include <arpa/inet.h>
 
 #include "spec.h"
 
@@ -240,6 +241,40 @@ static const char *interface(const uint8_t *text, uint32_t length)
 	for (uint32_t i = 0u; i < length; i++)
 		if (text[i] <= ' ' || text[i] == '/' || text[i] == ':' || text[i] >= 0x7fu)
 			return "must be an interface's name: no `/`, `:`, space or control";
+	return NULL;
+}
+
+/* An IPv6 network, "fd42:99::/64", beside a segment's IPv4 one: its host
+ * bits clear and a prefix from 48 to 120, so that it holds hull's ::1 and
+ * every machine a segment can, each drawn an address of its own. */
+static const char *subnet6(const uint8_t *text, uint32_t length)
+{
+	static const char reason[] = "must be an IPv6 network, an address/n with n from 48 to "
+	                             "120 and the host bits clear";
+	char            copy[64];
+	const char     *slash;
+	struct in6_addr address;
+	unsigned        prefix = 0u;
+	unsigned        digits = 0u;
+
+	if (length >= sizeof copy)
+		return reason;
+	memcpy(copy, text, length);
+	copy[length] = '\0';
+	if ((slash = strchr(copy, '/')) == NULL)
+		return reason;
+	for (const char *c = slash + 1; *c != '\0'; c++, digits++) {
+		if (!is_digit((uint8_t)*c) || digits == 3u)
+			return reason;
+		prefix = prefix * 10u + (unsigned)(*c - '0');
+	}
+	copy[slash - copy] = '\0';
+	if (digits == 0u || slash[1] == '0' || prefix < 48u || prefix > 120u ||
+	    inet_pton(AF_INET6, copy, &address) != 1)
+		return reason;
+	for (unsigned bit = prefix; bit < 128u; bit++)
+		if (address.s6_addr[bit / 8u] & (0x80u >> (bit % 8u)))
+			return reason;
 	return NULL;
 }
 
@@ -559,6 +594,7 @@ static const schema fault_link = TABLE(fault_link_keys);
  * each in the subnet, and each other's names. */
 static const key segment_keys[] = {
 	{ .name = "subnet", .type = STRING, .required = 1, .value = subnet },
+	{ .name = "subnet6", .type = STRING, .value = subnet6 },
 };
 static const schema segment = TABLE(segment_keys);
 

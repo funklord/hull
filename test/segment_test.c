@@ -1147,6 +1147,48 @@ int main(void)
 		send_dns(web, 10u, "db", 28u);
 		rcode = dns_reply(web, 10u, data, &length);
 		check("AAAA for a named machine, no data", rcode == 0 && length == 0u);
+		{
+			/* A segment with an IPv6 network too: AAAA for a machine its
+			 * plan names, live or not, and none for one it gives none;
+			 * PTR under ip6.arpa back to its name. */
+			static const uint8_t six_web[16] = { 0xfd, 0x42, 0, 0x55, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a };
+			static const uint8_t six_db[16]  = { 0xfd, 0x42, 0, 0x55, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x14 };
+			hull_segment_host    hosts[3] = { { "web", 0x0a37000au, 1, { 0 } },
+			                                  { "db", 0x0a370014u, 1, { 0 } },
+			                                  { "old", 0x0a37001eu, 0, { 0 } } };
+			int                  six;
+			char                 reverse[80];
+			size_t               at = 0u;
+
+			memcpy(hosts[0].address6, six_web, 16u);
+			memcpy(hosts[1].address6, six_db, 16u);
+			six = hull_segment_port_named("dns6", "web", 0x0a37000au, 24u, 0, hosts, 3u, why,
+			                              sizeof why);
+			if (six < 0) {
+				check("a port with IPv6 names", 0);
+			} else {
+				send_dns(six, 10u, "db", 28u);
+				rcode = dns_reply(six, 10u, data, &length);
+				check("AAAA for a machine its plan gives an IPv6 address",
+				      rcode == 0 && length == 16u && memcmp(data, six_db, 16u) == 0);
+				send_dns(six, 10u, "web.hull", 28u);
+				rcode = dns_reply(six, 10u, data, &length);
+				check("AAAA for the live machine itself",
+				      rcode == 0 && length == 16u && memcmp(data, six_web, 16u) == 0);
+				send_dns(six, 10u, "old", 28u);
+				rcode = dns_reply(six, 10u, data, &length);
+				check("AAAA for one given none, no data", rcode == 0 && length == 0u);
+				for (int k = 15; k >= 0; k--)
+					at += (size_t)snprintf(reverse + at, sizeof reverse - at, "%x.%x.",
+					                       six_db[k] & 15u, six_db[k] >> 4);
+				snprintf(reverse + at, sizeof reverse - at, "ip6.arpa");
+				send_dns(six, 10u, reverse, 12u);
+				rcode = dns_reply(six, 10u, data, &length);
+				check("PTR under ip6.arpa for a machine's IPv6 address",
+				      rcode == 0 && length == 9u && memcmp(data, "\2db\4hull", 9u) == 0);
+				close(six);
+			}
+		}
 		send_dns(web, 10u, "nobody", 1u);
 		check("a name it has not, NXDOMAIN", dns_reply(web, 10u, data, &length) == 3);
 		/* Sums, read through core/frame.situ before a field is: a UDP sum

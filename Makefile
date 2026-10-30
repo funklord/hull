@@ -100,7 +100,7 @@ ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(GEN_DIR)/disc.o \
               $(BUILD_DIR)/engine/access.o \
               $(BUILD_DIR)/engine/usage.o $(BUILD_DIR)/engine/sha256.o \
-              $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/idmap.o \
+              $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/ip6.o $(BUILD_DIR)/engine/idmap.o \
               $(BUILD_DIR)/engine/tree.o $(BUILD_DIR)/engine/hostnet.o \
               $(BUILD_DIR)/engine/hostdev.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o $(BUILD_DIR)/cli/runtime.o $(BUILD_DIR)/cli/doctor.o \
@@ -137,7 +137,7 @@ HULL        = $(BUILD_DIR)/hull
 # the engine writes holds nothing else, and beside hull, where the engine
 # looks for it.
 AGENT_BIN_OBJS = $(BUILD_DIR)/agent/agent.o $(WIRE_OBJS) $(BUILD_DIR)/engine/access.o \
-                 $(BUILD_DIR)/engine/stack.o
+                 $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/ip6.o
 AGENT_BIN      = $(BUILD_DIR)/hull-agent
 
 # The hosts database for section 8.1's names, loaded by glibc into any
@@ -176,7 +176,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  natsaid.conf natplan.conf bridged.conf bridge2.conf brnamed.conf brnone.conf \
                  brports.conf brdocker.conf brserve.conf brserve.out brsshd.conf brssh/probe \
                  brssh/usr/sbin/sshd relay-resolv.conf fakedns.py ping.conf compose.yaml \
-                 noimage.yaml arm64.conf armtree.conf) \
+                 noimage.yaml arm64.conf armtree.conf dual.conf) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
 # What test/docker_test.sh writes.

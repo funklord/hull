@@ -6,31 +6,48 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
 
 #include "names.h"
 
+/* The text of `item`'s entry `key` into `out`, "" where it has none: 1,
+ * or 0 where it is there and unreadable. */
+static int entry_text(const hull_spec *spec, const hull_sexpr_form *item, const char *key,
+                      char *out, size_t cap)
+{
+	hull_sexpr_form entry;
+	hull_sexpr_form head;
+	hull_sexpr_form value;
+	size_t          length;
+
+	out[0] = '\0';
+	if (!hull_spec_find(spec, item, key, &entry))
+		return 1;
+	if (!hull_sexpr_child(&spec->doc, &entry, &head) ||
+	    !hull_sexpr_next(&spec->doc, &head, &value) ||
+	    hull_sexpr_value(&spec->doc, &value, (uint8_t *)out, cap - 1u, &length) != HULL_SEXPR_OK)
+		return 0;
+	out[length] = '\0';
+	return 1;
+}
+
 /* A (segments ...) element's name, a string or a list's head, and its
- * subnet's text into `subnet` where it has one, else "". 0 if unreadable. */
+ * subnet's text into `subnet` where it has one, else "", and its IPv6
+ * subnet's into `subnet6` likewise. 0 if unreadable. */
 static int element(const hull_spec *spec, const hull_sexpr_form *item, char *name,
-                   size_t name_cap, char *subnet, size_t subnet_cap)
+                   size_t name_cap, char *subnet, size_t subnet_cap, char *subnet6,
+                   size_t subnet6_cap)
 {
 	hull_sexpr_form head = *item;
 	size_t          length;
 
 	subnet[0] = '\0';
+	subnet6[0] = '\0';
 	if (item->kind == HULL_SEXPR_LIST) {
-		hull_sexpr_form entry;
-		hull_sexpr_form key;
-		hull_sexpr_form value;
-
 		if (!hull_sexpr_child(&spec->doc, item, &head) ||
-		    !hull_spec_find(spec, item, "subnet", &entry) ||
-		    !hull_sexpr_child(&spec->doc, &entry, &key) ||
-		    !hull_sexpr_next(&spec->doc, &key, &value) ||
-		    hull_sexpr_value(&spec->doc, &value, (uint8_t *)subnet, subnet_cap - 1u,
-		                     &length) != HULL_SEXPR_OK)
+		    !entry_text(spec, item, "subnet", subnet, subnet_cap) || subnet[0] == '\0' ||
+		    !entry_text(spec, item, "subnet6", subnet6, subnet6_cap))
 			return 0;
-		subnet[length] = '\0';
 	}
 	if (hull_sexpr_value(&spec->doc, &head, (uint8_t *)name, name_cap - 1u, &length) !=
 	    HULL_SEXPR_OK)
@@ -51,6 +68,55 @@ static void parse_subnet(const char *text, uint32_t *network, unsigned *prefix)
 static uint32_t mask_of(unsigned prefix)
 {
 	return 0xffffffffu << (32u - prefix);
+}
+
+/* "address/n", which the spec has checked, into its network and prefix. */
+static void parse_subnet6(const char *text, uint8_t network[16], unsigned *prefix)
+{
+	char  copy[64];
+	char *slash;
+
+	snprintf(copy, sizeof copy, "%s", text);
+	slash = strchr(copy, '/');
+	*slash = '\0';
+	inet_pton(AF_INET6, copy, network);
+	*prefix = (unsigned)strtoul(slash + 1, NULL, 10);
+}
+
+/* Whether `a` and `b` agree in their first `bits`. */
+static int same_prefix(const uint8_t a[16], const uint8_t b[16], unsigned bits)
+{
+	for (unsigned bit = 0u; bit < bits; bit++)
+		if ((a[bit / 8u] ^ b[bit / 8u]) & (0x80u >> (bit % 8u)))
+			return 0;
+	return 1;
+}
+
+/* `network` with `host` added into its last 64 bits, into `out`. */
+static void host6(const uint8_t network[16], uint64_t host, uint8_t out[16])
+{
+	unsigned carry = 0u;
+
+	memcpy(out, network, 16u);
+	for (int i = 15; i >= 8; i--) {
+		unsigned sum = out[i] + (unsigned)(host & 0xffu) + carry;
+
+		out[i] = (uint8_t)sum;
+		carry  = sum >> 8;
+		host >>= 8;
+	}
+}
+
+static uint64_t draw6(const char *id, const char *segment)
+{
+	uint64_t hash = 14695981039346656037u;
+
+	for (const char *p = id; *p != '\0'; p++)
+		hash = (hash ^ (unsigned char)*p) * 1099511628211u;
+	hash = (hash ^ '/') * 1099511628211u;
+	for (const char *p = segment; *p != '\0'; p++)
+		hash = (hash ^ (unsigned char)*p) * 1099511628211u;
+	return hash;
 }
 
 static uint32_t draw(const char *id, const char *segment)
@@ -99,20 +165,48 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 		while (hull_sexpr_next(&spec->doc, &item, &item)) {
 			char                name[64];
 			char                subnet[32];
+			char                subnet6[64];
 			uint32_t            network;
 			unsigned            prefix;
+			uint8_t             network6[16];
+			unsigned            prefix6 = 0u;
 			hull_names_segment *s;
 
-			if (!element(spec, &item, name, sizeof name, subnet, sizeof subnet))
+			if (!element(spec, &item, name, sizeof name, subnet, sizeof subnet, subnet6,
+			             sizeof subnet6))
 				return refuse(names, "a segment of %s cannot be read%s", ids[i], "");
 			if (subnet[0] == '\0')
 				continue;
 			parse_subnet(subnet, &network, &prefix);
+			if (subnet6[0] != '\0')
+				parse_subnet6(subnet6, network6, &prefix6);
 			s = find(names, name);
 			if (s != NULL && (s->network != network || s->prefix != prefix))
 				return refuse(names, "segment %s is given two subnets, one by %s", name, ids[i]);
-			if (s != NULL)
+			/* An IPv6 network named by any machine is the segment's; two
+			 * that differ are refused as two IPv4 ones are. */
+			if (s != NULL && subnet6[0] != '\0' && s->has6 &&
+			    (s->prefix6 != prefix6 || memcmp(s->network6, network6, 16u) != 0))
+				return refuse(names, "segment %s is given two IPv6 subnets, one by %s", name,
+				              ids[i]);
+			if (subnet6[0] != '\0' && (s == NULL || !s->has6))
+				for (unsigned j = 0u; j < names->count; j++) {
+					const hull_names_segment *o = &names->segment[j];
+
+					if (o != s && o->has6 &&
+					    same_prefix(o->network6, network6,
+					                prefix6 < o->prefix6 ? prefix6 : o->prefix6))
+						return refuse(names, "segments %s and %s have IPv6 subnets that "
+						              "overlap", o->name, name);
+				}
+			if (s != NULL) {
+				if (subnet6[0] != '\0' && !s->has6) {
+					s->has6 = 1;
+					memcpy(s->network6, network6, 16u);
+					s->prefix6 = prefix6;
+				}
 				continue;
+			}
 			for (unsigned j = 0u; j < names->count; j++) {
 				const hull_names_segment *o = &names->segment[j];
 				uint32_t                  mask = mask_of(prefix < o->prefix ? prefix : o->prefix);
@@ -127,6 +221,11 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 			snprintf(s->name, sizeof s->name, "%s", name);
 			s->network = network;
 			s->prefix  = prefix;
+			if (subnet6[0] != '\0') {
+				s->has6 = 1;
+				memcpy(s->network6, network6, 16u);
+				s->prefix6 = prefix6;
+			}
 		}
 	}
 	if (names->count == 0u)
@@ -156,11 +255,13 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 		while (hull_sexpr_next(&spec->doc, &item, &item)) {
 			char                name[64];
 			char                subnet[32];
+			char                subnet6[64];
 			hull_names_segment *s;
 			uint32_t            usable;
 			uint32_t            slot;
 
-			element(spec, &item, name, sizeof name, subnet, sizeof subnet);
+			element(spec, &item, name, sizeof name, subnet, sizeof subnet, subnet6,
+			        sizeof subnet6);
 			if ((s = find(names, name)) == NULL)
 				continue;
 			if (subnet[0] == '\0')
@@ -179,6 +280,26 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 			}
 			s->member[s->count]  = at;
 			s->address[s->count] = s->network + 2u + slot;
+			/* Its IPv6 address the same way, past ::0 and hull's ::1, in
+			 * the host part's last 64 bits at most. */
+			if (s->has6) {
+				unsigned bits    = 128u - s->prefix6;
+				uint64_t usable6 = bits >= 64u ? UINT64_MAX - 1u : (UINT64_C(1) << bits) - 2u;
+				uint64_t slot6   = draw6(ids[at], name) % usable6;
+
+				for (int taken = 1; taken;) {
+					uint8_t candidate[16];
+
+					taken = 0;
+					host6(s->network6, slot6 + 2u, candidate);
+					for (unsigned k = 0u; k < s->count && !taken; k++)
+						taken = memcmp(s->address6[k], candidate, 16u) == 0;
+					if (taken)
+						slot6 = (slot6 + 1u) % usable6;
+					else
+						memcpy(s->address6[s->count], candidate, 16u);
+				}
+			}
 			s->count++;
 		}
 	}
@@ -253,6 +374,14 @@ long hull_names_entry(const hull_names *names, unsigned member, uint8_t *data, s
 				put(&o, "(7:address", 10u);
 				put_atom(&o, text);
 				put(&o, ")", 1u);
+				if (s->has6) {
+					char text6[INET6_ADDRSTRLEN];
+
+					inet_ntop(AF_INET6, s->address6[k], text6, sizeof text6);
+					put(&o, "(8:address6", 11u);
+					put_atom(&o, text6);
+					put(&o, ")", 1u);
+				}
 			}
 		/* The hosts, by id: insertion, as there are at most 256. */
 		for (unsigned k = 0u; k < s->count; k++) {
@@ -273,10 +402,31 @@ long hull_names_entry(const hull_names *names, unsigned member, uint8_t *data, s
 			put_atom(&o, text);
 			put(&o, ")", 1u);
 		}
+		put(&o, ")", 1u);
+		if (s->has6) {
+			put(&o, "(6:hosts6", 9u);
+			for (unsigned k = 0u; k < s->count; k++) {
+				char text6[INET6_ADDRSTRLEN];
+
+				put(&o, "(", 1u);
+				put_atom(&o, names->ids[s->member[order[k]]]);
+				inet_ntop(AF_INET6, s->address6[order[k]], text6, sizeof text6);
+				put_atom(&o, text6);
+				put(&o, ")", 1u);
+			}
+			put(&o, ")", 1u);
+		}
 		snprintf(prefix, sizeof prefix, "%u", s->prefix);
-		put(&o, ")(6:prefix", 10u);
+		put(&o, "(6:prefix", 9u);
 		put_atom(&o, prefix);
-		put(&o, "))", 2u);
+		put(&o, ")", 1u);
+		if (s->has6) {
+			snprintf(prefix, sizeof prefix, "%u", s->prefix6);
+			put(&o, "(7:prefix6", 10u);
+			put_atom(&o, prefix);
+			put(&o, ")", 1u);
+		}
+		put(&o, ")", 1u);
 	}
 	put(&o, ")", 1u);
 	return o.over ? -1 : (long)o.at;

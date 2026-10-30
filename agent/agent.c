@@ -83,6 +83,7 @@
 
 #include <linux/vm_sockets.h>
 
+#include "ip6.h"
 #include "access.h"
 #include "wire.h"
 
@@ -923,9 +924,13 @@ static const char *place_names(const hull_sexpr_doc *doc, const hull_sexpr_form 
 			struct sockaddr_in *mask;
 			char               *segment = hull_access_segment_name(doc, &item);
 			char                address[16];
+			char                address6[46];
 			unsigned            prefix = 0u;
+			unsigned            prefix6 = 0u;
 			int                 named = segment != NULL &&
 			                            hull_access_named(doc, names, segment, address, &prefix);
+			int                 named6 = named &&
+			                             hull_access_named6(doc, names, segment, address6, &prefix6);
 
 			free(segment);
 			if (!named)
@@ -944,6 +949,11 @@ static const char *place_names(const hull_sexpr_doc *doc, const hull_sexpr_form 
 			if (ioctl(fd, SIOCSIFNETMASK, &request) != 0 || bring_up(fd, request.ifr_name) != 0) {
 				close(fd);
 				return "a segment's NIC cannot be brought up";
+			}
+			/* Its IPv6 address too, where the segment has an IPv6 network. */
+			if (named6 && hull_ip6_add(request.ifr_name, address6, prefix6) != 0) {
+				close(fd);
+				return "a segment's NIC's IPv6 address cannot be set";
 			}
 		}
 	close(fd);

@@ -130,10 +130,13 @@ int hull_segment_port(const char *key, const char *machine, char *why, size_t ca
 int hull_segment_port_addressed(const char *key, const char *machine, uint32_t address,
                                 unsigned prefix, int forwards, char *why, size_t cap);
 
-/* A machine hull names on a segment: its id and its address, host order. */
+/* A machine hull names on a segment: its id and its address, host order,
+ * and its IPv6 address where the segment has an IPv6 network. */
 typedef struct hull_segment_host {
 	char     id[64];
 	uint32_t address;
+	int      has6;
+	uint8_t  address6[16];
 } hull_segment_host;
 
 /*

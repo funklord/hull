@@ -74,6 +74,7 @@
 #include "usage.h"
 #include "stack.h"
 #include "idmap.h"
+#include "ip6.h"
 
 #define MAX_ARGS    256u
 #define MAX_ENV     256u
@@ -163,6 +164,8 @@ struct hull_machine {
 	char             address_text[64];          /* the plan's, for each NIC's MAC */
 	char             segment_address[MAX_SEGMENTS][16];  /* hull's on it, or "" (Appendix D) */
 	unsigned         segment_prefix[MAX_SEGMENTS];
+	char             segment_address6[MAX_SEGMENTS][46]; /* its IPv6 one, or "" */
+	unsigned         segment_prefix6[MAX_SEGMENTS];
 	char            *hosts;      /* the /etc/hosts its addressed segments give it, or NULL */
 	char            *resolver;   /* the /etc/resolv.conf naming hull at their .1, or NULL */
 	int              adopted;    /* taken back: the init is not this process's child */
@@ -608,9 +611,12 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		/* The segments hull addresses, the plan's (names ...): an address
 		 * on each NIC, and every sibling's name in /etc/hosts. */
 		if (hull_access_find(doc, &top, "names", &entry)) {
-			for (unsigned i = 0u; i < m->segment_count; i++)
+			for (unsigned i = 0u; i < m->segment_count; i++) {
 				hull_access_named(doc, &entry, m->segment[i], m->segment_address[i],
 				                  &m->segment_prefix[i]);
+				hull_access_named6(doc, &entry, m->segment[i], m->segment_address6[i],
+				                   &m->segment_prefix6[i]);
+			}
 			/* hull at their .1 is the one to ask, which names a sibling
 			 * that joins later, and under NAT or on hull's bridge forwards
 			 * the rest to the host's resolvers (Appendix D); on a bridge
@@ -1690,6 +1696,9 @@ static void join_segments(const hull_machine *m, int report)
 			request.ifr_flags |= IFF_UP;
 			if (ioctl(fd, SIOCSIFFLAGS, &request) != 0)
 				child_fail(report, "a segment's NIC up");
+			if (m->segment_address6[i][0] != '\0' &&
+			    hull_ip6_add(request.ifr_name, m->segment_address6[i], m->segment_prefix6[i]) != 0)
+				child_fail(report, "a segment's NIC's IPv6 address");
 		}
 		close(fd);
 	}

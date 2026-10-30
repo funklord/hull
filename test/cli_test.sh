@@ -1462,6 +1462,23 @@ from_root 0 '^pinger +\| ping=10\.87\.0\.250 none$' -f "$root/ping.conf"
 cases=$((cases + 1))
 printf '%s\n' "$out" | grep -q '^pinger *| ping=10\.87\.0\.1 ok$' ||
 	fail "hull at .1 did not answer a ping" "$out"
+# A segment's IPv6 network beside its IPv4 one: each machine its drawn
+# IPv6 address on its NIC, the other's in /etc/hosts and from hull at .1
+# as AAAA, and reached there over IPv6 across the switch; an address of
+# the network nobody holds, not.
+printf '(machines (six-a %s) (six-b %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (dual-$$ (subnet \"10.89.0.0/24\") (subnet6 \"fd42:89::/64\"))) (command \"/probe\" \"sleep\" \"1\" \"addr6\" \"eth0\" \"hosts6\" \"six-b\" \"dns6\" \"six-b\" \"ping6\" \"six-b\" \"ping\" \"fd42:89::99\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (dual-$$ (subnet \"10.89.0.0/24\") (subnet6 \"fd42:89::/64\"))) (command \"/probe\" \"sleep\" \"5\" \"addr6\" \"eth0\")" \
+	> "$root/dual.conf"
+limit=60
+from_root 0 '^six-a +\| ping=fd42:89::99 none$' -f "$root/dual.conf"
+b6=$(printf '%s\n' "$out" | sed -n 's#^six-b *| addr6=eth0 \(fd42:89:[0-9a-f:]*\)/64$#\1#p')
+cases=$((cases + 1))
+[ -n "$b6" ] && printf '%s\n' "$out" | grep -q '^six-a *| addr6=eth0 fd42:89:[0-9a-f:]*/64$' &&
+	printf '%s\n' "$out" | grep -q "^six-a *| hosts6=six-b $b6\$" &&
+	printf '%s\n' "$out" | grep -q "^six-a *| dns6=six-b $b6\$" &&
+	printf '%s\n' "$out" | grep -q "^six-a *| ping=$b6 ok\$" ||
+	fail "two machines on a segment with an IPv6 network did not reach each other by it" "$out"
 # The compose dialect (section 9): `hull up` runs the compose file beside
 # it with no step between, saying on stderr what it does not translate,
 # and `-f` gives one to plan as to run. Its services share the project's

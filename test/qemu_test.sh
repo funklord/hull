@@ -645,8 +645,8 @@ printf '%s\n' "$out" | grep -q '^vweb *| read=nameserver 10\.86\.0\.1$' &&
 # before the engine said on the command line whether passt's was there.
 mixed="mixed-$$"
 printf '(machines (cweb %s) (vdb %s) (vraw %s))\n' \
-	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments ($mixed (subnet \"10.87.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"ask\" \"vdb\" \"7000\")" \
-	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network none) (segments ($mixed (subnet \"10.87.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"hosts\" \"cweb\" \"read\" \"/etc/resolv.conf\" \"dns\" \"cweb\" \"ptr\" \"10.87.0.0\" \"answer\" \"7000\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments ($mixed (subnet \"10.87.0.0/24\") (subnet6 \"fd42:87::/64\"))) (command \"/probe\" \"addr\" \"eth0\" \"addr6\" \"eth0\" \"ask\" \"vdb\" \"7000\")" \
+	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network none) (segments ($mixed (subnet \"10.87.0.0/24\") (subnet6 \"fd42:87::/64\"))) (command \"/probe\" \"addr\" \"eth0\" \"addr6\" \"eth0\" \"hosts\" \"cweb\" \"read\" \"/etc/resolv.conf\" \"dns\" \"cweb\" \"dns6\" \"cweb\" \"ptr\" \"10.87.0.0\" \"ping6\" \"cweb\" \"answer\" \"7000\")" \
 	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network none) (segments \"vraw-$$\") (command \"/probe\" \"addr\" \"eth0\")" \
 	> "$root/mixed.conf"
 name=mixed
@@ -667,6 +667,15 @@ printf '%s\n' "$out" | grep -q '^vdb *| read=nameserver 10\.87\.0\.1$' &&
 	printf '%s\n' "$out" | grep -q "^vdb *| dns=cweb $cweb_at\$" &&
 	printf '%s\n' "$out" | grep -q '^vdb *| ptr=10\.87\.0\.0 rcode 3$' ||
 	fail "a vm of (network none) was not named its sibling by hull at .1" "$out"
+# The segment's IPv6 network as well: each given its IPv6 address on its
+# NIC, the vm asking hull at .1 for the chroot machine's AAAA, which is
+# that address, and reaching it over IPv6 across the switch.
+cweb6=$(printf '%s\n' "$out" | sed -n 's#^cweb *| addr6=eth0 \(fd42:87:[0-9a-f:]*\)/64$#\1#p')
+cases=$((cases + 1))
+[ -n "$cweb6" ] && printf '%s\n' "$out" | grep -q '^vdb *| addr6=eth0 fd42:87:[0-9a-f:]*/64$' &&
+	printf '%s\n' "$out" | grep -q "^vdb *| dns6=cweb $cweb6\$" &&
+	printf '%s\n' "$out" | grep -q "^vdb *| ping=$cweb6 ok\$" ||
+	fail "a vm and a chroot machine did not reach each other over IPv6" "$out"
 timeout 10 "$hull" kill -s TERM anchor > /dev/null 2>&1
 wait "$anchored"
 # (init PATH): PID 1 is the image's init, here the probe as one, which

@@ -1857,6 +1857,33 @@ static int hosts_of(const hull_sexpr_doc *doc, const hull_sexpr_form *names, con
 		if (!ok)
 			return -1;
 	}
+	/* And each one's IPv6 address, where the segment has an IPv6 network,
+	 * matched by its id. */
+	if (hull_access_find(doc, &entry, "hosts6", &hosts) && hull_sexpr_child(doc, &hosts, &host))
+		while (hull_sexpr_next(doc, &host, &host)) {
+			hull_sexpr_form id_form;
+			hull_sexpr_form address_form;
+			char           *id = NULL;
+			char           *address = NULL;
+			struct in6_addr parsed;
+			int             ok;
+
+			if (hull_sexpr_child(doc, &host, &id_form) &&
+			    hull_sexpr_next(doc, &id_form, &address_form)) {
+				id      = hull_access_text(doc, &id_form);
+				address = hull_access_text(doc, &address_form);
+			}
+			ok = id != NULL && address != NULL && inet_pton(AF_INET6, address, &parsed) == 1;
+			for (unsigned k = 0u; ok && k < *count; k++)
+				if (strcmp((*out)[k].id, id) == 0) {
+					(*out)[k].has6 = 1;
+					memcpy((*out)[k].address6, &parsed, 16u);
+				}
+			free(id);
+			free(address);
+			if (!ok)
+				return -1;
+		}
 	return 0;
 }
 

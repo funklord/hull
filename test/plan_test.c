@@ -517,6 +517,59 @@ static void test_names(void)
 	              &names) != -1 || strstr(names.reason, "without its subnet") == NULL)
 		FAIL("a segment addressed and bare: %s", names.reason);
 
+	/* An IPv6 network beside: each machine drawn an IPv6 address too, in
+	 * it and past ::1, apart, the same whatever the file's order, and
+	 * written after each IPv4 key; and both families' clashes refused. */
+	cases++;
+	if (draw_file("(machines " SEG("web", "(lan (subnet \"10.99.0.0/24\") (subnet6 \"fd42:99::/64\"))")
+	              SEG("db", "(lan (subnet \"10.99.0.0/24\"))") ")", &names) != 0 ||
+	    names.count != 1u || !names.segment[0].has6 || names.segment[0].prefix6 != 64u) {
+		FAIL("an IPv6 network beside: %s", names.reason);
+	} else {
+		const hull_names_segment *s = &names.segment[0];
+		static const uint8_t      net[8] = { 0xfd, 0x42, 0x00, 0x99, 0, 0, 0, 0 };
+		const char               *e = entry_of(&names, 0u);
+
+		cases++;
+		if (memcmp(s->address6[0], net, 8u) != 0 || memcmp(s->address6[1], net, 8u) != 0 ||
+		    memcmp(s->address6[0], s->address6[1], 16u) == 0 ||
+		    (memcmp(s->address6[0] + 8, "\0\0\0\0\0\0\0", 7u) == 0 && s->address6[0][15] < 2u))
+			FAIL("the IPv6 addresses are not two hosts of fd42:99::/64 past ::1");
+		cases++;
+		if (strstr(e, ")(8:address6") == NULL || strstr(e, "(6:hosts6(2:db") == NULL ||
+		    strstr(e, "(6:prefix2:24)(7:prefix62:64)))") == NULL ||
+		    strstr(e, "(7:address") > strstr(e, "(8:address6") ||
+		    strstr(e, "(5:hosts") > strstr(e, "(6:hosts6"))
+			FAIL("web's entry does not carry its IPv6 names in order:\n  %s", e);
+		cases++;
+		if (draw_file("(machines " SEG("db", "(lan (subnet \"10.99.0.0/24\"))")
+		              SEG("web", "(lan (subnet \"10.99.0.0/24\") (subnet6 \"fd42:99::/64\"))") ")",
+		              &again) != 0 || strcmp(entry_of(&again, 1u), e) != 0)
+			FAIL("the file's order changed web's IPv6 entry");
+	}
+	cases++;
+	if (draw_file("(machines " SEG("a", "(n (subnet \"10.1.0.0/24\") (subnet6 \"fd01::/64\"))")
+	              SEG("b", "(n (subnet \"10.1.0.0/24\") (subnet6 \"fd02::/64\"))") ")", &names) != -1 ||
+	    strstr(names.reason, "two IPv6 subnets") == NULL)
+		FAIL("two IPv6 subnets for one segment: %s", names.reason);
+	cases++;
+	if (draw_file("(machines " SEG("a", "(n (subnet \"10.1.0.0/24\") (subnet6 \"fd01::/48\"))")
+	              SEG("b", "(m (subnet \"10.2.0.0/24\") (subnet6 \"fd01:0:0:7::/64\"))") ")",
+	              &names) != -1 || strstr(names.reason, "IPv6 subnets that overlap") == NULL)
+		FAIL("two segments, overlapping IPv6 subnets: %s", names.reason);
+	/* A /120 holds 254 past ::1: five there take five apart. */
+	cases++;
+	if (draw_file("(machines " SEG("a", "(n (subnet \"10.1.0.0/24\") (subnet6 \"fd01::/120\"))")
+	              SEG("b", "(n (subnet \"10.1.0.0/24\"))") SEG("c", "(n (subnet \"10.1.0.0/24\"))")
+	              ")", &names) != 0) {
+		FAIL("three on a /120: %s", names.reason);
+	} else {
+		for (unsigned k = 0u; k < names.segment[0].count; k++)
+			if (names.segment[0].address6[k][15] < 2u ||
+			    memcmp(names.segment[0].address6[k], "\xfd\x01", 2u) != 0)
+				FAIL("a /120's host %u is not past ::1", names.segment[0].address6[k][15]);
+	}
+
 	/* Two segments, sorted in the entry, and a machine on neither has none. */
 	cases++;
 	if (draw_file("(machines " SEG("a", "(z (subnet \"10.2.0.0/24\")) (y (subnet \"10.1.0.0/24\"))")

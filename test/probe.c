@@ -86,9 +86,13 @@
  *   resolve A N ask the DNS server at address A for NAME's IPv4 address,
  *               within 5 seconds, and say its answer's rcode and count
  *   arch        the machine the kernel reports to it, as uname -m does
- *   ping A      an ICMP echo request to address A, from a raw socket, up
- *               to three a second apart; ok and the data echoed whole,
- *               or none
+ *   ping A      an ICMP echo request to address A, IPv4 or IPv6, from a
+ *               raw socket, up to three a second apart; ok and the data
+ *               echoed whole, or none
+ *   ping6 N     ping N's IPv6 address in /etc/hosts
+ *   dns6 N      N's AAAA record, asked as dns asks for its A
+ *   hosts6 N    N's IPv6 address in /etc/hosts
+ *   addr6 IF    IF's IPv6 address of global scope and its prefix
  *   spin MS     use MS milliseconds of CPU time, by its own clock
  *   reap MS     spin MS in a child, and reap it
  *   hold N      take N MiB and touch every page, held until it exits
@@ -107,6 +111,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
 #include <net/if.h>
 #include <netpacket/packet.h>
 #include <netinet/in.h>
@@ -422,8 +427,11 @@ static void resolve(const char *server, const char *name)
 static void ping(const char *address)
 {
 	static const char  data[] = "hull ping";
-	int                fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	int                six = strchr(address, ':') != NULL;
+	int                fd = six ? socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6) :
+	                            socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
 	struct sockaddr_in to;
+	struct sockaddr_in6 to6;
 	uint8_t            request[8u + sizeof data - 1u];
 	uint8_t            reply[1500];
 	uint16_t           id = (uint16_t)getpid();
@@ -434,13 +442,20 @@ static void ping(const char *address)
 	}
 	memset(&to, 0, sizeof to);
 	to.sin_family = AF_INET;
-	inet_pton(AF_INET, address, &to.sin_addr);
+	memset(&to6, 0, sizeof to6);
+	to6.sin6_family = AF_INET6;
+	if (six ? inet_pton(AF_INET6, address, &to6.sin6_addr) != 1 :
+	          inet_pton(AF_INET, address, &to.sin_addr) != 1) {
+		printf("ping=%s not an address\n", address);
+		close(fd);
+		return;
+	}
 	for (unsigned try = 1u; try <= 3u; try++) {
 		struct pollfd p = { fd, POLLIN, 0 };
 		uint32_t      sum = 0u;
 
 		memset(request, 0, sizeof request);
-		request[0] = 8u;
+		request[0] = six ? 128u : 8u;   /* ICMPv6's echo request, whose sum the kernel takes */
 		request[4] = (uint8_t)(id >> 8);
 		request[5] = (uint8_t)id;
 		request[7] = (uint8_t)try;
@@ -451,22 +466,26 @@ static void ping(const char *address)
 			sum += (uint32_t)request[sizeof request - 1u] << 8;
 		while (sum >> 16)
 			sum = (sum & 0xffffu) + (sum >> 16);
-		request[2] = (uint8_t)(~sum >> 8);
-		request[3] = (uint8_t)~sum;
-		if (sendto(fd, request, sizeof request, 0, (struct sockaddr *)&to, sizeof to) < 0) {
+		if (!six) {
+			request[2] = (uint8_t)(~sum >> 8);
+			request[3] = (uint8_t)~sum;
+		}
+		if ((six ? sendto(fd, request, sizeof request, 0, (struct sockaddr *)&to6, sizeof to6) :
+		           sendto(fd, request, sizeof request, 0, (struct sockaddr *)&to, sizeof to)) < 0) {
 			printf("ping=%s %s\n", address, strerror(errno));
 			close(fd);
 			return;
 		}
-		/* A raw socket is given every ICMP message, its IPv4 header first. */
+		/* A raw socket is given every ICMP message, IPv4's header first
+		 * and ICMPv6's with none. */
 		while (poll(&p, 1u, 1000) == 1) {
 			ssize_t got = recv(fd, reply, sizeof reply, 0);
 			size_t  at;
 
-			if (got < 20)
+			if (got < (six ? 8 : 20))
 				break;
-			at = (size_t)(reply[0] & 0x0fu) * 4u;
-			if ((size_t)got == at + sizeof request && reply[at] == 0u &&
+			at = six ? 0u : (size_t)(reply[0] & 0x0fu) * 4u;
+			if ((size_t)got == at + sizeof request && reply[at] == (six ? 129u : 0u) &&
 			    reply[at + 4u] == request[4] && reply[at + 5u] == request[5] &&
 			    memcmp(reply + at + 8u, data, sizeof data - 1u) == 0) {
 				printf("ping=%s ok\n", address);
@@ -598,6 +617,11 @@ static void ask_dns(const char *step, const char *shown, const char *name, unsig
 			printf("%s=%s short answer\n", step, shown);
 		} else if (type == 1u && length == 4u) {
 			printf("%s=%s %u.%u.%u.%u\n", step, shown, data[0], data[1], data[2], data[3]);
+		} else if (type == 28u && length == 16u) {
+			char text[INET6_ADDRSTRLEN];
+
+			inet_ntop(AF_INET6, data, text, sizeof text);
+			printf("%s=%s %s\n", step, shown, text);
 		} else {
 			char   text[256];
 			size_t at = 0u;
@@ -791,6 +815,63 @@ static int lookup(const char *name, char *out, size_t cap)
 	if (hosts != NULL)
 		fclose(hosts);
 	return found;
+}
+
+/* `name`'s IPv6 address in /etc/hosts, a line whose address has a colon,
+ * into `out`: 1, or 0. */
+static int lookup6(const char *name, char *out, size_t cap)
+{
+	FILE *hosts = fopen("/etc/hosts", "r");
+	char  line[512];
+	int   found = 0;
+
+	while (hosts != NULL && !found && fgets(line, sizeof line, hosts) != NULL) {
+		char *save = NULL;
+		char *address;
+		char *alias;
+
+		*strchrnul(line, '#') = '\0';
+		if ((address = strtok_r(line, " \t\n", &save)) == NULL || strchr(address, ':') == NULL)
+			continue;
+		while (!found && (alias = strtok_r(NULL, " \t\n", &save)) != NULL)
+			if (strcmp(alias, name) == 0) {
+				snprintf(out, cap, "%s", address);
+				found = 1;
+			}
+	}
+	if (hosts != NULL)
+		fclose(hosts);
+	return found;
+}
+
+/* IF's IPv6 address of global scope and its prefix, or none. */
+static void addr6(const char *name)
+{
+	struct ifaddrs *all;
+	int             said = 0;
+
+	if (getifaddrs(&all) != 0) {
+		printf("addr6=%s %s\n", name, strerror(errno));
+		return;
+	}
+	for (struct ifaddrs *a = all; a != NULL && !said; a = a->ifa_next) {
+		const struct sockaddr_in6 *at = (const struct sockaddr_in6 *)a->ifa_addr;
+		const struct sockaddr_in6 *mask = (const struct sockaddr_in6 *)a->ifa_netmask;
+		char                       text[INET6_ADDRSTRLEN];
+		unsigned                   bits = 0u;
+
+		if (at == NULL || at->sin6_family != AF_INET6 || strcmp(a->ifa_name, name) != 0 ||
+		    IN6_IS_ADDR_LINKLOCAL(&at->sin6_addr))
+			continue;
+		for (unsigned i = 0u; mask != NULL && i < 16u; i++)
+			bits += (unsigned)__builtin_popcount(mask->sin6_addr.s6_addr[i]);
+		inet_ntop(AF_INET6, &at->sin6_addr, text, sizeof text);
+		printf("addr6=%s %s/%u\n", name, text, bits);
+		said = 1;
+	}
+	if (!said)
+		printf("addr6=%s none\n", name);
+	freeifaddrs(all);
 }
 
 static void answer(const char *port)
@@ -1338,6 +1419,25 @@ int main(int argc, char **argv)
 			i++;
 		} else if (strcmp(step, "addr") == 0) {
 			show_address(arg);
+			i++;
+		} else if (strcmp(step, "dns6") == 0) {
+			ask_dns(step, arg, arg, 28u);
+			i++;
+		} else if (strcmp(step, "ping6") == 0) {
+			char address[64];
+
+			if (lookup6(arg, address, sizeof address))
+				ping(address);
+			else
+				printf("ping=%s none in /etc/hosts\n", arg);
+			i++;
+		} else if (strcmp(step, "hosts6") == 0) {
+			char address[64];
+
+			printf("hosts6=%s %s\n", arg, lookup6(arg, address, sizeof address) ? address : "none");
+			i++;
+		} else if (strcmp(step, "addr6") == 0) {
+			addr6(arg);
 			i++;
 		} else if (strcmp(step, "hosts") == 0) {
 			char address[64];

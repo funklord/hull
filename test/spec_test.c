@@ -255,6 +255,17 @@ static void test_records(void)
 	NO(M("(segments (wire (subnet \"10.299.0.0/24\")))"), VALUE, "\"10.299.0.0/24\"",
 	   "machine.segments.wire.subnet");
 	NO(M("(segments (wire))"), MISSING, "(wire)", "machine.segments.wire.subnet");
+	/* And its IPv6 network beside it, never in its place. */
+	OK(M("(segments (wire (subnet \"10.99.0.0/24\") (subnet6 \"fd42:99::/64\")))"));
+	OK(M("(segments (wire (subnet \"10.99.0.0/24\") (subnet6 \"2001:db8:0:1::/120\")))"));
+	NO(M("(segments (wire (subnet \"10.99.0.0/24\") (subnet6 \"fd42:99::1/64\")))"), VALUE,
+	   "\"fd42:99::1/64\"", "machine.segments.wire.subnet6");
+	NO(M("(segments (wire (subnet \"10.99.0.0/24\") (subnet6 \"fd42:99::/124\")))"), VALUE,
+	   "\"fd42:99::/124\"", "machine.segments.wire.subnet6");
+	NO(M("(segments (wire (subnet \"10.99.0.0/24\") (subnet6 \"10.98.0.0/24\")))"), VALUE,
+	   "\"10.98.0.0/24\"", "machine.segments.wire.subnet6");
+	NO(M("(segments (wire (subnet6 \"fd42:99::/64\")))"), MISSING, "(wire (",
+	   "machine.segments.wire.subnet");
 	NO(M("(segments (wire (mask \"x\")))"), UNKNOWN, "mask", "machine.segments.wire.mask");
 	NO(M("(segments \"wire\" (wire (subnet \"10.99.0.0/24\")))"), DUPLICATE, "(wire (",
 	   "machine.segments");

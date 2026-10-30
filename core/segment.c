@@ -729,8 +729,15 @@ static const hull_segment_host *named(const segment *s, const char *name, uint32
 
 		if (p->prefix != 0u && (name != NULL ? strcasecmp(p->machine, name) == 0 :
 		                                       p->address == address)) {
+			memset(found, 0, sizeof *found);
 			snprintf(found->id, sizeof found->id, "%s", p->machine);
 			found->address = p->address;
+			/* Its IPv6 address, which its plan's own names give it. */
+			for (unsigned k = 0u; k < p->host_count; k++)
+				if (strcmp(p->hosts[k].id, p->machine) == 0 && p->hosts[k].has6) {
+					found->has6 = 1;
+					memcpy(found->address6, p->hosts[k].address6, 16u);
+				}
 			return found;
 		}
 	}
@@ -749,8 +756,25 @@ static const hull_segment_host *named(const segment *s, const char *name, uint32
 	return NULL;
 }
 
+/* The machine `s` names whose IPv6 address is `address6`, as named(). */
+static const hull_segment_host *named6(const segment *s, const uint8_t address6[16],
+                                       hull_segment_host *found)
+{
+	for (unsigned i = 0u; i < s->port_count; i++) {
+		const port *p = s->ports[i];
+
+		for (unsigned k = 0u; k < p->host_count; k++)
+			if (p->hosts[k].has6 && memcmp(p->hosts[k].address6, address6, 16u) == 0) {
+				*found = p->hosts[k];
+				return found;
+			}
+	}
+	return NULL;
+}
+
 #define DNS_A    1u
 #define DNS_PTR  12u
+#define DNS_AAAA 28u
 #define DNS_ANY  255u
 
 #define ASK_ON   SIZE_MAX
@@ -772,6 +796,7 @@ static size_t dns_answer(const segment *s, uint32_t network, unsigned prefix,
 	unsigned    type;
 	unsigned    rcode = 0u;
 	uint8_t     data[80];
+	uint8_t     address6[16];
 	size_t      data_length = 0u;
 	unsigned    answer_type = 0u;
 	const hull_segment_host *p = NULL;
@@ -840,6 +865,33 @@ static size_t dns_answer(const segment *s, uint32_t network, unsigned prefix,
 				answer_type = DNS_PTR;
 			}
 		}
+	} else if (rcode == 0u && n > 9u && strcmp(name + n - 9u, ".ip6.arpa") == 0) {
+		/* 32 nibbles, the last first: a machine's IPv6 address answered,
+		 * any other asked on, as an address outside the subnet is, since
+		 * the segment's IPv6 network is its plans' and not the switch's. */
+		int ok = n - 9u == 63u;
+
+		for (unsigned k = 0u; ok && k < 32u; k++) {
+			char c = name[2u * k];
+			int  v = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+
+			ok = v >= 0 && (k == 31u || name[2u * k + 1u] == '.');
+			if (ok && k % 2u == 0u)
+				address6[15u - k / 2u] = (uint8_t)v;
+			else if (ok)
+				address6[15u - k / 2u] |= (uint8_t)(v << 4);
+		}
+		if (!ok || (p = named6(s, address6, &found)) == NULL)
+			rcode = 5u;
+		else if (type == DNS_PTR || type == DNS_ANY) {
+			size_t id = strlen(p->id);
+
+			data[0] = (uint8_t)id;
+			memcpy(data + 1, p->id, id);
+			memcpy(data + 1u + id, "\4hull", 6u);
+			data_length = 1u + id + 6u;
+			answer_type = DNS_PTR;
+		}
 	} else if (rcode == 0u) {
 		int ours = n > 5u && strcmp(name + n - 5u, ".hull") == 0;
 
@@ -855,6 +907,10 @@ static size_t dns_answer(const segment *s, uint32_t network, unsigned prefix,
 			put32(data, p->address);
 			data_length = 4u;
 			answer_type = DNS_A;
+		} else if (type == DNS_AAAA && p->has6) {
+			memcpy(data, p->address6, 16u);
+			data_length = 16u;
+			answer_type = DNS_AAAA;
 		}
 	}
 	*question = at;
