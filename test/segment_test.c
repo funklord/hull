@@ -340,6 +340,56 @@ static int dns_reply(int fd, uint8_t me, uint8_t *data, size_t *data_length)
 	return f[45] & 0x0f;
 }
 
+/* An ICMP message of `type` from MAC and address ...`me` to .1, its data
+ * `data`, its sum one bit off where `wrong`. */
+static void send_ping(int fd, uint8_t me, unsigned type, const char *data, int wrong)
+{
+	uint8_t f[200] = { 0 };
+	size_t  length = strlen(data);
+	size_t  icmp = 8u + length;
+
+	memcpy(f, hull_mac, 6u);
+	f[6] = 0x52;
+	f[7] = 0x54;
+	f[11] = me;
+	put16(f + 12, 0x0800u);
+	f[14] = 0x45;
+	put16(f + 16, (unsigned)(20u + icmp));
+	f[22] = 64u;
+	f[23] = 1u;
+	f[26] = 10;
+	f[27] = 55;
+	f[29] = me;
+	f[30] = 10;
+	f[31] = 55;
+	f[33] = 1;
+	put16(f + 24, ~sum16(0u, f + 14, 20u) & 0xffffu);
+	f[34] = (uint8_t)type;
+	put16(f + 38, 0x4242u);
+	put16(f + 40, 7u);
+	memcpy(f + 42, data, length);
+	put16(f + 36, ~sum16(0u, f + 34, icmp) & 0xffffu);
+	if (wrong)
+		f[37] ^= 1u;
+	send_raw(fd, f, 14u + 20u + icmp < 60u ? 60u : 14u + 20u + icmp);
+}
+
+/* The echo reply to a send_ping() of `data` on `fd`: 1 where it came from
+ * .1 to ...`me` with its sums right, its identifier, sequence and data as
+ * sent; 0 otherwise. */
+static int ping_reply(int fd, uint8_t me, const char *data)
+{
+	uint8_t f[1514];
+	size_t  length = next_raw(fd, f, sizeof f, 1000);
+	size_t  icmp = 8u + strlen(data);
+
+	return length >= 14u + 20u + icmp && memcmp(f + 6, hull_mac, 6u) == 0 && f[5] == me &&
+	       get16(f + 12) == 0x0800u && sum16(0u, f + 14, 20u) == 0xffffu && f[23] == 1u &&
+	       f[29] == 1u && f[33] == me && get16(f + 16) == 20u + icmp && f[34] == 0u &&
+	       f[35] == 0u && sum16(0u, f + 34, icmp) == 0xffffu && get16(f + 38) == 0x4242u &&
+	       get16(f + 40) == 7u && memcmp(f + 42, data, strlen(data)) == 0;
+}
+
 /* Set, send_tcp() sends its segment with its sum one bit off. */
 static int tcp_sum_wrong;
 
@@ -1110,6 +1160,32 @@ int main(void)
 		send_dns_summed(web, 10u, "db", 1u, SUM_IP_WRONG);
 		check("a question whose IPv4 header sum is wrong, not answered",
 		      next_raw(web, f, sizeof f, 300) == 0u);
+		/* Ping: an echo request answered with its data, through the
+		 * asker's own way in; one with its sum wrong, and an echo reply
+		 * sent to .1, not. */
+		send_ping(web, 10u, 8u, "hull ping, an odd length", 0);
+		check("ping .1, answered with its data", ping_reply(web, 10u, "hull ping, an odd length"));
+		send_ping(web, 10u, 8u, "", 0);
+		check("ping .1 with no data, answered", ping_reply(web, 10u, ""));
+		send_ping(web, 10u, 8u, "wrong", 1);
+		check("a ping whose ICMP sum is wrong, not answered",
+		      next_raw(web, f, sizeof f, 300) == 0u);
+		send_ping(web, 10u, 0u, "reply", 0);
+		check("an echo reply sent to .1, not answered", next_raw(web, f, sizeof f, 300) == 0u);
+		check("the pings, not to another port", next_raw(db, f, sizeof f, 100) == 0u);
+		{
+			hull_impairment slow = { 0 };
+			uint64_t        sent;
+
+			slow.delay_ms = 80u;
+			impair("dnsd", "web", HULL_SEGMENT_IN, &slow);
+			sent = ms_now();
+			send_ping(web, 10u, 8u, "slow", 0);
+			check("ping .1 over a link delayed 80 ms, its reply 80 ms late",
+			      ping_reply(web, 10u, "slow") && ms_now() - sent >= 75u);
+			slow.delay_ms = 0u;
+			impair("dnsd", "web", HULL_SEGMENT_IN, &slow);
+		}
 		send_dns(web, 10u, "99.0.55.10.in-addr.arpa", 12u);
 		check("an address it has not, NXDOMAIN", dns_reply(web, 10u, data, &length) == 3);
 		send_dns(web, 10u, "example.com", 1u);

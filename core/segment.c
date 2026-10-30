@@ -945,6 +945,37 @@ static void send_answer(segment *s, unsigned to, const uint8_t mac[6], uint32_t 
 	}
 }
 
+/* .1's echo reply to `asker`'s request `echo`, in one frame as the request
+ * came: its identifier, sequence and data as they were. */
+static void send_echo(segment *s, unsigned to, const uint8_t mac[6], uint32_t self,
+                      uint32_t asker, situ_view_t echo)
+{
+	static uint16_t ip_id;
+	uint8_t         reply[4u + 1514u];
+	uint8_t        *out = reply + 4;
+	uint32_t        length = hull_frame_icmp_echo_data_len(echo);
+	uint32_t        wrote = 0u;
+	size_t          total;
+
+	if (8u + length > 1480u)
+		return;
+	memset(reply, 0, sizeof reply);
+	ip_id++;
+	if (hull_frame_ethernet_header_build(out, 14u, mac, hull_mac, 0x0800u, &wrote) != SITU_OK ||
+	    hull_frame_ipv4_header_build(out + 14, 20u, 4u, 0u, 0u, (uint16_t)(20u + 8u + length), ip_id,
+	                                 1u, 0u, 0u, 64u, 1u, self, asker, NULL, 0u, &wrote) != SITU_OK ||
+	    hull_frame_icmp_echo_build(out + 34, 8u + length, 0u, 0u,
+	                               hull_frame_icmp_echo_identifier_get(echo),
+	                               hull_frame_icmp_echo_sequence_get(echo),
+	                               hull_frame_icmp_echo_data_ptr(echo), length, &wrote) != SITU_OK)
+		return;
+	total = 14u + 20u + 8u + length;
+	if (total < 60u)
+		total = 60u;
+	put32(reply, (uint32_t)total);
+	cross(s, to, HULL_SEGMENT_IN, reply, 4u + total);
+}
+
 static unsigned resolvers(struct sockaddr_in out[3]);
 static segment *find(const char *key);
 static void conn_arm(conn *c);
@@ -1451,7 +1482,7 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 		situ_view_t        inner;
 		uint32_t           asker;
 
-		/* For .1 and not ARP or DNS: nothing else answers there. A
+		/* For .1 and not ARP, DNS or ping: nothing else answers there. A
 		 * header that does not validate, its sum among it, is not read. */
 		if (type != 0x0800u || hull_frame_ipv4_header_view(&msg, 14u, (uint32_t)(size - 14u),
 		                                                    &view) != SITU_OK ||
@@ -1475,6 +1506,18 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 			    hull_frame_tcp_segment_checksum_check(inner, first, sizeof first) == SITU_OK &&
 			    hull_frame_tcp_segment_destination_port_get(inner) == 53u)
 				tcp_in(s, from, frame, ip, header, inner, network, prefix);
+			return 1;
+		}
+		/* An echo request, ping's: answered, its sum right, back through
+		 * the asker's own way in, so a link's impairment shows in it. */
+		if (hull_frame_ipv4_header_protocol_get(view) == 1u) {
+			if (hull_frame_icmp_echo_view(&msg, (uint32_t)(14u + header),
+			                              (uint32_t)(datagram - header), &inner) == SITU_OK &&
+			    hull_frame_icmp_echo_validate(inner) == SITU_OK &&
+			    hull_frame_icmp_echo_checksum_check(inner) == SITU_OK &&
+			    hull_frame_icmp_echo_type_get(inner) == 8u)
+				send_echo(s, from, hull_frame_ethernet_header_source_ptr(ether), self, asker,
+				          inner);
 			return 1;
 		}
 		/* A UDP sum of 0 is a datagram sent with none, which IPv4 allows

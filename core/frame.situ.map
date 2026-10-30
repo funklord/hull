@@ -49,6 +49,15 @@ struct ethernet_header size=14 repr=ValueConverted atomic=NonAtomic
   ethernet_header.source                 offset=AbsoluteStatic(0x06) size=Fixed(6) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
   ethernet_header.ethertype              offset=AbsoluteStatic(0x0C) size=Fixed(2) align=Aligned(4) repr=ValueConverted atomic=AtomicWord
 
+struct icmp_echo size=8.. mutate=Immutable repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  icmp_echo.summed                       offset=AbsoluteStatic(0x00) size=Unbounded align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting auth=Covered(checksum)
+  icmp_echo.type                         offset=AbsoluteStatic(0x00) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord auth=Covered(checksum)
+  icmp_echo.code                         offset=AbsoluteStatic(0x01) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord auth=Covered(checksum)
+  icmp_echo.checksum                     offset=AbsoluteStatic(0x02) size=Fixed(2) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic mutate=Immutable
+  icmp_echo.identifier                   offset=AbsoluteStatic(0x04) size=Fixed(2) align=Aligned(4) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  icmp_echo.sequence                     offset=AbsoluteStatic(0x06) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  icmp_echo.data                         offset=AbsoluteStatic(0x08) size=Unbounded align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord mutate=Shifting auth=Covered(checksum)
+
 struct ipv4_header size=20..60 mutate=Immutable repr=ValueConverted atomic=NonAtomic auth=Covered(header_checksum)
   ipv4_header.header                     offset=AbsoluteStatic(0x00) size=Bounded(20, 60) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting auth=Covered(header_checksum)
   ipv4_header.version                    offset=AbsoluteStatic(0x00) size=Fixed(4bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(header_checksum)

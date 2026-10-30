@@ -30,5 +30,11 @@ tcp_segment syn 10 04 00 35 00 00 03 E8 00 00 00 00 50 02 FF FF 87 49 00 00
 # syn_ack_mss: .1's SYN-ACK with its MSS option
 tcp_segment syn_ack_mss 00 35 10 04 00 00 00 4D 00 00 03 E9 60 12 10 02 00 00 00 00 02 04 05 B4
 
+# ping: an echo request to .1, its sum right, "ping" its data
+icmp_echo ping 08 00 D6 E5 42 42 00 07 70 69 6E 67
+
+# pong: .1's echo reply to it
+icmp_echo pong 00 00 DE E5 42 42 00 07 70 69 6E 67
+
 # query: a question's header: one, recursion desired
 dns_header query 12 34 01 00 00 01 00 00 00 00 00 00

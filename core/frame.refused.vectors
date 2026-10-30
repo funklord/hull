@@ -26,5 +26,8 @@ tcp_segment offset_4 10 04 00 35 00 00 03 E8 00 00 00 00 40 02 FF FF 87 49 00 00
 # zero_not: a pseudo-header whose zero byte is not
 pseudo_header zero_not 0A 37 00 0A 0A 37 00 01 01 11 00 1C
 
+# code_1: an echo request whose code is not 0, its sum still right
+icmp_echo code_1 08 01 D6 E4 42 42 00 07 70 69 6E 67
+
 # z_bit: the one reserved Z bit set
 dns_header z_bit 12 34 01 40 00 01 00 00 00 00 00 00

@@ -85,6 +85,9 @@
  *               does, and send it the count
  *   resolve A N ask the DNS server at address A for NAME's IPv4 address,
  *               within 5 seconds, and say its answer's rcode and count
+ *   ping A      an ICMP echo request to address A, from a raw socket, up
+ *               to three a second apart; ok and the data echoed whole,
+ *               or none
  *   spin MS     use MS milliseconds of CPU time, by its own clock
  *   reap MS     spin MS in a child, and reap it
  *   hold N      take N MiB and touch every page, held until it exits
@@ -410,6 +413,68 @@ static void resolve(const char *server, const char *name)
 		printf("resolve=no answer\n");
 	else
 		printf("resolve=rcode %d answers %d\n", answer[3] & 0x0f, answer[6] << 8 | answer[7]);
+	close(fd);
+}
+
+/* Ping `address` once a second, three times at most: ok where an echo
+ * reply of ours comes back with the data sent. */
+static void ping(const char *address)
+{
+	static const char  data[] = "hull ping";
+	int                fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	struct sockaddr_in to;
+	uint8_t            request[8u + sizeof data - 1u];
+	uint8_t            reply[1500];
+	uint16_t           id = (uint16_t)getpid();
+
+	if (fd < 0) {
+		printf("ping=%s %s\n", address, strerror(errno));
+		return;
+	}
+	memset(&to, 0, sizeof to);
+	to.sin_family = AF_INET;
+	inet_pton(AF_INET, address, &to.sin_addr);
+	for (unsigned try = 1u; try <= 3u; try++) {
+		struct pollfd p = { fd, POLLIN, 0 };
+		uint32_t      sum = 0u;
+
+		memset(request, 0, sizeof request);
+		request[0] = 8u;
+		request[4] = (uint8_t)(id >> 8);
+		request[5] = (uint8_t)id;
+		request[7] = (uint8_t)try;
+		memcpy(request + 8, data, sizeof data - 1u);
+		for (size_t i = 0u; i + 1u < sizeof request; i += 2u)
+			sum += (uint32_t)(request[i] << 8 | request[i + 1u]);
+		if (sizeof request % 2u != 0u)
+			sum += (uint32_t)request[sizeof request - 1u] << 8;
+		while (sum >> 16)
+			sum = (sum & 0xffffu) + (sum >> 16);
+		request[2] = (uint8_t)(~sum >> 8);
+		request[3] = (uint8_t)~sum;
+		if (sendto(fd, request, sizeof request, 0, (struct sockaddr *)&to, sizeof to) < 0) {
+			printf("ping=%s %s\n", address, strerror(errno));
+			close(fd);
+			return;
+		}
+		/* A raw socket is given every ICMP message, its IPv4 header first. */
+		while (poll(&p, 1u, 1000) == 1) {
+			ssize_t got = recv(fd, reply, sizeof reply, 0);
+			size_t  at;
+
+			if (got < 20)
+				break;
+			at = (size_t)(reply[0] & 0x0fu) * 4u;
+			if ((size_t)got == at + sizeof request && reply[at] == 0u &&
+			    reply[at + 4u] == request[4] && reply[at + 5u] == request[5] &&
+			    memcmp(reply + at + 8u, data, sizeof data - 1u) == 0) {
+				printf("ping=%s ok\n", address);
+				close(fd);
+				return;
+			}
+		}
+	}
+	printf("ping=%s none\n", address);
 	close(fd);
 }
 
@@ -1203,6 +1268,9 @@ int main(int argc, char **argv)
 			i += 2;
 		} else if (strcmp(step, "dns") == 0 || strcmp(step, "dnstcp") == 0) {
 			ask_dns(step, arg, arg, 1u);
+			i++;
+		} else if (strcmp(step, "ping") == 0) {
+			ping(arg);
 			i++;
 		} else if (strcmp(step, "ptr") == 0) {
 			unsigned a, b, c, d;

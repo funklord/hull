@@ -1,6 +1,7 @@
 // What hull at a segment's .1 reads from a machine and writes back
 // (project.md Appendix D): an Ethernet frame's header, ARP for IPv4, an
-// IPv4 header, a UDP datagram, a TCP segment, and a DNS message's header.
+// IPv4 header, a UDP datagram, a TCP segment, an ICMP echo, and a DNS
+// message's header.
 // Every frame core/segment.c answers comes from a machine on the segment,
 // which is to say from whatever runs in it, so this is where hull reads
 // bytes it did not write; each is validated here, checksums included,
@@ -136,6 +137,22 @@ struct tcp_segment {
 }
 
 require offset(tcp_segment.options) == 20;
+
+// An ICMP echo request or reply, RFC 792: its sum over the whole message,
+// with no pseudo-header, and the data echoed back as it came.
+struct icmp_echo {
+	authenticated summed {
+		u8        type;
+		u8        code        [must_eq = 0];
+		checksum  u8 checksum[2] covers(summed) is internet_checksum
+			[self_as = 0];
+		u16       identifier;
+		u16       sequence;
+		u8        data[remaining];
+	}
+}
+
+require offset(icmp_echo.data) == 8;
 
 // A DNS message's twelve bytes of header, RFC 1035 4.1.1 with RFC 2535's
 // and RFC 4035's two bits; the question after it is segment.c's to read.

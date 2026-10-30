@@ -1437,6 +1437,15 @@ cases=$((cases + 1))
 printf '%s\n' "$out" | grep -q '^tcpasker *| dnstcp=tcpsib 10\.86\.0\.[0-9]*$' &&
 	printf '%s\n' "$out" | grep -q '^tcpasker *| dnstcp=tcpsib\.hull 10\.86\.0\.[0-9]*$' ||
 	fail "hull at .1 did not answer over TCP on a lossy link" "$out"
+# Ping at .1, through the machine's own kernel: answered, and an address
+# of the subnet nobody holds, not.
+printf '(machines (pinger %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (pinged-$$ (subnet \"10.87.0.0/24\"))) (command \"/probe\" \"ping\" \"10.87.0.1\" \"ping\" \"10.87.0.250\")" \
+	> "$root/ping.conf"
+from_root 0 '^pinger +\| ping=10\.87\.0\.250 none$' -f "$root/ping.conf"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^pinger *| ping=10\.87\.0\.1 ok$' ||
+	fail "hull at .1 did not answer a ping" "$out"
 # A segment of 40 machines, past the 32 a segment took before, each
 # up at its own address and all on the switch at once, each staying a
 # while: a network of a /24's size, not a handful.
