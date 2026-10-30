@@ -205,9 +205,25 @@ services:
       backend:
         aliases: [w]
       front:
+  dual:
+    image: busybox:1.36
+    networks: [six, given, small]
 networks:
   backend:
     driver: bridge
+  six:
+    enable_ipv6: true
+  given:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: "172.28.0.0/16"
+        - subnet: "fd00:28::/64"
+          gateway: "fd00:28::1"
+  small:
+    ipam:
+      config:
+        - subnet: 10.5.0.0/30
 YML
 "$hull" import "$dir/docker-compose.yml" > "$dir/compose.machines" 2>&1
 # The output parses: hull plan reads the multi-machine file and reaches
@@ -237,6 +253,12 @@ gbc '\(work-er \(source "busybox:1\.36"\) \(segments \(cli-backend \(subnet [^)]
 gbc '; a machine.s name is a DNS label, so this one is work-er'
 gbc '; network backend: aliases not translated'
 gbc '; network backend: driver not translated'
+# enable_ipv6 and ipam: a ULA /64 drawn for IPv6 where none is given, an
+# ipam config's subnets taken where hull takes them, one it does not said
+# and drawn instead, and the gateway said; a flow list of several read.
+gbc '\(dual \(source "busybox:1\.36"\) \(segments \(cli-six \(subnet "10\.[0-9.]+/24"\) \(subnet6 "fd[0-9a-f]{2}:[0-9a-f]{4}:[0-9a-f]{4}::/64"\)\) \(cli-given \(subnet "172\.28\.0\.0/16"\) \(subnet6 "fd00:28::/64"\)\) \(cli-small \(subnet "10\.1[6-9][0-9]\.[0-9]+\.0/24"\)\)\)'
+gbc '; network small: ipam subnet 10\.5\.0\.0/30 is not one hull takes, so one is drawn'
+gbc '; network given: ipam gateway not translated'
 gbc '^  \(sidecar \(source "busybox:1\.36"\)$'
 # network_mode: bridge, docker's own network, is hull's nat; host and none
 # are hull's as they are, a port under either dropped and said, as docker
@@ -1519,7 +1541,7 @@ cat > "$root/compose.yaml" <<'YML'
 services:
   web:
     image: "dir:./rootfs"
-    command: ["/probe", "say", "from compose", "env", "GREETING", "host", "dns", "db", "hosts", "db"]
+    command: ["/probe", "say", "from compose", "env", "GREETING", "host", "dns", "db", "hosts", "db", "dns6", "db"]
     environment:
       GREETING: hi
     hostname: composed
@@ -1531,12 +1553,14 @@ services:
 networks:
   default:
     driver: bridge
+    enable_ipv6: true
 YML
 limit=60
 expect 0 '^web +\| host=composed$' sh -c 'cd "$1" && exec "$2" up' up "$root" "$hull_abs"
 for want in '^web +\| from compose$' '^web +\| GREETING=hi$' \
 	'^compose\.yaml: web: depends_on not translated, its machines start together: db$' \
 	'^web +\| dns=db 10\.1[6-9][0-9]\.[0-9]+\.[0-9]+$' '^web +\| hosts=db 10\.1[6-9][0-9]\.' \
+	'^web +\| dns6=db fd[0-9a-f]{2}:[0-9a-f]{1,4}:[0-9a-f]{1,4}:' \
 	'^compose\.yaml: network default: driver not translated$'; do
 	cases=$((cases + 1))
 	printf '%s\n' "$out" | grep -Eq -- "$want" || fail "hull up: no line matches /$want/" "$out"

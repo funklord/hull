@@ -21,6 +21,7 @@
 #define _GNU_SOURCE
 
 #include <ctype.h>
+#include <arpa/inet.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -533,6 +534,60 @@ typedef struct svc {
 static char file_nets[MAX_NETS * 8][64];
 static int  file_net_count;
 
+/* What the file's top-level networks: say of each, by its name as a
+ * label: enable_ipv6, and the subnets its ipam config gives. */
+static struct declared {
+	char name[64];
+	int  ipv6;
+	char subnet[64];
+	char subnet6[64];
+} declared[MAX_NETS * 8];
+static int declared_count;
+
+static void as_label(char *out, size_t cap, const char *text);
+
+/* The declared network named `name`, made where `make` and it is not yet;
+ * NULL where there is none or no room. */
+static struct declared *declared_of(const char *name, int make)
+{
+	char label[64];
+
+	as_label(label, sizeof label, name);
+	for (int i = 0; i < declared_count; i++)
+		if (strcmp(declared[i].name, label) == 0)
+			return &declared[i];
+	if (!make || declared_count == MAX_NETS * 8)
+		return NULL;
+	memset(&declared[declared_count], 0, sizeof declared[0]);
+	snprintf(declared[declared_count].name, sizeof declared[0].name, "%s", label);
+	return &declared[declared_count++];
+}
+
+/* Whether `text` is a network hull takes as a segment's subnet: IPv4,
+ * a.b.c.d/n with n from 8 to 29, or IPv6, with n from 48 to 120, its host
+ * bits clear, as the spec checks them. */
+static int usable_subnet(const char *text, int six)
+{
+	char          copy[64];
+	char         *slash;
+	unsigned char address[16];
+	unsigned long prefix;
+	unsigned      bits = six ? 128u : 32u;
+
+	snprintf(copy, sizeof copy, "%s", text);
+	if ((slash = strchr(copy, '/')) == NULL)
+		return 0;
+	*slash = '\0';
+	prefix = strtoul(slash + 1, NULL, 10);
+	if (inet_pton(six ? AF_INET6 : AF_INET, copy, address) != 1 ||
+	    prefix < (six ? 48u : 8u) || prefix > (six ? 120u : 29u))
+		return 0;
+	for (unsigned bit = (unsigned)prefix; bit < bits; bit++)
+		if (address[bit / 8u] & (0x80u >> (bit % 8u)))
+			return 0;
+	return 1;
+}
+
 /* `text` as a DNS label, as a segment's and a machine's name must be:
  * lowercase, `-` for anything else, none leading, trailing or doubled,
  * at most 63; "x" where nothing is left. */
@@ -596,6 +651,7 @@ static int flow_list(char *s, char **args, int max)
 	for (;;) {
 		char *out;
 		char  q = 0;
+		char  stop;
 
 		while (*s == ' ' || *s == '\t' || *s == ',')
 			s++;
@@ -617,15 +673,17 @@ static int flow_list(char *s, char **args, int max)
 		else
 			while (out > args[n - 1] && (out[-1] == ' ' || out[-1] == '\t'))
 				out--;
-		/* An unquoted last item ends at the `]`, which ending it would
-		 * overwrite: so the list ends here. */
-		if (!q && *s == ']') {
-			*out = '\0';
-			return n;
-		}
-		if (*s == '\0')
-			return -1;
+		/* An unquoted item is ended in place, which overwrites the `,` or
+		 * `]` that ended it: so what that was is read first. */
+		stop = *s;
 		*out = '\0';
+		if (stop == '\0')
+			return -1;
+		if (!q) {
+			if (stop == ']')
+				return n;
+			s++;
+		}
 	}
 }
 
@@ -867,6 +925,7 @@ static char *segments(char *text, const char *project)
 {
 	unsigned subnet[MAX_NETS * 8];
 	sb       out = { NULL, 0u, 0u, 0 };
+	sb       notes = { NULL, 0u, 0u, 0 };
 
 	for (int i = 0; i < file_net_count; i++) {
 		char     form[160];
@@ -888,7 +947,7 @@ static char *segments(char *text, const char *project)
 		const char *end;
 		char        net[64];
 		char        segment[64];
-		char        form[200];
+		char        form[320];
 		int         i = 0;
 
 		if (*c != '\001' || (end = strchr(c, '\002')) == NULL) {
@@ -900,18 +959,82 @@ static char *segments(char *text, const char *project)
 			i++;
 		snprintf(form, sizeof form, "%.63s-%.63s", project, net);
 		as_label(segment, sizeof segment, form);
-		snprintf(form, sizeof form, "(%s (subnet \"10.%u.%u.0/24\"))", segment,
-		         160u + (i < file_net_count ? subnet[i] / 256u : 0u),
-		         i < file_net_count ? subnet[i] % 256u : 0u);
+		{
+			const struct declared *d = declared_of(net, 0);
+			char                   v4[64];
+			char                   v6[64] = "";
+
+			/* Its ipam subnets where hull can take them, else drawn: IPv4
+			 * under 10.160.0.0/11, and for enable_ipv6 a ULA /64 drawn by
+			 * FNV-1a from the segment's name, as RFC 4193 draws a global
+			 * id at random, so each is the same each run. */
+			if (d != NULL && d->subnet[0] != '\0' && usable_subnet(d->subnet, 0))
+				snprintf(v4, sizeof v4, "%s", d->subnet);
+			else
+				snprintf(v4, sizeof v4, "10.%u.%u.0/24",
+				         160u + (i < file_net_count ? subnet[i] / 256u : 0u),
+				         i < file_net_count ? subnet[i] % 256u : 0u);
+			if (d != NULL && d->subnet6[0] != '\0' && usable_subnet(d->subnet6, 1)) {
+				snprintf(v6, sizeof v6, "%s", d->subnet6);
+			} else if (d != NULL && (d->ipv6 || d->subnet6[0] != '\0')) {
+				uint64_t h = 14695981039346656037u;
+
+				for (const char *p = segment; *p != '\0'; p++)
+					h = (h ^ (uint8_t)*p) * 1099511628211u;
+				snprintf(v6, sizeof v6, "fd%02x:%02x%02x:%02x%02x::/64",
+				         (unsigned)(h >> 32 & 0xffu), (unsigned)(h >> 24 & 0xffu),
+				         (unsigned)(h >> 16 & 0xffu), (unsigned)(h >> 8 & 0xffu),
+				         (unsigned)(h & 0xffu));
+			}
+			/* Said once per network, at the head of the file: a comment in
+			 * a machine's line would end the line. */
+			for (int family = 0; d != NULL && family < 2; family++) {
+				const char *given = family == 0 ? d->subnet : d->subnet6;
+				char        line[300];
+
+				if (given[0] == '\0' || usable_subnet(given, family) ||
+				    (notes.data != NULL && strstr(notes.data, given) != NULL))
+					continue;
+				snprintf(line, sizeof line, "network %s: ipam subnet %s is not one hull takes, "
+				         "so one is drawn", net, given);
+				sb_str(&notes, "\n; ");
+				sb_str(&notes, line);
+				if (warnings != NULL)
+					fprintf(warnings, "%s: %s\n", warned_path, line);
+			}
+			if (v6[0] != '\0')
+				snprintf(form, sizeof form, "(%s (subnet \"%s\") (subnet6 \"%s\"))", segment, v4,
+				         v6);
+			else
+				snprintf(form, sizeof form, "(%s (subnet \"%s\"))", segment, v4);
+		}
 		sb_str(&out, form);
 		c = end;
 	}
 	free(text);
-	if (out.bad) {
+	if (out.bad || notes.bad) {
 		fprintf(stderr, "hull: import: out of memory\n");
 		free(out.data);
+		free(notes.data);
 		return NULL;
 	}
+	/* The notes after the opening `(machines`, with the file's others. */
+	if (notes.data != NULL && strncmp(out.data, "(machines", 9u) == 0) {
+		sb whole = { NULL, 0u, 0u, 0 };
+
+		sb_str(&whole, "(machines");
+		sb_str(&whole, notes.data);
+		sb_str(&whole, out.data + 9);
+		free(out.data);
+		out = whole;
+		if (out.bad) {
+			fprintf(stderr, "hull: import: out of memory\n");
+			free(out.data);
+			free(notes.data);
+			return NULL;
+		}
+	}
+	free(notes.data);
 	return out.data;
 }
 
@@ -949,9 +1072,12 @@ static char *compose_text(FILE *file, const char *project)
 	char   name[64];
 	int    in_networks = 0;
 	int    network_indent = -1;
+	int    key_indent = -1;
+	int    in_ipam = 0;
 	char   network[64] = "";
 
 	file_net_count = 0;
+	declared_count = 0;
 	as_label(name, sizeof name, project);
 
 	while (fgets(line, sizeof line, file) != NULL) {
@@ -995,22 +1121,54 @@ static char *compose_text(FILE *file, const char *project)
 		 * none, so each is said, `external` above all, which would join a
 		 * network made elsewhere. */
 		if (in_networks) {
-			colon = strchr(content, ':');
+			char *item = content;
+			char *value;
+
+			if (*item == '-')
+				item = trim(item + 1);
+			colon = strchr(item, ':');
 			if (network_indent < 0)
 				network_indent = ind;
 			if (colon != NULL)
 				*colon = '\0';
+			value = colon != NULL ? scalar(colon + 1) : (char *)"";
 			if (ind == network_indent) {
-				snprintf(network, sizeof network, "%s", trim(content));
+				snprintf(network, sizeof network, "%s", trim(item));
+				declared_of(network, 1);
+				key_indent = -1;
+				in_ipam = 0;
+				continue;
+			}
+			if (key_indent < 0)
+				key_indent = ind;
+			if (ind == key_indent)
+				in_ipam = 0;
+			/* IPv6 where enable_ipv6 asks it, and the subnets an ipam
+			 * config gives; the rest said, as before. */
+			if (ind == key_indent && strcmp(trim(item), "enable_ipv6") == 0) {
+				struct declared *d = declared_of(network, 1);
+
+				if (d != NULL)
+					d->ipv6 = strcmp(value, "true") == 0;
+			} else if (ind == key_indent && strcmp(trim(item), "ipam") == 0) {
+				in_ipam = 1;
+			} else if (in_ipam && (strcmp(trim(item), "config") == 0)) {
+				;
+			} else if (in_ipam && strcmp(trim(item), "subnet") == 0) {
+				struct declared *d = declared_of(network, 1);
+
+				if (d != NULL)
+					snprintf(strchr(value, ':') != NULL ? d->subnet6 : d->subnet,
+					         sizeof d->subnet, "%s", value);
 			} else {
 				sb_str(&top_notes, "\n; network ");
 				sb_str(&top_notes, network);
-				sb_str(&top_notes, ": ");
-				sb_str(&top_notes, trim(content));
+				sb_str(&top_notes, in_ipam ? ": ipam " : ": ");
+				sb_str(&top_notes, trim(item));
 				sb_str(&top_notes, " not translated");
 				if (warnings != NULL)
-					fprintf(warnings, "%s: network %s: %s not translated\n", warned_path,
-					        network, trim(content));
+					fprintf(warnings, "%s: network %s: %s%s not translated\n", warned_path,
+					        network, in_ipam ? "ipam " : "", trim(item));
 			}
 			continue;
 		}
