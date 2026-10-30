@@ -49,6 +49,15 @@ struct ethernet_header size=14 repr=ValueConverted atomic=NonAtomic
   ethernet_header.source                 offset=AbsoluteStatic(0x06) size=Fixed(6) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
   ethernet_header.ethertype              offset=AbsoluteStatic(0x0C) size=Fixed(2) align=Aligned(4) repr=ValueConverted atomic=AtomicWord
 
+struct icmp6_echo size=8.. mutate=Immutable repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  icmp6_echo.summed                      offset=AbsoluteStatic(0x00) size=Unbounded align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting auth=Covered(checksum)
+  icmp6_echo.type                        offset=AbsoluteStatic(0x00) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord auth=Covered(checksum)
+  icmp6_echo.code                        offset=AbsoluteStatic(0x01) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord auth=Covered(checksum)
+  icmp6_echo.checksum                    offset=AbsoluteStatic(0x02) size=Fixed(2) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic mutate=Immutable
+  icmp6_echo.identifier                  offset=AbsoluteStatic(0x04) size=Fixed(2) align=Aligned(4) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  icmp6_echo.sequence                    offset=AbsoluteStatic(0x06) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  icmp6_echo.data                        offset=AbsoluteStatic(0x08) size=Unbounded align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord mutate=Shifting auth=Covered(checksum)
+
 struct icmp_echo size=8.. mutate=Immutable repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
   icmp_echo.summed                       offset=AbsoluteStatic(0x00) size=Unbounded align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting auth=Covered(checksum)
   icmp_echo.type                         offset=AbsoluteStatic(0x00) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord auth=Covered(checksum)
@@ -76,6 +85,38 @@ struct ipv4_header size=20..60 mutate=Immutable repr=ValueConverted atomic=NonAt
   ipv4_header.source                     offset=AbsoluteStatic(0x0C) size=Fixed(4) align=Aligned(4) repr=ValueConverted atomic=AtomicWord auth=Covered(header_checksum)
   ipv4_header.destination                offset=AbsoluteStatic(0x10) size=Fixed(4) align=Aligned(8) repr=ValueConverted atomic=AtomicWord auth=Covered(header_checksum)
   ipv4_header.options                    offset=AbsoluteStatic(0x14) size=Bounded(0, 40) align=Aligned(4) repr=MemoryIdentical atomic=AtomicWord mutate=Shifting auth=Covered(header_checksum)
+
+struct ipv6_header size=40 repr=ValueConverted atomic=NonAtomic
+  ipv6_header.version                    offset=AbsoluteStatic(0x00) size=Fixed(4bit) align=Unaligned repr=ValueConverted atomic=NonAtomic
+  ipv6_header.traffic_high               offset=AbsoluteStatic(0x00:4) size=Fixed(4bit) align=Unaligned repr=ValueConverted atomic=NonAtomic
+  ipv6_header.traffic_low                offset=AbsoluteStatic(0x01) size=Fixed(4bit) align=Unaligned repr=ValueConverted atomic=NonAtomic
+  ipv6_header.flow_label                 offset=AbsoluteStatic(0x01:4) size=Fixed(20bit) align=Unaligned repr=ValueConverted atomic=NonAtomic
+  ipv6_header.payload_length             offset=AbsoluteStatic(0x04) size=Fixed(2) align=Aligned(4) repr=ValueConverted atomic=AtomicWord
+  ipv6_header.next_header                offset=AbsoluteStatic(0x06) size=Fixed(1) align=Aligned(2) repr=MemoryIdentical atomic=AtomicWord
+  ipv6_header.hop_limit                  offset=AbsoluteStatic(0x07) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  ipv6_header.source                     offset=AbsoluteStatic(0x08) size=Fixed(16) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic
+  ipv6_header.destination                offset=AbsoluteStatic(0x18) size=Fixed(16) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic
+
+struct neighbor_advertisement size=24.. mutate=Immutable repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  neighbor_advertisement.summed          offset=AbsoluteStatic(0x00) size=Unbounded align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting auth=Covered(checksum)
+  neighbor_advertisement.type            offset=AbsoluteStatic(0x00) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord auth=Covered(checksum)
+  neighbor_advertisement.code            offset=AbsoluteStatic(0x01) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord auth=Covered(checksum)
+  neighbor_advertisement.checksum        offset=AbsoluteStatic(0x02) size=Fixed(2) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic mutate=Immutable
+  neighbor_advertisement.router          offset=AbsoluteStatic(0x04) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  neighbor_advertisement.solicited       offset=AbsoluteStatic(0x04:1) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  neighbor_advertisement.override        offset=AbsoluteStatic(0x04:2) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  neighbor_advertisement.<reserved0>     offset=AbsoluteStatic(0x04:3) size=Fixed(29bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  neighbor_advertisement.target          offset=AbsoluteStatic(0x08) size=Fixed(16) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic auth=Covered(checksum)
+  neighbor_advertisement.options         offset=AbsoluteStatic(0x18) size=Unbounded align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord mutate=Shifting auth=Covered(checksum)
+
+struct neighbor_solicitation size=24.. mutate=Immutable repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  neighbor_solicitation.summed           offset=AbsoluteStatic(0x00) size=Unbounded align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting auth=Covered(checksum)
+  neighbor_solicitation.type             offset=AbsoluteStatic(0x00) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord auth=Covered(checksum)
+  neighbor_solicitation.code             offset=AbsoluteStatic(0x01) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord auth=Covered(checksum)
+  neighbor_solicitation.checksum         offset=AbsoluteStatic(0x02) size=Fixed(2) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic mutate=Immutable
+  neighbor_solicitation.unused           offset=AbsoluteStatic(0x04) size=Fixed(4) align=Aligned(4) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  neighbor_solicitation.target           offset=AbsoluteStatic(0x08) size=Fixed(16) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic auth=Covered(checksum)
+  neighbor_solicitation.options          offset=AbsoluteStatic(0x18) size=Unbounded align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord mutate=Shifting auth=Covered(checksum)
 
 struct pseudo_header size=12 repr=ValueConverted
   pseudo_header.source_address           offset=AbsoluteStatic(0x00) size=Fixed(4) align=Aligned(8) repr=ValueConverted atomic=AtomicWord

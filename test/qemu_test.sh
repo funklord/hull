@@ -676,6 +676,26 @@ cases=$((cases + 1))
 	printf '%s\n' "$out" | grep -q "^vdb *| dns6=cweb $cweb6\$" &&
 	printf '%s\n' "$out" | grep -q "^vdb *| ping=$cweb6 ok\$" ||
 	fail "a vm and a chroot machine did not reach each other over IPv6" "$out"
+# A segment of IPv6 alone: the vm's NIC up with its IPv6 address and no
+# IPv4 one, hull at its network's ::1 its nameserver, asked there over UDP
+# and TCP for the chroot machine's AAAA, which it then reaches; ::1 itself
+# answering ping.
+only6="only6-$$"
+printf '(machines (c6 %s) (v6 %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments ($only6 (subnet6 \"fd42:85::/64\"))) (command \"/probe\" \"addr6\" \"eth0\" \"sleep\" \"50\")" \
+	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network none) (segments ($only6 (subnet6 \"fd42:85::/64\"))) (command \"/probe\" \"addr6\" \"eth0\" \"read\" \"/etc/resolv.conf\" \"dns6\" \"c6\" \"dnstcp6\" \"c6\" \"ping6\" \"c6\" \"ping\" \"fd42:85::1\")" \
+	> "$root/only6.conf"
+name=only6
+boot only6 150
+has 0 '^v6 +\| read=nameserver fd42:85::1$'
+c6at=$(printf '%s\n' "$out" | sed -n 's#^c6 *| addr6=eth0 \(fd42:85:[0-9a-f:]*\)/64$#\1#p')
+cases=$((cases + 1))
+[ -n "$c6at" ] && printf '%s\n' "$out" | grep -q '^v6 *| addr6=eth0 fd42:85:[0-9a-f:]*/64$' &&
+	printf '%s\n' "$out" | grep -q "^v6 *| dns6=c6 $c6at\$" &&
+	printf '%s\n' "$out" | grep -q "^v6 *| dnstcp6=c6 $c6at\$" &&
+	printf '%s\n' "$out" | grep -q "^v6 *| ping=$c6at ok\$" &&
+	printf '%s\n' "$out" | grep -q '^v6 *| ping=fd42:85::1 ok$' ||
+	fail "a vm on a segment of IPv6 alone was not named and reached by hull at ::1" "$out"
 timeout 10 "$hull" kill -s TERM anchor > /dev/null 2>&1
 wait "$anchored"
 # (init PATH): PID 1 is the image's init, here the probe as one, which

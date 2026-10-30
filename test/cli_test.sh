@@ -1479,6 +1479,24 @@ cases=$((cases + 1))
 	printf '%s\n' "$out" | grep -q "^six-a *| dns6=six-b $b6\$" &&
 	printf '%s\n' "$out" | grep -q "^six-a *| ping=$b6 ok\$" ||
 	fail "two machines on a segment with an IPv6 network did not reach each other by it" "$out"
+# A segment of IPv6 alone: no IPv4 address, hull at the network's ::1 the
+# nameserver, its AAAA answered over UDP and TCP and no A, ::1 answering
+# ping, and the sibling reached.
+printf '(machines (only-a %s) (only-b %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (sixonly-$$ (subnet6 \"fd42:86::/64\"))) (command \"/probe\" \"sleep\" \"1\" \"addr\" \"eth0\" \"read\" \"/etc/resolv.conf\" \"dns6\" \"only-b\" \"dnstcp6\" \"only-b\" \"dns\" \"only-b\" \"ping\" \"fd42:86::1\" \"ping6\" \"only-b\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (sixonly-$$ (subnet6 \"fd42:86::/64\"))) (command \"/probe\" \"sleep\" \"6\" \"addr6\" \"eth0\")" \
+	> "$root/only6.conf"
+limit=60
+from_root 0 '^only-a +\| read=nameserver fd42:86::1$' -f "$root/only6.conf"
+ob6=$(printf '%s\n' "$out" | sed -n 's#^only-b *| addr6=eth0 \(fd42:86:[0-9a-f:]*\)/64$#\1#p')
+cases=$((cases + 1))
+[ -n "$ob6" ] && printf '%s\n' "$out" | grep -q '^only-a *| addr=eth0 none/0 up$' &&
+	printf '%s\n' "$out" | grep -q "^only-a *| dns6=only-b $ob6\$" &&
+	printf '%s\n' "$out" | grep -q "^only-a *| dnstcp6=only-b $ob6\$" &&
+	printf '%s\n' "$out" | grep -q '^only-a *| dns=only-b rcode 0$' &&
+	printf '%s\n' "$out" | grep -q '^only-a *| ping=fd42:86::1 ok$' &&
+	printf '%s\n' "$out" | grep -q "^only-a *| ping=$ob6 ok\$" ||
+	fail "two machines on a segment of IPv6 alone were not named and reached by hull at ::1" "$out"
 # The compose dialect (section 9): `hull up` runs the compose file beside
 # it with no step between, saying on stderr what it does not translate,
 # and `-f` gives one to plan as to run. Its services share the project's

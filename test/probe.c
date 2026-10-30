@@ -91,6 +91,7 @@
  *               echoed whole, or none
  *   ping6 N     ping N's IPv6 address in /etc/hosts
  *   dns6 N      N's AAAA record, asked as dns asks for its A
+ *   dnstcp6 N   the same over TCP
  *   hosts6 N    N's IPv6 address in /etc/hosts
  *   addr6 IF    IF's IPv6 address of global scope and its prefix
  *   spin MS     use MS milliseconds of CPU time, by its own clock
@@ -499,14 +500,14 @@ static void ping(const char *address)
 }
 
 /* The first nameserver /etc/resolv.conf names, into `out`: 1, or 0. */
-static int nameserver(char out[16])
+static int nameserver(char out[64])
 {
 	FILE *conf = fopen("/etc/resolv.conf", "r");
 	char  line[256];
 	int   found = 0;
 
 	while (conf != NULL && !found && fgets(line, sizeof line, conf) != NULL)
-		found = sscanf(line, "nameserver %15s", out) == 1;
+		found = sscanf(line, "nameserver %63s", out) == 1;
 	if (conf != NULL)
 		fclose(conf);
 	return found;
@@ -517,10 +518,10 @@ static int nameserver(char out[16])
  * answer's address or name, or its rcode. */
 /* One answer to `query` from `to` over TCP, each after its length as 16
  * bits (RFC 7766): its length, or -1. */
-static ssize_t ask_tcp(const struct sockaddr_in *to, const uint8_t *query, size_t n,
-                       uint8_t *answer, size_t cap)
+static ssize_t ask_tcp(const struct sockaddr *to, socklen_t to_length, const uint8_t *query,
+                       size_t n, uint8_t *answer, size_t cap)
 {
-	int           fd = socket(AF_INET, SOCK_STREAM, 0);
+	int           fd = socket(to->sa_family, SOCK_STREAM, 0);
 	uint8_t       framed[2 + 300];
 	uint8_t       length[2];
 	size_t        want;
@@ -532,7 +533,7 @@ static ssize_t ask_tcp(const struct sockaddr_in *to, const uint8_t *query, size_
 	memcpy(framed + 2, query, n);
 	p.fd     = fd;
 	p.events = POLLIN;
-	if (fd < 0 || connect(fd, (const struct sockaddr *)to, sizeof *to) != 0 ||
+	if (fd < 0 || connect(fd, to, to_length) != 0 ||
 	    write(fd, framed, n + 2u) != (ssize_t)(n + 2u) || poll(&p, 1u, 15000) != 1 ||
 	    read(fd, length, 2u) != 2) {
 		if (fd >= 0)
@@ -553,11 +554,14 @@ static ssize_t ask_tcp(const struct sockaddr_in *to, const uint8_t *query, size_
 
 static void ask_dns(const char *step, const char *shown, const char *name, unsigned type)
 {
-	int                tcp = strcmp(step, "dnstcp") == 0;
-	int                fd = socket(AF_INET, SOCK_DGRAM, 0);
-	struct sockaddr_in to;
-	struct pollfd      p;
-	char               server[16];
+	int                 tcp = strcmp(step, "dnstcp") == 0 || strcmp(step, "dnstcp6") == 0;
+	int                 fd;
+	struct sockaddr_in  to;
+	struct sockaddr_in6 to6;
+	struct sockaddr    *at;
+	socklen_t           at_length;
+	struct pollfd       p;
+	char                server[64];
 	uint8_t            query[300] = { 0x68, 0x76, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0 };
 	uint8_t            answer[1500];
 	size_t             n = 12u;
@@ -565,9 +569,26 @@ static void ask_dns(const char *step, const char *shown, const char *name, unsig
 
 	if (!nameserver(server)) {
 		printf("%s=%s no nameserver\n", step, shown);
-		close(fd);
 		return;
 	}
+	/* Its family, the nameserver's: IPv6 where hull is at a segment's
+	 * ::1, as on a segment of IPv6 alone. */
+	memset(&to, 0, sizeof to);
+	memset(&to6, 0, sizeof to6);
+	to.sin_family    = AF_INET;
+	to.sin_port      = htons(53);
+	to6.sin6_family  = AF_INET6;
+	to6.sin6_port    = htons(53);
+	if (strchr(server, ':') != NULL) {
+		inet_pton(AF_INET6, server, &to6.sin6_addr);
+		at        = (struct sockaddr *)&to6;
+		at_length = sizeof to6;
+	} else {
+		inet_pton(AF_INET, server, &to.sin_addr);
+		at        = (struct sockaddr *)&to;
+		at_length = sizeof to;
+	}
+	fd = socket(at->sa_family, SOCK_DGRAM, 0);
 	for (const char *label = name; *label != '\0' && n < sizeof query - 70u;) {
 		size_t length = strcspn(label, ".");
 
@@ -583,18 +604,14 @@ static void ask_dns(const char *step, const char *shown, const char *name, unsig
 	query[n++] = (uint8_t)type;
 	query[n++] = 0;
 	query[n++] = 1;
-	memset(&to, 0, sizeof to);
-	to.sin_family = AF_INET;
-	to.sin_port   = htons(53);
-	inet_pton(AF_INET, server, &to.sin_addr);
 	p.fd     = fd;
 	p.events = POLLIN;
 	/* Over TCP one connection, as a resolver keeps one: what it loses is
 	 * the connection's to send again, not a fresh one's to hide. */
 	for (int tries = 0; tries < (tcp ? 1 : 3) && got < 0; tries++) {
 		if (tcp)
-			got = ask_tcp(&to, query, n, answer, sizeof answer);
-		else if (sendto(fd, query, n, 0, (struct sockaddr *)&to, sizeof to) == (ssize_t)n &&
+			got = ask_tcp(at, at_length, query, n, answer, sizeof answer);
+		else if (sendto(fd, query, n, 0, at, at_length) == (ssize_t)n &&
 		         poll(&p, 1u, 2000) == 1)
 			got = recv(fd, answer, sizeof answer, 0);
 	}
@@ -1419,6 +1436,9 @@ int main(int argc, char **argv)
 			i++;
 		} else if (strcmp(step, "addr") == 0) {
 			show_address(arg);
+			i++;
+		} else if (strcmp(step, "dnstcp6") == 0) {
+			ask_dns(step, arg, arg, 28u);
 			i++;
 		} else if (strcmp(step, "dns6") == 0) {
 			ask_dns(step, arg, arg, 28u);

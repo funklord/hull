@@ -45,8 +45,9 @@ static int element(const hull_spec *spec, const hull_sexpr_form *item, char *nam
 	subnet6[0] = '\0';
 	if (item->kind == HULL_SEXPR_LIST) {
 		if (!hull_sexpr_child(&spec->doc, item, &head) ||
-		    !entry_text(spec, item, "subnet", subnet, subnet_cap) || subnet[0] == '\0' ||
-		    !entry_text(spec, item, "subnet6", subnet6, subnet6_cap))
+		    !entry_text(spec, item, "subnet", subnet, subnet_cap) ||
+		    !entry_text(spec, item, "subnet6", subnet6, subnet6_cap) ||
+		    (subnet[0] == '\0' && subnet6[0] == '\0'))
 			return 0;
 	}
 	if (hull_sexpr_value(&spec->doc, &head, (uint8_t *)name, name_cap - 1u, &length) !=
@@ -166,8 +167,8 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 			char                name[64];
 			char                subnet[32];
 			char                subnet6[64];
-			uint32_t            network;
-			unsigned            prefix;
+			uint32_t            network = 0u;
+			unsigned            prefix = 0u;
 			uint8_t             network6[16];
 			unsigned            prefix6 = 0u;
 			hull_names_segment *s;
@@ -175,14 +176,27 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 			if (!element(spec, &item, name, sizeof name, subnet, sizeof subnet, subnet6,
 			             sizeof subnet6))
 				return refuse(names, "a segment of %s cannot be read%s", ids[i], "");
-			if (subnet[0] == '\0')
+			if (subnet[0] == '\0' && subnet6[0] == '\0')
 				continue;
-			parse_subnet(subnet, &network, &prefix);
+			if (subnet[0] != '\0')
+				parse_subnet(subnet, &network, &prefix);
 			if (subnet6[0] != '\0')
 				parse_subnet6(subnet6, network6, &prefix6);
 			s = find(names, name);
-			if (s != NULL && (s->network != network || s->prefix != prefix))
+			/* Each family's network named by any machine is the segment's;
+			 * two that differ are refused. */
+			if (s != NULL && subnet[0] != '\0' && s->has4 &&
+			    (s->network != network || s->prefix != prefix))
 				return refuse(names, "segment %s is given two subnets, one by %s", name, ids[i]);
+			if (subnet[0] != '\0' && (s == NULL || !s->has4))
+				for (unsigned j = 0u; j < names->count; j++) {
+					const hull_names_segment *o = &names->segment[j];
+					uint32_t                  mask = mask_of(prefix < o->prefix ? prefix : o->prefix);
+
+					if (o != s && o->has4 && (network & mask) == (o->network & mask))
+						return refuse(names, "segments %s and %s have subnets that overlap",
+						              o->name, name);
+				}
 			/* An IPv6 network named by any machine is the segment's; two
 			 * that differ are refused as two IPv4 ones are. */
 			if (s != NULL && subnet6[0] != '\0' && s->has6 &&
@@ -200,6 +214,11 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 						              "overlap", o->name, name);
 				}
 			if (s != NULL) {
+				if (subnet[0] != '\0' && !s->has4) {
+					s->has4    = 1;
+					s->network = network;
+					s->prefix  = prefix;
+				}
 				if (subnet6[0] != '\0' && !s->has6) {
 					s->has6 = 1;
 					memcpy(s->network6, network6, 16u);
@@ -207,18 +226,11 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 				}
 				continue;
 			}
-			for (unsigned j = 0u; j < names->count; j++) {
-				const hull_names_segment *o = &names->segment[j];
-				uint32_t                  mask = mask_of(prefix < o->prefix ? prefix : o->prefix);
-
-				if ((network & mask) == (o->network & mask))
-					return refuse(names, "segments %s and %s have subnets that overlap",
-					              o->name, name);
-			}
 			if (names->count == HULL_NAMES_SEGMENTS)
 				return refuse(names, "more addressed segments than %s%s", "hull draws", "");
 			s = &names->segment[names->count++];
 			snprintf(s->name, sizeof s->name, "%s", name);
+			s->has4    = subnet[0] != '\0';
 			s->network = network;
 			s->prefix  = prefix;
 			if (subnet6[0] != '\0') {
@@ -264,22 +276,27 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 			        sizeof subnet6);
 			if ((s = find(names, name)) == NULL)
 				continue;
-			if (subnet[0] == '\0')
+			if (subnet[0] == '\0' && subnet6[0] == '\0')
 				return refuse(names, "segment %s is addressed, and %s names it without its "
 				              "subnet: give the subnet in both", name, ids[at]);
-			usable = (1u << (32u - s->prefix)) - 3u;
-			if (s->count == usable || s->count == HULL_NAMES_MEMBERS)
+			if (s->count == HULL_NAMES_MEMBERS)
 				return refuse(names, "segment %s holds no address for %s", name, ids[at]);
-			slot = draw(ids[at], name) % usable;
-			for (int taken = 1; taken;) {
-				taken = 0;
-				for (unsigned k = 0u; k < s->count && !taken; k++)
-					taken = s->address[k] == s->network + 2u + slot;
-				if (taken)
-					slot = (slot + 1u) % usable;
-			}
 			s->member[s->count]  = at;
-			s->address[s->count] = s->network + 2u + slot;
+			s->address[s->count] = 0u;
+			if (s->has4) {
+				usable = (1u << (32u - s->prefix)) - 3u;
+				if (s->count == usable)
+					return refuse(names, "segment %s holds no address for %s", name, ids[at]);
+				slot = draw(ids[at], name) % usable;
+				for (int taken = 1; taken;) {
+					taken = 0;
+					for (unsigned k = 0u; k < s->count && !taken; k++)
+						taken = s->address[k] == s->network + 2u + slot;
+					if (taken)
+						slot = (slot + 1u) % usable;
+				}
+				s->address[s->count] = s->network + 2u + slot;
+			}
 			/* Its IPv6 address the same way, past ::0 and hull's ::1, in
 			 * the host part's last 64 bits at most. */
 			if (s->has6) {
@@ -370,10 +387,12 @@ long hull_names_entry(const hull_names *names, unsigned member, uint8_t *data, s
 		put_atom(&o, s->name);
 		for (unsigned k = 0u; k < s->count; k++)
 			if (s->member[k] == member) {
-				dotted(s->address[k], text);
-				put(&o, "(7:address", 10u);
-				put_atom(&o, text);
-				put(&o, ")", 1u);
+				if (s->has4) {
+					dotted(s->address[k], text);
+					put(&o, "(7:address", 10u);
+					put_atom(&o, text);
+					put(&o, ")", 1u);
+				}
 				if (s->has6) {
 					char text6[INET6_ADDRSTRLEN];
 
@@ -394,15 +413,17 @@ long hull_names_entry(const hull_names *names, unsigned member, uint8_t *data, s
 			}
 			order[j] = k;
 		}
-		put(&o, "(5:hosts", 8u);
-		for (unsigned k = 0u; k < s->count; k++) {
-			put(&o, "(", 1u);
-			put_atom(&o, names->ids[s->member[order[k]]]);
-			dotted(s->address[order[k]], text);
-			put_atom(&o, text);
+		if (s->has4) {
+			put(&o, "(5:hosts", 8u);
+			for (unsigned k = 0u; k < s->count; k++) {
+				put(&o, "(", 1u);
+				put_atom(&o, names->ids[s->member[order[k]]]);
+				dotted(s->address[order[k]], text);
+				put_atom(&o, text);
+				put(&o, ")", 1u);
+			}
 			put(&o, ")", 1u);
 		}
-		put(&o, ")", 1u);
 		if (s->has6) {
 			put(&o, "(6:hosts6", 9u);
 			for (unsigned k = 0u; k < s->count; k++) {
@@ -416,10 +437,12 @@ long hull_names_entry(const hull_names *names, unsigned member, uint8_t *data, s
 			}
 			put(&o, ")", 1u);
 		}
-		snprintf(prefix, sizeof prefix, "%u", s->prefix);
-		put(&o, "(6:prefix", 9u);
-		put_atom(&o, prefix);
-		put(&o, ")", 1u);
+		if (s->has4) {
+			snprintf(prefix, sizeof prefix, "%u", s->prefix);
+			put(&o, "(6:prefix", 9u);
+			put_atom(&o, prefix);
+			put(&o, ")", 1u);
+		}
 		if (s->has6) {
 			snprintf(prefix, sizeof prefix, "%u", s->prefix6);
 			put(&o, "(7:prefix6", 10u);

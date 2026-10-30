@@ -929,28 +929,34 @@ static const char *place_names(const hull_sexpr_doc *doc, const hull_sexpr_form 
 			unsigned            prefix6 = 0u;
 			int                 named = segment != NULL &&
 			                            hull_access_named(doc, names, segment, address, &prefix);
-			int                 named6 = named &&
+			int                 named6 = segment != NULL &&
 			                             hull_access_named6(doc, names, segment, address6, &prefix6);
 
 			free(segment);
-			if (!named)
+			if (!named && !named6)
 				continue;
 			memset(&request, 0, sizeof request);
 			snprintf(request.ifr_name, sizeof request.ifr_name, "eth%u", nic);
-			set_address(&request.ifr_addr, address);
-			if (ioctl(fd, SIOCSIFADDR, &request) != 0) {
-				close(fd);
-				return "a segment's NIC's IPv4 address cannot be set";
+			if (named) {
+				set_address(&request.ifr_addr, address);
+				if (ioctl(fd, SIOCSIFADDR, &request) != 0) {
+					close(fd);
+					return "a segment's NIC's IPv4 address cannot be set";
+				}
+				mask = (struct sockaddr_in *)&request.ifr_netmask;
+				memset(&request.ifr_netmask, 0, sizeof request.ifr_netmask);
+				mask->sin_family = AF_INET;
+				mask->sin_addr.s_addr = htonl(0xffffffffu << (32u - prefix));
+				if (ioctl(fd, SIOCSIFNETMASK, &request) != 0) {
+					close(fd);
+					return "a segment's NIC's netmask cannot be set";
+				}
 			}
-			mask = (struct sockaddr_in *)&request.ifr_netmask;
-			memset(&request.ifr_netmask, 0, sizeof request.ifr_netmask);
-			mask->sin_family = AF_INET;
-			mask->sin_addr.s_addr = htonl(0xffffffffu << (32u - prefix));
-			if (ioctl(fd, SIOCSIFNETMASK, &request) != 0 || bring_up(fd, request.ifr_name) != 0) {
+			if (bring_up(fd, request.ifr_name) != 0) {
 				close(fd);
 				return "a segment's NIC cannot be brought up";
 			}
-			/* Its IPv6 address too, where the segment has an IPv6 network. */
+			/* Its IPv6 address, where the segment has an IPv6 network. */
 			if (named6 && hull_ip6_add(request.ifr_name, address6, prefix6) != 0) {
 				close(fd);
 				return "a segment's NIC's IPv6 address cannot be set";

@@ -159,7 +159,9 @@ struct slot {
 	struct {
 		char     segment[64];
 		uint32_t address;
-		unsigned prefix;
+		unsigned prefix;          /* 0 where the segment has IPv6 alone */
+		uint8_t  address6[16];
+		unsigned prefix6;         /* 0 where it has no IPv6 network */
 		hull_segment_host *hosts;   /* the plan's, every machine it names there */
 		unsigned           host_count;
 	}                  named[8];
@@ -405,6 +407,8 @@ static int on_segment(hull_core *core, const char *key, char *why, size_t cap)
 	const slot              *s          = core->slot;
 	uint32_t                 address    = 0u;
 	unsigned                 prefix     = 0u;
+	const uint8_t           *address6   = NULL;
+	unsigned                 prefix6    = 0u;
 	const hull_segment_host *hosts      = NULL;
 	unsigned                 host_count = 0u;
 	int                      fd;
@@ -413,12 +417,14 @@ static int on_segment(hull_core *core, const char *key, char *why, size_t cap)
 		if (strcmp(s->named[i].segment, key) == 0) {
 			address    = s->named[i].address;
 			prefix     = s->named[i].prefix;
+			address6   = s->named[i].address6;
+			prefix6    = s->named[i].prefix6;
 			hosts      = s->named[i].hosts;
 			host_count = s->named[i].host_count;
 		}
 	}
-	fd = hull_segment_port_named(key, s->id, address, prefix, s->forwards, hosts, host_count,
-	                             why, cap);
+	fd = hull_segment_port_named(key, s->id, address, prefix, address6, prefix6, s->forwards,
+	                             hosts, host_count, why, cap);
 
 	/* Before the machine runs, so that its first frame meets its link. */
 	for (unsigned i = 0u; fd >= 0 && i < s->link_count; i++) {
@@ -1809,8 +1815,6 @@ static int hosts_of(const hull_sexpr_doc *doc, const hull_sexpr_form *names, con
                     hull_segment_host **out, unsigned *count)
 {
 	hull_sexpr_form entry;
-	hull_sexpr_form hosts;
-	hull_sexpr_form host;
 	unsigned        n = 0u;
 	int             found = 0;
 
@@ -1826,64 +1830,68 @@ static int hosts_of(const hull_sexpr_doc *doc, const hull_sexpr_form *names, con
 		found = name != NULL && strcmp(name, segment) == 0;
 		free(name);
 	}
-	if (!found || !hull_access_find(doc, &entry, "hosts", &hosts))
+	if (!found)
 		return 0;
-	hull_sexpr_child(doc, &hosts, &host);
-	for (hull_sexpr_form h = host; hull_sexpr_next(doc, &h, &h);)
-		n++;
+	/* As many as both families name, at most: a machine named by both is
+	 * one host. */
+	for (unsigned family = 0u; family < 2u; family++) {
+		hull_sexpr_form hosts;
+		hull_sexpr_form host;
+
+		if (hull_access_find(doc, &entry, family == 0u ? "hosts" : "hosts6", &hosts) &&
+		    hull_sexpr_child(doc, &hosts, &host))
+			while (hull_sexpr_next(doc, &host, &host))
+				n++;
+	}
 	if (n == 0u || (*out = calloc(n, sizeof **out)) == NULL)
 		return n == 0u ? 0 : -1;
-	while (hull_sexpr_next(doc, &host, &host)) {
-		hull_sexpr_form id_form;
-		hull_sexpr_form address_form;
-		char           *id = NULL;
-		char           *address = NULL;
-		struct in_addr  parsed;
-		int             ok;
+	/* Each one's IPv4 address, then its IPv6 one where the segment has an
+	 * IPv6 network, matched by its id, or a host of its own where the
+	 * segment has IPv6 alone. */
+	for (unsigned family = 0u; family < 2u; family++) {
+		hull_sexpr_form hosts;
+		hull_sexpr_form host;
 
-		if (hull_sexpr_child(doc, &host, &id_form) &&
-		    hull_sexpr_next(doc, &id_form, &address_form)) {
-			id      = hull_access_text(doc, &id_form);
-			address = hull_access_text(doc, &address_form);
-		}
-		ok = id != NULL && address != NULL && strlen(id) < sizeof (*out)->id &&
-		     inet_pton(AF_INET, address, &parsed) == 1;
-		if (ok) {
-			snprintf((*out)[*count].id, sizeof (*out)->id, "%s", id);
-			(*out)[(*count)++].address = ntohl(parsed.s_addr);
-		}
-		free(id);
-		free(address);
-		if (!ok)
-			return -1;
-	}
-	/* And each one's IPv6 address, where the segment has an IPv6 network,
-	 * matched by its id. */
-	if (hull_access_find(doc, &entry, "hosts6", &hosts) && hull_sexpr_child(doc, &hosts, &host))
+		if (!hull_access_find(doc, &entry, family == 0u ? "hosts" : "hosts6", &hosts) ||
+		    !hull_sexpr_child(doc, &hosts, &host))
+			continue;
 		while (hull_sexpr_next(doc, &host, &host)) {
-			hull_sexpr_form id_form;
-			hull_sexpr_form address_form;
-			char           *id = NULL;
-			char           *address = NULL;
-			struct in6_addr parsed;
-			int             ok;
+			hull_sexpr_form    id_form;
+			hull_sexpr_form    address_form;
+			char              *id = NULL;
+			char              *address = NULL;
+			struct in_addr     parsed;
+			struct in6_addr    parsed6;
+			hull_segment_host *h = NULL;
+			int                ok;
 
 			if (hull_sexpr_child(doc, &host, &id_form) &&
 			    hull_sexpr_next(doc, &id_form, &address_form)) {
 				id      = hull_access_text(doc, &id_form);
 				address = hull_access_text(doc, &address_form);
 			}
-			ok = id != NULL && address != NULL && inet_pton(AF_INET6, address, &parsed) == 1;
-			for (unsigned k = 0u; ok && k < *count; k++)
-				if (strcmp((*out)[k].id, id) == 0) {
-					(*out)[k].has6 = 1;
-					memcpy((*out)[k].address6, &parsed, 16u);
-				}
+			ok = id != NULL && address != NULL && strlen(id) < sizeof (*out)->id &&
+			     (family == 0u ? inet_pton(AF_INET, address, &parsed) == 1 :
+			                     inet_pton(AF_INET6, address, &parsed6) == 1);
+			for (unsigned k = 0u; ok && family == 1u && k < *count && h == NULL; k++)
+				if (strcmp((*out)[k].id, id) == 0)
+					h = &(*out)[k];
+			if (ok && h == NULL) {
+				h = &(*out)[(*count)++];
+				snprintf(h->id, sizeof h->id, "%s", id);
+			}
+			if (ok && family == 0u) {
+				h->address = ntohl(parsed.s_addr);
+			} else if (ok) {
+				h->has6 = 1;
+				memcpy(h->address6, &parsed6, 16u);
+			}
 			free(id);
 			free(address);
 			if (!ok)
 				return -1;
 		}
+	}
 	return 0;
 }
 
@@ -1905,26 +1913,38 @@ static const char *named_of(slot *s, const hull_sexpr_doc *doc, const hull_sexpr
 		return NULL;
 	hull_sexpr_child(doc, &segments, &item);
 	while (hull_sexpr_next(doc, &item, &item)) {
-		char          *segment = hull_access_segment_name(doc, &item);
-		char           address[16];
-		unsigned       prefix;
-		struct in_addr parsed;
+		char           *segment = hull_access_segment_name(doc, &item);
+		char            address[16];
+		char            address6[46];
+		unsigned        prefix = 0u;
+		unsigned        prefix6 = 0u;
+		struct in_addr  parsed;
+		struct in6_addr parsed6;
+		int             has4;
+		int             has6;
 
 		if (segment == NULL)
 			return "a segment is a name";
-		if (!hull_access_named(doc, &names, segment, address, &prefix)) {
+		has4 = hull_access_named(doc, &names, segment, address, &prefix);
+		has6 = hull_access_named6(doc, &names, segment, address6, &prefix6);
+		if (!has4 && !has6) {
 			free(segment);
 			continue;
 		}
 		if (s->named_count == sizeof s->named / sizeof s->named[0] ||
 		    strlen(segment) >= sizeof s->named[0].segment ||
-		    inet_pton(AF_INET, address, &parsed) != 1 || prefix == 0u || prefix > 32u) {
+		    (has4 && (inet_pton(AF_INET, address, &parsed) != 1 || prefix == 0u || prefix > 32u)) ||
+		    (has6 && (inet_pton(AF_INET6, address6, &parsed6) != 1 || prefix6 == 0u ||
+		              prefix6 > 128u))) {
 			free(segment);
 			return "the plan's names cannot be read";
 		}
 		snprintf(s->named[s->named_count].segment, sizeof s->named[0].segment, "%s", segment);
-		s->named[s->named_count].address = ntohl(parsed.s_addr);
-		s->named[s->named_count].prefix  = prefix;
+		s->named[s->named_count].address = has4 ? ntohl(parsed.s_addr) : 0u;
+		s->named[s->named_count].prefix  = has4 ? prefix : 0u;
+		if (has6)
+			memcpy(s->named[s->named_count].address6, &parsed6, 16u);
+		s->named[s->named_count].prefix6 = has6 ? prefix6 : 0u;
 		if (hosts_of(doc, &names, segment, &s->named[s->named_count].hosts,
 		             &s->named[s->named_count].host_count) != 0) {
 			free(s->named[s->named_count].hosts);

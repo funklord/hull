@@ -591,12 +591,24 @@ static const key fault_link_keys[] = {
 static const schema fault_link = TABLE(fault_link_keys);
 
 /* A segment hull addresses (Appendix D): its machines given an address
- * each in the subnet, and each other's names. */
+ * each in the subnet, the IPv6 one, or both, and each other's names. */
+static hull_spec_status segment_across(walk *w, const hull_sexpr_form *record,
+                                       const hull_sexpr_form *found, uint64_t present);
 static const key segment_keys[] = {
-	{ .name = "subnet", .type = STRING, .required = 1, .value = subnet },
+	{ .name = "subnet", .type = STRING, .value = subnet },
 	{ .name = "subnet6", .type = STRING, .value = subnet6 },
 };
-static const schema segment = TABLE(segment_keys);
+static const schema segment = TABLE_ACROSS(segment_keys, segment_across);
+
+static hull_spec_status segment_across(walk *w, const hull_sexpr_form *record,
+                                       const hull_sexpr_form *found, uint64_t present)
+{
+	(void)found;
+	if ((present & 3u) == 0u)
+		return fail(w, HULL_SPEC_ERR_MISSING, record->offset,
+		            "a segment hull addresses is given its subnet, its subnet6, or both");
+	return HULL_SPEC_OK;
+}
 
 /* J.1 */
 static const key machine_keys[] = {

@@ -16,8 +16,9 @@
  * order. .1 is hull's, kept for a resolver and a gateway.
  *
  * A segment may also be given an IPv6 network beside its IPv4 one,
- * `(wire (subnet "10.99.0.0/24") (subnet6 "fd42:99::/64"))`: each machine
- * is then drawn an IPv6 address too, past the network's ::1, by FNV-1a
+ * `(wire (subnet "10.99.0.0/24") (subnet6 "fd42:99::/64"))`, or in its
+ * place, `(wire (subnet6 "fd42:99::/64"))`: each machine is then drawn an
+ * IPv6 address, past the network's ::1, by FNV-1a
  * over the same bytes 64 bits wide, a clash taking the next free as an
  * IPv4 one does, and named by it beside its IPv4 address.
  */
@@ -44,7 +45,8 @@ typedef struct hull_names_segment {
 	unsigned count;
 	unsigned member[HULL_NAMES_MEMBERS];    /* which of the file's machines */
 	uint32_t address[HULL_NAMES_MEMBERS];   /* its address, host order */
-	int      has6;                          /* given an IPv6 network as well */
+	int      has4;                          /* given an IPv4 network */
+	int      has6;                          /* given an IPv6 network */
 	uint8_t  network6[16];
 	unsigned prefix6;
 	uint8_t  address6[HULL_NAMES_MEMBERS][16];
@@ -71,7 +73,8 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
  * The plan's `(names ...)` entry for machine `member`, canonical, into
  * `out`: `(names (SEGMENT (address A) (hosts (ID A) ...) (prefix N)) ...)`
  * for each addressed segment it is on, sorted, with `(address6 A)`,
- * `(hosts6 (ID A) ...)` and `(prefix6 N)` where it has an IPv6 network. Its length; 0 where it is
+ * `(hosts6 (ID A) ...)` and `(prefix6 N)` where it has an IPv6 network,
+ * and without the IPv4 three where it has only that. Its length; 0 where it is
  * on none, and -1 where `cap` is too small.
  */
 long hull_names_entry(const hull_names *names, unsigned member, uint8_t *out, size_t cap);

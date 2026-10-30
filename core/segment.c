@@ -82,6 +82,8 @@ typedef struct port {
 	char     machine[64];
 	uint32_t address;   /* hull's address for it, host order (Appendix D) */
 	unsigned prefix;    /* its subnet's; 0 where the machine sets its own */
+	uint8_t  address6[16];  /* its IPv6 address, where the segment has an IPv6 network */
+	unsigned prefix6;   /* that network's; 0 where it has none */
 	int      forwards;  /* its machine has a way out, so .1 asks on for it */
 	hull_segment_host *hosts;   /* the names its plan gives the segment */
 	unsigned           host_count;
@@ -156,6 +158,14 @@ typedef struct segment {
 #define MAX_ASKED    256u
 #define MAX_ASKED_NS 5000000000u
 
+/* An end of what .1 says or is asked: a machine, or .1 itself, by IPv4 or
+ * by IPv6. */
+typedef struct peer {
+	int      six;
+	uint32_t v4;          /* host order */
+	uint8_t  v6[16];
+} peer;
+
 typedef struct asked {
 	int                used;
 	uint64_t           at;
@@ -166,7 +176,7 @@ typedef struct asked {
 	char               machine[64];
 	int                fd;
 	uint8_t            mac[6];
-	uint32_t           address;
+	peer               asker;
 	uint8_t            udp_port[2];
 	int                conn;            /* the TCP connection it came on, or -1 */
 	uint64_t           conn_generation;
@@ -203,7 +213,7 @@ typedef struct conn {
 	char     machine[64];
 	int      fd;
 	uint8_t  mac[6];
-	uint32_t address;        /* the asker's, host order */
+	peer     asker;          /* its address */
 	uint16_t their_port;
 	uint32_t rcv_nxt;        /* the next byte the asker sends */
 	uint32_t out_seq;        /* the sequence of out[0] */
@@ -685,11 +695,6 @@ static uint16_t get16(const uint8_t *at)
 	return (uint16_t)(at[0] << 8 | at[1]);
 }
 
-static uint32_t get32(const uint8_t *at)
-{
-	return (uint32_t)at[0] << 24 | (uint32_t)at[1] << 16 | (uint32_t)at[2] << 8 | at[3];
-}
-
 static void put16(uint8_t *at, uint32_t value)
 {
 	at[0] = (uint8_t)(value >> 8);
@@ -718,6 +723,108 @@ static int subnet_of(const segment *s, uint32_t *network, unsigned *prefix)
 	return 0;
 }
 
+/* The segment's IPv6 network, as subnet_of() its IPv4 one. */
+static int subnet6_of(const segment *s, uint8_t network6[16], unsigned *prefix6)
+{
+	for (unsigned i = 0u; i < s->port_count; i++) {
+		const port *p = s->ports[i];
+
+		if (p->prefix6 != 0u) {
+			*prefix6 = p->prefix6;
+			memcpy(network6, p->address6, 16u);
+			for (unsigned bit = p->prefix6; bit < 128u; bit++)
+				network6[bit / 8u] &= (uint8_t)~(0x80u >> (bit % 8u));
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static int peer_same(const peer *a, const peer *b)
+{
+	return a->six == b->six && (a->six ? memcmp(a->v6, b->v6, 16u) == 0 : a->v4 == b->v4);
+}
+
+/* .1 of `s` in the family `six` names: its network's .1, or ::1. 0 where
+ * the segment has no network of that family. */
+static int self_of(const segment *s, int six, peer *self)
+{
+	uint32_t network;
+	unsigned prefix;
+
+	memset(self, 0, sizeof *self);
+	self->six = six;
+	if (six) {
+		if (!subnet6_of(s, self->v6, &prefix))
+			return 0;
+		self->v6[15] |= 1u;
+		return 1;
+	}
+	if (!subnet_of(s, &network, &prefix))
+		return 0;
+	self->v4 = network + 1u;
+	return 1;
+}
+
+/* The pseudo-header UDP, TCP and ICMPv6 sum first, from `source` to
+ * `destination`: IPv4's 12 bytes, or IPv6's 40 folded into 12 -- their
+ * ones' complement sum in the first two, the rest zero -- as frame.situ
+ * says, so that one structure serves both families. */
+static void pseudo(uint8_t out[12], uint32_t source, uint32_t destination, uint8_t protocol,
+                   uint32_t length);
+
+static void pseudo_any(uint8_t out[12], const peer *source, const peer *destination,
+                       uint8_t protocol, uint32_t length)
+{
+	uint32_t sum = 0u;
+
+	if (!source->six) {
+		pseudo(out, source->v4, destination->v4, protocol, length);
+		return;
+	}
+	for (unsigned i = 0u; i < 16u; i += 2u)
+		sum += (uint32_t)(source->v6[i] << 8 | source->v6[i + 1u]) +
+		       (uint32_t)(destination->v6[i] << 8 | destination->v6[i + 1u]);
+	sum += (length >> 16) + (length & 0xffffu) + protocol;
+	while (sum >> 16)
+		sum = (sum & 0xffffu) + (sum >> 16);
+	memset(out, 0, 12u);
+	out[0] = (uint8_t)(sum >> 8);
+	out[1] = (uint8_t)sum;
+}
+
+/* Ethernet's and IP's headers into `out`, a frame of `cap`, around the
+ * `payload` bytes of `protocol` already at ip_room() past its Ethernet
+ * header, from `self` to `to` at `mac`: the frame's length, padded to
+ * Ethernet's least, or 0. IPv4's are whole and not to be fragmented. */
+static size_t ip_room(int six)
+{
+	return six ? 40u : 20u;
+}
+
+static size_t ip_frame(uint8_t *out, size_t cap, const uint8_t mac[6], const peer *self,
+                       const peer *to, uint8_t protocol, uint32_t payload, uint8_t hops)
+{
+	static uint16_t ip_id;
+	uint32_t        wrote = 0u;
+	size_t          total = 14u + ip_room(self->six) + payload;
+
+	if (total > cap ||
+	    hull_frame_ethernet_header_build(out, 14u, mac, hull_mac, self->six ? 0x86ddu : 0x0800u,
+	                                     &wrote) != SITU_OK)
+		return 0u;
+	if (self->six) {
+		if (hull_frame_ipv6_header_build(out + 14, 40u, 6u, 0u, 0u, 0u, (uint16_t)payload,
+		                                 protocol, hops, self->v6, to->v6, &wrote) != SITU_OK)
+			return 0u;
+	} else if (hull_frame_ipv4_header_build(out + 14, 20u, 4u, 0u, 0u, (uint16_t)(20u + payload),
+	                                        ++ip_id, 1u, 0u, 0u, hops, protocol, self->v4, to->v4,
+	                                        NULL, 0u, &wrote) != SITU_OK) {
+		return 0u;
+	}
+	return total < 60u ? 60u : total;
+}
+
 /* The machine named `name`, or at `address` where `name` is NULL: an
  * addressed port's, or else one a port's plan names, which may not be on
  * the segment yet or any longer. Its id and address, or NULL. */
@@ -727,8 +834,9 @@ static const hull_segment_host *named(const segment *s, const char *name, uint32
 	for (unsigned i = 0u; i < s->port_count; i++) {
 		const port *p = s->ports[i];
 
-		if (p->prefix != 0u && (name != NULL ? strcasecmp(p->machine, name) == 0 :
-		                                       p->address == address)) {
+		if ((name != NULL ? (p->prefix != 0u || p->prefix6 != 0u) &&
+		                    strcasecmp(p->machine, name) == 0 :
+		                    p->prefix != 0u && p->address == address)) {
 			memset(found, 0, sizeof *found);
 			snprintf(found->id, sizeof found->id, "%s", p->machine);
 			found->address = p->address;
@@ -801,7 +909,7 @@ static size_t dns_answer(const segment *s, uint32_t network, unsigned prefix,
 	unsigned    answer_type = 0u;
 	const hull_segment_host *p = NULL;
 	hull_segment_host        found;
-	uint32_t    mask = 0xffffffffu << (32u - prefix);
+	uint32_t    mask = prefix == 0u ? 0u : 0xffffffffu << (32u - prefix);
 
 	/* A question, read through core/frame.situ's header: one, of QUERY. */
 	{
@@ -851,8 +959,8 @@ static size_t dns_answer(const segment *s, uint32_t network, unsigned prefix,
 		} else {
 			uint32_t address = octet[0] << 24 | octet[1] << 16 | octet[2] << 8 | octet[3];
 
-			if ((address & mask) != network)
-				rcode = 5u;
+			if (prefix == 0u || (address & mask) != network)
+				rcode = 5u;   /* outside, or a segment of IPv6 alone */
 			else if ((p = named(s, NULL, address, &found)) == NULL)
 				rcode = 3u;
 			else if (type == DNS_PTR || type == DNS_ANY) {
@@ -903,7 +1011,8 @@ static size_t dns_answer(const segment *s, uint32_t network, unsigned prefix,
 			rcode = 5u;
 		else if ((p = named(s, name, 0u, &found)) == NULL)
 			rcode = ours || !forwards ? 3u : 5u;
-		else if (type == DNS_A || type == DNS_ANY) {
+		else if ((type == DNS_A || type == DNS_ANY) && p->address != 0u) {
+			/* None for one on a segment of IPv6 alone. */
 			put32(data, p->address);
 			data_length = 4u;
 			answer_type = DNS_A;
@@ -953,23 +1062,67 @@ static void pseudo(uint8_t out[12], uint32_t source, uint32_t destination, uint8
 		memset(out, 0, 12u);
 }
 
-static void send_answer(segment *s, unsigned to, const uint8_t mac[6], uint32_t self,
-                        uint32_t asker, const uint8_t udp_port[2], const uint8_t *dns,
-                        size_t length)
+/* Where `dns`'s question ends, past its header and one name: 0 where it
+ * has none whole. */
+static size_t question_end(const uint8_t *dns, size_t length)
+{
+	size_t at = 12u;
+
+	while (at < length && dns[at] != 0u) {
+		if (dns[at] > 63u)
+			return 0u;
+		at += 1u + dns[at];
+	}
+	return at + 5u <= length ? at + 5u : 0u;
+}
+
+/* The DNS answer `dns` to `asker` at `mac`, from .1 of its family, to its
+ * UDP port. Over IPv4 one past a frame goes in fragments; over IPv6, which
+ * a sender alone fragments and .1 does not, it goes as its question with
+ * TC set, and the asker asks again over TCP. */
+static void send_answer(segment *s, unsigned to, const uint8_t mac[6], const peer *asker,
+                        const uint8_t udp_port[2], const uint8_t *dns, size_t length)
 {
 	static uint8_t  datagram[8u + 65535u];
 	static uint16_t ip_id;
 	uint8_t         reply[4u + 1514u];
 	uint8_t        *out = reply + 4;
 	uint8_t         first[12];
+	uint8_t         cut[512];
 	uint32_t        whole = 0u;
 	uint32_t        wrote = 0u;
+	peer            self;
 
-	if (length > 65535u - 20u - 8u)
+	if (length > 65535u - 20u - 8u || !self_of(s, asker->six, &self))
 		return;
+	if (asker->six) {
+		size_t total;
+
+		if (8u + length > 1500u - 40u) {
+			size_t question = question_end(dns, length);
+
+			if (question == 0u || question > sizeof cut)
+				return;
+			memcpy(cut, dns, question);
+			cut[2] |= 0x02u;   /* TC */
+			memset(cut + 6, 0, 6u);
+			dns = cut;
+			length = question;
+		}
+		memset(reply, 0, sizeof reply);
+		pseudo_any(first, &self, asker, 17u, 8u + (uint32_t)length);
+		if (hull_frame_udp_datagram_build(out + 54, 1514u - 54u, 53u, (uint16_t)get16(udp_port),
+		                                  first, sizeof first, dns, (uint32_t)length,
+		                                  &whole) != SITU_OK ||
+		    (total = ip_frame(out, 1514u, mac, &self, asker, 17u, whole, 64u)) == 0u)
+			return;
+		put32(reply, (uint32_t)total);
+		cross(s, to, HULL_SEGMENT_IN, reply, 4u + total);
+		return;
+	}
 	/* The UDP sum over its pseudo-header and the whole datagram, as a
 	 * checking stack wants, before any of it is cut into fragments. */
-	pseudo(first, self, asker, 17u, 8u + (uint32_t)length);
+	pseudo(first, self.v4, asker->v4, 17u, 8u + (uint32_t)length);
 	if (hull_frame_udp_datagram_build(datagram, sizeof datagram, 53u, (uint16_t)get16(udp_port),
 	                                  first, sizeof first, dns, (uint32_t)length,
 	                                  &whole) != SITU_OK)
@@ -990,7 +1143,7 @@ static void send_answer(segment *s, unsigned to, const uint8_t mac[6], uint32_t 
 		if (hull_frame_ethernet_header_build(out, 14u, mac, hull_mac, 0x0800u, &wrote) != SITU_OK ||
 		    hull_frame_ipv4_header_build(out + 14, 20u, 4u, 0u, 0u, (uint16_t)(20u + piece), ip_id,
 		                                 at == 0u && !more, (uint8_t)more, (uint16_t)(at / 8u),
-		                                 64u, 17u, self, asker, NULL, 0u, &wrote) != SITU_OK)
+		                                 64u, 17u, self.v4, asker->v4, NULL, 0u, &wrote) != SITU_OK)
 			return;
 		memcpy(out + 34, datagram + at, piece);
 		total = 14u + 20u + piece;
@@ -1002,33 +1155,63 @@ static void send_answer(segment *s, unsigned to, const uint8_t mac[6], uint32_t 
 	}
 }
 
-/* .1's echo reply to `asker`'s request `echo`, in one frame as the request
- * came: its identifier, sequence and data as they were. */
-static void send_echo(segment *s, unsigned to, const uint8_t mac[6], uint32_t self,
-                      uint32_t asker, situ_view_t echo)
+/* .1's echo reply to `asker`'s request, ICMP's or ICMPv6's, in one frame
+ * as the request came: its identifier, sequence and data as they were. */
+static void send_echo(segment *s, unsigned to, const uint8_t mac[6], const peer *asker,
+                      uint16_t identifier, uint16_t sequence, const uint8_t *data,
+                      uint32_t length)
 {
-	static uint16_t ip_id;
-	uint8_t         reply[4u + 1514u];
-	uint8_t        *out = reply + 4;
-	uint32_t        length = hull_frame_icmp_echo_data_len(echo);
-	uint32_t        wrote = 0u;
-	size_t          total;
+	uint8_t  reply[4u + 1514u];
+	uint8_t *out = reply + 4;
+	uint8_t  first[12];
+	uint32_t wrote = 0u;
+	size_t   room = ip_room(asker->six);
+	size_t   total;
+	peer     self;
 
-	if (8u + length > 1480u)
+	if (8u + length > 1500u - room || !self_of(s, asker->six, &self))
 		return;
 	memset(reply, 0, sizeof reply);
-	ip_id++;
-	if (hull_frame_ethernet_header_build(out, 14u, mac, hull_mac, 0x0800u, &wrote) != SITU_OK ||
-	    hull_frame_ipv4_header_build(out + 14, 20u, 4u, 0u, 0u, (uint16_t)(20u + 8u + length), ip_id,
-	                                 1u, 0u, 0u, 64u, 1u, self, asker, NULL, 0u, &wrote) != SITU_OK ||
-	    hull_frame_icmp_echo_build(out + 34, 8u + length, 0u, 0u,
-	                               hull_frame_icmp_echo_identifier_get(echo),
-	                               hull_frame_icmp_echo_sequence_get(echo),
-	                               hull_frame_icmp_echo_data_ptr(echo), length, &wrote) != SITU_OK)
+	if (asker->six) {
+		pseudo_any(first, &self, asker, 58u, 8u + length);
+		if (hull_frame_icmp6_echo_build(out + 14 + room, 8u + length, 129u, 0u, first,
+		                                sizeof first, identifier, sequence, data, length,
+		                                &wrote) != SITU_OK)
+			return;
+	} else if (hull_frame_icmp_echo_build(out + 14 + room, 8u + length, 0u, 0u, identifier,
+	                                      sequence, data, length, &wrote) != SITU_OK) {
 		return;
-	total = 14u + 20u + 8u + length;
-	if (total < 60u)
-		total = 60u;
+	}
+	if ((total = ip_frame(out, 1514u, mac, &self, asker, asker->six ? 58u : 1u, 8u + length,
+	                      64u)) == 0u)
+		return;
+	put32(reply, (uint32_t)total);
+	cross(s, to, HULL_SEGMENT_IN, reply, 4u + total);
+}
+
+/* .1's neighbour advertisement for ::1 to `asker` at `mac`, as ARP's
+ * reply is for .1: solicited, overriding, hull's MAC its option, from a
+ * hop limit of 255 as RFC 4861 asks. */
+static void send_advert(segment *s, unsigned to, const uint8_t mac[6], const peer *asker)
+{
+	uint8_t  reply[4u + 1514u];
+	uint8_t *out = reply + 4;
+	uint8_t  first[12];
+	uint8_t  option[8] = { 2u, 1u };   /* target link-layer address, 8 bytes */
+	uint32_t wrote = 0u;
+	size_t   total;
+	peer     self;
+
+	if (!self_of(s, 1, &self))
+		return;
+	memcpy(option + 2, hull_mac, 6u);
+	memset(reply, 0, sizeof reply);
+	pseudo_any(first, &self, asker, 58u, 32u);
+	if (hull_frame_neighbor_advertisement_build(out + 54, 32u, 136u, 0u, first, sizeof first, 0u,
+	                                            1u, 1u, self.v6, option, sizeof option,
+	                                            &wrote) != SITU_OK ||
+	    (total = ip_frame(out, 1514u, mac, &self, asker, 58u, 32u, 255u)) == 0u)
+		return;
 	put32(reply, (uint32_t)total);
 	cross(s, to, HULL_SEGMENT_IN, reply, 4u + total);
 }
@@ -1037,8 +1220,8 @@ static unsigned resolvers(struct sockaddr_in6 out[3]);
 static void open_upstream(void);
 static segment *find(const char *key);
 static void conn_arm(conn *c);
-static void ask_on(segment *s, unsigned from, const uint8_t *frame, const uint8_t *ip,
-                   size_t header, const uint8_t *query, size_t length,
+static void ask_on(segment *s, unsigned from, const uint8_t mac[6], const peer *asker,
+                   const uint8_t udp_port[2], const uint8_t *query, size_t length,
                    const struct sockaddr_in6 *server, int on);
 
 /* `s`'s port that `c` came on, or -1 where it has gone. */
@@ -1062,30 +1245,26 @@ static void tcp_send(segment *s, const conn *c, unsigned flags, uint32_t seq,
 	uint32_t             segment_length = 20u + (syn ? 4u : 0u) + (uint32_t)length;
 	uint32_t             window = CONN_IN - c->in_length > 0xffffu ? 0xffffu :
 	                              (uint32_t)(CONN_IN - c->in_length);
-	uint32_t             network;
-	unsigned             prefix;
-	uint32_t             wrote = 0u;
+	peer                 self;
+	size_t               room = ip_room(c->asker.six);
 	uint32_t             tcp = 0u;
 	size_t               total;
 	int                  to = conn_port(s, c);
 
-	if (to < 0 || length > TCP_MSS || !subnet_of(s, &network, &prefix))
+	if (to < 0 || length > TCP_MSS || !self_of(s, c->asker.six, &self))
 		return;
 	memset(reply, 0, sizeof reply);
-	pseudo(first, network + 1u, c->address, 6u, segment_length);
-	if (hull_frame_ethernet_header_build(out, 14u, c->mac, hull_mac, 0x0800u, &wrote) != SITU_OK ||
-	    hull_frame_tcp_segment_build(out + 34, 1514u - 34u, 53u, c->their_port, seq,
+	pseudo_any(first, &self, &c->asker, 6u, segment_length);
+	if (hull_frame_tcp_segment_build(out + 14 + room, (uint32_t)(1514u - 14u - room), 53u,
+	                                 c->their_port, seq,
 	                                 (flags & TCP_ACK) != 0u ? c->rcv_nxt : 0u, 0u, 0u, 0u,
 	                                 (flags & TCP_ACK) != 0u, (flags & TCP_PSH) != 0u,
 	                                 (flags & TCP_RST) != 0u, (uint8_t)syn,
 	                                 (flags & TCP_FIN) != 0u, (uint16_t)window, first,
 	                                 sizeof first, 0u, mss, syn ? sizeof mss : 0u, data,
 	                                 (uint32_t)length, &tcp) != SITU_OK ||
-	    hull_frame_ipv4_header_build(out + 14, 20u, 4u, 0u, 0u, (uint16_t)(20u + tcp), 0u, 1u, 0u,
-	                                 0u, 64u, 6u, network + 1u, c->address, NULL, 0u,
-	                                 &wrote) != SITU_OK)
+	    (total = ip_frame(out, 1514u, c->mac, &self, &c->asker, 6u, tcp, 64u)) == 0u)
 		return;
-	total = 14u + 20u + tcp < 60u ? 60u : 14u + 20u + tcp;
 	put32(reply, (uint32_t)total);
 	cross(s, (unsigned)to, HULL_SEGMENT_IN, reply, 4u + total);
 }
@@ -1185,8 +1364,8 @@ static uint64_t conn_timers(uint64_t now)
 /* A TCP segment from port `from` for .1's port 53: a connection opened,
  * fed, acknowledged or closed, and each whole query on it answered, by
  * hull or asked on as a datagram's is. */
-static void tcp_in(segment *s, unsigned from, const uint8_t *frame, const uint8_t *ip,
-                   size_t header, situ_view_t tcp, uint32_t network, unsigned prefix)
+static void tcp_in(segment *s, unsigned from, const uint8_t mac[6], const peer *asker,
+                   situ_view_t tcp, uint32_t network, unsigned prefix)
 {
 	uint16_t       their_port = hull_frame_tcp_segment_source_port_get(tcp);
 	uint32_t       seq = hull_frame_tcp_segment_sequence_get(tcp);
@@ -1206,7 +1385,7 @@ static void tcp_in(segment *s, unsigned from, const uint8_t *frame, const uint8_
 		if (conns[i] != NULL && now - conns[i]->at > MAX_CONN_NS)
 			conn_drop((int)i);
 		if (c == NULL && conns[i] != NULL && conns[i]->their_port == their_port &&
-		    conns[i]->address == get32(ip + 12) && conns[i]->fd == s->ports[from]->fd &&
+		    peer_same(&conns[i]->asker, asker) && conns[i]->fd == s->ports[from]->fd &&
 		    strcmp(conns[i]->key, s->key) == 0 &&
 		    strcmp(conns[i]->machine, s->ports[from]->machine) == 0) {
 			c = conns[i];
@@ -1234,8 +1413,8 @@ static void tcp_in(segment *s, unsigned from, const uint8_t *frame, const uint8_
 			memset(&refused, 0, sizeof refused);
 			snprintf(refused.machine, sizeof refused.machine, "%s", s->ports[from]->machine);
 			refused.fd = s->ports[from]->fd;
-			memcpy(refused.mac, frame + 6, 6u);
-			refused.address = get32(ip + 12);
+			memcpy(refused.mac, mac, 6u);
+			refused.asker = *asker;
 			refused.their_port = their_port;
 			refused.rcv_nxt = seq + (uint32_t)length + ((flags & (TCP_SYN | TCP_FIN)) != 0u);
 			if ((flags & TCP_ACK) != 0u)
@@ -1250,8 +1429,8 @@ static void tcp_in(segment *s, unsigned from, const uint8_t *frame, const uint8_
 		snprintf(c->key, sizeof c->key, "%s", s->key);
 		snprintf(c->machine, sizeof c->machine, "%s", s->ports[from]->machine);
 		c->fd = s->ports[from]->fd;
-		memcpy(c->mac, frame + 6, 6u);
-		c->address = get32(ip + 12);
+		memcpy(c->mac, mac, 6u);
+		c->asker = *asker;
 		c->their_port = their_port;
 		c->rcv_nxt = seq + 1u;
 		c->out_seq = (uint32_t)splitmix(&asking_random) + 1u;
@@ -1327,11 +1506,14 @@ static void tcp_in(segment *s, unsigned from, const uint8_t *frame, const uint8_
 		}
 		dns = dns_answer(s, network, prefix, c->in + 2u, query, count != 0u, dns_out,
 		                 sizeof dns_out, &question);
-		if (dns == ASK_ON && query <= MAX_DNS)
-			ask_on(s, from, frame, ip, header, c->in + 2u, query,
+		if (dns == ASK_ON && query <= MAX_DNS) {
+			uint8_t their[2] = { (uint8_t)(c->their_port >> 8), (uint8_t)c->their_port };
+
+			ask_on(s, from, mac, asker, their, c->in + 2u, query,
 			       &servers[asking_next++ % count], at);
-		else if (dns != 0u && dns != ASK_ON)
+		} else if (dns != 0u && dns != ASK_ON) {
 			conn_answer(s, c, dns_out, dns);
+		}
 		memmove(c->in, c->in + 2u + query, c->in_length - 2u - query);
 		c->in_length -= 2u + query;
 	}
@@ -1440,8 +1622,8 @@ static unsigned resolvers(struct sockaddr_in6 out[3])
  * machine behind `s`'s port `from`, its answer to go back as `answered`
  * finds it. A question with nowhere to wait is dropped, as a full queue
  * drops a frame, and its asker asks again. */
-static void ask_on(segment *s, unsigned from, const uint8_t *frame, const uint8_t *ip,
-                   size_t header, const uint8_t *query, size_t length,
+static void ask_on(segment *s, unsigned from, const uint8_t mac[6], const peer *asker,
+                   const uint8_t udp_port[2], const uint8_t *query, size_t length,
                    const struct sockaddr_in6 *server, int on)
 {
 	uint64_t now = now_ns();
@@ -1481,9 +1663,9 @@ static void ask_on(segment *s, unsigned from, const uint8_t *frame, const uint8_
 	snprintf(a->key, sizeof a->key, "%s", s->key);
 	snprintf(a->machine, sizeof a->machine, "%s", s->ports[from]->machine);
 	a->fd       = s->ports[from]->fd;
-	memcpy(a->mac, frame + 6, 6u);
-	a->address  = get32(ip + 12);
-	memcpy(a->udp_port, ip + header, 2u);
+	memcpy(a->mac, mac, 6u);
+	a->asker    = *asker;
+	memcpy(a->udp_port, udp_port, 2u);
 	a->conn     = on;
 	a->conn_generation = on >= 0 ? conns[on]->generation : 0u;
 }
@@ -1504,8 +1686,6 @@ static void answered(void)
 		uint64_t                now = now_ns();
 		asked                  *a = NULL;
 		segment                *s;
-		uint32_t                network;
-		unsigned                prefix;
 		size_t                  length;
 
 		if (n < 0)
@@ -1536,7 +1716,7 @@ static void answered(void)
 		if (a == NULL)
 			continue;
 		a->used = 0;
-		if ((s = find(a->key)) == NULL || !subnet_of(s, &network, &prefix))
+		if ((s = find(a->key)) == NULL)
 			continue;
 		length = (size_t)n;
 		put16(reply, a->their_id);
@@ -1548,8 +1728,7 @@ static void answered(void)
 		}
 		for (unsigned i = 0u; i < s->port_count; i++) {
 			if (s->ports[i]->fd == a->fd && strcmp(s->ports[i]->machine, a->machine) == 0) {
-				send_answer(s, i, a->mac, network + 1u, a->address, a->udp_port, reply,
-				            length);
+				send_answer(s, i, a->mac, &a->asker, a->udp_port, reply, length);
 				break;
 			}
 		}
@@ -1564,35 +1743,41 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 	size_t         size = length - 4u;
 	uint8_t        reply[4u + 1514u];
 	uint8_t       *out = reply + 4;
-	uint32_t       network;
-	uint32_t       self;
-	unsigned       prefix;
+	uint32_t       network = 0u;
+	unsigned       prefix = 0u;
+	peer           self4;
+	peer           self6;
+	int            have4 = self_of(s, 0, &self4);
+	int            have6 = self_of(s, 1, &self6);
 	situ_msg_t     msg;
 	situ_view_t    ether;
 	situ_view_t    view;
 	uint16_t       type;
+	const uint8_t *mac;
 
-	if (!subnet_of(s, &network, &prefix) || size < 14u)
+	if ((!have4 && !have6) || size < 14u)
 		return 0;
-	self = network + 1u;
+	if (have4)
+		subnet_of(s, &network, &prefix);
 	/* What the machine sent, read through core/frame.situ: nothing writes
 	 * through these views, so the frame's constness holds. */
 	situ_msg_init(&msg, (uint8_t *)(uintptr_t)frame, (uint32_t)size);
 	if (hull_frame_ethernet_header_view(&msg, 0u, &ether) != SITU_OK)
 		return 0;
 	type = hull_frame_ethernet_header_ethertype_get(ether);
+	mac  = hull_frame_ethernet_header_source_ptr(ether);
 	/* ARP: who has .1. */
-	if (type == 0x0806u && hull_frame_arp_packet_view(&msg, 14u, &view) == SITU_OK &&
+	if (type == 0x0806u && have4 && hull_frame_arp_packet_view(&msg, 14u, &view) == SITU_OK &&
 	    hull_frame_arp_packet_validate(view) == SITU_OK &&
 	    hull_frame_arp_packet_operation_get(view) == 1u &&
-	    hull_frame_arp_packet_target_protocol_get(view) == self) {
+	    hull_frame_arp_packet_target_protocol_get(view) == self4.v4) {
 		uint32_t wrote = 0u;
 
 		memset(reply, 0, sizeof reply);
 		if (hull_frame_ethernet_header_build(out, 14u, hull_frame_arp_packet_sender_hardware_ptr(view),
 		                                     hull_mac, 0x0806u, &wrote) != SITU_OK ||
 		    hull_frame_arp_packet_build(out + 14, 28u, 1u, 0x0800u, 6u, 4u, HULL_FRAME_ARP_OPERATION_REPLY,
-		                                hull_mac, self,
+		                                hull_mac, self4.v4,
 		                                hull_frame_arp_packet_sender_hardware_ptr(view),
 		                                hull_frame_arp_packet_sender_protocol_get(view),
 		                                &wrote) != SITU_OK)
@@ -1601,10 +1786,40 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 		cross(s, from, HULL_SEGMENT_IN, reply, 4u + 60u);
 		return 1;
 	}
+	/* Neighbour discovery: who has ::1, asked of its solicited-node group
+	 * rather than of hull's MAC, and so read before that is looked at. One
+	 * for another target goes on as any multicast does, a machine's own
+	 * address able to share ::1's group. */
+	if (type == 0x86ddu && have6 && hull_frame_ipv6_header_view(&msg, 14u, &view) == SITU_OK &&
+	    hull_frame_ipv6_header_validate(view) == SITU_OK &&
+	    hull_frame_ipv6_header_next_header_get(view) == 58u &&
+	    54u + hull_frame_ipv6_header_payload_length_get(view) <= size &&
+	    size > 54u && frame[54] == 135u) {
+		situ_view_t solicit;
+		uint8_t     first[12];
+		peer        asker = { .six = 1 };
+		peer        to = { .six = 1 };
+		uint16_t    payload = hull_frame_ipv6_header_payload_length_get(view);
+
+		memcpy(asker.v6, hull_frame_ipv6_header_source_ptr(view), 16u);
+		memcpy(to.v6, hull_frame_ipv6_header_destination_ptr(view), 16u);
+		pseudo_any(first, &asker, &to, 58u, payload);
+		if (hull_frame_neighbor_solicitation_view(&msg, 54u, payload, &solicit) != SITU_OK ||
+		    hull_frame_neighbor_solicitation_validate(solicit) != SITU_OK ||
+		    hull_frame_neighbor_solicitation_checksum_check(solicit, first, sizeof first) != SITU_OK ||
+		    hull_frame_ipv6_header_hop_limit_get(view) != 255u ||
+		    memcmp(hull_frame_neighbor_solicitation_target_ptr(solicit), self6.v6, 16u) != 0)
+			return 0;
+		/* From ::, a machine's duplicate address detection of ::1, which
+		 * is hull's and not to be taken: nothing to answer it to. */
+		if (!IN6_IS_ADDR_UNSPECIFIED((const struct in6_addr *)(const void *)asker.v6))
+			send_advert(s, from, mac, &asker);
+		return 1;
+	}
 	if (memcmp(hull_frame_ethernet_header_destination_ptr(ether), hull_mac, 6u) == 0) {
-		const uint8_t     *ip = frame + 14;
-		size_t             header;
-		size_t             datagram;
+		size_t             at;
+		size_t             l4;
+		unsigned           protocol;
 		size_t             dns;
 		size_t             question = 0u;
 		uint8_t            dns_out[MAX_DNS];
@@ -1614,53 +1829,87 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 		struct sockaddr_in6 servers[3];
 		unsigned           count = 0u;
 		situ_view_t        inner;
-		uint32_t           asker;
+		peer               asker;
+		peer              *self;
 
-		/* For .1 and not ARP, DNS or ping: nothing else answers there. A
-		 * header that does not validate, its sum among it, is not read. */
-		if (type != 0x0800u || hull_frame_ipv4_header_view(&msg, 14u, (uint32_t)(size - 14u),
-		                                                    &view) != SITU_OK ||
-		    hull_frame_ipv4_header_validate(view) != SITU_OK ||
-		    hull_frame_ipv4_header_header_checksum_check(view) != SITU_OK ||
-		    hull_frame_ipv4_header_destination_get(view) != self ||
-		    hull_frame_ipv4_header_more_fragments_get(view) ||
-		    hull_frame_ipv4_header_fragment_offset_get(view) != 0u)
+		memset(&asker, 0, sizeof asker);
+		/* For .1 and not ARP, DNS, ping or neighbour discovery: nothing
+		 * else answers there. A header that does not validate, its sum
+		 * among it, is not read, nor IPv6 with an extension header. */
+		if (type == 0x0800u && have4) {
+			size_t header;
+			size_t datagram;
+
+			if (hull_frame_ipv4_header_view(&msg, 14u, (uint32_t)(size - 14u), &view) != SITU_OK ||
+			    hull_frame_ipv4_header_validate(view) != SITU_OK ||
+			    hull_frame_ipv4_header_header_checksum_check(view) != SITU_OK ||
+			    hull_frame_ipv4_header_destination_get(view) != self4.v4 ||
+			    hull_frame_ipv4_header_more_fragments_get(view) ||
+			    hull_frame_ipv4_header_fragment_offset_get(view) != 0u)
+				return 1;
+			header = (size_t)hull_frame_ipv4_header_ihl_get(view) * 4u;
+			datagram = hull_frame_ipv4_header_total_length_get(view);
+			if (datagram < header || 14u + datagram > size)
+				return 1;
+			asker.v4 = hull_frame_ipv4_header_source_get(view);
+			at       = 14u + header;
+			l4       = datagram - header;
+			protocol = hull_frame_ipv4_header_protocol_get(view);
+			self     = &self4;
+		} else if (type == 0x86ddu && have6) {
+			if (hull_frame_ipv6_header_view(&msg, 14u, &view) != SITU_OK ||
+			    hull_frame_ipv6_header_validate(view) != SITU_OK ||
+			    memcmp(hull_frame_ipv6_header_destination_ptr(view), self6.v6, 16u) != 0 ||
+			    54u + hull_frame_ipv6_header_payload_length_get(view) > size)
+				return 1;
+			asker.six = 1;
+			memcpy(asker.v6, hull_frame_ipv6_header_source_ptr(view), 16u);
+			at       = 54u;
+			l4       = hull_frame_ipv6_header_payload_length_get(view);
+			protocol = hull_frame_ipv6_header_next_header_get(view);
+			self     = &self6;
+		} else {
 			return 1;
-		header = (size_t)hull_frame_ipv4_header_ihl_get(view) * 4u;
-		datagram = hull_frame_ipv4_header_total_length_get(view);
-		asker = hull_frame_ipv4_header_source_get(view);
-		if (datagram < header || 14u + datagram > size)
-			return 1;
-		pseudo(first, asker, self, hull_frame_ipv4_header_protocol_get(view),
-		       (uint32_t)(datagram - header));
-		if (hull_frame_ipv4_header_protocol_get(view) == 6u) {
-			if (hull_frame_tcp_segment_view(&msg, (uint32_t)(14u + header),
-			                                (uint32_t)(datagram - header), &inner) == SITU_OK &&
+		}
+		pseudo_any(first, &asker, self, (uint8_t)protocol, (uint32_t)l4);
+		if (protocol == 6u) {
+			if (hull_frame_tcp_segment_view(&msg, (uint32_t)at, (uint32_t)l4, &inner) == SITU_OK &&
 			    hull_frame_tcp_segment_validate(inner) == SITU_OK &&
 			    hull_frame_tcp_segment_checksum_check(inner, first, sizeof first) == SITU_OK &&
 			    hull_frame_tcp_segment_destination_port_get(inner) == 53u)
-				tcp_in(s, from, frame, ip, header, inner, network, prefix);
+				tcp_in(s, from, mac, &asker, inner, network, prefix);
 			return 1;
 		}
 		/* An echo request, ping's: answered, its sum right, back through
 		 * the asker's own way in, so a link's impairment shows in it. */
-		if (hull_frame_ipv4_header_protocol_get(view) == 1u) {
-			if (hull_frame_icmp_echo_view(&msg, (uint32_t)(14u + header),
-			                              (uint32_t)(datagram - header), &inner) == SITU_OK &&
+		if (protocol == 1u && !asker.six) {
+			if (hull_frame_icmp_echo_view(&msg, (uint32_t)at, (uint32_t)l4, &inner) == SITU_OK &&
 			    hull_frame_icmp_echo_validate(inner) == SITU_OK &&
 			    hull_frame_icmp_echo_checksum_check(inner) == SITU_OK &&
 			    hull_frame_icmp_echo_type_get(inner) == 8u)
-				send_echo(s, from, hull_frame_ethernet_header_source_ptr(ether), self, asker,
-				          inner);
+				send_echo(s, from, mac, &asker, hull_frame_icmp_echo_identifier_get(inner),
+				          hull_frame_icmp_echo_sequence_get(inner),
+				          hull_frame_icmp_echo_data_ptr(inner), hull_frame_icmp_echo_data_len(inner));
+			return 1;
+		}
+		if (protocol == 58u && asker.six) {
+			if (hull_frame_icmp6_echo_view(&msg, (uint32_t)at, (uint32_t)l4, &inner) == SITU_OK &&
+			    hull_frame_icmp6_echo_validate(inner) == SITU_OK &&
+			    hull_frame_icmp6_echo_checksum_check(inner, first, sizeof first) == SITU_OK &&
+			    hull_frame_icmp6_echo_type_get(inner) == 128u)
+				send_echo(s, from, mac, &asker, hull_frame_icmp6_echo_identifier_get(inner),
+				          hull_frame_icmp6_echo_sequence_get(inner),
+				          hull_frame_icmp6_echo_data_ptr(inner), hull_frame_icmp6_echo_data_len(inner));
 			return 1;
 		}
 		/* A UDP sum of 0 is a datagram sent with none, which IPv4 allows
-		 * and frame.situ's udp_checksum accepts. */
-		if (hull_frame_ipv4_header_protocol_get(view) != 17u ||
-		    hull_frame_udp_datagram_view(&msg, (uint32_t)(14u + header),
-		                                 (uint32_t)(datagram - header), &inner) != SITU_OK ||
+		 * and frame.situ's udp_checksum accepts; IPv6 does not (RFC 8200
+		 * 8.1), so there it is refused. */
+		if (protocol != 17u ||
+		    hull_frame_udp_datagram_view(&msg, (uint32_t)at, (uint32_t)l4, &inner) != SITU_OK ||
 		    hull_frame_udp_datagram_validate(inner) != SITU_OK ||
 		    hull_frame_udp_datagram_destination_port_get(inner) != 53u ||
+		    (asker.six && get16(hull_frame_udp_datagram_checksum_ptr(inner)) == 0u) ||
 		    hull_frame_udp_datagram_checksum_check(inner, first, sizeof first) != SITU_OK)
 			return 1;
 		query        = hull_frame_udp_datagram_payload_ptr(inner);
@@ -1678,11 +1927,10 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 		dns = dns_answer(s, network, prefix, query, query_length, count != 0u, dns_out,
 		                 sizeof dns_out, &question);
 		if (dns == ASK_ON)
-			ask_on(s, from, frame, ip, header, query, query_length,
+			ask_on(s, from, mac, &asker, frame + at, query, query_length,
 			       &servers[asking_next++ % count], -1);
 		else if (dns != 0u)
-			send_answer(s, from, hull_frame_ethernet_header_source_ptr(ether), self, asker,
-			            ip + header, dns_out, dns);
+			send_answer(s, from, mac, &asker, frame + at, dns_out, dns);
 		return 1;
 	}
 	return 0;
@@ -1961,6 +2209,28 @@ static int addressed_apart(const segment *s, const port *p, char *why, size_t ca
 			return 0;
 		}
 	}
+	/* And the same of its IPv6 network and address. */
+	for (unsigned i = 0u; p->prefix6 != 0u && i < s->port_count; i++) {
+		const port *q = s->ports[i];
+		char        shown[INET6_ADDRSTRLEN];
+		int         apart = 0;
+
+		if (q->prefix6 == 0u || strcmp(q->machine, p->machine) == 0)
+			continue;
+		for (unsigned bit = 0u; bit < p->prefix6 && !apart; bit++)
+			apart = ((q->address6[bit / 8u] ^ p->address6[bit / 8u]) & (0x80u >> (bit % 8u))) != 0;
+		if (q->prefix6 != p->prefix6 || apart) {
+			snprintf(why, cap, "segment %s has another IPv6 network, as machine %s has it, "
+			         "than this machine gives it", s->key, q->machine);
+			return 0;
+		}
+		if (memcmp(q->address6, p->address6, 16u) == 0) {
+			inet_ntop(AF_INET6, p->address6, shown, sizeof shown);
+			snprintf(why, cap, "its address on segment %s, %s, is machine %s's", s->key, shown,
+			         q->machine);
+			return 0;
+		}
+	}
 	return 1;
 }
 
@@ -1982,12 +2252,14 @@ void hull_segment_resolvers(const char *const *servers, const unsigned *ports, u
 int hull_segment_port_addressed(const char *key, const char *machine, uint32_t address,
                                 unsigned prefix, int forwards, char *why, size_t cap)
 {
-	return hull_segment_port_named(key, machine, address, prefix, forwards, NULL, 0u, why, cap);
+	return hull_segment_port_named(key, machine, address, prefix, NULL, 0u, forwards, NULL, 0u,
+	                               why, cap);
 }
 
 int hull_segment_port_named(const char *key, const char *machine, uint32_t address,
-                            unsigned prefix, int forwards, const hull_segment_host *hosts,
-                            unsigned count, char *why, size_t cap)
+                            unsigned prefix, const uint8_t *address6, unsigned prefix6,
+                            int forwards, const hull_segment_host *hosts, unsigned count,
+                            char *why, size_t cap)
 {
 	int      pair[2];
 	segment *s = NULL;
@@ -2001,8 +2273,8 @@ int hull_segment_port_named(const char *key, const char *machine, uint32_t addre
 		say(why, cap, "a port's machine is named by its id");
 		return -1;
 	}
-	if (prefix > 32u) {
-		say(why, cap, "a subnet's prefix is at most 32");
+	if (prefix > 32u || prefix6 > 128u || (prefix6 != 0u && address6 == NULL)) {
+		say(why, cap, "a subnet's prefix is at most 32, an IPv6 one's 128, with its address");
 		return -1;
 	}
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) {
@@ -2024,6 +2296,9 @@ int hull_segment_port_named(const char *key, const char *machine, uint32_t addre
 	snprintf(p->machine, sizeof p->machine, "%s", machine);
 	p->address = address;
 	p->prefix  = prefix;
+	if (prefix6 != 0u)
+		memcpy(p->address6, address6, 16u);
+	p->prefix6 = prefix6;
 	p->forwards = forwards;
 	if (count != 0u)
 		memcpy(p->hosts, hosts, count * sizeof *hosts);

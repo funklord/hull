@@ -390,6 +390,40 @@ static int ping_reply(int fd, uint8_t me, const char *data)
 	       get16(f + 40) == 7u && memcmp(f + 42, data, strlen(data)) == 0;
 }
 
+/* An IPv6 frame from MAC and address fd42:55::`me` to `to` at `mac`, of
+ * `next`, `payload` its `length` bytes, its ICMPv6 or UDP sum at `sum_at`
+ * in the payload taken over the pseudo-header unless `sum_at` is past it;
+ * a hop limit of 255. */
+static const uint8_t only6_net[8] = { 0xfd, 0x42, 0, 0x55, 0, 0, 0, 0 };
+
+static void send_v6(int fd, uint8_t me, const uint8_t mac[6], const uint8_t to[16], uint8_t next,
+                    uint8_t *payload, size_t length, size_t sum_at)
+{
+	uint8_t  f[600] = { 0 };
+	uint32_t sum = 0u;
+
+	memcpy(f, mac, 6u);
+	f[6] = 0x52;
+	f[7] = 0x54;
+	f[11] = me;
+	put16(f + 12, 0x86ddu);
+	f[14] = 0x60;
+	put16(f + 18, (unsigned)length);
+	f[20] = next;
+	f[21] = 255u;
+	memcpy(f + 22, only6_net, 8u);
+	f[37] = me;
+	memcpy(f + 38, to, 16u);
+	if (sum_at + 2u <= length) {
+		payload[sum_at] = 0u;
+		payload[sum_at + 1u] = 0u;
+		sum = sum16(0u, f + 22, 32u) + (uint32_t)length + next;
+		put16(payload + sum_at, ~sum16(sum, payload, length) & 0xffffu);
+	}
+	memcpy(f + 54, payload, length);
+	send_raw(fd, f, 54u + length < 60u ? 60u : 54u + length);
+}
+
 /* Set, send_tcp() sends its segment with its sum one bit off. */
 static int tcp_sum_wrong;
 
@@ -1162,8 +1196,8 @@ int main(void)
 
 			memcpy(hosts[0].address6, six_web, 16u);
 			memcpy(hosts[1].address6, six_db, 16u);
-			six = hull_segment_port_named("dns6", "web", 0x0a37000au, 24u, 0, hosts, 3u, why,
-			                              sizeof why);
+			six = hull_segment_port_named("dns6", "web", 0x0a37000au, 24u, six_web, 64u, 0, hosts,
+			                              3u, why, sizeof why);
 			if (six < 0) {
 				check("a port with IPv6 names", 0);
 			} else {
@@ -1188,6 +1222,125 @@ int main(void)
 				      rcode == 0 && length == 9u && memcmp(data, "\2db\4hull", 9u) == 0);
 				close(six);
 			}
+		}
+		{
+			/* A segment of IPv6 alone: hull at ::1 answers neighbour
+			 * discovery for itself and no other, ping, and DNS over UDP,
+			 * a datagram with no sum refused as IPv6 has it. */
+			static const uint8_t solicited[6] = { 0x33, 0x33, 0xff, 0, 0, 1 };
+			static const uint8_t group[16] = { 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, 0, 0, 1 };
+			uint8_t              self6[16] = { 0xfd, 0x42, 0, 0x55, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+			uint8_t              web6[16];
+			uint8_t              db6[16];
+			hull_segment_host    hosts[2] = { { "web", 0u, 1, { 0 } }, { "db", 0u, 1, { 0 } } };
+			int                  w;
+			int                  d;
+
+			memcpy(web6, self6, 16u);
+			web6[15] = 10u;
+			memcpy(db6, self6, 16u);
+			db6[15] = 20u;
+			memcpy(hosts[0].address6, web6, 16u);
+			memcpy(hosts[1].address6, db6, 16u);
+			w = hull_segment_port_named("only6", "web", 0u, 0u, web6, 64u, 0, hosts, 2u, why,
+			                            sizeof why);
+			d = hull_segment_port_named("only6", "db", 0u, 0u, db6, 64u, 0, hosts, 2u, why,
+			                            sizeof why);
+			if (w < 0 || d < 0) {
+				check("two ports on a segment of IPv6 alone", 0);
+			} else {
+				uint8_t ns[32] = { 135, 0, 0, 0, 0, 0, 0, 0 };
+				uint8_t echo[12] = { 128, 0, 0, 0, 0x42, 0x42, 0, 1, 'p', 'i', 'n', 'g' };
+				uint8_t udp[64] = { 0x0f, 0xa0, 0, 53 };
+				uint8_t r[1514];
+				size_t  n;
+				size_t  at = 8u + 12u;
+
+				memcpy(ns + 8, self6, 16u);
+				ns[24] = 1u;   /* source link-layer address */
+				ns[25] = 1u;
+				memcpy(ns + 26, "\x52\x54\x00\x00\x00\x0a", 6u);
+				send_v6(w, 10u, solicited, group, 58u, ns, sizeof ns, 2u);
+				n = next_raw(w, r, sizeof r, 1000);
+				check("a neighbour solicitation for ::1, advertised with hull's MAC",
+				      n >= 54u + 32u && get16(r + 12) == 0x86ddu && r[20] == 58u && r[21] == 255u &&
+				      r[54] == 136u && (r[58] & 0x60u) == 0x60u && memcmp(r + 62, self6, 16u) == 0 &&
+				      r[78] == 2u && memcmp(r + 80, hull_mac, 6u) == 0 &&
+				      memcmp(r + 38, only6_net, 8u) == 0 && r[53] == 10u &&
+				      sum16(sum16(0u, r + 22, 32u) + 32u + 58u, r + 54, 32u) == 0xffffu);
+				check("the solicitation, not to another port", next_raw(d, r, sizeof r, 100) == 0u);
+				memcpy(ns + 8, db6, 16u);
+				send_v6(w, 10u, solicited, group, 58u, ns, sizeof ns, 2u);
+				check("one for another target, not answered", next_raw(w, r, sizeof r, 200) == 0u);
+				send_v6(w, 10u, hull_mac, self6, 58u, echo, sizeof echo, 2u);
+				n = next_raw(w, r, sizeof r, 1000);
+				check("ping ::1, answered",
+				      n >= 54u + 12u && r[54] == 129u && memcmp(r + 58, "\x42\x42\x00\x01ping", 8u) == 0 &&
+				      sum16(sum16(0u, r + 22, 32u) + 12u + 58u, r + 54, 12u) == 0xffffu);
+				/* An AAAA question for db, over UDP to [::1]:53. */
+				udp[8] = 0x12;
+				udp[9] = 0x34;
+				udp[10] = 0x01;
+				udp[13] = 1u;
+				memcpy(udp + at, "\2db\0\0\x1c\0\1", 8u);
+				at += 8u;
+				put16(udp + 4, (unsigned)at);
+				send_v6(w, 10u, hull_mac, self6, 17u, udp, at, 6u);
+				n = next_raw(w, r, sizeof r, 1000);
+				check("AAAA asked of ::1 over UDP, answered over IPv6",
+				      n >= 54u + at + 28u && r[20] == 17u && get16(r + 54) == 53u &&
+				      get16(r + 62) == 0x1234u && (r[64] & 0x80u) != 0u && get16(r + 68) == 1u &&
+				      memcmp(r + 54 + at + 12u, db6, 16u) == 0 &&
+				      sum16(sum16(0u, r + 22, 32u) + get16(r + 58) + 17u, r + 54, get16(r + 58)) ==
+				          0xffffu);
+				udp[6] = 0u;   /* the sum the last send wrote, gone */
+				udp[7] = 0u;
+				send_v6(w, 10u, hull_mac, self6, 17u, udp, at, at);
+				check("one with no UDP sum, refused over IPv6", next_raw(w, r, sizeof r, 200) == 0u);
+				{
+					/* A machine with a way out, asking a name outside: asked
+					 * on, and the answer given back to it over IPv6. */
+					unsigned           up_port = 0u;
+					int                up = resolver_of(&up_port);
+					const char        *up_server = "127.0.0.1";
+					int                o;
+					struct sockaddr_in up_from;
+					uint8_t            q[600];
+					size_t             got;
+					uint8_t            out6[16];
+
+					memcpy(out6, self6, 16u);
+					out6[15] = 30u;
+					o = hull_segment_port_named("only6", "out", 0u, 0u, out6, 64u, 1, NULL, 0u, why,
+					                            sizeof why);
+					hull_segment_resolvers(&up_server, &up_port, 1u);
+					at = 8u + 12u;
+					memcpy(udp + at, "\7example\3com\0\0\1\0\1", 17u);
+					at += 17u;
+					put16(udp + 4, (unsigned)at);
+					if (o >= 0)
+						send_v6(o, 30u, hull_mac, self6, 17u, udp, at, 6u);
+					got = asked_of(up, q, sizeof q, &up_from, 1000);
+					check("a name outside, asked on for an IPv6 asker", got != 0u);
+					if (got != 0u)
+						answer_from(up, q, got, &up_from, 0u);
+					n = o >= 0 ? next_raw(o, r, sizeof r, 1000) : 0u;
+					check("its answer, back over IPv6 under the machine's id",
+					      n > 54u + 8u + 12u && get16(r + 12) == 0x86ddu && r[20] == 17u &&
+					      r[53] == 30u && get16(r + 62) == 0x1234u &&
+					      sum16(sum16(0u, r + 22, 32u) + get16(r + 58) + 17u, r + 54, get16(r + 58)) ==
+					          0xffffu);
+					hull_segment_resolvers(NULL, NULL, 0u);
+					if (o >= 0)
+						close(o);
+					if (up >= 0)
+						close(up);
+				}
+			}
+			if (w >= 0)
+				close(w);
+			if (d >= 0)
+				close(d);
 		}
 		send_dns(web, 10u, "nobody", 1u);
 		check("a name it has not, NXDOMAIN", dns_reply(web, 10u, data, &length) == 3);

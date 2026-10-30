@@ -38,3 +38,15 @@ icmp_echo pong 00 00 DE E5 42 42 00 07 70 69 6E 67
 
 # query: a question's header: one, recursion desired
 dns_header query 12 34 01 00 00 01 00 00 00 00 00 00
+
+# solicit: an IPv6 header to ::1's solicited-node group, ICMPv6, hop limit 255
+ipv6_header solicit 60 00 00 00 00 20 3A FF FD 42 00 86 00 00 00 00 00 00 00 00 00 00 00 02 FF 02 00 00 00 00 00 00 00 00 00 01 FF 00 00 01
+
+# who_has6: a neighbour solicitation for ::1 with its source link-layer option
+neighbor_solicitation who_has6 87 00 00 00 00 00 00 00 FD 42 00 86 00 00 00 00 00 00 00 00 00 00 00 01 01 01 52 54 00 00 00 0A
+
+# is_at6: .1's advertisement, solicited and overriding, hull's MAC its option
+neighbor_advertisement is_at6 88 00 00 00 60 00 00 00 FD 42 00 86 00 00 00 00 00 00 00 00 00 00 00 01 02 01 02 68 75 6C 6C 01
+
+# ping6: an ICMPv6 echo request, "ping" its data
+icmp6_echo ping6 80 00 00 00 42 42 00 01 70 69 6E 67

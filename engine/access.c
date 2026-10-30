@@ -9,6 +9,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <arpa/inet.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -431,7 +432,7 @@ char *hull_access_hosts(const hull_sexpr_doc *doc, const hull_sexpr_form *names)
 char *hull_access_resolver(const hull_sexpr_doc *doc, const hull_sexpr_form *names)
 {
 	hull_sexpr_form segment;
-	char           *text = malloc(3u * 32u + 40u);
+	char           *text = malloc(3u * 64u + 40u);
 	size_t          at = 0u;
 	unsigned        servers = 0u;
 
@@ -450,9 +451,29 @@ char *hull_access_resolver(const hull_sexpr_doc *doc, const hull_sexpr_form *nam
 		if (address != NULL && prefix >= 1u && prefix <= 30u &&
 		    sscanf(address, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
 			self = ((a << 24 | b << 16 | c << 8 | d) & 0xffffffffu << (32u - prefix)) + 1u;
-			at += (size_t)snprintf(text + at, 32u, "nameserver %u.%u.%u.%u\n", self >> 24,
+			at += (size_t)snprintf(text + at, 64u, "nameserver %u.%u.%u.%u\n", self >> 24,
 			                       self >> 16 & 0xffu, self >> 8 & 0xffu, self & 0xffu);
 			servers++;
+		} else if (address == NULL) {
+			/* A segment of IPv6 alone: hull at its network's ::1. */
+			char           *address6 = hull_access_value(doc, &segment, "address6");
+			char           *bits6 = hull_access_value(doc, &segment, "prefix6");
+			unsigned        prefix6 = bits6 != NULL ? (unsigned)strtoul(bits6, NULL, 10) : 0u;
+			struct in6_addr parsed;
+
+			if (address6 != NULL && prefix6 >= 48u && prefix6 <= 120u &&
+			    inet_pton(AF_INET6, address6, &parsed) == 1) {
+				char shown[INET6_ADDRSTRLEN];
+
+				for (unsigned bit = prefix6; bit < 128u; bit++)
+					parsed.s6_addr[bit / 8u] &= (uint8_t)~(0x80u >> (bit % 8u));
+				parsed.s6_addr[15] |= 1u;
+				inet_ntop(AF_INET6, &parsed, shown, sizeof shown);
+				at += (size_t)snprintf(text + at, 64u, "nameserver %s\n", shown);
+				servers++;
+			}
+			free(address6);
+			free(bits6);
 		}
 		free(address);
 		free(bits);
@@ -463,7 +484,8 @@ char *hull_access_resolver(const hull_sexpr_doc *doc, const hull_sexpr_form *nam
 	}
 	/* edns0, so glibc asks with room for 1200 bytes, not 512, and an
 	 * answer the host's resolver would cut for UDP comes whole, .1
-	 * sending one past a frame in fragments; there is no TCP at .1. */
+	 * sending one past a frame in fragments, or over TCP where it is
+	 * asked so. */
 	memcpy(text + at, "search hull\noptions edns0\n", sizeof "search hull\noptions edns0\n");
 	return text;
 }

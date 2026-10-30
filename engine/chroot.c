@@ -1691,8 +1691,13 @@ static void join_segments(const hull_machine *m, int report)
 			    ioctl(fd, SIOCSIFADDR, &request) != 0)
 				child_fail(report, "a segment's NIC's IPv4 address");
 			at->sin_addr.s_addr = htonl(mask);
-			if (ioctl(fd, SIOCSIFNETMASK, &request) != 0 || ioctl(fd, SIOCGIFFLAGS, &request) != 0)
+			if (ioctl(fd, SIOCSIFNETMASK, &request) != 0)
 				child_fail(report, "a segment's NIC's netmask");
+		}
+		/* Up where hull addresses it, by either family or both. */
+		if (m->segment_address[i][0] != '\0' || m->segment_address6[i][0] != '\0') {
+			if (ioctl(fd, SIOCGIFFLAGS, &request) != 0)
+				child_fail(report, "a segment's NIC's flags");
 			request.ifr_flags |= IFF_UP;
 			if (ioctl(fd, SIOCSIFFLAGS, &request) != 0)
 				child_fail(report, "a segment's NIC up");

@@ -80,8 +80,9 @@ int hull_access_named6(const hull_sexpr_doc *doc, const hull_sexpr_form *names,
 
 /* The /etc/resolv.conf `names` gives a machine whose only network is its
  * segments: a nameserver at .1 of each addressed segment, hull's (Appendix
- * D), at most three, and `search hull`; as a C string the caller frees, or
- * NULL where it addresses none or memory ran out. */
+ * D), or at ::1 of its IPv6 network where it has no IPv4 one, at most
+ * three, and `search hull`; as a C string the caller frees, or NULL where
+ * it addresses none or memory ran out. */
 char *hull_access_resolver(const hull_sexpr_doc *doc, const hull_sexpr_form *names);
 
 /* The /etc/hosts `names` gives the machine: localhost, then a line for

@@ -557,6 +557,21 @@ static void test_names(void)
 	              SEG("b", "(m (subnet \"10.2.0.0/24\") (subnet6 \"fd01:0:0:7::/64\"))") ")",
 	              &names) != -1 || strstr(names.reason, "IPv6 subnets that overlap") == NULL)
 		FAIL("two segments, overlapping IPv6 subnets: %s", names.reason);
+	/* IPv6 alone: drawn as beside IPv4, its entry the IPv6 keys only. */
+	cases++;
+	if (draw_file("(machines " SEG("a", "(n (subnet6 \"fd03::/64\"))") SEG("b", "(n (subnet6 \"fd03::/64\"))")
+	              ")", &names) != 0 || names.count != 1u || names.segment[0].has4 ||
+	    !names.segment[0].has6 || names.segment[0].count != 2u) {
+		FAIL("a segment of IPv6 alone: %s", names.reason);
+	} else {
+		const char *e = entry_of(&names, 0u);
+
+		cases++;
+		if (strstr(e, "(7:address") != NULL || strstr(e, "(5:hosts") != NULL ||
+		    strstr(e, "(6:prefix") != NULL || strncmp(e, "(5:names(1:n(8:address6", 23u) != 0 ||
+		    strstr(e, "(6:hosts6(1:a") == NULL || strstr(e, "(7:prefix62:64)))") == NULL)
+			FAIL("an IPv6-only entry is not its IPv6 keys alone:\n  %s", e);
+	}
 	/* A /120 holds 254 past ::1: five there take five apart. */
 	cases++;
 	if (draw_file("(machines " SEG("a", "(n (subnet \"10.1.0.0/24\") (subnet6 \"fd01::/120\"))")

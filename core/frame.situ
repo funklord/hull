@@ -1,7 +1,9 @@
 // What hull at a segment's .1 reads from a machine and writes back
 // (project.md Appendix D): an Ethernet frame's header, ARP for IPv4, an
 // IPv4 header, a UDP datagram, a TCP segment, an ICMP echo, and a DNS
-// message's header.
+// message's header; and for a segment's IPv6 network, hull at its ::1,
+// an IPv6 header, ICMPv6's echo and its neighbour solicitation and
+// advertisement.
 // Every frame core/segment.c answers comes from a machine on the segment,
 // which is to say from whatever runs in it, so this is where hull reads
 // bytes it did not write; each is validated here, checksums included,
@@ -83,7 +85,11 @@ struct ipv4_header [allow_straddle] {
 require offset(ipv4_header.options) == 20;
 
 // The sum UDP and TCP take over their own bytes is taken over these first
-// (RFC 768, RFC 9293 3.1).
+// (RFC 768, RFC 9293 3.1). Over IPv6 their pseudo-header is 40 bytes
+// (RFC 8200 8.1), and ICMPv6 takes one too; it is given here folded into
+// these 12 -- its ones' complement sum in the first two bytes, the rest
+// zero -- since a ones' complement sum is its words' sum alone, wherever
+// they sit, so that UDP's and TCP's structures serve both families.
 struct pseudo_header {
 	u32  source_address;
 	u32  destination_address;
@@ -153,6 +159,67 @@ struct icmp_echo {
 }
 
 require offset(icmp_echo.data) == 8;
+
+// An IPv6 header, RFC 8200, with no extension header after it: .1 reads
+// none, a datagram with one being not one it answers.
+struct ipv6_header [allow_straddle] {
+	u4   version         [must_eq = 6];
+	u4   traffic_high;   // the traffic class, which spans the version's byte
+	u4   traffic_low;
+	u20  flow_label;
+	u16  payload_length;
+	u8   next_header;
+	u8   hop_limit;
+	u8   source[16];
+	u8   destination[16];
+}
+
+require size(ipv6_header) == 40;
+
+// ICMPv6's echo request or reply, RFC 4443 4: as ICMP's, its sum over a
+// pseudo-header first.
+struct icmp6_echo {
+	authenticated summed {
+		u8        type;
+		u8        code        [must_eq = 0];
+		checksum  u8 checksum[2] covers(summed) prefix(pseudo_header)
+			is internet_checksum [self_as = 0];
+		u16       identifier;
+		u16       sequence;
+		u8        data[remaining];
+	}
+}
+
+// A neighbour solicitation, RFC 4861 4.3, which a machine sends to learn
+// hull's MAC for ::1 as it sends ARP for .1; its options are read in C.
+struct neighbor_solicitation {
+	authenticated summed {
+		u8        type        [must_eq = 135];
+		u8        code        [must_eq = 0];
+		checksum  u8 checksum[2] covers(summed) prefix(pseudo_header)
+			is internet_checksum [self_as = 0];
+		u32       unused;
+		u8        target[16];
+		u8        options[remaining];
+	}
+}
+
+// hull's answer, RFC 4861 4.4: solicited, overriding, its MAC the target
+// link-layer address option.
+struct neighbor_advertisement [allow_straddle] {
+	authenticated summed {
+		u8        type        [must_eq = 136];
+		u8        code        [must_eq = 0];
+		checksum  u8 checksum[2] covers(summed) prefix(pseudo_header)
+			is internet_checksum [self_as = 0];
+		bit       router;
+		bit       solicited;
+		bit       override;
+		reserved  u29         [must_be_zero];
+		u8        target[16];
+		u8        options[remaining];
+	}
+}
 
 // A DNS message's twelve bytes of header, RFC 1035 4.1.1 with RFC 2535's
 // and RFC 4035's two bits; the question after it is segment.c's to read.
