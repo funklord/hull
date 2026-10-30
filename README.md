@@ -514,7 +514,8 @@ hull gc
 `hull import docker-compose.yml` a `(machines …)` file, each saying what
 it could not translate. `hull up` runs a compose file in place, with no
 conversion step: it reads `compose.yaml` or `docker-compose.yml` from the
-directory and says on stderr what it left out.
+directory, puts each network's services on a segment where they find each
+other by name, and says on stderr what it left out.
 
 A machine whose source names a stored tree runs it, taking the image's
 command, workdir and environment where the machine gives none of its own.

@@ -159,8 +159,11 @@ gb '; not translated: HEALTHCHECK'
 printf 'RUN true\n' > "$dir/nofrom.in"
 expect 2 'has no FROM' "$hull" import "$dir/nofrom.in"
 # hull import of a compose file (by its .yml name) to a (machines ...) form.
-# J.7's machines share one segment and section 4.8 plans them at once with
-# no ordering, so depends_on and networks are noted, not invented.
+# Section 4.8 plans a file's machines at once with no ordering, so
+# depends_on is noted, not invented; each network is an addressed segment
+# named for the project (the directory, `cli`), a service with none on
+# `default`, one with a network_mode on none, and what a segment does not
+# take -- an alias, a driver -- said.
 cat > "$dir/docker-compose.yml" <<'YML'
 version: "3.8"
 services:
@@ -196,8 +199,15 @@ services:
   sidecar:
     image: busybox:1.36
     network_mode: "service:web"
+  work_er:
+    image: busybox:1.36
+    networks:
+      backend:
+        aliases: [w]
+      front:
 networks:
   backend:
+    driver: bridge
 YML
 "$hull" import "$dir/docker-compose.yml" > "$dir/compose.machines" 2>&1
 # The output parses: hull plan reads the multi-machine file and reaches
@@ -220,9 +230,14 @@ gbc '\(command "postgres" "-c" "max_connections=50"\)'
 gbc '\(hostname "thedb"\)'
 gbc '\(restart always\)'
 gbc '; depends_on not translated, its machines start together: db'
-gbc '; networks not translated: \[backend\]'
 gbc '; build not translated'
-gbc '; top-level key not translated: networks'
+gbc '\(web \(source .*\(segments \(cli-default \(subnet "10\.1[6-9][0-9]\.[0-9]+\.0/24"\)\)\)'
+gbc '\(db \(source .*\(segments \(cli-backend \(subnet "10\.1[6-9][0-9]\.[0-9]+\.0/24"\)\)\)'
+gbc '\(work-er \(source "busybox:1\.36"\) \(segments \(cli-backend \(subnet [^)]*\)\) \(cli-front '
+gbc '; a machine.s name is a DNS label, so this one is work-er'
+gbc '; network backend: aliases not translated'
+gbc '; network backend: driver not translated'
+gbc '^  \(sidecar \(source "busybox:1\.36"\)$'
 # network_mode: bridge, docker's own network, is hull's nat; host and none
 # are hull's as they are, a port under either dropped and said, as docker
 # discards or refuses it; another container's network is noted.
@@ -1449,13 +1464,15 @@ printf '%s\n' "$out" | grep -q '^pinger *| ping=10\.87\.0\.1 ok$' ||
 	fail "hull at .1 did not answer a ping" "$out"
 # The compose dialect (section 9): `hull up` runs the compose file beside
 # it with no step between, saying on stderr what it does not translate,
-# and `-f` gives one to plan as to run. A service with no image is
-# refused, and a directory with no compose file says so.
+# and `-f` gives one to plan as to run. Its services share the project's
+# `default` network as a segment, so one finds another by its name, over
+# DNS at .1 and in /etc/hosts, as under compose. A service with no image
+# is refused, and a directory with no compose file says so.
 cat > "$root/compose.yaml" <<'YML'
 services:
   web:
     image: "dir:./rootfs"
-    command: ["/probe", "say", "from compose", "env", "GREETING", "host"]
+    command: ["/probe", "say", "from compose", "env", "GREETING", "host", "dns", "db", "hosts", "db"]
     environment:
       GREETING: hi
     hostname: composed
@@ -1463,15 +1480,17 @@ services:
       - db
   db:
     image: "dir:./rootfs"
-    command: ["/probe", "sleep", "1"]
+    command: ["/probe", "sleep", "2"]
 networks:
-  back: {}
+  default:
+    driver: bridge
 YML
 limit=60
 expect 0 '^web +\| host=composed$' sh -c 'cd "$1" && exec "$2" up' up "$root" "$hull_abs"
 for want in '^web +\| from compose$' '^web +\| GREETING=hi$' \
 	'^compose\.yaml: web: depends_on not translated, its machines start together: db$' \
-	'^compose\.yaml: top-level key not translated: networks$'; do
+	'^web +\| dns=db 10\.1[6-9][0-9]\.[0-9]+\.[0-9]+$' '^web +\| hosts=db 10\.1[6-9][0-9]\.' \
+	'^compose\.yaml: network default: driver not translated$'; do
 	cases=$((cases + 1))
 	printf '%s\n' "$out" | grep -Eq -- "$want" || fail "hull up: no line matches /$want/" "$out"
 done

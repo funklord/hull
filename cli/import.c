@@ -21,6 +21,7 @@
 #define _GNU_SOURCE
 
 #include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -499,10 +500,14 @@ static int import_dockerfile(FILE *file)
 
 /* A docker-compose.yml to a (machines ...) file (section 9, J.7). Only a
  * common block subset of YAML is read; what it cannot map onto hull's model
- * it says in a `;` comment, since J.7's machines share one segment and
- * section 4.8 plans them all at once with no ordering -- so compose's
- * networks and depends_on cannot be honoured, and are noted, not invented.
+ * it says in a `;` comment. Section 4.8 plans a file's machines at once with
+ * no ordering, so depends_on is noted, not invented. A network is a segment
+ * (Appendix D) named PROJECT-NETWORK, as compose names it PROJECT_NETWORK
+ * but for the `_` a segment's name cannot hold, and addressed, so that its
+ * services find each other by name as they do under compose: a service
+ * with no networks and no network_mode is on `default`, as under compose.
  */
+#define MAX_NETS 16
 typedef struct svc {
 	char name[128];
 	char source[512];      /* from image: */
@@ -516,7 +521,53 @@ typedef struct svc {
 	sb   volumes;          /* (volume ...) entries */
 	sb   notes;            /* this service's `;` annotations */
 	int  open;             /* a service is being read */
+	int  mode_given;       /* network_mode said, so no network is implied */
+	char nets[MAX_NETS][64];
+	int  net_count;
+	int  net_indent;       /* where a networks map's names are, or -1 */
+	char net_current[64];  /* the networks map's name being read */
 } svc;
+
+/* The networks a file's services are on, in the order first met, each
+ * given its subnet once the project's name is known. */
+static char file_nets[MAX_NETS * 8][64];
+static int  file_net_count;
+
+/* `text` as a DNS label, as a segment's and a machine's name must be:
+ * lowercase, `-` for anything else, none leading, trailing or doubled,
+ * at most 63; "x" where nothing is left. */
+static void as_label(char *out, size_t cap, const char *text)
+{
+	size_t n = 0u;
+
+	for (const char *c = text; *c != '\0' && n + 1u < cap && n < 63u; c++) {
+		char ch = (char)tolower((unsigned char)*c);
+
+		if (!isalnum((unsigned char)ch))
+			ch = '-';
+		if (ch == '-' && (n == 0u || out[n - 1u] == '-'))
+			continue;
+		out[n++] = ch;
+	}
+	while (n > 0u && out[n - 1u] == '-')
+		n--;
+	if (n == 0u && cap > 1u)
+		out[n++] = 'x';
+	out[n] = '\0';
+}
+
+/* Put the service on network `name`, once. */
+static void svc_join(svc *s, const char *name)
+{
+	char label[64];
+
+	as_label(label, sizeof label, name);
+	for (int i = 0; i < s->net_count; i++)
+		if (strcmp(s->nets[i], label) == 0)
+			return;
+	if (s->net_count < MAX_NETS)
+		snprintf(s->nets[s->net_count++], sizeof s->nets[0], "%s", label);
+}
 
 /* The scalar `s` without surrounding quotes and outer space. */
 static char *scalar(char *s)
@@ -566,14 +617,21 @@ static int flow_list(char *s, char **args, int max)
 		else
 			while (out > args[n - 1] && (out[-1] == ' ' || out[-1] == '\t'))
 				out--;
+		/* An unquoted last item ends at the `]`, which ending it would
+		 * overwrite: so the list ends here. */
+		if (!q && *s == ']') {
+			*out = '\0';
+			return n;
+		}
+		if (*s == '\0')
+			return -1;
 		*out = '\0';
 	}
 }
 
 /* A file's machines start together, with no order among them (section
- * 4.8), and a service's networks are not made segments. */
+ * 4.8). */
 #define DEPENDS_NOTE  "depends_on not translated, its machines start together"
-#define NETWORKS_NOTE "networks not translated"
 
 static void svc_note(svc *s, const char *why, const char *text)
 {
@@ -695,11 +753,31 @@ static void svc_flush(svc *s, sb *out)
 		fprintf(warnings, "%s: %s: no image to run it from\n", warned_path, s->name);
 		unrunnable = 1;
 	}
+	{
+		char label[64];
+
+		as_label(label, sizeof label, s->name);
+		if (strcmp(label, s->name) != 0) {
+			char why[200];
+
+			snprintf(why, sizeof why, "a machine's name is a DNS label, so this one is %s",
+			         label);
+			svc_note(s, why, NULL);
+			snprintf(s->name, sizeof s->name, "%s", label);
+		}
+	}
+	if (!s->mode_given && s->net_count == 0)
+		svc_join(s, "default");
 	sb_str(out, "\n  (");
 	sb_str(out, s->name);
 	sb_str(out, " (source ");
 	sb_quoted(out, s->source[0] != '\0' ? s->source : "SET-A-SOURCE");
 	sb_str(out, ")");
+	/* A container never writes its image, its writes being a layer of its
+	 * own: a directory named as the image is run so, as a stored image
+	 * already is. */
+	if (strncmp(s->source, "dir:", 4u) == 0)
+		sb_str(out, " (mutable overlay)");
 	if (s->command.len > 0u) {
 		sb_str(out, " (command");
 		sb_add(out, s->command.data, s->command.len);
@@ -725,6 +803,23 @@ static void svc_flush(svc *s, sb *out)
 	if (s->network[0] != '\0') {
 		sb_str(out, " (network ");
 		sb_str(out, s->network);
+		sb_str(out, ")");
+	}
+	/* Each network as a mark the whole file's translation replaces with
+	 * the segment, its name and subnet known only once the file is read. */
+	if (!s->mode_given && s->net_count > 0) {
+		sb_str(out, " (segments");
+		for (int i = 0; i < s->net_count; i++) {
+			int known = 0;
+
+			while (known < file_net_count && strcmp(file_nets[known], s->nets[i]) != 0)
+				known++;
+			if (known == file_net_count && file_net_count < MAX_NETS * 8)
+				snprintf(file_nets[file_net_count++], sizeof file_nets[0], "%s", s->nets[i]);
+			sb_str(out, " \001");
+			sb_str(out, s->nets[i]);
+			sb_str(out, "\002");
+		}
 		sb_str(out, ")");
 	}
 	if (s->volumes.len > 0u) {
@@ -764,9 +859,82 @@ static int indent_of(const char *line, const char **content)
 	return n;
 }
 
+/* A /24 under 10.160.0.0/11 for each of the file's networks, drawn from
+ * its segment's name by FNV-1a so that it is the same each run, and the
+ * next one along where two of the file's would be one, which a file may
+ * not hold; and `text` with each network's mark made its segment. */
+static char *segments(char *text, const char *project)
+{
+	unsigned subnet[MAX_NETS * 8];
+	sb       out = { NULL, 0u, 0u, 0 };
+
+	for (int i = 0; i < file_net_count; i++) {
+		char     form[160];
+		char     segment[64];
+		uint32_t h = 2166136261u;
+
+		snprintf(form, sizeof form, "%.63s-%.63s", project, file_nets[i]);
+		as_label(segment, sizeof segment, form);
+		for (const char *c = segment; *c != '\0'; c++)
+			h = (h ^ (uint8_t)*c) * 16777619u;
+		subnet[i] = h % 8192u;
+		for (int j = 0; j < i; j++)
+			if (subnet[j] == subnet[i]) {
+				subnet[i] = (subnet[i] + 1u) % 8192u;
+				j = -1;
+			}
+	}
+	for (const char *c = text; *c != '\0'; c++) {
+		const char *end;
+		char        net[64];
+		char        segment[64];
+		char        form[200];
+		int         i = 0;
+
+		if (*c != '\001' || (end = strchr(c, '\002')) == NULL) {
+			sb_add(&out, c, 1u);
+			continue;
+		}
+		snprintf(net, sizeof net, "%.*s", (int)(end - c - 1), c + 1);
+		while (i < file_net_count && strcmp(file_nets[i], net) != 0)
+			i++;
+		snprintf(form, sizeof form, "%.63s-%.63s", project, net);
+		as_label(segment, sizeof segment, form);
+		snprintf(form, sizeof form, "(%s (subnet \"10.%u.%u.0/24\"))", segment,
+		         160u + (i < file_net_count ? subnet[i] / 256u : 0u),
+		         i < file_net_count ? subnet[i] % 256u : 0u);
+		sb_str(&out, form);
+		c = end;
+	}
+	free(text);
+	if (out.bad) {
+		fprintf(stderr, "hull: import: out of memory\n");
+		free(out.data);
+		return NULL;
+	}
+	return out.data;
+}
+
+/* The compose project's name, as compose takes it where the file has no
+ * `name:`: the name of the directory `path` is in. */
+static void project_of(const char *path, char *out, size_t cap)
+{
+	char        *copy = realpath(path, NULL);
+	const char  *slash;
+
+	if (copy == NULL) {
+		snprintf(out, cap, "compose");
+		return;
+	}
+	*strrchr(copy, '/') = '\0';
+	slash = strrchr(copy, '/');
+	snprintf(out, cap, "%s", slash != NULL && slash[1] != '\0' ? slash + 1 : "compose");
+	free(copy);
+}
+
 /* The compose file `file` as a (machines ...) form, allocated, or NULL
- * having said why. */
-static char *compose_text(FILE *file)
+ * having said why; its networks' segments named for `project`. */
+static char *compose_text(FILE *file, const char *project)
 {
 	svc    s = { 0 };
 	sb     out = { NULL, 0u, 0u, 0 };
@@ -778,6 +946,13 @@ static char *compose_text(FILE *file)
 	char   field[64] = "";
 	int    any = 0;
 	char  *text;
+	char   name[64];
+	int    in_networks = 0;
+	int    network_indent = -1;
+	char   network[64] = "";
+
+	file_net_count = 0;
+	as_label(name, sizeof name, project);
 
 	while (fgets(line, sizeof line, file) != NULL) {
 		const char *c;
@@ -795,18 +970,47 @@ static char *compose_text(FILE *file)
 		if (ind == 0) {               /* a top-level key */
 			svc_flush(&s, &out);
 			in_services = 0;
+			in_networks = 0;
 			colon = strchr(content, ':');
 			if (colon != NULL && strncmp(content, "services:", 9u) == 0) {
 				in_services = 1;
+			} else if (colon != NULL && strncmp(content, "networks:", 9u) == 0) {
+				in_networks = 1;
+				network_indent = -1;
+			} else if (colon != NULL && strncmp(content, "name:", 5u) == 0) {
+				as_label(name, sizeof name, scalar(colon + 1));
 			} else if (colon != NULL) {
 				*colon = '\0';
-				if (strcmp(content, "version") != 0 && strcmp(content, "name") != 0) {
+				if (strcmp(content, "version") != 0) {
 					sb_str(&top_notes, "\n; top-level key not translated: ");
 					sb_str(&top_notes, content);
 					if (warnings != NULL)
 						fprintf(warnings, "%s: top-level key not translated: %s\n",
 						        warned_path, content);
 				}
+			}
+			continue;
+		}
+		/* A network's options are docker's to give it; a segment has
+		 * none, so each is said, `external` above all, which would join a
+		 * network made elsewhere. */
+		if (in_networks) {
+			colon = strchr(content, ':');
+			if (network_indent < 0)
+				network_indent = ind;
+			if (colon != NULL)
+				*colon = '\0';
+			if (ind == network_indent) {
+				snprintf(network, sizeof network, "%s", trim(content));
+			} else {
+				sb_str(&top_notes, "\n; network ");
+				sb_str(&top_notes, network);
+				sb_str(&top_notes, ": ");
+				sb_str(&top_notes, trim(content));
+				sb_str(&top_notes, " not translated");
+				if (warnings != NULL)
+					fprintf(warnings, "%s: network %s: %s not translated\n", warned_path,
+					        network, trim(content));
 			}
 			continue;
 		}
@@ -821,6 +1025,7 @@ static char *compose_text(FILE *file)
 				*colon = '\0';
 			snprintf(s.name, sizeof s.name, "%s", trim(content));
 			s.open = 1;
+			s.net_indent = -1;
 			any = 1;
 			field_indent = -1;
 			field[0] = '\0';
@@ -840,9 +1045,10 @@ static char *compose_text(FILE *file)
 			else if (strcmp(field, "command") == 0 || strcmp(field, "entrypoint") == 0) {
 				sb_str(&s.command, " ");
 				sb_quoted(&s.command, scalar(item));
-			} else if (strcmp(field, "depends_on") == 0 || strcmp(field, "networks") == 0)
-				svc_note(&s, strcmp(field, "depends_on") == 0 ? DEPENDS_NOTE : NETWORKS_NOTE,
-				         scalar(item));
+			} else if (strcmp(field, "networks") == 0)
+				svc_join(&s, scalar(item));
+			else if (strcmp(field, "depends_on") == 0)
+				svc_note(&s, DEPENDS_NOTE, scalar(item));
 			continue;
 		}
 		if (field_indent < 0)
@@ -850,6 +1056,26 @@ static char *compose_text(FILE *file)
 		if (ind > field_indent && field[0] != '\0') {   /* a map entry of `field` */
 			if (strcmp(field, "environment") == 0)
 				compose_env(&s, content, 1);
+			else if (strcmp(field, "networks") == 0) {
+				/* A networks map: each name, its options under it, an
+				 * alias or an address, which a segment does not take. */
+				char *at = strchr(content, ':');
+
+				if (at != NULL)
+					*at = '\0';
+				if (s.net_indent < 0)
+					s.net_indent = ind;
+				if (ind == s.net_indent) {
+					svc_join(&s, trim(content));
+					snprintf(s.net_current, sizeof s.net_current, "%s", trim(content));
+				} else {
+					char why[200];
+
+					snprintf(why, sizeof why, "network %s: %s not translated", s.net_current,
+					         trim(content));
+					svc_note(&s, why, NULL);
+				}
+			}
 			continue;
 		}
 		/* a field: key and its value, which may be empty (a block follows). */
@@ -908,9 +1134,16 @@ static char *compose_text(FILE *file)
 				svc_note(&s, key, "value not translated");
 		} else if (strcmp(key, "build") == 0)
 			svc_note(&s, "build not translated", "hull import the Dockerfile, then name the ref");
-		else if (strcmp(key, "depends_on") == 0 || strcmp(key, "networks") == 0)
-			svc_note(&s, strcmp(key, "depends_on") == 0 ? DEPENDS_NOTE : NETWORKS_NOTE,
-			         scalar(value));
+		else if (strcmp(key, "networks") == 0) {
+			char *items[MAX_NETS];
+			int   n = flow_list(value, items, MAX_NETS);
+
+			for (int i = 0; i < n; i++)
+				svc_join(&s, items[i]);
+			if (n < 0)
+				svc_note(&s, "networks not translated", scalar(value));
+		} else if (strcmp(key, "depends_on") == 0)
+			svc_note(&s, DEPENDS_NOTE, scalar(value));
 		else if (strcmp(key, "user") == 0)
 			svc_note(&s, "user not translated", scalar(value));
 		else if (strcmp(key, "network_mode") == 0) {
@@ -920,6 +1153,7 @@ static char *compose_text(FILE *file)
 			 * way to share. */
 			char *mode = scalar(value);
 
+			s.mode_given = 1;
 			if (strcmp(mode, "bridge") == 0) {
 				snprintf(s.network, sizeof s.network, "nat");
 				svc_note(&s, "network_mode bridge mapped to nat",
@@ -948,12 +1182,12 @@ static char *compose_text(FILE *file)
 	}
 	free(out.data);
 	free(top_notes.data);
-	return text;
+	return text != NULL ? segments(text, name) : NULL;
 }
 
-static int import_compose(FILE *file)
+static int import_compose(FILE *file, const char *project)
 {
-	char *text = compose_text(file);
+	char *text = compose_text(file, project);
 
 	if (text == NULL)
 		return 2;
@@ -976,15 +1210,17 @@ char *hull_import_compose(const char *path, FILE *notes)
 {
 	FILE *file = fopen(path, "r");
 	char *text;
+	char  project[256];
 
 	if (file == NULL) {
 		perror(path);
 		return NULL;
 	}
+	project_of(path, project, sizeof project);
 	warnings = notes;
 	warned_path = path;
 	unrunnable = 0;
-	text = compose_text(file);
+	text = compose_text(file, project);
 	fclose(file);
 	warnings = NULL;
 	if (text != NULL && unrunnable) {
@@ -1015,7 +1251,14 @@ int hull_import(const char *path)
 		fprintf(stderr, "hull: import: %s: cannot open\n", path);
 		return 2;
 	}
-	status = compose ? import_compose(file) : import_dockerfile(file);
+	if (compose) {
+		char project[256];
+
+		project_of(path, project, sizeof project);
+		status = import_compose(file, project);
+	} else {
+		status = import_dockerfile(file);
+	}
 	fclose(file);
 	return status;
 }
