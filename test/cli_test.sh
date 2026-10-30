@@ -1498,6 +1498,27 @@ expect 0 'compose\.yaml: db on chroot \(ns\): ok' "$hull" plan -f "$root/compose
 printf 'services:\n  lost:\n    build: ./lost\n' > "$root/noimage.yaml"
 expect 125 'noimage\.yaml: lost: no image to run it from' "$hull" up -f "$root/noimage.yaml"
 expect 125 'no compose\.yaml' sh -c 'cd "$1" && exec "$2" up' up "$root/rootfs" "$hull_abs"
+# A foreign arch on chroot, rootless: the probe built for arm64, run
+# translated by the host's qemu-user through binfmt_misc in the machine's
+# own user namespace, the plan saying so; and its registration seen by
+# nothing outside the machine.
+arm64_probe="$root/../arm64/rootfs/probe"
+if [ -x "$arm64_probe" ] && [ -x /usr/bin/qemu-aarch64 ]; then
+	printf '(machine (source "dir:../arm64/rootfs") (backend chroot) (mutable overlay) (arch arm64) (command "/probe" "arch" "say" "translated"))\n' \
+		> "$root/arm64.conf"
+	limit=60
+	expect 0 '^arch=aarch64$' "$hull" run -f "$root/arm64.conf"
+	for want in '^translated$' 'arch\.arm64: emulated: translated by the host.s qemu-user'; do
+		cases=$((cases + 1))
+		printf '%s\n' "$out" | grep -Eq -- "$want" || fail "arm64 on chroot: no line matches /$want/" "$out"
+	done
+	cases=$((cases + 1))
+	! grep -q '^hull-aarch64$' /proc/sys/fs/binfmt_misc/* 2>/dev/null &&
+		[ ! -e /proc/sys/fs/binfmt_misc/hull-aarch64 ] ||
+		fail "arm64 on chroot: its emulator was registered outside the machine" ""
+else
+	echo "cli: arm64 on chroot not measured: no arm64 probe (aarch64-linux-gnu-gcc) or no qemu-aarch64"
+fi
 # A segment of 40 machines, past the 32 a segment took before, each
 # up at its own address and all on the switch at once, each staying a
 # while: a network of a /24's size, not a handful.

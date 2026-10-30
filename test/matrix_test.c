@@ -70,6 +70,7 @@ static const hull_cap_entry docker_entries[] = {
 	{ "source.ref.overlay", HULL_SUP_NATIVE,   NULL, NULL },
 	{ "command",            HULL_SUP_NATIVE,   NULL, NULL },
 	{ "ports",              HULL_SUP_NATIVE,   NULL, NULL },
+	{ "arch.riscv64",       HULL_SUP_EMULATED, "translated by qemu-user", NULL },
 	{ NULL,                 HULL_SUP_NATIVE,   NULL, NULL },
 };
 
@@ -198,6 +199,10 @@ static void test_lists(void)
 	   "source.ref.overlay:n arch:r");
 	NO("(machine (source \"debian:13\") (arch arm64))", &docker, "ns",
 	   "source.ref.overlay:n arch:r");
+	/* An ns engine that declares a foreign arch runs it as its entry says,
+	 * and only that one. */
+	OK("(machine (source \"debian:13\") (arch riscv64))", &docker, "ns",
+	   "source.ref.overlay:n arch.riscv64:e");
 
 	/* Media: the key, then each type against media_types, then a listed
 	 * medium's source by its scheme, which an engine declares apart. */

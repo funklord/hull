@@ -85,6 +85,7 @@
  *               does, and send it the count
  *   resolve A N ask the DNS server at address A for NAME's IPv4 address,
  *               within 5 seconds, and say its answer's rcode and count
+ *   arch        the machine the kernel reports to it, as uname -m does
  *   ping A      an ICMP echo request to address A, from a raw socket, up
  *               to three a second apart; ok and the data echoed whole,
  *               or none
@@ -1269,6 +1270,10 @@ int main(int argc, char **argv)
 		} else if (strcmp(step, "dns") == 0 || strcmp(step, "dnstcp") == 0) {
 			ask_dns(step, arg, arg, 1u);
 			i++;
+		} else if (strcmp(step, "arch") == 0) {
+			struct utsname self;
+
+			printf("arch=%s\n", uname(&self) == 0 ? self.machine : strerror(errno));
 		} else if (strcmp(step, "ping") == 0) {
 			ping(arg);
 			i++;

@@ -224,23 +224,39 @@ static void resolve_source(resolver *r, const hull_sexpr_form *machine,
 	resolve(r, id, entry->offset);
 }
 
+/* Whether the engine declares the field `id` at all. */
+static int declared(const resolver *r, const char *id)
+{
+	for (const hull_cap_entry *entry = r->caps->entries; entry != NULL && entry->field != NULL;
+	     entry++)
+		if (strcmp(entry->field, id) == 0)
+			return 1;
+	return 0;
+}
+
 /*
  * `(arch arm64)`. The host's own asks nothing, by name or as `host`.
  * Another is a class's question before it is an engine's (section 6): ns
  * shares the host's kernel and vm is accelerated, so only emu runs a
- * foreign arch, and then only one the engine lists.
+ * foreign arch, and then only one the engine lists -- or an ns engine
+ * that declares `arch.ARCH`, which it can run translated on the host's
+ * kernel (qemu-user, section 5.3), emulated as its entry says.
  */
 static void resolve_arch(resolver *r, const hull_sexpr_form *entry)
 {
 	hull_sexpr_form head;
 	hull_sexpr_form value;
+	char            id[ID_SIZE];
 
 	hull_sexpr_child(&r->spec->doc, entry, &head);
 	hull_sexpr_next(&r->spec->doc, &head, &value);
 	if (hull_sexpr_is(&r->spec->doc, &value, "host") ||
 	    (r->host_arch != NULL && hull_sexpr_is(&r->spec->doc, &value, r->host_arch)))
 		return;
-	if (strcmp(r->class_name, "emu") != 0)
+	join_form(r, id, "arch", &value);
+	if (strcmp(r->class_name, "ns") == 0 && declared(r, id))
+		resolve(r, id, entry->offset);
+	else if (strcmp(r->class_name, "emu") != 0)
 		emit(r, "arch", HULL_OUTCOME_REJECTED,
 		     "only the emu class runs an arch other than the host's", NULL, entry->offset);
 	else if (listed(r->caps->arches, &r->spec->doc, &value))

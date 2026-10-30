@@ -226,6 +226,10 @@ where nothing else is available, since it needs only user namespaces.
   manager.
 - Nested namespaces work inside it: `unshare -rn` and rootless tools run
   in a machine.
+- A foreign architecture's tree, `(arch arm64)` (or arm, riscv64,
+  ppc64le, s390x), its programs translated by the host's qemu-user,
+  registered in the machine's own binfmt_misc: no root, nothing set up on
+  the host, and the plan says it is emulated.
 
 **Cons**
 - The host's kernel, shared: a machine can load no module, set no global
@@ -453,9 +457,6 @@ from a directory and scripted like any other machine.
   tree.
 - **hyperv**: the Windows-host slot, reserved so that Windows support
   arrives as an engine.
-- **qemu-user on ns**, `(tuning (ns (binfmt true)))`: a foreign-arch
-  process rather than a foreign-arch machine, faster than full emulation
-  and declared emulated, since syscall translation has edge cases.
 - **hw**: real machines, a board on a lab bench reached through leases
   from a pool, with the same spec and commands as a software one.
 

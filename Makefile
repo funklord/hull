@@ -175,7 +175,8 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  natports.out hostports.conf noneports.conf natexec.conf natexec.out natseg.conf \
                  natsaid.conf natplan.conf bridged.conf bridge2.conf brnamed.conf brnone.conf \
                  brports.conf brdocker.conf brserve.conf brserve.out brsshd.conf brssh/probe \
-                 brssh/usr/sbin/sshd relay-resolv.conf fakedns.py) \
+                 brssh/usr/sbin/sshd relay-resolv.conf fakedns.py ping.conf compose.yaml \
+                 noimage.yaml arm64.conf) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
 # What test/docker_test.sh writes.
@@ -215,6 +216,11 @@ FLIP_TEST_FILES = $(addprefix $(BUILD_DIR)/test/flip/, docker.out vm.out emu.out
 
 # The reference engine's test rootfs holds one static program.
 PROBE = $(BUILD_DIR)/test/cli/rootfs/probe
+# And the same program built for arm64, which chroot runs translated by
+# qemu-user, where a cross compiler is installed to build it; without one
+# the suite says the case is not measured.
+ARM64_CC    ?= aarch64-linux-gnu-gcc
+ARM64_PROBE := $(if $(shell command -v $(ARM64_CC) 2>/dev/null),$(BUILD_DIR)/test/arm64/rootfs/probe)
 
 TEST_SPEC_OBJS    = $(BUILD_DIR)/test/spec_test.o
 TEST_MATRIX_OBJS  = $(BUILD_DIR)/test/matrix_test.o
@@ -369,6 +375,10 @@ $(PROBE): test/probe.c
 	@mkdir -p '$(@D)'
 	$(CC) -static $(CFLAGS) -o $@ $<
 
+$(BUILD_DIR)/test/arm64/rootfs/probe: test/probe.c
+	@mkdir -p '$(@D)/proc' '$(@D)/dev'
+	$(ARM64_CC) -static $(CFLAGS) -o $@ $<
+
 $(HULL): $(CLI_OBJS) $(CORE_OBJS) $(ENGINE_OBJS) $(STORE_OBJS) $(OCI_OBJS) $(PLAN_OBJS) \
          $(SPEC_OBJS) $(SEXPR_OBJS)
 	$(CC) $(CFLAGS) -pthread -o $@ $^ $(PULL_LIBS)
@@ -473,7 +483,7 @@ check: style contract test
 # The reader's tests -- the spec's against every ```scheme example in
 # project.md as well -- then the gate's own suite, which travels with the
 # gate. Tests are built here and only here: a plain `make` does not.
-test: $(TEST_BINS) $(HULL) $(PROBE) $(NSS_LIB) vectors
+test: $(TEST_BINS) $(HULL) $(PROBE) $(ARM64_PROBE) $(NSS_LIB) vectors
 	$(BUILD_DIR)/test/sexpr_test
 	$(BUILD_DIR)/test/framing_test
 	$(BUILD_DIR)/test/spec_test project.md
@@ -574,5 +584,6 @@ clean:
 	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(STORE_OBJS) $(STORE_OBJS:.o=.d) $(OCI_OBJS) $(OCI_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) \
 	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) $(DISC_GEN) $(FRAME_GEN) \
 	        $(AGENT_BIN) $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
-	        $(CLI_TEST_FILES) $(PROBE) $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) \
+	        $(CLI_TEST_FILES) $(PROBE) $(BUILD_DIR)/test/arm64/rootfs/probe \
+	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) \
 	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor

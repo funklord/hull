@@ -61,6 +61,7 @@
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -114,6 +115,7 @@ struct hull_machine {
 	char            *workdir;
 	char            *hostname;   /* or NULL */
 	char            *init;       /* (init PATH): the image's init, PID 1 once handed to */
+	char             binfmt[400]; /* a foreign arch's binfmt_misc registration, or "" */
 	char            *argv[MAX_ARGS + 1u];
 	char            *envp[MAX_ENV + 1u];
 	int              readonly_root;
@@ -261,6 +263,8 @@ static unsigned long long bytes_of(const char *size)
 	return n;
 }
 
+static const char *foreign_arch(hull_machine *m, const char *arch);
+
 /* The plan's machine, read into `m`. Returns a reason, or NULL. */
 static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 {
@@ -286,6 +290,14 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	m->init = hull_access_value(doc, &machine, "init");
 	if (m->root == NULL || m->workdir == NULL)
 		return "the plan is missing its source or workdir";
+	{
+		char       *arch = hull_access_value(doc, &machine, "arch");
+		const char *why  = foreign_arch(m, arch);
+
+		free(arch);
+		if (why != NULL)
+			return why;
+	}
 
 	if (!hull_access_find(doc, &machine, "command", &entry))
 		return "the machine names no command, and no stored tree's runtime gives one, so it needs (command ...)";
@@ -681,6 +693,119 @@ static int make_path(const char *path)
 			return 0;
 		*slash = '/';
 	}
+}
+
+/*
+ * A foreign arch, run translated by the host's qemu-user: hull's name for
+ * it, qemu's, and the ELF header's magic and mask that binfmt_misc knows
+ * its binaries by, as qemu's own qemu-binfmt-conf.sh gives them.
+ */
+static const struct foreign_arch {
+	const char *name;
+	const char *qemu;
+	const char *magic;
+	const char *mask;
+} foreign_arches[] = {
+	{ "arm64", "aarch64",
+	  "\\x7f\\x45\\x4c\\x46\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\xb7\\x00",
+	  "\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff" },
+	{ "arm", "arm",
+	  "\\x7f\\x45\\x4c\\x46\\x01\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x28\\x00",
+	  "\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff" },
+	{ "riscv64", "riscv64",
+	  "\\x7f\\x45\\x4c\\x46\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\xf3\\x00",
+	  "\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff" },
+	{ "ppc64le", "ppc64le",
+	  "\\x7f\\x45\\x4c\\x46\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x15\\x00",
+	  "\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfc\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\x00" },
+	{ "s390x", "s390x",
+	  "\\x7f\\x45\\x4c\\x46\\x02\\x02\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x16",
+	  "\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfc\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff" },
+};
+
+/* The host's arch in the spec's spelling, as the CLI gives the planner. */
+static const char *host_arch(void)
+{
+	static struct utsname host;
+
+	if (uname(&host) != 0)
+		return "";
+	if (strcmp(host.machine, "x86_64") == 0)
+		return "amd64";
+	if (strcmp(host.machine, "aarch64") == 0)
+		return "arm64";
+	return host.machine;
+}
+
+/* Whether the ELF at `path` asks for no program interpreter, as a binary
+ * binfmt_misc opens at registration (its F flag) must not: it runs inside
+ * the machine's root, where the host's loader is not. */
+static int static_elf(const char *path)
+{
+	unsigned char header[64];
+	int           fd = open(path, O_RDONLY | O_CLOEXEC);
+	int           result = 0;
+
+	if (fd < 0)
+		return 0;
+	if (read(fd, header, sizeof header) == (ssize_t)sizeof header &&
+	    memcmp(header, "\177ELF", 4u) == 0 && header[4] == 2 && header[5] == 1) {
+		uint64_t phoff = 0u;
+		unsigned size  = (unsigned)(header[54] | header[55] << 8);
+		unsigned count = (unsigned)(header[56] | header[57] << 8);
+
+		for (int i = 7; i >= 0; i--)
+			phoff = phoff << 8 | header[32 + i];
+		result = size >= 4u;
+		for (unsigned i = 0u; result && i < count; i++) {
+			unsigned char type[4];
+
+			if (pread(fd, type, 4u, (off_t)(phoff + (uint64_t)i * size)) != 4)
+				result = 0;
+			else if ((type[0] | type[1] << 8 | type[2] << 16 | (unsigned)type[3] << 24) == 3u)
+				result = 0;   /* PT_INTERP */
+		}
+	}
+	close(fd);
+	return result;
+}
+
+/* `(arch ARCH)`: nothing for the host's own; for one qemu-user runs, its
+ * binfmt_misc registration in m->binfmt, naming the host's static
+ * qemu-ARCH; or why the machine cannot run. */
+static const char *foreign_arch(hull_machine *m, const char *arch)
+{
+	const struct foreign_arch *f = NULL;
+	static const char *const   dirs[] = { "/usr/bin", "/usr/local/bin" };
+	char                       qemu[64];
+	static char                why[200];
+
+	m->binfmt[0] = '\0';
+	if (arch == NULL || strcmp(arch, "host") == 0 || strcmp(arch, host_arch()) == 0)
+		return NULL;
+	for (size_t i = 0u; i < sizeof foreign_arches / sizeof foreign_arches[0]; i++)
+		if (strcmp(foreign_arches[i].name, arch) == 0)
+			f = &foreign_arches[i];
+	if (f == NULL) {
+		snprintf(why, sizeof why, "chroot does not run arch %s", arch);
+		return why;
+	}
+	for (size_t i = 0u; i < sizeof dirs / sizeof dirs[0]; i++) {
+		snprintf(qemu, sizeof qemu, "%s/qemu-%s", dirs[i], f->qemu);
+		if (access(qemu, X_OK) != 0)
+			continue;
+		if (!static_elf(qemu)) {
+			snprintf(why, sizeof why, "(arch %s) is run by %s, which is not a static binary, "
+			         "as it must be to run in the machine's root", arch, qemu);
+			return why;
+		}
+		snprintf(m->binfmt, sizeof m->binfmt, ":hull-%s:M::%s:%s:%s:F", f->qemu, f->magic,
+		         f->mask, qemu);
+		return NULL;
+	}
+	snprintf(why, sizeof why, "(arch %s) on chroot is run by qemu-%s, which is not installed "
+	         "(Debian's qemu-user)", arch, f->qemu);
+	return why;
 }
 
 static void child_fail(int report, const char *step)
@@ -1842,6 +1967,28 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		if (stat("proc", &st) == 0 && S_ISDIR(st.st_mode) &&
 		    mount("proc", "proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) != 0)
 			child_fail(report, "mounting /proc");
+		/* A foreign arch: binfmt_misc of the machine's own user namespace
+		 * (Linux 6.7), on its /proc where a program looks for it, given
+		 * qemu-user while the host's binary is still to be seen; F opens
+		 * it now, so it runs in the machine's root. The mount holds the
+		 * registration, which goes with it, and nothing outside sees it. */
+		if (m->binfmt[0] != '\0') {
+			int fd;
+
+			if (stat("proc", &st) != 0 || !S_ISDIR(st.st_mode)) {
+				errno = ENOENT;
+				child_fail(report, "a foreign arch registers its emulator on the tree's /proc, "
+				                   "and it has none");
+			}
+			if (mount("binfmt_misc", "proc/sys/fs/binfmt_misc", "binfmt_misc",
+			          MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) != 0)
+				child_fail(report, "binfmt_misc in the machine's user namespace (Linux 6.7 and "
+				                   "later)");
+			fd = open("proc/sys/fs/binfmt_misc/register", O_WRONLY | O_CLOEXEC);
+			if (fd < 0 || write(fd, m->binfmt, strlen(m->binfmt)) != (ssize_t)strlen(m->binfmt))
+				child_fail(report, "registering the foreign arch's emulator");
+			close(fd);
+		}
 		/* And its devices; a machine of the host's own / keeps the
 		 * host's /dev, which is already its tree's. */
 		if (!(now.st_dev == new_root.st_dev && now.st_ino == new_root.st_ino) &&
@@ -3531,6 +3678,10 @@ static hull_status chroot_stream_close(hull_core *core, hull_stream *st, hull_er
 
 /* --- the declaration ----------------------------------------------------- */
 
+#define ARCH_NOTE "translated by the host's qemu-user, registered through binfmt_misc in the " \
+                  "machine's own user namespace; the kernel is the host's, which answers " \
+                  "its system calls"
+
 static const hull_cap_entry entries[] = {
 	/* The dir itself, bound onto itself and chrooted into; or beneath an
 	 * overlayfs in the machine's mount namespace, whose upper layer is a
@@ -3615,6 +3766,12 @@ static const hull_cap_entry entries[] = {
 	  NULL },
 	{ "owners",                 HULL_SUP_NATIVE,
 	  "given in the overlay before the workload, where many uids are mapped", NULL },
+	/* A foreign arch, its programs translated on the host's kernel. */
+	{ "arch.arm64",             HULL_SUP_EMULATED, ARCH_NOTE, NULL },
+	{ "arch.arm",               HULL_SUP_EMULATED, ARCH_NOTE, NULL },
+	{ "arch.riscv64",           HULL_SUP_EMULATED, ARCH_NOTE, NULL },
+	{ "arch.ppc64le",           HULL_SUP_EMULATED, ARCH_NOTE, NULL },
+	{ "arch.s390x",             HULL_SUP_EMULATED, ARCH_NOTE, NULL },
 	{ "init",                   HULL_SUP_NATIVE,
 	  "the image's init is PID 1, the engine's a child of it, and its poweroff ends the machine",
 	  NULL },
