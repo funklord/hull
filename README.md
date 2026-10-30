@@ -512,7 +512,9 @@ hull gc
 
 `hull import Dockerfile` prints the same image as a `(build …)` form, and
 `hull import docker-compose.yml` a `(machines …)` file, each saying what
-it could not translate.
+it could not translate. `hull up` runs a compose file in place, with no
+conversion step: it reads `compose.yaml` or `docker-compose.yml` from the
+directory and says on stderr what it left out.
 
 A machine whose source names a stored tree runs it, taking the image's
 command, workdir and environment where the machine gives none of its own.

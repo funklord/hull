@@ -9,8 +9,14 @@
  * EXPOSE, USER, VOLUME and STOPSIGNAL become the runtime.
  *
  * Only a single stage is translated: a second FROM ends it with a comment,
- * since multi-stage COPY --from has no (build ...) shape. The compose and
- * foreign-image imports the CLI sketch names are not written.
+ * since multi-stage COPY --from has no (build ...) shape. The foreign-image
+ * import the CLI sketch names is not written.
+ *
+ * A compose file is translated the same way to a (machines ...) form, and
+ * is also section 9's compose dialect: hull_import_compose() gives the
+ * form to the planner in place of a file, each note said on stderr as
+ * well, so that `hull up` and `-f compose.yaml` run it with no step
+ * between and nothing it leaves out goes unsaid.
  */
 #define _GNU_SOURCE
 
@@ -22,6 +28,12 @@
 #include "import.h"
 
 #define MAX_ENV   128
+
+/* Where a translation for the dialect says its notes, and of which file;
+ * NULL for `hull import`, whose notes are in what it prints. */
+static FILE       *warnings;
+static const char *warned_path;
+static int         unrunnable;
 #define LINE_CAP  (1u << 20)
 
 typedef struct sb {
@@ -558,8 +570,16 @@ static int flow_list(char *s, char **args, int max)
 	}
 }
 
+/* A file's machines start together, with no order among them (section
+ * 4.8), and a service's networks are not made segments. */
+#define DEPENDS_NOTE  "depends_on not translated, its machines start together"
+#define NETWORKS_NOTE "networks not translated"
+
 static void svc_note(svc *s, const char *why, const char *text)
 {
+	if (warnings != NULL)
+		fprintf(warnings, "%s: %s: %s%s%s\n", warned_path, s->name, why,
+		        text != NULL && text[0] != '\0' ? ": " : "", text != NULL ? text : "");
 	sb_str(&s->notes, "\n    ; ");
 	sb_str(&s->notes, why);
 	if (text != NULL && text[0] != '\0') {
@@ -671,6 +691,10 @@ static void svc_flush(svc *s, sb *out)
 {
 	if (!s->open)
 		return;
+	if (s->source[0] == '\0' && warnings != NULL) {
+		fprintf(warnings, "%s: %s: no image to run it from\n", warned_path, s->name);
+		unrunnable = 1;
+	}
 	sb_str(out, "\n  (");
 	sb_str(out, s->name);
 	sb_str(out, " (source ");
@@ -740,7 +764,9 @@ static int indent_of(const char *line, const char **content)
 	return n;
 }
 
-static int import_compose(FILE *file)
+/* The compose file `file` as a (machines ...) form, allocated, or NULL
+ * having said why. */
+static char *compose_text(FILE *file)
 {
 	svc    s = { 0 };
 	sb     out = { NULL, 0u, 0u, 0 };
@@ -751,6 +777,7 @@ static int import_compose(FILE *file)
 	int    field_indent = -1;
 	char   field[64] = "";
 	int    any = 0;
+	char  *text;
 
 	while (fgets(line, sizeof line, file) != NULL) {
 		const char *c;
@@ -776,6 +803,9 @@ static int import_compose(FILE *file)
 				if (strcmp(content, "version") != 0 && strcmp(content, "name") != 0) {
 					sb_str(&top_notes, "\n; top-level key not translated: ");
 					sb_str(&top_notes, content);
+					if (warnings != NULL)
+						fprintf(warnings, "%s: top-level key not translated: %s\n",
+						        warned_path, content);
 				}
 			}
 			continue;
@@ -811,7 +841,8 @@ static int import_compose(FILE *file)
 				sb_str(&s.command, " ");
 				sb_quoted(&s.command, scalar(item));
 			} else if (strcmp(field, "depends_on") == 0 || strcmp(field, "networks") == 0)
-				svc_note(&s, field, scalar(item));
+				svc_note(&s, strcmp(field, "depends_on") == 0 ? DEPENDS_NOTE : NETWORKS_NOTE,
+				         scalar(item));
 			continue;
 		}
 		if (field_indent < 0)
@@ -878,7 +909,8 @@ static int import_compose(FILE *file)
 		} else if (strcmp(key, "build") == 0)
 			svc_note(&s, "build not translated", "hull import the Dockerfile, then name the ref");
 		else if (strcmp(key, "depends_on") == 0 || strcmp(key, "networks") == 0)
-			svc_note(&s, key, scalar(value));
+			svc_note(&s, strcmp(key, "depends_on") == 0 ? DEPENDS_NOTE : NETWORKS_NOTE,
+			         scalar(value));
 		else if (strcmp(key, "user") == 0)
 			svc_note(&s, "user not translated", scalar(value));
 		else if (strcmp(key, "network_mode") == 0) {
@@ -906,18 +938,63 @@ static int import_compose(FILE *file)
 		fprintf(stderr, "hull: import: no services: found; is this a compose file?\n");
 		free(out.data);
 		free(top_notes.data);
-		return 2;
+		return NULL;
 	}
-	if (out.bad || top_notes.bad) {
+	if (out.bad || top_notes.bad ||
+	    asprintf(&text, "(machines%s%s\n)\n", top_notes.data ? top_notes.data : "",
+	             out.data) < 0) {
 		fprintf(stderr, "hull: import: out of memory\n");
-		free(out.data);
-		free(top_notes.data);
-		return 2;
+		text = NULL;
 	}
-	printf("(machines%s%s\n)\n", top_notes.data ? top_notes.data : "", out.data);
 	free(out.data);
 	free(top_notes.data);
+	return text;
+}
+
+static int import_compose(FILE *file)
+{
+	char *text = compose_text(file);
+
+	if (text == NULL)
+		return 2;
+	fputs(text, stdout);
+	free(text);
 	return 0;
+}
+
+int hull_import_is_compose(const char *path)
+{
+	const char *base = strrchr(path, '/');
+	const char *dot;
+
+	base = base != NULL ? base + 1 : path;
+	dot = strrchr(base, '.');
+	return dot != NULL && (strcmp(dot, ".yml") == 0 || strcmp(dot, ".yaml") == 0);
+}
+
+char *hull_import_compose(const char *path, FILE *notes)
+{
+	FILE *file = fopen(path, "r");
+	char *text;
+
+	if (file == NULL) {
+		perror(path);
+		return NULL;
+	}
+	warnings = notes;
+	warned_path = path;
+	unrunnable = 0;
+	text = compose_text(file);
+	fclose(file);
+	warnings = NULL;
+	if (text != NULL && unrunnable) {
+		fprintf(notes != NULL ? notes : stderr,
+		        "%s: a service with no image does not run: hull runs one from an image "
+		        "or a directory\n", path);
+		free(text);
+		text = NULL;
+	}
+	return text;
 }
 
 /* Dockerfile or compose, told apart by the file's name: a compose file ends
@@ -925,15 +1002,15 @@ static int import_compose(FILE *file)
 int hull_import(const char *path)
 {
 	const char *base = strrchr(path, '/');
-	const char *dot;
 	FILE       *file;
 	int         compose;
 	int         status;
 
+	/* `hull import` also takes a compose file by a name with compose in
+	 * it, which a spec reader does not, a spec's own name being free. */
 	base = base != NULL ? base + 1 : path;
-	dot = strrchr(base, '.');
-	compose = strstr(base, "compose") != NULL ||
-	          (dot != NULL && (strcmp(dot, ".yml") == 0 || strcmp(dot, ".yaml") == 0));
+	compose = hull_import_is_compose(path) || strstr(base, "compose") != NULL;
+
 	if ((file = fopen(path, "r")) == NULL) {
 		fprintf(stderr, "hull: import: %s: cannot open\n", path);
 		return 2;

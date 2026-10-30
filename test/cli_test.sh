@@ -219,7 +219,8 @@ gbc '\(volume \(host "\./site"\) \(guest "/usr/share/nginx/html"\) \(mode ro\)\)
 gbc '\(command "postgres" "-c" "max_connections=50"\)'
 gbc '\(hostname "thedb"\)'
 gbc '\(restart always\)'
-gbc '; depends_on: db'
+gbc '; depends_on not translated, its machines start together: db'
+gbc '; networks not translated: \[backend\]'
 gbc '; build not translated'
 gbc '; top-level key not translated: networks'
 # network_mode: bridge, docker's own network, is hull's nat; host and none
@@ -1446,6 +1447,38 @@ from_root 0 '^pinger +\| ping=10\.87\.0\.250 none$' -f "$root/ping.conf"
 cases=$((cases + 1))
 printf '%s\n' "$out" | grep -q '^pinger *| ping=10\.87\.0\.1 ok$' ||
 	fail "hull at .1 did not answer a ping" "$out"
+# The compose dialect (section 9): `hull up` runs the compose file beside
+# it with no step between, saying on stderr what it does not translate,
+# and `-f` gives one to plan as to run. A service with no image is
+# refused, and a directory with no compose file says so.
+cat > "$root/compose.yaml" <<'YML'
+services:
+  web:
+    image: "dir:./rootfs"
+    command: ["/probe", "say", "from compose", "env", "GREETING", "host"]
+    environment:
+      GREETING: hi
+    hostname: composed
+    depends_on:
+      - db
+  db:
+    image: "dir:./rootfs"
+    command: ["/probe", "sleep", "1"]
+networks:
+  back: {}
+YML
+limit=60
+expect 0 '^web +\| host=composed$' sh -c 'cd "$1" && exec "$2" up' up "$root" "$hull_abs"
+for want in '^web +\| from compose$' '^web +\| GREETING=hi$' \
+	'^compose\.yaml: web: depends_on not translated, its machines start together: db$' \
+	'^compose\.yaml: top-level key not translated: networks$'; do
+	cases=$((cases + 1))
+	printf '%s\n' "$out" | grep -Eq -- "$want" || fail "hull up: no line matches /$want/" "$out"
+done
+expect 0 'compose\.yaml: db on chroot \(ns\): ok' "$hull" plan -f "$root/compose.yaml" --backend chroot
+printf 'services:\n  lost:\n    build: ./lost\n' > "$root/noimage.yaml"
+expect 125 'noimage\.yaml: lost: no image to run it from' "$hull" up -f "$root/noimage.yaml"
+expect 125 'no compose\.yaml' sh -c 'cd "$1" && exec "$2" up' up "$root/rootfs" "$hull_abs"
 # A segment of 40 machines, past the 32 a segment took before, each
 # up at its own address and all on the switch at once, each staying a
 # while: a network of a /24's size, not a handful.

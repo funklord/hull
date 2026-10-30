@@ -115,7 +115,8 @@ static void usage(FILE *out)
 	      "       hull diff REF REF | hull tag REF NEW | hull tag -d REF\n"
 	      "       hull manifest show REF | hull manifest compile [REF]\n"
 	      "       hull pull IMAGE [REF] | hull push REF IMAGE\n"
-	      "       hull import DOCKERFILE\n"
+	      "       hull import DOCKERFILE|COMPOSE-FILE\n"
+	      "       hull up [-f COMPOSE-FILE] [--backend B] [NAME]\n"
 	      "       hull core\n"
 	      "       hull engines | hull doctor\n"
 	      "       hull --version\n", out);
@@ -218,6 +219,49 @@ static uint8_t *read_file(const char *path, size_t *length)
 	}
 	fclose(file);
 	return data;
+}
+
+/* A spec's text: the file at `path`, or where it is a compose file, the
+ * (machines ...) form section 9's compose dialect translates it to, in a
+ * buffer of MAX_FILE as read_file()'s is. What it leaves out is said on
+ * stderr, once in a process however often the file is read. */
+static uint8_t *spec_text(const char *path, size_t *length)
+{
+	static int said;
+	uint8_t   *data;
+	char      *text;
+	size_t     n;
+
+	if (!hull_import_is_compose(path))
+		return read_file(path, length);
+	text = hull_import_compose(path, said ? NULL : stderr);
+	said = 1;
+	if (text == NULL)
+		return NULL;
+	n = strlen(text);
+	if (n > MAX_FILE || (data = malloc(MAX_FILE)) == NULL) {
+		fprintf(stderr, "%s: its translation is too large\n", path);
+		free(text);
+		return NULL;
+	}
+	memcpy(data, text, n);
+	free(text);
+	*length = n;
+	return data;
+}
+
+/* The compose file `hull up` runs, in the working directory, in the order
+ * the Compose specification looks for one; NULL where there is none. */
+static const char *compose_file(void)
+{
+	static const char *const names[] = {
+		"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"
+	};
+
+	for (size_t i = 0u; i < sizeof names / sizeof names[0]; i++)
+		if (access(names[i], F_OK) == 0)
+			return names[i];
+	return NULL;
 }
 
 /* --- a source the store holds --------------------------------------------- */
@@ -751,7 +795,7 @@ static int resolve_all(const options *o, const hull_registry *registry)
 	size_t          length;
 	int             worst = 0;
 
-	data = read_file(o->file, &length);
+	data = spec_text(o->file, &length);
 	if (data == NULL)
 		return 2;
 	if (store_sources(o->file, data, &length, 0) != 0) {
@@ -1750,7 +1794,7 @@ static int systemd_unit(options *o, const char *name)
 	char           *slash;
 	ssize_t         n;
 
-	data = read_file(o->file, &length);
+	data = spec_text(o->file, &length);
 	if (data == NULL)
 		return 125;
 	/* No store_sources: the unit's own `hull run` resolves a bare ref; here
@@ -1837,7 +1881,7 @@ static int run(options *o, const hull_registry *registry, const char *name)
 	char                 id[64];
 	int                  status;
 
-	data = read_file(o->file, &length);
+	data = spec_text(o->file, &length);
 	if (data == NULL)
 		return 125;
 	if (store_sources(o->file, data, &length, 1) != 0) {
@@ -4785,6 +4829,12 @@ int main(int argc, char **argv)
 		list_engines(&registry);
 		return 0;
 	}
+	/* `hull up` is `hull run` of the compose file beside it, section 9's
+	 * compose dialect, or of the file -f names. */
+	if (strcmp(command, "up") == 0) {
+		command = "run";
+		o.file  = NULL;
+	}
 	if (strcmp(command, "plan") != 0 && strcmp(command, "check") != 0 &&
 	    strcmp(command, "run") != 0 && strcmp(command, "build") != 0 &&
 	    strcmp(command, "systemd") != 0) {
@@ -4822,6 +4872,11 @@ int main(int argc, char **argv)
 	if (strcmp(command, "check") != 0 && o.backend_count > 1u) {
 		fprintf(stderr, "hull: %s takes one backend; check takes several\n", command);
 		return strcmp(command, "run") == 0 ? 125 : 2;
+	}
+	if (o.file == NULL && (o.file = compose_file()) == NULL) {
+		fprintf(stderr, "hull: up: no compose.yaml, compose.yml, docker-compose.yaml or "
+		        "docker-compose.yml here; -f names one\n");
+		return 125;
 	}
 	o.base = base_of(o.file);
 	if (o.base == NULL) {
