@@ -94,6 +94,9 @@
  *   dnstcp6 N   the same over TCP
  *   hosts6 N    N's IPv6 address in /etc/hosts
  *   addr6 IF    IF's IPv6 address of global scope and its prefix
+ *   slaac IF    the address SLAAC makes on IF from an advertisement, its
+ *               interface identifier IF's MAC's EUI-64, waited for up to
+ *               15 seconds; or none
  *   spin MS     use MS milliseconds of CPU time, by its own clock
  *   reap MS     spin MS in a child, and reap it
  *   hold N      take N MiB and touch every page, held until it exits
@@ -891,6 +894,54 @@ static void addr6(const char *name)
 	freeifaddrs(all);
 }
 
+/* The address SLAAC makes on IF from an advertised prefix, its interface
+ * identifier the EUI-64 of IF's MAC, once it is there: up to 15 seconds,
+ * the kernel soliciting, being advertised to, and checking its address
+ * for duplicates before it is one. */
+static void slaac(const char *name)
+{
+	struct ifreq request;
+	uint8_t      eui[8];
+	int          fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+
+	memset(&request, 0, sizeof request);
+	snprintf(request.ifr_name, sizeof request.ifr_name, "%s", name);
+	if (fd < 0 || ioctl(fd, SIOCGIFHWADDR, &request) != 0) {
+		printf("slaac=%s %s\n", name, strerror(errno));
+		if (fd >= 0)
+			close(fd);
+		return;
+	}
+	close(fd);
+	memcpy(eui, request.ifr_hwaddr.sa_data, 3u);
+	eui[0] ^= 0x02u;
+	eui[3] = 0xffu;
+	eui[4] = 0xfeu;
+	memcpy(eui + 5, request.ifr_hwaddr.sa_data + 3, 3u);
+	for (int tries = 0; tries < 30; tries++) {
+		struct ifaddrs *all;
+
+		if (getifaddrs(&all) == 0) {
+			for (struct ifaddrs *a = all; a != NULL; a = a->ifa_next) {
+				const struct sockaddr_in6 *at = (const struct sockaddr_in6 *)a->ifa_addr;
+				char                       text[INET6_ADDRSTRLEN];
+
+				if (at == NULL || at->sin6_family != AF_INET6 || strcmp(a->ifa_name, name) != 0 ||
+				    IN6_IS_ADDR_LINKLOCAL(&at->sin6_addr) ||
+				    memcmp(at->sin6_addr.s6_addr + 8, eui, 8u) != 0)
+					continue;
+				inet_ntop(AF_INET6, &at->sin6_addr, text, sizeof text);
+				printf("slaac=%s %s\n", name, text);
+				freeifaddrs(all);
+				return;
+			}
+			freeifaddrs(all);
+		}
+		usleep(500000);
+	}
+	printf("slaac=%s none\n", name);
+}
+
 static void answer(const char *port)
 {
 	struct sockaddr_in at = { .sin_family = AF_INET, .sin_port = htons((uint16_t)atoi(port)) };
@@ -1455,6 +1506,9 @@ int main(int argc, char **argv)
 			char address[64];
 
 			printf("hosts6=%s %s\n", arg, lookup6(arg, address, sizeof address) ? address : "none");
+			i++;
+		} else if (strcmp(step, "slaac") == 0) {
+			slaac(arg);
 			i++;
 		} else if (strcmp(step, "addr6") == 0) {
 			addr6(arg);

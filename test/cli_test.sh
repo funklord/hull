@@ -1497,6 +1497,18 @@ cases=$((cases + 1))
 	printf '%s\n' "$out" | grep -q '^only-a *| ping=fd42:86::1 ok$' &&
 	printf '%s\n' "$out" | grep -q "^only-a *| ping=$ob6 ok\$" ||
 	fail "two machines on a segment of IPv6 alone were not named and reached by hull at ::1" "$out"
+# (advertise true): a machine's own kernel solicits a router as its NIC
+# comes up and makes its SLAAC address from hull's advertisement; one on
+# a segment hull does not advertise makes none.
+printf '(machines (ra-a %s) (ra-b %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (adv-$$ (subnet6 \"fd42:84::/64\") (advertise true))) (command \"/probe\" \"slaac\" \"eth0\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (quiet-$$ (subnet6 \"fd42:83::/64\"))) (command \"/probe\" \"slaac\" \"eth0\")" \
+	> "$root/advert.conf"
+limit=60
+from_root 0 '^ra-a +\| slaac=eth0 fd42:84::[0-9a-f:]*ff:fe[0-9a-f:]*$' -f "$root/advert.conf"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^ra-b *| slaac=eth0 none$' ||
+	fail "a machine on a segment hull does not advertise made a SLAAC address" "$out"
 # The compose dialect (section 9): `hull up` runs the compose file beside
 # it with no step between, saying on stderr what it does not translate,
 # and `-f` gives one to plan as to run. Its services share the project's

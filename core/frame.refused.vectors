@@ -43,3 +43,9 @@ neighbor_advertisement reserved_set 88 00 00 00 60 00 00 01 FD 42 00 86 00 00 00
 
 # code_1_6: an ICMPv6 echo whose code is not 0
 icmp6_echo code_1_6 80 01 00 00 42 42 00 01 70 69 6E 67
+
+# code_1_rs: a router solicitation whose code is not 0
+router_solicitation code_1_rs 85 01 00 00 00 00 00 00 01 01 52 54 00 00 00 0A
+
+# reserved_ra: an advertisement with a reserved flag set
+router_advertisement reserved_ra 86 00 00 00 40 01 00 00 00 00 00 00 00 00 00 00 01 01 02 68 75 6C 6C 01

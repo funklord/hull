@@ -265,6 +265,13 @@ static void test_records(void)
 	NO(M("(segments (wire (subnet \"10.99.0.0/24\") (subnet6 \"10.98.0.0/24\")))"), VALUE,
 	   "\"10.98.0.0/24\"", "machine.segments.wire.subnet6");
 	OK(M("(segments (wire (subnet6 \"fd42:99::/64\")))"));
+	/* Router advertisements, of an IPv6 network of /64 alone. */
+	OK(M("(segments (wire (subnet6 \"fd42:99::/64\") (advertise true)))"));
+	OK(M("(segments (wire (subnet \"10.99.0.0/24\") (advertise false)))"));
+	NO(M("(segments (wire (subnet6 \"fd42:99::/80\") (advertise true)))"), SHAPE, "(advertise true)",
+	   "machine.segments.wire.advertise");
+	NO(M("(segments (wire (subnet \"10.99.0.0/24\") (advertise true)))"), SHAPE, "(advertise true)",
+	   "machine.segments.wire.advertise");
 	NO(M("(segments (wire (mask \"x\")))"), UNKNOWN, "mask", "machine.segments.wire.mask");
 	NO(M("(segments \"wire\" (wire (subnet \"10.99.0.0/24\")))"), DUPLICATE, "(wire (",
 	   "machine.segments");

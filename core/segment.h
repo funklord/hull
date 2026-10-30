@@ -142,8 +142,10 @@ typedef struct hull_segment_host {
 /*
  * hull_segment_port_addressed, with the machine's IPv6 address and its
  * network's prefix where the segment has an IPv6 network (`prefix6` 0
- * where not, and `prefix` 0 where it has IPv6 alone), and the names the
- * machine's plan gives the segment, `hosts`, `count` of them, which the switch copies: what its
+ * where not, and `prefix` 0 where it has IPv6 alone), whether hull
+ * advertises that network to it (`advertise`: router advertisements for
+ * SLAAC, from hull's link-local address), and the names the machine's
+ * plan gives the segment, `hosts`, `count` of them, which the switch copies: what its
  * /etc/hosts holds, every machine of its file. hull at .1 answers for
  * them while the port is there, as well as for the machines whose ports
  * are, so that a sibling not yet started, or already gone, is named by
@@ -151,8 +153,8 @@ typedef struct hull_segment_host {
  */
 int hull_segment_port_named(const char *key, const char *machine, uint32_t address,
                             unsigned prefix, const uint8_t *address6, unsigned prefix6,
-                            int forwards, const hull_segment_host *hosts, unsigned count,
-                            char *why, size_t cap);
+                            int advertise, int forwards, const hull_segment_host *hosts,
+                            unsigned count, char *why, size_t cap);
 
 /*
  * The resolvers .1 asks on to, `count` of them, at most three: IPv4

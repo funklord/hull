@@ -2,8 +2,8 @@
 // (project.md Appendix D): an Ethernet frame's header, ARP for IPv4, an
 // IPv4 header, a UDP datagram, a TCP segment, an ICMP echo, and a DNS
 // message's header; and for a segment's IPv6 network, hull at its ::1,
-// an IPv6 header, ICMPv6's echo and its neighbour solicitation and
-// advertisement.
+// an IPv6 header, ICMPv6's echo, its neighbour solicitation and
+// advertisement, and its router solicitation and advertisement.
 // Every frame core/segment.c answers comes from a machine on the segment,
 // which is to say from whatever runs in it, so this is where hull reads
 // bytes it did not write; each is validated here, checksums included,
@@ -217,6 +217,41 @@ struct neighbor_advertisement [allow_straddle] {
 		bit       override;
 		reserved  u29         [must_be_zero];
 		u8        target[16];
+		u8        options[remaining];
+	}
+}
+
+// A router solicitation, RFC 4861 4.1, which a machine's kernel sends as
+// its interface comes up, asking for an advertisement at once.
+struct router_solicitation {
+	authenticated summed {
+		u8        type        [must_eq = 133];
+		u8        code        [must_eq = 0];
+		checksum  u8 checksum[2] covers(summed) prefix(pseudo_header)
+			is internet_checksum [self_as = 0];
+		u32       unused;
+		u8        options[remaining];
+	}
+}
+
+// hull's router advertisement, RFC 4861 4.2, where a segment asks it to
+// advertise its IPv6 network: the hop limit to use, neither managed nor
+// other configuration, and a router lifetime of 0 -- hull is no gateway,
+// and a machine's default route stays its own; the prefix, RDNSS and DNSSL
+// are its options, built in C.
+struct router_advertisement [allow_straddle] {
+	authenticated summed {
+		u8        type        [must_eq = 134];
+		u8        code        [must_eq = 0];
+		checksum  u8 checksum[2] covers(summed) prefix(pseudo_header)
+			is internet_checksum [self_as = 0];
+		u8        hop_limit;
+		bit       managed;
+		bit       other;
+		reserved  u6          [must_be_zero];
+		u16       router_lifetime;
+		u32       reachable_time;
+		u32       retransmit_timer;
 		u8        options[remaining];
 	}
 }

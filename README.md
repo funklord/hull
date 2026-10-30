@@ -103,7 +103,8 @@ them has:
 - **Networks to test against.** Machines on chroot and on vms join one
   layer-2 segment, switched by hull, as the user. Given a subnet, they
   are addressed, named to each other and answered by hull's own DNS;
-  given an IPv6 one beside it or in its place, by either family or both.
+  given an IPv6 one beside it or in its place, by either family or both,
+  and advertised for SLAAC where asked.
   Each link can lose, delay, reorder, duplicate, corrupt or rate-limit
   traffic in netem's terms, changed while running; frames can be
   dropped, rewritten or replayed by pattern, or injected; and any link

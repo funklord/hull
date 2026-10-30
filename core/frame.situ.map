@@ -125,6 +125,28 @@ struct pseudo_header size=12 repr=ValueConverted
   pseudo_header.protocol                 offset=AbsoluteStatic(0x09) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
   pseudo_header.length                   offset=AbsoluteStatic(0x0A) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord
 
+struct router_advertisement size=16.. mutate=Immutable repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  router_advertisement.summed            offset=AbsoluteStatic(0x00) size=Unbounded align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting auth=Covered(checksum)
+  router_advertisement.type              offset=AbsoluteStatic(0x00) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord auth=Covered(checksum)
+  router_advertisement.code              offset=AbsoluteStatic(0x01) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord auth=Covered(checksum)
+  router_advertisement.checksum          offset=AbsoluteStatic(0x02) size=Fixed(2) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic mutate=Immutable
+  router_advertisement.hop_limit         offset=AbsoluteStatic(0x04) size=Fixed(1) align=Aligned(4) repr=MemoryIdentical atomic=AtomicWord auth=Covered(checksum)
+  router_advertisement.managed           offset=AbsoluteStatic(0x05) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  router_advertisement.other             offset=AbsoluteStatic(0x05:1) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  router_advertisement.<reserved0>       offset=AbsoluteStatic(0x05:2) size=Fixed(6bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  router_advertisement.router_lifetime   offset=AbsoluteStatic(0x06) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  router_advertisement.reachable_time    offset=AbsoluteStatic(0x08) size=Fixed(4) align=Aligned(8) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  router_advertisement.retransmit_timer  offset=AbsoluteStatic(0x0C) size=Fixed(4) align=Aligned(4) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  router_advertisement.options           offset=AbsoluteStatic(0x10) size=Unbounded align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord mutate=Shifting auth=Covered(checksum)
+
+struct router_solicitation size=8.. mutate=Immutable repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  router_solicitation.summed             offset=AbsoluteStatic(0x00) size=Unbounded align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting auth=Covered(checksum)
+  router_solicitation.type               offset=AbsoluteStatic(0x00) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord auth=Covered(checksum)
+  router_solicitation.code               offset=AbsoluteStatic(0x01) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord auth=Covered(checksum)
+  router_solicitation.checksum           offset=AbsoluteStatic(0x02) size=Fixed(2) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic mutate=Immutable
+  router_solicitation.unused             offset=AbsoluteStatic(0x04) size=Fixed(4) align=Aligned(4) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  router_solicitation.options            offset=AbsoluteStatic(0x08) size=Unbounded align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord mutate=Shifting auth=Covered(checksum)
+
 struct tcp_segment size=20.. mutate=Immutable address=Unstable repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
   tcp_segment.summed                     offset=AbsoluteStatic(0x00) size=Unbounded align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting auth=Covered(checksum)
   tcp_segment.source_port                offset=AbsoluteStatic(0x00) size=Fixed(2) align=Aligned(8) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)

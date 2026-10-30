@@ -1196,7 +1196,7 @@ int main(void)
 
 			memcpy(hosts[0].address6, six_web, 16u);
 			memcpy(hosts[1].address6, six_db, 16u);
-			six = hull_segment_port_named("dns6", "web", 0x0a37000au, 24u, six_web, 64u, 0, hosts,
+			six = hull_segment_port_named("dns6", "web", 0x0a37000au, 24u, six_web, 64u, 0, 0, hosts,
 			                              3u, why, sizeof why);
 			if (six < 0) {
 				check("a port with IPv6 names", 0);
@@ -1242,9 +1242,9 @@ int main(void)
 			db6[15] = 20u;
 			memcpy(hosts[0].address6, web6, 16u);
 			memcpy(hosts[1].address6, db6, 16u);
-			w = hull_segment_port_named("only6", "web", 0u, 0u, web6, 64u, 0, hosts, 2u, why,
+			w = hull_segment_port_named("only6", "web", 0u, 0u, web6, 64u, 0, 0, hosts, 2u, why,
 			                            sizeof why);
-			d = hull_segment_port_named("only6", "db", 0u, 0u, db6, 64u, 0, hosts, 2u, why,
+			d = hull_segment_port_named("only6", "db", 0u, 0u, db6, 64u, 0, 0, hosts, 2u, why,
 			                            sizeof why);
 			if (w < 0 || d < 0) {
 				check("two ports on a segment of IPv6 alone", 0);
@@ -1298,6 +1298,17 @@ int main(void)
 				send_v6(w, 10u, hull_mac, self6, 17u, udp, at, at);
 				check("one with no UDP sum, refused over IPv6", next_raw(w, r, sizeof r, 200) == 0u);
 				{
+					/* A router solicitation where hull does not advertise:
+					 * no answer. */
+					static const uint8_t routers_mac[6] = { 0x33, 0x33, 0, 0, 0, 2 };
+					static const uint8_t routers[16] = { 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+					uint8_t              rs[8] = { 133, 0 };
+
+					send_v6(w, 10u, routers_mac, routers, 58u, rs, sizeof rs, 2u);
+					check("a router solicitation where hull does not advertise, unanswered",
+					      next_raw(w, r, sizeof r, 200) == 0u);
+				}
+				{
 					/* A machine with a way out, asking a name outside: asked
 					 * on, and the answer given back to it over IPv6. */
 					unsigned           up_port = 0u;
@@ -1311,7 +1322,7 @@ int main(void)
 
 					memcpy(out6, self6, 16u);
 					out6[15] = 30u;
-					o = hull_segment_port_named("only6", "out", 0u, 0u, out6, 64u, 1, NULL, 0u, why,
+					o = hull_segment_port_named("only6", "out", 0u, 0u, out6, 64u, 0, 1, NULL, 0u, why,
 					                            sizeof why);
 					hull_segment_resolvers(&up_server, &up_port, 1u);
 					at = 8u + 12u;
@@ -1341,6 +1352,55 @@ int main(void)
 				close(w);
 			if (d >= 0)
 				close(d);
+		}
+		{
+			/* (advertise true): a router solicitation answered with hull's
+			 * advertisement, from its link-local address, of the network
+			 * for SLAAC with ::1 its DNS and hull to search; and a
+			 * solicitation for that link-local address advertised. */
+			static const uint8_t routers_mac[6] = { 0x33, 0x33, 0, 0, 0, 2 };
+			static const uint8_t routers[16] = { 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+			static const uint8_t link_local[16] = { 0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+			                                        0, 'h', 'u', 0xff, 0xfe, 'l', 'l', 1 };
+			uint8_t              self6[16] = { 0xfd, 0x42, 0, 0x55, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+			uint8_t              me6[16];
+			int                  a;
+
+			memcpy(me6, self6, 16u);
+			me6[15] = 10u;
+			a = hull_segment_port_named("ra6", "web", 0u, 0u, me6, 64u, 1, 0, NULL, 0u, why,
+			                            sizeof why);
+			if (a < 0) {
+				check("a port on a segment hull advertises", 0);
+			} else {
+				uint8_t rs[16] = { 133, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0x52, 0x54, 0, 0, 0, 10 };
+				uint8_t ns[32] = { 135, 0 };
+				uint8_t r[1514];
+				size_t  n;
+				size_t  o = 54u + 16u;
+
+				send_v6(a, 10u, routers_mac, routers, 58u, rs, sizeof rs, 2u);
+				n = next_raw(a, r, sizeof r, 1000);
+				check("a router solicitation, answered with hull's advertisement",
+				      n >= o + 80u && get16(r + 12) == 0x86ddu && r[20] == 58u && r[21] == 255u &&
+				      memcmp(r + 22, link_local, 16u) == 0 && r[53] == 10u && r[54] == 134u &&
+				      get16(r + 60) == 0u &&
+				      sum16(sum16(0u, r + 22, 32u) + get16(r + 18) + 58u, r + 54, get16(r + 18)) ==
+				          0xffffu);
+				check("its options: hull's MAC, the prefix for SLAAC, ::1 to ask, hull to search",
+				      n >= o + 80u && r[o] == 1u && memcmp(r + o + 2u, hull_mac, 6u) == 0 &&
+				      r[o + 8u] == 3u && r[o + 10u] == 64u && r[o + 11u] == 0xc0u &&
+				      memcmp(r + o + 24u, self6, 8u) == 0 &&
+				      r[o + 40u] == 25u && memcmp(r + o + 48u, self6, 16u) == 0 &&
+				      r[o + 64u] == 31u && memcmp(r + o + 72u, "\4hull\0", 6u) == 0);
+				memcpy(ns + 8, link_local, 16u);
+				send_v6(a, 10u, routers_mac, routers, 58u, ns, 24u, 2u);
+				n = next_raw(a, r, sizeof r, 1000);
+				check("a solicitation for hull's link-local address, advertised",
+				      n >= 54u + 32u && r[54] == 136u && memcmp(r + 62, link_local, 16u) == 0 &&
+				      memcmp(r + 22, link_local, 16u) == 0);
+				close(a);
+			}
 		}
 		send_dns(web, 10u, "nobody", 1u);
 		check("a name it has not, NXDOMAIN", dns_reply(web, 10u, data, &length) == 3);

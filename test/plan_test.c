@@ -572,6 +572,15 @@ static void test_names(void)
 		    strstr(e, "(6:hosts6(1:a") == NULL || strstr(e, "(7:prefix62:64)))") == NULL)
 			FAIL("an IPv6-only entry is not its IPv6 keys alone:\n  %s", e);
 	}
+	/* (advertise true) on one machine's naming is the segment's, written
+	 * between the addresses and the hosts. */
+	cases++;
+	if (draw_file("(machines " SEG("a", "(n (subnet6 \"fd03::/64\") (advertise true))")
+	              SEG("b", "(n (subnet6 \"fd03::/64\"))") ")", &names) != 0 ||
+	    !names.segment[0].advertise ||
+	    strstr(entry_of(&names, 1u), ")(9:advertise4:true)(6:hosts6(") == NULL)
+		FAIL("advertise was not the segment's, or not in its place: %s", entry_of(&names, 1u));
+
 	/* A /120 holds 254 past ::1: five there take five apart. */
 	cases++;
 	if (draw_file("(machines " SEG("a", "(n (subnet \"10.1.0.0/24\") (subnet6 \"fd01::/120\"))")

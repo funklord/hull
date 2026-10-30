@@ -597,17 +597,47 @@ static hull_spec_status segment_across(walk *w, const hull_sexpr_form *record,
 static const key segment_keys[] = {
 	{ .name = "subnet", .type = STRING, .value = subnet },
 	{ .name = "subnet6", .type = STRING, .value = subnet6 },
+	{ .name = "advertise", .type = BOOLEAN },
 };
 static const schema segment = TABLE_ACROSS(segment_keys, segment_across);
 
+/* Where these sit in segment_keys, for segment_across. */
+#define SEGMENT_SUBNET6   1u
+#define SEGMENT_ADVERTISE 2u
+
+/* Given subnet, subnet6 or both; and (advertise true), hull's router
+ * advertisements for SLAAC, only of an IPv6 network of /64, the one
+ * length SLAAC makes an address in (RFC 4862 5.5.3). */
 static hull_spec_status segment_across(walk *w, const hull_sexpr_form *record,
                                        const hull_sexpr_form *found, uint64_t present)
 {
-	(void)found;
+	hull_sexpr_form head;
+	hull_sexpr_form value;
+	size_t          saved;
+	uint8_t         text[64];
+	size_t          length = 0u;
+
 	if ((present & 3u) == 0u)
 		return fail(w, HULL_SPEC_ERR_MISSING, record->offset,
 		            "a segment hull addresses is given its subnet, its subnet6, or both");
-	return HULL_SPEC_OK;
+	if (!(present & ((uint64_t)1 << SEGMENT_ADVERTISE)))
+		return HULL_SPEC_OK;
+	hull_sexpr_child(w->doc, &found[SEGMENT_ADVERTISE], &head);
+	hull_sexpr_next(w->doc, &head, &value);
+	if (!hull_sexpr_is(w->doc, &value, "true"))
+		return HULL_SPEC_OK;
+	if (present & ((uint64_t)1 << SEGMENT_SUBNET6)) {
+		hull_sexpr_child(w->doc, &found[SEGMENT_SUBNET6], &head);
+		hull_sexpr_next(w->doc, &head, &value);
+		if (hull_sexpr_value(w->doc, &value, text, sizeof text - 1u, &length) == HULL_SEXPR_OK &&
+		    length > 3u && memcmp(text + length - 3u, "/64", 3u) == 0)
+			return HULL_SPEC_OK;
+	}
+	saved = push_text(w, "advertise");
+	fail(w, HULL_SPEC_ERR_SHAPE, found[SEGMENT_ADVERTISE].offset,
+	     "advertises an IPv6 network for SLAAC, which needs a subnet6 of /64");
+	pop(w, saved);
+	return HULL_SPEC_ERR_SHAPE;
 }
 
 /* J.1 */

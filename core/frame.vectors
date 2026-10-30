@@ -50,3 +50,9 @@ neighbor_advertisement is_at6 88 00 00 00 60 00 00 00 FD 42 00 86 00 00 00 00 00
 
 # ping6: an ICMPv6 echo request, "ping" its data
 icmp6_echo ping6 80 00 00 00 42 42 00 01 70 69 6E 67
+
+# solicit_router: a router solicitation with its source link-layer option
+router_solicitation solicit_router 85 00 00 00 00 00 00 00 01 01 52 54 00 00 00 0A
+
+# advertise: hull's router advertisement, lifetime 0, hull's MAC its option
+router_advertisement advertise 86 00 00 00 40 00 00 00 00 00 00 00 00 00 00 00 01 01 02 68 75 6C 6C 01

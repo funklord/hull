@@ -84,6 +84,7 @@ typedef struct port {
 	unsigned prefix;    /* its subnet's; 0 where the machine sets its own */
 	uint8_t  address6[16];  /* its IPv6 address, where the segment has an IPv6 network */
 	unsigned prefix6;   /* that network's; 0 where it has none */
+	int      advertise; /* hull's router advertisements for it, on its solicitation */
 	int      forwards;  /* its machine has a way out, so .1 asks on for it */
 	hull_segment_host *hosts;   /* the names its plan gives the segment */
 	unsigned           host_count;
@@ -1189,10 +1190,27 @@ static void send_echo(segment *s, unsigned to, const uint8_t mac[6], const peer 
 	cross(s, to, HULL_SEGMENT_IN, reply, 4u + total);
 }
 
-/* .1's neighbour advertisement for ::1 to `asker` at `mac`, as ARP's
- * reply is for .1: solicited, overriding, hull's MAC its option, from a
- * hop limit of 255 as RFC 4861 asks. */
-static void send_advert(segment *s, unsigned to, const uint8_t mac[6], const peer *asker)
+/* hull's link-local address, from its MAC as EUI-64 makes one: what its
+ * router advertisements come from, as RFC 4861 4.2 asks of a router. */
+static const uint8_t hull_link_local[16] = { 0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+                                             0x00, 'h', 'u', 0xff, 0xfe, 'l', 'l', 0x01 };
+
+/* Whether hull advertises `s`'s IPv6 network: where any machine's plan
+ * asks it, one advertiser on the segment whoever does. */
+static int advertises(const segment *s)
+{
+	for (unsigned i = 0u; i < s->port_count; i++)
+		if (s->ports[i]->advertise)
+			return 1;
+	return 0;
+}
+
+/* .1's neighbour advertisement for `target`, ::1 or hull's link-local
+ * address, to `asker` at `mac`, as ARP's reply is for .1: solicited,
+ * overriding, hull's MAC its option, from a hop limit of 255 as RFC 4861
+ * asks. */
+static void send_advert(segment *s, unsigned to, const uint8_t mac[6], const peer *asker,
+                        const uint8_t target[16])
 {
 	uint8_t  reply[4u + 1514u];
 	uint8_t *out = reply + 4;
@@ -1202,15 +1220,82 @@ static void send_advert(segment *s, unsigned to, const uint8_t mac[6], const pee
 	size_t   total;
 	peer     self;
 
-	if (!self_of(s, 1, &self))
-		return;
+	memset(&self, 0, sizeof self);
+	self.six = 1;
+	memcpy(self.v6, target, 16u);
 	memcpy(option + 2, hull_mac, 6u);
 	memset(reply, 0, sizeof reply);
 	pseudo_any(first, &self, asker, 58u, 32u);
 	if (hull_frame_neighbor_advertisement_build(out + 54, 32u, 136u, 0u, first, sizeof first, 0u,
-	                                            1u, 1u, self.v6, option, sizeof option,
+	                                            1u, 1u, target, option, sizeof option,
 	                                            &wrote) != SITU_OK ||
 	    (total = ip_frame(out, 1514u, mac, &self, asker, 58u, 32u, 255u)) == 0u)
+		return;
+	put32(reply, (uint32_t)total);
+	cross(s, to, HULL_SEGMENT_IN, reply, 4u + total);
+}
+
+/* hull's router advertisement of `s`'s IPv6 network to `asker` at `mac`,
+ * or to every node where it solicited from ::, from hull's link-local
+ * address: a router lifetime of 0, hull being no gateway; the prefix,
+ * on-link and for SLAAC; ::1 as its DNS server (RDNSS, RFC 8106) and
+ * `hull` to search (DNSSL). The lifetimes are for ever, as the network's
+ * is the segment's while it is there, so nothing is sent unasked. */
+static void send_ra(segment *s, unsigned to, const uint8_t mac[6], const peer *asker)
+{
+	static const uint8_t all_nodes[16] = { 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+	static const uint8_t all_nodes_mac[6] = { 0x33, 0x33, 0, 0, 0, 1 };
+	uint8_t              reply[4u + 1514u];
+	uint8_t             *out = reply + 4;
+	uint8_t              first[12];
+	uint8_t              options[8u + 32u + 24u + 16u];
+	uint8_t             *o = options;
+	uint32_t             wrote = 0u;
+	size_t               total;
+	peer                 self = { .six = 1 };
+	peer                 dns;
+	peer                 to_peer = *asker;
+	unsigned             prefix6;
+	uint8_t              network6[16];
+
+	if (!subnet6_of(s, network6, &prefix6) || !self_of(s, 1, &dns))
+		return;
+	memcpy(self.v6, hull_link_local, 16u);
+	if (IN6_IS_ADDR_UNSPECIFIED((const struct in6_addr *)(const void *)asker->v6)) {
+		memcpy(to_peer.v6, all_nodes, 16u);
+		mac = all_nodes_mac;
+	}
+	memset(options, 0, sizeof options);
+	/* Source link-layer address: hull's MAC. */
+	o[0] = 1u;
+	o[1] = 1u;
+	memcpy(o + 2, hull_mac, 6u);
+	o += 8;
+	/* Prefix information: the network, on-link and autonomous. */
+	o[0] = 3u;
+	o[1] = 4u;
+	o[2] = (uint8_t)prefix6;
+	o[3] = 0xc0u;
+	memset(o + 4, 0xff, 8u);
+	memcpy(o + 16, network6, 16u);
+	o += 32;
+	/* RDNSS: ::1, hull's DNS. */
+	o[0] = 25u;
+	o[1] = 3u;
+	memset(o + 4, 0xff, 4u);
+	memcpy(o + 8, dns.v6, 16u);
+	o += 24;
+	/* DNSSL: hull, padded to eight. */
+	o[0] = 31u;
+	o[1] = 2u;
+	memset(o + 4, 0xff, 4u);
+	memcpy(o + 8, "\4hull", 6u);
+	memset(reply, 0, sizeof reply);
+	pseudo_any(first, &self, &to_peer, 58u, 16u + sizeof options);
+	if (hull_frame_router_advertisement_build(out + 54, 16u + sizeof options, 134u, 0u, first,
+	                                          sizeof first, 64u, 0u, 0u, 0u, 0u, 0u, options,
+	                                          sizeof options, &wrote) != SITU_OK ||
+	    (total = ip_frame(out, 1514u, mac, &self, &to_peer, 58u, 16u + sizeof options, 255u)) == 0u)
 		return;
 	put32(reply, (uint32_t)total);
 	cross(s, to, HULL_SEGMENT_IN, reply, 4u + total);
@@ -1804,16 +1889,50 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 		memcpy(asker.v6, hull_frame_ipv6_header_source_ptr(view), 16u);
 		memcpy(to.v6, hull_frame_ipv6_header_destination_ptr(view), 16u);
 		pseudo_any(first, &asker, &to, 58u, payload);
+		const uint8_t *target;
+
 		if (hull_frame_neighbor_solicitation_view(&msg, 54u, payload, &solicit) != SITU_OK ||
 		    hull_frame_neighbor_solicitation_validate(solicit) != SITU_OK ||
 		    hull_frame_neighbor_solicitation_checksum_check(solicit, first, sizeof first) != SITU_OK ||
-		    hull_frame_ipv6_header_hop_limit_get(view) != 255u ||
-		    memcmp(hull_frame_neighbor_solicitation_target_ptr(solicit), self6.v6, 16u) != 0)
+		    hull_frame_ipv6_header_hop_limit_get(view) != 255u)
 			return 0;
-		/* From ::, a machine's duplicate address detection of ::1, which
-		 * is hull's and not to be taken: nothing to answer it to. */
+		/* For ::1, or for hull's link-local address where it advertises,
+		 * which its advertisements come from. */
+		target = hull_frame_neighbor_solicitation_target_ptr(solicit);
+		if (memcmp(target, self6.v6, 16u) != 0 &&
+		    !(advertises(s) && memcmp(target, hull_link_local, 16u) == 0))
+			return 0;
+		/* From ::, a machine's duplicate address detection of hull's own,
+		 * which is not to be taken: nothing to answer it to. */
 		if (!IN6_IS_ADDR_UNSPECIFIED((const struct in6_addr *)(const void *)asker.v6))
-			send_advert(s, from, mac, &asker);
+			send_advert(s, from, mac, &asker, target);
+		return 1;
+	}
+	/* A router solicitation, where hull advertises the segment's network:
+	 * its advertisement back to the machine that asked, which the kernel
+	 * asks for as its interface comes up. Where it does not, it goes on as
+	 * any multicast does, to whatever router a machine runs. */
+	if (type == 0x86ddu && have6 && advertises(s) &&
+	    hull_frame_ipv6_header_view(&msg, 14u, &view) == SITU_OK &&
+	    hull_frame_ipv6_header_validate(view) == SITU_OK &&
+	    hull_frame_ipv6_header_next_header_get(view) == 58u &&
+	    54u + hull_frame_ipv6_header_payload_length_get(view) <= size &&
+	    size > 54u && frame[54] == 133u) {
+		situ_view_t solicit;
+		uint8_t     first[12];
+		peer        asker = { .six = 1 };
+		peer        to = { .six = 1 };
+		uint16_t    payload = hull_frame_ipv6_header_payload_length_get(view);
+
+		memcpy(asker.v6, hull_frame_ipv6_header_source_ptr(view), 16u);
+		memcpy(to.v6, hull_frame_ipv6_header_destination_ptr(view), 16u);
+		pseudo_any(first, &asker, &to, 58u, payload);
+		if (hull_frame_router_solicitation_view(&msg, 54u, payload, &solicit) != SITU_OK ||
+		    hull_frame_router_solicitation_validate(solicit) != SITU_OK ||
+		    hull_frame_router_solicitation_checksum_check(solicit, first, sizeof first) != SITU_OK ||
+		    hull_frame_ipv6_header_hop_limit_get(view) != 255u)
+			return 0;
+		send_ra(s, from, mac, &asker);
 		return 1;
 	}
 	if (memcmp(hull_frame_ethernet_header_destination_ptr(ether), hull_mac, 6u) == 0) {
@@ -2252,14 +2371,14 @@ void hull_segment_resolvers(const char *const *servers, const unsigned *ports, u
 int hull_segment_port_addressed(const char *key, const char *machine, uint32_t address,
                                 unsigned prefix, int forwards, char *why, size_t cap)
 {
-	return hull_segment_port_named(key, machine, address, prefix, NULL, 0u, forwards, NULL, 0u,
-	                               why, cap);
+	return hull_segment_port_named(key, machine, address, prefix, NULL, 0u, 0, forwards, NULL,
+	                               0u, why, cap);
 }
 
 int hull_segment_port_named(const char *key, const char *machine, uint32_t address,
                             unsigned prefix, const uint8_t *address6, unsigned prefix6,
-                            int forwards, const hull_segment_host *hosts, unsigned count,
-                            char *why, size_t cap)
+                            int advertise, int forwards, const hull_segment_host *hosts,
+                            unsigned count, char *why, size_t cap)
 {
 	int      pair[2];
 	segment *s = NULL;
@@ -2299,6 +2418,7 @@ int hull_segment_port_named(const char *key, const char *machine, uint32_t addre
 	if (prefix6 != 0u)
 		memcpy(p->address6, address6, 16u);
 	p->prefix6 = prefix6;
+	p->advertise = advertise && prefix6 != 0u;
 	p->forwards = forwards;
 	if (count != 0u)
 		memcpy(p->hosts, hosts, count * sizeof *hosts);
