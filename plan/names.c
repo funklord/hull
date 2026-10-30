@@ -168,6 +168,7 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 			char                subnet[32];
 			char                subnet6[64];
 			char                advertise[8];
+			char                gateway[8];
 			uint32_t            network = 0u;
 			unsigned            prefix = 0u;
 			uint8_t             network6[16];
@@ -183,13 +184,17 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 				parse_subnet(subnet, &network, &prefix);
 			if (subnet6[0] != '\0')
 				parse_subnet6(subnet6, network6, &prefix6);
-			if (!entry_text(spec, &item, "advertise", advertise, sizeof advertise))
+			if (!entry_text(spec, &item, "advertise", advertise, sizeof advertise) ||
+			    !entry_text(spec, &item, "gateway", gateway, sizeof gateway))
 				return refuse(names, "a segment of %s cannot be read%s", ids[i], "");
 			s = find(names, name);
 			/* Advertised where any machine asks it: one advertiser on a
-			 * segment, hull at ::1, whoever names it. */
+			 * segment, hull at ::1, whoever names it; and a gateway the
+			 * same, .1 being one. */
 			if (s != NULL && strcmp(advertise, "true") == 0)
 				s->advertise = 1;
+			if (s != NULL && strcmp(gateway, "true") == 0)
+				s->gateway = 1;
 			/* Each family's network named by any machine is the segment's;
 			 * two that differ are refused. */
 			if (s != NULL && subnet[0] != '\0' && s->has4 &&
@@ -238,6 +243,7 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 			s = &names->segment[names->count++];
 			snprintf(s->name, sizeof s->name, "%s", name);
 			s->advertise = strcmp(advertise, "true") == 0;
+			s->gateway   = strcmp(gateway, "true") == 0;
 			s->has4    = subnet[0] != '\0';
 			s->network = network;
 			s->prefix  = prefix;
@@ -412,6 +418,8 @@ long hull_names_entry(const hull_names *names, unsigned member, uint8_t *data, s
 			}
 		if (s->advertise)
 			put(&o, "(9:advertise4:true)", 19u);
+		if (s->gateway)
+			put(&o, "(7:gateway4:true)", 17u);
 		/* The hosts, by id: insertion, as there are at most 256. */
 		for (unsigned k = 0u; k < s->count; k++) {
 			unsigned j = k;

@@ -368,6 +368,21 @@ int hull_access_named6(const hull_sexpr_doc *doc, const hull_sexpr_form *names,
 	return found;
 }
 
+int hull_access_gateway(const hull_sexpr_doc *doc, const hull_sexpr_form *names,
+                        const char *segment)
+{
+	hull_sexpr_form record;
+	char           *flag;
+	int             given;
+
+	if (!hull_access_find(doc, names, segment, &record))
+		return 0;
+	flag  = hull_access_value(doc, &record, "gateway");
+	given = flag != NULL && strcmp(flag, "true") == 0;
+	free(flag);
+	return given;
+}
+
 char *hull_access_hosts(const hull_sexpr_doc *doc, const hull_sexpr_form *names)
 {
 	static const char        opening[] = "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n";

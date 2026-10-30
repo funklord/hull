@@ -11,6 +11,8 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdint.h>
@@ -388,6 +390,85 @@ static int ping_reply(int fd, uint8_t me, const char *data)
 	       f[29] == 1u && f[33] == me && get16(f + 16) == 20u + icmp && f[34] == 0u &&
 	       f[35] == 0u && sum16(0u, f + 34, icmp) == 0xffffu && get16(f + 38) == 0x4242u &&
 	       get16(f + 40) == 7u && memcmp(f + 42, data, strlen(data)) == 0;
+}
+
+/* A UDP datagram from MAC and address 10.55.0.`me`, port `from`, to .1's
+ * MAC for `to` (network order) at `port`, `data` its payload, no sum. */
+static void send_udp_out(int fd, uint8_t me, uint32_t to, unsigned from, unsigned port,
+                         const char *data)
+{
+	uint8_t f[200] = { 0 };
+	size_t  length = strlen(data);
+
+	memcpy(f, hull_mac, 6u);
+	f[6] = 0x52;
+	f[7] = 0x54;
+	f[11] = me;
+	put16(f + 12, 0x0800u);
+	f[14] = 0x45;
+	put16(f + 16, (unsigned)(28u + length));
+	f[22] = 64u;
+	f[23] = 17u;
+	f[26] = 10;
+	f[27] = 55;
+	f[29] = me;
+	memcpy(f + 30, &to, 4u);
+	put16(f + 24, ~sum16(0u, f + 14, 20u) & 0xffffu);
+	put16(f + 34, from);
+	put16(f + 36, port);
+	put16(f + 38, (unsigned)(8u + length));
+	memcpy(f + 42, data, length);
+	send_raw(fd, f, 42u + length < 60u ? 60u : 42u + length);
+}
+
+/* The host's first IPv4 address not its loopback's, network order: 1, or
+ * 0 where it has none, so that a way out has nowhere to go. */
+static int host_address(uint32_t *out)
+{
+	struct ifaddrs *all;
+	int             found = 0;
+
+	if (getifaddrs(&all) != 0)
+		return 0;
+	for (const struct ifaddrs *a = all; a != NULL && !found; a = a->ifa_next)
+		if (a->ifa_addr != NULL && a->ifa_addr->sa_family == AF_INET &&
+		    (a->ifa_flags & IFF_LOOPBACK) == 0u && (a->ifa_flags & IFF_UP) != 0u) {
+			*out = ((const struct sockaddr_in *)a->ifa_addr)->sin_addr.s_addr;
+			found = 1;
+		}
+	freeifaddrs(all);
+	return found;
+}
+
+/* Whether a passt given `address` is running, by /proc. */
+static int passt_for(const char *address)
+{
+	DIR           *proc = opendir("/proc");
+	struct dirent *entry;
+	int            found = 0;
+
+	while (proc != NULL && !found && (entry = readdir(proc)) != NULL) {
+		char   path[64];
+		char   line[1024];
+		FILE  *f;
+		size_t n;
+
+		if (entry->d_name[0] < '1' || entry->d_name[0] > '9')
+			continue;
+		snprintf(path, sizeof path, "/proc/%.20s/cmdline", entry->d_name);
+		if ((f = fopen(path, "r")) == NULL)
+			continue;
+		n = fread(line, 1u, sizeof line - 1u, f);
+		fclose(f);
+		line[n] = '\0';
+		if (strcmp(line, "passt") != 0)
+			continue;
+		for (size_t at = 0u; at < n && !found; at += strlen(line + at) + 1u)
+			found = strcmp(line + at, address) == 0;
+	}
+	if (proc != NULL)
+		closedir(proc);
+	return found;
 }
 
 /* An IPv6 frame from MAC and address fd42:55::`me` to `to` at `mac`, of
@@ -1196,7 +1277,7 @@ int main(void)
 
 			memcpy(hosts[0].address6, six_web, 16u);
 			memcpy(hosts[1].address6, six_db, 16u);
-			six = hull_segment_port_named("dns6", "web", 0x0a37000au, 24u, six_web, 64u, 0, 0, hosts,
+			six = hull_segment_port_named("dns6", "web", 0x0a37000au, 24u, six_web, 64u, 0, 0, 0, hosts,
 			                              3u, why, sizeof why);
 			if (six < 0) {
 				check("a port with IPv6 names", 0);
@@ -1242,9 +1323,9 @@ int main(void)
 			db6[15] = 20u;
 			memcpy(hosts[0].address6, web6, 16u);
 			memcpy(hosts[1].address6, db6, 16u);
-			w = hull_segment_port_named("only6", "web", 0u, 0u, web6, 64u, 0, 0, hosts, 2u, why,
+			w = hull_segment_port_named("only6", "web", 0u, 0u, web6, 64u, 0, 0, 0, hosts, 2u, why,
 			                            sizeof why);
-			d = hull_segment_port_named("only6", "db", 0u, 0u, db6, 64u, 0, 0, hosts, 2u, why,
+			d = hull_segment_port_named("only6", "db", 0u, 0u, db6, 64u, 0, 0, 0, hosts, 2u, why,
 			                            sizeof why);
 			if (w < 0 || d < 0) {
 				check("two ports on a segment of IPv6 alone", 0);
@@ -1322,7 +1403,7 @@ int main(void)
 
 					memcpy(out6, self6, 16u);
 					out6[15] = 30u;
-					o = hull_segment_port_named("only6", "out", 0u, 0u, out6, 64u, 0, 1, NULL, 0u, why,
+					o = hull_segment_port_named("only6", "out", 0u, 0u, out6, 64u, 0, 0, 1, NULL, 0u, why,
 					                            sizeof why);
 					hull_segment_resolvers(&up_server, &up_port, 1u);
 					at = 8u + 12u;
@@ -1368,7 +1449,7 @@ int main(void)
 
 			memcpy(me6, self6, 16u);
 			me6[15] = 10u;
-			a = hull_segment_port_named("ra6", "web", 0u, 0u, me6, 64u, 1, 0, NULL, 0u, why,
+			a = hull_segment_port_named("ra6", "web", 0u, 0u, me6, 64u, 1, 0, 0, NULL, 0u, why,
 			                            sizeof why);
 			if (a < 0) {
 				check("a port on a segment hull advertises", 0);
@@ -1771,6 +1852,68 @@ int main(void)
 		close(x);
 		close(y);
 		close(z);
+	}
+	{
+		/* A way out through .1, where the segment is a gateway: a datagram
+		 * to the host's address through the port's own passt, and its
+		 * answer back through the port; none for a port of a machine
+		 * that is not given one, nor flooded to it; the passt gone with
+		 * its port, and no descriptor left. */
+		uint32_t           host;
+		int                before = settled_descriptors();
+
+		if (!host_address(&host)) {
+			printf("segment: no IPv4 address but the loopback's, the way out not tried\n");
+		} else {
+			char               why[256] = "";
+			int                out = hull_segment_port_named("gw", "out", 0x0a37000au, 24u, NULL, 0u,
+			                                                 0, 1, 1, NULL, 0u, why, sizeof why);
+			int                quiet = hull_segment_port_named("gw", "quiet", 0x0a370014u, 24u,
+			                                                   NULL, 0u, 0, 0, 0, NULL, 0u, why,
+			                                                   sizeof why);
+			int                far = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+			struct sockaddr_in at = { .sin_family = AF_INET, .sin_addr.s_addr = host };
+			socklen_t          size = sizeof at;
+			struct sockaddr_in from;
+			struct pollfd      ready = { far, POLLIN, 0 };
+			uint8_t            f[1514];
+			char               got[64] = "";
+			ssize_t            n = -1;
+			size_t             length;
+
+			check("a port with a way out", out >= 0 && quiet >= 0);
+			if (out < 0)
+				printf("  %s\n", why);
+			if (far < 0 || bind(far, (struct sockaddr *)&at, sizeof at) != 0 ||
+			    getsockname(far, (struct sockaddr *)&at, &size) != 0)
+				fail("a socket of the host's", strerror(errno));
+			check("its passt running", passt_for("10.55.0.10"));
+			send_udp_out(out, 10u, host, 40010u, ntohs(at.sin_port), "out through .1");
+			size = sizeof from;
+			if (poll(&ready, 1u, 2000) == 1)
+				n = recvfrom(far, got, sizeof got - 1u, 0, (struct sockaddr *)&from, &size);
+			check("a datagram out through .1, from the host's own address",
+			      n == 14 && memcmp(got, "out through .1", 14u) == 0 &&
+			      from.sin_addr.s_addr == host);
+			if (n > 0)
+				sendto(far, "back in", 7u, 0, (struct sockaddr *)&from, size);
+			length = next_raw(out, f, sizeof f, 2000);
+			check("its answer back, from .1's MAC to the machine's address",
+			      length >= 49u && memcmp(f + 6, hull_mac, 6u) == 0 && get16(f + 12) == 0x0800u &&
+			      f[29] != 0u && f[30] == 10u && f[31] == 55u && f[33] == 10u &&
+			      get16(f + 36) == 40010u && memcmp(f + 42, "back in", 7u) == 0);
+			send_udp_out(quiet, 20u, host, 40020u, ntohs(at.sin_port), "no way out");
+			check("no way out without a gateway", poll(&ready, 1u, 300) == 0);
+			check("nor to another port", next_raw(out, f, sizeof f, 100) == 0u);
+			close(out);
+			close(quiet);
+			if (far >= 0)
+				close(far);
+			for (int tries = 0; tries < 50 && passt_for("10.55.0.10"); tries++)
+				usleep(20000);
+			check("its passt gone with its port", !passt_for("10.55.0.10"));
+		}
+		check("no descriptor left by a way out", settled_descriptors() == before);
 	}
 	{
 		/* Inject onto a segment no machine is on is refused. */

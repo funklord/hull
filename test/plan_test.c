@@ -581,6 +581,15 @@ static void test_names(void)
 	    strstr(entry_of(&names, 1u), ")(9:advertise4:true)(6:hosts6(") == NULL)
 		FAIL("advertise was not the segment's, or not in its place: %s", entry_of(&names, 1u));
 
+	/* (gateway true) the same: one machine's asks it of the segment, and
+	 * it is written after advertise, before the hosts. */
+	cases++;
+	if (draw_file("(machines " SEG("a", "(n (subnet \"10.5.0.0/24\"))")
+	              SEG("b", "(n (subnet \"10.5.0.0/24\") (gateway true))") ")", &names) != 0 ||
+	    !names.segment[0].gateway ||
+	    strstr(entry_of(&names, 0u), ")(7:gateway4:true)(5:hosts(") == NULL)
+		FAIL("gateway was not the segment's, or not in its place: %s", entry_of(&names, 0u));
+
 	/* A /120 holds 254 past ::1: five there take five apart. */
 	cases++;
 	if (draw_file("(machines " SEG("a", "(n (subnet \"10.1.0.0/24\") (subnet6 \"fd01::/120\"))")

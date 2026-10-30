@@ -2329,6 +2329,50 @@ else
 fi
 kill "$nat_listener" 2>/dev/null
 wait "$nat_listener" 2>/dev/null
+# (gateway true): a segment's .1 the way out of a machine whose only
+# network is the segment, a passt of its own behind it (Appendix D): the
+# host's own address reached from a machine of (network none), and its
+# route out through .1, and .1 asking on for it a name outside, which it
+# refuses a machine with no way out (rcode 5); one on a segment that is no
+# gateway reaches nothing beyond it, having no route.
+if [ -n "$hostaddr" ]; then
+	rm -f "$root/gwlisten.out"
+	(timeout -k 2 40 python3 -c '
+import socket, sys
+s = socket.socket()
+s.bind((sys.argv[1], 0))
+s.listen(2)
+s.settimeout(30)
+print(s.getsockname()[1], flush=True)
+while True:
+	c, a = s.accept()
+	c.sendall(b"out through .1\n")
+	c.close()
+' "$hostaddr" > "$root/gwlisten.out" 2>&1) &
+	gw_listener=$!
+	tries=0
+	until [ -s "$root/gwlisten.out" ] || [ "$tries" -ge 40 ]; do
+		tries=$((tries + 1))
+		sleep 0.1
+	done
+	gw_port=$(head -1 "$root/gwlisten.out")
+	printf '(machines (gw-a %s) (gw-b %s))\n' \
+		"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (gw-$$ (subnet \"10.93.0.0/24\") (gateway true))) (command \"/probe\" \"dial\" \"$hostaddr\" \"$gw_port\" \"resolve\" \"10.93.0.1\" \"hull-test.invalid\")" \
+		"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (nogw-$$ (subnet \"10.92.0.0/24\"))) (command \"/probe\" \"dial\" \"$hostaddr\" \"$gw_port\")" \
+		> "$root/gateway.conf"
+	limit=60
+	from_root 0 "^gw-a +\\| dial $hostaddr:$gw_port=out through \\.1\$" -f "$root/gateway.conf"
+	cases=$((cases + 1))
+	printf '%s\n' "$out" | grep -q '^gw-a *| resolve=rcode [0-4] ' ||
+		fail "a machine whose way out is .1 was refused a name outside" "$out"
+	cases=$((cases + 1))
+	printf '%s\n' "$out" | grep -q "^gw-b *| dial $hostaddr:$gw_port=Network is unreachable\$" ||
+		fail "a machine on a segment that is no gateway reached beyond it" "$out"
+	kill "$gw_listener" 2>/dev/null
+	wait "$gw_listener" 2>/dev/null
+else
+	printf 'cli: the host has no address but loopback; the way out through .1 is not tried\n'
+fi
 # (network nat) says the default outright: on chroot the same network of
 # the machine's own, pasta's eth0 and its own loopback; and every engine
 # takes it, as passt's on a vm and docker's bridge.

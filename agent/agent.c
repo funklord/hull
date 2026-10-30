@@ -904,6 +904,7 @@ static const char *place_names(const hull_sexpr_doc *doc, const hull_sexpr_form 
 	char           *bridge = hull_access_value(doc, machine, "bridge");
 	const char     *reason;
 	int             uplinked;
+	int             routed;
 	int             owned;
 	int             fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 
@@ -911,6 +912,7 @@ static const char *place_names(const hull_sexpr_doc *doc, const hull_sexpr_form 
 	if (network == NULL || strcmp(network, "none") != 0)
 		nic = 1u;
 	uplinked = nic != 0u;
+	routed   = uplinked;   /* passt's, or a bridge's, default route */
 	/* On a bridge its owner named, the machine's addressing is its own. */
 	owned = network != NULL && strcmp(network, "bridge") == 0 && bridge != NULL;
 	free(network);
@@ -931,6 +933,7 @@ static const char *place_names(const hull_sexpr_doc *doc, const hull_sexpr_form 
 			                            hull_access_named(doc, names, segment, address, &prefix);
 			int                 named6 = segment != NULL &&
 			                             hull_access_named6(doc, names, segment, address6, &prefix6);
+			int                 gatewayed = named && hull_access_gateway(doc, names, segment);
 
 			free(segment);
 			if (!named && !named6)
@@ -960,6 +963,28 @@ static const char *place_names(const hull_sexpr_doc *doc, const hull_sexpr_form 
 			if (named6 && hull_ip6_add(request.ifr_name, address6, prefix6) != 0) {
 				close(fd);
 				return "a segment's NIC's IPv6 address cannot be set";
+			}
+			/* The first segment whose .1 is a gateway is the way out of a
+			 * machine with none of its own (Appendix D). */
+			if (!routed && gatewayed) {
+				struct rtentry route;
+				struct in_addr at;
+				char           gateway[16];
+
+				inet_pton(AF_INET, address, &at);
+				at.s_addr = htonl((ntohl(at.s_addr) & (0xffffffffu << (32u - prefix))) + 1u);
+				inet_ntop(AF_INET, &at, gateway, sizeof gateway);
+				memset(&route, 0, sizeof route);
+				set_address(&route.rt_dst, "0.0.0.0");
+				set_address(&route.rt_genmask, "0.0.0.0");
+				set_address(&route.rt_gateway, gateway);
+				route.rt_flags = RTF_UP | RTF_GATEWAY;
+				route.rt_dev   = request.ifr_name;
+				if (ioctl(fd, SIOCADDRT, &route) != 0) {
+					close(fd);
+					return "a segment's route out through its .1 cannot be set";
+				}
+				routed = 1;
 			}
 		}
 	close(fd);

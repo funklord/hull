@@ -78,6 +78,11 @@ int hull_access_named(const hull_sexpr_doc *doc, const hull_sexpr_form *names,
 int hull_access_named6(const hull_sexpr_doc *doc, const hull_sexpr_form *names,
                        const char *segment, char address[46], unsigned *prefix);
 
+/* Whether `names` makes the segment's .1 the machine's gateway, `(gateway
+ * true)`, and so its default route where it has no other: 1 or 0. */
+int hull_access_gateway(const hull_sexpr_doc *doc, const hull_sexpr_form *names,
+                        const char *segment);
+
 /* The /etc/resolv.conf `names` gives a machine whose only network is its
  * segments: a nameserver at .1 of each addressed segment, hull's (Appendix
  * D), or at ::1 of its IPv6 network where it has no IPv4 one, at most

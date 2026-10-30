@@ -48,6 +48,7 @@ typedef struct hull_names_segment {
 	int      has4;                          /* given an IPv4 network */
 	int      has6;                          /* given an IPv6 network */
 	int      advertise;                     /* (advertise true): hull's router advertisements */
+	int      gateway;                       /* (gateway true): a way out through .1 */
 	uint8_t  network6[16];
 	unsigned prefix6;
 	uint8_t  address6[HULL_NAMES_MEMBERS][16];
@@ -75,8 +76,9 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
  * `out`: `(names (SEGMENT (address A) (hosts (ID A) ...) (prefix N)) ...)`
  * for each addressed segment it is on, sorted, with `(address6 A)`,
  * `(hosts6 (ID A) ...)` and `(prefix6 N)` where it has an IPv6 network,
- * and without the IPv4 three where it has only that, and `(advertise
- * true)` where any machine on it asks hull to advertise its network. Its length; 0 where it is
+ * and without the IPv4 three where it has only that, `(advertise
+ * true)` where any machine on it asks hull to advertise its network, and
+ * `(gateway true)` where any asks for a way out through .1. Its length; 0 where it is
  * on none, and -1 where `cap` is too small.
  */
 long hull_names_entry(const hull_names *names, unsigned member, uint8_t *out, size_t cap);

@@ -166,6 +166,7 @@ struct hull_machine {
 	unsigned         segment_prefix[MAX_SEGMENTS];
 	char             segment_address6[MAX_SEGMENTS][46]; /* its IPv6 one, or "" */
 	unsigned         segment_prefix6[MAX_SEGMENTS];
+	int              segment_gateway[MAX_SEGMENTS];      /* its .1 the way out */
 	char            *hosts;      /* the /etc/hosts its addressed segments give it, or NULL */
 	char            *resolver;   /* the /etc/resolv.conf naming hull at their .1, or NULL */
 	int              adopted;    /* taken back: the init is not this process's child */
@@ -616,6 +617,8 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 				                  &m->segment_prefix[i]);
 				hull_access_named6(doc, &entry, m->segment[i], m->segment_address6[i],
 				                   &m->segment_prefix6[i]);
+				m->segment_gateway[i] = m->segment_address[i][0] != '\0' &&
+				                        hull_access_gateway(doc, &entry, m->segment[i]);
 			}
 			/* hull at their .1 is the one to ask, which names a sibling
 			 * that joins later, and under NAT or on hull's bridge forwards
@@ -1662,6 +1665,7 @@ static void join_segments(const hull_machine *m, int report)
 {
 	int   tap[MAX_SEGMENTS];
 	pid_t relayer;
+	int   routed = m->nat || m->bridge;   /* a default route already, its own */
 
 	for (unsigned i = 0u; i < m->segment_count; i++) {
 		struct ifreq request = { 0 };
@@ -1704,6 +1708,25 @@ static void join_segments(const hull_machine *m, int report)
 			if (m->segment_address6[i][0] != '\0' &&
 			    hull_ip6_add(request.ifr_name, m->segment_address6[i], m->segment_prefix6[i]) != 0)
 				child_fail(report, "a segment's NIC's IPv6 address");
+		}
+		/* The first segment whose .1 is a gateway is the way out of a
+		 * machine with none of its own (Appendix D). */
+		if (!routed && m->segment_gateway[i]) {
+			struct rtentry      route = { 0 };
+			struct sockaddr_in *gateway = (struct sockaddr_in *)&route.rt_gateway;
+			uint32_t            mask = 0xffffffffu << (32u - m->segment_prefix[i]);
+			struct in_addr      address;
+
+			inet_pton(AF_INET, m->segment_address[i], &address);
+			((struct sockaddr_in *)&route.rt_dst)->sin_family     = AF_INET;
+			((struct sockaddr_in *)&route.rt_genmask)->sin_family = AF_INET;
+			gateway->sin_family      = AF_INET;
+			gateway->sin_addr.s_addr = htonl((ntohl(address.s_addr) & mask) + 1u);
+			route.rt_flags = RTF_UP | RTF_GATEWAY;
+			route.rt_dev   = request.ifr_name;
+			if (ioctl(fd, SIOCADDRT, &route) != 0)
+				child_fail(report, "a segment's route out through its .1");
+			routed = 1;
 		}
 		close(fd);
 	}

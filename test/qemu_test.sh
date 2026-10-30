@@ -1031,6 +1031,39 @@ cases=$((cases + 1))
 if grep -q '^loopback came' "$root/listen.out"; then
 	fail "the host's loopback listener was reached" "$(cat "$root/listen.out")"
 fi
+# (gateway true): a vm of (network none), its eth0 its segment's, has
+# the segment's .1 as its way out, a passt of its own behind it (Appendix
+# D): the host's own address reached through it, and .1 asking on for it
+# a name outside, which it refuses a machine with no way out.
+if [ -n "$hostaddr" ]; then
+	rm -f "$root/gwlisten.out"
+	timeout 60 python3 -c '
+import socket, sys
+s = socket.socket()
+s.bind((sys.argv[1], 0))
+s.listen(1)
+s.settimeout(50)
+print(s.getsockname()[1], flush=True)
+c, _ = s.accept()
+c.sendall(b"out through .1\n")
+c.close()' "$hostaddr" > "$root/gwlisten.out" 2>&1 &
+	gw_listener=$!
+	tries=0
+	until [ -s "$root/gwlisten.out" ] || [ "$tries" -ge 40 ]; do
+		tries=$((tries + 1))
+		sleep 0.1
+	done
+	gw_port=$(head -1 "$root/gwlisten.out")
+	conf vgateway "(backend vm) (mutable overlay) (network none) (segments (vgw-$$ (subnet \"10.91.0.0/24\") (gateway true))) (command \"/probe\" \"dial\" \"$hostaddr\" \"$gw_port\" \"resolve\" \"10.91.0.1\" \"hull-test.invalid\")"
+	name=vgateway
+	boot vgateway
+	has 0 "^dial $hostaddr:$gw_port=out through \\.1\$"
+	has 0 '^resolve=rcode [0-4] '
+	kill "$gw_listener" 2>/dev/null
+	wait "$gw_listener" 2>/dev/null
+else
+	printf 'qemu: the host has no address but loopback; the way out through .1 is not tried\n'
+fi
 
 # Ports, from the machine's address, each connection an agent channel to the
 # machine's own address. Six free ports; the machine serves five in

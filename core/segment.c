@@ -38,8 +38,11 @@
 #include <strings.h>
 #include <netinet/in.h>
 #include <net/if.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -77,6 +80,16 @@ typedef struct way {
 	hull_segment_count count;
 } way;
 
+/* A port's way out through .1: its passt's socket, framed as a port's,
+ * and what is left of a frame each way. */
+typedef struct uplink {
+	int     fd;
+	uint8_t in[4u + MAX_FRAME];
+	size_t  in_length;
+	uint8_t out[4u + MAX_FRAME];
+	size_t  out_length;
+} uplink;
+
 typedef struct port {
 	int      fd;
 	char     machine[64];
@@ -86,6 +99,7 @@ typedef struct port {
 	unsigned prefix6;   /* that network's; 0 where it has none */
 	int      advertise; /* hull's router advertisements for it, on its solicitation */
 	int      forwards;  /* its machine has a way out, so .1 asks on for it */
+	uplink  *up;        /* its way out through .1, where its segment is a gateway */
 	hull_segment_host *hosts;   /* the names its plan gives the segment */
 	unsigned           host_count;
 	uint8_t  in[4u + MAX_FRAME];
@@ -1237,7 +1251,7 @@ static void send_advert(segment *s, unsigned to, const uint8_t mac[6], const pee
 
 /* hull's router advertisement of `s`'s IPv6 network to `asker` at `mac`,
  * or to every node where it solicited from ::, from hull's link-local
- * address: a router lifetime of 0, hull being no gateway; the prefix,
+ * address: a router lifetime of 0, hull being no IPv6 gateway; the prefix,
  * on-link and for SLAAC; ::1 as its DNS server (RDNSS, RFC 8106) and
  * `hull` to search (DNSSL). The lifetimes are for ever, as the network's
  * is the segment's while it is there, so nothing is sent unasked. */
@@ -1954,16 +1968,20 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 		memset(&asker, 0, sizeof asker);
 		/* For .1 and not ARP, DNS, ping or neighbour discovery: nothing
 		 * else answers there. A header that does not validate, its sum
-		 * among it, is not read, nor IPv6 with an extension header. */
+		 * among it, is not read, nor IPv6 with an extension header. IPv4
+		 * for beyond .1 is forward()'s, out through it or nowhere. */
 		if (type == 0x0800u && have4) {
 			size_t header;
 			size_t datagram;
 
 			if (hull_frame_ipv4_header_view(&msg, 14u, (uint32_t)(size - 14u), &view) != SITU_OK ||
 			    hull_frame_ipv4_header_validate(view) != SITU_OK ||
-			    hull_frame_ipv4_header_header_checksum_check(view) != SITU_OK ||
-			    hull_frame_ipv4_header_destination_get(view) != self4.v4 ||
-			    hull_frame_ipv4_header_more_fragments_get(view) ||
+			    hull_frame_ipv4_header_header_checksum_check(view) != SITU_OK)
+				return 1;
+			/* For beyond .1: its way out's, where it is a gateway. */
+			if (hull_frame_ipv4_header_destination_get(view) != self4.v4)
+				return 0;
+			if (hull_frame_ipv4_header_more_fragments_get(view) ||
 			    hull_frame_ipv4_header_fragment_offset_get(view) != 0u)
 				return 1;
 			header = (size_t)hull_frame_ipv4_header_ihl_get(view) * 4u;
@@ -2055,6 +2073,186 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 	return 0;
 }
 
+/* --- a way out through .1 -------------------------------------------------- */
+
+/*
+ * A port's way out, where its segment is a gateway (Appendix D): passt,
+ * as the user, on a socket pair whose other end is the switch's, given
+ * the machine's own address, its subnet and .1 as its gateway, so that it
+ * is the machine's NAT as a vm's passt is the vm's. One a machine, as
+ * passt serves one guest: measured with two behind one, its replies went
+ * to the MAC that last spoke, and two flows from one source port, one
+ * from each machine, shared a host port and the second took the first's
+ * answers. Its MAC is hull's, so that what it sends comes from .1. It
+ * answers no ARP, DHCP or NDP, which are the switch's or nobody's, maps
+ * no host loopback onto .1 and forwards nothing in. passt's parent exits
+ * once it is set up, saying why where it cannot; the daemon it leaves
+ * ends when the switch's end closes, with the port.
+ */
+static void dotted(uint32_t address, char out[16]);
+
+static uplink *start_uplink(uint32_t address, unsigned prefix, char *why, size_t cap)
+{
+	char        self[16];
+	char        bits[4];
+	char        gateway[16];
+	const char *argv[] = { "passt", "--quiet", "--fd", "3", "--one-off", "--ipv4-only",
+	                       "--address", self, "--netmask", bits, "--gateway", gateway,
+	                       "--no-map-gw", "--mac-addr", "02:68:75:6c:6c:01", "--no-dhcp",
+	                       "--no-ndp", "--no-dhcpv6", "--no-ra", "--tcp-ports", "none",
+	                       "--udp-ports", "none", NULL };
+	uint32_t    mask = prefix == 0u ? 0u : 0xffffffffu << (32u - prefix);
+	int         pair[2];
+	int         said[2];
+	int         status;
+	pid_t       pid;
+	uplink     *up;
+
+	dotted(address, self);
+	snprintf(bits, sizeof bits, "%u", prefix);
+	dotted((address & mask) + 1u, gateway);
+	if ((up = calloc(1u, sizeof *up)) == NULL) {
+		say(why, cap, "out of memory");
+		return NULL;
+	}
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) {
+		say(why, cap, strerror(errno));
+		free(up);
+		return NULL;
+	}
+	if (pipe2(said, O_CLOEXEC) != 0) {
+		say(why, cap, strerror(errno));
+		close(pair[0]);
+		close(pair[1]);
+		free(up);
+		return NULL;
+	}
+	pid = fork();
+	if (pid == 0) {
+		int null = open("/dev/null", O_RDWR);
+
+		if (null < 0 || dup2(null, 0) < 0 || dup2(null, 1) < 0 || dup2(said[1], 2) < 0 ||
+		    dup2(pair[1], 3) < 0)
+			_exit(126);
+		syscall(SYS_close_range, 4u, ~0u, 0u);
+		signal(SIGPIPE, SIG_DFL);
+		execvp(argv[0], (char *const *)argv);
+		dprintf(2, "%s\n", strerror(errno));
+		_exit(127);
+	}
+	close(pair[1]);
+	close(said[1]);
+	if (pid > 0)
+		while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+			;
+	if (pid < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		char    line[200] = "";
+		ssize_t n = pid < 0 ? -1 : read(said[0], line, sizeof line - 1u);
+		char   *end;
+
+		/* Its last line, which says why. */
+		line[n > 0 ? n : 0] = '\0';
+		while ((end = strrchr(line, '\n')) != NULL && end[1] == '\0')
+			*end = '\0';
+		snprintf(why, cap, "passt, which a segment's gateway needs: %s",
+		         (end = strrchr(line, '\n')) != NULL ? end + 1 :
+		         line[0] != '\0' ? line : "it could not start");
+		close(said[0]);
+		close(pair[0]);
+		free(up);
+		return NULL;
+	}
+	close(said[0]);
+	fcntl(pair[0], F_SETFL, O_NONBLOCK);
+	up->fd = pair[0];
+	return up;
+}
+
+/* A frame `p` sent to .1's MAC that .1 does not answer: to its passt,
+ * where it has one, if it is IPv4 to beyond the subnet -- one to a
+ * sibling is the sibling's MAC's, and .1's own are answered or are not --
+ * and dropped otherwise, as a router without that route drops it. */
+static void route_out(segment *s, unsigned from, const uint8_t *framed, size_t length)
+{
+	port       *p = s->ports[from];
+	uplink     *up = p->up;
+	uint32_t    mask = p->prefix == 0u ? 0u : 0xffffffffu << (32u - p->prefix);
+	situ_msg_t  msg;
+	situ_view_t ether;
+	situ_view_t view;
+	ssize_t     n;
+
+	if (up == NULL || up->fd < 0 || up->out_length != 0u || p->prefix == 0u)
+		return;
+	situ_msg_init(&msg, (uint8_t *)(uintptr_t)(framed + 4), (uint32_t)(length - 4u));
+	if (hull_frame_ethernet_header_view(&msg, 0u, &ether) != SITU_OK ||
+	    hull_frame_ethernet_header_ethertype_get(ether) != 0x0800u ||
+	    hull_frame_ipv4_header_view(&msg, 14u, (uint32_t)(length - 4u - 14u), &view) != SITU_OK ||
+	    hull_frame_ipv4_header_validate(view) != SITU_OK ||
+	    (hull_frame_ipv4_header_destination_get(view) & mask) == (p->address & mask))
+		return;
+	n = send(up->fd, framed, length, MSG_DONTWAIT | MSG_NOSIGNAL);
+	if (n < 0)
+		n = 0;
+	if ((size_t)n < length) {
+		memcpy(up->out, framed + n, length - (size_t)n);
+		up->out_length = length - (size_t)n;
+	}
+}
+
+/* What is left of `up`'s output, as much as passt takes now. */
+static void drain_uplink(uplink *up)
+{
+	ssize_t n;
+
+	if (up->out_length == 0u)
+		return;
+	n = send(up->fd, up->out, up->out_length, MSG_DONTWAIT | MSG_NOSIGNAL);
+	if (n > 0) {
+		memmove(up->out, up->out + n, up->out_length - (size_t)n);
+		up->out_length -= (size_t)n;
+	}
+}
+
+/* Read what port `i`'s passt sent, each IPv4 frame it completes given to
+ * the port through its link, as a sibling's would be. A passt gone ends
+ * the way out and nothing else. */
+static void take_uplink(segment *s, unsigned i)
+{
+	uplink *up = s->ports[i]->up;
+	ssize_t n = recv(up->fd, up->in + up->in_length, sizeof up->in - up->in_length, MSG_DONTWAIT);
+
+	if (n < 0 && (errno == EAGAIN || errno == EINTR))
+		return;
+	if (n <= 0) {
+		close(up->fd);
+		up->fd = -1;
+		return;
+	}
+	up->in_length += (size_t)n;
+	for (;;) {
+		uint32_t frame;
+		size_t   whole;
+
+		if (up->in_length < 4u)
+			break;
+		frame = (uint32_t)up->in[0] << 24 | (uint32_t)up->in[1] << 16 |
+		        (uint32_t)up->in[2] << 8 | (uint32_t)up->in[3];
+		if (frame > MAX_FRAME) {
+			close(up->fd);
+			up->fd = -1;
+			return;
+		}
+		whole = 4u + frame;
+		if (up->in_length < whole)
+			break;
+		if (whole >= 4u + 14u && get16(up->in + 4u + 12u) == 0x0800u)
+			cross(s, i, HULL_SEGMENT_IN, up->in, whole);
+		memmove(up->in, up->in + whole, up->in_length - whole);
+		up->in_length -= whole;
+	}
+}
+
 static void forward(segment *s, unsigned from, const uint8_t *framed, size_t length)
 {
 	int to;
@@ -2063,6 +2261,13 @@ static void forward(segment *s, unsigned from, const uint8_t *framed, size_t len
 		return;
 	if (answer(s, from, framed, length))
 		return;
+	/* To .1's MAC and not .1's to answer: out through it, where the port
+	 * has a way out, and to no other port either way, the MAC being no
+	 * machine's. */
+	if (memcmp(framed + 4, hull_mac, 6u) == 0) {
+		route_out(s, from, framed, length);
+		return;
+	}
 	to = lookup(s, framed + 4, from);
 	if (to == -2)
 		return;
@@ -2115,6 +2320,9 @@ static void free_port(port *p)
 		}
 	}
 	close(p->fd);
+	if (p->up != NULL && p->up->fd >= 0)
+		close(p->up->fd);
+	free(p->up);
 	free(p->hosts);
 	free(p);
 }
@@ -2177,9 +2385,10 @@ static void *serve(void *arg)
 	(void)arg;
 	/* Static, the switch being this one thread: every port of every
 	 * segment is a third of a megabyte, too much for a stack. */
-	static struct pollfd fds[2u + MAX_SEGMENTS * MAX_PORTS];
-	static segment      *of[MAX_SEGMENTS * MAX_PORTS];
-	static unsigned      at[MAX_SEGMENTS * MAX_PORTS];
+	static struct pollfd fds[2u + 2u * MAX_SEGMENTS * MAX_PORTS];
+	static segment      *of[2u * MAX_SEGMENTS * MAX_PORTS];
+	static unsigned      at[2u * MAX_SEGMENTS * MAX_PORTS];
+	static int           up_of[2u * MAX_SEGMENTS * MAX_PORTS];   /* the port's passt's */
 
 	for (;;) {
 		nfds_t        base;
@@ -2196,11 +2405,23 @@ static void *serve(void *arg)
 			segment *s = segments[k];
 
 			for (unsigned i = 0u; s != NULL && i < s->port_count; i++) {
+				const uplink *up = s->ports[i]->up;
+
 				fds[n] = (struct pollfd){ s->ports[i]->fd,
 				                          (short)(POLLIN | (s->ports[i]->out_length != 0u ?
 				                                            POLLOUT : 0)), 0 };
 				of[n - base] = s;
 				at[n - base] = i;
+				up_of[n - base] = 0;
+				n++;
+				if (up == NULL || up->fd < 0)
+					continue;
+				fds[n] = (struct pollfd){ up->fd,
+				                          (short)(POLLIN | (up->out_length != 0u ? POLLOUT : 0)),
+				                          0 };
+				of[n - base] = s;
+				at[n - base] = i;
+				up_of[n - base] = 1;
 				n++;
 			}
 		}
@@ -2225,8 +2446,20 @@ static void *serve(void *arg)
 			segment *s = of[k - 1u - base];
 			unsigned i = at[k - 1u - base];
 
-			if (fds[k - 1u].revents == 0 || i >= s->port_count ||
-			    s->ports[i]->fd != fds[k - 1u].fd)
+			if (fds[k - 1u].revents == 0 || i >= s->port_count)
+				continue;
+			if (up_of[k - 1u - base]) {
+				uplink *up = s->ports[i]->up;
+
+				if (up == NULL || up->fd != fds[k - 1u].fd)
+					continue;
+				if ((fds[k - 1u].revents & POLLOUT) != 0)
+					drain_uplink(up);
+				if ((fds[k - 1u].revents & (POLLIN | POLLHUP | POLLERR)) != 0)
+					take_uplink(s, i);
+				continue;
+			}
+			if (s->ports[i]->fd != fds[k - 1u].fd)
 				continue;
 			if ((fds[k - 1u].revents & POLLOUT) != 0)
 				drain(s->ports[i]);
@@ -2371,18 +2604,19 @@ void hull_segment_resolvers(const char *const *servers, const unsigned *ports, u
 int hull_segment_port_addressed(const char *key, const char *machine, uint32_t address,
                                 unsigned prefix, int forwards, char *why, size_t cap)
 {
-	return hull_segment_port_named(key, machine, address, prefix, NULL, 0u, 0, forwards, NULL,
-	                               0u, why, cap);
+	return hull_segment_port_named(key, machine, address, prefix, NULL, 0u, 0, 0, forwards,
+	                               NULL, 0u, why, cap);
 }
 
 int hull_segment_port_named(const char *key, const char *machine, uint32_t address,
                             unsigned prefix, const uint8_t *address6, unsigned prefix6,
-                            int advertise, int forwards, const hull_segment_host *hosts,
-                            unsigned count, char *why, size_t cap)
+                            int advertise, int gateway, int forwards,
+                            const hull_segment_host *hosts, unsigned count, char *why, size_t cap)
 {
 	int      pair[2];
 	segment *s = NULL;
 	port    *p;
+	uplink  *up = NULL;
 
 	if (strlen(key) >= sizeof s->key) {
 		say(why, cap, "a segment's name is too long");
@@ -2396,8 +2630,14 @@ int hull_segment_port_named(const char *key, const char *machine, uint32_t addre
 		say(why, cap, "a subnet's prefix is at most 32, an IPv6 one's 128, with its address");
 		return -1;
 	}
+	/* Its passt before the lock, which the switch's frames wait on. */
+	if (gateway && prefix != 0u && (up = start_uplink(address, prefix, why, cap)) == NULL)
+		return -1;
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) {
 		say(why, cap, strerror(errno));
+		if (up != NULL)
+			close(up->fd);
+		free(up);
 		return -1;
 	}
 	p = calloc(1u, sizeof *p);
@@ -2408,9 +2648,13 @@ int hull_segment_port_named(const char *key, const char *machine, uint32_t addre
 	if (p == NULL) {
 		close(pair[0]);
 		close(pair[1]);
+		if (up != NULL)
+			close(up->fd);
+		free(up);
 		say(why, cap, "out of memory");
 		return -1;
 	}
+	p->up = up;
 	p->fd = pair[0];
 	snprintf(p->machine, sizeof p->machine, "%s", machine);
 	p->address = address;
@@ -2431,9 +2675,7 @@ int hull_segment_port_named(const char *key, const char *machine, uint32_t addre
 		if (pipe2(wake, O_CLOEXEC | O_NONBLOCK) != 0 ||
 		    pthread_create(&thread, NULL, serve, NULL) != 0) {
 			pthread_mutex_unlock(&lock);
-			free(p->hosts);
-			free(p);
-			close(pair[0]);
+			free_port(p);
 			close(pair[1]);
 			say(why, cap, "the switch could not be started");
 			return -1;
@@ -2450,18 +2692,14 @@ int hull_segment_port_named(const char *key, const char *machine, uint32_t addre
 	}
 	if (s == NULL || s->port_count == MAX_PORTS) {
 		pthread_mutex_unlock(&lock);
-		free(p->hosts);
-		free(p);
-		close(pair[0]);
+		free_port(p);
 		close(pair[1]);
 		say(why, cap, s == NULL ? "too many segments" : "too many machines on the segment");
 		return -1;
 	}
 	if (!addressed_apart(s, p, why, cap)) {
 		pthread_mutex_unlock(&lock);
-		free(p->hosts);
-		free(p);
-		close(pair[0]);
+		free_port(p);
 		close(pair[1]);
 		return -1;
 	}

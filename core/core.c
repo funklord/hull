@@ -163,13 +163,15 @@ struct slot {
 		uint8_t  address6[16];
 		unsigned prefix6;         /* 0 where it has no IPv6 network */
 		int      advertise;       /* hull advertises the IPv6 network there */
+		int      gateway;         /* .1 its way out, where it has none of its own */
 		hull_segment_host *hosts;   /* the plan's, every machine it names there */
 		unsigned           host_count;
 	}                  named[8];
 	unsigned           named_count;
 	/* A network out besides its segments, so that hull at .1 forwards
 	 * what it does not hold to the host's resolvers: not (network none),
-	 * whose machine must reach nothing beyond the segment, DNS included. */
+	 * whose machine must reach nothing beyond the segment, DNS included,
+	 * but where a segment's gateway is its way out. */
 	int                forwards;
 	int                exited;
 	int                code;
@@ -411,6 +413,7 @@ static int on_segment(hull_core *core, const char *key, char *why, size_t cap)
 	const uint8_t           *address6   = NULL;
 	unsigned                 prefix6    = 0u;
 	int                      advertise  = 0;
+	int                      gateway    = 0;
 	const hull_segment_host *hosts      = NULL;
 	unsigned                 host_count = 0u;
 	int                      fd;
@@ -422,12 +425,16 @@ static int on_segment(hull_core *core, const char *key, char *why, size_t cap)
 			address6   = s->named[i].address6;
 			prefix6    = s->named[i].prefix6;
 			advertise  = s->named[i].advertise;
+			gateway    = s->named[i].gateway;
 			hosts      = s->named[i].hosts;
 			host_count = s->named[i].host_count;
 		}
 	}
+	/* .1 the way out of a machine with none of its own: one with its own
+	 * keeps it, as its default route is that one's. */
+	gateway = gateway && !s->forwards;
 	fd = hull_segment_port_named(key, s->id, address, prefix, address6, prefix6, advertise,
-	                             s->forwards, hosts, host_count, why, cap);
+	                             gateway, s->forwards || gateway, hosts, host_count, why, cap);
 
 	/* Before the machine runs, so that its first frame meets its link. */
 	for (unsigned i = 0u; fd >= 0 && i < s->link_count; i++) {
@@ -1954,6 +1961,10 @@ static const char *named_of(slot *s, const hull_sexpr_doc *doc, const hull_sexpr
 			                       hull_access_value(doc, &record, "advertise") : NULL;
 
 			s->named[s->named_count].advertise = has6 && flag != NULL && strcmp(flag, "true") == 0;
+			free(flag);
+			flag = hull_access_find(doc, &names, segment, &record) ?
+			       hull_access_value(doc, &record, "gateway") : NULL;
+			s->named[s->named_count].gateway = has4 && flag != NULL && strcmp(flag, "true") == 0;
 			free(flag);
 		}
 		if (hosts_of(doc, &names, segment, &s->named[s->named_count].hosts,
