@@ -234,9 +234,22 @@ static void send_arp(int fd, uint8_t me, uint8_t whom)
 	send_raw(fd, f, sizeof f);
 }
 
+#define SUM_NONE      0   /* no UDP sum, as IPv4 allows */
+#define SUM_UDP       1   /* a UDP sum, right */
+#define SUM_UDP_WRONG 2   /* a UDP sum, one bit off */
+#define SUM_IP_WRONG  3   /* the IPv4 header's sum one bit off */
+
+static void send_dns_summed(int fd, uint8_t me, const char *name, unsigned type, int sum);
+
 /* A DNS question for `name` of `type`, from MAC and address ...`me` to
  * hull's .1, from UDP port 4000. */
 static void send_dns(int fd, uint8_t me, const char *name, unsigned type)
+{
+	send_dns_summed(fd, me, name, type, SUM_NONE);
+}
+
+/* The same, its sums as `sum` says. */
+static void send_dns_summed(int fd, uint8_t me, const char *name, unsigned type, int sum)
 {
 	uint8_t f[300] = { 0 };
 	size_t  at = 14u + 28u + 12u;
@@ -278,6 +291,21 @@ static void send_dns(int fd, uint8_t me, const char *name, unsigned type)
 	put16(f + 34, 4000u);
 	put16(f + 36, 53u);
 	put16(f + 38, (unsigned)(8u + dns));
+	if (sum == SUM_UDP || sum == SUM_UDP_WRONG) {
+		uint8_t  pseudo[12];
+		uint32_t total;
+
+		memcpy(pseudo, f + 26, 8u);
+		pseudo[8] = 0u;
+		pseudo[9] = 17u;
+		put16(pseudo + 10, (unsigned)(8u + dns));
+		total = sum16(0u, pseudo, 12u);
+		put16(f + 40, ~sum16(total, f + 34, 8u + dns) & 0xffffu);
+		if (sum == SUM_UDP_WRONG)
+			f[41] ^= 1u;
+	}
+	if (sum == SUM_IP_WRONG)
+		f[25] ^= 1u;
 	send_raw(fd, f, at);
 }
 
@@ -311,6 +339,9 @@ static int dns_reply(int fd, uint8_t me, uint8_t *data, size_t *data_length)
 	}
 	return f[45] & 0x0f;
 }
+
+/* Set, send_tcp() sends its segment with its sum one bit off. */
+static int tcp_sum_wrong;
 
 /* A TCP segment from MAC and address ...`me`, port 4100, to .1's 53:
  * `flags`, `seq`, `ack`, and `data`. */
@@ -353,6 +384,8 @@ static void send_tcp(int fd, uint8_t me, unsigned flags, uint32_t seq, uint32_t 
 	put16(pseudo + 10, (unsigned)(20u + length));
 	sum = sum16(0u, pseudo, 12u);
 	put16(f + 50, ~sum16(sum, f + 34, 20u + length) & 0xffffu);
+	if (tcp_sum_wrong)
+		f[51] ^= 1u;
 	send_raw(fd, f, 54u + length < 60u ? 60u : 54u + length);
 }
 
@@ -1066,6 +1099,17 @@ int main(void)
 		check("AAAA for a named machine, no data", rcode == 0 && length == 0u);
 		send_dns(web, 10u, "nobody", 1u);
 		check("a name it has not, NXDOMAIN", dns_reply(web, 10u, data, &length) == 3);
+		/* Sums, read through core/frame.situ before a field is: a UDP sum
+		 * that is right is answered, and one bit off in it or in the IPv4
+		 * header's, nothing, as a host's stack drops such a datagram. */
+		send_dns_summed(web, 10u, "db", 1u, SUM_UDP);
+		check("a question with its UDP sum, answered", dns_reply(web, 10u, data, &length) == 0);
+		send_dns_summed(web, 10u, "db", 1u, SUM_UDP_WRONG);
+		check("a question whose UDP sum is wrong, not answered",
+		      next_raw(web, f, sizeof f, 300) == 0u);
+		send_dns_summed(web, 10u, "db", 1u, SUM_IP_WRONG);
+		check("a question whose IPv4 header sum is wrong, not answered",
+		      next_raw(web, f, sizeof f, 300) == 0u);
 		send_dns(web, 10u, "99.0.55.10.in-addr.arpa", 12u);
 		check("an address it has not, NXDOMAIN", dns_reply(web, 10u, data, &length) == 3);
 		send_dns(web, 10u, "example.com", 1u);
@@ -1235,6 +1279,11 @@ int main(void)
 		int      flags;
 
 		hull_segment_resolvers(&server, &resolver_port, 1u);
+		tcp_sum_wrong = 1;
+		send_tcp(web, 10u, 0x02u, 1000u, 0u, NULL, 0u);
+		tcp_sum_wrong = 0;
+		check("a SYN whose TCP sum is wrong, not answered",
+		      next_tcp(web, 10u, &seq, &ack, data, &length, 300) < 0);
 		send_tcp(web, 10u, 0x02u, 1000u, 0u, NULL, 0u);
 		flags = next_tcp(web, 10u, &seq, &ack, data, &length, 1000);
 		check("a SYN to .1:53, answered SYN-ACK", flags == 0x12 && ack == 1001u);

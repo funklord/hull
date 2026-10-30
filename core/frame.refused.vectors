@@ -1,0 +1,30 @@
+# Frames that core/frame.situ must refuse, every one of them: each an
+# accepted vector with one byte changed, the comment saying which rule
+# it breaks.
+
+# not_ipv4: ARP for another protocol than IPv4
+arp_packet not_ipv4 00 01 86 00 06 04 00 01 52 54 00 00 00 0A 0A 37 00 0A 00 00 00 00 00 00 0A 37 00 01
+
+# long_hardware: ARP whose hardware addresses say 8 bytes
+arp_packet long_hardware 00 01 08 00 08 04 00 01 52 54 00 00 00 0A 0A 37 00 0A 00 00 00 00 00 00 0A 37 00 01
+
+# version_6: a header saying version 6
+ipv4_header version_6 65 00 00 30 00 01 40 00 40 11 26 44 0A 37 00 0A 0A 37 00 01
+
+# ihl_4: a header shorter than its 20 bytes
+ipv4_header ihl_4 44 00 00 30 00 01 40 00 40 11 26 44 0A 37 00 0A 0A 37 00 01
+
+# reserved_flag: the reserved flag set
+ipv4_header reserved_flag 45 00 00 30 00 01 C0 00 40 11 26 44 0A 37 00 0A 0A 37 00 01
+
+# length_7: a UDP length shorter than its header
+udp_datagram length_7 0F A0 00 35 00 07 00 00 12 34 01 00 00 01 00 00 00 00 00 00 02 64 62 00 00 01 00 01
+
+# offset_4: a data offset shorter than the header
+tcp_segment offset_4 10 04 00 35 00 00 03 E8 00 00 00 00 40 02 FF FF 87 49 00 00
+
+# zero_not: a pseudo-header whose zero byte is not
+pseudo_header zero_not 0A 37 00 0A 0A 37 00 01 01 11 00 1C
+
+# z_bit: the one reserved Z bit set
+dns_header z_bit 12 34 01 40 00 01 00 00 00 00 00 00

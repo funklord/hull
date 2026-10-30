@@ -119,12 +119,18 @@ FRONTEND_GEN = $(GEN_DIR)/frontend.c $(GEN_DIR)/frontend.h
 # The agent protocol (Appendix B), validated in both directions by the
 # same wire: the host reads the agent's messages, the agent the host's.
 PROTOCOL_GEN = $(GEN_DIR)/protocol.c $(GEN_DIR)/protocol.h
+# The frames hull at a segment's .1 reads from machines and writes back
+# (Appendix D), each validated before a field is read, from core/frame.situ.
+# Its checksum codec is derived, situc gen-derived's frame_derived.c.
+FRAME_GEN    = $(GEN_DIR)/frame.c $(GEN_DIR)/frame.h $(GEN_DIR)/frame_edit.h $(GEN_DIR)/frame_build.h \
+               $(GEN_DIR)/frame_derived.c
 # An ISO9660 image's structures, which engine/iso.c builds a disc's data
 # track from (section 3.10), from engine/disc.situ.
 DISC_GEN     = $(GEN_DIR)/disc.c $(GEN_DIR)/disc.h $(GEN_DIR)/disc_edit.h $(GEN_DIR)/disc_build.h
 WIRE_OBJS    = $(BUILD_DIR)/core/wire.o $(GEN_DIR)/frontend.o $(GEN_DIR)/protocol.o \
                $(BUILD_DIR)/agent/framing.o $(GEN_DIR)/message.o
-CORE_OBJS    = $(BUILD_DIR)/core/core.o $(BUILD_DIR)/core/segment.o $(WIRE_OBJS)
+CORE_OBJS    = $(BUILD_DIR)/core/core.o $(BUILD_DIR)/core/segment.o $(GEN_DIR)/frame.o \
+               $(GEN_DIR)/frame_derived.o $(WIRE_OBJS)
 HULL        = $(BUILD_DIR)/hull
 
 # The guest agent, PID 1 in a qemu machine: static, since the initramfs
@@ -284,6 +290,11 @@ $(PROTOCOL_GEN) &: agent/protocol.situ sexpr/canonical.situ $(SITU_COMPILER)
 	@mkdir -p '$(GEN_DIR)'
 	$(SITUC) build --target c --prefix hull_protocol --out '$(GEN_DIR)' agent/protocol.situ
 
+$(FRAME_GEN) &: core/frame.situ $(SITU_COMPILER)
+	@mkdir -p '$(GEN_DIR)'
+	$(SITUC) build --target c --layer edit --prefix hull_frame --out '$(GEN_DIR)' core/frame.situ
+	$(SITUC) gen-derived --target c --prefix hull_frame --out '$(GEN_DIR)' core/frame.situ
+
 $(DISC_GEN) &: engine/disc.situ $(SITU_COMPILER)
 	@mkdir -p '$(GEN_DIR)'
 	$(SITUC) build --target c --layer edit --prefix hull_disc --out '$(GEN_DIR)' engine/disc.situ
@@ -324,7 +335,7 @@ $(BUILD_DIR)/oci/%.o: oci/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/core/%.o: core/%.c VERSION | $(GEN_HEADERS) $(AGENT_GEN) $(FRONTEND_GEN) \
-                                          $(PROTOCOL_GEN)
+                                          $(PROTOCOL_GEN) $(FRAME_GEN)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) -DHULL_VERSION='"$(VERSION)"' $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
@@ -397,7 +408,7 @@ $(BUILD_DIR)/situ/situ.o: $(SITU_DIR)/runtime/c/situ.c
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/test/%.o: test/%.c | $(GEN_HEADERS) $(AGENT_GEN) $(DISC_GEN)
+$(BUILD_DIR)/test/%.o: test/%.c | $(GEN_HEADERS) $(AGENT_GEN) $(DISC_GEN) $(FRAME_GEN)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
@@ -434,7 +445,9 @@ $(BUILD_DIR)/test/json_test: $(TEST_JSON_OBJS) $(BUILD_DIR)/oci/json.o
 $(BUILD_DIR)/test/runtime_test: $(TEST_RUNTIME_OBJS) $(BUILD_DIR)/cli/runtime.o
 	$(CC) $(CFLAGS) -o $@ $^
 
-$(BUILD_DIR)/test/segment_test: $(TEST_SEGMENT_OBJS) $(BUILD_DIR)/core/segment.o
+$(BUILD_DIR)/test/segment_test: $(TEST_SEGMENT_OBJS) $(BUILD_DIR)/core/segment.o \
+                                $(GEN_DIR)/frame.o $(GEN_DIR)/frame_derived.o \
+                                $(BUILD_DIR)/situ/situ.o
 	$(CC) $(CFLAGS) -o $@ $^ -pthread
 
 $(BUILD_DIR)/test/hostdev_test: $(TEST_HOSTDEV_OBJS) $(BUILD_DIR)/engine/hostdev.o
@@ -453,7 +466,7 @@ $(BUILD_DIR)/test/iso_test: $(TEST_ISO_OBJS) $(BUILD_DIR)/engine/iso.o $(GEN_DIR
 # Appendices A and B and the core protocol (project.md section 4.10) as
 # situ describes them: schemas nothing is generated from yet, held to
 # their committed maps and to vectors of real bytes.
-DESCRIBED = manifest/manifest agent/protocol core/frontend engine/disc
+DESCRIBED = manifest/manifest agent/protocol core/frontend engine/disc core/frame
 
 check: style contract test
 
@@ -536,6 +549,7 @@ contract: $(SITU_MARK)
 	$(SITUC) map --check agent/protocol.situ
 	$(SITUC) map --check core/frontend.situ
 	$(SITUC) map --check engine/disc.situ
+	$(SITUC) map --check core/frame.situ
 
 hooks:
 	@if ! command -v git >/dev/null 2>&1; then \
@@ -558,7 +572,7 @@ clean:
 	        $(AGENT_OBJS) $(AGENT_OBJS:.o=.d) $(AGENT_GEN) \
 	        $(SPEC_OBJS) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS) $(PLAN_OBJS:.o=.d) \
 	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(STORE_OBJS) $(STORE_OBJS:.o=.d) $(OCI_OBJS) $(OCI_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) \
-	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) $(DISC_GEN) \
+	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) $(DISC_GEN) $(FRAME_GEN) \
 	        $(AGENT_BIN) $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) \
 	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor

@@ -1,0 +1,34 @@
+# Frames that core/frame.situ must accept, checked by `make test` with
+# `situc verify`: what a machine sends .1 and what .1 sends back, with
+# their sums right. verify reads each structure alone, so the sums UDP
+# and TCP take over a pseudo-header are test/segment_test.c's to check.
+
+# to_dot1: a frame from a machine to .1, IPv4
+ethernet_header to_dot1 52 54 00 00 00 0A 02 68 75 6C 6C 01 08 00
+
+# who_has: a machine asking who has .1
+arp_packet who_has 00 01 08 00 06 04 00 01 52 54 00 00 00 0A 0A 37 00 0A 00 00 00 00 00 00 0A 37 00 01
+
+# is_at: .1 saying it is at hull's MAC
+arp_packet is_at 00 01 08 00 06 04 00 02 02 68 75 6C 6C 01 0A 37 00 01 52 54 00 00 00 0A 0A 37 00 0A
+
+# udp: a question's IPv4 header, its sum right, do not fragment
+ipv4_header udp 45 00 00 30 00 01 40 00 40 11 26 44 0A 37 00 0A 0A 37 00 01
+
+# udp: the 12 bytes a UDP sum over 10.55.0.10 to .1 starts with
+pseudo_header udp 0A 37 00 0A 0A 37 00 01 00 11 00 1C
+
+# unsummed: a question to port 53 sent with no sum, as IPv4 allows
+udp_datagram unsummed 0F A0 00 35 00 1C 00 00 12 34 01 00 00 01 00 00 00 00 00 00 02 64 62 00 00 01 00 01
+
+# summed: the same with its sum
+udp_datagram summed 0F A0 00 35 00 1C 63 CD 12 34 01 00 00 01 00 00 00 00 00 00 02 64 62 00 00 01 00 01
+
+# syn: a SYN to .1:53
+tcp_segment syn 10 04 00 35 00 00 03 E8 00 00 00 00 50 02 FF FF 87 49 00 00
+
+# syn_ack_mss: .1's SYN-ACK with its MSS option
+tcp_segment syn_ack_mss 00 35 10 04 00 00 00 4D 00 00 03 E9 60 12 10 02 00 00 00 00 02 04 05 B4
+
+# query: a question's header: one, recursion desired
+dns_header query 12 34 01 00 00 01 00 00 00 00 00 00

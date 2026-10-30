@@ -1,0 +1,152 @@
+// What hull at a segment's .1 reads from a machine and writes back
+// (project.md Appendix D): an Ethernet frame's header, ARP for IPv4, an
+// IPv4 header, a UDP datagram, a TCP segment, and a DNS message's header.
+// Every frame core/segment.c answers comes from a machine on the segment,
+// which is to say from whatever runs in it, so this is where hull reads
+// bytes it did not write; each is validated here, checksums included,
+// before the switch looks at a field. The structures follow situ's own
+// example/ethernet, arp, ipv4, udp, tcp and dns, which say why each is so.
+
+codec internet_checksum {
+	kernel = ones_complement(width = 16, complement);
+}
+
+impl internet_checksum derived;
+
+target buffer;
+endian big;
+bit_order msb_first;
+
+// The frame's first 14 bytes. Its type is a number, not an enum: the
+// switch carries every type and .1 answers two.
+struct ethernet_header {
+	u8   destination[6];
+	u8   source[6];
+	u16  ethertype;
+}
+
+require size(ethernet_header) == 14;
+
+enum arp_operation : u16 {
+	request = 1,
+	reply   = 2,
+}
+
+// ARP for IPv4 over Ethernet, RFC 826 with its lengths fixed: the only
+// ARP .1 answers, a request for its own address.
+struct arp_packet {
+	u16            hardware_type    [must_eq = 1];
+	u16            protocol_type    [must_eq = 0x0800];
+	u8             hardware_length  [must_eq = 6];
+	u8             protocol_length  [must_eq = 4];
+	arp_operation  operation;
+	u8             sender_hardware[6];
+	u32            sender_protocol;
+	u8             target_hardware[6];
+	u32            target_protocol;
+}
+
+require size(arp_packet) == 28;
+
+// An IPv4 header, RFC 791, its options included and its sum checked; the
+// payload after it is the datagram's total length less this.
+struct ipv4_header [allow_straddle] {
+	authenticated header {
+		u4        version          [must_eq = 4];
+		u4        ihl              [min = 5];
+		u6        dscp;
+		u2        ecn;
+		u16       total_length;
+		u16       identification;
+		reserved  bit              [must_be_zero];
+		bit       dont_fragment;
+		bit       more_fragments;
+		u13       fragment_offset;
+		u8        time_to_live;
+		u8        protocol;
+		checksum u8 header_checksum[2] covers(header) is internet_checksum
+			[self_as = 0];
+		u32       source;
+		u32       destination;
+		u8        options[(ihl - 5) * 4];
+	}
+}
+
+require offset(ipv4_header.options) == 20;
+
+// The sum UDP and TCP take over their own bytes is taken over these first
+// (RFC 768, RFC 9293 3.1).
+struct pseudo_header {
+	u32  source_address;
+	u32  destination_address;
+	u8   zero        [must_eq = 0];
+	u8   protocol;
+	u16  length;
+}
+
+require size(pseudo_header) == 12;
+
+// A UDP datagram, RFC 768. A sum of 0 is a datagram sent with none, which
+// IPv4 allows: segment.c checks the sum only where one was sent.
+struct udp_datagram {
+	authenticated summed {
+		u16  source_port;
+		u16  destination_port;
+		u16  length  [min = 8];
+		checksum u8 checksum[2] covers(summed) prefix(pseudo_header)
+			is internet_checksum [self_as = 0];
+		u8   payload[length - 8];
+	}
+}
+
+require offset(udp_datagram.payload) == 8;
+
+// A TCP segment, RFC 9293, its options and its payload.
+struct tcp_segment {
+	authenticated summed {
+		u16       source_port;
+		u16       destination_port;
+		u32       sequence;
+		u32       acknowledgement;
+		u4        data_offset  [min = 5];
+		reserved  u4           [must_be_zero];
+		bit       cwr;
+		bit       ece;
+		bit       urgent;
+		bit       ack;
+		bit       push;
+		bit       reset;
+		bit       syn;
+		bit       fin;
+		u16       window;
+		checksum  u8 checksum[2] covers(summed) prefix(pseudo_header)
+			is internet_checksum [self_as = 0];
+		u16       urgent_pointer;
+		u8        options[(data_offset - 5) * 4];
+		u8        payload[remaining];
+	}
+}
+
+require offset(tcp_segment.options) == 20;
+
+// A DNS message's twelve bytes of header, RFC 1035 4.1.1 with RFC 2535's
+// and RFC 4035's two bits; the question after it is segment.c's to read.
+struct dns_header {
+	u16       id;
+	bit       is_response;
+	u4        opcode;
+	bit       authoritative;
+	bit       truncated;
+	bit       recursion_desired;
+	bit       recursion_available;
+	reserved  u1    [must_be_zero];
+	bit       authentic_data;
+	bit       checking_disabled;
+	u4        response_code;
+	u16       question_count;
+	u16       answer_count;
+	u16       authority_count;
+	u16       additional_count;
+}
+
+require size(dns_header) == 12;

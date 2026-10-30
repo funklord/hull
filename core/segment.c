@@ -42,6 +42,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "frame_build.h"
 #include "segment.h"
 
 #define MAX_SEGMENTS 64u
@@ -700,18 +701,6 @@ static void put32(uint8_t *at, uint32_t value)
 	put16(at + 2, value);
 }
 
-/* The ones' complement sum RFC 791 and 768 take, folded. */
-static uint32_t sum16(uint32_t sum, const uint8_t *data, size_t length)
-{
-	for (size_t i = 0u; i + 1u < length; i += 2u)
-		sum += get16(data + i);
-	if (length % 2u != 0u)
-		sum += (uint32_t)data[length - 1u] << 8;
-	while (sum >> 16)
-		sum = (sum & 0xffffu) + (sum >> 16);
-	return sum;
-}
-
 /* The subnet hull addresses `s` in, from any port it addresses: 0 where
  * it addresses none, the segment then bare. */
 static int subnet_of(const segment *s, uint32_t *network, unsigned *prefix)
@@ -788,9 +777,21 @@ static size_t dns_answer(const segment *s, uint32_t network, unsigned prefix,
 	hull_segment_host        found;
 	uint32_t    mask = 0xffffffffu << (32u - prefix);
 
-	if (length < 12u || (query[2] & 0x80u) != 0u || (query[2] & 0x78u) != 0u ||
-	    get16(query + 4) != 1u)
-		return 0u;
+	/* A question, read through core/frame.situ's header: one, of QUERY. */
+	{
+		situ_msg_t  msg;
+		situ_view_t head;
+
+		if (length < 12u)
+			return 0u;
+		situ_msg_init(&msg, (uint8_t *)(uintptr_t)query, (uint32_t)length);
+		if (hull_frame_dns_header_view(&msg, 0u, &head) != SITU_OK ||
+		    hull_frame_dns_header_validate(head) != SITU_OK ||
+		    hull_frame_dns_header_is_response_get(head) ||
+		    hull_frame_dns_header_opcode_get(head) != 0u ||
+		    hull_frame_dns_header_question_count_get(head) != 1u)
+			return 0u;
+	}
 	/* The question's name, lowercased, its labels joined by dots; no
 	 * pointer, since a question has nothing earlier to point at. */
 	while (at < length && query[at] != 0u) {
@@ -884,6 +885,17 @@ static size_t dns_answer(const segment *s, uint32_t network, unsigned prefix,
  * impairment holds for it too. One past a frame goes as IP fragments,
  * which the asker's kernel puts back together: so an answer up to the
  * asker's EDNS size arrives whole, with no TCP at .1 to ask again on. */
+/* The 12 bytes the UDP and TCP sums are taken over first. */
+static void pseudo(uint8_t out[12], uint32_t source, uint32_t destination, uint8_t protocol,
+                   uint32_t length)
+{
+	uint32_t wrote = 0u;
+
+	if (hull_frame_pseudo_header_build(out, 12u, source, destination, 0u, protocol,
+	                                   (uint16_t)length, &wrote) != SITU_OK)
+		memset(out, 0, 12u);
+}
+
 static void send_answer(segment *s, unsigned to, const uint8_t mac[6], uint32_t self,
                         uint32_t asker, const uint8_t udp_port[2], const uint8_t *dns,
                         size_t length)
@@ -892,49 +904,37 @@ static void send_answer(segment *s, unsigned to, const uint8_t mac[6], uint32_t 
 	static uint16_t ip_id;
 	uint8_t         reply[4u + 1514u];
 	uint8_t        *out = reply + 4;
-	size_t          whole = 8u + length;
-	uint32_t        sum;
+	uint8_t         first[12];
+	uint32_t        whole = 0u;
+	uint32_t        wrote = 0u;
 
-	if (whole > 65535u - 20u)
+	if (length > 65535u - 20u - 8u)
 		return;
-	put16(datagram, 53u);
-	memcpy(datagram + 2, udp_port, 2u);
-	put16(datagram + 4, (uint32_t)whole);
-	put16(datagram + 6, 0u);
-	memcpy(datagram + 8, dns, length);
 	/* The UDP sum over its pseudo-header and the whole datagram, as a
 	 * checking stack wants, before any of it is cut into fragments. */
-	put32(reply, self);
-	put32(reply + 4, asker);
-	sum = sum16(0u, reply, 8u);
-	sum += 17u + (uint32_t)whole;
-	sum = sum16(sum, datagram, whole);
-	put16(datagram + 6, (~sum & 0xffffu) == 0u ? 0xffffu : ~sum & 0xffffu);
+	pseudo(first, self, asker, 17u, 8u + (uint32_t)length);
+	if (hull_frame_udp_datagram_build(datagram, sizeof datagram, 53u, (uint16_t)get16(udp_port),
+	                                  first, sizeof first, dns, (uint32_t)length,
+	                                  &whole) != SITU_OK)
+		return;
 	ip_id++;
-	for (size_t at = 0u; at < whole;) {
-		size_t piece = whole - at;
-		int    more  = 0;
-		size_t total;
+	for (uint32_t at = 0u; at < whole;) {
+		uint32_t piece = whole - at;
+		int      more  = 0;
+		size_t   total;
 
 		if (piece > 1480u) {
 			piece = 1480u;   /* a multiple of 8, as every fragment but the last is */
 			more  = 1;
 		}
 		memset(reply, 0, sizeof reply);
-		memcpy(out, mac, 6u);
-		memcpy(out + 6, hull_mac, 6u);
-		put16(out + 12, 0x0800u);
-		out[14] = 0x45u;
-		put16(out + 16, (uint32_t)(20u + piece));
-		put16(out + 18, ip_id);
 		/* Don't fragment where it is whole; else more-fragments and the
 		 * offset, in 8-byte units. */
-		put16(out + 20, at == 0u && !more ? 0x4000u : (more ? 0x2000u : 0u) | (uint32_t)(at / 8u));
-		out[22] = 64u;
-		out[23] = 17u;
-		put32(out + 26, self);
-		put32(out + 30, asker);
-		put16(out + 24, ~sum16(0u, out + 14, 20u) & 0xffffu);
+		if (hull_frame_ethernet_header_build(out, 14u, mac, hull_mac, 0x0800u, &wrote) != SITU_OK ||
+		    hull_frame_ipv4_header_build(out + 14, 20u, 4u, 0u, 0u, (uint16_t)(20u + piece), ip_id,
+		                                 at == 0u && !more, (uint8_t)more, (uint16_t)(at / 8u),
+		                                 64u, 17u, self, asker, NULL, 0u, &wrote) != SITU_OK)
+			return;
 		memcpy(out + 34, datagram + at, piece);
 		total = 14u + 20u + piece;
 		if (total < 60u)
@@ -965,50 +965,40 @@ static int conn_port(const segment *s, const conn *c)
 static void tcp_send(segment *s, const conn *c, unsigned flags, uint32_t seq,
                      const uint8_t *data, size_t length)
 {
-	uint8_t  reply[4u + 1514u];
-	uint8_t *out = reply + 4;
-	uint8_t *tcp = out + 34;
-	size_t   options = (flags & TCP_SYN) != 0u ? 4u : 0u;
-	size_t   segment_length = 20u + options + length;
-	uint32_t network;
-	unsigned prefix;
-	uint32_t sum;
-	int      to = conn_port(s, c);
+	static const uint8_t mss[4] = { 2u, 4u, TCP_MSS >> 8, TCP_MSS & 0xffu };
+	uint8_t              reply[4u + 1514u];
+	uint8_t             *out = reply + 4;
+	uint8_t              first[12];
+	int                  syn = (flags & TCP_SYN) != 0u;
+	uint32_t             segment_length = 20u + (syn ? 4u : 0u) + (uint32_t)length;
+	uint32_t             window = CONN_IN - c->in_length > 0xffffu ? 0xffffu :
+	                              (uint32_t)(CONN_IN - c->in_length);
+	uint32_t             network;
+	unsigned             prefix;
+	uint32_t             wrote = 0u;
+	uint32_t             tcp = 0u;
+	size_t               total;
+	int                  to = conn_port(s, c);
 
 	if (to < 0 || length > TCP_MSS || !subnet_of(s, &network, &prefix))
 		return;
 	memset(reply, 0, sizeof reply);
-	memcpy(out, c->mac, 6u);
-	memcpy(out + 6, hull_mac, 6u);
-	put16(out + 12, 0x0800u);
-	out[14] = 0x45u;
-	put16(out + 16, (uint32_t)(20u + segment_length));
-	put16(out + 20, 0x4000u);
-	out[22] = 64u;
-	out[23] = 6u;
-	put32(out + 26, network + 1u);
-	put32(out + 30, c->address);
-	put16(out + 24, ~sum16(0u, out + 14, 20u) & 0xffffu);
-	put16(tcp, 53u);
-	put16(tcp + 2, c->their_port);
-	put32(tcp + 4, seq);
-	put32(tcp + 8, (flags & TCP_ACK) != 0u ? c->rcv_nxt : 0u);
-	tcp[12] = (uint8_t)((20u + options) / 4u << 4);
-	tcp[13] = (uint8_t)flags;
-	put16(tcp + 14, CONN_IN - c->in_length > 0xffffu ? 0xffffu : (uint32_t)(CONN_IN - c->in_length));
-	if (options != 0u) {
-		tcp[20] = 2u;     /* MSS */
-		tcp[21] = 4u;
-		put16(tcp + 22, TCP_MSS);
-	}
-	memcpy(tcp + 20 + options, data, length);
-	/* The pseudo-header's addresses, the IP header's own. */
-	sum = sum16(0u, out + 26, 8u);
-	sum += 6u + (uint32_t)segment_length;
-	sum = sum16(sum, tcp, segment_length);
-	put16(tcp + 16, ~sum & 0xffffu);
-	put32(reply, (uint32_t)(14u + 20u + segment_length < 60u ? 60u : 14u + 20u + segment_length));
-	cross(s, (unsigned)to, HULL_SEGMENT_IN, reply, 4u + get32(reply));
+	pseudo(first, network + 1u, c->address, 6u, segment_length);
+	if (hull_frame_ethernet_header_build(out, 14u, c->mac, hull_mac, 0x0800u, &wrote) != SITU_OK ||
+	    hull_frame_tcp_segment_build(out + 34, 1514u - 34u, 53u, c->their_port, seq,
+	                                 (flags & TCP_ACK) != 0u ? c->rcv_nxt : 0u, 0u, 0u, 0u,
+	                                 (flags & TCP_ACK) != 0u, (flags & TCP_PSH) != 0u,
+	                                 (flags & TCP_RST) != 0u, (uint8_t)syn,
+	                                 (flags & TCP_FIN) != 0u, (uint16_t)window, first,
+	                                 sizeof first, 0u, mss, syn ? sizeof mss : 0u, data,
+	                                 (uint32_t)length, &tcp) != SITU_OK ||
+	    hull_frame_ipv4_header_build(out + 14, 20u, 4u, 0u, 0u, (uint16_t)(20u + tcp), 0u, 1u, 0u,
+	                                 0u, 64u, 6u, network + 1u, c->address, NULL, 0u,
+	                                 &wrote) != SITU_OK)
+		return;
+	total = 14u + 20u + tcp < 60u ? 60u : 14u + 20u + tcp;
+	put32(reply, (uint32_t)total);
+	cross(s, (unsigned)to, HULL_SEGMENT_IN, reply, 4u + total);
 }
 
 /* What of `c`'s answers it has not yet been sent, sent, in segments. */
@@ -1107,31 +1097,22 @@ static uint64_t conn_timers(uint64_t now)
  * fed, acknowledged or closed, and each whole query on it answered, by
  * hull or asked on as a datagram's is. */
 static void tcp_in(segment *s, unsigned from, const uint8_t *frame, const uint8_t *ip,
-                   size_t header, size_t datagram, uint32_t network, unsigned prefix)
+                   size_t header, situ_view_t tcp, uint32_t network, unsigned prefix)
 {
-	const uint8_t *tcp = ip + header;
-	size_t         offset;
-	uint16_t       their_port;
-	uint32_t       seq;
-	uint32_t       ack;
-	unsigned       flags;
-	const uint8_t *data;
-	size_t         length;
+	uint16_t       their_port = hull_frame_tcp_segment_source_port_get(tcp);
+	uint32_t       seq = hull_frame_tcp_segment_sequence_get(tcp);
+	uint32_t       ack = hull_frame_tcp_segment_acknowledgement_get(tcp);
+	unsigned       flags = (hull_frame_tcp_segment_fin_get(tcp) ? TCP_FIN : 0u) |
+	                       (hull_frame_tcp_segment_syn_get(tcp) ? TCP_SYN : 0u) |
+	                       (hull_frame_tcp_segment_reset_get(tcp) ? TCP_RST : 0u) |
+	                       (hull_frame_tcp_segment_push_get(tcp) ? TCP_PSH : 0u) |
+	                       (hull_frame_tcp_segment_ack_get(tcp) ? TCP_ACK : 0u);
+	const uint8_t *data = hull_frame_tcp_segment_payload_ptr(tcp);
+	size_t         length = hull_frame_tcp_segment_payload_len(tcp);
 	uint64_t       now = now_ns();
 	conn          *c = NULL;
 	int            at = -1;
 
-	if (datagram < header + 20u)
-		return;
-	offset = (size_t)(tcp[12] >> 4) * 4u;
-	if (offset < 20u || datagram < header + offset)
-		return;
-	their_port = (uint16_t)get16(tcp);
-	seq = get32(tcp + 4);
-	ack = get32(tcp + 8);
-	flags = tcp[13];
-	data = tcp + offset;
-	length = datagram - header - offset;
 	for (unsigned i = 0u; i < MAX_CONNS; i++) {
 		if (conns[i] != NULL && now - conns[i]->at > MAX_CONN_NS)
 			conn_drop((int)i);
@@ -1421,55 +1402,92 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 	uint32_t       network;
 	uint32_t       self;
 	unsigned       prefix;
+	situ_msg_t     msg;
+	situ_view_t    ether;
+	situ_view_t    view;
+	uint16_t       type;
 
-	if (!subnet_of(s, &network, &prefix))
+	if (!subnet_of(s, &network, &prefix) || size < 14u)
 		return 0;
 	self = network + 1u;
+	/* What the machine sent, read through core/frame.situ: nothing writes
+	 * through these views, so the frame's constness holds. */
+	situ_msg_init(&msg, (uint8_t *)(uintptr_t)frame, (uint32_t)size);
+	if (hull_frame_ethernet_header_view(&msg, 0u, &ether) != SITU_OK)
+		return 0;
+	type = hull_frame_ethernet_header_ethertype_get(ether);
 	/* ARP: who has .1. */
-	if (size >= 42u && get16(frame + 12) == 0x0806u && get16(frame + 14) == 1u &&
-	    get16(frame + 16) == 0x0800u && frame[18] == 6u && frame[19] == 4u &&
-	    get16(frame + 20) == 1u && get32(frame + 38) == self) {
+	if (type == 0x0806u && hull_frame_arp_packet_view(&msg, 14u, &view) == SITU_OK &&
+	    hull_frame_arp_packet_validate(view) == SITU_OK &&
+	    hull_frame_arp_packet_operation_get(view) == 1u &&
+	    hull_frame_arp_packet_target_protocol_get(view) == self) {
+		uint32_t wrote = 0u;
+
 		memset(reply, 0, sizeof reply);
-		memcpy(out, frame + 6, 6u);
-		memcpy(out + 6, hull_mac, 6u);
-		put16(out + 12, 0x0806u);
-		put16(out + 14, 1u);
-		put16(out + 16, 0x0800u);
-		out[18] = 6u;
-		out[19] = 4u;
-		put16(out + 20, 2u);
-		memcpy(out + 22, hull_mac, 6u);
-		put32(out + 28, self);
-		memcpy(out + 32, frame + 22, 10u);   /* the asker's MAC and address */
+		if (hull_frame_ethernet_header_build(out, 14u, hull_frame_arp_packet_sender_hardware_ptr(view),
+		                                     hull_mac, 0x0806u, &wrote) != SITU_OK ||
+		    hull_frame_arp_packet_build(out + 14, 28u, 1u, 0x0800u, 6u, 4u, HULL_FRAME_ARP_OPERATION_REPLY,
+		                                hull_mac, self,
+		                                hull_frame_arp_packet_sender_hardware_ptr(view),
+		                                hull_frame_arp_packet_sender_protocol_get(view),
+		                                &wrote) != SITU_OK)
+			return 1;
 		put32(reply, 60u);
 		cross(s, from, HULL_SEGMENT_IN, reply, 4u + 60u);
 		return 1;
 	}
-	if (memcmp(frame, hull_mac, 6u) == 0) {
+	if (memcmp(hull_frame_ethernet_header_destination_ptr(ether), hull_mac, 6u) == 0) {
 		const uint8_t     *ip = frame + 14;
 		size_t             header;
 		size_t             datagram;
 		size_t             dns;
 		size_t             question = 0u;
 		uint8_t            dns_out[MAX_DNS];
+		uint8_t            first[12];
+		const uint8_t     *query;
+		size_t             query_length;
 		struct sockaddr_in servers[3];
 		unsigned           count = 0u;
+		situ_view_t        inner;
+		uint32_t           asker;
 
-		/* For .1 and not ARP or DNS: nothing else answers there. */
-		if (size < 14u + 20u + 8u || get16(frame + 12) != 0x0800u || ip[0] >> 4 != 4u)
+		/* For .1 and not ARP or DNS: nothing else answers there. A
+		 * header that does not validate, its sum among it, is not read. */
+		if (type != 0x0800u || hull_frame_ipv4_header_view(&msg, 14u, (uint32_t)(size - 14u),
+		                                                    &view) != SITU_OK ||
+		    hull_frame_ipv4_header_validate(view) != SITU_OK ||
+		    hull_frame_ipv4_header_header_checksum_check(view) != SITU_OK ||
+		    hull_frame_ipv4_header_destination_get(view) != self ||
+		    hull_frame_ipv4_header_more_fragments_get(view) ||
+		    hull_frame_ipv4_header_fragment_offset_get(view) != 0u)
 			return 1;
-		header = (size_t)(ip[0] & 0x0fu) * 4u;
-		datagram = get16(ip + 2);
-		if (header >= 20u && datagram >= header + 20u && 14u + datagram <= size &&
-		    ip[9] == 6u && (get16(ip + 6) & 0x3fffu) == 0u && get32(ip + 16) == self &&
-		    get16(ip + header + 2) == 53u) {
-			tcp_in(s, from, frame, ip, header, datagram, network, prefix);
+		header = (size_t)hull_frame_ipv4_header_ihl_get(view) * 4u;
+		datagram = hull_frame_ipv4_header_total_length_get(view);
+		asker = hull_frame_ipv4_header_source_get(view);
+		if (datagram < header || 14u + datagram > size)
+			return 1;
+		pseudo(first, asker, self, hull_frame_ipv4_header_protocol_get(view),
+		       (uint32_t)(datagram - header));
+		if (hull_frame_ipv4_header_protocol_get(view) == 6u) {
+			if (hull_frame_tcp_segment_view(&msg, (uint32_t)(14u + header),
+			                                (uint32_t)(datagram - header), &inner) == SITU_OK &&
+			    hull_frame_tcp_segment_validate(inner) == SITU_OK &&
+			    hull_frame_tcp_segment_checksum_check(inner, first, sizeof first) == SITU_OK &&
+			    hull_frame_tcp_segment_destination_port_get(inner) == 53u)
+				tcp_in(s, from, frame, ip, header, inner, network, prefix);
 			return 1;
 		}
-		if (header < 20u || datagram < header + 8u || 14u + datagram > size || ip[9] != 17u ||
-		    (get16(ip + 6) & 0x3fffu) != 0u || get32(ip + 16) != self ||
-		    get16(ip + header + 2) != 53u)
+		/* A UDP sum of 0 is a datagram sent with none, which IPv4 allows. */
+		if (hull_frame_ipv4_header_protocol_get(view) != 17u ||
+		    hull_frame_udp_datagram_view(&msg, (uint32_t)(14u + header),
+		                                 (uint32_t)(datagram - header), &inner) != SITU_OK ||
+		    hull_frame_udp_datagram_validate(inner) != SITU_OK ||
+		    hull_frame_udp_datagram_destination_port_get(inner) != 53u ||
+		    (get16(hull_frame_udp_datagram_checksum_ptr(inner)) != 0u &&
+		     hull_frame_udp_datagram_checksum_check(inner, first, sizeof first) != SITU_OK))
 			return 1;
+		query        = hull_frame_udp_datagram_payload_ptr(inner);
+		query_length = hull_frame_udp_datagram_payload_len(inner);
 		/* Asked on only for a machine with a way out, and where there is a
 		 * resolver to ask, from a socket opened for the first question;
 		 * otherwise refused, as before there was one. */
@@ -1480,13 +1498,14 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 			else
 				(void)!write(wake[1], "", 1u);   /* for the poll() to take it */
 		}
-		dns = dns_answer(s, network, prefix, ip + header + 8u, datagram - header - 8u,
-		                 count != 0u, dns_out, sizeof dns_out, &question);
+		dns = dns_answer(s, network, prefix, query, query_length, count != 0u, dns_out,
+		                 sizeof dns_out, &question);
 		if (dns == ASK_ON)
-			ask_on(s, from, frame, ip, header, ip + header + 8u, datagram - header - 8u,
+			ask_on(s, from, frame, ip, header, query, query_length,
 			       &servers[asking_next++ % count], -1);
 		else if (dns != 0u)
-			send_answer(s, from, frame + 6, self, get32(ip + 12), ip + header, dns_out, dns);
+			send_answer(s, from, hull_frame_ethernet_header_source_ptr(ether), self, asker,
+			            ip + header, dns_out, dns);
 		return 1;
 	}
 	return 0;

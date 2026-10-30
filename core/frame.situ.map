@@ -1,0 +1,105 @@
+# situ capability map v1
+# schema: frame.situ
+# core:   offset size align repr atomic
+#
+# Core axes are always shown. Any other axis appears only where it has
+# been weakened below its strongest value.
+#
+# Offsets are byte values, or byte:bit where a field does not start on
+# a byte boundary. Sizes are bytes unless suffixed with `bit`.
+#
+# A struct's size is a bare number where it is fixed, `min..max` where
+# it is bounded, and `min..` where nothing bounds it.
+
+# codecs. `trusted` means the properties are declared and
+# unverified: run `situc gen-codec-tests` to falsify a lying one.
+codec internet_checksum derived expansion=+2 seekable=linear granularity=block systematic deterministic
+
+struct arp_packet size=28 repr=ValueConverted atomic=NonAtomic
+  arp_packet.hardware_type               offset=AbsoluteStatic(0x00) size=Fixed(2) align=Aligned(8) repr=ValueConverted atomic=AtomicWord
+  arp_packet.protocol_type               offset=AbsoluteStatic(0x02) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord
+  arp_packet.hardware_length             offset=AbsoluteStatic(0x04) size=Fixed(1) align=Aligned(4) repr=MemoryIdentical atomic=AtomicWord
+  arp_packet.protocol_length             offset=AbsoluteStatic(0x05) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  arp_packet.operation                   offset=AbsoluteStatic(0x06) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord
+  arp_packet.sender_hardware             offset=AbsoluteStatic(0x08) size=Fixed(6) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic
+  arp_packet.sender_protocol             offset=AbsoluteStatic(0x0E) size=Fixed(4) align=Aligned(2) repr=ValueConverted atomic=NonAtomic
+  arp_packet.target_hardware             offset=AbsoluteStatic(0x12) size=Fixed(6) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
+  arp_packet.target_protocol             offset=AbsoluteStatic(0x18) size=Fixed(4) align=Aligned(8) repr=ValueConverted atomic=AtomicWord
+
+struct dns_header size=12 repr=ValueConverted atomic=NonAtomic
+  dns_header.id                          offset=AbsoluteStatic(0x00) size=Fixed(2) align=Aligned(8) repr=ValueConverted atomic=AtomicWord
+  dns_header.is_response                 offset=AbsoluteStatic(0x02) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic
+  dns_header.opcode                      offset=AbsoluteStatic(0x02:1) size=Fixed(4bit) align=Unaligned repr=ValueConverted atomic=NonAtomic
+  dns_header.authoritative               offset=AbsoluteStatic(0x02:5) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic
+  dns_header.truncated                   offset=AbsoluteStatic(0x02:6) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic
+  dns_header.recursion_desired           offset=AbsoluteStatic(0x02:7) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic
+  dns_header.recursion_available         offset=AbsoluteStatic(0x03) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic
+  dns_header.<reserved0>                 offset=AbsoluteStatic(0x03:1) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic
+  dns_header.authentic_data              offset=AbsoluteStatic(0x03:2) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic
+  dns_header.checking_disabled           offset=AbsoluteStatic(0x03:3) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic
+  dns_header.response_code               offset=AbsoluteStatic(0x03:4) size=Fixed(4bit) align=Unaligned repr=ValueConverted atomic=NonAtomic
+  dns_header.question_count              offset=AbsoluteStatic(0x04) size=Fixed(2) align=Aligned(4) repr=ValueConverted atomic=AtomicWord
+  dns_header.answer_count                offset=AbsoluteStatic(0x06) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord
+  dns_header.authority_count             offset=AbsoluteStatic(0x08) size=Fixed(2) align=Aligned(8) repr=ValueConverted atomic=AtomicWord
+  dns_header.additional_count            offset=AbsoluteStatic(0x0A) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord
+
+struct ethernet_header size=14 repr=ValueConverted atomic=NonAtomic
+  ethernet_header.destination            offset=AbsoluteStatic(0x00) size=Fixed(6) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic
+  ethernet_header.source                 offset=AbsoluteStatic(0x06) size=Fixed(6) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
+  ethernet_header.ethertype              offset=AbsoluteStatic(0x0C) size=Fixed(2) align=Aligned(4) repr=ValueConverted atomic=AtomicWord
+
+struct ipv4_header size=20..60 mutate=Immutable repr=ValueConverted atomic=NonAtomic auth=Covered(header_checksum)
+  ipv4_header.header                     offset=AbsoluteStatic(0x00) size=Bounded(20, 60) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting auth=Covered(header_checksum)
+  ipv4_header.version                    offset=AbsoluteStatic(0x00) size=Fixed(4bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(header_checksum)
+  ipv4_header.ihl                        offset=AbsoluteStatic(0x00:4) size=Fixed(4bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(header_checksum)
+  ipv4_header.dscp                       offset=AbsoluteStatic(0x01) size=Fixed(6bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(header_checksum)
+  ipv4_header.ecn                        offset=AbsoluteStatic(0x01:6) size=Fixed(2bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(header_checksum)
+  ipv4_header.total_length               offset=AbsoluteStatic(0x02) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord auth=Covered(header_checksum)
+  ipv4_header.identification             offset=AbsoluteStatic(0x04) size=Fixed(2) align=Aligned(4) repr=ValueConverted atomic=AtomicWord auth=Covered(header_checksum)
+  ipv4_header.<reserved0>                offset=AbsoluteStatic(0x06) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(header_checksum)
+  ipv4_header.dont_fragment              offset=AbsoluteStatic(0x06:1) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(header_checksum)
+  ipv4_header.more_fragments             offset=AbsoluteStatic(0x06:2) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(header_checksum)
+  ipv4_header.fragment_offset            offset=AbsoluteStatic(0x06:3) size=Fixed(13bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(header_checksum)
+  ipv4_header.time_to_live               offset=AbsoluteStatic(0x08) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord auth=Covered(header_checksum)
+  ipv4_header.protocol                   offset=AbsoluteStatic(0x09) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord auth=Covered(header_checksum)
+  ipv4_header.header_checksum            offset=AbsoluteStatic(0x0A) size=Fixed(2) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic mutate=Immutable
+  ipv4_header.source                     offset=AbsoluteStatic(0x0C) size=Fixed(4) align=Aligned(4) repr=ValueConverted atomic=AtomicWord auth=Covered(header_checksum)
+  ipv4_header.destination                offset=AbsoluteStatic(0x10) size=Fixed(4) align=Aligned(8) repr=ValueConverted atomic=AtomicWord auth=Covered(header_checksum)
+  ipv4_header.options                    offset=AbsoluteStatic(0x14) size=Bounded(0, 40) align=Aligned(4) repr=MemoryIdentical atomic=AtomicWord mutate=Shifting auth=Covered(header_checksum)
+
+struct pseudo_header size=12 repr=ValueConverted
+  pseudo_header.source_address           offset=AbsoluteStatic(0x00) size=Fixed(4) align=Aligned(8) repr=ValueConverted atomic=AtomicWord
+  pseudo_header.destination_address      offset=AbsoluteStatic(0x04) size=Fixed(4) align=Aligned(4) repr=ValueConverted atomic=AtomicWord
+  pseudo_header.zero                     offset=AbsoluteStatic(0x08) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord
+  pseudo_header.protocol                 offset=AbsoluteStatic(0x09) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  pseudo_header.length                   offset=AbsoluteStatic(0x0A) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord
+
+struct tcp_segment size=20.. mutate=Immutable address=Unstable repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  tcp_segment.summed                     offset=AbsoluteStatic(0x00) size=Unbounded align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting auth=Covered(checksum)
+  tcp_segment.source_port                offset=AbsoluteStatic(0x00) size=Fixed(2) align=Aligned(8) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  tcp_segment.destination_port           offset=AbsoluteStatic(0x02) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  tcp_segment.sequence                   offset=AbsoluteStatic(0x04) size=Fixed(4) align=Aligned(4) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  tcp_segment.acknowledgement            offset=AbsoluteStatic(0x08) size=Fixed(4) align=Aligned(8) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  tcp_segment.data_offset                offset=AbsoluteStatic(0x0C) size=Fixed(4bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  tcp_segment.<reserved0>                offset=AbsoluteStatic(0x0C:4) size=Fixed(4bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  tcp_segment.cwr                        offset=AbsoluteStatic(0x0D) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  tcp_segment.ece                        offset=AbsoluteStatic(0x0D:1) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  tcp_segment.urgent                     offset=AbsoluteStatic(0x0D:2) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  tcp_segment.ack                        offset=AbsoluteStatic(0x0D:3) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  tcp_segment.push                       offset=AbsoluteStatic(0x0D:4) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  tcp_segment.reset                      offset=AbsoluteStatic(0x0D:5) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  tcp_segment.syn                        offset=AbsoluteStatic(0x0D:6) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  tcp_segment.fin                        offset=AbsoluteStatic(0x0D:7) size=Fixed(1bit) align=Unaligned repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  tcp_segment.window                     offset=AbsoluteStatic(0x0E) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  tcp_segment.checksum                   offset=AbsoluteStatic(0x10) size=Fixed(2) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic mutate=Immutable
+  tcp_segment.urgent_pointer             offset=AbsoluteStatic(0x12) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  tcp_segment.options                    offset=AbsoluteStatic(0x14) size=Bounded(0, 40) align=Aligned(4) repr=MemoryIdentical atomic=AtomicWord mutate=Shifting auth=Covered(checksum)
+  tcp_segment.payload                    offset=Dynamic size=Unbounded align=Unaligned repr=MemoryIdentical atomic=AtomicWord mutate=Shifting address=Unstable auth=Covered(checksum)
+
+struct udp_datagram size=8..65535 mutate=Immutable repr=ValueConverted atomic=NonAtomic auth=Covered(checksum)
+  udp_datagram.summed                    offset=AbsoluteStatic(0x00) size=Bounded(8, 65535) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting auth=Covered(checksum)
+  udp_datagram.source_port               offset=AbsoluteStatic(0x00) size=Fixed(2) align=Aligned(8) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  udp_datagram.destination_port          offset=AbsoluteStatic(0x02) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  udp_datagram.length                    offset=AbsoluteStatic(0x04) size=Fixed(2) align=Aligned(4) repr=ValueConverted atomic=AtomicWord auth=Covered(checksum)
+  udp_datagram.checksum                  offset=AbsoluteStatic(0x06) size=Fixed(2) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic mutate=Immutable
+  udp_datagram.payload                   offset=AbsoluteStatic(0x08) size=Bounded(0, 65527) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord mutate=Shifting auth=Covered(checksum)
