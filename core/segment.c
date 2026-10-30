@@ -37,6 +37,7 @@
 #include <string.h>
 #include <strings.h>
 #include <netinet/in.h>
+#include <net/if.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <time.h>
@@ -159,8 +160,8 @@ typedef struct asked {
 	int                used;
 	uint64_t           at;
 	uint16_t           id;
-	uint16_t           their_id;
-	struct sockaddr_in server;
+	uint16_t            their_id;
+	struct sockaddr_in6 server;
 	char               key[512];
 	char               machine[64];
 	int                fd;
@@ -227,7 +228,7 @@ static conn              *conns[MAX_CONNS];
 static uint64_t           conn_generation;
 static uint64_t           asking_random;
 static unsigned           asking_next;     /* the resolver the next question goes to */
-static struct sockaddr_in resolvers_given[3];
+static struct sockaddr_in6 resolvers_given[3];
 static unsigned           resolvers_given_count;
 
 static void say(char *why, size_t cap, const char *reason)
@@ -976,12 +977,13 @@ static void send_echo(segment *s, unsigned to, const uint8_t mac[6], uint32_t se
 	cross(s, to, HULL_SEGMENT_IN, reply, 4u + total);
 }
 
-static unsigned resolvers(struct sockaddr_in out[3]);
+static unsigned resolvers(struct sockaddr_in6 out[3]);
+static void open_upstream(void);
 static segment *find(const char *key);
 static void conn_arm(conn *c);
 static void ask_on(segment *s, unsigned from, const uint8_t *frame, const uint8_t *ip,
                    size_t header, const uint8_t *query, size_t length,
-                   const struct sockaddr_in *server, int on);
+                   const struct sockaddr_in6 *server, int on);
 
 /* `s`'s port that `c` came on, or -1 where it has gone. */
 static int conn_port(const segment *s, const conn *c)
@@ -1257,11 +1259,11 @@ static void tcp_in(segment *s, unsigned from, const uint8_t *frame, const uint8_
 		uint8_t            dns_out[MAX_DNS];
 		size_t             question = 0u;
 		size_t             dns;
-		struct sockaddr_in servers[3];
+		struct sockaddr_in6 servers[3];
 		unsigned           count = 0u;
 
 		if (s->ports[from]->forwards && (count = resolvers(servers)) != 0u && upstream < 0) {
-			upstream = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+			open_upstream();
 			if (upstream < 0)
 				count = 0u;
 			else
@@ -1290,7 +1292,72 @@ static void tcp_in(segment *s, unsigned from, const uint8_t *frame, const uint8_
 /* The host's resolvers, IPv4, at most three: those a test gave, else
  * /etc/resolv.conf's, read each time, since the host's can change under
  * a long-lived core -- its loopback ones too, the core being the host's. */
-static unsigned resolvers(struct sockaddr_in out[3])
+/* A nameserver as resolv.conf names one, IPv4 or IPv6 with a scope after
+ * `%` where it is link-local, into `out` as IPv6, an IPv4 one mapped, so
+ * that one socket asks both and one comparison knows an answer's sender.
+ * 1, or 0 where it is neither. */
+static int resolver_address(const char *text, unsigned port, struct sockaddr_in6 *out)
+{
+	char           address[64];
+	char          *scope;
+	struct in_addr v4;
+
+	memset(out, 0, sizeof *out);
+	out->sin6_family = AF_INET6;
+	out->sin6_port   = htons((uint16_t)port);
+	snprintf(address, sizeof address, "%s", text);
+	if ((scope = strchr(address, '%')) != NULL)
+		*scope++ = '\0';
+	if (inet_pton(AF_INET, address, &v4) == 1) {
+		out->sin6_addr.s6_addr[10] = 0xffu;
+		out->sin6_addr.s6_addr[11] = 0xffu;
+		memcpy(&out->sin6_addr.s6_addr[12], &v4, 4u);
+		return 1;
+	}
+	if (inet_pton(AF_INET6, address, &out->sin6_addr) != 1)
+		return 0;
+	if (scope != NULL && (out->sin6_scope_id = if_nametoindex(scope)) == 0u)
+		out->sin6_scope_id = (uint32_t)strtoul(scope, NULL, 10);
+	return 1;
+}
+
+/* The socket .1 asks on: IPv6 taking IPv4 too, or IPv4 alone where the
+ * host has no IPv6, which then asks only its IPv4 resolvers. */
+static int upstream_v6;
+
+static void open_upstream(void)
+{
+	int off = 0;
+
+	upstream = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+	upstream_v6 = upstream >= 0 &&
+	              setsockopt(upstream, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof off) == 0;
+	if (upstream >= 0 && !upstream_v6) {
+		close(upstream);
+		upstream = -1;
+	}
+	if (upstream < 0)
+		upstream = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+}
+
+/* `server` sent to on the upstream socket, as its family takes it. */
+static ssize_t send_upstream(const uint8_t *data, size_t length, const struct sockaddr_in6 *server)
+{
+	struct sockaddr_in v4 = { .sin_family = AF_INET };
+
+	if (upstream_v6)
+		return sendto(upstream, data, length, MSG_DONTWAIT, (const struct sockaddr *)server,
+		              sizeof *server);
+	if (!IN6_IS_ADDR_V4MAPPED(&server->sin6_addr)) {
+		errno = EAFNOSUPPORT;
+		return -1;
+	}
+	v4.sin_port = server->sin6_port;
+	memcpy(&v4.sin_addr, &server->sin6_addr.s6_addr[12], 4u);
+	return sendto(upstream, data, length, MSG_DONTWAIT, (const struct sockaddr *)&v4, sizeof v4);
+}
+
+static unsigned resolvers(struct sockaddr_in6 out[3])
 {
 	FILE    *conf;
 	char     line[256];
@@ -1305,13 +1372,9 @@ static unsigned resolvers(struct sockaddr_in out[3])
 	while (count < 3u && fgets(line, sizeof line, conf) != NULL) {
 		char server[64];
 
-		memset(&out[count], 0, sizeof out[count]);
 		if (sscanf(line, "nameserver %63s", server) == 1 &&
-		    inet_pton(AF_INET, server, &out[count].sin_addr) == 1) {
-			out[count].sin_family = AF_INET;
-			out[count].sin_port   = htons(53u);
+		    resolver_address(server, 53u, &out[count]))
 			count++;
-		}
 	}
 	fclose(conf);
 	return count;
@@ -1323,7 +1386,7 @@ static unsigned resolvers(struct sockaddr_in out[3])
  * drops a frame, and its asker asks again. */
 static void ask_on(segment *s, unsigned from, const uint8_t *frame, const uint8_t *ip,
                    size_t header, const uint8_t *query, size_t length,
-                   const struct sockaddr_in *server, int on)
+                   const struct sockaddr_in6 *server, int on)
 {
 	uint64_t now = now_ns();
 	asked   *a = NULL;
@@ -1351,8 +1414,7 @@ static void ask_on(segment *s, unsigned from, const uint8_t *frame, const uint8_
 	} while (taken);
 	memcpy(sent, query, length);
 	put16(sent, id);
-	if (sendto(upstream, sent, length, MSG_DONTWAIT, (const struct sockaddr *)server,
-	           sizeof *server) != (ssize_t)length)
+	if (send_upstream(sent, length, server) != (ssize_t)length)
 		return;
 	memset(a, 0, sizeof *a);
 	a->used     = 1;
@@ -1378,26 +1440,42 @@ static void answered(void)
 	static uint8_t reply[65536];
 
 	for (;;) {
-		struct sockaddr_in from;
-		socklen_t          from_length = sizeof from;
-		ssize_t            n = recvfrom(upstream, reply, sizeof reply, MSG_DONTWAIT,
-		                                (struct sockaddr *)&from, &from_length);
-		uint64_t           now = now_ns();
-		asked             *a = NULL;
-		segment           *s;
-		uint32_t           network;
-		unsigned           prefix;
-		size_t             length;
+		struct sockaddr_storage from;
+		struct sockaddr_in6     sender = { .sin6_family = AF_INET6 };
+		socklen_t               from_length = sizeof from;
+		ssize_t                 n = recvfrom(upstream, reply, sizeof reply, MSG_DONTWAIT,
+		                                     (struct sockaddr *)&from, &from_length);
+		uint64_t                now = now_ns();
+		asked                  *a = NULL;
+		segment                *s;
+		uint32_t                network;
+		unsigned                prefix;
+		size_t                  length;
 
 		if (n < 0)
 			break;
 		if (n < 12)
 			continue;
+		/* Who sent it, as the question's server is held: IPv6, an IPv4
+		 * sender mapped. */
+		if (from.ss_family == AF_INET6) {
+			sender = *(const struct sockaddr_in6 *)&from;
+		} else if (from.ss_family == AF_INET) {
+			const struct sockaddr_in *v4 = (const struct sockaddr_in *)&from;
+
+			sender.sin6_addr.s6_addr[10] = 0xffu;
+			sender.sin6_addr.s6_addr[11] = 0xffu;
+			memcpy(&sender.sin6_addr.s6_addr[12], &v4->sin_addr, 4u);
+			sender.sin6_port = v4->sin_port;
+		} else {
+			continue;
+		}
 		for (unsigned i = 0u; i < MAX_ASKED && a == NULL; i++)
 			if (asking[i].used && asking[i].id == get16(reply) &&
 			    now - asking[i].at <= MAX_ASKED_NS &&
-			    asking[i].server.sin_addr.s_addr == from.sin_addr.s_addr &&
-			    asking[i].server.sin_port == from.sin_port)
+			    memcmp(&asking[i].server.sin6_addr, &sender.sin6_addr,
+			           sizeof sender.sin6_addr) == 0 &&
+			    asking[i].server.sin6_port == sender.sin6_port)
 				a = &asking[i];
 		if (a == NULL)
 			continue;
@@ -1477,7 +1555,7 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 		uint8_t            first[12];
 		const uint8_t     *query;
 		size_t             query_length;
-		struct sockaddr_in servers[3];
+		struct sockaddr_in6 servers[3];
 		unsigned           count = 0u;
 		situ_view_t        inner;
 		uint32_t           asker;
@@ -1535,7 +1613,7 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 		 * resolver to ask, from a socket opened for the first question;
 		 * otherwise refused, as before there was one. */
 		if (s->ports[from]->forwards && (count = resolvers(servers)) != 0u && upstream < 0) {
-			upstream = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+			open_upstream();
 			if (upstream < 0)
 				count = 0u;
 			else
@@ -1839,16 +1917,9 @@ void hull_segment_resolvers(const char *const *servers, const unsigned *ports, u
 {
 	pthread_mutex_lock(&lock);
 	resolvers_given_count = 0u;
-	for (unsigned i = 0u; i < count && i < 3u; i++) {
-		struct sockaddr_in *at = &resolvers_given[resolvers_given_count];
-
-		memset(at, 0, sizeof *at);
-		if (inet_pton(AF_INET, servers[i], &at->sin_addr) != 1)
-			continue;
-		at->sin_family = AF_INET;
-		at->sin_port   = htons((uint16_t)ports[i]);
-		resolvers_given_count++;
-	}
+	for (unsigned i = 0u; i < count && i < 3u; i++)
+		if (resolver_address(servers[i], ports[i], &resolvers_given[resolvers_given_count]))
+			resolvers_given_count++;
 	pthread_mutex_unlock(&lock);
 }
 

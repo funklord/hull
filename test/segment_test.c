@@ -1312,6 +1312,47 @@ int main(void)
 		check("a machine of (network none), refused",
 		      dns_reply(db, 20u, data, &length) == 5 &&
 		      asked_of(resolver, q, sizeof q, &from, 100) == 0u);
+		{
+			/* A host whose resolver is IPv6 alone, `nameserver ::1`: asked
+			 * on there, and its answer given back. */
+			struct sockaddr_in6 at6 = { .sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT };
+			struct sockaddr_in6 from6;
+			socklen_t           at6_length = sizeof at6;
+			int                 resolver6 = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+			unsigned            port6 = 0u;
+			const char         *server6 = "::1";
+
+			if (resolver6 >= 0 && bind(resolver6, (struct sockaddr *)&at6, sizeof at6) == 0 &&
+			    getsockname(resolver6, (struct sockaddr *)&at6, &at6_length) == 0) {
+				struct pollfd p = { resolver6, POLLIN, 0 };
+				socklen_t     from6_length = sizeof from6;
+				ssize_t       n = 0;
+
+				port6 = ntohs(at6.sin6_port);
+				hull_segment_resolvers(&server6, &port6, 1u);
+				send_dns(web, 10u, "example.com", 1u);
+				if (poll(&p, 1u, 1000) == 1)
+					n = recvfrom(resolver6, q, sizeof q, 0, (struct sockaddr *)&from6,
+					             &from6_length);
+				check("a name outside, asked on of an IPv6 resolver",
+				      n == 12 + 13 + 4 && memcmp(q + 12, "\7example\3com", 13u) == 0);
+				if (n > 0) {
+					uint8_t reply[600];
+
+					memcpy(reply, q, (size_t)n);
+					reply[2] = 0x81;
+					reply[3] = 0x83;   /* NXDOMAIN, as an answer of its own */
+					sendto(resolver6, reply, (size_t)n, 0, (struct sockaddr *)&from6,
+					       from6_length);
+				}
+				check("its answer, back from the IPv6 resolver",
+				      dns_reply(web, 10u, data, &length) == 3);
+			} else {
+				check("a resolver of the test's on ::1", 0);
+			}
+			if (resolver6 >= 0)
+				close(resolver6);
+		}
 		hull_segment_resolvers(NULL, NULL, 0u);
 		close(web);
 		close(db);
