@@ -1,0 +1,133 @@
+// An ISO9660 image's structures (ECMA-119), as engine/iso.c writes them:
+// the projector of a disc collection's data track (project.md section
+// 3.10), its files/ made the disc a DOS program reads. The layout -- which
+// sector holds what, and in what order -- is iso.c's; what each structure
+// is, byte for byte, is said here once, and iso.c only builds them.
+//
+// ECMA-119 writes most numbers twice, little-endian and then big-endian,
+// its "both-byte orders" (7.2.3, 7.3.3). Each is two fields here, the
+// second required equal to the first, so a builder handed two values that
+// differ refuses rather than writing a disc a reader on the other order
+// would read otherwise.
+
+target buffer;
+endian little;
+
+// 9.1, a directory's record of one of its entries. The identifier and its
+// pad to an even length are one run, sized by the record's own length:
+// iso.c pads it, and `id_length` says how much of it is the name.
+struct directory_record {
+	u8   length           [min = 34];
+	u8   extended_length  [must_eq = 0];
+	u32  extent           ;
+	u32  extent_big       [endian = big, must_eq = extent];
+	u32  size             ;
+	u32  size_big         [endian = big, must_eq = size];
+	u8   date[7];
+	u8   flags;
+	u8   unit_size        [must_eq = 0];
+	u8   gap_size         [must_eq = 0];
+	u16  volume_sequence  [must_eq = 1];
+	u16  volume_sequence_big [endian = big, must_eq = 1];
+	u8   id_length        [min = 1];
+	u8   id[length - 33];
+}
+
+// The root's record as the volume descriptor holds it (8.4.18): 34 bytes,
+// its identifier the one byte 0.
+struct root_record {
+	u8   length           [must_eq = 34];
+	u8   extended_length  [must_eq = 0];
+	u32  extent           ;
+	u32  extent_big       [endian = big, must_eq = extent];
+	u32  size             ;
+	u32  size_big         [endian = big, must_eq = size];
+	u8   date[7];
+	u8   flags            [must_eq = 2];
+	u8   unit_size        [must_eq = 0];
+	u8   gap_size         [must_eq = 0];
+	u16  volume_sequence  [must_eq = 1];
+	u16  volume_sequence_big [endian = big, must_eq = 1];
+	u8   id_length        [must_eq = 1];
+	u8   id               [must_eq = 0];
+}
+
+require size(root_record) == 34;
+
+// 8.4, the primary volume descriptor, sector 16. Its text fields are
+// a-characters padded with spaces, which iso.c writes; its dates are
+// 16 digits and an offset, 17 bytes each.
+struct primary_descriptor {
+	u8   type             [must_eq = 1];
+	u8   standard[5]      [must_eq = "CD001"];
+	u8   version          [must_eq = 1];
+	reserved u8           [must_be_zero];
+	u8   system_id[32];
+	u8   volume_id[32];
+	reserved u8[8]        [must_be_zero];
+	u32  space            ;
+	u32  space_big        [endian = big, must_eq = space];
+	reserved u8[32]       [must_be_zero];
+	u16  set_size         [must_eq = 1];
+	u16  set_size_big     [endian = big, must_eq = 1];
+	u16  sequence         [must_eq = 1];
+	u16  sequence_big     [endian = big, must_eq = 1];
+	u16  block_size       [must_eq = 2048];
+	u16  block_size_big   [endian = big, must_eq = 2048];
+	u32  path_table_size  ;
+	u32  path_table_size_big [endian = big, must_eq = path_table_size];
+	u32  l_path_table     ;
+	u32  l_optional       [must_eq = 0];
+	u32  m_path_table     [endian = big];
+	u32  m_optional       [endian = big, must_eq = 0];
+	root_record root;
+	u8   volume_set_id[128];
+	u8   publisher_id[128];
+	u8   preparer_id[128];
+	u8   application_id[128];
+	u8   copyright_file[37];
+	u8   abstract_file[37];
+	u8   bibliographic_file[37];
+	u8   created[17];
+	u8   modified[17];
+	u8   expires[17];
+	u8   effective[17];
+	u8   structure_version [must_eq = 1];
+	reserved u8           [must_be_zero];
+	u8   application_use[512];
+	reserved u8[653]      [must_be_zero];
+}
+
+require size(primary_descriptor) == 2048;
+require offset(primary_descriptor.root) == 156;
+require offset(primary_descriptor.created) == 813;
+
+// 8.3, the set's terminator, sector 17.
+struct terminator {
+	u8   type             [must_eq = 255];
+	u8   standard[5]      [must_eq = "CD001"];
+	u8   version          [must_eq = 1];
+	reserved u8[2041]     [must_be_zero];
+}
+
+require size(terminator) == 2048;
+
+// 9.4, an entry of the path table, little-endian (the L table) and big
+// (the M): a directory's identifier, extent and parent's number. The pad
+// to an even length after the identifier is iso.c's, a size computed
+// modulo 2 being one no builder can invert.
+struct path_entry {
+	u8   id_length        [min = 1];
+	u8   extended_length  [must_eq = 0];
+	u32  extent;
+	u16  parent           [min = 1];
+	u8   id[id_length];
+}
+
+struct path_entry_big [endian = big] {
+	u8   id_length        [min = 1];
+	u8   extended_length  [must_eq = 0];
+	u32  extent;
+	u16  parent           [min = 1];
+	u8   id[id_length];
+}

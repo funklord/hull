@@ -1,0 +1,118 @@
+# situ capability map v1
+# schema: disc.situ
+# core:   offset size align repr atomic
+#
+# Core axes are always shown. Any other axis appears only where it has
+# been weakened below its strongest value.
+#
+# Offsets are byte values, or byte:bit where a field does not start on
+# a byte boundary. Sizes are bytes unless suffixed with `bit`.
+#
+# A struct's size is a bare number where it is fixed, `min..max` where
+# it is bounded, and `min..` where nothing bounds it.
+
+struct directory_record size=34..255 mutate=Shifting repr=ValueConverted atomic=NonAtomic
+  directory_record.length                offset=AbsoluteStatic(0x00) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord
+  directory_record.extended_length       offset=AbsoluteStatic(0x01) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  directory_record.extent                offset=AbsoluteStatic(0x02) size=Fixed(4) align=Aligned(2) repr=ValueConverted atomic=NonAtomic
+  directory_record.extent_big            offset=AbsoluteStatic(0x06) size=Fixed(4) align=Aligned(2) repr=ValueConverted atomic=NonAtomic
+  directory_record.size                  offset=AbsoluteStatic(0x0A) size=Fixed(4) align=Aligned(2) repr=ValueConverted atomic=NonAtomic
+  directory_record.size_big              offset=AbsoluteStatic(0x0E) size=Fixed(4) align=Aligned(2) repr=ValueConverted atomic=NonAtomic
+  directory_record.date                  offset=AbsoluteStatic(0x12) size=Fixed(7) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
+  directory_record.flags                 offset=AbsoluteStatic(0x19) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  directory_record.unit_size             offset=AbsoluteStatic(0x1A) size=Fixed(1) align=Aligned(2) repr=MemoryIdentical atomic=AtomicWord
+  directory_record.gap_size              offset=AbsoluteStatic(0x1B) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  directory_record.volume_sequence       offset=AbsoluteStatic(0x1C) size=Fixed(2) align=Aligned(4) repr=ValueConverted atomic=AtomicWord
+  directory_record.volume_sequence_big   offset=AbsoluteStatic(0x1E) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord
+  directory_record.id_length             offset=AbsoluteStatic(0x20) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord
+  directory_record.id                    offset=AbsoluteStatic(0x21) size=Bounded(1, 222) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord mutate=Shifting
+
+struct path_entry size=9..263 mutate=Shifting repr=ValueConverted atomic=NonAtomic
+  path_entry.id_length                   offset=AbsoluteStatic(0x00) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord
+  path_entry.extended_length             offset=AbsoluteStatic(0x01) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  path_entry.extent                      offset=AbsoluteStatic(0x02) size=Fixed(4) align=Aligned(2) repr=ValueConverted atomic=NonAtomic
+  path_entry.parent                      offset=AbsoluteStatic(0x06) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord
+  path_entry.id                          offset=AbsoluteStatic(0x08) size=Bounded(1, 255) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord mutate=Shifting
+
+struct path_entry_big size=9..263 mutate=Shifting repr=ValueConverted atomic=NonAtomic
+  path_entry_big.id_length               offset=AbsoluteStatic(0x00) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord
+  path_entry_big.extended_length         offset=AbsoluteStatic(0x01) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  path_entry_big.extent                  offset=AbsoluteStatic(0x02) size=Fixed(4) align=Aligned(2) repr=ValueConverted atomic=NonAtomic
+  path_entry_big.parent                  offset=AbsoluteStatic(0x06) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord
+  path_entry_big.id                      offset=AbsoluteStatic(0x08) size=Bounded(1, 255) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord mutate=Shifting
+
+struct primary_descriptor size=2048 repr=ValueConverted atomic=NonAtomic
+  primary_descriptor.type                offset=AbsoluteStatic(0x00) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord
+  primary_descriptor.standard            offset=AbsoluteStatic(0x01) size=Fixed(5) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.version             offset=AbsoluteStatic(0x06) size=Fixed(1) align=Aligned(2) repr=MemoryIdentical atomic=AtomicWord
+  primary_descriptor.<reserved0>         offset=AbsoluteStatic(0x07) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  primary_descriptor.system_id           offset=AbsoluteStatic(0x08) size=Fixed(32) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.volume_id           offset=AbsoluteStatic(0x28) size=Fixed(32) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.<reserved1>         offset=AbsoluteStatic(0x48) size=Fixed(8) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.space               offset=AbsoluteStatic(0x50) size=Fixed(4) align=Aligned(8) repr=ValueConverted atomic=AtomicWord
+  primary_descriptor.space_big           offset=AbsoluteStatic(0x54) size=Fixed(4) align=Aligned(4) repr=ValueConverted atomic=AtomicWord
+  primary_descriptor.<reserved2>         offset=AbsoluteStatic(0x58) size=Fixed(32) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.set_size            offset=AbsoluteStatic(0x78) size=Fixed(2) align=Aligned(8) repr=ValueConverted atomic=AtomicWord
+  primary_descriptor.set_size_big        offset=AbsoluteStatic(0x7A) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord
+  primary_descriptor.sequence            offset=AbsoluteStatic(0x7C) size=Fixed(2) align=Aligned(4) repr=ValueConverted atomic=AtomicWord
+  primary_descriptor.sequence_big        offset=AbsoluteStatic(0x7E) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord
+  primary_descriptor.block_size          offset=AbsoluteStatic(0x80) size=Fixed(2) align=Aligned(8) repr=ValueConverted atomic=AtomicWord
+  primary_descriptor.block_size_big      offset=AbsoluteStatic(0x82) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord
+  primary_descriptor.path_table_size     offset=AbsoluteStatic(0x84) size=Fixed(4) align=Aligned(4) repr=ValueConverted atomic=AtomicWord
+  primary_descriptor.path_table_size_big offset=AbsoluteStatic(0x88) size=Fixed(4) align=Aligned(8) repr=ValueConverted atomic=AtomicWord
+  primary_descriptor.l_path_table        offset=AbsoluteStatic(0x8C) size=Fixed(4) align=Aligned(4) repr=ValueConverted atomic=AtomicWord
+  primary_descriptor.l_optional          offset=AbsoluteStatic(0x90) size=Fixed(4) align=Aligned(8) repr=ValueConverted atomic=AtomicWord
+  primary_descriptor.m_path_table        offset=AbsoluteStatic(0x94) size=Fixed(4) align=Aligned(4) repr=ValueConverted atomic=AtomicWord
+  primary_descriptor.m_optional          offset=AbsoluteStatic(0x98) size=Fixed(4) align=Aligned(8) repr=ValueConverted atomic=AtomicWord
+  primary_descriptor.root                offset=AbsoluteStatic(0x9C) size=Fixed(34) align=Aligned(4) repr=ValueConverted atomic=NonAtomic
+  primary_descriptor.root.length         offset=AbsoluteStatic(0x9C) size=Fixed(1) align=Aligned(4) repr=MemoryIdentical atomic=AtomicWord
+  primary_descriptor.root.extended_length offset=AbsoluteStatic(0x9D) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  primary_descriptor.root.extent         offset=AbsoluteStatic(0x9E) size=Fixed(4) align=Aligned(2) repr=ValueConverted atomic=NonAtomic
+  primary_descriptor.root.extent_big     offset=AbsoluteStatic(0xA2) size=Fixed(4) align=Aligned(2) repr=ValueConverted atomic=NonAtomic
+  primary_descriptor.root.size           offset=AbsoluteStatic(0xA6) size=Fixed(4) align=Aligned(2) repr=ValueConverted atomic=NonAtomic
+  primary_descriptor.root.size_big       offset=AbsoluteStatic(0xAA) size=Fixed(4) align=Aligned(2) repr=ValueConverted atomic=NonAtomic
+  primary_descriptor.root.date           offset=AbsoluteStatic(0xAE) size=Fixed(7) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.root.flags          offset=AbsoluteStatic(0xB5) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  primary_descriptor.root.unit_size      offset=AbsoluteStatic(0xB6) size=Fixed(1) align=Aligned(2) repr=MemoryIdentical atomic=AtomicWord
+  primary_descriptor.root.gap_size       offset=AbsoluteStatic(0xB7) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  primary_descriptor.root.volume_sequence offset=AbsoluteStatic(0xB8) size=Fixed(2) align=Aligned(8) repr=ValueConverted atomic=AtomicWord
+  primary_descriptor.root.volume_sequence_big offset=AbsoluteStatic(0xBA) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord
+  primary_descriptor.root.id_length      offset=AbsoluteStatic(0xBC) size=Fixed(1) align=Aligned(4) repr=MemoryIdentical atomic=AtomicWord
+  primary_descriptor.root.id             offset=AbsoluteStatic(0xBD) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  primary_descriptor.volume_set_id       offset=AbsoluteStatic(0xBE) size=Fixed(128) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.publisher_id        offset=AbsoluteStatic(0x13E) size=Fixed(128) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.preparer_id         offset=AbsoluteStatic(0x1BE) size=Fixed(128) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.application_id      offset=AbsoluteStatic(0x23E) size=Fixed(128) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.copyright_file      offset=AbsoluteStatic(0x2BE) size=Fixed(37) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.abstract_file       offset=AbsoluteStatic(0x2E3) size=Fixed(37) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.bibliographic_file  offset=AbsoluteStatic(0x308) size=Fixed(37) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.created             offset=AbsoluteStatic(0x32D) size=Fixed(17) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.modified            offset=AbsoluteStatic(0x33E) size=Fixed(17) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.expires             offset=AbsoluteStatic(0x34F) size=Fixed(17) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.effective           offset=AbsoluteStatic(0x360) size=Fixed(17) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.structure_version   offset=AbsoluteStatic(0x371) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  primary_descriptor.<reserved3>         offset=AbsoluteStatic(0x372) size=Fixed(1) align=Aligned(2) repr=MemoryIdentical atomic=AtomicWord
+  primary_descriptor.application_use     offset=AbsoluteStatic(0x373) size=Fixed(512) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
+  primary_descriptor.<reserved4>         offset=AbsoluteStatic(0x573) size=Fixed(653) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
+
+struct root_record size=34 repr=ValueConverted atomic=NonAtomic
+  root_record.length                     offset=AbsoluteStatic(0x00) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord
+  root_record.extended_length            offset=AbsoluteStatic(0x01) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  root_record.extent                     offset=AbsoluteStatic(0x02) size=Fixed(4) align=Aligned(2) repr=ValueConverted atomic=NonAtomic
+  root_record.extent_big                 offset=AbsoluteStatic(0x06) size=Fixed(4) align=Aligned(2) repr=ValueConverted atomic=NonAtomic
+  root_record.size                       offset=AbsoluteStatic(0x0A) size=Fixed(4) align=Aligned(2) repr=ValueConverted atomic=NonAtomic
+  root_record.size_big                   offset=AbsoluteStatic(0x0E) size=Fixed(4) align=Aligned(2) repr=ValueConverted atomic=NonAtomic
+  root_record.date                       offset=AbsoluteStatic(0x12) size=Fixed(7) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
+  root_record.flags                      offset=AbsoluteStatic(0x19) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  root_record.unit_size                  offset=AbsoluteStatic(0x1A) size=Fixed(1) align=Aligned(2) repr=MemoryIdentical atomic=AtomicWord
+  root_record.gap_size                   offset=AbsoluteStatic(0x1B) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  root_record.volume_sequence            offset=AbsoluteStatic(0x1C) size=Fixed(2) align=Aligned(4) repr=ValueConverted atomic=AtomicWord
+  root_record.volume_sequence_big        offset=AbsoluteStatic(0x1E) size=Fixed(2) align=Aligned(2) repr=ValueConverted atomic=AtomicWord
+  root_record.id_length                  offset=AbsoluteStatic(0x20) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord
+  root_record.id                         offset=AbsoluteStatic(0x21) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+
+struct terminator size=2048 atomic=NonAtomic
+  terminator.type                        offset=AbsoluteStatic(0x00) size=Fixed(1) align=Aligned(8) repr=MemoryIdentical atomic=AtomicWord
+  terminator.standard                    offset=AbsoluteStatic(0x01) size=Fixed(5) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
+  terminator.version                     offset=AbsoluteStatic(0x06) size=Fixed(1) align=Aligned(2) repr=MemoryIdentical atomic=AtomicWord
+  terminator.<reserved0>                 offset=AbsoluteStatic(0x07) size=Fixed(2041) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic

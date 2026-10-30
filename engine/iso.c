@@ -5,7 +5,10 @@
  * ECMA-119 at level 1, as a DOS-era disc is: sixteen empty system
  * sectors, the primary volume descriptor and its terminator, the path
  * table both ways round, every directory, then every file, each
- * contiguous. The tree is read breadth first with each directory's
+ * contiguous. What each structure is, byte for byte, is engine/disc.situ's,
+ * and its generated builders write them, refusing a value the schema
+ * does not allow -- a both-byte-orders pair that disagrees among them;
+ * where they sit is this file's. The tree is read breadth first with each directory's
  * entries sorted, which is the path table's own order, so a directory's
  * number is its place in that walk. Every date is 1980-01-01, so nothing
  * of the host's clock reaches the image.
@@ -24,6 +27,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "disc_build.h"
 #include "iso.h"
 
 #define SECTOR    2048u
@@ -59,21 +63,7 @@ static int fail(image *im, const char *what, const char *path)
 	return -1;
 }
 
-static void both16(uint8_t *at, uint32_t value)
-{
-	at[0] = (uint8_t)value;
-	at[1] = (uint8_t)(value >> 8);
-	at[2] = (uint8_t)(value >> 8);
-	at[3] = (uint8_t)value;
-}
-
-static void both32(uint8_t *at, uint32_t value)
-{
-	for (unsigned i = 0u; i < 4u; i++) {
-		at[i]     = (uint8_t)(value >> (8u * i));
-		at[7u - i] = (uint8_t)(value >> (8u * i));
-	}
-}
+static const uint8_t record_date[7] = { 80, 1, 1, 0, 0, 0, 0 };   /* 1980-01-01 */
 
 /* `name` as a level-1 identifier into `id`: 1 to 8 d-characters, then a
  * dot and at most 3 more for a file; capitals. 0 where it cannot be. */
@@ -191,29 +181,33 @@ static uint32_t record_length(size_t length)
 	return (uint32_t)(33u + length + ((33u + length) % 2u));
 }
 
-/* The bytes of `n`'s identifier as a record carries it. */
+/* The bytes of `n`'s identifier as a record carries it: a file's with
+ * its separator even where it has no extension, as 7.5.1 has it, ZERO.;1. */
 static size_t record_id(const node *n, char out[20])
 {
-	return (size_t)snprintf(out, 20, n->dir ? "%s" : "%s;1", n->id);
+	if (n->dir)
+		return (size_t)snprintf(out, 20, "%s", n->id);
+	return (size_t)snprintf(out, 20, strchr(n->id, '.') != NULL ? "%s;1" : "%s.;1", n->id);
 }
 
-/* A directory record into `at` for extent `extent` of `size` bytes. */
-static uint32_t put_record(uint8_t *at, uint32_t extent, uint32_t size, int dir, const char *id,
-                           size_t id_length)
+/* A directory record into `at`, which holds `cap`, for extent `extent`
+ * of `size` bytes, its identifier padded to an even length: the bytes it
+ * took, or 0 where the schema refused it. */
+static uint32_t put_record(uint8_t *at, uint32_t cap, uint32_t extent, uint32_t size, int dir,
+                           const char *id, size_t id_length)
 {
-	static const uint8_t date[7] = { 80, 1, 1, 0, 0, 0, 0 };   /* 1980-01-01 */
-	uint32_t             length = record_length(id_length);
+	uint8_t  padded[40] = { 0 };
+	uint32_t length = record_length(id_length);
+	uint32_t wrote = 0u;
 
-	memset(at, 0, length);
-	at[0] = (uint8_t)length;
-	both32(at + 2, extent);
-	both32(at + 10, size);
-	memcpy(at + 18, date, sizeof date);
-	at[25] = dir ? 2u : 0u;
-	both16(at + 28, 1u);
-	at[32] = (uint8_t)id_length;
-	memcpy(at + 33, id, id_length);
-	return length;
+	memcpy(padded, id, id_length);
+	if (length - 33u > sizeof padded ||
+	    hull_disc_directory_record_build(at, cap, 0u, extent, extent, size, size, record_date,
+	                                     dir ? 2u : 0u, 0u, 0u, 1u, 1u, (uint8_t)id_length,
+	                                     padded, length - 33u, &wrote) != SITU_OK ||
+	    wrote != length)
+		return 0u;
+	return wrote;
 }
 
 /* Directory `d`'s extent: its records packed, none across a sector. */
@@ -258,20 +252,25 @@ static int put_path_table(image *im, uint32_t table_bytes, int big)
 	for (unsigned i = 0u; i < im->count; i++) {
 		const node *d = &im->nodes[i];
 		size_t      length = i == 0u ? 1u : strlen(d->id);
-		uint8_t     entry[8u + 8u + 1u];
-		uint32_t    entry_length = (uint32_t)(8u + length + length % 2u);
+		uint8_t     entry[8u + 8u + 1u] = { 0 };
+		uint8_t     id[8] = { 0 };
+		uint32_t    entry_length;
 		uint32_t    parent = im->nodes[d->parent].number;
+		uint32_t    wrote = 0u;
+		situ_err_t  err;
 
 		if (!d->dir)
 			continue;
-		memset(entry, 0, sizeof entry);
-		entry[0] = (uint8_t)length;
-		for (unsigned b = 0u; b < 4u; b++)
-			entry[2u + b] = (uint8_t)(d->extent >> (8u * (big ? 3u - b : b)));
-		entry[6] = (uint8_t)(parent >> (big ? 8u : 0u));
-		entry[7] = (uint8_t)(parent >> (big ? 0u : 8u));
 		if (i != 0u)
-			memcpy(entry + 8, d->id, length);
+			memcpy(id, d->id, length);
+		err = big ? hull_disc_path_entry_big_build(entry, sizeof entry, 0u, d->extent,
+		                                           (uint16_t)parent, id, (uint32_t)length, &wrote) :
+		            hull_disc_path_entry_build(entry, sizeof entry, 0u, d->extent,
+		                                       (uint16_t)parent, id, (uint32_t)length, &wrote);
+		if (err != SITU_OK || wrote != 8u + length)
+			return fail(im, "a path table entry the schema refuses", d->path);
+		/* The pad to an even length, the schema's to leave to the writer. */
+		entry_length = wrote + (uint32_t)(length % 2u);
 		for (uint32_t b = 0u; b < entry_length; b++) {
 			im->sector[at++] = entry[b];
 			written++;
@@ -397,35 +396,47 @@ int hull_iso_write(const char *root, const char *volume, int fd, char *detail, s
 		if (put_sector(&im) != 0)
 			goto done;
 	{
-		/* The primary volume descriptor. */
+		/* The primary volume descriptor, then the set's terminator. */
 		static const char date[] = "1980010100000000";
-		uint8_t *p = im.sector;
+		uint8_t  root[34];
+		uint8_t  system_id[32];
+		uint8_t  volume_id[32];
+		uint8_t  long_id[128];
+		uint8_t  file_id[37];
+		uint8_t  made[17] = { 0 };
+		uint8_t  never[17] = { 0 };
+		uint8_t  application_use[512] = { 0 };
+		uint32_t wrote = 0u;
 
-		p[0] = 1u;
-		memcpy(p + 1, "CD001", 5u);
-		p[6] = 1u;
-		memset(p + 8, ' ', 32u);
-		memset(p + 40, ' ', 32u);
-		memcpy(p + 40, label, strlen(volume));
-		both32(p + 80, next);
-		both16(p + 120, 1u);
-		both16(p + 124, 1u);
-		both16(p + 128, SECTOR);
-		both32(p + 132, table_bytes);
-		for (unsigned b = 0u; b < 4u; b++) {
-			p[140u + b] = (uint8_t)(18u >> (8u * b));
-			p[148u + b] = (uint8_t)((18u + table_sectors) >> (8u * (3u - b)));
+		memset(system_id, ' ', sizeof system_id);
+		memset(volume_id, ' ', sizeof volume_id);
+		memset(long_id, ' ', sizeof long_id);
+		memset(file_id, ' ', sizeof file_id);
+		memcpy(volume_id, label, strlen(volume));
+		memcpy(made, date, 16u);
+		memset(never, '0', 16u);
+		if (hull_disc_root_record_build(root, sizeof root, 34u, 0u, im.nodes[0].extent,
+		                                im.nodes[0].extent, (uint32_t)im.nodes[0].size,
+		                                (uint32_t)im.nodes[0].size, record_date, 2u, 0u, 0u, 1u,
+		                                1u, 1u, 0u, &wrote) != SITU_OK ||
+		    hull_disc_primary_descriptor_build(im.sector, SECTOR, 1u, 1u, system_id, volume_id,
+		                                       next, next, 1u, 1u, 1u, 1u, SECTOR, SECTOR,
+		                                       table_bytes, table_bytes, 18u, 0u,
+		                                       18u + table_sectors, 0u, root, sizeof root,
+		                                       long_id, long_id, long_id, long_id, file_id,
+		                                       file_id, file_id, made, made, never, never, 1u,
+		                                       application_use, &wrote) != SITU_OK ||
+		    wrote != SECTOR) {
+			fail(&im, "the volume descriptor the schema refuses", NULL);
+			goto done;
 		}
-		put_record(p + 156, im.nodes[0].extent, (uint32_t)im.nodes[0].size, 1, "\0", 1u);
-		memset(p + 190, ' ', 128u * 4u + 37u * 3u);
-		for (unsigned d = 0u; d < 4u; d++)
-			memcpy(p + 813u + 17u * d, d < 2u ? date : "0000000000000000", 16u);
-		p[881] = 1u;
 		if (put_sector(&im) != 0)
 			goto done;
-		p[0] = 255u;
-		memcpy(p + 1, "CD001", 5u);
-		p[6] = 1u;
+		if (hull_disc_terminator_build(im.sector, SECTOR, 255u, 1u, &wrote) != SITU_OK ||
+		    wrote != SECTOR) {
+			fail(&im, "the terminator the schema refuses", NULL);
+			goto done;
+		}
 		if (put_sector(&im) != 0)
 			goto done;
 	}
@@ -439,8 +450,13 @@ int hull_iso_write(const char *root, const char *volume, int fd, char *detail, s
 
 		if (!d->dir)
 			continue;
-		at  = put_record(im.sector, d->extent, (uint32_t)d->size, 1, "\0", 1u);
-		at += put_record(im.sector + at, up->extent, (uint32_t)up->size, 1, "\1", 1u);
+		at  = put_record(im.sector, SECTOR, d->extent, (uint32_t)d->size, 1, "\0", 1u);
+		at += put_record(im.sector + at, SECTOR - at, up->extent, (uint32_t)up->size, 1, "\1",
+		                 1u);
+		if (at != 2u * 34u) {
+			fail(&im, "a directory record the schema refuses", d->path);
+			goto done;
+		}
 		for (unsigned k = 0u; k < d->count; k++) {
 			const node *c = &im.nodes[d->first + k];
 			char        id[20];
@@ -453,7 +469,12 @@ int hull_iso_write(const char *root, const char *volume, int fd, char *detail, s
 				written += SECTOR;
 				at = 0u;
 			}
-			at += put_record(im.sector + at, c->extent, (uint32_t)c->size, c->dir, id, length);
+			if ((record = put_record(im.sector + at, SECTOR - at, c->extent, (uint32_t)c->size,
+			                         c->dir, id, length)) == 0u) {
+				fail(&im, "a directory record the schema refuses", c->path);
+				goto done;
+			}
+			at += record;
 		}
 		if (put_sector(&im) != 0)
 			goto done;

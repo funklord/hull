@@ -97,6 +97,7 @@ PLAN_OBJS = $(BUILD_DIR)/plan/matrix.o $(BUILD_DIR)/plan/registry.o \
 ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/chroot.o $(BUILD_DIR)/engine/dos.o \
               $(BUILD_DIR)/engine/dosbox.o $(BUILD_DIR)/engine/dosemu.o $(BUILD_DIR)/engine/iso.o \
+              $(GEN_DIR)/disc.o \
               $(BUILD_DIR)/engine/access.o \
               $(BUILD_DIR)/engine/usage.o $(BUILD_DIR)/engine/sha256.o \
               $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/idmap.o \
@@ -118,6 +119,9 @@ FRONTEND_GEN = $(GEN_DIR)/frontend.c $(GEN_DIR)/frontend.h
 # The agent protocol (Appendix B), validated in both directions by the
 # same wire: the host reads the agent's messages, the agent the host's.
 PROTOCOL_GEN = $(GEN_DIR)/protocol.c $(GEN_DIR)/protocol.h
+# An ISO9660 image's structures, which engine/iso.c builds a disc's data
+# track from (section 3.10), from engine/disc.situ.
+DISC_GEN     = $(GEN_DIR)/disc.c $(GEN_DIR)/disc.h $(GEN_DIR)/disc_edit.h $(GEN_DIR)/disc_build.h
 WIRE_OBJS    = $(BUILD_DIR)/core/wire.o $(GEN_DIR)/frontend.o $(GEN_DIR)/protocol.o \
                $(BUILD_DIR)/agent/framing.o $(GEN_DIR)/message.o
 CORE_OBJS    = $(BUILD_DIR)/core/core.o $(BUILD_DIR)/core/segment.o $(WIRE_OBJS)
@@ -217,16 +221,18 @@ TEST_JSON_OBJS    = $(BUILD_DIR)/test/json_test.o
 TEST_RUNTIME_OBJS = $(BUILD_DIR)/test/runtime_test.o
 TEST_SEGMENT_OBJS = $(BUILD_DIR)/test/segment_test.o
 TEST_HOSTDEV_OBJS = $(BUILD_DIR)/test/hostdev_test.o
+TEST_ISO_OBJS     = $(BUILD_DIR)/test/iso_test.o
 TEST_OBJS = $(TEST_SEXPR_OBJS) $(TEST_FRAMING_OBJS) $(TEST_SPEC_OBJS) $(TEST_MATRIX_OBJS) \
             $(TEST_REGISTRY_OBJS) $(TEST_PLAN_OBJS) $(TEST_WIRE_OBJS) $(TEST_SHA256_OBJS) \
             $(TEST_TREE_OBJS) $(TEST_JSON_OBJS) $(TEST_RUNTIME_OBJS) $(TEST_SEGMENT_OBJS) \
-            $(TEST_HOSTDEV_OBJS)
+            $(TEST_HOSTDEV_OBJS) $(TEST_ISO_OBJS)
 TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
             $(BUILD_DIR)/test/spec_test $(BUILD_DIR)/test/matrix_test \
             $(BUILD_DIR)/test/registry_test $(BUILD_DIR)/test/plan_test \
             $(BUILD_DIR)/test/wire_test $(BUILD_DIR)/test/sha256_test \
             $(BUILD_DIR)/test/tree_tar $(BUILD_DIR)/test/json_test $(BUILD_DIR)/test/runtime_test \
-            $(BUILD_DIR)/test/segment_test $(BUILD_DIR)/test/hostdev_test
+            $(BUILD_DIR)/test/segment_test $(BUILD_DIR)/test/hostdev_test \
+            $(BUILD_DIR)/test/iso_test
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
@@ -278,6 +284,10 @@ $(PROTOCOL_GEN) &: agent/protocol.situ sexpr/canonical.situ $(SITU_COMPILER)
 	@mkdir -p '$(GEN_DIR)'
 	$(SITUC) build --target c --prefix hull_protocol --out '$(GEN_DIR)' agent/protocol.situ
 
+$(DISC_GEN) &: engine/disc.situ $(SITU_COMPILER)
+	@mkdir -p '$(GEN_DIR)'
+	$(SITUC) build --target c --layer edit --prefix hull_disc --out '$(GEN_DIR)' engine/disc.situ
+
 $(AGENT_GEN) &: agent/message.situ $(SITU_COMPILER)
 	@mkdir -p '$(GEN_DIR)'
 	$(SITUC) build --target c --layer frame --prefix hull_agent --out '$(GEN_DIR)' agent/message.situ
@@ -301,7 +311,7 @@ $(BUILD_DIR)/plan/%.o: plan/%.c | $(GEN_HEADERS)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/engine/%.o: engine/%.c | $(GEN_HEADERS) $(AGENT_GEN)
+$(BUILD_DIR)/engine/%.o: engine/%.c | $(GEN_HEADERS) $(AGENT_GEN) $(DISC_GEN)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
@@ -387,7 +397,7 @@ $(BUILD_DIR)/situ/situ.o: $(SITU_DIR)/runtime/c/situ.c
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/test/%.o: test/%.c | $(GEN_HEADERS) $(AGENT_GEN)
+$(BUILD_DIR)/test/%.o: test/%.c | $(GEN_HEADERS) $(AGENT_GEN) $(DISC_GEN)
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
@@ -430,6 +440,10 @@ $(BUILD_DIR)/test/segment_test: $(TEST_SEGMENT_OBJS) $(BUILD_DIR)/core/segment.o
 $(BUILD_DIR)/test/hostdev_test: $(TEST_HOSTDEV_OBJS) $(BUILD_DIR)/engine/hostdev.o
 	$(CC) $(CFLAGS) -o $@ $^ -pthread
 
+$(BUILD_DIR)/test/iso_test: $(TEST_ISO_OBJS) $(BUILD_DIR)/engine/iso.o $(GEN_DIR)/disc.o \
+                            $(BUILD_DIR)/situ/situ.o
+	$(CC) $(CFLAGS) -o $@ $^
+
 -include $(SEXPR_OBJS:.o=.d) $(AGENT_OBJS:.o=.d) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS:.o=.d) \
          $(ENGINE_OBJS:.o=.d) $(STORE_OBJS:.o=.d) $(OCI_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(CORE_OBJS:.o=.d) \
          $(TEST_OBJS:.o=.d) $(BUILD_DIR)/agent/agent.d
@@ -439,7 +453,7 @@ $(BUILD_DIR)/test/hostdev_test: $(TEST_HOSTDEV_OBJS) $(BUILD_DIR)/engine/hostdev
 # Appendices A and B and the core protocol (project.md section 4.10) as
 # situ describes them: schemas nothing is generated from yet, held to
 # their committed maps and to vectors of real bytes.
-DESCRIBED = manifest/manifest agent/protocol core/frontend
+DESCRIBED = manifest/manifest agent/protocol core/frontend engine/disc
 
 check: style contract test
 
@@ -459,6 +473,7 @@ test: $(TEST_BINS) $(HULL) $(PROBE) $(NSS_LIB) vectors
 	BUILD_DIR='$(BUILD_DIR)' $(BUILD_DIR)/test/runtime_test
 	$(BUILD_DIR)/test/segment_test
 	BUILD_DIR='$(BUILD_DIR)' $(BUILD_DIR)/test/hostdev_test
+	BUILD_DIR='$(BUILD_DIR)' $(BUILD_DIR)/test/iso_test
 	BUILD_DIR='$(BUILD_DIR)' sh test/tree_test.sh '$(BUILD_DIR)/test/tree_tar'
 	BUILD_DIR='$(BUILD_DIR)' sh test/cli_test.sh '$(HULL)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/nss_test.sh '$(HULL)' '$(NSS_LIB)'
@@ -520,6 +535,7 @@ contract: $(SITU_MARK)
 	$(SITUC) map --check manifest/manifest.situ
 	$(SITUC) map --check agent/protocol.situ
 	$(SITUC) map --check core/frontend.situ
+	$(SITUC) map --check engine/disc.situ
 
 hooks:
 	@if ! command -v git >/dev/null 2>&1; then \
@@ -542,7 +558,7 @@ clean:
 	        $(AGENT_OBJS) $(AGENT_OBJS:.o=.d) $(AGENT_GEN) \
 	        $(SPEC_OBJS) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS) $(PLAN_OBJS:.o=.d) \
 	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(STORE_OBJS) $(STORE_OBJS:.o=.d) $(OCI_OBJS) $(OCI_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) \
-	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) \
+	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) $(DISC_GEN) \
 	        $(AGENT_BIN) $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) \
 	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor
