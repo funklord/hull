@@ -853,10 +853,12 @@ rm -rf "${root:?}/vbase"
 mkdir -p "$root/vbase/bin" "$root/vbase/proc" "$root/vbase/dev" "$root/vbase/sys" \
 	"$root/vbase/tmp"
 cp "$probe" "$root/vbase/bin/sh"
-cat > "$root/vbuilt.conf" <<'BUILD'
+# Named for this run, so that the store a suite before it left does not
+# hand back both steps cached and the second never runs to look.
+cat > "$root/vbuilt.conf" <<BUILD
 (build (base "dir:./vbase")
-  (steps (step (name "give") (backend vm) (run "probe write /given chown /given 101"))
-         (step (name "look") (backend vm) (run "probe owner /given"))))
+  (steps (step (name "give-$$") (backend vm) (run "probe write /given chown /given 101"))
+         (step (name "look-$$") (backend vm) (run "probe owner /given"))))
 BUILD
 if [ "$vowned_owner" = '^owner=101:102 0[0-7]{3}$' ]; then
 	cases=$((cases + 1))
