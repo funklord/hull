@@ -316,6 +316,21 @@ cases=$((cases + 1))
 [ "$(cat "$root/inroot/usr/lib/landed" 2> /dev/null)" = extra ] && [ ! -e /usr/lib/landed ] ||
 	fail "a copy through the base's symlink to /usr/lib did not land in the tree's" \
 		"$(cd "$root/inroot" && find . | head)"
+# A base of another arch: its steps run as it, translated on chroot, and
+# what they make is stored as it, a step's programs being the base's.
+arm64_probe=${BUILD_DIR:?}/test/arm64/rootfs/probe
+if [ -x "$arm64_probe" ] && [ -x /usr/bin/qemu-aarch64 ]; then
+	mkdir -p "$root/armbase/bin" "$root/armbase/proc" "$root/armbase/dev"
+	cp "$arm64_probe" "$root/armbase/bin/sh"
+	cp "$arm64_probe" "$root/armbase/probe"
+	expect 0 '^armbase/1 sha256:' "$hull" commit --arch arm64 "$root/armbase" armbase/1
+	printf '(build (base "armbase/1") (steps (step (name "arm") (run "probe arch write /made"))))\n' \
+		> "$root/b/arm.conf"
+	expect 0 '^arch=aarch64$' "$hull" build -f "$root/b/arm.conf" app/arm
+	expect 0 '^\(manifest .*\(arch arm64\)|^  \(arch arm64\)' "$hull" manifest show app/arm
+else
+	echo "build: a base of another arch not measured: no arm64 probe or no qemu-aarch64"
+fi
 cases=$((cases + 1))
 [ -z "$(ls -A "$store/tmp")" ] || fail "a build left its scratch in tmp/" "$(ls "$store/tmp")"
 

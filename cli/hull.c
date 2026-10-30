@@ -114,7 +114,7 @@ static void usage(FILE *out)
 	      "       hull materialize REF DIR | hull images\n"
 	      "       hull diff REF REF | hull tag REF NEW | hull tag -d REF\n"
 	      "       hull manifest show REF | hull manifest compile [REF]\n"
-	      "       hull pull IMAGE [REF] | hull push REF IMAGE\n"
+	      "       hull pull [--arch A] IMAGE [REF] | hull push REF IMAGE\n"
 	      "       hull import DOCKERFILE|COMPOSE-FILE\n"
 	      "       hull up [-f COMPOSE-FILE] [--backend B] [NAME]\n"
 	      "       hull core\n"
@@ -655,6 +655,50 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 		add_text(&source, "\")");
 		if (!has_mutable)
 			add_text(&source, " (mutable overlay)");
+		/* A tree of a foreign arch is run as one: the machine takes its
+		 * manifest's arch where it names none, and naming another is
+		 * refused, a tree's programs being of the arch they were built
+		 * for whatever the machine says. */
+		{
+			char            tree_arch[64];
+			char            asked[64] = "";
+			hull_sexpr_form arch_entry;
+			hull_sexpr_form arch_head;
+			hull_sexpr_form arch_value;
+
+			if (hull_store_arch(&store, name, tree_arch, why, sizeof why) != 0) {
+				fprintf(stderr, "%s: %s: %s\n", file, name, why);
+				result = -1;
+				break;
+			}
+			if (strspn(tree_arch, "abcdefghijklmnopqrstuvwxyz0123456789_") != strlen(tree_arch)) {
+				fprintf(stderr, "%s: %s: its manifest's arch is not a name\n", file, name);
+				result = -1;
+				break;
+			}
+			if (hull_spec_find(&spec, &machines[i], "arch", &arch_entry) &&
+			    hull_sexpr_child(&spec.doc, &arch_entry, &arch_head) &&
+			    hull_sexpr_next(&spec.doc, &arch_head, &arch_value) &&
+			    arch_value.content_length < sizeof asked) {
+				memcpy(asked, spec.doc.data + arch_value.content, arch_value.content_length);
+				asked[arch_value.content_length] = '\0';
+				if (strcmp(asked, "host") == 0)
+					snprintf(asked, sizeof asked, "%s", host_arch());
+			}
+			if (strcmp(tree_arch, "none") != 0 && asked[0] != '\0' &&
+			    strcmp(asked, tree_arch) != 0) {
+				fprintf(stderr, "%s: %s is a tree of %s, and the machine says (arch %s)\n",
+				        file, name, tree_arch, asked);
+				result = -1;
+				break;
+			}
+			if (strcmp(tree_arch, "none") != 0 && asked[0] == '\0' &&
+			    strcmp(tree_arch, host_arch()) != 0) {
+				add_text(&source, " (arch ");
+				add_text(&source, tree_arch);
+				add_text(&source, ")");
+			}
+		}
 		/* A stored image's non-root owners, which the checkout flattened to
 		 * the user's, given back when the machine starts: its manifest
 		 * holds them, hull_store_owners lists each as uid, gid and path, and
@@ -2519,6 +2563,7 @@ static int build_file(options *o, const hull_registry *registry, const char *ref
 {
 	static char     first_pass[MAX_BUILD_STEPS][65];
 	char            base_hex[65];
+	char            build_arch[64];
 	unsigned        index = 0u;
 	int             pass = 0;
 	static uint8_t  canonical[HULL_PLAN_TEXT];
@@ -2584,6 +2629,22 @@ static int build_file(options *o, const hull_registry *registry, const char *ref
 	}
 	fprintf(stderr, "hull: build: base %s is sha256:%s\n", base, parent);
 	snprintf(base_hex, sizeof base_hex, "%s", parent);
+	/* The base's arch is the build's: each step runs as it, translated on
+	 * chroot where it is foreign (section 4.4), and each tree is stored as
+	 * it, a step's programs being the base's. */
+	{
+		char name[80];
+
+		snprintf(name, sizeof name, "sha256:%s", base_hex);
+		if (hull_store_arch(&store, name, build_arch, why, sizeof why) != 0)
+			goto done;
+		if (strcmp(build_arch, "none") == 0)
+			snprintf(build_arch, sizeof build_arch, "%s", host_arch());
+		if (strspn(build_arch, "abcdefghijklmnopqrstuvwxyz0123456789_") != strlen(build_arch)) {
+			snprintf(why, sizeof why, "the base's manifest's arch is not a name");
+			goto done;
+		}
+	}
 
 	/* With --check, Appendix E's test of a build: every step run twice
 	 * from the base, the cache read by neither, and each step's two
@@ -2843,6 +2904,11 @@ next_pass:
 				add_text(&conf, ") (hostname \"build-");
 				add_bytes(&conf, key_hex, 12u);
 				add_text(&conf, "\")");
+				if (strcmp(build_arch, host_arch()) != 0) {
+					add_text(&conf, " (arch ");
+					add_text(&conf, build_arch);
+					add_text(&conf, ")");
+				}
 				/* (network true) is the host's on chroot, and on a vm its
 				 * own; otherwise none. */
 				if (!network)
@@ -2972,7 +3038,7 @@ next_pass:
 				if (!provenance.failed && exported) {
 					int tar = open(tar_path, O_RDONLY | O_CLOEXEC);
 
-					ok = tar >= 0 && hull_store_commit_tar(&store, tar, host_arch(), cache, drop,
+					ok = tar >= 0 && hull_store_commit_tar(&store, tar, build_arch, cache, drop,
 					                                       &extra, &made, why, sizeof why) == 0;
 					if (tar < 0)
 						snprintf(why, sizeof why, "step %s: its tree was not exported: %s", name,
@@ -2981,7 +3047,7 @@ next_pass:
 						close(tar);
 				} else {
 					ok = !provenance.failed &&
-					     hull_store_commit(&store, root_path, host_arch(), cache, &extra, &made,
+					     hull_store_commit(&store, root_path, build_arch, cache, &extra, &made,
 					                       why, sizeof why) == 0;
 				}
 				if (ok) {
@@ -3236,14 +3302,18 @@ static int images(void)
 
 /* An image from its registry into the store, as `ref`, or as the image's
  * own name, so that a machine whose source is that name runs it. */
-static int pull(const char *name, const char *ref)
+/* `arch` is the platform an index is narrowed to, the host's where NULL:
+ * another's tree runs on chroot translated, taking its arch from the
+ * manifest (section 4.4). */
+static int pull(const char *name, const char *ref, const char *arch)
 {
 	hull_store  store;
 	hull_commit made;
 	char        why[4400] = "";
-	const char *arch = host_arch();
 	int         status;
 
+	if (arch == NULL)
+		arch = host_arch();
 	if (arch == NULL) {
 		fprintf(stderr, "hull: pull: the host's arch could not be read\n");
 		return 1;
@@ -4709,8 +4779,11 @@ int main(int argc, char **argv)
 		return tag(argv[2], argv[3]);
 	if (strcmp(command, "push") == 0 && argc == 4)
 		return push(argv[2], argv[3]);
+	if (strcmp(command, "pull") == 0 && argc >= 5 && strcmp(argv[2], "--arch") == 0 &&
+	    argc <= 6)
+		return pull(argv[4], argc == 6 ? argv[5] : argv[4], argv[3]);
 	if (strcmp(command, "pull") == 0 && (argc == 3 || argc == 4))
-		return pull(argv[2], argc == 4 ? argv[3] : argv[2]);
+		return pull(argv[2], argc == 4 ? argv[3] : argv[2], NULL);
 	if (strcmp(command, "manifest") == 0 && argc == 4 && strcmp(argv[2], "show") == 0)
 		return show_manifest(argv[3]);
 	if (strcmp(command, "manifest") == 0 && (argc == 3 || argc == 4) &&

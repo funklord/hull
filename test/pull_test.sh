@@ -382,6 +382,17 @@ expect 1 "a layer's path with \`.\` or \`..\` in it, refused" "$hull" pull "$bad
 expect 1 'a zstd layer, which hull does not yet read' "$hull" pull "$bad:zstd"
 expect 1 'linux/s390x, linux/ppc64le' "$hull" pull "$bad:elsewhere"
 expect 1 'the image is for s390x' "$hull" pull "$bad:foreign"
+# An image of another arch alone: refused by a plain pull, which narrows
+# to the host's, saying the one there is; fetched by --arch; and run as
+# that arch, a machine naming none taking the tree's and one naming
+# another refused.
+expect 1 'linux/riscv64' "$hull" pull "127.0.0.1:$port/test/other:1" other/host
+expect 0 '^other/1 sha256:[0-9a-f]{64}$' "$hull" pull --arch riscv64 "127.0.0.1:$port/test/other:1" other/1
+printf '(machine (source "other/1") (backend chroot) (command "/probe"))\n' > "$root/other.conf"
+expect 0 'arch\.riscv64: emulated' "$hull" plan -f "$root/other.conf"
+printf '(machine (source "other/1") (backend chroot) (arch host) (command "/probe"))\n' \
+	> "$root/otherhost.conf"
+expect 2 "other/1 is a tree of riscv64, and the machine says \\(arch $arch\\)" "$hull" plan -f "$root/otherhost.conf"
 expect 1 'its length is not the size the manifest gives' "$hull" pull "$bad:short"
 expect 1 'the manifest is not the digest that names it' "$hull" pull "$bad:lying"
 expect 1 'not found there' "$hull" pull "127.0.0.1:$port/test/image:nope"

@@ -1516,6 +1516,13 @@ if [ -x "$arm64_probe" ] && [ -x /usr/bin/qemu-aarch64 ]; then
 	! grep -q '^hull-aarch64$' /proc/sys/fs/binfmt_misc/* 2>/dev/null &&
 		[ ! -e /proc/sys/fs/binfmt_misc/hull-aarch64 ] ||
 		fail "arm64 on chroot: its emulator was registered outside the machine" ""
+	# The same tree stored as arm64 and run by its ref: the machine names
+	# no arch, and takes the manifest's.
+	expect 0 '^armtree/1 sha256:' "$hull" commit --arch arm64 "$root/../arm64/rootfs" armtree/1
+	printf '(machine (source "armtree/1") (backend chroot) (command "/probe" "arch"))\n' \
+		> "$root/armtree.conf"
+	limit=60
+	expect 0 '^arch=aarch64$' "$hull" run -f "$root/armtree.conf"
 else
 	echo "cli: arm64 on chroot not measured: no arm64 probe (aarch64-linux-gnu-gcc) or no qemu-aarch64"
 fi

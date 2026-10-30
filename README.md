@@ -499,6 +499,7 @@ on its own. When you want it:
 
 ```sh
 hull pull debian:13                  # any OCI registry, as the user
+hull pull --arch arm64 debian:13 deb-arm/13   # another arch's, run on chroot translated
 hull build -f build.conf app/1       # steps, each cached by what it was made from
 hull build --check -f build.conf app/1   # rebuild and compare: is it reproducible?
 hull push app/1 registry.example/app:1

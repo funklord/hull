@@ -112,6 +112,11 @@ void hull_store_release(int held);
 int hull_store_runtime(hull_store *store, const char *name, uint8_t **out, size_t *length,
                        char *why, size_t cap);
 
+/* The arch of the manifest `name` names, as A.2 records it (`amd64`,
+ * `arm64`), into `arch`; "none" where it records none. 0, or -1 with
+ * `why`. */
+int hull_store_arch(hull_store *store, const char *name, char arch[64], char *why, size_t cap);
+
 /* The tree `ref` names, a ref or sha256:HEX, made at `dir`, which must not
  * exist or be empty.
  * What the user cannot make rootless -- a device, another owner, a

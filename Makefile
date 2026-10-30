@@ -176,7 +176,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  natsaid.conf natplan.conf bridged.conf bridge2.conf brnamed.conf brnone.conf \
                  brports.conf brdocker.conf brserve.conf brserve.out brsshd.conf brssh/probe \
                  brssh/usr/sbin/sshd relay-resolv.conf fakedns.py ping.conf compose.yaml \
-                 noimage.yaml arm64.conf) \
+                 noimage.yaml arm64.conf armtree.conf) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
 # What test/docker_test.sh writes.

@@ -95,7 +95,7 @@ def build(root, probe, arch):
 				              for other in index] +
 				             ([{"mediaType": "application/vnd.oci.image.manifest.v1+json",
 				                "digest": name, "size": len(body),
-				                "platform": {"architecture": arch, "os": "linux"}}]
+				                "platform": {"architecture": config_arch, "os": "linux"}}]
 				              if include else [])}).encode()
 			put(top)
 		path = os.path.join(repos, repo, "tags")
@@ -181,6 +181,9 @@ def build(root, probe, arch):
 		with open(os.path.join(repos, repo, "tags", "1"), "wb") as f:
 			f.write(image)
 	manifest("test/bad", "foreign", [(gz, good)], config_arch="s390x")
+	# An image of another arch alone, which `hull pull --arch` fetches
+	# and a plain pull refuses: an index with that platform and no other.
+	manifest("test/other", "1", [(gz, good)], config_arch="riscv64", index=[])
 	# A layer longer than its manifest says.
 	manifest("test/bad", "short", [(gz, good, len(good) - 1)])
 	# An index whose manifest, fetched by its digest, is another manifest.

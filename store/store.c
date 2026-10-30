@@ -2562,3 +2562,27 @@ done:
 	free(data);
 	return result;
 }
+
+int hull_store_arch(hull_store *store, const char *name, char arch[64], char *why, size_t cap)
+{
+	char            hex[65];
+	uint8_t        *data;
+	size_t          size;
+	hull_sexpr_doc  doc;
+	hull_sexpr_form top;
+
+	flock(store->lock, LOCK_SH);
+	data = name_manifest(store, name, hex, why, cap) == 0 ?
+	       read_manifest(store, hex, &size, why, cap) : NULL;
+	flock(store->lock, LOCK_UN);
+	if (data == NULL)
+		return -1;
+	if (hull_sexpr_open(&doc, data, size, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
+	    !hull_sexpr_first(&doc, &top)) {
+		free(data);
+		return say(why, cap, name, "its manifest is not one");
+	}
+	field_text(&doc, &top, "arch", arch, 64u);
+	free(data);
+	return 0;
+}
