@@ -1477,14 +1477,14 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 				tcp_in(s, from, frame, ip, header, inner, network, prefix);
 			return 1;
 		}
-		/* A UDP sum of 0 is a datagram sent with none, which IPv4 allows. */
+		/* A UDP sum of 0 is a datagram sent with none, which IPv4 allows
+		 * and frame.situ's udp_checksum accepts. */
 		if (hull_frame_ipv4_header_protocol_get(view) != 17u ||
 		    hull_frame_udp_datagram_view(&msg, (uint32_t)(14u + header),
 		                                 (uint32_t)(datagram - header), &inner) != SITU_OK ||
 		    hull_frame_udp_datagram_validate(inner) != SITU_OK ||
 		    hull_frame_udp_datagram_destination_port_get(inner) != 53u ||
-		    (get16(hull_frame_udp_datagram_checksum_ptr(inner)) != 0u &&
-		     hull_frame_udp_datagram_checksum_check(inner, first, sizeof first) != SITU_OK))
+		    hull_frame_udp_datagram_checksum_check(inner, first, sizeof first) != SITU_OK)
 			return 1;
 		query        = hull_frame_udp_datagram_payload_ptr(inner);
 		query_length = hull_frame_udp_datagram_payload_len(inner);

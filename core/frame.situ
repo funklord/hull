@@ -11,7 +11,14 @@ codec internet_checksum {
 	kernel = ones_complement(width = 16, complement);
 }
 
+// UDP's own, RFC 768: a computed zero is sent as all ones, a zero in the
+// field meaning the sender computed none, which a stored zero is read as.
+codec udp_checksum {
+	kernel = ones_complement(width = 16, complement, zero_means_none);
+}
+
 impl internet_checksum derived;
+impl udp_checksum derived;
 
 target buffer;
 endian big;
@@ -86,15 +93,16 @@ struct pseudo_header {
 
 require size(pseudo_header) == 12;
 
-// A UDP datagram, RFC 768. A sum of 0 is a datagram sent with none, which
-// IPv4 allows: segment.c checks the sum only where one was sent.
+// A UDP datagram, RFC 768, its sum udp_checksum: a stored 0 is a datagram
+// sent with none, which IPv4 allows and the codec accepts, and a sum that
+// computes to 0 is written as all ones.
 struct udp_datagram {
 	authenticated summed {
 		u16  source_port;
 		u16  destination_port;
 		u16  length  [min = 8];
 		checksum u8 checksum[2] covers(summed) prefix(pseudo_header)
-			is internet_checksum [self_as = 0];
+			is udp_checksum [self_as = 0];
 		u8   payload[length - 8];
 	}
 }

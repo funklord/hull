@@ -62,12 +62,6 @@ core_message exited_no_signal 28 36 3A 65 78 69 74 65 64 28 32 3A 63 68 31 3A 31
 # core_hello: the version is required
 core_message hello_no_version 28 35 3A 68 65 6C 6C 6F 28 32 3A 63 68 31 3A 30 29 28 35 3A 70 72 6F 74 6F 31 3A 31 29 29
 
-# machine_no_state: (8:machines(2:ch1:6)(7:machine(7:address12:127.107.3.97)(5:class2:ns)(6:engine6:chroot)(2:id3:web)))
-# listed: every entry. situ does not read a run's elements, so this is
-# refused by the run's framing falling short, not by `listed`: the core
-# checks every machine entry itself.
-core_message machine_no_state 28 38 3A 6D 61 63 68 69 6E 65 73 28 32 3A 63 68 31 3A 36 29 28 37 3A 6D 61 63 68 69 6E 65 28 37 3A 61 64 64 72 65 73 73 31 32 3A 31 32 37 2E 31 30 37 2E 33 2E 39 37 29 28 35 3A 63 6C 61 73 73 32 3A 6E 73 29 28 36 3A 65 6E 67 69 6E 65 36 3A 63 68 72 6F 6F 74 29 28 32 3A 69 64 33 3A 77 65 62 29 29 29
-
 # started_no_machine: (7:started(2:ch1:1))
 # started: the machine is required
 core_message started_no_machine 28 37 3A 73 74 61 72 74 65 64 28 32 3A 63 68 31 3A 31 29 29

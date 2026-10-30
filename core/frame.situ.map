@@ -14,6 +14,7 @@
 # codecs. `trusted` means the properties are declared and
 # unverified: run `situc gen-codec-tests` to falsify a lying one.
 codec internet_checksum derived expansion=+2 seekable=linear granularity=block systematic deterministic
+codec udp_checksum derived expansion=+2 seekable=linear granularity=block systematic deterministic
 
 struct arp_packet size=28 repr=ValueConverted atomic=NonAtomic
   arp_packet.hardware_type               offset=AbsoluteStatic(0x00) size=Fixed(2) align=Aligned(8) repr=ValueConverted atomic=AtomicWord
