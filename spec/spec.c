@@ -651,6 +651,17 @@ static hull_spec_status segment_across(walk *w, const hull_sexpr_form *record,
 	return HULL_SPEC_ERR_SHAPE;
 }
 
+/* J.1: (ready (command "pg_isready") (interval 1s) (timeout 1m)), what
+ * says a machine is ready for those started after it: the command, run
+ * in it every interval from its start until it exits 0, for at most the
+ * timeout. */
+static const key ready_keys[] = {
+	{ .name = "command",  .type = STRINGS, .required = 1, .nonempty = 1 },
+	{ .name = "interval", .type = STRING, .value = duration },
+	{ .name = "timeout",  .type = STRING, .value = duration },
+};
+static const schema ready = TABLE(ready_keys);
+
 /* J.1 */
 static const key machine_keys[] = {
 	{ .name = "source",        .type = STRING, .required = 1, .value = nonempty },
@@ -687,6 +698,8 @@ static const key machine_keys[] = {
 	{ .name = "tuning",        .type = RECORD, .record = &tuning },
 	{ .name = "bridge",        .type = STRING, .value = interface },
 	{ .name = "devices",       .type = RECORD, .record = &devices },
+	{ .name = "after",         .type = SYMBOLS, .nonempty = 1, .value = label },
+	{ .name = "ready",         .type = RECORD, .record = &ready },
 };
 static hull_spec_status machine_across(walk *w, const hull_sexpr_form *record,
                                        const hull_sexpr_form *found, uint64_t present);
@@ -1182,13 +1195,126 @@ static hull_spec_status step_across(walk *w, const hull_sexpr_form *record,
 	return HULL_SPEC_ERR_VALUE;
 }
 
+/* The most machines a file's start order is checked over; more than a
+ * run takes (HULL_NAMES_MEMBERS), so a file a run refuses is not
+ * refused here first. */
+#define ORDER_MACHINES 512u
+
+/* The value of a machine's `key` entry, its head's first sibling, or 0. */
+static int machine_entry(const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
+                         const char *key, hull_sexpr_form *entry)
+{
+	hull_sexpr_form item;
+	hull_sexpr_form head;
+	int             more = hull_sexpr_child(doc, machine, &item) &&
+	                       hull_sexpr_next(doc, &item, &item);
+
+	for (; more; more = hull_sexpr_next(doc, &item, &item))
+		if (item.kind == HULL_SEXPR_LIST && hull_sexpr_child(doc, &item, &head) &&
+		    hull_sexpr_is(doc, &head, key)) {
+			*entry = item;
+			return 1;
+		}
+	return 0;
+}
+
+/* (after NAME ...) names siblings in (machines ...), none itself, and no
+ * machine waits on itself through others: such a file could start none of
+ * them. Kahn's order: what waits on nothing left starts, until nothing
+ * does; any left over wait in a ring. */
+static hull_spec_status order_across(walk *w, const hull_sexpr_form *machines)
+{
+	static hull_sexpr_form names[ORDER_MACHINES];
+	static hull_sexpr_form afters[ORDER_MACHINES];
+	static uint8_t         has_after[ORDER_MACHINES];
+	static uint8_t         started[ORDER_MACHINES];
+	hull_sexpr_form        machine;
+	hull_sexpr_form        value;
+	unsigned               count = 0u;
+	unsigned               left;
+	int                    more;
+	size_t                 saved;
+
+	hull_sexpr_child(w->doc, machines, &machine);
+	for (more = hull_sexpr_next(w->doc, &machine, &machine); more && count < ORDER_MACHINES;
+	     more = hull_sexpr_next(w->doc, &machine, &machine)) {
+		hull_sexpr_child(w->doc, &machine, &names[count]);
+		has_after[count] = (uint8_t)machine_entry(w->doc, &machine, "after", &afters[count]);
+		started[count] = 0u;
+		count++;
+	}
+	for (unsigned i = 0u; i < count; i++) {
+		if (!has_after[i])
+			continue;
+		hull_sexpr_child(w->doc, &afters[i], &value);
+		while (hull_sexpr_next(w->doc, &value, &value)) {
+			const char *why = NULL;
+			unsigned    j;
+
+			for (j = 0u; j < count && !same_name(w->doc, &names[j], &value); j++)
+				;
+			if (j == count)
+				why = "is not a machine of this file";
+			else if (j == i)
+				why = "is this machine: it cannot start after itself";
+			if (why != NULL) {
+				saved = push_text(w, "machines");
+				push_form(w, &names[i]);
+				push_text(w, "after");
+				fail(w, HULL_SPEC_ERR_VALUE, value.offset, why);
+				pop(w, saved);
+				return HULL_SPEC_ERR_VALUE;
+			}
+		}
+	}
+	for (left = count; left > 0u;) {
+		unsigned now = 0u;
+
+		for (unsigned i = 0u; i < count; i++) {
+			int waits = 0;
+
+			if (started[i])
+				continue;
+			if (has_after[i]) {
+				hull_sexpr_child(w->doc, &afters[i], &value);
+				while (!waits && hull_sexpr_next(w->doc, &value, &value))
+					for (unsigned j = 0u; j < count; j++)
+						if (same_name(w->doc, &names[j], &value) && !started[j])
+							waits = 1;
+			}
+			if (!waits) {
+				started[i] = 1u;
+				now++;
+			}
+		}
+		if (now == 0u)
+			break;
+		left -= now;
+	}
+	if (left == 0u)
+		return HULL_SPEC_OK;
+	for (unsigned i = 0u; i < count; i++)
+		if (!started[i]) {
+			saved = push_text(w, "machines");
+			push_form(w, &names[i]);
+			push_text(w, "after");
+			fail(w, HULL_SPEC_ERR_VALUE, afters[i].offset,
+			     "waits on a machine that waits on it: none of them could start");
+			pop(w, saved);
+			break;
+		}
+	return HULL_SPEC_ERR_VALUE;
+}
+
 static hull_spec_status file_across(walk *w, const hull_sexpr_form *record,
                                     const hull_sexpr_form *found, uint64_t present)
 {
+	hull_sexpr_form entry;
+	size_t          saved;
+
 	(void)record;
 	if ((present & ((uint64_t)1 << FILE_MACHINE)) && (present & ((uint64_t)1 << FILE_MACHINES))) {
-		size_t saved = push_text(w, "machines");
-
+		saved = push_text(w, "machines");
 		fail(w, HULL_SPEC_ERR_SHAPE, found[FILE_MACHINES].offset,
 		     "cannot stand beside machine: a file holds one or the other");
 		pop(w, saved);
@@ -1196,6 +1322,24 @@ static hull_spec_status file_across(walk *w, const hull_sexpr_form *record,
 	}
 	if (present == 0u)
 		return fail(w, HULL_SPEC_ERR_MISSING, 0u, "a file holds machine, machines or build");
+	/* A lone machine has no sibling to start after, nor one to be ready
+	 * for. */
+	if (present & ((uint64_t)1 << FILE_MACHINE)) {
+		static const char *const keys[] = { "after", "ready" };
+
+		for (unsigned i = 0u; i < 2u; i++)
+			if (machine_entry(w->doc, &found[FILE_MACHINE], keys[i], &entry)) {
+				saved = push_text(w, "machine");
+				push_text(w, keys[i]);
+				fail(w, HULL_SPEC_ERR_SHAPE, entry.offset,
+				     "orders the machines of a (machines ...) file, and a lone machine has no "
+				     "others");
+				pop(w, saved);
+				return HULL_SPEC_ERR_SHAPE;
+			}
+	}
+	if (present & ((uint64_t)1 << FILE_MACHINES))
+		return order_across(w, &found[FILE_MACHINES]);
 	return HULL_SPEC_OK;
 }
 

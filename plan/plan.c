@@ -292,6 +292,12 @@ static void write_machine(writer *w, const char *projection)
 		hull_sexpr_child(&w->spec->doc, &entry, &key);
 		if (hull_sexpr_is(&w->spec->doc, &key, "projection")) {
 			projection_at = entry.offset;
+		} else if (hull_sexpr_is(&w->spec->doc, &key, "after") ||
+		           hull_sexpr_is(&w->spec->doc, &key, "ready")) {
+			/* The order a file's run starts its machines in, not the
+			 * machine's: no engine reads them, and a plan is one
+			 * machine, which has no others to start after. */
+			continue;
 		} else if (hull_sexpr_is(&w->spec->doc, &key, "security")) {
 			put_record(w, &entry, security_defaults, COUNT(security_defaults));
 		} else if (hull_sexpr_is(&w->spec->doc, &key, "ports")) {

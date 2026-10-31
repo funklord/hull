@@ -1194,6 +1194,13 @@ int main(int argc, char **argv)
 				printf("\n");
 			}
 			i++;
+		} else if (strcmp(step, "present") == 0) {
+			/* A ready command's: on while the file is there, else 1. */
+			if (access(arg, F_OK) != 0) {
+				printf("absent=%s\n", arg);
+				return 1;
+			}
+			i++;
 		} else if (strcmp(step, "kind") == 0) {
 			struct stat file;
 

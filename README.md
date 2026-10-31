@@ -474,6 +474,7 @@ from a directory and scripted like any other machine.
 | speed, a build step, a test of user-space code | chroot |
 | your own kernel, modules, sysctls, netns, an init system | vm |
 | several machines on a wire of their own | chroot or vm, with `(segments …)`, mixed freely |
+| a test that waits for its server to be up | `(after server)` on it, `(ready (command …))` on the server |
 | the same, on a host with no KVM | emu |
 | software written for DOS | dos |
 | exactly what docker gives, on a host that has it | docker |
@@ -524,7 +525,8 @@ hull gc
 it could not translate. `hull up` runs a compose file in place, with no
 conversion step: it reads `compose.yaml` or `docker-compose.yml` from the
 directory, puts each network's services on a segment where they find each
-other by name, and says on stderr what it left out.
+other by name, starts each once what it `depends_on` is up -- healthy,
+where a healthcheck says so -- and says on stderr what it left out.
 
 A machine whose source names a stored tree runs it, taking the image's
 command, workdir and environment where the machine gives none of its own.

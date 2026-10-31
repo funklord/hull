@@ -501,8 +501,9 @@ static int import_dockerfile(FILE *file)
 
 /* A docker-compose.yml to a (machines ...) file (section 9, J.7). Only a
  * common block subset of YAML is read; what it cannot map onto hull's model
- * it says in a `;` comment. Section 4.8 plans a file's machines at once with
- * no ordering, so depends_on is noted, not invented. A network is a segment
+ * it says in a `;` comment. depends_on is (after ...), and a healthcheck
+ * (ready ...), so a service starts once those it depends on are up, as
+ * under compose. A network is a segment
  * (Appendix D) named PROJECT-NETWORK, as compose names it PROJECT_NETWORK
  * but for the `_` a segment's name cannot hold, and addressed, so that its
  * services find each other by name as they do under compose: a service
@@ -527,6 +528,19 @@ typedef struct svc {
 	int  net_count;
 	int  net_indent;       /* where a networks map's names are, or -1 */
 	char net_current[64];  /* the networks map's name being read */
+	sb   after;            /* depends_on, as machine names */
+	int  dep_indent;       /* where a depends_on map's names are, or -1 */
+	char dep_current[64];  /* the depends_on map's name being read */
+	int  health_given;     /* a healthcheck test said */
+	int  health_off;       /* disable: true, or a test of NONE */
+	int  health_shell;     /* the test is a shell line */
+	char test[16][256];    /* the test's words, CMD's or the line */
+	int  test_count;
+	int  in_test;          /* a block list of the test's words follows */
+	long interval_ms;      /* compose's own, or -1 for its default */
+	long timeout_ms;
+	long retries;
+	long start_ms;
 } svc;
 
 /* The networks a file's services are on, in the order first met, each
@@ -687,10 +701,6 @@ static int flow_list(char *s, char **args, int max)
 	}
 }
 
-/* A file's machines start together, with no order among them (section
- * 4.8). */
-#define DEPENDS_NOTE  "depends_on not translated, its machines start together"
-
 static void svc_note(svc *s, const char *why, const char *text)
 {
 	if (warnings != NULL)
@@ -793,12 +803,82 @@ static void compose_volume(svc *s, char *spec)
 
 static void svc_reset(svc *s)
 {
+	free(s->after.data);
 	free(s->command.data);
 	free(s->env.data);
 	free(s->ports.data);
 	free(s->volumes.data);
 	free(s->notes.data);
 	memset(s, 0, sizeof *s);
+	s->dep_indent  = -1;
+	s->interval_ms = -1;
+	s->timeout_ms  = -1;
+	s->retries     = -1;
+	s->start_ms    = -1;
+}
+
+/* A compose duration, `1m30s` or `500ms`, in milliseconds; -1 where it is
+ * not one. */
+static long compose_ms(const char *text)
+{
+	static const struct { const char *unit; long ms; } units[] = {
+		{ "ms", 1 }, { "us", 0 }, { "ns", 0 }, { "h", 3600000 }, { "m", 60000 }, { "s", 1000 },
+	};
+	long total = 0;
+
+	if (*text == '\0')
+		return -1;
+	while (*text != '\0') {
+		char  *end;
+		double n = strtod(text, &end);
+		size_t i;
+
+		if (end == text)
+			return -1;
+		for (i = 0u; i < sizeof units / sizeof units[0]; i++)
+			if (strncmp(end, units[i].unit, strlen(units[i].unit)) == 0)
+				break;
+		if (i == sizeof units / sizeof units[0])
+			return -1;
+		total += (long)(n * (double)units[i].ms);
+		text = end + strlen(units[i].unit);
+	}
+	return total;
+}
+
+/* depends_on's `name`, as the machine it became. */
+static void svc_after(svc *s, const char *name)
+{
+	char label[64];
+
+	as_label(label, sizeof label, name);
+	sb_str(&s->after, " ");
+	sb_str(&s->after, label);
+}
+
+/* A healthcheck's test: a flow list, a block list's first word, or a line. */
+static void svc_test_word(svc *s, const char *word)
+{
+	if (s->test_count == 0) {
+		s->health_given = 1;
+		if (strcmp(word, "NONE") == 0) {
+			s->health_off = 1;
+			return;
+		}
+		if (strcmp(word, "CMD-SHELL") == 0) {
+			s->health_shell = 1;
+			s->test_count = -1;  /* the word is no word of the command */
+		} else if (strcmp(word, "CMD") == 0) {
+			s->test_count = -1;
+		}
+		if (s->test_count == -1) {
+			s->test_count = 0;
+			s->in_test = 2;      /* the marker is read; words follow */
+			return;
+		}
+	}
+	if (s->test_count < 16)
+		snprintf(s->test[s->test_count++], sizeof s->test[0], "%s", word);
 }
 
 /* The buffered service, as a (name ...) machine, its closing paren on its
@@ -899,6 +979,36 @@ static void svc_flush(svc *s, sb *out)
 		sb_str(out, " (restart ");
 		sb_str(out, s->restart);
 		sb_str(out, ")");
+	}
+	if (s->after.len > 0u) {
+		sb_str(out, " (after");
+		sb_add(out, s->after.data, s->after.len);
+		sb_str(out, ")");
+	}
+	/* A healthcheck as (ready ...): its test the command, its interval
+	 * the interval, and the longest compose waits before calling the
+	 * service unhealthy the timeout -- start_period, then retries checks
+	 * each of an interval and at most a timeout. compose's defaults: 30s,
+	 * 30s, 3 and 0. */
+	if (s->health_given && !s->health_off && s->test_count > 0) {
+		long interval = s->interval_ms >= 0 ? s->interval_ms : 30000;
+		long each     = s->timeout_ms >= 0 ? s->timeout_ms : 30000;
+		long retries  = s->retries >= 0 ? s->retries : 3;
+		long start    = s->start_ms >= 0 ? s->start_ms : 0;
+		long total    = start + retries * (interval + each);
+		char text[64];
+
+		sb_str(out, " (ready (command");
+		if (s->health_shell)
+			sb_str(out, " \"/bin/sh\" \"-c\"");
+		for (int i = 0; i < s->test_count; i++) {
+			sb_str(out, " ");
+			sb_quoted(out, s->test[i]);
+		}
+		snprintf(text, sizeof text, ") (interval \"%lds\") (timeout \"%lds\"))",
+		         interval < 1000 ? 1 : (interval + 999) / 1000,
+		         total < 1000 ? 1 : (total + 999) / 1000);
+		sb_str(out, text);
 	}
 	sb_add(out, s->notes.data ? s->notes.data : "", s->notes.len);
 	sb_str(out, "\n  )");
@@ -1183,7 +1293,12 @@ static char *compose_text(FILE *file, const char *project)
 				*colon = '\0';
 			snprintf(s.name, sizeof s.name, "%s", trim(content));
 			s.open = 1;
-			s.net_indent = -1;
+			s.net_indent  = -1;
+			s.dep_indent  = -1;
+			s.interval_ms = -1;
+			s.timeout_ms  = -1;
+			s.retries     = -1;
+			s.start_ms    = -1;
 			any = 1;
 			field_indent = -1;
 			field[0] = '\0';
@@ -1206,7 +1321,9 @@ static char *compose_text(FILE *file, const char *project)
 			} else if (strcmp(field, "networks") == 0)
 				svc_join(&s, scalar(item));
 			else if (strcmp(field, "depends_on") == 0)
-				svc_note(&s, DEPENDS_NOTE, scalar(item));
+				svc_after(&s, scalar(item));
+			else if (strcmp(field, "healthcheck") == 0 && s.in_test)
+				svc_test_word(&s, scalar(item));
 			continue;
 		}
 		if (field_indent < 0)
@@ -1231,6 +1348,76 @@ static char *compose_text(FILE *file, const char *project)
 
 					snprintf(why, sizeof why, "network %s: %s not translated", s.net_current,
 					         trim(content));
+					svc_note(&s, why, NULL);
+				}
+			} else if (strcmp(field, "depends_on") == 0) {
+				/* A depends_on map: each name, and under it its
+				 * condition, which (after ...) is but for one. */
+				char *at = strchr(content, ':');
+				char *option = at != NULL ? scalar(at + 1) : "";
+
+				if (at != NULL)
+					*at = '\0';
+				if (s.dep_indent < 0)
+					s.dep_indent = ind;
+				if (ind == s.dep_indent) {
+					svc_after(&s, trim(content));
+					snprintf(s.dep_current, sizeof s.dep_current, "%s", trim(content));
+				} else if (strcmp(trim(content), "condition") == 0 &&
+				           strcmp(option, "service_completed_successfully") == 0) {
+					char why[200];
+
+					snprintf(why, sizeof why, "depends_on %s: service_completed_successfully "
+					         "not translated, its start waited for instead", s.dep_current);
+					svc_note(&s, why, NULL);
+				} else if (strcmp(trim(content), "condition") != 0 &&
+				           !(strcmp(trim(content), "required") == 0 &&
+				             strcmp(option, "true") == 0)) {
+					char why[200];
+
+					snprintf(why, sizeof why, "depends_on %s: %s not translated", s.dep_current,
+					         trim(content));
+					svc_note(&s, why, NULL);
+				}
+			} else if (strcmp(field, "healthcheck") == 0) {
+				char *at = strchr(content, ':');
+				char *value_text;
+				char *words[16];
+				int   n;
+
+				if (at == NULL)
+					continue;
+				*at = '\0';
+				value_text = trim(at + 1);
+				s.in_test = 0;
+				if (strcmp(trim(content), "test") == 0) {
+					if (*value_text == '\0') {
+						s.in_test = 1;
+					} else if ((n = flow_list(value_text, words, 16)) >= 0) {
+						s.in_test = 1;
+						for (int i = 0; i < n; i++)
+							svc_test_word(&s, words[i]);
+						s.in_test = 0;
+					} else {
+						s.health_given = 1;
+						s.health_shell = 1;
+						s.test_count   = 1;
+						snprintf(s.test[0], sizeof s.test[0], "%s", scalar(value_text));
+					}
+				} else if (strcmp(trim(content), "disable") == 0) {
+					s.health_off = strcmp(scalar(value_text), "true") == 0;
+				} else if (strcmp(trim(content), "interval") == 0) {
+					s.interval_ms = compose_ms(scalar(value_text));
+				} else if (strcmp(trim(content), "timeout") == 0) {
+					s.timeout_ms = compose_ms(scalar(value_text));
+				} else if (strcmp(trim(content), "start_period") == 0) {
+					s.start_ms = compose_ms(scalar(value_text));
+				} else if (strcmp(trim(content), "retries") == 0) {
+					s.retries = strtol(scalar(value_text), NULL, 10);
+				} else {
+					char why[200];
+
+					snprintf(why, sizeof why, "healthcheck %s not translated", trim(content));
 					svc_note(&s, why, NULL);
 				}
 			}
@@ -1300,8 +1487,16 @@ static char *compose_text(FILE *file, const char *project)
 				svc_join(&s, items[i]);
 			if (n < 0)
 				svc_note(&s, "networks not translated", scalar(value));
-		} else if (strcmp(key, "depends_on") == 0)
-			svc_note(&s, DEPENDS_NOTE, scalar(value));
+		} else if (strcmp(key, "depends_on") == 0) {
+			char *items[64];
+			int   n = flow_list(value, items, 64);
+
+			for (int i = 0; i < n; i++)
+				svc_after(&s, items[i]);
+			if (n < 0)
+				svc_note(&s, "depends_on not translated", scalar(value));
+		} else if (strcmp(key, "healthcheck") == 0)
+			svc_note(&s, "healthcheck not translated", "a flow map; write it as a block");
 		else if (strcmp(key, "user") == 0)
 			svc_note(&s, "user not translated", scalar(value));
 		else if (strcmp(key, "network_mode") == 0) {

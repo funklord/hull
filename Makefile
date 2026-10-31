@@ -178,7 +178,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  brssh/usr/sbin/sshd relay-resolv.conf fakedns.py ping.conf compose.yaml \
                  noimage.yaml arm64.conf armtree.conf dual.conf only6.conf advert.conf \
                  gateway.conf gwlisten.out gateway6.conf hello.py replhold.conf \
-                 ownroot.conf natports.bind) \
+                 ownroot.conf natports.bind ordered.conf unready.conf ordergone.conf orderdata/up orderdata/composed) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
 # What test/docker_test.sh writes.

@@ -98,6 +98,26 @@ static void test_file(void)
 	NO("(machine (source \"a\")) (machines (web (source \"b\")))", SHAPE,
 	   "(machines", "machines");
 	NO("(machines)", SHAPE, "(machines", "machines");
+	/* Start order: (after ...) names siblings, none itself, in no ring;
+	 * (ready ...) is a command, its interval and timeout durations; and
+	 * neither is a lone machine's, which has no others to order. */
+	OK("(machines (web (source \"a\") (after db cache)) (db (source \"b\")"
+	   " (ready (command \"pg_isready\") (interval \"2s\") (timeout \"1m\")))"
+	   " (cache (source \"c\") (after db)))");
+	NO("(machines (web (source \"a\") (after dbx)) (db (source \"b\")))", VALUE, "dbx",
+	   "machines.web.after");
+	NO("(machines (web (source \"a\") (after web)))", VALUE, "web)", "machines.web.after");
+	NO("(machines (a (source \"a\") (after c)) (b (source \"b\") (after a))"
+	   " (c (source \"c\") (after b)) (d (source \"d\")))", VALUE, "(after c", "machines.a.after");
+	NO("(machines (web (source \"a\") (after)))", SHAPE, "(after", "machines.web.after");
+	NO("(machines (web (source \"a\") (after \"db\")) (db (source \"b\")))", SHAPE, "\"db\"",
+	   "machines.web.after");
+	NO("(machines (db (source \"b\") (ready (interval \"1s\"))))", MISSING, "(ready",
+	   "machines.db.ready.command");
+	NO("(machines (db (source \"b\") (ready (command \"x\") (timeout \"5\"))))", VALUE, "\"5\"",
+	   "machines.db.ready.timeout");
+	NO(M("(after db)"), SHAPE, "(after", "machine.after");
+	NO(M("(ready (command \"x\"))"), SHAPE, "(ready", "machine.ready");
 }
 
 static void test_values(void)

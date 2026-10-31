@@ -160,7 +160,7 @@ printf 'RUN true\n' > "$dir/nofrom.in"
 expect 2 'has no FROM' "$hull" import "$dir/nofrom.in"
 # hull import of a compose file (by its .yml name) to a (machines ...) form.
 # Section 4.8 plans a file's machines at once with no ordering, so
-# depends_on is noted, not invented; each network is an addressed segment
+# depends_on is (after ...); each network is an addressed segment
 # named for the project (the directory, `cli`), a service with none on
 # `default`, one with a network_mode on none, and what a segment does not
 # take -- an alias, a driver -- said.
@@ -185,9 +185,22 @@ services:
     command: ["postgres", "-c", "max_connections=50"]
     build: ./db
     networks: [backend]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "app"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
   cache:
     image: redis:7
     network_mode: bridge
+    depends_on:
+      db:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - redis-cli ping
   agent:
     image: busybox:1.36
     network_mode: host
@@ -245,7 +258,12 @@ gbc '\(volume \(host "\./site"\) \(guest "/usr/share/nginx/html"\) \(mode ro\)\)
 gbc '\(command "postgres" "-c" "max_connections=50"\)'
 gbc '\(hostname "thedb"\)'
 gbc '\(restart always\)'
-gbc '; depends_on not translated, its machines start together: db'
+gbc '\(after db\)'
+# A healthcheck's timeout is the longest compose waits: start_period, then
+# retries checks of an interval and a timeout each; 30s, 30s, 3 unsaid.
+gbc '\(ready \(command "pg_isready" "-U" "app"\) \(interval "5s"\) \(timeout "50s"\)\)'
+gbc '\(ready \(command "/bin/sh" "-c" "redis-cli ping"\) \(interval "30s"\) \(timeout "180s"\)\)'
+gbc '; depends_on db: service_completed_successfully not translated, its start waited for instead'
 gbc '; build not translated'
 gbc '\(web \(source .*\(segments \(cli-default \(subnet "10\.1[6-9][0-9]\.[0-9]+\.0/24"\)\)\)'
 gbc '\(db \(source .*\(segments \(cli-backend \(subnet "10\.1[6-9][0-9]\.[0-9]+\.0/24"\)\)\)'
@@ -1537,6 +1555,7 @@ printf '%s\n' "$out" | grep -q '^ra-b *| slaac=eth0 none$' ||
 # `default` network as a segment, so one finds another by its name, over
 # DNS at .1 and in /etc/hosts, as under compose. A service with no image
 # is refused, and a directory with no compose file says so.
+mkdir -p "$root/orderdata"
 cat > "$root/compose.yaml" <<'YML'
 services:
   web:
@@ -1546,25 +1565,33 @@ services:
       GREETING: hi
     hostname: composed
     depends_on:
-      - db
+      db:
+        condition: service_healthy
   db:
     image: "dir:./rootfs"
-    command: ["/probe", "sleep", "2"]
+    command: ["/probe", "write", "/data/composed", "sleep", "4"]
+    volumes:
+      - ./orderdata:/data
+    healthcheck:
+      test: ["CMD", "/probe", "present", "/data/composed"]
+      interval: 1s
 networks:
   default:
     driver: bridge
     enable_ipv6: true
 YML
+rm -f "$root/orderdata/composed"
 limit=60
 expect 0 '^web +\| host=composed$' sh -c 'cd "$1" && exec "$2" up' up "$root" "$hull_abs"
 for want in '^web +\| from compose$' '^web +\| GREETING=hi$' \
-	'^compose\.yaml: web: depends_on not translated, its machines start together: db$' \
 	'^web +\| dns=db 10\.1[6-9][0-9]\.[0-9]+\.[0-9]+$' '^web +\| hosts=db 10\.1[6-9][0-9]\.' \
 	'^web +\| dns6=db fd[0-9a-f]{2}:[0-9a-f]{1,4}:[0-9a-f]{1,4}:' \
 	'^compose\.yaml: network default: driver not translated$'; do
 	cases=$((cases + 1))
 	printf '%s\n' "$out" | grep -Eq -- "$want" || fail "hull up: no line matches /$want/" "$out"
 done
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q 'depends_on\|healthcheck' && fail "hull up said it did not translate depends_on" "$out"
 expect 0 'compose\.yaml: db on chroot \(ns\): ok' "$hull" plan -f "$root/compose.yaml" --backend chroot
 printf 'services:\n  lost:\n    build: ./lost\n' > "$root/noimage.yaml"
 expect 125 'noimage\.yaml: lost: no image to run it from' "$hull" up -f "$root/noimage.yaml"
@@ -1658,6 +1685,33 @@ printf '(machines (a %s) (b %s))\n' \
 	"(source \"dir:./rootfs\") (backend chroot) (network none) (segments \"half-$$\") (command \"/probe\" \"say\" \"ran\")" \
 	> "$root/half.conf"
 from_root 125 "names it without its subnet" -f "$root/half.conf"
+# Start order: web is (after db), and db is ready once its ready command
+# finds the file it writes a second in; web, looking for that file first,
+# ends 0 only when started after it. db given up on at its timeout starts
+# nothing after it; one that ends before it is ready, nothing either.
+mkdir -p "$root/orderdata"
+rm -f "$root/orderdata/up"
+order() { # NAME DB-COMMAND DB-READY
+	printf '(machines (web %s) (db %s))\n' \
+		"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (after db) (volumes (volume (host \"$root/orderdata\") (guest \"/data\"))) (command \"/probe\" \"present\" \"/data/up\" \"say\" \"web found it\")" \
+		"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (volumes (volume (host \"$root/orderdata\") (guest \"/data\"))) $2 (ready $3)" \
+		> "$root/$1.conf"
+}
+order ordered '(command "/probe" "sleep" "1" "write" "/data/up" "sleep" "2")' \
+	'(command "/probe" "present" "/data/up") (interval "1s")'
+limit=30
+from_root 0 '^web +\| web found it$' -f "$root/ordered.conf"
+rm -f "$root/orderdata/up"
+order unready '(command "/probe" "sleep" "5")' \
+	'(command "/probe" "present" "/data/never") (timeout "2s")'
+limit=30
+from_root 125 '^hull: db: not ready after 2s: its ready command exited 1, saying: absent=/data/never$' \
+	-f "$root/unready.conf"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^web ' && fail "a machine started after one not ready" "$out"
+order ordergone '(command "/probe" "exit" "0")' '(command "/probe" "present" "/data/never")'
+limit=30
+from_root 125 '^hull: web: not started: db ended before it was ready$' -f "$root/ordergone.conf"
 # Segments beside NAT, as a vm has them beside passt: pasta's eth0 first,
 # the segments' NICs from eth1; an addressed segment's siblings named by
 # /etc/hosts and reached by name across the core's switch, the machine

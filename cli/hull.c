@@ -1671,16 +1671,29 @@ static int prepare_run(options *o, const hull_registry *registry, hull_spec *spe
 
 #define LINE_CAP 4096u
 
-/* One machine of a whole file's run: its channel is 1 + 2 * its place, and
- * its stop's the one after. */
+/* One machine of a whole file's run: its channel is 1 + 2 * its place,
+ * its stop's the one after, and its readiness is asked on PROBE_CHANNEL +
+ * 2 * its place. */
 typedef struct member {
-	char     id[64];
-	char     name[64];
-	int      ended;
-	int      status;
-	size_t   held[2];             /* a line not yet ended, per stream */
-	uint8_t  line[2][LINE_CAP];
+	char      id[64];
+	char      name[64];
+	int       ended;
+	int       status;
+	int       sent;          /* its run asked of the core */
+	int       up;            /* started, and ready where it says how */
+	int       ready;         /* it says how, with (ready ...) */
+	int       probing;       /* its (ready (command ...)) is running */
+	long long interval_ms;
+	long long timeout_ms;
+	long long next_ms;       /* when it is asked next, once started */
+	long long until_ms;      /* when it is given up on, once started */
+	char      said[160];     /* what the command running now said, its end */
+	char      last[256];     /* why it was not ready, the last time asked */
+	size_t    held[2];       /* a line not yet ended, per stream */
+	uint8_t   line[2][LINE_CAP];
 } member;
+
+#define PROBE_CHANNEL (1u + 2u * HULL_NAMES_MEMBERS)
 
 /* What a member wrote, a line at a time, each behind its name: so that
  * two machines writing at once do not split each other's lines. A line
@@ -1706,18 +1719,135 @@ static void member_write(member *m, int width, int stream, const uint8_t *data, 
 	fflush(to);
 }
 
+static long long seconds_of(const char *text);
+
+static long long monotonic_ms(void)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+/* A machine's (ready ...), read before the file's text is let go: the
+ * exec its command is, sent each time it is asked, and how often and for
+ * how long. 1s and 5m where it does not say: a machine is asked again soon,
+ * and one that boots a whole system has time to. */
+static int ready_of(const hull_spec *spec, const hull_sexpr_form *entry, member *m,
+                    unsigned place, hull_msg *probe)
+{
+	hull_sexpr_form ready;
+	hull_sexpr_form command;
+	hull_sexpr_form word;
+	hull_sexpr_form found;
+	char            text[4096];
+	size_t          length;
+
+	m->interval_ms = 1000;
+	m->timeout_ms  = 300000;
+	if (!hull_spec_find(spec, entry, "ready", &ready))
+		return 0;
+	m->ready = 1;
+	if (hull_spec_find(spec, &ready, "interval", &found) &&
+	    hull_sexpr_child(&spec->doc, &found, &word) && hull_sexpr_next(&spec->doc, &word, &word) &&
+	    hull_sexpr_value(&spec->doc, &word, (uint8_t *)text, sizeof text - 1u, &length) ==
+	    HULL_SEXPR_OK) {
+		text[length] = '\0';
+		m->interval_ms = seconds_of(text) * 1000;
+	}
+	if (hull_spec_find(spec, &ready, "timeout", &found) &&
+	    hull_sexpr_child(&spec->doc, &found, &word) && hull_sexpr_next(&spec->doc, &word, &word) &&
+	    hull_sexpr_value(&spec->doc, &word, (uint8_t *)text, sizeof text - 1u, &length) ==
+	    HULL_SEXPR_OK) {
+		text[length] = '\0';
+		m->timeout_ms = seconds_of(text) * 1000;
+	}
+	hull_spec_find(spec, &ready, "command", &command);
+	hull_msg_raw(probe, "(4:exec(4:argv");
+	hull_sexpr_child(&spec->doc, &command, &word);
+	while (hull_sexpr_next(&spec->doc, &word, &word)) {
+		if (hull_sexpr_value(&spec->doc, &word, (uint8_t *)text, sizeof text - 1u, &length) !=
+		    HULL_SEXPR_OK) {
+			fprintf(stderr, "hull: %s: a word of its ready command is too long\n", m->name);
+			return -1;
+		}
+		hull_msg_atom(probe, (const uint8_t *)text, length);
+	}
+	hull_msg_raw(probe, ")");
+	hull_msg_channel(probe, PROBE_CHANNEL + 2u * place);
+	hull_msg_raw(probe, "(7:machine");
+	hull_msg_text(probe, m->id);
+	hull_msg_raw(probe, ")(3:tty5:false))");
+	return probe->failed ? -1 : 0;
+}
+
+/* Each machine not yet started whose (after ...) are all up, started;
+ * -1 when a run could not be sent. */
+static int start_ready(hull_wire *wire, member *members, hull_msg *requests, unsigned count,
+                       uint8_t (*waits)[HULL_NAMES_MEMBERS / 8u])
+{
+	for (unsigned i = 0u; i < count; i++) {
+		int held = 0;
+
+		if (members[i].sent || members[i].ended)
+			continue;
+		for (unsigned j = 0u; j < count && !held; j++)
+			held = (waits[i][j / 8u] >> (j % 8u) & 1u) && !members[j].up;
+		if (held)
+			continue;
+		members[i].sent = 1;
+		if (requests[i].failed || hull_wire_send(wire->fd, &requests[i]) != 0) {
+			fprintf(stderr, "hull: the run of %s could not be sent\n", members[i].name);
+			return -1;
+		}
+		hull_msg_free(&requests[i]);
+	}
+	return 0;
+}
+
+/* A machine is up: what waited on it alone may start. */
+static int now_up(hull_wire *wire, member *members, hull_msg *requests, unsigned count,
+                  uint8_t (*waits)[HULL_NAMES_MEMBERS / 8u], member *m)
+{
+	m->up = 1;
+	return start_ready(wire, members, requests, count, waits);
+}
+
+/* What a command asking a machine's readiness said, its last bytes, so
+ * that a machine not ready can say why. */
+static void probe_said(member *m, const uint8_t *data, size_t n)
+{
+	size_t have = strlen(m->said);
+	size_t room = sizeof m->said - 1u;
+
+	if (n >= room) {
+		data += n - room;
+		n = room;
+		have = 0u;
+	} else if (have + n > room) {
+		memmove(m->said, m->said + (have + n - room), room - n);
+		have = room - n;
+	}
+	memcpy(m->said + have, data, n);
+	m->said[have + n] = '\0';
+}
+
 /* Every machine of a (machines ...) file: each planned before any starts,
- * so one the file cannot run starts none; all run at once on one
- * connection, a channel each, their output a line at a time behind their
- * names; and the first to fail, or SIGINT or SIGTERM, stops the rest. The
- * run ends when every machine has: 0 when each ended 0, else the status
- * of the first that did not. */
+ * so one the file cannot run starts none; all run on one connection, a
+ * channel each, their output a line at a time behind their names; and the
+ * first to fail, or SIGINT or SIGTERM, stops the rest. A machine starts
+ * when those it is (after ...) are up: started, and where one says
+ * (ready ...), its command exited 0 in it. The run ends when every machine
+ * has: 0 when each ended 0, else the status of the first that did not. */
 static int run_all(options *o, const hull_registry *registry, hull_spec *spec, uint8_t *data)
 {
 	static hull_names names_drawn;
 	const hull_names *names = &names_drawn;
 	static member   members[HULL_NAMES_MEMBERS];
 	static hull_msg requests[HULL_NAMES_MEMBERS];
+	static hull_msg probes[HULL_NAMES_MEMBERS];
+	static hull_sexpr_form forms[HULL_NAMES_MEMBERS];
+	static uint8_t  waits[HULL_NAMES_MEMBERS][HULL_NAMES_MEMBERS / 8u];
 	hull_sexpr_form entry;
 	hull_wire       wire;
 	struct sigaction action;
@@ -1728,7 +1858,9 @@ static int run_all(options *o, const hull_registry *registry, hull_spec *spec, u
 	int             stopping = 0;
 
 	memset(requests, 0, sizeof requests);
+	memset(probes, 0, sizeof probes);
 	memset(members, 0, sizeof members);
+	memset(waits, 0, sizeof waits);
 	if (draw_names(o, spec, &names_drawn) != 0) {
 		free(data);
 		return 125;
@@ -1753,18 +1885,37 @@ static int run_all(options *o, const hull_registry *registry, hull_spec *spec, u
 		}
 		m->name[length] = '\0';
 		if (prepare_run(o, registry, spec, &entry, m->name, names, 1u + 2u * count,
-		                &requests[count], m->id, sizeof m->id) != 0) {
+		                &requests[count], m->id, sizeof m->id) != 0 ||
+		    ready_of(spec, &entry, m, count, &probes[count]) != 0) {
+			count++;
 			status = 125;
 			break;
 		}
+		forms[count] = entry;
 		if ((int)length > width)
 			width = (int)length;
 		count++;
 	}
+	/* (after ...) as places, the spec check having held each to a
+	 * sibling and the whole to an order. */
+	for (unsigned i = 0u; i < count && status == 0; i++) {
+		hull_sexpr_form after;
+		hull_sexpr_form name;
+
+		if (!hull_spec_find(spec, &forms[i], "after", &after))
+			continue;
+		hull_sexpr_child(&spec->doc, &after, &name);
+		while (hull_sexpr_next(&spec->doc, &name, &name))
+			for (unsigned j = 0u; j < count; j++)
+				if (hull_sexpr_is(&spec->doc, &name, members[j].name))
+					waits[i][j / 8u] |= (uint8_t)(1u << (j % 8u));
+	}
 	free(data);
 	if (status != 0) {
-		for (unsigned i = 0u; i <= count && i < 64u; i++)
+		for (unsigned i = 0u; i < count; i++) {
 			hull_msg_free(&requests[i]);
+			hull_msg_free(&probes[i]);
+		}
 		return status;
 	}
 
@@ -1772,52 +1923,191 @@ static int run_all(options *o, const hull_registry *registry, hull_spec *spec, u
 	action.sa_handler = interrupt;
 	sigaction(SIGINT, &action, NULL);
 	sigaction(SIGTERM, &action, NULL);
-	if (connect_core(&wire, 1) != 0) {
-		for (unsigned i = 0u; i < count; i++)
+	if (connect_core(&wire, 1) != 0 ||
+	    (start_ready(&wire, members, requests, count, waits) != 0 &&
+	     (hull_wire_close(&wire), 1))) {
+		for (unsigned i = 0u; i < count; i++) {
 			hull_msg_free(&requests[i]);
-		return 125;
-	}
-	for (unsigned i = 0u; i < count; i++) {
-		if (requests[i].failed || hull_wire_send(wire.fd, &requests[i]) != 0) {
-			fprintf(stderr, "hull: the run of %s could not be sent\n", members[i].name);
-			for (unsigned j = i; j < count; j++)
-				hull_msg_free(&requests[j]);
-			hull_wire_close(&wire);
-			return 125;
+			hull_msg_free(&probes[i]);
 		}
-		hull_msg_free(&requests[i]);
+		return 125;
 	}
 
 	for (left = count; left > 0u;) {
 		hull_sexpr_doc   body;
 		hull_sexpr_form  value;
 		long long        channel = -1;
+		long long        now;
+		int              wait_ms = -1;
 		hull_wire_status read;
 		member          *m;
+		int              probe;
 		int              ended = -1;
 
 		if ((interrupted || status != 0) && !stopping) {
 			stopping = 1;
-			for (unsigned i = 0u; i < count; i++)
-				if (!members[i].ended)
+			for (unsigned i = 0u; i < count; i++) {
+				if (members[i].ended)
+					continue;
+				if (members[i].sent) {
 					send_request(&wire, "(4:stop", 2u + 2u * i, members[i].id,
 					             "(10:timeout_ms5:10000)");
+				} else {
+					members[i].ended = 1;
+					left--;
+				}
+			}
+			if (left == 0u)
+				break;
 		}
-		read = hull_wire_read(&wire, &body);
-		if (read == HULL_WIRE_WAIT)
+
+		/* Each machine started and not yet ready asked again when its
+		 * interval is up, and given up on at its timeout. */
+		now = monotonic_ms();
+		for (unsigned i = 0u; i < count && !stopping && status == 0; i++) {
+			m = &members[i];
+			if (!m->ready || m->up || m->ended || m->until_ms == 0)
+				continue;
+			if (now >= m->until_ms) {
+				fprintf(stderr, "hull: %s: not ready after %llds%s%s\n", m->name,
+				        m->timeout_ms / 1000, m->last[0] != '\0' ? ": " : "", m->last);
+				status = 125;
+				break;
+			}
+			if (!m->probing && now >= m->next_ms) {
+				hull_msg eof = { 0 };
+
+				/* Its stdin ended at once: a command asking readiness
+				 * reads nothing. */
+				hull_msg_raw(&eof, "(3:eof");
+				hull_msg_channel(&eof, PROBE_CHANNEL + 2u * i);
+				hull_msg_raw(&eof, ")");
+				m->probing = 1;
+				m->said[0] = '\0';
+				hull_wire_send(wire.fd, &probes[i]);
+				hull_wire_send(wire.fd, &eof);
+				hull_msg_free(&eof);
+			}
+		}
+		/* Given up on just now: the top stops the rest. */
+		if (status != 0 && !stopping)
 			continue;
+		read = hull_wire_next(&wire, &body);
+		if (read == HULL_WIRE_WAIT) {
+			struct pollfd ready = { wire.fd, POLLIN, 0 };
+
+			now = monotonic_ms();
+			for (unsigned i = 0u; i < count && !stopping; i++) {
+				long long due;
+
+				m = &members[i];
+				if (!m->ready || m->up || m->ended || m->until_ms == 0)
+					continue;
+				due = m->until_ms;
+				if (!m->probing && m->next_ms < due)
+					due = m->next_ms;
+				due -= now;
+				if (due < 0)
+					due = 0;
+				if (wait_ms < 0 || due < wait_ms)
+					wait_ms = (int)due;
+			}
+			if (poll(&ready, 1u, wait_ms) <= 0)
+				continue;
+			read = hull_wire_fill(&wire);
+			if (read == HULL_WIRE_OK || read == HULL_WIRE_WAIT)
+				continue;
+		}
 		if (read != HULL_WIRE_OK) {
 			fprintf(stderr, "hull: the core went away\n");
 			hull_wire_close(&wire);
+			for (unsigned i = 0u; i < count; i++) {
+				hull_msg_free(&requests[i]);
+				hull_msg_free(&probes[i]);
+			}
 			return 125;
 		}
 		if (!hull_msg_find(&body, "ch", &value) || !hull_msg_long(&body, &value, &channel) ||
-		    channel < 1 || channel % 2 != 1 || (unsigned long long)channel >= 1u + 2u * count)
+		    channel < 1 || channel % 2 != 1)
 			continue;
-		m = &members[(channel - 1) / 2];
+		if ((unsigned long long)channel < 1u + 2u * count) {
+			probe = 0;
+			m = &members[(channel - 1) / 2];
+		} else if ((unsigned long long)channel >= PROBE_CHANNEL &&
+		           (unsigned long long)channel < PROBE_CHANNEL + 2u * count) {
+			probe = 1;
+			m = &members[(channel - PROBE_CHANNEL) / 2];
+		} else {
+			continue;
+		}
 		if (m->ended)
 			continue;
-		if (hull_msg_is(&body, "data")) {
+
+		if (probe) {
+			if (hull_msg_is(&body, "data")) {
+				hull_sexpr_form buf;
+				hull_msg        credit = { 0 };
+
+				if (!hull_msg_find(&body, "buf", &buf))
+					continue;
+				probe_said(m, body.data + buf.content, buf.content_length);
+				/* Taken as soon as it comes, so a command that says much
+				 * is not held back. */
+				hull_msg_raw(&credit, "(6:credit(5:bytes");
+				hull_msg_number(&credit, (long long)buf.content_length);
+				hull_msg_raw(&credit, ")");
+				hull_msg_channel(&credit, (uint32_t)channel);
+				hull_msg_raw(&credit, ")");
+				hull_wire_send(wire.fd, &credit);
+				hull_msg_free(&credit);
+			} else if (hull_msg_is(&body, "exited") || hull_msg_is(&body, "error")) {
+				long long code = 0;
+				long long sig  = 0;
+				char      reason[200] = "an error";
+				size_t    n;
+
+				m->probing = 0;
+				m->next_ms = monotonic_ms() + m->interval_ms;
+				if (hull_msg_is(&body, "error")) {
+					if (hull_msg_find(&body, "reason", &value))
+						hull_msg_string(&body, &value, reason, sizeof reason);
+					snprintf(m->last, sizeof m->last, "its ready command could not run: %s",
+					         reason);
+					continue;
+				}
+				if (hull_msg_find(&body, "code", &value))
+					hull_msg_long(&body, &value, &code);
+				if (hull_msg_find(&body, "signal", &value))
+					hull_msg_long(&body, &value, &sig);
+				if (code == 0 && sig == 0) {
+					if (!stopping &&
+					    now_up(&wire, members, requests, count, waits, m) != 0)
+						status = 125;
+					continue;
+				}
+				for (n = strlen(m->said); n > 0u && (m->said[n - 1u] == '\n' ||
+				                                     m->said[n - 1u] == '\r'); n--)
+					m->said[n - 1u] = '\0';
+				if (sig != 0)
+					snprintf(m->last, sizeof m->last, "its ready command ended on signal %lld",
+					         sig);
+				else
+					snprintf(m->last, sizeof m->last, "its ready command exited %lld%s%s",
+					         code, m->said[0] != '\0' ? ", saying: " : "",
+					         strrchr(m->said, '\n') != NULL ? strrchr(m->said, '\n') + 1 :
+					         m->said);
+			}
+			continue;
+		}
+
+		if (hull_msg_is(&body, "started")) {
+			if (m->ready) {
+				m->until_ms = monotonic_ms() + m->timeout_ms;
+				m->next_ms  = 0;
+			} else if (!stopping && now_up(&wire, members, requests, count, waits, m) != 0) {
+				status = 125;
+			}
+		} else if (hull_msg_is(&body, "data")) {
 			hull_sexpr_form buf;
 			hull_sexpr_form fd;
 
@@ -1860,9 +2150,24 @@ static int run_all(options *o, const hull_registry *registry, hull_spec *spec, u
 			 * reports: the first that ended other than 0 is. */
 			if (ended != 0 && status == 0 && !stopping)
 				status = ended;
+			/* One that ended before it was up can never be: what
+			 * waits on it would wait for ever. */
+			if (!m->up && status == 0 && !stopping)
+				for (unsigned i = 0u; i < count && status == 0; i++)
+					if (!members[i].sent &&
+					    (waits[i][(unsigned)(m - members) / 8u] >>
+					     ((unsigned)(m - members) % 8u) & 1u)) {
+						fprintf(stderr, "hull: %s: not started: %s ended before it was "
+						        "ready\n", members[i].name, m->name);
+						status = 125;
+					}
 		}
 	}
 	hull_wire_close(&wire);
+	for (unsigned i = 0u; i < count; i++) {
+		hull_msg_free(&requests[i]);
+		hull_msg_free(&probes[i]);
+	}
 	if (status == 0 && interrupted)
 		for (unsigned i = 0u; i < count && status == 0; i++)
 			status = members[i].status;
