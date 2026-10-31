@@ -171,6 +171,7 @@ struct hull_machine {
 	char            *resolver;   /* the /etc/resolv.conf naming hull at their .1, or NULL */
 	int              adopted;    /* taken back: the init is not this process's child */
 	int              pidfd;      /* the init's, when adopted, else -1 */
+	pid_t            pasta;      /* pasta's daemon, its network and ports, or 0 */
 	char             dir[4096];  /* the machine's directory, for init.sock, or "" */
 	uint8_t         *plan;       /* the plan, for persist() */
 	size_t           plan_length;
@@ -2340,6 +2341,8 @@ static int read_full(int fd, void *bytes, size_t n)
 	return 0;
 }
 
+static void end_pasta(hull_machine *m);
+
 static void *read_workload(void *arg)
 {
 	/* The thread's own: one runs per machine, and a buffer they shared
@@ -2396,6 +2399,8 @@ static void *read_workload(void *arg)
 	m->done = 1;
 	pthread_cond_broadcast(&m->done_cond);
 	pthread_mutex_unlock(&m->lock);
+	/* Its ports free before anyone hears it has ended. */
+	end_pasta(m);
 	if (!said && m->adopted)
 		status = SIGKILL;  /* a wait status: killed by it */
 	if (WIFSIGNALED(status))
@@ -2608,7 +2613,96 @@ static const char *start_limits(const hull_machine *m, char *why, size_t cap)
  * needs no supervising and outlives a core under keep with its machine.
  * NULL, or why in `why`.
  */
-static const char *start_pasta(const hull_machine *m, char *why, size_t cap)
+/*
+ * Whether `pid` is pasta's daemon for the init `init`: pasta, the user's,
+ * given the init's pid as its last word. Read again before each signal,
+ * as a pid is a moment and not a process.
+ */
+static int pasta_of(pid_t pid, pid_t init)
+{
+	char    path[64];
+	char    words[4096];
+	char    want[24];
+	ssize_t n;
+	int     fd;
+	size_t  last = 0u;
+
+	snprintf(path, sizeof path, "/proc/%ld/cmdline", (long)pid);
+	if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0)
+		return 0;
+	n = read(fd, words, sizeof words - 1u);
+	close(fd);
+	if (n <= 0)
+		return 0;
+	words[n] = '\0';
+	for (ssize_t i = 0; i + 1 < n; i++)
+		if (words[i] == '\0')
+			last = (size_t)i + 1u;
+	snprintf(want, sizeof want, "%ld", (long)init);
+	return strcmp(words + last, want) == 0 &&
+	       (strcmp(words, "pasta") == 0 ||
+	        (strlen(words) > 6u && strcmp(words + strlen(words) - 6u, "/pasta") == 0));
+}
+
+/* pasta's daemon for `init`, which its parent left on exiting: found in
+ * /proc, as it writes no pid file where AppArmor lets it be read here
+ * (engine/qemu.c says the same of passt). 0 where none is seen. */
+static pid_t find_pasta(pid_t init)
+{
+	DIR           *proc = opendir("/proc");
+	struct dirent *entry;
+	pid_t          found = 0;
+
+	while (proc != NULL && found == 0 && (entry = readdir(proc)) != NULL) {
+		pid_t pid;
+
+		if (entry->d_name[0] < '1' || entry->d_name[0] > '9')
+			continue;
+		pid = (pid_t)strtol(entry->d_name, NULL, 10);
+		if (pasta_of(pid, init))
+			found = pid;
+	}
+	if (proc != NULL)
+		closedir(proc);
+	return found;
+}
+
+/*
+ * pasta ended with its machine, and waited for, at most 2 s: left to see
+ * the namespace go by itself it took about a second, its ports held all
+ * the while, so a run of the same machine straight after -- on any
+ * engine, a test's loop or `make check-flip`'s next backend -- found its
+ * address and port in use. A daemon gone or another's by now is left.
+ */
+static void end_pasta(hull_machine *m)
+{
+	if (m->pasta <= 0 || !pasta_of(m->pasta, m->pid)) {
+		m->pasta = 0;
+		return;
+	}
+	kill(m->pasta, SIGTERM);
+	for (int tries = 0; tries < 200; tries++) {
+		char  path[64];
+		char  stat_line[256];
+		int   fd;
+		ssize_t n;
+		char *state;
+
+		snprintf(path, sizeof path, "/proc/%ld/stat", (long)m->pasta);
+		if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0)
+			break;
+		n = read(fd, stat_line, sizeof stat_line - 1u);
+		close(fd);
+		stat_line[n > 0 ? n : 0] = '\0';
+		/* Exited, its sockets closed, though not yet reaped. */
+		if ((state = strrchr(stat_line, ')')) != NULL && state[1] == ' ' && state[2] == 'Z')
+			break;
+		usleep(10000);
+	}
+	m->pasta = 0;
+}
+
+static const char *start_pasta(hull_machine *m, char *why, size_t cap)
 {
 	char        pid_text[24];
 	char        forward[MAX_PORTS + 1u][96];
@@ -2709,8 +2803,10 @@ static const char *start_pasta(const hull_machine *m, char *why, size_t cap)
 	fcntl(said[0], F_SETFL, O_NONBLOCK);
 	got = read(said[0], why, cap - 1u);
 	close(said[0]);
-	if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+	if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+		m->pasta = find_pasta(m->pid);
 		return NULL;
+	}
 	if (got <= 0)
 		snprintf(why, cap, "pasta could not give the machine its network");
 	else {

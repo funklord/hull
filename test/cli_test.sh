@@ -2568,6 +2568,19 @@ while time.time() < deadline:
 wait "$natrun"
 [ "$answer" = "hello from the machine" ] && grep -q '^served=hello$' "$root/natports.out" ||
 	fail "a chroot machine's port under NAT was not reached at its address" "$answer $(cat "$root/natports.out")"
+# Its port free once the run has returned, as the run's end is the
+# machine's: pasta ended with it, where left to see the namespace go it
+# held the port a second longer, and a run of the same machine straight
+# after, on any engine, found the address in use.
+cases=$((cases + 1))
+# SO_REUSEADDR, as pasta and docker bind: the connection just served
+# leaves a TIME_WAIT on the port, which refuses a bind without it.
+python3 -c '
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((sys.argv[1], int(sys.argv[2])))' "$nat_at" "$nat_port" 2> "$root/natports.bind" ||
+	fail "a chroot machine's port was still held after its run returned" "$(cat "$root/natports.bind")"
 conf hostports '(network host) (command "/probe") (ports (port (host 8080) (guest 80)))'
 from_root 125 'ports need a network of the machine.s own: \(network host\) is the host.s' -f "$root/hostports.conf"
 conf noneports '(network none) (command "/probe") (ports (port (host 8080) (guest 80)))'
