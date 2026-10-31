@@ -212,7 +212,8 @@ where nothing else is available, since it needs only user namespaces.
   instead, and `(network none)` gives `lo` alone.
 - On `(segments …)` beside NAT or `(network none)`, a NIC on each, so
   chroot machines and vms share one wire, with addresses and names where
-  the segment has a subnet.
+  the segment has a subnet, and with `(gateway true)` a way out through
+  hull at its `.1` and `::1` for a machine of `(network none)`.
 - Files in the machine are the files on disk: no protocol in between, so
   inotify, locks and mmap behave exactly as on the host.
 - Writes in place, `(mutable direct)`, or into an overlay,
@@ -295,7 +296,8 @@ for testing network software against real layer 2.
   learning switch in the user's core, shared with chroot machines on the
   same segment. Bare, the guest sets its own address; given a subnet,
   hull addresses each machine, names them to each other, and answers DNS
-  at the segment's `.1`.
+  at the segment's `.1`; with `(gateway true)` a guest of
+  `(network none)` goes out through `.1` and `::1`.
 - `(devices …)`: USB devices, serial and parallel ports, and PCI by VFIO,
   each held by one machine at a time. USB and the parallel port are
   passed by qemu, so their timing is not the host's, and the plan says
