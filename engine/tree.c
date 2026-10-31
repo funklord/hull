@@ -29,6 +29,8 @@ typedef struct writer {
 	int            one_fs;          /* only the root's own mount */
 	uint64_t       mount;           /* the root's mount id, where one_fs */
 	dev_t          device;          /* its device, where no mount id is given */
+	const hull_tree_owner *owners;  /* given over the disk's, sorted by path */
+	size_t                 owner_count;
 	uint8_t        buffer[65536];
 } writer;
 
@@ -161,6 +163,11 @@ static int write_header(writer *w, const hull_tar_entry *e)
 	return put(w, block, sizeof block);
 }
 
+static int owner_order(const void *a, const void *b)
+{
+	return strcmp(((const hull_tree_owner *)a)->path, ((const hull_tree_owner *)b)->path);
+}
+
 static int name_order(const void *a, const void *b)
 {
 	return strcmp(*(char *const *)a, *(char *const *)b);
@@ -180,6 +187,8 @@ static int header(writer *w, int dir, const char *at, const char *name, char typ
 	                     .size = size, .link = link };
 	static char     list[65536];
 	char           *names[256];
+	char            key[MAX_PATH];
+	size_t          length = strlen(name);
 	const uint8_t  *values[256];
 	size_t          lengths[256];
 	uint8_t        *held[256];
@@ -187,6 +196,21 @@ static int header(writer *w, int dir, const char *at, const char *name, char typ
 	int             status;
 	int             fd = dir >= 0 ? openat(dir, at, O_PATH | O_NOFOLLOW | O_CLOEXEC) : -1;
 
+	/* An owner given for it, by its name without a directory's slash. */
+	if (w->owner_count != 0u && length < sizeof key) {
+		const hull_tree_owner *given;
+		hull_tree_owner        sought;
+
+		memcpy(key, name, length + 1u);
+		if (length > 0u && key[length - 1u] == '/')
+			key[length - 1u] = '\0';
+		sought.path = key;
+		given = bsearch(&sought, w->owners, w->owner_count, sizeof *w->owners, owner_order);
+		if (given != NULL) {
+			e.uid = given->uid;
+			e.gid = given->gid;
+		}
+	}
 	if (fd >= 0) {
 		char    path[64];
 		ssize_t n;
@@ -384,14 +408,29 @@ static int walk(writer *w, int dir, size_t base, unsigned depth)
 	return status;
 }
 
+static int tar_tree(const char *root, int one_fs, const hull_tree_owner *owners, size_t count,
+                    hull_tree_sink sink, void *context, char *detail, size_t detail_cap);
+
 int hull_tree_tar(const char *root, hull_tree_sink sink, void *context, char *detail,
                   size_t detail_cap)
 {
-	return hull_tree_tar_fs(root, 0, sink, context, detail, detail_cap);
+	return tar_tree(root, 0, NULL, 0u, sink, context, detail, detail_cap);
+}
+
+int hull_tree_tar_owned(const char *root, const hull_tree_owner *owners, size_t count,
+                        hull_tree_sink sink, void *context, char *detail, size_t detail_cap)
+{
+	return tar_tree(root, 0, owners, count, sink, context, detail, detail_cap);
 }
 
 int hull_tree_tar_fs(const char *root, int one_fs, hull_tree_sink sink, void *context,
                      char *detail, size_t detail_cap)
+{
+	return tar_tree(root, one_fs, NULL, 0u, sink, context, detail, detail_cap);
+}
+
+static int tar_tree(const char *root, int one_fs, const hull_tree_owner *owners, size_t count,
+                    hull_tree_sink sink, void *context, char *detail, size_t detail_cap)
 {
 	static const uint8_t end[2u * BLOCK];
 	writer              *w = calloc(1u, sizeof *w);
@@ -415,8 +454,10 @@ int hull_tree_tar_fs(const char *root, int one_fs, hull_tree_sink sink, void *co
 		free(w);
 		return -1;
 	}
-	w->one_fs = one_fs;
-	w->device = top.st_dev;
+	w->one_fs      = one_fs;
+	w->device      = top.st_dev;
+	w->owners      = owners;
+	w->owner_count = count;
 	{
 		struct statx root_mount;
 

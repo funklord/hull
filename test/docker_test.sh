@@ -120,6 +120,78 @@ printf '%s\n' "$committed" | grep -q '^dexported/1 sha256:' ||
 	fail "a docker export did not commit" "$committed"
 conf unexported '(export "/proc/hull-no-such/export.tar") (command "true")'
 expect 125 "the export.s file /proc/hull-no-such/export\\.tar: No such file or directory" unexported
+# (owners PATH): owners given in the dir's import, its tar carrying them,
+# so the container sees the file as 101:102 while on the user's disk it
+# stays the user's; on an image ref, refused, which keeps its own.
+mkdir -p "$root/rootfs"
+cp "$probe" "$root/rootfs/probe"
+printf 'given\n' > "$root/rootfs/given"
+printf '101\000102\000given\000' > "$root/owners.list"
+printf '(machine (source "dir:./rootfs") (mutable overlay) (backend docker) (hostname "dtest") %s)\n' \
+	"(owners \"$root/owners.list\") (command \"/probe\" \"owner\" \"/given\" \"owner\" \"/probe\")" \
+	> "$root/owned.conf"
+expect 0 '^owner=101:102 0[0-7]{3}$' owned
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -Eq "^owner=$(id -u):[0-9]+ 0[0-7]+\$" &&
+	[ "$(stat -c %u "$root/rootfs/given")" = "$(id -u)" ] ||
+	fail "an owner not listed was not the user's, or a given one reached the disk" "$out"
+rm -f "$root/rootfs/given"
+conf ownedref "(owners \"$root/owners.list\") (command \"true\")"
+expect 125 'owners are given to a dir.s import' ownedref
+# A stored image's owners, end to end: its tar committed with alpine's
+# tree, the probe and a file of 101:102; run on docker it is checked out,
+# all the user's, and the owners list hull writes from its manifest gives
+# the file back its owner. Then a build of two steps on docker over it:
+# each an import given its parent's owners and docker export, so the
+# second sees 101:102 as the first did, and what the workload wrote as
+# the user it ran as is the commit's root, as chroot's namespace root is.
+cid=$(timeout 30 docker create alpine:latest true 2>/dev/null)
+timeout 60 docker export "$cid" > "$root/alpine.tar"
+timeout 20 docker rm "$cid" > /dev/null 2>&1
+timeout 60 python3 - "$root/alpine.tar" "$root/rootfs/probe" "$root/ownedbase.tar" <<'PYEOF'
+import io, sys, tarfile
+src, probe, out = sys.argv[1:]
+t = tarfile.open(out, "w", format=tarfile.PAX_FORMAT)
+for m in tarfile.open(src):
+	if m.name.lstrip("./") in ("", ".dockerenv") or m.islnk():
+		continue
+	t.addfile(m, tarfile.open(src).extractfile(m) if m.isfile() else None)
+def add(name, uid, gid, mode, data):
+	i = tarfile.TarInfo(name)
+	i.uid, i.gid, i.mode, i.size = uid, gid, mode, len(data)
+	t.addfile(i, io.BytesIO(data))
+with open(probe, "rb") as f:
+	add("probe", 0, 0, 0o755, f.read())
+add("given", 101, 102, 0o644, b"given\n")
+t.close()
+PYEOF
+committed=$(timeout 60 "$hull" commit --tar "$root/ownedbase.tar" ownedbase/1 2>&1)
+printf '(machine (source "ownedbase/1") (backend docker) (hostname "dtest") %s)\n' \
+	'(command "/probe" "owner" "/given")' > "$root/ownedrun.conf"
+expect 0 '^owner=101:102 0[0-7]{3}$' ownedrun
+mkdir -p "$root/b"
+# Run $$ in the first step's line, so that this suite's store, kept from
+# run to run, holds no cache of it.
+cat > "$root/b/hull.conf" <<EOF
+(build
+  (base "ownedbase/1")
+  (steps
+    (step (name "write") (backend docker)
+          (run "/probe owner /given write /srv/made say run-$$"))
+    (step (name "read") (backend docker)
+          (run "/probe owner /given read /srv/made"))))
+EOF
+cases=$((cases + 1))
+built=$(cd "$root/b" && timeout 300 "$hull" build -f hull.conf dbuilt/1 2>&1)
+view=$(timeout 30 "$hull" manifest show dbuilt/1 2>&1)
+[ "$(printf '%s\n' "$built" | grep -Ec '^owner=101:102 0[0-7]{3}$')" = 2 ] &&
+	printf '%s\n' "$built" | grep -q '^read=Success$' &&
+	printf '%s\n' "$built" | grep -q '^dbuilt/1 sha256:' &&
+	printf '%s\n' "$view" | grep -qF '(owner (gid 102) (uid 101)) (path "given")' &&
+	printf '%s\n' "$view" | grep -qF '(owner root) (path "srv/made")' ||
+	fail "a build on docker did not keep its owners, or its writes as root's" "$committed
+$built
+$(printf '%s\n' "$view" | grep -E 'given|made')"
 # Refused for being read-only, by name, and somewhere this uid could
 # otherwise write: /tmp, on the root, is everybody's.
 conf volro '(command "sh" "-c" "echo x > /data/out || true")' \
@@ -686,6 +758,16 @@ printf '%s\n' '(machine (source "hull-no-such-image:0") (backend docker) (hostna
 expect 125 'create: .*hull-no-such-image' noimage
 conf nocmd '(command "/nope")'
 expect 127 'exec /nope failed' nocmd
+
+# The imports of the store's checkouts, which this suite's store holds and
+# gc therefore keeps: removed by their hull.path, under this suite's data.
+for image in $(timeout 10 docker images --filter reference=hull-dir --format '{{.ID}}' | sort -u); do
+	at=$(timeout 10 docker image inspect -f '{{index .Config.Labels "hull.path"}}' "$image" 2>/dev/null |
+		python3 -c 'import sys; print(bytes.fromhex(sys.stdin.read().strip()).decode())' 2>/dev/null)
+	case $at in
+	"$root"/data/*) timeout 30 docker rmi -f "$image" > /dev/null 2>&1 ;;
+	esac
+done
 
 # Nothing left on the daemon.
 cases=$((cases + 1))

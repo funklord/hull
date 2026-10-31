@@ -702,26 +702,13 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 		/* A stored image's non-root owners, which the checkout flattened to
 		 * the user's, given back when the machine starts: its manifest
 		 * holds them, hull_store_owners lists each as uid, gid and path, and
-		 * the engine chowns them in the overlay -- chroot's namespace one,
-		 * qemu's host-side. Docker keeps an image's own owners and declares
-		 * the key rejected, so it is given none; and a plan, which makes no
-		 * checkout, names none. The list is a sibling of the checkout,
-		 * written only on a real run and only where the manifest gives an
-		 * explicit owner. */
+		 * the engine gives them in the overlay -- chroot's namespace one,
+		 * qemu's host-side, docker's import's tar since 2026-10-31. A plan,
+		 * which makes no checkout, names none. The list is a sibling of the
+		 * checkout, written only on a real run and only where the manifest
+		 * gives an explicit owner. */
 		if (create) {
-			char            backend[64] = "";
-			hull_sexpr_form be_entry;
-			hull_sexpr_form be_head;
-			hull_sexpr_form be_value;
-
-			if (hull_spec_find(&spec, &machines[i], "backend", &be_entry) &&
-			    hull_sexpr_child(&spec.doc, &be_entry, &be_head) &&
-			    hull_sexpr_next(&spec.doc, &be_head, &be_value) &&
-			    be_value.content_length < sizeof backend) {
-				memcpy(backend, spec.doc.data + be_value.content, be_value.content_length);
-				backend[be_value.content_length] = '\0';
-			}
-			if (strcmp(backend, "docker") != 0) {
+			{
 				char owners_file[4500];
 				int  list;
 
@@ -2949,9 +2936,10 @@ static int build_runtime(const hull_spec *spec, const hull_sexpr_form *own, cons
  * `hull build`: section 3.6's steps over the base, each committed, each
  * cached by hash(parent, step, inputs). A step's tree is its parent
  * materialized under the store's tmp/, its copies put in, its run line
- * run as a chroot machine on it, `(mutable direct)` and its network none
- * unless it says (network true), and the tree committed, /tmp and its
- * discard paths dropped, with the parent's runtime and A.5's build
+ * run as a machine on it, chroot's or the engine the step names, an
+ * overlay given the parent's owners and exported, its network none unless
+ * it says (network true), and the tree committed, /tmp and its discard
+ * paths dropped, with the parent's runtime and A.5's build
  * provenance. The last step's manifest is tagged `ref`.
  */
 #define MAX_BUILD_STEPS 256u
@@ -3082,13 +3070,13 @@ next_pass:
 		record_text(&spec, &step, "name", name, sizeof name);
 		has_run = record_text(&spec, &step, "run", run_line, sizeof run_line);
 		record_text(&spec, &step, "backend", backend, sizeof backend);
-		/* Exported only where a machine runs: a step of copies alone gives
-		 * no owner, and its tree is the directory as it stands. A step on
-		 * chroot or on qemu, vm or emu, is an overlay whose tree is taken
-		 * as a tar, owners and all; on docker it writes the copy in place. */
-		exported = has_run && (backend[0] == '\0' || strcmp(backend, "ns") == 0 ||
-		                       strcmp(backend, "chroot") == 0 || strcmp(backend, "vm") == 0 ||
-		                       strcmp(backend, "emu") == 0 || strcmp(backend, "qemu") == 0);
+		/* Exported where a machine runs: a step of copies alone gives no
+		 * owner, and its tree is the directory as it stands. A step with a
+		 * run line, on any engine, is an overlay whose tree is taken as a
+		 * tar, owners and all -- on docker an import given the parent's
+		 * owners and docker export, the user's uid it ran as being the
+		 * commit's root as the namespace's root is on chroot. */
+		exported = has_run;
 		network = hull_spec_find(&spec, &step, "network", &entry) &&
 		          hull_sexpr_child(&spec.doc, &entry, &item) &&
 		          hull_sexpr_next(&spec.doc, &item, &item) &&
@@ -3287,15 +3275,11 @@ next_pass:
 				add_text(&conf, "(machine (source ");
 				add_text(&conf, "\"dir:");
 				add_text(&conf, root_path);
-				if (exported) {
-					add_text(&conf, "\") (mutable overlay) (owners ");
-					add_quoted(&conf, (const uint8_t *)owners_path, strlen(owners_path));
-					add_text(&conf, ") (export ");
-					add_quoted(&conf, (const uint8_t *)tar_path, strlen(tar_path));
-					add_text(&conf, ") (backend ");
-				} else {
-					add_text(&conf, "\") (mutable direct) (backend ");
-				}
+				add_text(&conf, "\") (mutable overlay) (owners ");
+				add_quoted(&conf, (const uint8_t *)owners_path, strlen(owners_path));
+				add_text(&conf, ") (export ");
+				add_quoted(&conf, (const uint8_t *)tar_path, strlen(tar_path));
+				add_text(&conf, ") (backend ");
 				add_text(&conf, backend[0] == '\0' || strcmp(backend, "ns") == 0 ? "chroot" :
 				                backend);
 				add_text(&conf, ") (hostname \"build-");

@@ -44,6 +44,22 @@ int hull_tree_tar(const char *root, hull_tree_sink sink, void *context, char *de
 int hull_tree_tar_fs(const char *root, int one_fs, hull_tree_sink sink, void *context,
                      char *detail, size_t detail_cap);
 
+/* An owner given over the disk's, for hull_tree_tar_owned: a path of the
+ * tree as (owners PATH) lists it, no leading or trailing slash, and its
+ * ids. */
+typedef struct hull_tree_owner {
+	const char        *path;
+	unsigned long long uid;
+	unsigned long long gid;
+} hull_tree_owner;
+
+/* hull_tree_tar, each entry `owners` names given that owner in its
+ * header in place of the disk's: a stored tree's, whose checkout is all
+ * the user's, as the docker adapter imports it. `owners`, `count` of
+ * them, sorted bytewise by path. */
+int hull_tree_tar_owned(const char *root, const hull_tree_owner *owners, size_t count,
+                        hull_tree_sink sink, void *context, char *detail, size_t detail_cap);
+
 /* One entry of such a stream, for a writer that has no directory to walk,
  * as `hull push` writes a layer from a manifest: its name as the stream
  * holds it, a directory's ending in `/`; its type, '0' a file, '2' a

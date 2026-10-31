@@ -89,6 +89,11 @@ typedef struct text {
 	int     failed;
 } text;
 
+static int owner_order(const void *a, const void *b)
+{
+	return strcmp(((const hull_tree_owner *)a)->path, ((const hull_tree_owner *)b)->path);
+}
+
 static void add(text *t, const char *bytes, size_t n)
 {
 	if (t->failed)
@@ -457,8 +462,8 @@ static void retire_imports(const char *tree, const char *keep)
  * not one per state of it that ever ran. hull.path is that path in hex,
  * for gc to ask whether the tree is still there.
  */
-static const char *import_dir(const char *root, char *image, size_t cap, char *detail,
-                              size_t detail_cap)
+static const char *import_dir(const char *root, const hull_tree_owner *owners, size_t count,
+                              char *image, size_t cap, char *detail, size_t detail_cap)
 {
 	static const char changed[] = "the directory changed while it was imported";
 	reading           first;
@@ -479,7 +484,7 @@ static const char *import_dir(const char *root, char *image, size_t cap, char *d
 
 	memset(&first, 0, sizeof first);
 	hull_sha256_init(&first.sha);
-	if (hull_tree_tar(root, counted, &first, detail, detail_cap) != 0)
+	if (hull_tree_tar_owned(root, owners, count, counted, &first, detail, detail_cap) != 0)
 		return detail;
 	hull_sha256_final(&first.sha, digest);
 	hull_sha256_hex(digest, hex);
@@ -535,7 +540,7 @@ static const char *import_dir(const char *root, char *image, size_t cap, char *d
 		return detail;
 	}
 	free(head.data);
-	if (hull_tree_tar(root, sent, &second, detail, detail_cap) != 0) {
+	if (hull_tree_tar_owned(root, owners, count, sent, &second, detail, detail_cap) != 0) {
 		close(fd);
 		if (second.over)
 			snprintf(detail, detail_cap, "%s", changed);
@@ -1125,25 +1130,110 @@ static void remove_container(const char *id)
 }
 
 
-/* The image the machine runs: its ref, or its dir's import. A reason, or
- * NULL. */
+/* (owners PATH)'s list, as engine/idmap.c reads it -- UID, GID and a path
+ * of the tree, each ended by a NUL -- into `list`, sorted by path, its
+ * text held in `*data`, for the import's tar to give each its owner, as
+ * chroot gives them in its namespace: the workload runs as the user, so
+ * a docker import is where an owner can be given without root. A
+ * reason, or NULL. */
+static const char *read_owners(const char *path, char **data, hull_tree_owner **list,
+                               size_t *count)
+{
+	FILE  *f = fopen(path, "re");
+	size_t length = 0u;
+	size_t cap = 0u;
+	size_t n;
+
+	*data  = NULL;
+	*list  = NULL;
+	*count = 0u;
+	if (f == NULL)
+		return "the owners' file cannot be read";
+	for (;;) {
+		char *more;
+
+		if (length == cap) {
+			if (cap >= (64u << 20) || (more = realloc(*data, cap + 65536u)) == NULL) {
+				fclose(f);
+				return "the owners' file is too large";
+			}
+			*data = more;
+			cap += 65536u;
+		}
+		n = fread(*data + length, 1u, cap - length, f);
+		length += n;
+		if (n == 0u)
+			break;
+	}
+	fclose(f);
+	for (size_t at = 0u; at < length;) {
+		const char      *fields[3];
+		unsigned         k = 0u;
+		hull_tree_owner *grown;
+
+		for (; k < 3u && at < length; k++) {
+			fields[k] = *data + at;
+			while (at < length && (*data)[at] != '\0')
+				at++;
+			if (at == length)
+				break;
+			at++;
+		}
+		if (k < 3u)
+			break;
+		if ((*count & 1023u) == 0u) {
+			grown = realloc(*list, (*count + 1024u) * sizeof **list);
+			if (grown == NULL)
+				return "out of memory";
+			*list = grown;
+		}
+		(*list)[*count].path = fields[2];
+		(*list)[*count].uid  = strtoull(fields[0], NULL, 10);
+		(*list)[*count].gid  = strtoull(fields[1], NULL, 10);
+		(*count)++;
+	}
+	if (*count > 1u)
+		qsort(*list, *count, sizeof **list, owner_order);
+	return NULL;
+}
+
+/* The image the machine runs: its ref, or its dir's import, with the
+ * owners (owners PATH) gives. A reason, or NULL. */
 static const char *source_image(const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
                                 char *image, size_t cap)
 {
-	char       *source = hull_access_value(doc, machine, "source");
-	char       *root;
-	const char *reason = NULL;
+	char            *source = hull_access_value(doc, machine, "source");
+	char            *given = hull_access_value(doc, machine, "owners");
+	char            *root;
+	char            *data = NULL;
+	hull_tree_owner *owners = NULL;
+	size_t           count = 0u;
+	const char      *reason = NULL;
 
-	if (source != NULL && is_ref(source)) {
+	if (given != NULL) {
+		char *at = hull_access_path(doc, given);
+
+		reason = at == NULL ? "out of memory" : read_owners(at, &data, &owners, &count);
+		free(at);
+	}
+	if (reason != NULL) {
+		/* said below */
+	} else if (source != NULL && is_ref(source)) {
 		snprintf(image, cap, "%s", source);
+		if (given != NULL)
+			reason = "owners are given to a dir's import: an image ref keeps its own";
 	} else if (source != NULL && strncmp(source, "dir:", 4u) == 0 && source[4] != '\0') {
 		root = hull_access_path(doc, source + 4);
 		reason = root == NULL ? "out of memory" :
-		         import_dir(root, image, cap, create_detail, sizeof create_detail);
+		         import_dir(root, owners, count, image, cap, create_detail,
+		                    sizeof create_detail);
 		free(root);
 	} else {
 		reason = "the docker adapter runs an image ref or a dir";
 	}
+	free(owners);
+	free(data);
+	free(given);
 	free(source);
 	return reason;
 }
@@ -1826,8 +1916,8 @@ static const hull_cap_entry entries[] = {
 	  "not yet: a container's layers are its image's", NULL },
 	{ "upper",              HULL_SUP_REJECTED,
 	  "a container's writable layer is the daemon's", NULL },
-	{ "owners",             HULL_SUP_REJECTED,
-	  "not yet: an image's own owners are docker's", NULL },
+	{ "owners",             HULL_SUP_EMULATED,
+	  "given in the dir's import, its tar carrying each listed owner", NULL },
 	{ "init",               HULL_SUP_REJECTED,
 	  "not yet: a container's PID 1 is docker's init, for its signals", NULL },
 	{ "segments",           HULL_SUP_REJECTED,
