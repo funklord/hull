@@ -94,6 +94,32 @@ expect 0 '^write=ok$' vol
 cases=$((cases + 1))
 [ -O "$root/data/out" ] || fail "a write through a volume is not this account's file" "$(ls -l "$root/data")"
 rm -f "$root/data/out"
+# (export PATH): the container's root as a tar once its workload ends,
+# docker export's, with what the workload wrote, as its uid, and no
+# volume; it commits as chroot's does. A file that cannot be made is
+# refused before anything runs.
+rm -f "$root/exported.tar"
+conf exported "(export \"$root/exported.tar\")" \
+	'(command "sh" "-c" "echo made here > /tmp/made; cat /data/in")' \
+	'(volumes (volume (host "./data") (guest "/data")))'
+expect 0 '^from the host$' exported
+cases=$((cases + 1))
+said=$(timeout 30 python3 -c '
+import sys, tarfile
+t = tarfile.open(sys.argv[1])
+names = {m.name.rstrip("/"): m for m in t}
+made = names.get("tmp/made")
+print("made", t.extractfile(made).read().decode().strip() if made else "-", made.uid if made else "-")
+print("volume", "data/in" in names)
+print("shell", "bin/sh" in names)' "$root/exported.tar" 2>&1)
+[ "$said" = "$(printf 'made made here %s\nvolume False\nshell True' "$(id -u)")" ] ||
+	fail "an export's tree is not the container's" "$said"
+cases=$((cases + 1))
+committed=$(timeout 60 "$hull" commit --tar "$root/exported.tar" dexported/1 2>&1)
+printf '%s\n' "$committed" | grep -q '^dexported/1 sha256:' ||
+	fail "a docker export did not commit" "$committed"
+conf unexported '(export "/proc/hull-no-such/export.tar") (command "true")'
+expect 125 "the export.s file /proc/hull-no-such/export\\.tar: No such file or directory" unexported
 # Refused for being read-only, by name, and somewhere this uid could
 # otherwise write: /tmp, on the root, is everybody's.
 conf volro '(command "sh" "-c" "echo x > /data/out || true")' \

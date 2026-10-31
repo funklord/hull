@@ -73,6 +73,7 @@ struct hull_machine {
 	pthread_mutex_t  lock;
 	pthread_cond_t   done_cond;
 	int              done;
+	int              export_fd;  /* (export PATH)'s file, or -1 */
 	char             detail[512];
 };
 
@@ -994,6 +995,68 @@ static int read_full(int fd, uint8_t *buffer, size_t n)
 	return 0;
 }
 
+/* The container's root as docker export gives it, into (export PATH)'s
+ * file once the workload has ended: the daemon's tar, owners and xattrs as
+ * the container has them, no volume, as on chroot. Asked over HTTP/1.0 so
+ * the body comes unchunked and ends with the connection. A failure empties
+ * the file, which no commit takes, says why on the workload's stderr, and
+ * makes the end 125, as on chroot. */
+static void export_container(hull_machine *m, long *code)
+{
+	char    request[256];
+	char    head[4096];
+	char    detail[512] = "";
+	uint8_t buffer[65536];
+	size_t  n = 0u;
+	int     status = 0;
+	int     fd = dial();
+
+	snprintf(request, sizeof request,
+	         "GET " API "/containers/%s/export HTTP/1.0\r\nHost: docker\r\n\r\n", m->id);
+	if (fd < 0 || send_all(fd, request, strlen(request)) != 0) {
+		snprintf(detail, sizeof detail, "the Docker daemon at %s cannot be reached",
+		         socket_path());
+	} else {
+		while (n + 1u < sizeof head && read(fd, head + n, 1u) == 1) {
+			n++;
+			if (n >= 4u && memcmp(head + n - 4u, "\r\n\r\n", 4u) == 0)
+				break;
+		}
+		head[n] = '\0';
+		if (sscanf(head, "HTTP/1.%*d %d", &status) != 1 || status != 200)
+			snprintf(detail, sizeof detail, "the daemon answered the export %d", status);
+	}
+	while (detail[0] == '\0') {
+		ssize_t got = read(fd, buffer, sizeof buffer);
+
+		if (got < 0 && errno == EINTR)
+			continue;
+		if (got < 0)
+			snprintf(detail, sizeof detail, "reading it: %s", strerror(errno));
+		if (got <= 0)
+			break;
+		if (send_all(m->export_fd, (const char *)buffer, (size_t)got) != 0)
+			snprintf(detail, sizeof detail, "writing it: %s", strerror(errno));
+	}
+	if (detail[0] == '\0' && fsync(m->export_fd) != 0)
+		snprintf(detail, sizeof detail, "writing it: %s", strerror(errno));
+	if (fd >= 0)
+		close(fd);
+	if (detail[0] != '\0') {
+		char said[600];
+		int  length = snprintf(said, sizeof said, "hull: export: %s\n", detail);
+
+		if (ftruncate(m->export_fd, 0) != 0) {
+			/* nothing more can be done; the status says it */
+		}
+		if (length > 0)
+			host->on_data(m->core, NULL, 2, (const uint8_t *)said, (size_t)length);
+		*code = 125;
+	}
+	close(m->export_fd);
+	m->export_fd = -1;
+}
+
 static void *read_workload(void *arg)
 {
 	hull_machine *m = arg;
@@ -1026,6 +1089,8 @@ static void *read_workload(void *arg)
 	if (call("POST", path, NULL, &status, &answer) == 0 && status == 200)
 		json_number(answer, "StatusCode", &code);
 	free(answer);
+	if (m->export_fd >= 0)
+		export_container(m, &code);
 	pthread_mutex_lock(&m->lock);
 	m->done = 1;
 	pthread_cond_broadcast(&m->done_cond);
@@ -1040,6 +1105,8 @@ static void *read_workload(void *arg)
 static void release(hull_machine *m)
 {
 	hull_hostdev_unclaim(m);
+	if (m->export_fd >= 0)
+		close(m->export_fd);
 	free(m->body);
 	pthread_mutex_destroy(&m->lock);
 	pthread_cond_destroy(&m->done_cond);
@@ -1090,6 +1157,7 @@ static hull_status docker_create(hull_core *core, hull_buf plan, hull_machine **
 	const char     *reason;
 	char           *answer = NULL;
 	char           *hostname;
+	char           *export;
 	char            path[160];
 	char            image[256];
 	int             status = 0;
@@ -1099,10 +1167,29 @@ static hull_status docker_create(hull_core *core, hull_buf plan, hull_machine **
 	m = calloc(1u, sizeof *m);
 	if (m == NULL)
 		return fail(error, HULL_ERR_INTERNAL, "out of memory");
-	m->core   = core;
-	m->attach = -1;
+	m->core      = core;
+	m->attach    = -1;
+	m->export_fd = -1;
 	pthread_mutex_init(&m->lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
+	/* The export's file opened now, as chroot does before its workload,
+	 * so a path that cannot be written is said before anything runs. */
+	if ((export = hull_access_value(&doc, &machine, "export")) != NULL) {
+		char *at = hull_access_path(&doc, export);
+
+		if (at == NULL ||
+		    (m->export_fd = open(at, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+		                         0600)) < 0) {
+			snprintf(create_detail, sizeof create_detail, "the export's file %s: %s",
+			         at != NULL ? at : export, at != NULL ? strerror(errno) : "no path");
+			free(at);
+			free(export);
+			release(m);
+			return fail(error, HULL_ERR_RUNTIME, create_detail);
+		}
+		free(at);
+		free(export);
+	}
 	hostname = hull_access_value(&doc, &machine, "hostname");
 	snprintf(m->name, sizeof m->name, "hull-%s-%ld-%u", hostname != NULL ? hostname : "machine",
 	         (long)getpid(), machines_made++);
@@ -1268,8 +1355,9 @@ static hull_status docker_adopt(hull_core *core, hull_buf state, hull_machine **
 	m = calloc(1u, sizeof *m);
 	if (m == NULL)
 		return fail(error, HULL_ERR_INTERNAL, "out of memory");
-	m->core   = core;
-	m->attach = -1;
+	m->core      = core;
+	m->attach    = -1;
+	m->export_fd = -1;   /* the export's file was the old core's, and went with it */
 	pthread_mutex_init(&m->lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
 	memcpy(m->id, state.data, state.len);
@@ -1732,8 +1820,8 @@ static const hull_cap_entry entries[] = {
 	  "docker's own bridge, or the docker network (bridge NAME) names", NULL },
 	{ "bridge",             HULL_SUP_NATIVE,   "a docker network, by its name", NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   NULL, NULL },
-	{ "export",             HULL_SUP_REJECTED,
-	  "not yet: docker export does it, and the adapter does not call it", NULL },
+	{ "export",             HULL_SUP_NATIVE,
+	  "docker export, once the workload ends", NULL },
 	{ "layers",             HULL_SUP_REJECTED,
 	  "not yet: a container's layers are its image's", NULL },
 	{ "upper",              HULL_SUP_REJECTED,
