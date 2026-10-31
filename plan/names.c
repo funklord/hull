@@ -31,6 +31,24 @@ static int entry_text(const hull_spec *spec, const hull_sexpr_form *item, const 
 	return 1;
 }
 
+/* A duration the spec has checked, "30s" and its kind, as seconds; 0
+ * past what an unsigned holds. */
+static unsigned seconds_of(const char *text)
+{
+	char         *end;
+	unsigned long n = strtoul(text, &end, 10);
+	unsigned long unit;
+
+	switch (*end) {
+	case 'm': unit = 60u; break;
+	case 'h': unit = 3600u; break;
+	case 'd': unit = 86400u; break;
+	case 'w': unit = 604800u; break;
+	default:  unit = 1u; break;
+	}
+	return n > UINT32_MAX / unit ? 0u : (unsigned)(n * unit);
+}
+
 /* A (segments ...) element's name, a string or a list's head, and its
  * subnet's text into `subnet` where it has one, else "", and its IPv6
  * subnet's into `subnet6` likewise. 0 if unreadable. */
@@ -168,6 +186,8 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 			char                subnet[32];
 			char                subnet6[64];
 			char                advertise[8];
+			char                every[16];
+			unsigned            seconds = 0u;
 			char                gateway[8];
 			uint32_t            network = 0u;
 			unsigned            prefix = 0u;
@@ -185,14 +205,20 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 			if (subnet6[0] != '\0')
 				parse_subnet6(subnet6, network6, &prefix6);
 			if (!entry_text(spec, &item, "advertise", advertise, sizeof advertise) ||
-			    !entry_text(spec, &item, "gateway", gateway, sizeof gateway))
+			    !entry_text(spec, &item, "gateway", gateway, sizeof gateway) ||
+			    !entry_text(spec, &item, "advertise_every", every, sizeof every))
 				return refuse(names, "a segment of %s cannot be read%s", ids[i], "");
+			if (every[0] != '\0' && strcmp(advertise, "true") == 0)
+				seconds = seconds_of(every);
 			s = find(names, name);
 			/* Advertised where any machine asks it: one advertiser on a
 			 * segment, hull at ::1, whoever names it; and a gateway the
 			 * same, .1 being one. */
 			if (s != NULL && strcmp(advertise, "true") == 0)
 				s->advertise = 1;
+			/* Sent unasked as often as the most eager machine asks. */
+			if (s != NULL && seconds != 0u && (s->every == 0u || seconds < s->every))
+				s->every = seconds;
 			if (s != NULL && strcmp(gateway, "true") == 0)
 				s->gateway = 1;
 			/* Each family's network named by any machine is the segment's;
@@ -243,6 +269,7 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 			s = &names->segment[names->count++];
 			snprintf(s->name, sizeof s->name, "%s", name);
 			s->advertise = strcmp(advertise, "true") == 0;
+			s->every     = seconds;
 			s->gateway   = strcmp(gateway, "true") == 0;
 			s->has4    = subnet[0] != '\0';
 			s->network = network;
@@ -418,6 +445,14 @@ long hull_names_entry(const hull_names *names, unsigned member, uint8_t *data, s
 			}
 		if (s->advertise)
 			put(&o, "(9:advertise4:true)", 19u);
+		if (s->advertise && s->every != 0u) {
+			char text_every[16];
+
+			snprintf(text_every, sizeof text_every, "%u", s->every);
+			put(&o, "(15:advertise_every", 19u);
+			put_atom(&o, text_every);
+			put(&o, ")", 1u);
+		}
 		if (s->gateway)
 			put(&o, "(7:gateway4:true)", 17u);
 		/* The hosts, by id: insertion, as there are at most 256. */

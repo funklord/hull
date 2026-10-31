@@ -164,6 +164,8 @@ typedef struct segment {
 	rule     rules[MAX_RULES];
 	source   sources[MAX_SOURCES];
 	capture  capture;
+	unsigned every;     /* seconds between router advertisements sent unasked; 0, none */
+	uint64_t next_ra;   /* when the next of those is due */
 } segment;
 
 /* A question .1 asked on for a machine, until its answer or MAX_ASKED_NS:
@@ -1258,7 +1260,9 @@ static void send_advert(segment *s, unsigned to, const uint8_t mac[6], const pee
  * outright; the prefix, on-link and for SLAAC; ::1 as its DNS server
  * (RDNSS, RFC 8106) and
  * `hull` to search (DNSSL). The lifetimes are for ever, as the network's
- * is the segment's while it is there, so nothing is sent unasked. */
+ * is the segment's while it is there; so it is sent unasked only where a
+ * plan asks it, (advertise_every D), for a machine that starts to accept
+ * advertisements after its kernel solicited (send_unasked). */
 static void send_ra(segment *s, unsigned to, const uint8_t mac[6], const peer *asker)
 {
 	static const uint8_t all_nodes[16] = { 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
@@ -1317,6 +1321,22 @@ static void send_ra(segment *s, unsigned to, const uint8_t mac[6], const peer *a
 		return;
 	put32(reply, (uint32_t)total);
 	cross(s, to, HULL_SEGMENT_IN, reply, 4u + total);
+}
+
+/* `s`'s router advertisement to every node on every port, where it is
+ * due: when the next is due, or UINT64_MAX where none is asked. */
+static uint64_t send_unasked(segment *s, uint64_t now)
+{
+	const peer unspecified = { .six = 1 };
+
+	if (s->every == 0u || !advertises(s))
+		return UINT64_MAX;
+	if (now >= s->next_ra) {
+		for (unsigned i = 0u; i < s->port_count; i++)
+			send_ra(s, i, hull_mac, &unspecified);
+		s->next_ra = now + (uint64_t)s->every * 1000000000u;
+	}
+	return s->next_ra;
 }
 
 static unsigned resolvers(struct sockaddr_in6 out[3]);
@@ -2689,6 +2709,8 @@ static void *serve(void *arg)
 			}
 			if (s != NULL && (due = fire_sources(s, now)) < first)
 				first = due;
+			if (s != NULL && (due = send_unasked(s, now)) < first)
+				first = due;
 		}
 		{
 			uint64_t due = conn_timers(now);
@@ -2798,6 +2820,26 @@ static int addressed_apart(const segment *s, const port *p, char *why, size_t ca
 int hull_segment_port(const char *key, const char *machine, char *why, size_t cap)
 {
 	return hull_segment_port_addressed(key, machine, 0u, 0u, 0, why, cap);
+}
+
+int hull_segment_advertise_every(const char *key, unsigned seconds)
+{
+	segment *s;
+	uint64_t next;
+
+	pthread_mutex_lock(&lock);
+	s = find(key);
+	if (s != NULL && seconds != 0u && (s->every == 0u || seconds < s->every)) {
+		next = now_ns() + (uint64_t)seconds * 1000000000u;
+		if (s->every == 0u || next < s->next_ra)
+			s->next_ra = next;
+		s->every = seconds;
+	}
+	pthread_mutex_unlock(&lock);
+	if (s == NULL)
+		return -1;
+	(void)!write(wake[1], "", 1u);   /* for the poll() to take its timer */
+	return 0;
 }
 
 void hull_segment_resolvers(const char *const *servers, const unsigned *ports, unsigned count)

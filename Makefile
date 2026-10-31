@@ -176,7 +176,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  natsaid.conf natplan.conf bridged.conf bridge2.conf brnamed.conf brnone.conf \
                  brports.conf brdocker.conf brserve.conf brserve.out brsshd.conf brssh/probe \
                  brssh/usr/sbin/sshd relay-resolv.conf fakedns.py ping.conf compose.yaml \
-                 noimage.yaml arm64.conf armtree.conf dual.conf only6.conf advert.conf \
+                 noimage.yaml arm64.conf armtree.conf dual.conf only6.conf advert.conf advevery.conf \
                  gateway.conf gwlisten.out gateway6.conf hello.py replhold.conf \
                  ownroot.conf natports.bind ordered.conf unready.conf ordergone.conf orderdata/up orderdata/composed \
                  cserve.conf cserve.out cheld.out cheld.in portready.conf portunready.conf) \

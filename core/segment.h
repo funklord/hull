@@ -160,6 +160,14 @@ int hull_segment_port_named(const char *key, const char *machine, uint32_t addre
                             const hull_segment_host *hosts, unsigned count, char *why, size_t cap);
 
 /*
+ * hull's router advertisements on segment `key`, where it advertises, sent
+ * unasked as well, to every node, every `seconds`: the least any port's
+ * plan asks while the segment is there, the first now. 0, or -1 where
+ * there is no such segment.
+ */
+int hull_segment_advertise_every(const char *key, unsigned seconds);
+
+/*
  * The resolvers .1 asks on to, `count` of them, at most three: IPv4
  * addresses and their UDP ports, in place of /etc/resolv.conf's, for a
  * test that cannot own port 53. A `count` of 0 goes back to the host's.

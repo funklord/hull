@@ -581,6 +581,18 @@ static void test_names(void)
 	    strstr(entry_of(&names, 1u), ")(9:advertise4:true)(6:hosts6(") == NULL)
 		FAIL("advertise was not the segment's, or not in its place: %s", entry_of(&names, 1u));
 
+	/* (advertise_every D) the least any machine asks, in seconds, written
+	 * after advertise. */
+	cases++;
+	if (draw_file("(machines " SEG("a", "(n (subnet6 \"fd03::/64\") (advertise true)"
+	                                    " (advertise_every \"2m\"))")
+	              SEG("b", "(n (subnet6 \"fd03::/64\") (advertise true) (advertise_every \"30s\"))")
+	              SEG("c", "(n (subnet6 \"fd03::/64\"))") ")", &names) != 0 ||
+	    names.segment[0].every != 30u ||
+	    strstr(entry_of(&names, 2u), ")(9:advertise4:true)(15:advertise_every2:30)(6:hosts6(") ==
+	        NULL)
+		FAIL("advertise_every was not the least, or not in its place: %s", entry_of(&names, 2u));
+
 	/* (gateway true) the same: one machine's asks it of the segment, and
 	 * it is written after advertise, before the hosts. */
 	cases++;

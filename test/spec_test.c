@@ -294,6 +294,14 @@ static void test_records(void)
 	/* Router advertisements, of an IPv6 network of /64 alone. */
 	OK(M("(segments (wire (subnet6 \"fd42:99::/64\") (advertise true)))"));
 	OK(M("(segments (wire (subnet \"10.99.0.0/24\") (advertise false)))"));
+	/* Sent unasked as well, only beside it, every a duration. */
+	OK(M("(segments (wire (subnet6 \"fd42:99::/64\") (advertise true) (advertise_every \"30s\")))"));
+	NO(M("(segments (wire (subnet6 \"fd42:99::/64\") (advertise_every \"30s\")))"), SHAPE,
+	   "(advertise_every", "machine.segments.wire.advertise_every");
+	NO(M("(segments (wire (subnet6 \"fd42:99::/64\") (advertise false) (advertise_every \"30s\")))"),
+	   SHAPE, "(advertise_every", "machine.segments.wire.advertise_every");
+	NO(M("(segments (wire (subnet6 \"fd42:99::/64\") (advertise true) (advertise_every \"30\")))"),
+	   VALUE, "\"30\"", "machine.segments.wire.advertise_every");
 	NO(M("(segments (wire (subnet6 \"fd42:99::/80\") (advertise true)))"), SHAPE, "(advertise true)",
 	   "machine.segments.wire.advertise");
 	NO(M("(segments (wire (subnet \"10.99.0.0/24\") (advertise true)))"), SHAPE, "(advertise true)",

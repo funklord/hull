@@ -1530,6 +1530,25 @@ int main(void)
 				check("a solicitation for hull's link-local address, advertised",
 				      n >= 54u + 32u && r[54] == 136u && memcmp(r + 62, link_local, 16u) == 0 &&
 				      memcmp(r + 22, link_local, 16u) == 0);
+				/* Nothing unasked, until (advertise_every D) asks it: then
+				 * the advertisement to every node, every D, the port having
+				 * solicited nothing. */
+				check("nothing advertised unasked, where no plan asks it",
+				      next_raw(a, r, sizeof r, 1500) == 0u);
+				check("unasked advertisements, on no segment, refused",
+				      hull_segment_advertise_every("nosuch", 1u) == -1);
+				check("unasked advertisements, asked every second",
+				      hull_segment_advertise_every("ra6", 1u) == 0);
+				for (int k = 0; k < 2; k++) {
+					static const uint8_t all_nodes_mac[6] = { 0x33, 0x33, 0, 0, 0, 1 };
+
+					n = next_raw(a, r, sizeof r, 1600);
+					check(k == 0 ? "an advertisement unasked, to every node" :
+					               "and another a second later",
+					      n >= o + 80u && memcmp(r, all_nodes_mac, 6u) == 0 && r[54] == 134u &&
+					      memcmp(r + 22, link_local, 16u) == 0 && r[53] == 1u && r[38] == 0xffu &&
+					      r[o + 8u] == 3u && memcmp(r + o + 24u, self6, 8u) == 0);
+				}
 				close(a);
 			}
 		}

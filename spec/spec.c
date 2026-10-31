@@ -599,12 +599,14 @@ static const key segment_keys[] = {
 	{ .name = "subnet6", .type = STRING, .value = subnet6 },
 	{ .name = "advertise", .type = BOOLEAN },
 	{ .name = "gateway", .type = BOOLEAN },
+	{ .name = "advertise_every", .type = STRING, .value = duration },
 };
 static const schema segment = TABLE_ACROSS(segment_keys, segment_across);
 
 /* Where these sit in segment_keys, for segment_across. */
 #define SEGMENT_SUBNET6   1u
 #define SEGMENT_ADVERTISE 2u
+#define SEGMENT_EVERY     4u
 
 /* Whether the record's `at` key, present, is `true`. */
 static int given_true(const walk *w, const hull_sexpr_form *found, uint64_t present, unsigned at)
@@ -621,8 +623,9 @@ static int given_true(const walk *w, const hull_sexpr_form *found, uint64_t pres
 
 /* Given subnet, subnet6 or both; (advertise true), hull's router
  * advertisements for SLAAC, only of an IPv6 network of /64, the one
- * length SLAAC makes an address in (RFC 4862 5.5.3). (gateway true), a
- * way out through .1 and ::1, takes either network. */
+ * length SLAAC makes an address in (RFC 4862 5.5.3), and
+ * (advertise_every "30s"), the same sent unasked as well, only beside it.
+ * (gateway true), a way out through .1 and ::1, takes either network. */
 static hull_spec_status segment_across(walk *w, const hull_sexpr_form *record,
                                        const hull_sexpr_form *found, uint64_t present)
 {
@@ -635,8 +638,15 @@ static hull_spec_status segment_across(walk *w, const hull_sexpr_form *record,
 	if ((present & 3u) == 0u)
 		return fail(w, HULL_SPEC_ERR_MISSING, record->offset,
 		            "a segment hull addresses is given its subnet, its subnet6, or both");
-	if (!given_true(w, found, present, SEGMENT_ADVERTISE))
-		return HULL_SPEC_OK;
+	if (!given_true(w, found, present, SEGMENT_ADVERTISE)) {
+		if (!(present & ((uint64_t)1 << SEGMENT_EVERY)))
+			return HULL_SPEC_OK;
+		saved = push_text(w, "advertise_every");
+		fail(w, HULL_SPEC_ERR_SHAPE, found[SEGMENT_EVERY].offset,
+		     "sends hull's router advertisements unasked, which needs (advertise true)");
+		pop(w, saved);
+		return HULL_SPEC_ERR_SHAPE;
+	}
 	if (present & ((uint64_t)1 << SEGMENT_SUBNET6)) {
 		hull_sexpr_child(w->doc, &found[SEGMENT_SUBNET6], &head);
 		hull_sexpr_next(w->doc, &head, &value);

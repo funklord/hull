@@ -1599,6 +1599,21 @@ from_root 0 '^ra-a +\| slaac=eth0 fd42:84::[0-9a-f:]*ff:fe[0-9a-f:]*$' -f "$root
 cases=$((cases + 1))
 printf '%s\n' "$out" | grep -q '^ra-b *| slaac=eth0 none$' ||
 	fail "a machine on a segment hull does not advertise made a SLAAC address" "$out"
+# (advertise_every D): a machine that takes advertisements only after its
+# kernel would have solicited -- IPv6 brought back up with accept_ra 0,
+# then 1, so that it solicits nothing -- makes its SLAAC address from one
+# hull sends unasked; on a segment advertised only when asked, none.
+late='"tell" "/proc/sys/net/ipv6/conf/eth0/accept_ra" "0" "tell" "/proc/sys/net/ipv6/conf/eth0/disable_ipv6" "1" "tell" "/proc/sys/net/ipv6/conf/eth0/disable_ipv6" "0" "sleep" "3" "tell" "/proc/sys/net/ipv6/conf/eth0/accept_ra" "1" "slaac" "eth0"'
+printf '(machines (ra-late %s) (ra-asked %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (every-$$ (subnet6 \"fd42:82::/64\") (advertise true) (advertise_every \"2s\"))) (command \"/probe\" $late)" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (asked-$$ (subnet6 \"fd42:81::/64\") (advertise true))) (command \"/probe\" $late)" \
+	> "$root/advevery.conf"
+limit=60
+from_root 0 '^ra-late +\| slaac=eth0 fd42:82::[0-9a-f:]*ff:fe[0-9a-f:]*$' -f "$root/advevery.conf"
+cases=$((cases + 1))
+[ "$(printf '%s\n' "$out" | grep -c '| tell=ok$')" = 8 ] &&
+	printf '%s\n' "$out" | grep -q '^ra-asked *| slaac=eth0 none$' ||
+	fail "a machine taking advertisements late made a SLAAC address where hull sends none unasked" "$out"
 # The compose dialect (section 9): `hull up` runs the compose file beside
 # it with no step between, saying on stderr what it does not translate,
 # and `-f` gives one to plan as to run. Its services share the project's
