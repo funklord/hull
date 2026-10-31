@@ -3398,49 +3398,154 @@ static void *read_dial(void *arg)
 	return NULL;
 }
 
+/* A connect not answered in two seconds is refused: 0, or why not. */
+static int connect_within(int fd, const struct sockaddr_in *to)
+{
+	struct pollfd wait = { fd, POLLOUT, 0 };
+	int           failed = 0;
+	socklen_t     length = sizeof failed;
+
+	if (connect(fd, (const struct sockaddr *)to, sizeof *to) == 0)
+		return 0;
+	if (errno != EINPROGRESS)
+		return errno;
+	if (poll(&wait, 1u, 2000) != 1)
+		return ETIMEDOUT;
+	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &failed, &length) != 0)
+		return errno;
+	return failed;
+}
+
 /*
- * A connection to the machine's sshd, for `hull proxy-ssh` and `hull ssh`
- * (section 8.1). chroot shares the host's network, so the sshd bound the
- * machine's own 127.107 address on HULL_SSH_PORT (run_init), and this is a
- * plain connect to it on the host loopback -- no agent, unlike qemu's over
- * vsock. Only the sshd is reachable this way; a machine with none, or a
- * dial to any other port, is refused.
+ * A connection to `port` on the machine's own loopback, made in its
+ * network namespace: by a child, which joins the machine's user namespace
+ * and then its network one -- which a thread of the core cannot, the core
+ * having threads -- connects there, and hands the socket back. A socket
+ * stays in the namespace it was made in, so the core reads and writes it
+ * as any other. The fd, or -1 with why not in `failed`.
+ */
+static int dial_inside(const hull_machine *m, uint16_t port, int *failed)
+{
+	static const char *const kinds[] = { "user", "net" };
+	static const int         flags[] = { CLONE_NEWUSER, CLONE_NEWNET };
+	char                     path[64];
+	char                     control[CMSG_SPACE(sizeof(int))];
+	int                      ns[2];
+	int                      pair[2];
+	int                      fd = -1;
+	int                      why = 0;
+	pid_t                    child;
+	struct iovec             part = { &why, sizeof why };
+	struct msghdr            message = { 0 };
+	struct cmsghdr          *header;
+
+	for (unsigned i = 0u; i < 2u; i++) {
+		snprintf(path, sizeof path, "/proc/%ld/ns/%s", (long)m->pid, kinds[i]);
+		ns[i] = open(path, O_RDONLY | O_CLOEXEC);
+	}
+	if (ns[0] < 0 || ns[1] < 0 || socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) {
+		*failed = ns[0] < 0 || ns[1] < 0 ? ESRCH : errno;
+		for (unsigned i = 0u; i < 2u; i++)
+			if (ns[i] >= 0)
+				close(ns[i]);
+		return -1;
+	}
+	child = fork();
+	if (child == 0) {
+		struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(port),
+		                          .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+
+		close(pair[0]);
+		for (unsigned i = 0u; i < 2u && why == 0; i++)
+			if (setns(ns[i], flags[i]) != 0)
+				why = errno;
+		if (why == 0 &&
+		    (fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)) < 0)
+			why = errno;
+		if (why == 0)
+			why = connect_within(fd, &to);
+		message.msg_iov    = &part;
+		message.msg_iovlen = 1u;
+		if (why == 0) {
+			message.msg_control    = control;
+			message.msg_controllen = sizeof control;
+			header                 = CMSG_FIRSTHDR(&message);
+			header->cmsg_level     = SOL_SOCKET;
+			header->cmsg_type      = SCM_RIGHTS;
+			header->cmsg_len       = CMSG_LEN(sizeof(int));
+			memcpy(CMSG_DATA(header), &fd, sizeof fd);
+		}
+		_exit(sendmsg(pair[1], &message, 0) < 0);
+	}
+	close(ns[0]);
+	close(ns[1]);
+	close(pair[1]);
+	if (child < 0) {
+		*failed = errno;
+		close(pair[0]);
+		return -1;
+	}
+	message.msg_iov        = &part;
+	message.msg_iovlen     = 1u;
+	message.msg_control    = control;
+	message.msg_controllen = sizeof control;
+	why = EIO;
+	if (recvmsg(pair[0], &message, MSG_CMSG_CLOEXEC) == (ssize_t)sizeof why && why == 0 &&
+	    (header = CMSG_FIRSTHDR(&message)) != NULL && header->cmsg_type == SCM_RIGHTS)
+		memcpy(&fd, CMSG_DATA(header), sizeof fd);
+	else if (why == 0)
+		why = EIO;
+	close(pair[0]);
+	waitpid(child, NULL, 0);
+	*failed = why;
+	return why == 0 ? fd : -1;
+}
+
+/*
+ * One of the machine's ports, declared or not, as a stream. The sshd
+ * (ssh true) gave it, for `hull proxy-ssh` and `hull ssh` (section 8.1),
+ * bound the machine's own 127.107 address on HULL_SSH_PORT (run_init), so
+ * port 22 is a plain connect to that on the host loopback. Any other port
+ * is the machine's own loopback: in its network namespace where it has
+ * one, the host's under (network host), whose ports are the machine's.
  */
 static hull_status chroot_dial(hull_core *core, hull_machine *m, uint16_t port,
                                hull_stream **out, hull_error *error)
 {
 	struct sockaddr_in to;
-	struct pollfd      wait;
 	hull_stream       *st;
 	int                fd;
 	int                failed = 0;
-	socklen_t          length = sizeof failed;
+	int                done;
 
-	if (!m->ssh)
-		return fail(error, HULL_ERR_UNSUPPORTED, "that machine runs no sshd to reach");
-	if (port != 22u)
-		return fail(error, HULL_ERR_UNSUPPORTED, "a chroot machine has no port to dial but its "
-		            "sshd's, which is port 22");
+	pthread_mutex_lock(&m->lock);
+	done = m->done;
+	pthread_mutex_unlock(&m->lock);
+	if (!m->started || done)
+		return fail(error, HULL_ERR_GONE, "the machine is not running");
 	memset(&to, 0, sizeof to);
 	to.sin_family = AF_INET;
-	to.sin_port   = htons(HULL_SSH_PORT);
-	if (inet_pton(AF_INET, m->address_text, &to.sin_addr) != 1)
-		return fail(error, HULL_ERR_GONE, "the machine has no address to dial");
-	fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-	if (fd < 0)
-		return fail(error, HULL_ERR_INTERNAL, "no socket to dial with");
-	if (connect(fd, (struct sockaddr *)&to, sizeof to) != 0) {
-		wait = (struct pollfd){ fd, POLLOUT, 0 };
-		if (errno != EINPROGRESS)
-			failed = errno;
-		else if (poll(&wait, 1u, 2000) != 1)
-			failed = ETIMEDOUT;
-		else if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &failed, &length) != 0)
-			failed = errno;
+	if (port == 22u && m->ssh) {
+		to.sin_port = htons(HULL_SSH_PORT);
+		if (inet_pton(AF_INET, m->address_text, &to.sin_addr) != 1)
+			return fail(error, HULL_ERR_GONE, "the machine has no address to dial");
+	} else {
+		to.sin_port        = htons(port);
+		to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 	}
-	if (failed != 0) {
-		close(fd);
-		snprintf(m->detail, sizeof m->detail, "port 22: %s", strerror(failed));
+	if ((m->no_network || m->nat || m->bridge) && !(port == 22u && m->ssh)) {
+		fd = dial_inside(m, port, &failed);
+	} else {
+		fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+		if (fd < 0)
+			return fail(error, HULL_ERR_INTERNAL, "no socket to dial with");
+		if ((failed = connect_within(fd, &to)) != 0) {
+			close(fd);
+			fd = -1;
+		}
+	}
+	if (fd < 0) {
+		snprintf(m->detail, sizeof m->detail, "port %u: %s", (unsigned)port, strerror(failed));
 		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	}
 	if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK) != 0 ||

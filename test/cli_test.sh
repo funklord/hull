@@ -712,10 +712,60 @@ cmp -s "$root/ssh-config.before" "$root/home/.ssh/config" ||
 	fail "ssh-config --remove did not give back the file as it was" "$(cat "$root/home/.ssh/config")"
 expect 1 '^hull: ssh-config: HOME is not set$' env -u HOME "$hull" ssh-config
 
-# A chroot machine without (ssh true) runs no sshd, so proxy-ssh has
-# nothing to reach; and a name that is only the suffix names none.
-expect 125 "^hull: that machine runs no sshd to reach$" "$hull" proxy-ssh execd.hull
+# A chroot machine's own ports, any of them, since 2026-10-31: dialed on
+# its loopback in its network namespace, so proxy-ssh reaches a 22 it
+# serves itself, and one nothing listens on is refused; a name that is
+# only the suffix names none.
+expect 125 "^hull: port 22: Connection refused$" "$hull" proxy-ssh execd.hull
 expect 125 '^hull: \.hull names no machine$' "$hull" proxy-ssh .hull
+conf cserve '(command "/probe" "serve" "tcp" "22" "serve" "tcp" "22")' '(hostname "cserve")'
+rm -f "$root/cserve.out" "$root/cheld.out" "$root/cheld.in"
+(cd / && exec timeout -k 2 60 "$hull_abs" run -f "$root/cserve.conf" > "$root/cserve.out" 2>&1) &
+server=$!
+tries=0
+until grep -q '^serving$' "$root/cserve.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+heard=$(printf 'hi from ssh\n' | (cd / && timeout 20 "$hull_abs" proxy-ssh cserve 2>&1))
+got=$?
+cases=$((cases + 1))
+[ "$got" = 0 ] && [ "$heard" = "hello from the machine" ] &&
+	grep -q '^served=hi from ssh$' "$root/cserve.out" ||
+	fail "proxy-ssh did not carry a chroot machine's own port 22 both ways: $got" \
+		"$heard; $(cat "$root/cserve.out")"
+# And a signal to proxy-ssh, which ssh ends its ProxyCommand with, ends
+# the connection it holds: the core resets it, as docker's does. Its
+# input is a fifo this shell holds open, and the probe gives up on a
+# silent client after 5 seconds, so the end is looked for in 2.
+tries=0
+until [ "$(grep -c '^serving$' "$root/cserve.out" 2>/dev/null)" = 2 ] || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+mkfifo "$root/cheld.in"
+exec 9<> "$root/cheld.in"
+(cd / && exec "$hull_abs" proxy-ssh cserve < "$root/cheld.in" > "$root/cheld.out" 2>&1) &
+held=$!
+tries=0
+until grep -q '^hello from the machine$' "$root/cheld.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+kill -HUP "$held" 2>/dev/null
+tries=0
+while [ -d "/proc/$held" ] && [ "$tries" -lt 8 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+cases=$((cases + 1))
+[ ! -d "/proc/$held" ] && grep -q '^hello from the machine$' "$root/cheld.out" ||
+	fail "a SIGHUP to proxy-ssh did not end its connection to a chroot machine" \
+		"$(cat "$root/cheld.out")"
+kill -KILL "$held" 2>/dev/null
+wait "$held" 2>/dev/null
+exec 9>&-
+wait "$server"
 expect 0 '^GREETING=hi$' "$hull" exec execd /probe env GREETING
 # Small, and counted from 3 in the machine's own PID namespace, where a
 # host pid would be neither.
