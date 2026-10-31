@@ -212,7 +212,8 @@ QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf vbuilt.conf die.
 
 # What test/flip_test.sh writes: the project, and its rsync'd copy.
 FLIP_PROJECT    = hull.conf rootfs/probe rootfs/etc/flip
-FLIP_TEST_FILES = $(addprefix $(BUILD_DIR)/test/flip/, chroot.out docker.out vm.out emu.out \
+FLIP_TEST_FILES = $(addprefix $(BUILD_DIR)/test/flip/, chroot.out docker.out vm.out emu.out nodocker.out \
+                  run/hull/core.log run/hull/core.lock \
                   $(addprefix project/, $(FLIP_PROJECT)) \
                   $(addprefix deployed/, $(FLIP_PROJECT) data/out))
 
@@ -267,7 +268,7 @@ help:
 	@echo '  check     style, the situ contracts, then the tests'
 	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
 	@echo '  check-qemu    hull run on the qemu engine, as the user, with KVM'
-	@echo '  check-flip    one hull.conf, rsync'"'"'d, run on docker, vm and emu'
+	@echo '  check-flip    one hull.conf, rsync'"'"'d, run on chroot, vm, emu and docker'
 	@echo '  test      build and run the reader tests, the vectors, then the gate'"'"'s'
 	@echo '  vectors   the described schemas against bytes they must accept and refuse'
 	@echo '  style     the indentation and whitespace gate'

@@ -82,9 +82,10 @@ them has:
 - **One file, three ways to run it.** `--backend vm` or `--backend emu`
   moves a machine from namespaces on the host's kernel to a KVM guest or
   to TCG emulation; `--backend docker` hands it to a Docker daemon where
-  one is wanted. A project copied with `rsync` runs unchanged on docker,
-  vm and emu, with the same output and its port at the same address,
-  which `make check-flip` holds it to.
+  one is wanted. A project copied with `rsync` runs unchanged on chroot,
+  vm, emu and docker, with the same output and its port at the same
+  address, which `make check-flip` holds it to -- the first three with
+  Docker absent.
 - **A directory is a machine.** Point the spec at a directory and run;
   no image is built or stored. Images are there when wanted: `hull pull`
   and `hull push` speak to any OCI registry, `hull build` caches each
@@ -557,7 +558,7 @@ make         # build/hull and its agent; fetches vendor/situ the first time
 fmake        # ./hull, ./hull-agent and ./libnss_hull.so, as fmake.toml describes
 make check   # the style gate, the situ contracts, then the tests
 make check-qemu    # the vm and emu engines, booting real guests
-make check-flip    # one project, unchanged, on docker, vm and emu
+make check-flip    # one project, unchanged, on chroot, vm, emu and docker
 make check-docker  # the docker adapter, against the daemon
 make hooks   # install the commit-msg hook
 ```
