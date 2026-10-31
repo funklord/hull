@@ -99,7 +99,8 @@ them has:
   line that gives it.
 - **Differences reported, not discovered.** `hull plan` lists every
   field of a spec as native, emulated at a stated cost, or rejected with
-  the reason, for the backend chosen, before anything runs.
+  the reason, for the backend chosen, before anything runs; `hull check`
+  does it for several backends at once.
 - **Networks to test against.** Machines on chroot and on vms join one
   layer-2 segment, switched by hull, as the user. Given a subnet, they
   are addressed, named to each other and answered by hull's own DNS;
@@ -111,7 +112,7 @@ them has:
   traffic in netem's terms, changed while running; frames can be
   dropped, rewritten or replayed by pattern, or injected; and any link
   can be captured to a pcap file, with counts of what happened to every
-  frame.
+  frame -- in the spec, or at runtime by `hull segment NAME`.
 - **A kernel of its own when the test needs one.** A vm loads the host's
   modules, `mac80211_hwsim` radios or `pppoe`, or boots a kernel given
   as a file or carried by the image, and the image's own init can run
