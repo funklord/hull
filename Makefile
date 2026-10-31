@@ -177,7 +177,8 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  brports.conf brdocker.conf brserve.conf brserve.out brsshd.conf brssh/probe \
                  brssh/usr/sbin/sshd relay-resolv.conf fakedns.py ping.conf compose.yaml \
                  noimage.yaml arm64.conf armtree.conf dual.conf only6.conf advert.conf \
-                 gateway.conf gwlisten.out gateway6.conf hello.py replhold.conf) \
+                 gateway.conf gwlisten.out gateway6.conf hello.py replhold.conf \
+                 ownroot.conf) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
 # What test/docker_test.sh writes.
@@ -235,17 +236,18 @@ TEST_RUNTIME_OBJS = $(BUILD_DIR)/test/runtime_test.o
 TEST_SEGMENT_OBJS = $(BUILD_DIR)/test/segment_test.o
 TEST_HOSTDEV_OBJS = $(BUILD_DIR)/test/hostdev_test.o
 TEST_ISO_OBJS     = $(BUILD_DIR)/test/iso_test.o
+TEST_IDMAP_OBJS   = $(BUILD_DIR)/test/idmap_test.o
 TEST_OBJS = $(TEST_SEXPR_OBJS) $(TEST_FRAMING_OBJS) $(TEST_SPEC_OBJS) $(TEST_MATRIX_OBJS) \
             $(TEST_REGISTRY_OBJS) $(TEST_PLAN_OBJS) $(TEST_WIRE_OBJS) $(TEST_SHA256_OBJS) \
             $(TEST_TREE_OBJS) $(TEST_JSON_OBJS) $(TEST_RUNTIME_OBJS) $(TEST_SEGMENT_OBJS) \
-            $(TEST_HOSTDEV_OBJS) $(TEST_ISO_OBJS)
+            $(TEST_HOSTDEV_OBJS) $(TEST_ISO_OBJS) $(TEST_IDMAP_OBJS)
 TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
             $(BUILD_DIR)/test/spec_test $(BUILD_DIR)/test/matrix_test \
             $(BUILD_DIR)/test/registry_test $(BUILD_DIR)/test/plan_test \
             $(BUILD_DIR)/test/wire_test $(BUILD_DIR)/test/sha256_test \
             $(BUILD_DIR)/test/tree_tar $(BUILD_DIR)/test/json_test $(BUILD_DIR)/test/runtime_test \
             $(BUILD_DIR)/test/segment_test $(BUILD_DIR)/test/hostdev_test \
-            $(BUILD_DIR)/test/iso_test
+            $(BUILD_DIR)/test/iso_test $(BUILD_DIR)/test/idmap_test
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
@@ -444,6 +446,9 @@ $(BUILD_DIR)/test/plan_test: $(TEST_PLAN_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR
 $(BUILD_DIR)/test/wire_test: $(TEST_WIRE_OBJS) $(WIRE_OBJS) $(SEXPR_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
+$(BUILD_DIR)/test/idmap_test: $(TEST_IDMAP_OBJS) $(BUILD_DIR)/engine/idmap.o
+	$(CC) $(CFLAGS) -o $@ $^
+
 $(BUILD_DIR)/test/sha256_test: $(TEST_SHA256_OBJS) $(BUILD_DIR)/engine/sha256.o
 	$(CC) $(CFLAGS) -o $@ $^
 
@@ -493,6 +498,7 @@ test: $(TEST_BINS) $(HULL) $(PROBE) $(ARM64_PROBE) $(NSS_LIB) vectors
 	$(BUILD_DIR)/test/plan_test
 	$(BUILD_DIR)/test/wire_test
 	$(BUILD_DIR)/test/sha256_test
+	$(BUILD_DIR)/test/idmap_test
 	$(BUILD_DIR)/test/json_test
 	BUILD_DIR='$(BUILD_DIR)' $(BUILD_DIR)/test/runtime_test
 	$(BUILD_DIR)/test/segment_test

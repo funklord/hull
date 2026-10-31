@@ -1654,6 +1654,118 @@ static void relay_frames(const int *tap, const int *port, unsigned n)
 	}
 }
 
+/* How deep and how far unmapped_owner() looks: a tree's own top, where
+ * its owners are set, without reading a whole distribution's files. */
+#define OWNER_DEPTH   3u
+#define OWNER_ENTRIES 20000u
+
+/* Under the directory `fd`, its path `path`, the first entry -- itself,
+ * then what it holds to OWNER_DEPTH -- whose owner or group the machine
+ * cannot map (hull_id_mapped()), the tree's top aside: 1 with its path, the id and which kind
+ * in `found`, `id` and `group`; 0 where none is. `fd` is closed. */
+static int unmapped_owner(int fd, char *path, size_t cap, unsigned depth, unsigned *seen,
+                          uid_t uid, gid_t gid, int many, unsigned long *id, int *group)
+{
+	struct stat    self;
+	DIR           *dir;
+	struct dirent *entry;
+	size_t         length = strlen(path);
+	int            found = 0;
+
+	if (fstat(fd, &self) != 0) {
+		close(fd);
+		return 0;
+	}
+	/* Not the tree's own top, whose upper is hull's, never copied up. */
+	if (depth != 0u && (!hull_id_mapped(0, self.st_uid, uid, gid, many) ||
+	                    !hull_id_mapped(1, self.st_gid, uid, gid, many))) {
+		*group = hull_id_mapped(0, self.st_uid, uid, gid, many);
+		*id    = *group ? (unsigned long)self.st_gid : (unsigned long)self.st_uid;
+		close(fd);
+		return 1;
+	}
+	if (depth >= OWNER_DEPTH || (dir = fdopendir(fd)) == NULL) {
+		close(fd);
+		return 0;
+	}
+	while (!found && *seen < OWNER_ENTRIES && (entry = readdir(dir)) != NULL) {
+		struct stat each;
+
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue;
+		(*seen)++;
+		if (fstatat(dirfd(dir), entry->d_name, &each, AT_SYMLINK_NOFOLLOW) != 0)
+			continue;
+		snprintf(path + length, cap - length, "%s%s", length > 1u ? "/" : "", entry->d_name);
+		if (S_ISDIR(each.st_mode)) {
+			int sub = openat(dirfd(dir), entry->d_name,
+			                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+
+			if (sub >= 0)
+				found = unmapped_owner(sub, path, cap, depth + 1u, seen, uid, gid, many,
+				                       id, group);
+		} else if (!hull_id_mapped(0, each.st_uid, uid, gid, many) ||
+		           !hull_id_mapped(1, each.st_gid, uid, gid, many)) {
+			*group = hull_id_mapped(0, each.st_uid, uid, gid, many);
+			*id    = *group ? (unsigned long)each.st_gid : (unsigned long)each.st_uid;
+			found  = 1;
+		}
+		if (!found)
+			path[length] = '\0';
+	}
+	closedir(dir);
+	return found;
+}
+
+/*
+ * What a machine above an overlay is told of its tree, into `out`, or ""
+ * : the first owner in the source or a layer the machine cannot map,
+ * which the overlay refuses to copy up, so that a write there fails with
+ * EOVERFLOW, "Value too large for defined data type", and nothing says
+ * why. Found in this workspace's own trees, whose directories are the
+ * group users and setgid, where the user's primary group is its own. The
+ * line in /etc/subuid or /etc/subgid that would map the id is named;
+ * hull maps what such a line grants as itself (hull_map_many()).
+ */
+static void owner_notice(const hull_machine *m, uid_t uid, gid_t gid, char *out, size_t cap)
+{
+	const char *trees[1u + MAX_VOLUMES];
+	unsigned    count = 0u;
+
+	out[0] = '\0';
+	if (!m->overlay)
+		return;
+	trees[count++] = m->root;
+	for (unsigned i = 0u; i < m->layer_count; i++)
+		trees[count++] = m->layer_path[i];
+	for (unsigned i = 0u; i < count; i++) {
+		char           path[4096] = "/";
+		unsigned       seen = 0u;
+		unsigned long  id = 0u;
+		int            group = 0;
+		int            fd = trees[i] != NULL ?
+		                    open(trees[i], O_RDONLY | O_DIRECTORY | O_CLOEXEC) : -1;
+		struct passwd *me = getpwuid(uid);
+
+		if (fd < 0 ||
+		    !unmapped_owner(fd, path, sizeof path, 0u, &seen, uid, gid, m->many, &id, &group))
+			continue;
+		if (id == 0u)
+			snprintf(out, cap, "hull: %s %s owns %.400s in the tree, the host's root, which no "
+			         "machine of a user's maps: a write there under (mutable overlay) fails, "
+			         "Value too large for defined data type\n", group ? "group" : "user",
+			         "0", path);
+		else
+			snprintf(out, cap, "hull: %s %lu owns %.400s in the tree and is not mapped into the "
+			         "machine: a write there under (mutable overlay) fails, Value too large "
+			         "for defined data type; the line `%s:%lu:1` in %s maps it, a "
+			         "one-time setting for the host's owner\n", group ? "group" : "user", id,
+			         path, me != NULL ? me->pw_name : "USER", id,
+			         group ? "/etc/subgid" : "/etc/subuid");
+		return;
+	}
+}
+
 /*
  * The machine's NICs on its segments, eth0, eth1, ..., each a tap in its
  * own network namespace with the MAC hull_access_segment_mac() gives it,
@@ -1820,9 +1932,19 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	{
 		char said = 0;
 
+		char    notice[1024];
+		ssize_t told = 0;
+		ssize_t n;
+
 		if (read(mapped, &said, 1u) != 1)
 			child_fail(report, "the uid map");
+		while (told < (ssize_t)sizeof notice &&
+		       (n = read(mapped, notice + told, sizeof notice - (size_t)told)) > 0)
+			told += n;
 		close(mapped);
+		if (told > 0 && write(err[1], notice, (size_t)told) < 0) {
+			/* the workload's stderr is gone; nothing to tell */
+		}
 		if (said == 'O') {
 			static const char one[] =
 			    "hull: one uid is mapped, the host giving this user no subordinate range: "
@@ -2779,6 +2901,16 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 		kill(m->pid, SIGKILL);
 	if (write(mapped[1], m->many ? "M" : wanted ? "O" : "S", 1u) != 1) {
 		/* The child reads its end closed and says so on the report. */
+	}
+	/* After it, what the machine is to be told of its tree's owners, if
+	 * anything: read to the end, the end being this close. */
+	{
+		char notice[1024];
+
+		owner_notice(m, uid, gid, notice, sizeof notice);
+		if (notice[0] != '\0' && write(mapped[1], notice, strlen(notice)) < 0) {
+			/* a notice lost is a notice; the machine runs */
+		}
 	}
 	close(mapped[1]);
 	if (dir_fd >= 0)

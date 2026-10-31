@@ -2107,6 +2107,45 @@ if { tr '\0' ' ' < "/proc/$core_pid/cmdline"; } 2>/dev/null | grep -q ' core $';
 fi
 rm -rf "${root:?}/replrun"
 
+# A tree's owner the machine cannot map: a directory of a group of the
+# user's that is not its primary one and that no line of /etc/subgid
+# grants -- this workspace's trees are the group users, setgid, which
+# found it -- is named on stderr with the line that maps it, since a
+# write there under (mutable overlay) fails with EOVERFLOW and nothing
+# else says why; with the user's own group, nothing is said and the write
+# lands.
+other_group=
+for g in $(id -G); do
+	[ "$g" = "$(id -g)" ] && continue
+	awk -F: -v u="$(id -un)" -v n="$(id -u)" -v g="$g" \
+		'($1 == u || $1 == n) && g >= $2 && g < $2 + $3 { found = 1 } END { exit !found }' \
+		/etc/subgid 2>/dev/null && continue
+	other_group=$g
+	break
+done
+rm -rf "$root/ownroot"
+mkdir -p "$root/ownroot/proc" "$root/ownroot/dev" "$root/ownroot/sys" "$root/ownroot/srv"
+cp "$root/rootfs/probe" "$root/ownroot/probe"
+chgrp -R "$(id -g)" "$root/ownroot"
+chmod -R g-s "$root/ownroot"
+printf '%s\n' '(machine (source "dir:./ownroot") (mutable overlay) (command "/probe" "write" "/srv/x"))' \
+	> "$root/ownroot.conf"
+from_root 0 '^write=ok$' -f "$root/ownroot.conf"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q 'owns .* in the tree' &&
+	fail "a tree of the user's own group drew a notice of its owners" "$out"
+if [ -n "$other_group" ]; then
+	chgrp "$other_group" "$root/ownroot/srv"
+	from_root 0 "^hull: group $other_group owns /srv in the tree and is not mapped into the machine: .* the line \`$(id -un):$other_group:1\` in /etc/subgid maps it" \
+		-f "$root/ownroot.conf"
+	cases=$((cases + 1))
+	printf '%s\n' "$out" | grep -q '^write=Value too large for defined data type$' ||
+		fail "a write into a directory of an unmapped group did not fail as said" "$out"
+else
+	printf 'cli: the user has no group but its own, or subgid grants them all; the owner notice is not tried\n'
+fi
+rm -rf "$root/ownroot"
+
 # One core: a second gives way to the first, says nothing, and leaves the
 # first answering on its socket.
 expect 0 '' "$hull" core
