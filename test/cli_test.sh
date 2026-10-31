@@ -78,7 +78,7 @@ printf '%s\n' '(machine (source "debian:13") (ports (port (host 8080) (guest 80)
 printf '%s\n' '(machine (source "dir:./rootfs"))' > "$dir/dir.conf"
 printf '%s\n' '(machine (source "dir:.") (fidelity inotify))' > "$dir/inotify.conf"
 printf '%s\n' '(machine (source "debian:13") (arch riscv64))' > "$dir/foreign.conf"
-printf '%s\n' '(machines (web (source "debian:13")) (db (source "dir:./db")))' \
+printf '%s\n' '(machines (web (source "debian:13")) (db (source "dir:./db") (init "/sbin/init")))' \
 	> "$dir/machines.conf"
 printf '%s\n' '(build (base "debian:13"))' > "$dir/build.conf"
 printf '%s\n' '(machine (sauce "a"))' > "$dir/bad.conf"
@@ -364,9 +364,9 @@ expect 0 'source\.ref\.overlay: native$' "$hull" plan --explain -f "$dir/ref.con
 # no image yet.
 expect 1 ':1:10: machine on qemu \(vm\): source\.ref\.overlay: rejected: the engine does not declare this field$' \
 	"$hull" plan -f "$dir/ref.conf" --backend vm
-expect 1 ':1:10: machine on docker \(ns\): source\.dir\.direct: rejected: docker cannot' \
+# A dir in place, docker's since 2026-10-31, emulated and said so.
+expect 0 ':1:10: machine on docker \(ns\): source\.dir\.direct: emulated: the directory.s entries bound' \
 	"$hull" plan -f "$dir/dir.conf" --backend docker
-expect 1 'machine on docker \(ns\): rejected, 1 field$' "$hull" plan -f "$dir/dir.conf" --backend docker
 # Segments are qemu's and chroot's: docker refuses them, and says why.
 printf '%s\n' '(machine (source "dir:./rootfs") (segments "wire"))' > "$dir/segmented.conf"
 expect 0 'segments: native: a tap each' \
@@ -381,6 +381,7 @@ expect 0 'init: native: the image.s init is PID 1, the engine.s a child of it' \
 	"$hull" plan --explain -f "$dir/inited.conf" --backend chroot
 expect 1 'init: rejected: the workload runs as the user, and an image.s init wants root' \
 	"$hull" plan -f "$dir/inited.conf" --backend docker
+expect 1 'machine on docker \(ns\): rejected, 1 field$' "$hull" plan -f "$dir/inited.conf" --backend docker
 expect 2 'plan takes one backend' "$hull" plan -f "$dir/ref.conf" --backend ns,vm
 expect 0 '^\(machine \(source "debian:13"\) \(ports \(port \(host 8080\) \(guest 80\) \(proto tcp\)\)\) .*\(projection bind\)\)$' \
 	"$hull" plan --resolved -f "$dir/ref.conf" --backend docker
@@ -394,12 +395,12 @@ expect 1 'fidelity\.inotify: rejected: .* \(--accept vm:inotify-poll honours it\
 	"$hull" plan -f "$dir/inotify.conf" --backend vm
 expect 0 'fidelity\.inotify: accepted' \
 	"$hull" plan -f "$dir/inotify.conf" --backend vm --accept vm:inotify-poll
-expect 1 'source\.dir\.direct: rejected' \
-	"$hull" plan -f "$dir/dir.conf" --backend docker --accept vm:inotify-poll
+expect 1 'init: rejected' \
+	"$hull" plan -f "$dir/inited.conf" --backend docker --accept vm:inotify-poll
 
 # check: every backend listed, and the worst of them decides.
-expect 1 'machine on qemu \(vm\): ok$' "$hull" check -f "$dir/dir.conf" --backend docker,vm
-expect 1 'machine on docker \(ns\): rejected' "$hull" check -f "$dir/dir.conf" --backend docker,vm
+expect 1 'machine on qemu \(vm\): ok$' "$hull" check -f "$dir/inited.conf" --backend docker,vm
+expect 1 'machine on docker \(ns\): rejected' "$hull" check -f "$dir/inited.conf" --backend docker,vm
 expect 0 'machine on chroot \(ns\): ok$' "$hull" check -f "$dir/dir.conf" --backend ns,vm
 expect 0 'machine on qemu \(emu\): ok$' "$hull" check -f "$dir/dir.conf" --backend vm,emu
 expect 1 'machine on qemu \(vm\): arch: rejected: only the emu class' \
@@ -3024,9 +3025,9 @@ devconf() { # NAME ENTRIES...: a machine of devroot, whose tree has a /dev
 devconf devnode '(devices (node "/dev/net/tun")) (command "/probe" "read" "/dev/net/tun" "kind" "/dev/net/tun")'
 expect 0 'devices.node: native: the host.s node, bound into /dev' \
 	"$hull" plan --explain -f "$root/devnode.conf"
-# Rejected for its direct dir source, which docker cannot run, and not
-# for its device.
-expect 1 'devices.node: native: the host.s node by --device' \
+# Its device docker's --device, its dir in place docker's too since
+# 2026-10-31.
+expect 0 'devices.node: native: the host.s node by --device' \
 	"$hull" plan --explain -f "$root/devnode.conf" --backend docker
 expect 1 'devices.node: rejected: a host.s device node has no device of a guest.s to be' \
 	"$hull" plan -f "$root/devnode.conf" --backend vm

@@ -92,6 +92,9 @@ struct hull_machine {
 		int        upper_fd;   /* the upper, held open for its writes, or -1 */
 	}                stacks[MAX_STACKS];
 	unsigned         stack_count;
+	char            *direct;     /* (mutable direct): the directory bound in, or NULL */
+	char            *direct_binds;  /* its entries' binds, frame_direct's, as JSON strings */
+	size_t           direct_binds_length;
 	char             detail[512];
 };
 
@@ -1057,6 +1060,17 @@ static void add_ports(text *exposed, text *bindings, const hull_sexpr_doc *doc,
 /* A failed create returns no handle, so it keeps its reason where the
  * caller can read it after the handle is gone. */
 static char create_detail[512];
+static int  resolve_in(const char *root, const char *path, char *out, size_t cap);
+
+/* Whether the machine is a dir run in place, (mutable direct). */
+static int in_place(const hull_sexpr_doc *doc, const hull_sexpr_form *machine)
+{
+	char *mode = hull_access_value(doc, machine, "mutable");
+	int   direct = mode != NULL && strcmp(mode, "direct") == 0;
+
+	free(mode);
+	return direct;
+}
 
 /* The create request's body, into `m->body`. Returns a reason, or NULL. */
 static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
@@ -1177,6 +1191,37 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	}
 	if (hull_access_find(doc, machine, "volumes", &entry))
 		reason = add_binds(&binds, doc, &entry, m->detail, sizeof m->detail);
+	/* In place: the directory's entries, and a volume's guest path there,
+	 * which docker would otherwise make in the user's tree as root. */
+	if (reason == NULL && m->direct != NULL) {
+		if (hull_access_find(doc, machine, "volumes", &entry)) {
+			hull_sexpr_form item;
+
+			hull_sexpr_child(doc, &entry, &item);
+			for (int more = hull_sexpr_next(doc, &item, &item); more && reason == NULL;
+			     more = hull_sexpr_next(doc, &item, &item)) {
+				char       *guest = hull_access_value(doc, &item, "guest");
+				char        resolved[4096];
+				char        at[8400];
+				struct stat there;
+
+				if (guest != NULL &&
+				    (resolve_in(m->direct, guest, resolved, sizeof resolved) != 0 ||
+				     (snprintf(at, sizeof at, "%s/%s", m->direct, resolved),
+				      lstat(at, &there) != 0))) {
+					snprintf(m->detail, sizeof m->detail, "volume %s: the guest path is not in "
+					         "the machine, and is made only above an overlay", guest);
+					reason = m->detail;
+				}
+				free(guest);
+			}
+		}
+		if (reason == NULL && m->direct_binds_length != 0u) {
+			if (binds.length != 0u)
+				add_text(&binds, ",");
+			add(&binds, m->direct_binds, m->direct_binds_length);
+		}
+	}
 	/* The secrets the core wrote, read-only where J.3 puts them; the
 	 * daemon makes the mount point. */
 	hull_sexpr_first(doc, &top);
@@ -2228,6 +2273,8 @@ static void release(hull_machine *m)
 		close(m->upper_fd);
 	for (unsigned i = 0u; i < m->tree_count; i++)
 		free(m->trees[i]);
+	free(m->direct);
+	free(m->direct_binds);
 	for (unsigned i = 0u; i < m->stack_count; i++) {
 		free(m->stacks[i].guest);
 		hull_stack_release(&m->stacks[i].stack);
@@ -2321,6 +2368,369 @@ static const char *read_owners(const char *path, char **data, hull_tree_owner **
 
 /* The image the machine runs: its ref, or its dir's import, with the
  * owners (owners PATH) gives. A reason, or NULL. */
+/* --- a directory in place ---------------------------------------------- */
+
+static const char *direct_image(const char *root, const text *body, char *image, size_t cap,
+                                char *detail, size_t detail_cap);
+
+/* A ustar entry of the frame's image, into `t`: a directory or a symlink,
+ * its name short enough for ustar's field. 0, or -1. */
+static int frame_entry(text *t, const char *name, char type, unsigned mode, const char *link)
+{
+	char     block[512];
+	unsigned sum = 0u;
+
+	if (strlen(name) >= 100u || (link != NULL && strlen(link) >= 100u))
+		return -1;
+	memset(block, 0, sizeof block);
+	memcpy(block, name, strlen(name));
+	snprintf(block + 100, 8u, "%07o", mode & 07777u);
+	memcpy(block + 108, "0000000", 7u);
+	memcpy(block + 116, "0000000", 7u);
+	memcpy(block + 124, "00000000000", 11u);
+	memcpy(block + 136, "00000000000", 11u);
+	memset(block + 148, ' ', 8u);
+	block[156] = type;
+	if (link != NULL)
+		memcpy(block + 157, link, strlen(link));
+	memcpy(block + 257, "ustar", 6u);
+	memcpy(block + 263, "00", 2u);
+	for (size_t i = 0u; i < sizeof block; i++)
+		sum += (unsigned char)block[i];
+	snprintf(block + 148, 8u, "%06o", sum);
+	add(t, block, sizeof block);
+	return t->failed ? -1 : 0;
+}
+
+/* `path`, "/etc/hosts", as the machine would find it in the tree at
+ * `root`: each symlink on the way followed inside the tree, an absolute
+ * one from its root, so that a /sbin linked to usr/sbin is usr/sbin. The
+ * real relative path into `out`, "usr/sbin/docker-init"; what is missing
+ * is kept as written. 0, or -1 for a loop or a path too long. */
+static int resolve_in(const char *root, const char *path, char *out, size_t cap)
+{
+	char     rest[4096];
+	char     done[4096] = "";
+	unsigned links = 0u;
+
+	snprintf(rest, sizeof rest, "%s", path);
+	for (;;) {
+		char       *at = rest;
+		char       *slash;
+		char        component[256];
+		char        here[8400];
+		char        target[4096];
+		struct stat there;
+		ssize_t     n;
+
+		while (*at == '/')
+			at++;
+		if (*at == '\0')
+			break;
+		slash = strchr(at, '/');
+		snprintf(component, sizeof component, "%.*s", slash != NULL ? (int)(slash - at) :
+		         (int)strlen(at), at);
+		memmove(rest, slash != NULL ? slash : "", strlen(slash != NULL ? slash : "") + 1u);
+		if (strcmp(component, ".") == 0)
+			continue;
+		if (strcmp(component, "..") == 0) {
+			char *up = strrchr(done, '/');
+
+			if (up != NULL)
+				*up = '\0';
+			else
+				done[0] = '\0';
+			continue;
+		}
+		snprintf(here, sizeof here, "%s/%s%s%s", root, done, done[0] != '\0' ? "/" : "",
+		         component);
+		if (lstat(here, &there) == 0 && S_ISLNK(there.st_mode)) {
+			char joined[8200];
+
+			if (++links > 40u || (n = readlink(here, target, sizeof target - 1u)) < 0)
+				return -1;
+			target[n] = '\0';
+			if (target[0] == '/')
+				done[0] = '\0';
+			snprintf(joined, sizeof joined, "%s%s", target, rest);
+			if (strlen(joined) >= sizeof rest)
+				return -1;
+			memcpy(rest, joined, strlen(joined) + 1u);
+			continue;
+		}
+		if (strlen(done) + strlen(component) + 2u >= sizeof done)
+			return -1;
+		if (done[0] != '\0')
+			strcat(done, "/");
+		strcat(done, component);
+	}
+	return snprintf(out, cap, "%s", done) >= (int)cap ? -1 : 0;
+}
+
+/* Whether `rel` is one of the `count` directories split. */
+static int is_split(char *const *split, size_t count, const char *rel)
+{
+	for (size_t i = 0u; i < count; i++)
+		if (strcmp(split[i], rel) == 0)
+			return 1;
+	return 0;
+}
+
+/*
+ * The tree at `root` bound into a container entry by entry, `rel` the
+ * directory walked, "" the root: each entry a bind into `binds`, `:ro`
+ * with `readonly`, but a symlink, which goes into `frame` as itself rather
+ * than followed on the host; a split directory, one docker mounts
+ * something inside, walked in turn, it being the frame's own, root's, so
+ * that what docker makes there is made in the image and never in the
+ * user's tree, and a new file there is refused rather than kept nowhere;
+ * and what docker mounts itself, /proc, /sys, /dev and `skip`, left out.
+ * A reason, or NULL.
+ */
+static const char *bind_tree(const char *root, const char *rel, char *const *split, size_t count,
+                             char *const *skip, size_t skip_count, int readonly, text *binds,
+                             text *frame)
+{
+	char           here[4200];
+	DIR           *list;
+	struct dirent *found;
+	char         **names = NULL;
+	size_t         n = 0u;
+	const char    *reason = NULL;
+
+	snprintf(here, sizeof here, "%s%s%s", root, rel[0] != '\0' ? "/" : "", rel);
+	if ((list = opendir(here)) == NULL)
+		return "the directory cannot be read";
+	while ((found = readdir(list)) != NULL) {
+		char **grown;
+
+		if (strcmp(found->d_name, ".") == 0 || strcmp(found->d_name, "..") == 0)
+			continue;
+		if ((grown = realloc(names, (n + 1u) * sizeof *names)) == NULL ||
+		    (grown[n] = strdup(found->d_name)) == NULL) {
+			names = grown != NULL ? grown : names;
+			reason = "out of memory";
+			break;
+		}
+		names = grown;
+		n++;
+	}
+	closedir(list);
+	if (names != NULL)
+		qsort(names, n, sizeof *names, path_order);
+	for (size_t i = 0u; i < n && reason == NULL; i++) {
+		char        child[4200];
+		char        host[8400];
+		struct stat there;
+		int         skipped = 0;
+
+		snprintf(child, sizeof child, "%s%s%s", rel, rel[0] != '\0' ? "/" : "", names[i]);
+		snprintf(host, sizeof host, "%s/%s", root, child);
+		for (size_t k = 0u; k < skip_count; k++)
+			skipped |= strcmp(skip[k], child) == 0;
+		if (skipped || (rel[0] == '\0' && (strcmp(child, "proc") == 0 ||
+		                                   strcmp(child, "sys") == 0 ||
+		                                   strcmp(child, "dev") == 0)))
+			continue;
+		if (lstat(host, &there) != 0) {
+			reason = "an entry of the directory went while it was read";
+		} else if (S_ISLNK(there.st_mode)) {
+			char    target[4096];
+			ssize_t length = readlink(host, target, sizeof target - 1u);
+
+			if (length < 0)
+				reason = "a symlink of the directory cannot be read";
+			else {
+				target[length] = '\0';
+				if (frame_entry(frame, child, '2', 0777u, target) != 0)
+					reason = "a symlink's path or target is past ustar's 100 bytes";
+			}
+		} else if (S_ISDIR(there.st_mode) && is_split(split, count, child)) {
+			char dir_name[4208];
+
+			snprintf(dir_name, sizeof dir_name, "%s/", child);
+			if (frame_entry(frame, dir_name, '5', 0755u, NULL) != 0)
+				reason = "a directory's path is past ustar's 100 bytes";
+			else
+				reason = bind_tree(root, child, split, count, skip, skip_count, readonly, binds,
+				                   frame);
+		} else {
+			text bind = { 0 };
+
+			add_text(&bind, host);
+			add_text(&bind, ":/");
+			add_text(&bind, child);
+			add_text(&bind, readonly ? ":ro" : ":rw");
+			if (binds->length != 0u)
+				add_text(binds, ",");
+			add_json(binds, bind.data != NULL ? bind.data : "");
+			binds->failed |= bind.failed;
+			free(bind.data);
+		}
+	}
+	for (size_t i = 0u; i < n; i++)
+		free(names[i]);
+	free(names);
+	return reason;
+}
+
+/*
+ * (mutable direct)'s frame: what docker mounts in every container, its
+ * init and the three /etc files, and a secrets directory where there is
+ * one, each resolved in the tree; every directory above each split, so
+ * docker makes its mount point in the image rather than in the user's
+ * tree, where it would make it as root; the tree's symlinks among them
+ * and at its top as the image's own; the rest bound into `binds`. The
+ * image is imported, and its name into `image`. A reason, or NULL.
+ */
+static const char *frame_direct(hull_machine *m, int secrets, int readonly, text *binds,
+                                char *image, size_t cap)
+{
+	static const char *const targets[] = {
+		"/sbin/docker-init", "/etc/hosts", "/etc/hostname", "/etc/resolv.conf",
+		"/run/hull/secrets", NULL
+	};
+	char       *split[64];
+	char       *skip[8];
+	size_t      split_count = 0u;
+	size_t      skip_count = 0u;
+	text        frame = { 0 };
+	const char *reason = NULL;
+	char        zeroes[1024];
+
+	for (unsigned i = 0u; targets[i] != NULL && reason == NULL; i++) {
+		char resolved[4096];
+		char cut[4096];
+
+		if (strcmp(targets[i], "/run/hull/secrets") == 0 && !secrets)
+			continue;
+		if (resolve_in(m->direct, targets[i], resolved, sizeof resolved) != 0) {
+			reason = "a symlink in the directory loops, or a path in it is too long";
+			break;
+		}
+		/* The target itself is docker's, not bound; each above it split. */
+		if (skip_count < 8u && (skip[skip_count] = strdup(resolved)) != NULL)
+			skip_count++;
+		snprintf(cut, sizeof cut, "%s", resolved);
+		for (char *slash = strrchr(cut, '/'); slash != NULL; slash = strrchr(cut, '/')) {
+			*slash = '\0';
+			if (!is_split(split, split_count, cut) && split_count < 64u &&
+			    (split[split_count] = strdup(cut)) != NULL)
+				split_count++;
+		}
+	}
+	if (reason == NULL)
+		reason = bind_tree(m->direct, "", split, split_count, skip, skip_count, readonly, binds,
+		                   &frame);
+	memset(zeroes, 0, sizeof zeroes);
+	add(&frame, zeroes, sizeof zeroes);
+	if (reason == NULL && frame.failed)
+		reason = "out of memory";
+	if (reason == NULL)
+		reason = direct_image(m->direct, &frame, image, cap, create_detail, sizeof create_detail);
+	for (size_t i = 0u; i < split_count; i++)
+		free(split[i]);
+	for (size_t i = 0u; i < skip_count; i++)
+		free(skip[i]);
+	free(frame.data);
+	return reason;
+}
+
+/*
+ * (mutable direct)'s image: the frame, `hull-dir:<digest>` for the tree's
+ * real path and the frame, since what the machine runs is the directory
+ * itself, bound in entry by entry (frame_direct). Labelled as a dir's import is, so gc
+ * keeps it while the tree is there and an overlay's import of the same
+ * tree retires it, and it them. NULL, or why in `detail`.
+ */
+static const char *direct_image(const char *root, const text *body, char *image, size_t cap,
+                                char *detail, size_t detail_cap)
+{
+	hull_sha256       named;
+	uint8_t           digest[32];
+	char              tree[65];
+	char              hex[65];
+	char              where[2u * PATH_MAX + 1u];
+	char              path[400];
+	char              id[80];
+	char             *canonical = realpath(root, NULL);
+	const char       *at = canonical != NULL ? canonical : root;
+	char             *answer = NULL;
+	const char       *found;
+	text              head = { 0 };
+	int               status = 0;
+	int               fd;
+	size_t            n = 0u;
+
+	hull_sha256_init(&named);
+	hull_sha256_update(&named, (const uint8_t *)at, strlen(at));
+	hull_sha256_final(&named, digest);
+	hull_sha256_hex(digest, tree);
+	hull_sha256_init(&named);
+	hull_sha256_update(&named, (const uint8_t *)"hull direct\n", 12u);
+	hull_sha256_update(&named, (const uint8_t *)at, strlen(at) + 1u);
+	hull_sha256_update(&named, (const uint8_t *)body->data, body->length);
+	hull_sha256_final(&named, digest);
+	hull_sha256_hex(digest, hex);
+	where[0] = '\0';
+	for (size_t i = 0u; at[i] != '\0' && 2u * i + 2u < sizeof where; i++)
+		snprintf(where + 2u * i, 3u, "%02x", (unsigned char)at[i]);
+	free(canonical);
+	snprintf(image, cap, "hull-dir:%s", hex);
+	snprintf(path, sizeof path, "/images/%s/json", image);
+	if (call("GET", path, NULL, &status, &answer) != 0) {
+		snprintf(detail, detail_cap, "the Docker daemon at %s cannot be reached", socket_path());
+		return detail;
+	}
+	free(answer);
+	answer = NULL;
+	if (status == 200)
+		return NULL;
+	if (status != 404)
+		return daemon_says(detail, detail_cap, "looking for the import", status, NULL);
+	fd = dial();
+	addf(&head, "POST " API "/images/create?fromSrc=-&changes=LABEL%%20hull.tree%%3D%s"
+	     "&changes=LABEL%%20hull.path%%3D%s HTTP/1.1\r\n"
+	     "Host: docker\r\nConnection: close\r\nContent-Type: application/x-tar\r\n"
+	     "Content-Length: %zu\r\n\r\n", tree, where, body->length);
+	if (fd < 0 || head.failed || send_all(fd, head.data, head.length) != 0 ||
+	    send_all(fd, body->data, body->length) != 0 || read_answer(fd, &status, &answer) != 0) {
+		free(head.data);
+		if (fd >= 0)
+			close(fd);
+		free(answer);
+		snprintf(detail, detail_cap, "the image of the directory's frame could not be imported");
+		return detail;
+	}
+	free(head.data);
+	if (status != 200 || json_string(answer, "error", detail, detail_cap)) {
+		if (status != 200)
+			daemon_says(detail, detail_cap, "import", status, answer);
+		free(answer);
+		return detail;
+	}
+	found = strstr(answer, "\"status\":\"sha256:");
+	if (found != NULL)
+		for (found += strlen("\"status\":\""); *found != '"' && *found != '\0' && n + 1u < sizeof id;)
+			id[n++] = *found++;
+	id[n] = '\0';
+	free(answer);
+	answer = NULL;
+	if (n == 0u) {
+		snprintf(detail, detail_cap, "the import named no image");
+		return detail;
+	}
+	snprintf(path, sizeof path, "/images/%s/tag?repo=hull-dir&tag=%s", id, hex);
+	if (call("POST", path, NULL, &status, &answer) != 0 || status != 201) {
+		daemon_says(detail, detail_cap, "tagging the import", status, answer);
+		free(answer);
+		return detail;
+	}
+	free(answer);
+	retire_imports(tree, id);
+	return NULL;
+}
+
 /* The volumes of (layers ...), each its guest path relative and its
  * stack, its upper made where missing and held open for the writes it
  * keeps, as the root's is. A reason, or NULL. */
@@ -2457,6 +2867,10 @@ static const char *source_image(hull_machine *m, const hull_sexpr_doc *doc,
 	char            *trees[MAX_LAYERS] = { NULL };
 	unsigned         layers = 0u;
 	hull_sexpr_form  entry;
+	char            *mutable_mode = hull_access_value(doc, machine, "mutable");
+	int              direct = mutable_mode != NULL && strcmp(mutable_mode, "direct") == 0;
+
+	free(mutable_mode);
 
 	if (given != NULL) {
 		char *at = hull_access_path(doc, given);
@@ -2498,6 +2912,40 @@ static const char *source_image(hull_machine *m, const hull_sexpr_doc *doc,
 		else if (m->stack_count != 0u)
 			reason = "a volume's stack of layers is laid into a dir's import: an image ref "
 			         "is the daemon's";
+	} else if (source != NULL && strncmp(source, "dir:", 4u) == 0 && source[4] != '\0' &&
+	           direct) {
+		/* In place: an empty image, the directory bound in (add_direct);
+		 * what lies above an overlay has none to lie above. */
+		root = hull_access_path(doc, source + 4);
+		if (given != NULL)
+			reason = "owners are given above an overlay: (owners ...) needs (mutable overlay)";
+		else if (layers != 0u)
+			reason = "layers and an upper lie under an overlay: they need (mutable overlay)";
+		else if (m->stack_count != 0u)
+			reason = "a volume's stack is laid into an overlay's import: it needs "
+			         "(mutable overlay)";
+		else if (hull_access_find(doc, machine, "export", &entry))
+			reason = "an export is of an overlay's tree: (export ...) needs (mutable overlay)";
+		else if (root == NULL || (m->direct = strdup(root)) == NULL)
+			reason = "out of memory";
+		else {
+			hull_sexpr_form top;
+			hull_sexpr_form security;
+			char           *secrets;
+			int             readonly;
+
+			hull_sexpr_first(doc, &top);
+			secrets  = hull_access_value(doc, &top, "secrets");
+			readonly = hull_access_find(doc, machine, "security", &security) &&
+			           hull_access_true(doc, &security, "readonly_root");
+			text binds = { 0 };
+
+			reason = frame_direct(m, secrets != NULL, readonly, &binds, image, cap);
+			m->direct_binds        = binds.data;
+			m->direct_binds_length = binds.length;
+			free(secrets);
+		}
+		free(root);
 	} else if (source != NULL && strncmp(source, "dir:", 4u) == 0 && source[4] != '\0') {
 		root = hull_access_path(doc, source + 4);
 		trees[0] = root;
@@ -2569,8 +3017,11 @@ static hull_status docker_create(hull_core *core, hull_buf plan, hull_machine **
 		}
 	}
 	/* The export's file opened now, as chroot does before its workload,
-	 * so a path that cannot be written is said before anything runs. */
-	if ((export = hull_access_value(&doc, &machine, "export")) != NULL) {
+	 * so a path that cannot be written is said before anything runs; in
+	 * place there is no overlay to export, refused before any file is
+	 * made (source_image says so). */
+	export = in_place(&doc, &machine) ? NULL : hull_access_value(&doc, &machine, "export");
+	if (export != NULL) {
 		char *at = hull_access_path(&doc, export);
 
 		if (at == NULL ||
@@ -3204,8 +3655,10 @@ static hull_status docker_stream_close(hull_core *core, hull_stream *st, hull_er
 static const hull_cap_entry entries[] = {
 	/* Docker runs an image, not a directory (5.0). The cached docker
 	 * import that would run a dir as an overlay is not written yet. */
-	{ "source.dir.direct",  HULL_SUP_REJECTED,
-	  "docker cannot run a directory in place", NULL },
+	{ "source.dir.direct",  HULL_SUP_EMULATED,
+	  "the directory's entries bound into an image of its frame, each directory docker "
+	  "mounts something in bound entry by entry, so a write lands in the directory as it "
+	  "is made", NULL },
 	{ "source.dir.overlay", HULL_SUP_EMULATED,
 	  "a docker import of the tree, kept by its SHA-256; / is root's, as docker makes it",
 	  NULL },

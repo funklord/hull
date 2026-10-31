@@ -751,9 +751,63 @@ printf '%s\n' "$out" | grep -qx "docker: removed hull-dir:$inuse, its tree is go
 timeout 30 docker rmi "hull-dir:$digest" "hull-dir:$changed" "hull-dtest-named:$changed" \
 	"hull-dir:$third" "hull-dir:$gone" "hull-dir:$inuse" "hull-dir:$unlabelled" > /dev/null 2>&1
 rm -f "$root/rootfs/srv/added" "$root/rootfs/srv/more"
-printf '(machine (source "dir:./rootfs") (backend docker) (hostname "dtest") (command "/probe"))\n' \
+# A dir in place, (mutable direct), a dir's default: an image of its frame,
+# the tree's entries bound in, so a write lands in the user's directory
+# while the machine runs. Where docker mounts something -- its init,
+# here through a /sbin linked to usr/sbin as a merged /usr has it, and
+# the files over /etc -- the directory above is the image's, so docker
+# makes nothing in the user's tree, and a new file there, or at the top,
+# is refused rather than kept nowhere. An export, and a volume whose
+# guest path is not in the tree, are refused, as on chroot.
+rm -f "$root/direct/root/srv/new" "$root/direct/live"
+mkdir -p "$root/direct/root/proc" "$root/direct/root/etc" "$root/direct/root/usr/sbin" \
+	"$root/direct/root/srv"
+cp "$probe" "$root/direct/root/probe"
+printf 'here\n' > "$root/direct/root/etc/motd"
+ln -sfn usr/sbin "$root/direct/root/sbin"
+printf '(machine (source "dir:./direct/root") (backend docker) (hostname "dtest") %s)\n' \
+	'(command "/probe" "read" "/etc/motd" "write" "/srv/new" "sleep" "4" "write" "/etc/new" "write" "/top" "list" "/sbin")' \
 	> "$root/dirin.conf"
-expect 125 'source\.dir\.direct: rejected' dirin
+(cd / && exec timeout -k 2 60 "$hull" run -f "$root/dirin.conf" > "$root/direct/out" 2>&1) &
+runner=$!
+tries=0
+until [ -e "$root/direct/root/srv/new" ] || [ "$tries" -ge 60 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+# Still running, its cmdline there, which a zombie's is not.
+tr -d '\000' < "/proc/$runner/cmdline" 2> /dev/null | grep -q . &&
+	[ -e "$root/direct/root/srv/new" ] && : > "$root/direct/live"
+wait "$runner"
+got=$?
+out=$(cat "$root/direct/out")
+cases=$((cases + 1))
+[ "$got" = 0 ] && printf '%s\n' "$out" | grep -q 'source\.dir\.direct: emulated' &&
+	printf '%s\n' "$out" | grep -q '^read=here$' &&
+	[ "$(printf '%s\n' "$out" | grep -c '^write=Permission denied$')" = 2 ] &&
+	printf '%s\n' "$out" | grep -q '^list= docker-init$' &&
+	[ -e "$root/direct/live" ] && [ -O "$root/direct/root/srv/new" ] &&
+	[ "$(ls -A "$root/direct/root/etc")" = motd ] && [ -z "$(ls -A "$root/direct/root/usr/sbin")" ] &&
+	[ ! -e "$root/direct/root/top" ] ||
+	fail "a dir in place did not take its writes as they were made, or docker made files in it" \
+		"exit $got, live $([ -e "$root/direct/live" ] && echo yes || echo no)
+$out
+$(ls -la "$root/direct/root" "$root/direct/root/etc" "$root/direct/root/usr/sbin" 2>&1)"
+printf '(machine (source "dir:./direct/root") (backend docker) (hostname "dtest") %s)\n' \
+	'(export "./direct/out.tar") (command "true")' > "$root/dexported.conf"
+cases=$((cases + 1))
+said=$(cd / && timeout 60 "$hull" run -f "$root/dexported.conf" 2>&1)
+[ $? = 125 ] && printf '%s\n' "$said" | grep -q 'needs (mutable overlay)' &&
+	[ ! -e "$root/direct/out.tar" ] ||
+	fail "an export of a dir in place was not refused" "$said"
+printf '(machine (source "dir:./direct/root") (backend docker) (hostname "dtest") %s)\n' \
+	'(volumes (volume (host "./data") (guest "/nowhere"))) (command "true")' \
+	> "$root/dvolumed.conf"
+cases=$((cases + 1))
+said=$(cd / && timeout 60 "$hull" run -f "$root/dvolumed.conf" 2>&1)
+[ $? = 125 ] && printf '%s\n' "$said" | grep -q 'volume /nowhere: the guest path is not in the machine' &&
+	[ ! -e "$root/direct/root/nowhere" ] ||
+	fail "a volume's guest path missing from a dir in place was made or not refused" "$said"
 
 # A machine kept, under a core killed outright, is the next core's: one
 # that `hull ps` starts, though it starts none otherwise, as the kept
@@ -883,7 +937,7 @@ for image in $(timeout 10 docker images --filter reference=hull-dir --format '{{
 	at=$(timeout 10 docker image inspect -f '{{index .Config.Labels "hull.path"}}' "$image" 2>/dev/null |
 		python3 -c 'import sys; print(bytes.fromhex(sys.stdin.read().strip()).decode())' 2>/dev/null)
 	case $at in
-	"$root"/data/* | "$root"/stacked/*) timeout 30 docker rmi -f "$image" > /dev/null 2>&1 ;;
+	"$root"/data/* | "$root"/stacked/* | "$root"/direct/*) timeout 30 docker rmi -f "$image" > /dev/null 2>&1 ;;
 	esac
 done
 

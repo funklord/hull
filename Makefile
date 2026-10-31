@@ -197,7 +197,9 @@ DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf vol
                     uppered.conf reuppered.conf upperref.conf \
                     layered/site/opq/x layered/data/opq/y \
                     stacked.conf stacked/out.tar stacked/root/probe stacked/root/mnt/under \
-                    stacked/data/c stacked/data/d stacked/data/sub/b stacked/seed/s)
+                    stacked/data/c stacked/data/d stacked/data/sub/b stacked/seed/s \
+                    direct/out direct/live direct/root/srv/new direct/root/probe \
+                    direct/root/etc/motd direct/root/sbin dexported.conf dvolumed.conf)
 
 # What test/qemu_test.sh writes.
 QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf vbuilt.conf die.conf nope.conf write.conf \

@@ -395,10 +395,14 @@ machine on docker with the same machine on chroot or vm.
   capabilities, which docker grants only to root, are refused, and an
   image that needs root inside, an `apt-get` say, fails here; chroot maps
   root to the user instead.
-- A directory cannot run in place: `(mutable direct)` is refused, and an
-  overlay is a `docker import` of the tree, kept by its hash.
-- No `(init …)` yet, and no `(segments …)`: chroot gives a container a
-  wire of its own without a root daemon.
+- A directory in place, `(mutable direct)`, is its entries bound into
+  the container one by one, docker being unable to bind over `/`: a new
+  file at the top of the tree, or in a directory docker mounts something
+  in such as `/etc`, is refused there. An overlay is a `docker import`
+  of the tree, kept by its hash.
+- No `(init …)` and no `(segments …)`: an image's init wants root, and a
+  container's network is the root daemon's. chroot gives a machine both
+  without one.
 
 **Caveats**
 - `/` in a container is root's, as docker makes every image's, while the
