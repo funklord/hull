@@ -379,7 +379,7 @@ expect 0 'machine on qemu \(vm\): ok|segments: native' \
 printf '%s\n' '(machine (source "dir:./rootfs") (init "/sbin/init"))' > "$dir/inited.conf"
 expect 0 'init: native: the image.s init is PID 1, the engine.s a child of it' \
 	"$hull" plan --explain -f "$dir/inited.conf" --backend chroot
-expect 1 'init: rejected: not yet: a container.s PID 1 is docker.s init' \
+expect 1 'init: rejected: the workload runs as the user, and an image.s init wants root' \
 	"$hull" plan -f "$dir/inited.conf" --backend docker
 expect 2 'plan takes one backend' "$hull" plan -f "$dir/ref.conf" --backend ns,vm
 expect 0 '^\(machine \(source "debian:13"\) \(ports \(port \(host 8080\) \(guest 80\) \(proto tcp\)\)\) .*\(projection bind\)\)$' \

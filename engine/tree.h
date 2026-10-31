@@ -60,6 +60,14 @@ typedef struct hull_tree_owner {
 int hull_tree_tar_owned(const char *root, const hull_tree_owner *owners, size_t count,
                         hull_tree_sink sink, void *context, char *detail, size_t detail_cap);
 
+/* hull_tree_tar_owned, `root` an overlay's layer or upper: a whiteout,
+ * a character device 0/0, written as docker's `.wh.NAME`, an empty file,
+ * and an opaque directory, user.overlay.opaque y as userxattr marks it,
+ * given docker's `.wh..wh..opq` first in it; user.overlay.* xattrs left
+ * out. What docker's union reads a layer's whiteouts as. */
+int hull_tree_tar_layer(const char *root, const hull_tree_owner *owners, size_t count,
+                        hull_tree_sink sink, void *context, char *detail, size_t detail_cap);
+
 /* One entry of such a stream, for a writer that has no directory to walk,
  * as `hull push` writes a layer from a manifest: its name as the stream
  * holds it, a directory's ending in `/`; its type, '0' a file, '2' a

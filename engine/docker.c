@@ -49,6 +49,9 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/utsname.h>
+#include <sys/sysmacros.h>
+#include <dirent.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -76,6 +79,7 @@ struct hull_machine {
 	pthread_cond_t   done_cond;
 	int              done;
 	int              export_fd;  /* (export PATH)'s file, or -1 */
+	int              upper_fd;   /* (upper PATH), its directory, or -1 */
 	char             detail[512];
 };
 
@@ -698,8 +702,9 @@ static const char *import_layers(char *const *trees, unsigned count, const hull_
 	for (unsigned i = 0u; i < count; i++) {
 		memset(&first[i], 0, sizeof first[i]);
 		hull_sha256_init(&first[i].sha);
-		if (hull_tree_tar_owned(trees[i], owners, owner_count, counted, &first[i], detail,
-		                        detail_cap) != 0) {
+		if ((i == 0u ? hull_tree_tar_owned : hull_tree_tar_layer)(trees[i], owners, owner_count,
+		                                                         counted, &first[i], detail,
+		                                                         detail_cap) != 0) {
 			free(config.data);
 			return detail;
 		}
@@ -765,8 +770,9 @@ static const char *import_layers(char *const *trees, unsigned count, const hull_
 		second.limit = first[i].length;
 		snprintf(name, sizeof name, "%u/layer.tar", i);
 		if (save_header(fd, name, first[i].length) != 0 ||
-		    hull_tree_tar_owned(trees[i], owners, owner_count, sent, &second, detail,
-		                        detail_cap) != 0) {
+		    (i == 0u ? hull_tree_tar_owned : hull_tree_tar_layer)(trees[i], owners, owner_count,
+		                                                         sent, &second, detail,
+		                                                         detail_cap) != 0) {
 			if (second.over)
 				snprintf(detail, detail_cap, "the directory changed while it was imported");
 			goto failed;
@@ -1290,6 +1296,533 @@ static void export_container(hull_machine *m, long *code)
 	m->export_fd = -1;
 }
 
+/* --- the upper, written back --------------------------------------------- */
+
+/* A tar read from a connection a block at a time. */
+typedef struct tar_in {
+	int     fd;
+	uint8_t block[512];
+} tar_in;
+
+static int tar_block(tar_in *t)
+{
+	return read_full(t->fd, t->block, sizeof t->block);
+}
+
+static unsigned long long tar_number(const uint8_t *field, size_t width)
+{
+	unsigned long long n = 0u;
+
+	if ((field[0] & 0x80u) != 0u) {   /* base-256, for what octal cannot hold */
+		for (size_t i = 1u; i < width; i++)
+			n = n << 8 | field[i];
+		return n;
+	}
+	for (size_t i = 0u; i < width && field[i] >= '0' && field[i] <= '7'; i++)
+		n = n * 8u + (unsigned)(field[i] - '0');
+	return n;
+}
+
+/* `n` bytes of the stream into `out`, `cap` of them kept, the rest and the
+ * block's padding read past. 0, or -1. */
+static int tar_data(tar_in *t, unsigned long long n, uint8_t *out, size_t cap)
+{
+	unsigned long long at = 0u;
+
+	while (at < n) {
+		size_t take;
+
+		if (tar_block(t) != 0)
+			return -1;
+		take = n - at < 512u ? (size_t)(n - at) : 512u;
+		if (out != NULL && at < cap)
+			memcpy(out + at, t->block, at + take <= cap ? take : (size_t)(cap - at));
+		at += take;
+	}
+	return 0;
+}
+
+/* A path of the container's, "/a/b", its parent opened beneath the upper,
+ * each directory on the way made where missing and never a link followed,
+ * the leaf's name into `leaf`. The parent's descriptor, or -1. */
+static int upper_parent(int upper, const char *path, char *leaf, size_t cap)
+{
+	char  copy[4096];
+	char *at;
+	char *slash;
+	int   dir = dup(upper);
+
+	if (dir < 0 || snprintf(copy, sizeof copy, "%s", path) >= (int)sizeof copy) {
+		if (dir >= 0)
+			close(dir);
+		return -1;
+	}
+	for (at = copy; *at == '/'; at++)
+		;
+	while ((slash = strchr(at, '/')) != NULL) {
+		int next;
+
+		*slash = '\0';
+		if (*at == '\0' || strcmp(at, ".") == 0 || strcmp(at, "..") == 0) {
+			close(dir);
+			return -1;
+		}
+		next = openat(dir, at, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		if (next < 0 && errno == ENOENT && mkdirat(dir, at, 0755) == 0)
+			next = openat(dir, at, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		if (next < 0) {
+			/* A whiteout or a file where the container has a directory:
+			 * the container's directory wins, as the upper's would. */
+			struct stat there;
+
+			if (fstatat(dir, at, &there, AT_SYMLINK_NOFOLLOW) == 0 && !S_ISDIR(there.st_mode) &&
+			    unlinkat(dir, at, 0) == 0 && mkdirat(dir, at, 0755) == 0)
+				next = openat(dir, at, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		}
+		close(dir);
+		if (next < 0)
+			return -1;
+		dir = next;
+		at = slash + 1;
+	}
+	if (*at == '\0' || strcmp(at, ".") == 0 || strcmp(at, "..") == 0 ||
+	    snprintf(leaf, cap, "%s", at) >= (int)cap) {
+		close(dir);
+		return -1;
+	}
+	return dir;
+}
+
+/* What is at `leaf` in `dir` removed, a directory with what it holds. */
+static void upper_clear(int dir, const char *leaf)
+{
+	struct stat there;
+
+	if (fstatat(dir, leaf, &there, AT_SYMLINK_NOFOLLOW) != 0)
+		return;
+	if (S_ISDIR(there.st_mode)) {
+		int            inner = openat(dir, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		DIR           *list = inner >= 0 ? fdopendir(inner) : NULL;
+		struct dirent *found;
+
+		if (list == NULL && inner >= 0)
+			close(inner);
+		while (list != NULL && (found = readdir(list)) != NULL)
+			if (strcmp(found->d_name, ".") != 0 && strcmp(found->d_name, "..") != 0)
+				upper_clear(dirfd(list), found->d_name);
+		if (list != NULL)
+			closedir(list);
+		unlinkat(dir, leaf, AT_REMOVEDIR);
+	} else {
+		unlinkat(dir, leaf, 0);
+	}
+}
+
+static int path_order(const void *a, const void *b)
+{
+	return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* Whether `path` is `mount` or beneath it. */
+static int beneath(const char *path, const char *mount)
+{
+	size_t length = strlen(mount);
+
+	return strncmp(path, mount, length) == 0 && (path[length] == '\0' || path[length] == '/');
+}
+
+/* What docker mounts in every container, which its list of changes names
+ * though no workload wrote it: its init, its marker, the files it binds
+ * over /etc, and the kernel's filesystems. */
+static const char *const docker_mounts[] = {
+	"/.dockerenv", "/sbin/docker-init", "/etc/hosts", "/etc/hostname", "/etc/resolv.conf",
+	"/dev", "/proc", "/sys", NULL
+};
+
+/* Whether a change at `path` is docker's or a mount's rather than the
+ * workload's: at or beneath one of `mounts`, or a directory docker added
+ * only to hold one, nothing the workload kept beneath it. */
+static int not_written(const char *path, int added, char *const *mounts, size_t mount_count,
+                       char *const *kept, size_t kept_count)
+{
+	int holds = 0;
+
+	for (size_t i = 0u; i < mount_count; i++) {
+		if (beneath(path, mounts[i]))
+			return 1;
+		holds |= beneath(mounts[i], path);
+	}
+	if (!added || !holds)
+		return 0;
+	for (size_t i = 0u; i < kept_count; i++) {
+		int mine = strcmp(kept[i], path) != 0 && beneath(kept[i], path);
+
+		for (size_t j = 0u; mine && j < mount_count; j++)
+			if (beneath(kept[i], mounts[j]))
+				mine = 0;
+		if (mine)
+			return 0;
+	}
+	return 1;
+}
+
+/* One entry of the export, `path` the container's, put in the upper as
+ * the container has it, the user's. 0; 1 where it is a kind the upper
+ * does not take; -1. */
+static int upper_put(int upper, const char *path, char type, unsigned mode,
+                     unsigned long long mtime, const char *link, tar_in *t,
+                     unsigned long long size)
+{
+	char leaf[256];
+	int  dir = upper_parent(upper, path, leaf, sizeof leaf);
+	int  result = 0;
+
+	if (dir < 0)
+		return -1;
+	if (type == '5') {
+		struct stat there;
+
+		if (fstatat(dir, leaf, &there, AT_SYMLINK_NOFOLLOW) == 0 && !S_ISDIR(there.st_mode))
+			upper_clear(dir, leaf);
+		if ((mkdirat(dir, leaf, 0700) != 0 && errno != EEXIST) ||
+		    fchmodat(dir, leaf, mode & 07777, 0) != 0)
+			result = -1;
+	} else {
+		upper_clear(dir, leaf);
+		if (type == '0' || type == '7') {
+			int                fd = openat(dir, leaf, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+			                               O_CLOEXEC, 0600);
+			unsigned long long at = 0u;
+
+			while (fd >= 0 && at < size && result == 0) {
+				size_t take;
+
+				if (tar_block(t) != 0) {
+					result = -1;
+					break;
+				}
+				take = size - at < 512u ? (size_t)(size - at) : 512u;
+				if (send_all(fd, (const char *)t->block, take) != 0)
+					result = -1;
+				at += take;
+			}
+			if (fd < 0)
+				result = -1;
+			size = 0u;   /* read */
+			if (fd >= 0) {
+				struct timespec times[2] = { { .tv_nsec = UTIME_OMIT },
+				                             { .tv_sec = (time_t)mtime } };
+
+				if (fchmod(fd, mode & 07777) != 0)
+					result = -1;
+				futimens(fd, times);
+				close(fd);
+			}
+		} else if (type == '2') {
+			if (symlinkat(link, dir, leaf) != 0)
+				result = -1;
+		} else if (type == '6') {
+			if (mknodat(dir, leaf, S_IFIFO | (mode & 0777), 0) != 0)
+				result = -1;
+		} else {
+			result = 1;   /* a hard link or a device: not kept */
+		}
+	}
+	close(dir);
+	if (size != 0u && tar_data(t, size, NULL, 0u) != 0)
+		return -1;
+	return result;
+}
+
+/*
+ * (upper PATH)'s writes, kept as an overlay's upper keeps them, from the
+ * container docker made of the layers with the upper on top: what the
+ * daemon lists as changed, /containers/ID/changes, and what each added or
+ * changed entry now is, from docker export. A deletion is a whiteout, a
+ * character device 0/0, which the kernel lets the user make; a directory
+ * made again over one below is listed by docker as each child deleted,
+ * so a whiteout each says the same. Every entry is the user's, as an
+ * upper on disk is on chroot (one uid). A hard link or a device the
+ * container made is not kept, and said. A failure says why on the
+ * workload's stderr and makes the end 125, as an export's does.
+ */
+static void write_upper(hull_machine *m, long *code)
+{
+	char         path[160];
+	char         request[256];
+	char         head[4096];
+	char         detail[512] = "";
+	char        *answer = NULL;
+	char       **kept = NULL;
+	char       **gone = NULL;
+	char        *mounts[64];
+	size_t       mount_count = 0u;
+	size_t       kept_count = 0u;
+	size_t       gone_count = 0u;
+	unsigned     dropped = 0u;
+	int          status = 0;
+	int          fd = -1;
+	size_t       n = 0u;
+	tar_in       t;
+	const char  *at;
+	static char  name[4096];
+	static char  link[4096];
+
+	/* Its mounts, which docker's list of changes names: docker's own and
+	 * each volume's destination. */
+	for (unsigned i = 0u; docker_mounts[i] != NULL; i++)
+		mounts[mount_count++] = (char *)docker_mounts[i];
+	snprintf(path, sizeof path, "/containers/%s/json", m->id);
+	if (call("GET", path, NULL, &status, &answer) != 0 || status != 200) {
+		snprintf(detail, sizeof detail, "the container's mounts could not be read");
+		goto said;
+	}
+	for (at = strstr(answer, "\"Destination\":\""); at != NULL && mount_count < 64u;
+	     at = strstr(at, "\"Destination\":\"")) {
+		size_t k = 0u;
+		char   found[4096];
+
+		for (at += 15; *at != '"' && *at != '\0' && k + 1u < sizeof found; at++)
+			found[k++] = *at;
+		found[k] = '\0';
+		if ((mounts[mount_count] = strdup(found)) != NULL)
+			mount_count++;
+	}
+	free(answer);
+	answer = NULL;
+	snprintf(path, sizeof path, "/containers/%s/changes", m->id);
+	if (call("GET", path, NULL, &status, &answer) != 0 || status != 200) {
+		snprintf(detail, sizeof detail, "the daemon's list of changes: %s",
+		         status != 0 ? "refused" : "not read, or too long");
+		goto said;
+	}
+	for (at = answer != NULL ? strstr(answer, "\"Path\":\"") : NULL; at != NULL;
+	     at = strstr(at, "\"Path\":\"")) {
+		char        found[4096];
+		size_t      k = 0u;
+		long        kind = -1;
+		const char *kind_at;
+		char     ***list;
+		size_t     *count;
+
+		for (at += 8; *at != '"' && *at != '\0' && k + 1u < sizeof found; at++) {
+			if (*at == '\\' && at[1] != '\0')
+				at++;
+			found[k++] = *at;
+		}
+		found[k] = '\0';
+		kind_at = strstr(at, "\"Kind\":");
+		if (kind_at != NULL)
+			kind = strtol(kind_at + 7, NULL, 10);
+		list  = kind == 2 ? &gone : &kept;
+		count = kind == 2 ? &gone_count : &kept_count;
+		/* An added one carries its kind as a NUL after its path. */
+		if ((*count & 1023u) == 0u) {
+			char **grown = realloc(*list, (*count + 1024u) * sizeof **list);
+
+			if (grown == NULL) {
+				snprintf(detail, sizeof detail, "out of memory");
+				goto said;
+			}
+			*list = grown;
+		}
+		if (((*list)[*count] = malloc(k + 2u)) != NULL) {
+			memcpy((*list)[*count], found, k + 1u);
+			(*list)[*count][k + 1u] = kind == 1 ? 'A' : 'C';
+		}
+		if ((*list)[*count] == NULL) {
+			snprintf(detail, sizeof detail, "out of memory");
+			goto said;
+		}
+		(*count)++;
+	}
+	/* Deletions first, a path beneath one already deleted skipped. */
+	qsort(gone, gone_count, sizeof *gone, path_order);
+	for (size_t i = 0u; i < gone_count; i++) {
+		char   leaf[256];
+		int    dir;
+		size_t under = 0u;
+
+		for (size_t j = 0u; j < i; j++) {
+			size_t length = strlen(gone[j]);
+
+			if (strncmp(gone[i], gone[j], length) == 0 && gone[i][length] == '/')
+				under = 1u;
+		}
+		if (under || not_written(gone[i], 0, mounts, mount_count, kept,
+		                         kept_count))
+			continue;
+		if ((dir = upper_parent(m->upper_fd, gone[i], leaf, sizeof leaf)) < 0) {
+			snprintf(detail, sizeof detail, "%.400s: not a path the upper can hold", gone[i]);
+			goto said;
+		}
+		upper_clear(dir, leaf);
+		if (mknodat(dir, leaf, S_IFCHR, makedev(0, 0)) != 0) {
+			snprintf(detail, sizeof detail, "%.400s's whiteout: %s", gone[i], strerror(errno));
+			close(dir);
+			goto said;
+		}
+		close(dir);
+	}
+	qsort(kept, kept_count, sizeof *kept, path_order);
+
+	/* What each added or changed entry is, from the export. */
+	fd = dial();
+	snprintf(request, sizeof request,
+	         "GET " API "/containers/%s/export HTTP/1.0\r\nHost: docker\r\n\r\n", m->id);
+	if (fd < 0 || send_all(fd, request, strlen(request)) != 0) {
+		snprintf(detail, sizeof detail, "the Docker daemon at %s cannot be reached",
+		         socket_path());
+		goto said;
+	}
+	while (n + 1u < sizeof head && read(fd, head + n, 1u) == 1) {
+		n++;
+		if (n >= 4u && memcmp(head + n - 4u, "\r\n\r\n", 4u) == 0)
+			break;
+	}
+	head[n] = '\0';
+	if (sscanf(head, "HTTP/1.%*d %d", &status) != 1 || status != 200) {
+		snprintf(detail, sizeof detail, "the daemon answered the export %d", status);
+		goto said;
+	}
+	t.fd = fd;
+	name[0] = '\0';
+	link[0] = '\0';
+	for (;;) {
+		unsigned long long size;
+		char               type;
+		char               full[4200];
+		const char        *key = full;
+		char             **found_kept;
+		int                put;
+
+		if (tar_block(&t) != 0) {
+			snprintf(detail, sizeof detail, "the export ended before its end");
+			goto said;
+		}
+		if (t.block[0] == '\0')
+			break;
+		size = tar_number(t.block + 124, 12u);
+		type = (char)t.block[156];
+		if (type == 'x' || type == 'L' || type == 'K') {
+			static uint8_t records[65536];
+
+			if (size >= sizeof records || tar_data(&t, size, records, sizeof records) != 0) {
+				snprintf(detail, sizeof detail, "an export's header past what hull reads");
+				goto said;
+			}
+			records[size] = '\0';
+			if (type == 'L')
+				snprintf(name, sizeof name, "%.4095s", (char *)records);
+			else if (type == 'K')
+				snprintf(link, sizeof link, "%.4095s", (char *)records);
+			else
+				for (size_t r = 0u; r < size;) {
+					unsigned long length = strtoul((char *)records + r, NULL, 10);
+					char         *field = strchr((char *)records + r, ' ');
+
+					if (length == 0u || field == NULL || r + length > size)
+						break;
+					records[r + length - 1u] = '\0';   /* its newline */
+					if (strncmp(field + 1, "path=", 5u) == 0)
+						snprintf(name, sizeof name, "%.4095s", field + 6);
+					else if (strncmp(field + 1, "linkpath=", 9u) == 0)
+						snprintf(link, sizeof link, "%.4095s", field + 10);
+					r += length;
+				}
+			continue;
+		}
+		if (type == 'g') {
+			if (tar_data(&t, size, NULL, 0u) != 0)
+				break;
+			continue;
+		}
+		if (name[0] == '\0') {
+			char prefix[156];
+			char own[101];
+
+			memcpy(prefix, t.block + 345, 155u);
+			prefix[155] = '\0';
+			memcpy(own, t.block, 100u);
+			own[100] = '\0';
+			snprintf(name, sizeof name, "%s%s%s", prefix, prefix[0] != '\0' ? "/" : "", own);
+		}
+		if (link[0] == '\0') {
+			memcpy(link, t.block + 157, 100u);
+			link[100] = '\0';
+		}
+		/* "/a/b", as the daemon lists it. */
+		{
+			const char *bare = name;
+			size_t      length;
+
+			while (bare[0] == '.' && bare[1] == '/')
+				bare += 2;
+			while (*bare == '/')
+				bare++;
+			snprintf(full, sizeof full, "/%s", bare);
+			length = strlen(full);
+			while (length > 1u && full[length - 1u] == '/')
+				full[--length] = '\0';
+		}
+		put = 0;
+		found_kept = strcmp(full, "/") != 0 ?
+		             bsearch(&key, kept, kept_count, sizeof *kept, path_order) : NULL;
+		if (found_kept != NULL &&
+		    !not_written(full, (*found_kept)[strlen(*found_kept) + 1u] == 'A', mounts, mount_count,
+		                 kept, kept_count)) {
+			put = upper_put(m->upper_fd, full, type == '\0' ? '0' : type,
+			                (unsigned)tar_number(t.block + 100, 8u), tar_number(t.block + 136, 12u),
+			                link, &t, type == '5' ? 0u : size);
+			if (put < 0) {
+				snprintf(detail, sizeof detail, "%.400s: %s", full, strerror(errno));
+				goto said;
+			}
+			dropped += put == 1;
+			if (type == '5' && size != 0u && tar_data(&t, size, NULL, 0u) != 0) {
+				snprintf(detail, sizeof detail, "the export ended before its end");
+				goto said;
+			}
+		} else if (tar_data(&t, size, NULL, 0u) != 0) {
+			snprintf(detail, sizeof detail, "the export ended before its end");
+			goto said;
+		}
+		name[0] = '\0';
+		link[0] = '\0';
+	}
+	if (dropped != 0u) {
+		char said[200];
+		int  length = snprintf(said, sizeof said,
+		                       "hull: upper: %u hard links or devices the machine made not kept\n",
+		                       dropped);
+
+		if (length > 0)
+			host->on_data(m->core, NULL, 2, (const uint8_t *)said, (size_t)length);
+	}
+
+said:
+	if (detail[0] != '\0') {
+		char said[600];
+		int  length = snprintf(said, sizeof said, "hull: upper: %s\n", detail);
+
+		if (length > 0)
+			host->on_data(m->core, NULL, 2, (const uint8_t *)said, (size_t)length);
+		*code = 125;
+	}
+	if (fd >= 0)
+		close(fd);
+	for (size_t i = 0u; i < mount_count; i++)   /* the volumes', strdup'd */
+		if (i >= sizeof docker_mounts / sizeof *docker_mounts - 1u)
+			free(mounts[i]);
+	for (size_t i = 0u; i < kept_count; i++)
+		free(kept[i]);
+	for (size_t i = 0u; i < gone_count; i++)
+		free(gone[i]);
+	free(kept);
+	free(gone);
+	free(answer);
+}
+
 static void *read_workload(void *arg)
 {
 	hull_machine *m = arg;
@@ -1322,6 +1855,8 @@ static void *read_workload(void *arg)
 	if (call("POST", path, NULL, &status, &answer) == 0 && status == 200)
 		json_number(answer, "StatusCode", &code);
 	free(answer);
+	if (m->upper_fd >= 0)
+		write_upper(m, &code);
 	if (m->export_fd >= 0)
 		export_container(m, &code);
 	pthread_mutex_lock(&m->lock);
@@ -1340,6 +1875,8 @@ static void release(hull_machine *m)
 	hull_hostdev_unclaim(m);
 	if (m->export_fd >= 0)
 		close(m->export_fd);
+	if (m->upper_fd >= 0)
+		close(m->upper_fd);
 	free(m->body);
 	pthread_mutex_destroy(&m->lock);
 	pthread_cond_destroy(&m->done_cond);
@@ -1428,7 +1965,7 @@ static const char *read_owners(const char *path, char **data, hull_tree_owner **
 /* The image the machine runs: its ref, or its dir's import, with the
  * owners (owners PATH) gives. A reason, or NULL. */
 static const char *source_image(const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
-                                char *image, size_t cap)
+                                const char *upper, char *image, size_t cap)
 {
 	char            *source = hull_access_value(doc, machine, "source");
 	char            *given = hull_access_value(doc, machine, "owners");
@@ -1458,7 +1995,7 @@ static const char *source_image(const hull_sexpr_doc *doc, const hull_sexpr_form
 		     more = hull_sexpr_next(doc, &item, &item)) {
 			char *text = hull_access_text(doc, &item);
 
-			if (layers + 1u == MAX_LAYERS)
+			if (layers + 2u == MAX_LAYERS)   /* room for an upper above them */
 				reason = "there are too many layers";
 			else if (text == NULL || strncmp(text, "dir:", 4u) != 0)
 				reason = "a layer is a dir: source";
@@ -1467,6 +2004,10 @@ static const char *source_image(const hull_sexpr_doc *doc, const hull_sexpr_form
 			free(text);
 		}
 	}
+	/* (upper PATH): the top layer, its whiteouts docker's. */
+	if (reason == NULL && upper != NULL &&
+	    (trees[1u + layers++] = strdup(upper)) == NULL)
+		reason = "out of memory";
 	if (reason != NULL) {
 		/* said below */
 	} else if (source != NULL && is_ref(source)) {
@@ -1474,7 +2015,7 @@ static const char *source_image(const hull_sexpr_doc *doc, const hull_sexpr_form
 		if (given != NULL)
 			reason = "owners are given to a dir's import: an image ref keeps its own";
 		else if (layers != 0u)
-			reason = "layers lie above a dir's import: an image ref has its own";
+			reason = "layers and an upper lie above a dir's import: an image ref has its own";
 	} else if (source != NULL && strncmp(source, "dir:", 4u) == 0 && source[4] != '\0') {
 		root = hull_access_path(doc, source + 4);
 		trees[0] = root;
@@ -1506,6 +2047,8 @@ static hull_status docker_create(hull_core *core, hull_buf plan, hull_machine **
 	char           *answer = NULL;
 	char           *hostname;
 	char           *export;
+	char           *upper;
+	char           *upper_at = NULL;
 	char            path[160];
 	char            image[256];
 	int             status = 0;
@@ -1518,8 +2061,25 @@ static hull_status docker_create(hull_core *core, hull_buf plan, hull_machine **
 	m->core      = core;
 	m->attach    = -1;
 	m->export_fd = -1;
+	m->upper_fd  = -1;
 	pthread_mutex_init(&m->lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
+	/* (upper PATH), made where missing as chroot makes it, and held open
+	 * for the writes it keeps; by its path the import's top layer. */
+	if ((upper = hull_access_value(&doc, &machine, "upper")) != NULL) {
+		upper_at = hull_access_path(&doc, upper);
+		free(upper);
+		if (upper_at == NULL ||
+		    (mkdir(upper_at, 0755) != 0 && errno != EEXIST) ||
+		    (m->upper_fd = open(upper_at, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)) < 0) {
+			snprintf(create_detail, sizeof create_detail, "the upper %s: %s",
+			         upper_at != NULL ? upper_at : "", upper_at != NULL ? strerror(errno) :
+			                                                                "out of memory");
+			free(upper_at);
+			release(m);
+			return fail(error, HULL_ERR_RUNTIME, create_detail);
+		}
+	}
 	/* The export's file opened now, as chroot does before its workload,
 	 * so a path that cannot be written is said before anything runs. */
 	if ((export = hull_access_value(&doc, &machine, "export")) != NULL) {
@@ -1532,6 +2092,7 @@ static hull_status docker_create(hull_core *core, hull_buf plan, hull_machine **
 			         at != NULL ? at : export, at != NULL ? strerror(errno) : "no path");
 			free(at);
 			free(export);
+			free(upper_at);
 			release(m);
 			return fail(error, HULL_ERR_RUNTIME, create_detail);
 		}
@@ -1543,7 +2104,8 @@ static hull_status docker_create(hull_core *core, hull_buf plan, hull_machine **
 	         (long)getpid(), machines_made++);
 	free(hostname);
 
-	reason = source_image(&doc, &machine, image, sizeof image);
+	reason = source_image(&doc, &machine, upper_at, image, sizeof image);
+	free(upper_at);
 	if (reason == NULL)
 		reason = build(m, &doc, &machine, image);
 	if (reason != NULL) {
@@ -1706,6 +2268,7 @@ static hull_status docker_adopt(hull_core *core, hull_buf state, hull_machine **
 	m->core      = core;
 	m->attach    = -1;
 	m->export_fd = -1;   /* the export's file was the old core's, and went with it */
+	m->upper_fd  = -1;   /* and the upper's writes, which that core was to keep */
 	pthread_mutex_init(&m->lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
 	memcpy(m->id, state.data, state.len);
@@ -2172,12 +2735,13 @@ static const hull_cap_entry entries[] = {
 	  "docker export, once the workload ends", NULL },
 	{ "layers",             HULL_SUP_EMULATED,
 	  "an image of as many layers, each dir's tar one, loaded into the daemon", NULL },
-	{ "upper",              HULL_SUP_REJECTED,
-	  "a container's writable layer is the daemon's", NULL },
+	{ "upper",              HULL_SUP_EMULATED,
+	  "the import's top layer, and the container's changes written back into it as it ends, "
+	  "the user's", NULL },
 	{ "owners",             HULL_SUP_EMULATED,
 	  "given in the dir's import, its tar carrying each listed owner", NULL },
 	{ "init",               HULL_SUP_REJECTED,
-	  "not yet: a container's PID 1 is docker's init, for its signals", NULL },
+	  "the workload runs as the user, and an image's init wants root as PID 1", NULL },
 	{ "segments",           HULL_SUP_REJECTED,
 	  "a container's NIC is the daemon's, never on the core's switch", NULL },
 	{ "impair",             HULL_SUP_REJECTED,

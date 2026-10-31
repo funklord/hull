@@ -223,7 +223,48 @@ cases=$((cases + 1))
 [ -n "$first_layered" ] && [ "$(layered_images)" = "$first_layered" ] ||
 	fail "the same layers were not run from the same image" "$first_layered then $(layered_images)"
 conf layeredref '(layers "dir:/tmp") (command "true")'
-expect 125 'layers lie above a dir.s import' layeredref
+expect 125 'layers and an upper lie above a dir.s import' layeredref
+# (upper PATH): the import's top layer, and the container's changes
+# written back into it as it ends -- a write kept, a removal a whiteout,
+# the user's -- so a second run sees what the first left. Docker's own
+# mounts and a volume's destination are not the workload's writes and
+# land in no upper.
+rm -f "$root/layered/data/srv/d" "$root/layered/data/srv/x" "$root/layered/vol/v"
+rmdir "$root/layered/data/srv" 2> /dev/null
+mkdir -p "$root/layered/data" "$root/layered/site/srv" "$root/layered/vol"
+printf 'c\n' > "$root/layered/data/c"
+printf 'x\n' > "$root/layered/site/srv/x"
+# And an opaque directory, as an overlay marks one made again over one
+# below: what lies beneath it hidden.
+mkdir -p "$root/layered/site/opq" "$root/layered/data/opq"
+printf 'x\n' > "$root/layered/site/opq/x"
+printf 'y\n' > "$root/layered/data/opq/y"
+timeout 10 python3 -c 'import os, sys; os.setxattr(sys.argv[1], "user.overlay.opaque", b"y")' \
+	"$root/layered/data/opq"
+printf '(machine (source "dir:./layered/template") (layers "dir:./layered/site") (upper "./layered/data") (mutable overlay) (backend docker) (hostname "dtest") %s)\n' \
+	'(volumes (volume (host "./layered/vol") (guest "/vol"))) (command "/probe" "read" "/c" "write" "/srv/d" "remove" "/srv/x" "write" "/vol/v")' \
+	> "$root/uppered.conf"
+expect 0 'upper: emulated' uppered
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^read=c$' && [ "$(printf '%s\n' "$out" | grep -c '^write=ok$')" = 2 ] &&
+	printf '%s\n' "$out" | grep -q '^remove=ok$' &&
+	[ -f "$root/layered/data/srv/d" ] && [ -O "$root/layered/data/srv/d" ] &&
+	[ -c "$root/layered/data/srv/x" ] && [ -e "$root/layered/site/srv/x" ] &&
+	[ ! -e "$root/layered/template/srv" ] && [ ! -e "$root/layered/data/vol" ] &&
+	[ ! -e "$root/layered/data/sbin" ] && [ ! -e "$root/layered/data/.dockerenv" ] &&
+	[ ! -e "$root/layered/data/etc" ] && [ -e "$root/layered/vol/v" ] ||
+	fail "a machine's writes did not land in its upper alone, as an upper keeps them" \
+		"$out
+$(ls -laR "$root/layered/data" 2>&1)"
+printf '(machine (source "dir:./layered/template") (layers "dir:./layered/site") (upper "./layered/data") (mutable overlay) (backend docker) (hostname "dtest") %s)\n' \
+	'(command "/probe" "list" "/srv" "list" "/opq")' > "$root/reuppered.conf"
+expect 0 '^list= d$' reuppered
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^list= y$' ||
+	fail "an upper's opaque directory did not hide what lay below it" "$out"
+conf upperref "(upper \"$root/layered/refupper\") (command \"true\")"
+expect 125 'layers and an upper lie above a dir.s import' upperref
+rmdir "$root/layered/refupper" 2> /dev/null
 for image in $(layered_images); do timeout 30 docker rmi "$image" > /dev/null 2>&1; done
 # Refused for being read-only, by name, and somewhere this uid could
 # otherwise write: /tmp, on the root, is everybody's.

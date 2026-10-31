@@ -192,7 +192,10 @@ DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf vol
                     netnone.conf netports.conf exported.conf exported.tar unexported.conf \
                     owned.conf owners.list rootfs/given ownedref.conf alpine.tar ownedbase.tar \
                     ownedrun.conf b/hull.conf layered.conf layeredref.conf layered/template/probe \
-                    layered/template/a layered/site/a layered/site/sub/b)
+                    layered/template/a layered/site/a layered/site/sub/b layered/site/srv/x \
+                    layered/data/c layered/data/srv/d layered/data/srv/x layered/vol/v \
+                    uppered.conf reuppered.conf upperref.conf \
+                    layered/site/opq/x layered/data/opq/y)
 
 # What test/qemu_test.sh writes.
 QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf vbuilt.conf die.conf nope.conf write.conf \

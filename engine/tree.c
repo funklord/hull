@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
@@ -31,6 +32,7 @@ typedef struct writer {
 	dev_t          device;          /* its device, where no mount id is given */
 	const hull_tree_owner *owners;  /* given over the disk's, sorted by path */
 	size_t                 owner_count;
+	int                    overlay; /* an overlay's whiteouts as docker's .wh. entries */
 	uint8_t        buffer[65536];
 } writer;
 
@@ -220,7 +222,8 @@ static int header(writer *w, int dir, const char *at, const char *name, char typ
 		snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
 		n = listxattr(path, list, sizeof list);
 		for (ssize_t i = 0; n > 0 && i < n && count < 256u; i += (ssize_t)strlen(list + i) + 1)
-			if (strncmp(list + i, "user.", 5u) == 0 || strncmp(list + i, "security.", 9u) == 0)
+			if ((strncmp(list + i, "user.", 5u) == 0 || strncmp(list + i, "security.", 9u) == 0) &&
+			    !(w->overlay && strncmp(list + i, "user.overlay.", 13u) == 0))
 				names[count++] = list + i;
 		qsort(names, count, sizeof names[0], name_order);
 		for (unsigned i = 0u; i < count; i++) {
@@ -329,6 +332,26 @@ static int entry(writer *w, int dir, const char *name, size_t base, unsigned dep
 		w->path[base + length]      = '/';
 		w->path[base + length + 1u] = '\0';
 		status = header(w, dir, name, w->path, '5', &st, 0u, NULL);
+		/* An opaque directory of an overlay's, user.overlay.opaque y as
+		 * userxattr writes it, hides what lies below it: docker's marker,
+		 * first in it, before what it holds. */
+		if (status == 0 && w->overlay) {
+			char opaque[2];
+
+			if (fgetxattr(fd, "user.overlay.opaque", opaque, sizeof opaque) == 1 &&
+			    opaque[0] == 'y') {
+				struct stat marker = st;
+
+				if (base + length + 1u + 12u >= sizeof w->path)
+					status = fail(w, "a name under it is too long");
+				else {
+					memcpy(w->path + base + length + 1u, ".wh..wh..opq", 13u);
+					marker.st_mode = S_IFREG;
+					status = header(w, -1, NULL, w->path, '0', &marker, 0u, NULL);
+					w->path[base + length + 1u] = '\0';
+				}
+			}
+		}
 		if (status == 0)
 			status = walk(w, fd, base + length + 1u, depth + 1u);
 		close(fd);
@@ -356,6 +379,17 @@ static int entry(writer *w, int dir, const char *name, size_t base, unsigned dep
 		status = header(w, dir, name, w->path, '2', &st, 0u, target);
 	} else if (S_ISFIFO(st.st_mode)) {
 		status = header(w, dir, name, w->path, '6', &st, 0u, NULL);
+	} else if (w->overlay && S_ISCHR(st.st_mode) && st.st_rdev == makedev(0, 0)) {
+		/* An overlay's whiteout, a character device 0/0: docker's is an
+		 * empty file named .wh. and the name it hides. */
+		struct stat marker = st;
+
+		if (base + 4u + length + 1u >= sizeof w->path)
+			return fail(w, "a name under it is too long");
+		memmove(w->path + base + 4u, name, length + 1u);
+		memcpy(w->path + base, ".wh.", 4u);
+		marker.st_mode = S_IFREG;
+		status = header(w, -1, NULL, w->path, '0', &marker, 0u, NULL);
 	} else if (S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode)) {
 		status = fail(w, "a device node is not imported");
 	}
@@ -409,28 +443,36 @@ static int walk(writer *w, int dir, size_t base, unsigned depth)
 }
 
 static int tar_tree(const char *root, int one_fs, const hull_tree_owner *owners, size_t count,
-                    hull_tree_sink sink, void *context, char *detail, size_t detail_cap);
+                    int overlay, hull_tree_sink sink, void *context, char *detail,
+                    size_t detail_cap);
 
 int hull_tree_tar(const char *root, hull_tree_sink sink, void *context, char *detail,
                   size_t detail_cap)
 {
-	return tar_tree(root, 0, NULL, 0u, sink, context, detail, detail_cap);
+	return tar_tree(root, 0, NULL, 0u, 0, sink, context, detail, detail_cap);
 }
 
 int hull_tree_tar_owned(const char *root, const hull_tree_owner *owners, size_t count,
                         hull_tree_sink sink, void *context, char *detail, size_t detail_cap)
 {
-	return tar_tree(root, 0, owners, count, sink, context, detail, detail_cap);
+	return tar_tree(root, 0, owners, count, 0, sink, context, detail, detail_cap);
+}
+
+int hull_tree_tar_layer(const char *root, const hull_tree_owner *owners, size_t count,
+                        hull_tree_sink sink, void *context, char *detail, size_t detail_cap)
+{
+	return tar_tree(root, 0, owners, count, 1, sink, context, detail, detail_cap);
 }
 
 int hull_tree_tar_fs(const char *root, int one_fs, hull_tree_sink sink, void *context,
                      char *detail, size_t detail_cap)
 {
-	return tar_tree(root, one_fs, NULL, 0u, sink, context, detail, detail_cap);
+	return tar_tree(root, one_fs, NULL, 0u, 0, sink, context, detail, detail_cap);
 }
 
 static int tar_tree(const char *root, int one_fs, const hull_tree_owner *owners, size_t count,
-                    hull_tree_sink sink, void *context, char *detail, size_t detail_cap)
+                    int overlay, hull_tree_sink sink, void *context, char *detail,
+                    size_t detail_cap)
 {
 	static const uint8_t end[2u * BLOCK];
 	writer              *w = calloc(1u, sizeof *w);
@@ -458,6 +500,7 @@ static int tar_tree(const char *root, int one_fs, const hull_tree_owner *owners,
 	w->device      = top.st_dev;
 	w->owners      = owners;
 	w->owner_count = count;
+	w->overlay     = overlay;
 	{
 		struct statx root_mount;
 
