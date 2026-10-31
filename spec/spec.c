@@ -692,6 +692,11 @@ static hull_spec_status machine_across(walk *w, const hull_sexpr_form *record,
                                        const hull_sexpr_form *found, uint64_t present);
 static const schema machine = TABLE_ACROSS(machine_keys, machine_across);
 
+const char *hull_spec_machine_key(unsigned index)
+{
+	return index < machine.count ? machine.keys[index].name : NULL;
+}
+
 /* Where these sit in machine_keys, for machine_across; spec_test holds
  * both, a key moved making (network bridge) (bridge NAME) refused. */
 #define MACHINE_NETWORK 18u

@@ -437,6 +437,42 @@ static void test_examples(const char *path)
 		FAIL("%s: %u ```scheme blocks, and there are at least 4", path, found);
 }
 
+/* Appendix J is the complete key inventory: every key a machine takes has
+ * a row in its tables, `| \`KEY\` |`, so that one added to the schema and
+ * not to J is found here rather than by a reader looking it up. Six had
+ * none when this was written. */
+static void test_inventory(const char *path)
+{
+	static char  text[1u << 20];
+	FILE        *file = fopen(path, "rb");
+	size_t       length;
+	const char  *appendix;
+	unsigned     keys = 0u;
+
+	if (file == NULL) {
+		FAIL("cannot open %s", path);
+		return;
+	}
+	length = fread(text, 1u, sizeof text - 1u, file);
+	fclose(file);
+	text[length] = '\0';
+	if ((appendix = strstr(text, "\n# Appendix J ")) == NULL) {
+		FAIL("%s: no Appendix J", path);
+		return;
+	}
+	for (const char *key; (key = hull_spec_machine_key(keys)) != NULL; keys++) {
+		char row[80];
+
+		snprintf(row, sizeof row, "\n| `%s` |", key);
+		cases++;
+		if (strstr(appendix, row) == NULL)
+			FAIL("%s: machine key %s has no row in Appendix J", path, key);
+	}
+	/* 34 when this was written: fewer means the schema was not read. */
+	if (keys < 34u)
+		FAIL("the schema gave %u machine keys, and there are at least 34", keys);
+}
+
 int main(int argc, char **argv)
 {
 	alarm(60);
@@ -449,6 +485,7 @@ int main(int argc, char **argv)
 	test_records();
 	test_reporting();
 	test_examples(argv[1]);
+	test_inventory(argv[1]);
 	printf("spec: %u cases, %u failed\n", cases, failures);
 	return failures == 0u ? 0 : 1;
 }

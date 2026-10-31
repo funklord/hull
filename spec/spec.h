@@ -72,6 +72,10 @@ hull_spec_status hull_spec_open(hull_spec *spec, const uint8_t *data, size_t len
 int hull_spec_find(const hull_spec *spec, const hull_sexpr_form *record,
                    const char *key, hull_sexpr_form *entry);
 
+/* The name of the `index`th key a machine takes, in the schema's order,
+ * so that a test can hold Appendix J to the schema; NULL past the last. */
+const char *hull_spec_machine_key(unsigned index);
+
 #ifdef __cplusplus
 }
 #endif
