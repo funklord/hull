@@ -48,6 +48,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -61,6 +62,7 @@
 
 #define API           "/v1.41"
 #define MAX_RESPONSE  (1u << 20)
+#define MAX_LAYERS    17u   /* the source and sixteen (layers ...) above it */
 
 struct hull_machine {
 	hull_core       *core;
@@ -595,6 +597,232 @@ static const char *import_dir(const char *root, const hull_tree_owner *owners, s
 	free(answer);
 	retire_imports(tree, id);
 	return NULL;
+}
+
+/* A ustar header of the docker-save tar's own, for an entry hull names:
+ * a short name, a file's size, nothing else; 0, or -1. */
+static int save_header(int fd, const char *name, unsigned long long size)
+{
+	uint8_t  block[512];
+	unsigned sum = 0u;
+
+	memset(block, 0, sizeof block);
+	snprintf((char *)block, 100u, "%s", name);
+	memcpy(block + 100, "0000644", 7u);
+	memcpy(block + 108, "0000000", 7u);
+	memcpy(block + 116, "0000000", 7u);
+	snprintf((char *)block + 124, 12u, "%011llo", size);
+	memcpy(block + 136, "00000000000", 11u);
+	memset(block + 148, ' ', 8u);
+	block[156] = '0';
+	memcpy(block + 257, "ustar", 6u);
+	memcpy(block + 263, "00", 2u);
+	for (size_t i = 0u; i < sizeof block; i++)
+		sum += block[i];
+	snprintf((char *)block + 148, 8u, "%06o", sum);
+	return send_all(fd, (const char *)block, sizeof block);
+}
+
+/* The zeroes after `n` bytes, to the end of their block. */
+static int save_pad(int fd, unsigned long long n)
+{
+	static const char zeroes[512];
+
+	return n % 512u == 0u ? 0 : send_all(fd, zeroes, 512u - (size_t)(n % 512u));
+}
+
+static unsigned long long save_entry(unsigned long long n)
+{
+	return 512u + (n + 511u) / 512u * 512u;
+}
+
+/*
+ * A dir source with (layers ...) as an image of as many layers, `trees`,
+ * `count` of them, the source first: each tree's tar a layer of its own,
+ * docker's union putting each above the last as overlayfs does, loaded as
+ * a docker-save tar, `hull-dir:<digest of its config>`, into `image`. The
+ * config names each layer's digest, which the daemon checks as it loads,
+ * so a tree that changed between the two readings is refused there.
+ * Labelled as an import is, hull.tree the paths' SHA-256 together and
+ * hull.path the source's, for gc. NULL, or why in `detail`.
+ */
+static const char *import_layers(char *const *trees, unsigned count, const hull_tree_owner *owners,
+                                 size_t owner_count, char *image, size_t cap, char *detail,
+                                 size_t detail_cap)
+{
+	reading            first[MAX_LAYERS];
+	uint8_t            digest[32];
+	char               hex[65];
+	char               tree[65];
+	char               where[2u * PATH_MAX + 1u];
+	char               path[400];
+	char               name[32];
+	char              *answer = NULL;
+	const char        *arch = "amd64";
+	text               config = { 0 };
+	text               manifest = { 0 };
+	text               head = { 0 };
+	unsigned long long total = 1024u;
+	int                status = 0;
+	int                fd;
+	struct utsname     self;
+
+	if (count > MAX_LAYERS) {
+		snprintf(detail, detail_cap, "more than %u layers", MAX_LAYERS - 1u);
+		return detail;
+	}
+	if (uname(&self) == 0 && strcmp(self.machine, "aarch64") == 0)
+		arch = "arm64";
+	{
+		hull_sha256 named;
+
+		hull_sha256_init(&named);
+		for (unsigned i = 0u; i < count; i++) {
+			char       *canonical = realpath(trees[i], NULL);
+			const char *at = canonical != NULL ? canonical : trees[i];
+
+			hull_sha256_update(&named, (const uint8_t *)at, strlen(at) + 1u);
+			if (i == 0u) {
+				where[0] = '\0';
+				for (size_t k = 0u; at[k] != '\0' && 2u * k + 2u < sizeof where; k++)
+					snprintf(where + 2u * k, 3u, "%02x", (unsigned char)at[k]);
+			}
+			free(canonical);
+		}
+		hull_sha256_final(&named, digest);
+		hull_sha256_hex(digest, tree);
+	}
+	addf(&config, "{\"architecture\":\"%s\",\"os\":\"linux\",\"config\":{\"Labels\":"
+	     "{\"hull.tree\":\"%s\",\"hull.path\":\"%s\"}},\"rootfs\":{\"type\":\"layers\","
+	     "\"diff_ids\":[", arch, tree, where);
+	for (unsigned i = 0u; i < count; i++) {
+		memset(&first[i], 0, sizeof first[i]);
+		hull_sha256_init(&first[i].sha);
+		if (hull_tree_tar_owned(trees[i], owners, owner_count, counted, &first[i], detail,
+		                        detail_cap) != 0) {
+			free(config.data);
+			return detail;
+		}
+		hull_sha256_final(&first[i].sha, digest);
+		hull_sha256_hex(digest, hex);
+		addf(&config, "%s\"sha256:%s\"", i == 0u ? "" : ",", hex);
+		total += save_entry(first[i].length);
+	}
+	add_text(&config, "]}}");
+	if (config.failed) {
+		free(config.data);
+		snprintf(detail, detail_cap, "out of memory");
+		return detail;
+	}
+	{
+		hull_sha256 own;
+
+		hull_sha256_init(&own);
+		hull_sha256_update(&own, (const uint8_t *)config.data, config.length);
+		hull_sha256_final(&own, digest);
+		hull_sha256_hex(digest, hex);
+	}
+	snprintf(image, cap, "hull-dir:%s", hex);
+	snprintf(path, sizeof path, "/images/%s/json", image);
+	if (call("GET", path, NULL, &status, &answer) != 0) {
+		free(config.data);
+		snprintf(detail, detail_cap, "the Docker daemon at %s cannot be reached", socket_path());
+		return detail;
+	}
+	free(answer);
+	answer = NULL;
+	if (status == 200) {
+		free(config.data);
+		return NULL;
+	}
+	if (status != 404) {
+		free(config.data);
+		return daemon_says(detail, detail_cap, "looking for the import", status, NULL);
+	}
+	addf(&manifest, "[{\"Config\":\"config.json\",\"RepoTags\":[\"%s\"],\"Layers\":[", image);
+	for (unsigned i = 0u; i < count; i++)
+		addf(&manifest, "%s\"%u/layer.tar\"", i == 0u ? "" : ",", i);
+	add_text(&manifest, "]}]");
+	total += save_entry(config.length) + save_entry(manifest.length);
+	fd = dial();
+	addf(&head, "POST " API "/images/load?quiet=1 HTTP/1.1\r\nHost: docker\r\n"
+	     "Connection: close\r\nContent-Type: application/x-tar\r\nContent-Length: %llu\r\n\r\n",
+	     total);
+	if (fd < 0 || manifest.failed || head.failed ||
+	    send_all(fd, head.data, head.length) != 0 ||
+	    save_header(fd, "config.json", config.length) != 0 ||
+	    send_all(fd, config.data, config.length) != 0 || save_pad(fd, config.length) != 0) {
+		snprintf(detail, detail_cap, fd < 0 ? "the Docker daemon at %s cannot be reached" :
+		                                      "the layers could not be sent to %s", socket_path());
+		goto failed;
+	}
+	for (unsigned i = 0u; i < count; i++) {
+		reading second;
+
+		memset(&second, 0, sizeof second);
+		hull_sha256_init(&second.sha);
+		second.fd    = fd;
+		second.limit = first[i].length;
+		snprintf(name, sizeof name, "%u/layer.tar", i);
+		if (save_header(fd, name, first[i].length) != 0 ||
+		    hull_tree_tar_owned(trees[i], owners, owner_count, sent, &second, detail,
+		                        detail_cap) != 0) {
+			if (second.over)
+				snprintf(detail, detail_cap, "the directory changed while it was imported");
+			goto failed;
+		}
+		/* A tree that shrank is sent to the length promised, and its
+		 * digest, which the daemon checks, then differs. */
+		while (second.length < second.limit) {
+			static const char zeroes[4096];
+			size_t            take = second.limit - second.length < sizeof zeroes ?
+			                         (size_t)(second.limit - second.length) : sizeof zeroes;
+
+			if (send_all(fd, zeroes, take) != 0)
+				break;
+			second.length += take;
+		}
+		if (save_pad(fd, first[i].length) != 0) {
+			snprintf(detail, detail_cap, "the layers could not be sent");
+			goto failed;
+		}
+	}
+	{
+		static const char end[1024];
+
+		if (save_header(fd, "manifest.json", manifest.length) != 0 ||
+		    send_all(fd, manifest.data, manifest.length) != 0 ||
+		    save_pad(fd, manifest.length) != 0 || send_all(fd, end, sizeof end) != 0) {
+			snprintf(detail, detail_cap, "the layers could not be sent");
+			goto failed;
+		}
+	}
+	if (read_answer(fd, &status, &answer) != 0) {
+		snprintf(detail, detail_cap, "the load got no answer");
+		goto failed;
+	}
+	if (status != 200 || json_string(answer, "error", detail, detail_cap)) {
+		if (status != 200)
+			daemon_says(detail, detail_cap, "load", status, answer);
+		goto failed;
+	}
+	free(answer);
+	free(config.data);
+	free(manifest.data);
+	free(head.data);
+	close(fd);
+	snprintf(path, sizeof path, "sha256:%s", hex);
+	retire_imports(tree, path);
+	return NULL;
+
+failed:
+	free(answer);
+	free(config.data);
+	free(manifest.data);
+	free(head.data);
+	if (fd >= 0)
+		close(fd);
+	return detail;
 }
 
 /* --- the plan, as a container -------------------------------------------- */
@@ -1210,11 +1438,34 @@ static const char *source_image(const hull_sexpr_doc *doc, const hull_sexpr_form
 	size_t           count = 0u;
 	const char      *reason = NULL;
 
+	char            *trees[MAX_LAYERS] = { NULL };
+	unsigned         layers = 0u;
+	hull_sexpr_form  entry;
+
 	if (given != NULL) {
 		char *at = hull_access_path(doc, given);
 
 		reason = at == NULL ? "out of memory" : read_owners(at, &data, &owners, &count);
 		free(at);
+	}
+	/* (layers "dir:..." ...): each above the source, the last on top. */
+	if (reason == NULL && hull_access_find(doc, machine, "layers", &entry)) {
+		hull_sexpr_form item;
+		int             more;
+
+		hull_sexpr_child(doc, &entry, &item);
+		for (more = hull_sexpr_next(doc, &item, &item); more && reason == NULL;
+		     more = hull_sexpr_next(doc, &item, &item)) {
+			char *text = hull_access_text(doc, &item);
+
+			if (layers + 1u == MAX_LAYERS)
+				reason = "there are too many layers";
+			else if (text == NULL || strncmp(text, "dir:", 4u) != 0)
+				reason = "a layer is a dir: source";
+			else if ((trees[1u + layers++] = hull_access_path(doc, text + 4)) == NULL)
+				reason = "out of memory";
+			free(text);
+		}
 	}
 	if (reason != NULL) {
 		/* said below */
@@ -1222,15 +1473,22 @@ static const char *source_image(const hull_sexpr_doc *doc, const hull_sexpr_form
 		snprintf(image, cap, "%s", source);
 		if (given != NULL)
 			reason = "owners are given to a dir's import: an image ref keeps its own";
+		else if (layers != 0u)
+			reason = "layers lie above a dir's import: an image ref has its own";
 	} else if (source != NULL && strncmp(source, "dir:", 4u) == 0 && source[4] != '\0') {
 		root = hull_access_path(doc, source + 4);
+		trees[0] = root;
 		reason = root == NULL ? "out of memory" :
+		         layers != 0u ?
+		         import_layers(trees, 1u + layers, owners, count, image, cap, create_detail,
+		                       sizeof create_detail) :
 		         import_dir(root, owners, count, image, cap, create_detail,
 		                    sizeof create_detail);
-		free(root);
 	} else {
 		reason = "the docker adapter runs an image ref or a dir";
 	}
+	for (unsigned i = 0u; i < MAX_LAYERS; i++)
+		free(trees[i]);
 	free(owners);
 	free(data);
 	free(given);
@@ -1912,8 +2170,8 @@ static const hull_cap_entry entries[] = {
 	{ "network.none",       HULL_SUP_NATIVE,   NULL, NULL },
 	{ "export",             HULL_SUP_NATIVE,
 	  "docker export, once the workload ends", NULL },
-	{ "layers",             HULL_SUP_REJECTED,
-	  "not yet: a container's layers are its image's", NULL },
+	{ "layers",             HULL_SUP_EMULATED,
+	  "an image of as many layers, each dir's tar one, loaded into the daemon", NULL },
 	{ "upper",              HULL_SUP_REJECTED,
 	  "a container's writable layer is the daemon's", NULL },
 	{ "owners",             HULL_SUP_EMULATED,

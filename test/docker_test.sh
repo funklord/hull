@@ -192,6 +192,39 @@ view=$(timeout 30 "$hull" manifest show dbuilt/1 2>&1)
 	fail "a build on docker did not keep its owners, or its writes as root's" "$committed
 $built
 $(printf '%s\n' "$view" | grep -E 'given|made')"
+# (layers "dir:..." ...): an image of as many layers, the source's tar
+# beneath and each layer's above it, docker's union making the top one
+# win; a write is the container's and lands in no layer; the same trees
+# run again from the same image; and an image ref is refused them.
+mkdir -p "$root/layered/template" "$root/layered/site/sub"
+cp "$probe" "$root/layered/template/probe"
+printf 'template\n' > "$root/layered/template/a"
+printf 'site\n' > "$root/layered/site/a"
+printf 'b\n' > "$root/layered/site/sub/b"
+printf '(machine (source "dir:./layered/template") (layers "dir:./layered/site") (mutable overlay) (backend docker) (hostname "dtest") %s)\n' \
+	'(command "/probe" "read" "/a" "read" "/sub/b" "write" "/sub/w" "write" "/w")' > "$root/layered.conf"
+expect 0 'layers: emulated: an image of as many layers' layered
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^read=site$' && printf '%s\n' "$out" | grep -q '^read=b$' &&
+	[ "$(printf '%s\n' "$out" | grep -c '^write=')" = 2 ] &&
+	[ ! -e "$root/layered/site/sub/w" ] && [ ! -e "$root/layered/template/w" ] ||
+	fail "a layered machine did not see its top layer, or wrote into one" "$out"
+layered_images() {
+	timeout 10 docker images --filter label=hull.path --format '{{.ID}} {{.Repository}}:{{.Tag}}' |
+		grep ' hull-dir:' | while read -r id ref; do
+		at=$(timeout 10 docker image inspect -f '{{index .Config.Labels "hull.path"}}' "$id" |
+			python3 -c 'import sys; print(bytes.fromhex(sys.stdin.read().strip()).decode())')
+		[ "$at" = "$(realpath "$root/layered/template")" ] && printf '%s\n' "$ref"
+	done
+}
+first_layered=$(layered_images)
+expect 0 '^read=site$' layered
+cases=$((cases + 1))
+[ -n "$first_layered" ] && [ "$(layered_images)" = "$first_layered" ] ||
+	fail "the same layers were not run from the same image" "$first_layered then $(layered_images)"
+conf layeredref '(layers "dir:/tmp") (command "true")'
+expect 125 'layers lie above a dir.s import' layeredref
+for image in $(layered_images); do timeout 30 docker rmi "$image" > /dev/null 2>&1; done
 # Refused for being read-only, by name, and somewhere this uid could
 # otherwise write: /tmp, on the root, is everybody's.
 conf volro '(command "sh" "-c" "echo x > /data/out || true")' \
