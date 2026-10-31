@@ -272,11 +272,11 @@ static void test_records(void)
 	   "machine.segments.wire.advertise");
 	NO(M("(segments (wire (subnet \"10.99.0.0/24\") (advertise true)))"), SHAPE, "(advertise true)",
 	   "machine.segments.wire.advertise");
-	/* A gateway at .1, of an IPv4 network alone. */
+	/* A gateway at .1 and ::1, of either network. */
 	OK(M("(segments (wire (subnet \"10.99.0.0/24\") (gateway true)))"));
-	OK(M("(segments (wire (subnet6 \"fd42:99::/64\") (gateway false)))"));
-	NO(M("(segments (wire (subnet6 \"fd42:99::/64\") (gateway true)))"), SHAPE, "(gateway true)",
-	   "machine.segments.wire.gateway");
+	OK(M("(segments (wire (subnet6 \"fd42:99::/72\") (gateway true)))"));
+	NO(M("(segments (wire (gateway true)))"), MISSING, "(wire (gateway true))",
+	   "machine.segments.wire");
 	NO(M("(segments (wire (mask \"x\")))"), UNKNOWN, "mask", "machine.segments.wire.mask");
 	NO(M("(segments \"wire\" (wire (subnet \"10.99.0.0/24\")))"), DUPLICATE, "(wire (",
 	   "machine.segments");

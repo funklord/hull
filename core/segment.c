@@ -1251,8 +1251,9 @@ static void send_advert(segment *s, unsigned to, const uint8_t mac[6], const pee
 
 /* hull's router advertisement of `s`'s IPv6 network to `asker` at `mac`,
  * or to every node where it solicited from ::, from hull's link-local
- * address: a router lifetime of 0, hull being no IPv6 gateway; the prefix,
- * on-link and for SLAAC; ::1 as its DNS server (RDNSS, RFC 8106) and
+ * address: a router lifetime of 0, a gateway's route being set
+ * outright; the prefix, on-link and for SLAAC; ::1 as its DNS server
+ * (RDNSS, RFC 8106) and
  * `hull` to search (DNSSL). The lifetimes are for ever, as the network's
  * is the segment's while it is there, so nothing is sent unasked. */
 static void send_ra(segment *s, unsigned to, const uint8_t mac[6], const peer *asker)
@@ -1968,8 +1969,9 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 		memset(&asker, 0, sizeof asker);
 		/* For .1 and not ARP, DNS, ping or neighbour discovery: nothing
 		 * else answers there. A header that does not validate, its sum
-		 * among it, is not read, nor IPv6 with an extension header. IPv4
-		 * for beyond .1 is forward()'s, out through it or nowhere. */
+		 * among it, is not read, nor IPv6 with an extension header. What
+		 * is for beyond .1 or ::1 is forward()'s, out through it or
+		 * nowhere. */
 		if (type == 0x0800u && have4) {
 			size_t header;
 			size_t datagram;
@@ -1995,9 +1997,11 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 			self     = &self4;
 		} else if (type == 0x86ddu && have6) {
 			if (hull_frame_ipv6_header_view(&msg, 14u, &view) != SITU_OK ||
-			    hull_frame_ipv6_header_validate(view) != SITU_OK ||
-			    memcmp(hull_frame_ipv6_header_destination_ptr(view), self6.v6, 16u) != 0 ||
-			    54u + hull_frame_ipv6_header_payload_length_get(view) > size)
+			    hull_frame_ipv6_header_validate(view) != SITU_OK)
+				return 1;
+			if (memcmp(hull_frame_ipv6_header_destination_ptr(view), self6.v6, 16u) != 0)
+				return 0;
+			if (54u + hull_frame_ipv6_header_payload_length_get(view) > size)
 				return 1;
 			asker.six = 1;
 			memcpy(asker.v6, hull_frame_ipv6_header_source_ptr(view), 16u);
@@ -2078,12 +2082,14 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
 /*
  * A port's way out, where its segment is a gateway (Appendix D): passt,
  * as the user, on a socket pair whose other end is the switch's, given
- * the machine's own address, its subnet and .1 as its gateway, so that it
- * is the machine's NAT as a vm's passt is the vm's. One a machine, as
+ * the machine's own address, its subnet and .1 as its gateway, and its
+ * IPv6 address and hull's link-local one where the segment has an IPv6
+ * network, so that it is the machine's NAT as a vm's passt is the vm's. One a machine, as
  * passt serves one guest: measured with two behind one, its replies went
  * to the MAC that last spoke, and two flows from one source port, one
  * from each machine, shared a host port and the second took the first's
- * answers. Its MAC is hull's, so that what it sends comes from .1. It
+ * answers. Its MAC is hull's, so that what it sends comes from .1 and
+ * ::1. It
  * answers no ARP, DHCP or NDP, which are the switch's or nobody's, maps
  * no host loopback onto .1 and forwards nothing in. passt's parent exits
  * once it is set up, saying why where it cannot; the daemon it leaves
@@ -2091,16 +2097,16 @@ static int answer(segment *s, unsigned from, const uint8_t *framed, size_t lengt
  */
 static void dotted(uint32_t address, char out[16]);
 
-static uplink *start_uplink(uint32_t address, unsigned prefix, char *why, size_t cap)
+static uplink *start_uplink(uint32_t address, unsigned prefix, const uint8_t *address6,
+                           unsigned prefix6, char *why, size_t cap)
 {
 	char        self[16];
-	char        bits[4];
+	char        bits[12];
 	char        gateway[16];
-	const char *argv[] = { "passt", "--quiet", "--fd", "3", "--one-off", "--ipv4-only",
-	                       "--address", self, "--netmask", bits, "--gateway", gateway,
-	                       "--no-map-gw", "--mac-addr", "02:68:75:6c:6c:01", "--no-dhcp",
-	                       "--no-ndp", "--no-dhcpv6", "--no-ra", "--tcp-ports", "none",
-	                       "--udp-ports", "none", NULL };
+	char        self6[INET6_ADDRSTRLEN];
+	char        gateway6[INET6_ADDRSTRLEN];
+	const char *argv[32];
+	unsigned    a = 0u;
 	uint32_t    mask = prefix == 0u ? 0u : 0xffffffffu << (32u - prefix);
 	int         pair[2];
 	int         said[2];
@@ -2108,9 +2114,48 @@ static uplink *start_uplink(uint32_t address, unsigned prefix, char *why, size_t
 	pid_t       pid;
 	uplink     *up;
 
-	dotted(address, self);
-	snprintf(bits, sizeof bits, "%u", prefix);
-	dotted((address & mask) + 1u, gateway);
+	argv[a++] = "passt";
+	argv[a++] = "--quiet";
+	argv[a++] = "--fd";
+	argv[a++] = "3";
+	argv[a++] = "--one-off";
+	if (prefix != 0u) {
+		dotted(address, self);
+		snprintf(bits, sizeof bits, "%u", prefix);
+		dotted((address & mask) + 1u, gateway);
+		argv[a++] = "--address";
+		argv[a++] = self;
+		argv[a++] = "--netmask";
+		argv[a++] = bits;
+		argv[a++] = "--gateway";
+		argv[a++] = gateway;
+	} else {
+		argv[a++] = "--ipv6-only";
+	}
+	if (prefix6 != 0u) {
+		/* Its gateway is where its router advertisements would come
+		 * from, which it sends none of: hull's link-local address. */
+		inet_ntop(AF_INET6, address6, self6, sizeof self6);
+		inet_ntop(AF_INET6, hull_link_local, gateway6, sizeof gateway6);
+		argv[a++] = "--address";
+		argv[a++] = self6;
+		argv[a++] = "--gateway";
+		argv[a++] = gateway6;
+	} else {
+		argv[a++] = "--ipv4-only";
+	}
+	argv[a++] = "--no-map-gw";
+	argv[a++] = "--mac-addr";
+	argv[a++] = "02:68:75:6c:6c:01";
+	argv[a++] = "--no-dhcp";
+	argv[a++] = "--no-ndp";
+	argv[a++] = "--no-dhcpv6";
+	argv[a++] = "--no-ra";
+	argv[a++] = "--tcp-ports";
+	argv[a++] = "none";
+	argv[a++] = "--udp-ports";
+	argv[a++] = "none";
+	argv[a] = NULL;
 	if ((up = calloc(1u, sizeof *up)) == NULL) {
 		say(why, cap, "out of memory");
 		return NULL;
@@ -2168,10 +2213,21 @@ static uplink *start_uplink(uint32_t address, unsigned prefix, char *why, size_t
 	return up;
 }
 
-/* A frame `p` sent to .1's MAC that .1 does not answer: to its passt,
- * where it has one, if it is IPv4 to beyond the subnet -- one to a
- * sibling is the sibling's MAC's, and .1's own are answered or are not --
- * and dropped otherwise, as a router without that route drops it. */
+/* Whether `a` is in the IPv6 network of `prefix` bits at `network`. */
+static int within6(const uint8_t *a, const uint8_t *network, unsigned prefix)
+{
+	for (unsigned bit = 0u; bit < prefix; bit++)
+		if (((a[bit / 8u] ^ network[bit / 8u]) >> (7u - bit % 8u) & 1u) != 0u)
+			return 0;
+	return 1;
+}
+
+/* A frame `p` sent to .1's MAC that .1 and ::1 do not answer: to its
+ * passt, where it has one, if it is for beyond the subnet of its family
+ * -- one for a sibling is the sibling's MAC's, and hull's own are
+ * answered or are not -- and not for a link-local or multicast address,
+ * which no router forwards; dropped otherwise, as a router without that
+ * route drops it. */
 static void route_out(segment *s, unsigned from, const uint8_t *framed, size_t length)
 {
 	port       *p = s->ports[from];
@@ -2180,17 +2236,34 @@ static void route_out(segment *s, unsigned from, const uint8_t *framed, size_t l
 	situ_msg_t  msg;
 	situ_view_t ether;
 	situ_view_t view;
+	uint16_t    type;
 	ssize_t     n;
 
-	if (up == NULL || up->fd < 0 || up->out_length != 0u || p->prefix == 0u)
+	if (up == NULL || up->fd < 0 || up->out_length != 0u)
 		return;
 	situ_msg_init(&msg, (uint8_t *)(uintptr_t)(framed + 4), (uint32_t)(length - 4u));
-	if (hull_frame_ethernet_header_view(&msg, 0u, &ether) != SITU_OK ||
-	    hull_frame_ethernet_header_ethertype_get(ether) != 0x0800u ||
-	    hull_frame_ipv4_header_view(&msg, 14u, (uint32_t)(length - 4u - 14u), &view) != SITU_OK ||
-	    hull_frame_ipv4_header_validate(view) != SITU_OK ||
-	    (hull_frame_ipv4_header_destination_get(view) & mask) == (p->address & mask))
+	if (hull_frame_ethernet_header_view(&msg, 0u, &ether) != SITU_OK)
 		return;
+	type = hull_frame_ethernet_header_ethertype_get(ether);
+	if (type == 0x0800u) {
+		if (p->prefix == 0u ||
+		    hull_frame_ipv4_header_view(&msg, 14u, (uint32_t)(length - 4u - 14u), &view) != SITU_OK ||
+		    hull_frame_ipv4_header_validate(view) != SITU_OK ||
+		    (hull_frame_ipv4_header_destination_get(view) & mask) == (p->address & mask))
+			return;
+	} else if (type == 0x86ddu) {
+		const uint8_t *to;
+
+		if (p->prefix6 == 0u || hull_frame_ipv6_header_view(&msg, 14u, &view) != SITU_OK ||
+		    hull_frame_ipv6_header_validate(view) != SITU_OK)
+			return;
+		to = hull_frame_ipv6_header_destination_ptr(view);
+		if (within6(to, p->address6, p->prefix6) || to[0] == 0xffu ||
+		    (to[0] == 0xfeu && (to[1] & 0xc0u) == 0x80u))
+			return;
+	} else {
+		return;
+	}
 	n = send(up->fd, framed, length, MSG_DONTWAIT | MSG_NOSIGNAL);
 	if (n < 0)
 		n = 0;
@@ -2214,7 +2287,7 @@ static void drain_uplink(uplink *up)
 	}
 }
 
-/* Read what port `i`'s passt sent, each IPv4 frame it completes given to
+/* Read what port `i`'s passt sent, each IP frame it completes given to
  * the port through its link, as a sibling's would be. A passt gone ends
  * the way out and nothing else. */
 static void take_uplink(segment *s, unsigned i)
@@ -2246,7 +2319,8 @@ static void take_uplink(segment *s, unsigned i)
 		whole = 4u + frame;
 		if (up->in_length < whole)
 			break;
-		if (whole >= 4u + 14u && get16(up->in + 4u + 12u) == 0x0800u)
+		if (whole >= 4u + 14u &&
+		    (get16(up->in + 4u + 12u) == 0x0800u || get16(up->in + 4u + 12u) == 0x86ddu))
 			cross(s, i, HULL_SEGMENT_IN, up->in, whole);
 		memmove(up->in, up->in + whole, up->in_length - whole);
 		up->in_length -= whole;
@@ -2631,7 +2705,8 @@ int hull_segment_port_named(const char *key, const char *machine, uint32_t addre
 		return -1;
 	}
 	/* Its passt before the lock, which the switch's frames wait on. */
-	if (gateway && prefix != 0u && (up = start_uplink(address, prefix, why, cap)) == NULL)
+	if (gateway && (prefix != 0u || prefix6 != 0u) &&
+	    (up = start_uplink(address, prefix, address6, prefix6, why, cap)) == NULL)
 		return -1;
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) {
 		say(why, cap, strerror(errno));

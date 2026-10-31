@@ -146,7 +146,7 @@ typedef struct hull_segment_host {
  * advertises that network to it (`advertise`: router advertisements for
  * SLAAC, from hull's link-local address), whether .1 is its way out
  * (`gateway`: a passt of the port's own, which what the machine sends to
- * .1's MAC for beyond the IPv4 subnet goes through, refused where passt
+ * .1's MAC for beyond its subnet, either family's, goes through, refused where passt
  * cannot start), and the names the machine's
  * plan gives the segment, `hosts`, `count` of them, which the switch copies: what its
  * /etc/hosts holds, every machine of its file. hull at .1 answers for

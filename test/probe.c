@@ -352,18 +352,25 @@ static void serve(const char *proto, const char *port)
 
 static void dial(const char *address, const char *port)
 {
-	int                fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-	struct sockaddr_in to;
-	struct pollfd      p;
-	int                error = 0;
-	socklen_t          length = sizeof error;
-	char               text[256];
+	int                  six = strchr(address, ':') != NULL;   /* an IPv6 address */
+	int                  fd = socket(six ? AF_INET6 : AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	struct sockaddr_in6  to6;
+	struct sockaddr_in   to;
+	struct pollfd        p;
+	int                  error = 0;
+	socklen_t            length = sizeof error;
+	char                 text[256];
 
 	memset(&to, 0, sizeof to);
 	to.sin_family = AF_INET;
 	to.sin_port   = htons((unsigned short)atoi(port));
 	inet_pton(AF_INET, address, &to.sin_addr);
-	if (connect(fd, (struct sockaddr *)&to, sizeof to) != 0 && errno != EINPROGRESS) {
+	memset(&to6, 0, sizeof to6);
+	to6.sin6_family = AF_INET6;
+	to6.sin6_port   = to.sin_port;
+	inet_pton(AF_INET6, address, &to6.sin6_addr);
+	if ((six ? connect(fd, (struct sockaddr *)&to6, sizeof to6) :
+	           connect(fd, (struct sockaddr *)&to, sizeof to)) != 0 && errno != EINPROGRESS) {
 		printf("dial %s:%s=%s\n", address, port, strerror(errno));
 		close(fd);
 		return;

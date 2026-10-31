@@ -1964,7 +1964,7 @@ static const char *named_of(slot *s, const hull_sexpr_doc *doc, const hull_sexpr
 			free(flag);
 			flag = hull_access_find(doc, &names, segment, &record) ?
 			       hull_access_value(doc, &record, "gateway") : NULL;
-			s->named[s->named_count].gateway = has4 && flag != NULL && strcmp(flag, "true") == 0;
+			s->named[s->named_count].gateway = flag != NULL && strcmp(flag, "true") == 0;
 			free(flag);
 		}
 		if (hosts_of(doc, &names, segment, &s->named[s->named_count].hosts,

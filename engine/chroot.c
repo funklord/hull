@@ -617,8 +617,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 				                  &m->segment_prefix[i]);
 				hull_access_named6(doc, &entry, m->segment[i], m->segment_address6[i],
 				                   &m->segment_prefix6[i]);
-				m->segment_gateway[i] = m->segment_address[i][0] != '\0' &&
-				                        hull_access_gateway(doc, &entry, m->segment[i]);
+				m->segment_gateway[i] = hull_access_gateway(doc, &entry, m->segment[i]);
 			}
 			/* hull at their .1 is the one to ask, which names a sibling
 			 * that joins later, and under NAT or on hull's bridge forwards
@@ -1666,6 +1665,7 @@ static void join_segments(const hull_machine *m, int report)
 	int   tap[MAX_SEGMENTS];
 	pid_t relayer;
 	int   routed = m->nat || m->bridge;   /* a default route already, its own */
+	int   routed6 = routed;
 
 	for (unsigned i = 0u; i < m->segment_count; i++) {
 		struct ifreq request = { 0 };
@@ -1710,8 +1710,15 @@ static void join_segments(const hull_machine *m, int report)
 				child_fail(report, "a segment's NIC's IPv6 address");
 		}
 		/* The first segment whose .1 is a gateway is the way out of a
-		 * machine with none of its own (Appendix D). */
-		if (!routed && m->segment_gateway[i]) {
+		 * machine with none of its own (Appendix D), and the first whose
+		 * ::1 is, by IPv6. */
+		if (!routed6 && m->segment_gateway[i] && m->segment_address6[i][0] != '\0') {
+			if (hull_ip6_route(request.ifr_name, m->segment_address6[i],
+			                   m->segment_prefix6[i]) != 0)
+				child_fail(report, "a segment's IPv6 route out through its ::1");
+			routed6 = 1;
+		}
+		if (!routed && m->segment_gateway[i] && m->segment_address[i][0] != '\0') {
 			struct rtentry      route = { 0 };
 			struct sockaddr_in *gateway = (struct sockaddr_in *)&route.rt_gateway;
 			uint32_t            mask = 0xffffffffu << (32u - m->segment_prefix[i]);

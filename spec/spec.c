@@ -603,10 +603,8 @@ static const key segment_keys[] = {
 static const schema segment = TABLE_ACROSS(segment_keys, segment_across);
 
 /* Where these sit in segment_keys, for segment_across. */
-#define SEGMENT_SUBNET    0u
 #define SEGMENT_SUBNET6   1u
 #define SEGMENT_ADVERTISE 2u
-#define SEGMENT_GATEWAY   3u
 
 /* Whether the record's `at` key, present, is `true`. */
 static int given_true(const walk *w, const hull_sexpr_form *found, uint64_t present, unsigned at)
@@ -623,8 +621,8 @@ static int given_true(const walk *w, const hull_sexpr_form *found, uint64_t pres
 
 /* Given subnet, subnet6 or both; (advertise true), hull's router
  * advertisements for SLAAC, only of an IPv6 network of /64, the one
- * length SLAAC makes an address in (RFC 4862 5.5.3); and (gateway true),
- * a way out through .1, only of an IPv4 network, .1 being IPv4's. */
+ * length SLAAC makes an address in (RFC 4862 5.5.3). (gateway true), a
+ * way out through .1 and ::1, takes either network. */
 static hull_spec_status segment_across(walk *w, const hull_sexpr_form *record,
                                        const hull_sexpr_form *found, uint64_t present)
 {
@@ -637,14 +635,6 @@ static hull_spec_status segment_across(walk *w, const hull_sexpr_form *record,
 	if ((present & 3u) == 0u)
 		return fail(w, HULL_SPEC_ERR_MISSING, record->offset,
 		            "a segment hull addresses is given its subnet, its subnet6, or both");
-	if (given_true(w, found, present, SEGMENT_GATEWAY) &&
-	    !(present & ((uint64_t)1 << SEGMENT_SUBNET))) {
-		saved = push_text(w, "gateway");
-		fail(w, HULL_SPEC_ERR_SHAPE, found[SEGMENT_GATEWAY].offset,
-		     "routes out through the segment's .1, which needs a subnet");
-		pop(w, saved);
-		return HULL_SPEC_ERR_SHAPE;
-	}
 	if (!given_true(w, found, present, SEGMENT_ADVERTISE))
 		return HULL_SPEC_OK;
 	if (present & ((uint64_t)1 << SEGMENT_SUBNET6)) {

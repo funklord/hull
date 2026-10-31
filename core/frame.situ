@@ -236,9 +236,9 @@ struct router_solicitation {
 
 // hull's router advertisement, RFC 4861 4.2, where a segment asks it to
 // advertise its IPv6 network: the hop limit to use, neither managed nor
-// other configuration, and a router lifetime of 0 -- hull is no IPv6 gateway,
-// and a machine's default route stays its own; the prefix, RDNSS and DNSSL
-// are its options, built in C.
+// other configuration, and a router lifetime of 0 -- a machine's default
+// route stays its own, a gateway's being set outright; the prefix, RDNSS
+// and DNSSL are its options, built in C.
 struct router_advertisement [allow_straddle] {
 	authenticated summed {
 		u8        type        [must_eq = 134];

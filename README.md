@@ -105,7 +105,8 @@ them has:
   are addressed, named to each other and answered by hull's own DNS;
   given an IPv6 one beside it or in its place, by either family or both,
   and advertised for SLAAC where asked; and given a way out through
-  hull at the segment's `.1` where a machine has no network of its own.
+  hull at the segment's `.1` and `::1` where a machine has no network of
+  its own.
   Each link can lose, delay, reorder, duplicate, corrupt or rate-limit
   traffic in netem's terms, changed while running; frames can be
   dropped, rewritten or replayed by pattern, or injected; and any link

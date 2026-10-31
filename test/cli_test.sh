@@ -2373,6 +2373,30 @@ while True:
 else
 	printf 'cli: the host has no address but loopback; the way out through .1 is not tried\n'
 fi
+# (gateway true) at ::1, the same by IPv6, in a namespace whose host side
+# has IPv6, as this host may not (test/gateway_net.sh): a machine of a
+# segment of IPv6 alone reaching the host's IPv6 address, one of both
+# families each, and one on a segment of IPv6 that is no gateway reaching
+# nothing beyond it. hull there is its own core, in a directory of its own.
+mkdir -p "$root/gw6run"
+chmod 700 "$root/gw6run"
+printf '(machines (g6-only %s) (g6-both %s) (g6-none %s))\n' \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (g6only-$$ (subnet6 \"fd42:95::/64\") (gateway true))) (command \"/probe\" \"dial\" \"2001:db8:7::10\" \"7777\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (g6both-$$ (subnet \"10.94.0.0/24\") (subnet6 \"fd42:94::/64\") (gateway true))) (command \"/probe\" \"dial\" \"2001:db8:7::10\" \"7777\" \"dial\" \"192.0.2.10\" \"7778\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments (g6none-$$ (subnet6 \"fd42:93::/64\"))) (command \"/probe\" \"dial\" \"2001:db8:7::10\" \"7777\")" \
+	> "$root/gateway6.conf"
+limit=120
+expect 0 '^g6-only +\| dial 2001:db8:7::10:7777=out through ::1$' \
+	unshare -rn sh "$(dirname "$0")/gateway_net.sh" "$hull_abs" "$root/gateway6.conf" "$root/gw6run"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^g6-both *| dial 2001:db8:7::10:7777=out through ::1$' &&
+	printf '%s\n' "$out" | grep -q '^g6-both *| dial 192\.0\.2\.10:7778=out through \.1$' ||
+	fail "a machine on a segment of both families did not go out through ::1 and .1" "$out"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^g6-none *| dial 2001:db8:7::10:7777=Network is unreachable$' ||
+	fail "a machine on a segment of IPv6 that is no gateway reached beyond it" "$out"
+sleep 3
+rm -rf "${root:?}/gw6run"
 # (network nat) says the default outright: on chroot the same network of
 # the machine's own, pasta's eth0 and its own loopback; and every engine
 # takes it, as passt's on a vm and docker's bridge.

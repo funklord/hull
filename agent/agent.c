@@ -905,6 +905,7 @@ static const char *place_names(const hull_sexpr_doc *doc, const hull_sexpr_form 
 	const char     *reason;
 	int             uplinked;
 	int             routed;
+	int             routed6;
 	int             owned;
 	int             fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 
@@ -913,6 +914,7 @@ static const char *place_names(const hull_sexpr_doc *doc, const hull_sexpr_form 
 		nic = 1u;
 	uplinked = nic != 0u;
 	routed   = uplinked;   /* passt's, or a bridge's, default route */
+	routed6  = uplinked;
 	/* On a bridge its owner named, the machine's addressing is its own. */
 	owned = network != NULL && strcmp(network, "bridge") == 0 && bridge != NULL;
 	free(network);
@@ -933,7 +935,8 @@ static const char *place_names(const hull_sexpr_doc *doc, const hull_sexpr_form 
 			                            hull_access_named(doc, names, segment, address, &prefix);
 			int                 named6 = segment != NULL &&
 			                             hull_access_named6(doc, names, segment, address6, &prefix6);
-			int                 gatewayed = named && hull_access_gateway(doc, names, segment);
+			int                 gatewayed = (named || named6) &&
+			                                hull_access_gateway(doc, names, segment);
 
 			free(segment);
 			if (!named && !named6)
@@ -965,8 +968,16 @@ static const char *place_names(const hull_sexpr_doc *doc, const hull_sexpr_form 
 				return "a segment's NIC's IPv6 address cannot be set";
 			}
 			/* The first segment whose .1 is a gateway is the way out of a
-			 * machine with none of its own (Appendix D). */
-			if (!routed && gatewayed) {
+			 * machine with none of its own (Appendix D), and the first whose
+			 * ::1 is, by IPv6. */
+			if (!routed6 && gatewayed && named6) {
+				if (hull_ip6_route(request.ifr_name, address6, prefix6) != 0) {
+					close(fd);
+					return "a segment's IPv6 route out through its ::1 cannot be set";
+				}
+				routed6 = 1;
+			}
+			if (!routed && gatewayed && named) {
 				struct rtentry route;
 				struct in_addr at;
 				char           gateway[16];

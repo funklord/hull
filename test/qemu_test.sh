@@ -1064,6 +1064,24 @@ c.close()' "$hostaddr" > "$root/gwlisten.out" 2>&1 &
 else
 	printf 'qemu: the host has no address but loopback; the way out through .1 is not tried\n'
 fi
+# (gateway true) at ::1, by IPv6, in a namespace whose host side has
+# IPv6 (test/gateway_net.sh): a vm of a segment of IPv6 alone and one of
+# both families reaching the host's addresses through the agent's routes.
+mkdir -p "$root/gw6run"
+chmod 700 "$root/gw6run"
+printf '(machines (v6-only %s) (v6-both %s))\n' \
+	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network none) (segments (v6only-$$ (subnet6 \"fd42:92::/64\") (gateway true))) (command \"/probe\" \"dial\" \"2001:db8:7::10\" \"7777\")" \
+	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network none) (segments (v6both-$$ (subnet \"10.90.0.0/24\") (subnet6 \"fd42:90::/64\") (gateway true))) (command \"/probe\" \"dial\" \"2001:db8:7::10\" \"7777\" \"dial\" \"192.0.2.10\" \"7778\")" \
+	> "$root/vgateway6.conf"
+name=vgateway6
+out=$(timeout 150 unshare -rn sh "$(dirname "$0")/gateway_net.sh" "$hull" "$root/vgateway6.conf" \
+	"$root/gw6run" 2>&1)
+got=$?
+has 0 '^v6-only +\| dial 2001:db8:7::10:7777=out through ::1$'
+has 0 '^v6-both +\| dial 2001:db8:7::10:7777=out through ::1$'
+has 0 '^v6-both +\| dial 192\.0\.2\.10:7778=out through \.1$'
+sleep 3
+rm -rf "${root:?}/gw6run"
 
 # Ports, from the machine's address, each connection an agent channel to the
 # machine's own address. Six free ports; the machine serves five in
