@@ -2021,6 +2021,92 @@ rm -rf "${root:?}/onerun"
 expect 1 'no such machine' "$hull" stats nobody
 expect 2 'usage' "$hull" stats
 
+# A frontend of another build said in its hello (section 4.10): a core
+# holding no machine and no other frontend answers `(replaced true)` and
+# goes, so that the next command starts that build's; one with another
+# frontend connected, or holding a machine kept past its own frontend,
+# stays and says nothing of going. Said by a hello of the test's own, as
+# another build's frontend would say it, to a core in a runtime directory
+# of its own, its pid read from the socket's peer; `hold` keeps a second
+# connection open while it asks.
+mkdir -p "$root/replrun"
+chmod 700 "$root/replrun"
+cat > "$root/hello.py" <<'PY'
+import os, socket, struct, sys
+# By the directory's descriptor, as hull dials it: a socket's path holds
+# 108 bytes, which a deep runtime directory passes.
+at = os.open(sys.argv[1] + "/hull", os.O_RDONLY | os.O_DIRECTORY)
+def dial():
+    s = socket.socket(socket.AF_UNIX)
+    s.connect("/proc/self/fd/%d/core.sock" % at)
+    return s
+held = dial() if sys.argv[2:] == ["hold"] else None
+s = dial()
+pid = struct.unpack("3i", s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[0]
+body = b"(5:hello(2:ch1:0)(6:commit11:other-build)(3:exe5:1:2:3)(5:proto1:1))"
+s.sendall(struct.pack("!I", len(body)) + body)
+head = s.recv(4, socket.MSG_WAITALL)
+print(pid, s.recv(struct.unpack("!I", head)[0], socket.MSG_WAITALL).decode())
+PY
+replcore() { # a core of its own in replrun, and its socket there
+	(XDG_RUNTIME_DIR="$root/replrun" HULL_CORE_IDLE=20 timeout -k 2 30 "$hull" core \
+		> /dev/null 2>&1 &)
+	tries=0
+	until [ -S "$root/replrun/hull/core.sock" ] || [ "$tries" -ge 40 ]; do
+		tries=$((tries + 1))
+		sleep 0.1
+	done
+}
+replhello() { # [hold]: said and core_pid, and a moment for a core going to go
+	said=$(timeout 10 python3 -I "$root/hello.py" "$root/replrun" "$@" 2>&1)
+	core_pid=${said%% *}
+	case $core_pid in ''|*[!0-9]*) core_pid=0 ;; esac
+	tries=0
+	while [ -d "/proc/$core_pid" ] && [ "$tries" -lt 20 ]; do
+		tries=$((tries + 1))
+		sleep 0.1
+	done
+}
+replcore
+replhello hold
+cases=$((cases + 1))
+case $said in
+*'(5:proto1:1))') [ -d "/proc/$core_pid" ] ||
+	fail "a core with another frontend connected went" "$said" ;;
+*) fail "a core with another frontend connected gave way, or did not answer" "$said" ;;
+esac
+replhello
+cases=$((cases + 1))
+case $said in
+*'(8:replaced4:true))') [ ! -d "/proc/$core_pid" ] ||
+	fail "an idle core said it was replaced and stayed" "$said" ;;
+*) fail "an idle core did not give way to a frontend of another build" "$said" ;;
+esac
+# A machine kept past its run: the run's frontend ended at 2 s, the
+# machine sleeping on to 8 s, held by its core alone.
+conf replhold '(mutable overlay) (network none) (on_disconnect keep) (command "/probe" "sleep" "8")'
+(cd / && XDG_RUNTIME_DIR="$root/replrun" HULL_CORE_IDLE=20 timeout -k 1 2 "$hull_abs" run \
+	-f "$root/replhold.conf" > /dev/null 2>&1 &)
+sleep 3
+replhello
+cases=$((cases + 1))
+case $said in
+*'(5:proto1:1))') [ -d "/proc/$core_pid" ] || fail "a core holding a machine went" "$said" ;;
+*) fail "a core holding a machine gave way, or did not answer" "$said" ;;
+esac
+# The machine ends at its 8 s; its core is ended then rather than left
+# to idle out in a directory about to go.
+sleep 6
+if { tr '\0' ' ' < "/proc/$core_pid/cmdline"; } 2>/dev/null | grep -q ' core $'; then
+	kill "$core_pid"
+	tries=0
+	while [ -d "/proc/$core_pid" ] && [ "$tries" -lt 50 ]; do
+		tries=$((tries + 1))
+		sleep 0.1
+	done
+fi
+rm -rf "${root:?}/replrun"
+
 # One core: a second gives way to the first, says nothing, and leaves the
 # first answering on its socket.
 expect 0 '' "$hull" core

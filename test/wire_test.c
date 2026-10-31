@@ -71,6 +71,45 @@ static void test_directions(void)
 	REFUSES(CORE, "(4:data(3:buf2:hi)(2:ch1:1)(2:fd1:0))");
 	REFUSES(CLIENT, "(5:hello (2:ch1:0)(5:proto1:1))");  /* not canonical */
 	REFUSES(CLIENT, "(5:hello(2:ch1:0)(5:proto1:1))(4:list(2:ch1:6))");  /* two forms */
+
+	/* Which build is speaking, since 2026-10-31: both or neither from a
+	 * frontend; the core's executable, and its going, each its own. */
+	LETS(CLIENT, "(5:hello(2:ch1:0)(6:commit5:a-b-c)(3:exe5:1:2:3)(5:proto1:1))");
+	REFUSES(CLIENT, "(5:hello(2:ch1:0)(6:commit5:a-b-c)(5:proto1:1))");
+	REFUSES(CLIENT, "(5:hello(2:ch1:0)(3:exe5:1:2:3)(6:commit5:a-b-c)(5:proto1:1))");
+	LETS(CORE, "(5:hello(2:ch1:0)(12:core_version3:0.1)(3:exe5:1:2:3)(5:proto1:1))");
+	LETS(CORE, "(5:hello(2:ch1:0)(12:core_version3:0.1)(5:proto1:1)(8:replaced4:true))");
+	LETS(CORE, "(5:hello(2:ch1:0)(12:core_version3:0.1)(3:exe5:1:2:3)(5:proto1:1)"
+	           "(8:replaced4:true))");
+	REFUSES(CORE, "(5:hello(2:ch1:0)(12:core_version3:0.1)(5:proto1:1)(8:replaced5:false))");
+}
+
+/* Two builds told apart: by commit, and by executable where the commit
+ * names more than one build. */
+static void test_builds(void)
+{
+	static const struct {
+		const char *commit, *exe, *other_commit, *other_exe;
+		int         same;
+	} given[] = {
+		{ "abc", "1:2:3", "abc", "1:2:3", 1 },
+		{ "abc", "1:2:3", "abc", "1:9:3", 1 },              /* two copies of one clean build */
+		{ "abc", "1:2:3", "def", "1:2:3", 0 },
+		{ "abc-dirty", "1:2:3", "abc-dirty", "1:2:4", 0 },  /* rebuilt with changes */
+		{ "abc-dirty", "1:2:3", "abc-dirty", "1:2:3", 1 },
+		{ "unknown", "1:2:3", "unknown", "1:9:3", 0 },
+		{ "unknown", "1:2:3", "abc", "1:9:3", 0 },          /* the loose side's file differs */
+		{ "abc-dirty", "", "abc-dirty", "1:2:3", 1 },       /* one unread: not told apart */
+		{ "abc-dirty", "1:2:3", "def-dirty", "1:2:3", 0 },
+	};
+
+	for (size_t i = 0u; i < sizeof given / sizeof given[0]; i++) {
+		cases++;
+		if (hull_wire_same_build(given[i].commit, given[i].exe, given[i].other_commit,
+		                         given[i].other_exe) != given[i].same)
+			FAIL("%s %s against %s %s: same %d", given[i].commit, given[i].exe,
+			     given[i].other_commit, given[i].other_exe, !given[i].same);
+	}
 }
 
 static void test_numbers(void)
@@ -105,6 +144,7 @@ int main(void)
 	alarm(60);
 	test_directions();
 	test_numbers();
+	test_builds();
 	printf("wire: %u cases, %u failed\n", cases, failures);
 	return failures == 0u ? 0 : 1;
 }

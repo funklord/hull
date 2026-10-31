@@ -163,3 +163,6 @@ client_message inject_without_channel 28 36 3A 69 6E 6A 65 63 74 28 35 3A 63 6F 
 
 # capture_without_channel: (7:capture(6:frames1:0)(4:name4:wire))
 client_message capture_without_channel 28 37 3A 63 61 70 74 75 72 65 28 36 3A 66 72 61 6D 65 73 31 3A 30 29 28 34 3A 6E 61 6D 65 34 3A 77 69 72 65 29 29
+# hello_commit_alone: (5:hello(2:ch1:0)(6:commit5:a-b-c)(5:proto1:1))
+# client_hello: a commit is said with its executable
+client_message hello_commit_alone 28 35 3A 68 65 6C 6C 6F 28 32 3A 63 68 31 3A 30 29 28 36 3A 63 6F 6D 6D 69 74 35 3A 61 2D 62 2D 63 29 28 35 3A 70 72 6F 74 6F 31 3A 31 29 29

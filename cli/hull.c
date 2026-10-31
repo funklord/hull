@@ -1014,9 +1014,17 @@ static int kept_machines(void)
  * since an idle core can leave between two. */
 static int connect_core(hull_wire *wire, int start)
 {
-	hull_msg       hello = { 0 };
+	char           exe[64];
+	int            given_way = 0;
+	int            plain = 0;   /* the hello of a core from before builds were said */
+	hull_msg       hello;
 	hull_sexpr_doc body;
-	int            fd = dial_core();
+	int            fd;
+
+	hull_wire_exe(exe, sizeof exe);
+again:
+	memset(&hello, 0, sizeof hello);
+	fd = dial_core();
 
 	start = start || kept_machines();
 	if (fd < 0 && start && getenv("XDG_RUNTIME_DIR") != NULL) {
@@ -1042,9 +1050,26 @@ static int connect_core(hull_wire *wire, int start)
 		close(fd);
 		return -1;
 	}
-	hull_msg_raw(&hello, "(5:hello(2:ch1:0)(5:proto1:1))");
+	if (plain) {
+		hull_msg_raw(&hello, "(5:hello(2:ch1:0)(5:proto1:1))");
+	} else {
+		hull_msg_raw(&hello, "(5:hello(2:ch1:0)(6:commit");
+		hull_msg_text(&hello, HULL_COMMIT);
+		hull_msg_raw(&hello, ")(3:exe");
+		hull_msg_text(&hello, exe);
+		hull_msg_raw(&hello, ")(5:proto1:1))");
+	}
 	if (hull_wire_send(fd, &hello) != 0 || hull_wire_read(wire, &body) != HULL_WIRE_OK ||
 	    !hull_msg_is(&body, "hello")) {
+		/* A core from before 2026-10-31 refuses the build's entries, as
+		 * its description has none: said hello to again as it was, and
+		 * warned of below. */
+		if (!plain) {
+			hull_msg_free(&hello);
+			hull_wire_close(wire);
+			plain = 1;
+			goto again;
+		}
 		fprintf(stderr, "hull: the core did not answer hello\n");
 		hull_msg_free(&hello);
 		hull_wire_close(wire);
@@ -1054,26 +1079,55 @@ static int connect_core(hull_wire *wire, int start)
 	/* A core left running from an older build serves its old engine, where
 	 * this frontend plans against the new one, so a feature this build adds
 	 * is planned and then silently does nothing -- which cost a day's
-	 * misdiagnosis once. The core reports the commit it was built from; warn
-	 * when it is not this build's. Both unknown (no git at build) cannot be
-	 * told apart, so say nothing then. */
+	 * misdiagnosis once. The core says which build it is, and where it is
+	 * another and idle, holding no machine, it goes and says so: then this
+	 * starts its own build's core, once. Where it holds machines it stays,
+	 * and this warns, as its machines would go with it. */
 	{
 		hull_sexpr_form top;
-		char           *core_commit;
+		char           *core_commit = NULL;
+		char           *core_exe = NULL;
+		char           *replaced = NULL;
 
 		if (hull_sexpr_first(&body, &top) &&
 		    (core_commit = hull_access_value(&body, &top, "core_version")) != NULL) {
-			if (strcmp(core_commit, "unknown") != 0 && strcmp(HULL_COMMIT, "unknown") != 0 &&
-			    strcmp(core_commit, HULL_COMMIT) != 0)
+			core_exe = hull_access_value(&body, &top, "exe");
+			replaced = hull_access_value(&body, &top, "replaced");
+			if (replaced != NULL && strcmp(replaced, "true") == 0 && !given_way) {
+				free(core_commit);
+				free(core_exe);
+				free(replaced);
+				hull_wire_close(wire);
+				given_way = 1;
+				start = 1;
+				/* Gone once its socket is: it unlinks that first. */
+				for (int tries = 0; tries < 100; tries++) {
+					struct timespec pause = { 0, 20000000L };
+					int             old = dial_core();
+
+					if (old < 0)
+						break;
+					close(old);
+					nanosleep(&pause, NULL);
+				}
+				goto again;
+			}
+			if (!hull_wire_same_build(core_commit, core_exe != NULL ? core_exe : "", HULL_COMMIT,
+			                          exe))
 				fprintf(stderr,
-				        "hull: warning: the running core was built from %s, but this is %s; a "
-				        "machine planned here runs on the core's older engine, so a newer "
-				        "feature may do nothing until the core is restarted -- it exits on its "
-				        "own once its machines are gone and it has idled, or end its `hull core` "
-				        "process, and the next command starts this build\n",
-				        core_commit, HULL_COMMIT);
-			free(core_commit);
+				        "hull: warning: the running core is another build than this: %s%s%s; a "
+				        "machine planned here runs on the core's engine, so a newer feature may "
+				        "do nothing until the core is restarted -- it holds machines, or is from "
+				        "before a core gave way, so it stays; it exits on its own once they are "
+				        "gone and it has idled, or end its `hull core` process, and the next "
+				        "command starts this build\n",
+				        core_commit,
+				        strcmp(core_commit, HULL_COMMIT) == 0 ? ", built again since, as " : " against ",
+				        HULL_COMMIT);
 		}
+		free(core_commit);
+		free(core_exe);
+		free(replaced);
 	}
 	return 0;
 }

@@ -82,12 +82,32 @@ struct client_message {
 }
 
 // The protocol version the frontend speaks; the core answers with its own.
+// Since 2026-10-31 also which build the frontend is, its commit and its
+// executable (hull_wire_exe), so that the core can tell a rebuilt hull
+// from its own and, idle, give way to it (section 4.10); both or neither,
+// neither from a frontend before them.
 struct client_hello {
 	preamble u8[7] = "5:hello";
 	control  ch;
+	peek u32  next;
+	variant build switch (next) {
+		case COMMIT_ENTRY:  build_entries  given;
+		default:            absent         not_given;
+	}
 	preamble u8[8] = "(5:proto";
 	atom  proto;
 	preamble u8[2] = "))";
+}
+
+const COMMIT_ENTRY = ('(' << 24) | ('6' << 16) | (':' << 8) | 'c';
+const EXE_ENTRY    = ('(' << 24) | ('3' << 16) | (':' << 8) | 'e';
+
+struct build_entries {
+	preamble u8[9] = "(6:commit";
+	atom  commit;
+	preamble u8[7] = ")(3:exe";
+	atom  exe;
+	u8    close  [must_eq = ')'];
 }
 
 // Run a machine: its id, and the plan the frontend made for it (section
@@ -388,14 +408,42 @@ struct core_message {
 	}
 }
 
+// The core's commit, its executable where it can read it, and its
+// protocol; `(replaced true)` where the frontend is another build and the
+// core, holding no machine and no other frontend, goes so that the next
+// command starts that build's (section 4.10).
 struct core_hello {
 	preamble u8[7] = "5:hello";
 	control  ch;
 	preamble u8[16] = "(12:core_version";
 	atom  version;
-	preamble u8[9] = ")(5:proto";
+	u8    version_close  [must_eq = ')'];
+	peek u32  next;
+	variant own switch (next) {
+		case EXE_ENTRY:  exe_entry  given;
+		default:         absent     not_given;
+	}
+	preamble u8[8] = "(5:proto";
 	atom  proto;
-	preamble u8[2] = "))";
+	u8    proto_close  [must_eq = ')'];
+	peek u8  after_proto;
+	variant going switch (after_proto) {
+		case '(':  replaced_entry  replaced;
+		default:   absent          stays;
+	}
+	u8  close  [must_eq = ')'];
+}
+
+struct exe_entry {
+	preamble u8[6] = "(3:exe";
+	atom  exe;
+	u8    close  [must_eq = ')'];
+}
+
+struct replaced_entry {
+	preamble u8[11] = "(8:replaced";
+	yes   value;
+	u8    close  [must_eq = ')'];
 }
 
 struct started {

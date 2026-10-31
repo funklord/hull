@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include "frontend.h"
 #include "protocol.h"
@@ -271,4 +272,35 @@ int hull_msg_long(const hull_sexpr_doc *body, const hull_sexpr_form *value, long
 	errno = 0;
 	*out = strtoll(text, &end, 10);
 	return errno == 0 && *end == '\0';
+}
+
+void hull_wire_exe(char *out, size_t cap)
+{
+	struct stat self;
+
+	if (cap == 0u)
+		return;
+	out[0] = '\0';
+	/* The link names the file this process runs, a replaced one included. */
+	if (stat("/proc/self/exe", &self) == 0)
+		snprintf(out, cap, "%llu:%llu:%lld%09ld", (unsigned long long)self.st_dev,
+		         (unsigned long long)self.st_ino, (long long)self.st_mtim.tv_sec,
+		         self.st_mtim.tv_nsec);
+}
+
+int hull_wire_same_build(const char *commit, const char *exe, const char *other_commit,
+                         const char *other_exe)
+{
+	size_t length = strlen(commit);
+	int    loose = strcmp(commit, "unknown") == 0 ||
+	               (length > 6u && strcmp(commit + length - 6u, "-dirty") == 0);
+
+	/* Unknown against a commit is not compared, as before: a skew
+	 * cannot be told from none. */
+	if (strcmp(commit, "unknown") != 0 && strcmp(other_commit, "unknown") != 0 &&
+	    strcmp(commit, other_commit) != 0)
+		return 0;
+	if (!loose || exe[0] == '\0' || other_exe[0] == '\0')
+		return 1;
+	return strcmp(exe, other_exe) == 0;
 }

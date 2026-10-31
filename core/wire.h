@@ -99,6 +99,28 @@ int hull_msg_string(const hull_sexpr_doc *body, const hull_sexpr_form *value, ch
 /* A value as a number, or 0 if it is not minimal decimal. */
 int hull_msg_long(const hull_sexpr_doc *body, const hull_sexpr_form *value, long long *out);
 
+/* --- which build is speaking --------------------------------------------- */
+
+/*
+ * The running executable's identity, `DEV:INODE:MTIME`, its mtime in
+ * nanoseconds, into `out`; "" where it cannot be read. A frontend says
+ * it in its hello and the core holds its own, so that two builds of one
+ * commit with changes of their own, which HULL_COMMIT names alike with
+ * -dirty, are told apart: a rebuilt binary is a new file, or one written
+ * since.
+ */
+void hull_wire_exe(char *out, size_t cap);
+
+/*
+ * Whether two builds, each by its HULL_COMMIT and its hull_wire_exe(),
+ * are one: their commits alike, and, where the commit says -dirty or is
+ * unknown, so that it names more than one build, their executables too.
+ * Two copies of one clean commit are one build wherever they lie; an
+ * executable either side cannot read is not told apart.
+ */
+int hull_wire_same_build(const char *commit, const char *exe, const char *other_commit,
+                         const char *other_exe);
+
 #ifdef __cplusplus
 }
 #endif

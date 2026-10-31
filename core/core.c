@@ -3344,6 +3344,15 @@ static void handle_gc(client *c, uint32_t ch)
 	pthread_detach(thread);
 }
 
+/* Set by a signal, or by a hello this core goes for: the loop's last. */
+static volatile sig_atomic_t ending;
+/* This core's executable as it started (hull_wire_exe), before a rebuild
+ * could write over it. */
+static char                  core_exe[64];
+
+static unsigned clients_but(const client *c);
+static int any_machines(void);
+
 static void handle(client *c, const hull_sexpr_doc *body)
 {
 	hull_sexpr_form value;
@@ -3356,10 +3365,33 @@ static void handle(client *c, const hull_sexpr_doc *body)
 	}
 	if (hull_msg_is(body, "hello")) {
 		hull_msg m = { 0 };
+		char     commit[128] = "";
+		char     exe[64] = "";
+		int      replaced = 0;
 
+		/* A frontend of another build, a core of this one idle for it --
+		 * no machine held, no frontend but it -- goes, and the frontend
+		 * starts its own build's: what a rebuilt hull meets otherwise is
+		 * its old engine, a new feature planned and doing nothing. */
+		if (hull_msg_find(body, "commit", &value) &&
+		    hull_msg_string(body, &value, commit, sizeof commit) &&
+		    hull_msg_find(body, "exe", &value) && hull_msg_string(body, &value, exe, sizeof exe) &&
+		    !hull_wire_same_build(HULL_COMMIT, core_exe, commit, exe) && !any_machines() &&
+		    clients_but(c) == 0u) {
+			replaced = 1;
+			ending = 1;
+			fprintf(stderr, "hull core %ld: a frontend of %s is another build, and none of "
+			        "this one's is here; going for it\n", (long)getpid(), commit);
+		}
 		hull_msg_raw(&m, "(5:hello(2:ch1:0)(12:core_version");
 		hull_msg_text(&m, HULL_COMMIT);
-		hull_msg_raw(&m, ")(5:proto1:1))");
+		hull_msg_raw(&m, ")");
+		if (core_exe[0] != '\0') {
+			hull_msg_raw(&m, "(3:exe");
+			hull_msg_text(&m, core_exe);
+			hull_msg_raw(&m, ")");
+		}
+		hull_msg_raw(&m, replaced ? "(5:proto1:1)(8:replaced4:true))" : "(5:proto1:1))");
 		send_to(c, &m);
 	} else if (ch == 0) {
 		send_error(c, 0u, "channel 0 is for hello");
@@ -3464,7 +3496,6 @@ static void flush_all(void)
 			disconnect(&clients[i]);
 }
 
-static volatile sig_atomic_t ending;
 
 static void end(int signal)
 {
@@ -3484,6 +3515,27 @@ static int any_clients(void)
 {
 	for (unsigned i = 0u; i < MAX_CLIENTS; i++)
 		if (clients[i].used)
+			return 1;
+	return 0;
+}
+
+/* How many frontends there are besides `c`. */
+static unsigned clients_but(const client *c)
+{
+	unsigned n = 0u;
+
+	for (unsigned i = 0u; i < MAX_CLIENTS; i++)
+		if (clients[i].used && &clients[i] != c)
+			n++;
+	return n;
+}
+
+/* Whether the core holds any machine, running, exited and not yet let
+ * go of, or kept. */
+static int any_machines(void)
+{
+	for (unsigned i = 0u; i < MAX_MACHINES; i++)
+		if (machines[i].used)
 			return 1;
 	return 0;
 }
@@ -3650,6 +3702,9 @@ int hull_core_run(const char *host_arch)
 	int                listener;
 	int                logged = 0;
 	long long          place_checked = monotonic_ms();
+
+	/* Which build this is, before anything could replace its file. */
+	hull_wire_exe(core_exe, sizeof core_exe);
 
 	/* A started core's log, named by the frontend that started it, which
 	 * leaves its own output at /dev/null: appended to until this core
