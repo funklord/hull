@@ -971,6 +971,70 @@ static void add_pair(void *context, const char *pair)
 	add_json(t, pair);
 }
 
+/*
+ * A mount point inside a volume bound from the user's directory: a volume
+ * guest path beneath another's, or the secrets' /run/hull/secrets beneath
+ * one. Docker makes a missing mount point as root, so in such a volume it
+ * would leave a root-owned directory on the user's disk -- measured, a
+ * volume at /mnt/x over one at /mnt from ./a left ./a/x root's. So one
+ * that is not there is refused, naming it. A reason in `detail`, or NULL.
+ */
+static const char *nested_mounts(const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
+                                 char *detail, size_t cap)
+{
+	hull_sexpr_form entry;
+	hull_sexpr_form top;
+	hull_sexpr_form item;
+	hull_sexpr_form other;
+	char           *secrets;
+	char           *points[MAX_STACKS * 8u + 1u];
+	size_t          count = 0u;
+	const char     *reason = NULL;
+
+	hull_sexpr_first(doc, &top);
+	if ((secrets = hull_access_value(doc, &top, "secrets")) != NULL)
+		points[count++] = strdup("/run/hull/secrets");
+	free(secrets);
+	if (hull_access_find(doc, machine, "volumes", &entry)) {
+		hull_sexpr_child(doc, &entry, &item);
+		for (int more = hull_sexpr_next(doc, &item, &item); more && count < MAX_STACKS * 8u;
+		     more = hull_sexpr_next(doc, &item, &item))
+			points[count++] = hull_access_value(doc, &item, "guest");
+	}
+	for (size_t i = 0u; i < count && reason == NULL && hull_access_find(doc, machine, "volumes",
+	                                                                    &entry); i++) {
+		if (points[i] == NULL)
+			continue;
+		hull_sexpr_child(doc, &entry, &other);
+		for (int more = hull_sexpr_next(doc, &other, &other); more && reason == NULL;
+		     more = hull_sexpr_next(doc, &other, &other)) {
+			hull_sexpr_form layers;
+			char           *guest = hull_access_value(doc, &other, "guest");
+			char           *written = hull_access_value(doc, &other, "host");
+			char           *host = written != NULL ? hull_access_path(doc, written) : NULL;
+			size_t          length = guest != NULL ? strlen(guest) : 0u;
+			struct stat     there;
+			char            at[8400];
+
+			while (length > 1u && guest[length - 1u] == '/')
+				length--;
+			if (guest != NULL && host != NULL && !hull_access_find(doc, &other, "layers", &layers) &&
+			    strncmp(points[i], guest, length) == 0 && points[i][length] == '/' &&
+			    (snprintf(at, sizeof at, "%s%s", host, points[i] + length), stat(at, &there) != 0)) {
+				snprintf(detail, cap, "%s: the mount point is in volume %s's directory and is "
+				         "not there, where docker would make it as root", points[i], guest);
+				reason = detail;
+			}
+			free(guest);
+			free(written);
+			free(host);
+		}
+	}
+	for (size_t i = 0u; i < count; i++)
+		free(points[i]);
+	return reason;
+}
+
 /* `(volumes (volume ...))` as Binds, each host path made absolute against
  * the plan's base: the daemon resolves nothing relative. Returns a
  * reason, or NULL. */
@@ -1191,6 +1255,8 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	}
 	if (hull_access_find(doc, machine, "volumes", &entry))
 		reason = add_binds(&binds, doc, &entry, m->detail, sizeof m->detail);
+	if (reason == NULL)
+		reason = nested_mounts(doc, machine, m->detail, sizeof m->detail);
 	/* In place: the directory's entries, and a volume's guest path there,
 	 * which docker would otherwise make in the user's tree as root. */
 	if (reason == NULL && m->direct != NULL) {

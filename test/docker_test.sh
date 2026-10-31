@@ -310,6 +310,20 @@ conf upperref "(upper \"$root/layered/refupper\") (command \"true\")"
 expect 125 'layers and an upper lie above a dir.s import' upperref
 rmdir "$root/layered/refupper" 2> /dev/null
 for image in $(layered_images); do timeout 30 docker rmi "$image" > /dev/null 2>&1; done
+# A volume inside another, from the user's directories: docker makes a
+# missing mount point as root, so one not there in the outer volume's
+# directory is refused, and nothing is made; one there runs.
+mkdir -p "$root/nest/a" "$root/nest/b"
+rmdir "$root/nest/a/x" 2> /dev/null
+printf 'inner\n' > "$root/nest/b/in"
+conf nested '(volumes (volume (host "./nest/a") (guest "/mnt")) (volume (host "./nest/b") (guest "/mnt/x"))) (command "cat" "/mnt/x/in")'
+expect 125 '/mnt/x: the mount point is in volume /mnt.s directory and is not there' nested
+cases=$((cases + 1))
+[ ! -e "$root/nest/a/x" ] || fail "a nested volume's mount point was made in the user's directory" \
+	"$(ls -la "$root/nest/a")"
+mkdir "$root/nest/a/x"
+expect 0 '^inner$' nested
+rmdir "$root/nest/a/x"
 # Refused for being read-only, by name, and somewhere this uid could
 # otherwise write: /tmp, on the root, is everybody's.
 conf volro '(command "sh" "-c" "echo x > /data/out || true")' \
