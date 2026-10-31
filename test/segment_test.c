@@ -679,11 +679,10 @@ static size_t asked_of(int fd, uint8_t *out, size_t cap, struct sockaddr_in *fro
 
 /* `question` answered from `fd` to `to`: an A of 192.0.2.7, or where
  * `padding` is given, that many bytes of TXT besides, past a frame. */
-static void answer_from(int fd, const uint8_t *question, size_t length,
-                        const struct sockaddr_in *to, size_t padding)
+/* The answer answer_from() sends, into `reply`: its length. */
+static size_t answer_of(uint8_t *reply, const uint8_t *question, size_t length, size_t padding)
 {
-	uint8_t reply[4096];
-	size_t  at = length;
+	size_t at = length;
 
 	memcpy(reply, question, length);
 	reply[2] = 0x81;   /* an answer, recursion desired */
@@ -713,7 +712,58 @@ static void answer_from(int fd, const uint8_t *question, size_t length,
 			reply[at + i] = (uint8_t)(padding - i < 200u ? padding - i - 1u : 199u);
 		at += padding;
 	}
+	return at;
+}
+
+static void answer_from(int fd, const uint8_t *question, size_t length,
+                        const struct sockaddr_in *to, size_t padding)
+{
+	uint8_t reply[4096];
+	size_t  at = answer_of(reply, question, length, padding);
+
 	sendto(fd, reply, at, 0, (const struct sockaddr *)to, sizeof *to);
+}
+
+/* The question as a resolver too small to answer it says so: its header
+ * an answer, truncated, TC set, and nothing after the question. */
+static void truncated_from(int fd, const uint8_t *question, size_t length,
+                           const struct sockaddr_in *to)
+{
+	uint8_t reply[600];
+
+	memcpy(reply, question, length);
+	reply[2] = 0x83;   /* an answer, truncated, recursion desired */
+	reply[3] = 0x80;
+	sendto(fd, reply, length, 0, (const struct sockaddr *)to, sizeof *to);
+}
+
+/* The test's resolver over TCP, listening on `port` of the loopback, as
+ * its datagram side is: the question it is asked within `ms` into
+ * `question`, answered with answer_from()'s answer and `padding`; the
+ * question's length, or 0. */
+static size_t answer_over_tcp(int listener, uint8_t *question, size_t cap, size_t padding,
+                              int ms)
+{
+	struct pollfd ready = { listener, POLLIN, 0 };
+	uint8_t       reply[4096];
+	uint8_t       head[2];
+	size_t        length;
+	size_t        at;
+	int           fd;
+
+	if (poll(&ready, 1u, ms) != 1 || (fd = accept(listener, NULL, NULL)) < 0)
+		return 0u;
+	if (recv(fd, head, 2u, MSG_WAITALL) != 2 || (length = get16(head)) > cap ||
+	    recv(fd, question, length, MSG_WAITALL) != (ssize_t)length) {
+		close(fd);
+		return 0u;
+	}
+	at = answer_of(reply + 2, question, length, padding);
+	put16(reply, (unsigned)at);
+	if (write(fd, reply, 2u + at) != (ssize_t)(2u + at))
+		length = 0u;
+	close(fd);
+	return length;
 }
 
 /* The frames in pcap file `path`, their tags (each frame's 15th byte) into
@@ -1731,6 +1781,13 @@ int main(void)
 		uint32_t theirs;
 		int      flags;
 
+		int      stream = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+		struct sockaddr_in same = { .sin_family = AF_INET, .sin_port = htons((uint16_t)resolver_port),
+		                            .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+
+		if (stream < 0 || bind(stream, (struct sockaddr *)&same, sizeof same) != 0 ||
+		    listen(stream, 4) != 0)
+			fail("the test's resolver over TCP", strerror(errno));
 		hull_segment_resolvers(&server, &resolver_port, 1u);
 		tcp_sum_wrong = 1;
 		send_tcp(web, 10u, 0x02u, 1000u, 0u, NULL, 0u);
@@ -1771,6 +1828,27 @@ int main(void)
 		      flags >= 0 && seq == theirs && get16(data + 2) == 0x5678u &&
 		      data[length - 4u] == 192u && data[length - 1u] == 7u);
 		theirs += (uint32_t)length;
+		/* A name outside whose answer comes back truncated, TC set: asked
+		 * again over TCP of the same resolver, as the asker asked it, and
+		 * the whole answer put into the connection. */
+		first += n;
+		n = tcp_query(query, "big.example");
+		send_tcp(web, 10u, 0x18u, 1001u + (uint32_t)first, theirs, query, n);
+		got = asked_of(resolver, q, sizeof q, &from, 1000);
+		check("a name outside, asked on from TCP again", got != 0u);
+		if (got != 0u)
+			truncated_from(resolver, q, got, &from);
+		got = stream >= 0 ? answer_over_tcp(stream, q, sizeof q, 600u, 2000) : 0u;
+		check("its truncated answer, asked again over TCP of the same resolver",
+		      got == 12u + 13u + 4u && memcmp(q + 12, "\3big\7example", 13u) == 0);
+		do
+			flags = next_tcp(web, 10u, &seq, &ack, data, &length, 2000);
+		while (flags >= 0 && length == 0u);
+		check("the whole answer back over TCP, not truncated, under the machine's id",
+		      flags >= 0 && seq == theirs && length == 2u + get16(data) &&
+		      get16(data + 2) == 0x5678u && (data[4] & 0x02u) == 0u && get16(data + 8) == 2u &&
+		      length > 600u && data[length - 1u] == 'x');
+		theirs += (uint32_t)length;
 		send_tcp(web, 10u, 0x11u, 1001u + (uint32_t)(first + n), theirs, NULL, 0u);
 		flags = next_tcp(web, 10u, &seq, &ack, data, &length, 1000);
 		check("its FIN, answered by .1's", flags == 0x11 && seq == theirs &&
@@ -1787,6 +1865,8 @@ int main(void)
 		close(db);
 		if (resolver >= 0)
 			close(resolver);
+		if (stream >= 0)
+			close(stream);
 	}
 	{
 		/* A capture: x's way out, what it sent before its link's loss, and

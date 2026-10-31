@@ -181,6 +181,8 @@ typedef struct peer {
 	uint8_t  v6[16];
 } peer;
 
+#define MAX_DNS  (1514u - 14u - 28u)   /* what one frame carries of an answer */
+
 typedef struct asked {
 	int                used;
 	uint64_t           at;
@@ -195,6 +197,8 @@ typedef struct asked {
 	uint8_t            udp_port[2];
 	int                conn;            /* the TCP connection it came on, or -1 */
 	uint64_t           conn_generation;
+	uint8_t            query[MAX_DNS];  /* as sent, for TCP's: asked again over TCP */
+	size_t             query_length;
 } asked;
 
 /*
@@ -901,7 +905,6 @@ static const hull_segment_host *named6(const segment *s, const uint8_t address6[
 #define DNS_ANY  255u
 
 #define ASK_ON   SIZE_MAX
-#define MAX_DNS  (1514u - 14u - 28u)   /* what one frame carries of an answer */
 
 /* The answer to DNS `query` from the names `s` holds, into `out`: its
  * length, or 0 for none. hull's names are ID, ID.hull and the subnet's
@@ -1768,6 +1771,136 @@ static void ask_on(segment *s, unsigned from, const uint8_t mac[6], const peer *
 	memcpy(a->udp_port, udp_port, 2u);
 	a->conn     = on;
 	a->conn_generation = on >= 0 ? conns[on]->generation : 0u;
+	if (on >= 0) {
+		memcpy(a->query, sent, length);
+		a->query_length = length;
+	}
+}
+
+/*
+ * A question that came over TCP and was asked on as a datagram, whose
+ * answer came back truncated: asked again of the same server over TCP,
+ * as the asker itself would ask it, and the whole answer put into the
+ * asker's connection -- or the truncated one, where that fails. Without
+ * it an answer past a datagram's size, DNSSEC's as often as not, reached
+ * a machine truncated over TCP too, which a resolver takes as a failure,
+ * where pasta's resolver had forwarded TCP as TCP. In a thread of its
+ * own, as many as MAX_RETRIES at once, so that the switch never waits on
+ * a connection; the thread takes the lock only to answer.
+ */
+#define MAX_RETRIES   8u
+#define RETRY_WAIT_S  4
+
+typedef struct retry {
+	char                key[512];
+	int                 conn;
+	uint64_t            generation;
+	uint16_t            their_id;
+	struct sockaddr_in6 server;
+	uint8_t             query[MAX_DNS];
+	size_t              query_length;
+	uint8_t             truncated[MAX_DNS];
+	size_t              truncated_length;
+} retry;
+
+static unsigned retrying;   /* threads asking over TCP, under the lock */
+
+/* All of `length` bytes to or from `fd`, as its timeouts allow: 1, or 0. */
+static int whole(int fd, uint8_t *data, size_t length, int writing)
+{
+	while (length != 0u) {
+		ssize_t n = writing ? send(fd, data, length, MSG_NOSIGNAL) : recv(fd, data, length, 0);
+
+		if (n <= 0) {
+			if (n < 0 && errno == EINTR)
+				continue;
+			return 0;
+		}
+		data += n;
+		length -= (size_t)n;
+	}
+	return 1;
+}
+
+static void *retry_over_tcp(void *arg)
+{
+	retry          *r = arg;
+	uint8_t         out[2u + MAX_DNS];
+	uint8_t        *answer = malloc(65535u);
+	uint8_t         size[2];
+	size_t          length = 0u;
+	struct timeval  wait = { RETRY_WAIT_S, 0 };
+	struct sockaddr_in four = { .sin_family = AF_INET, .sin_port = r->server.sin6_port };
+	int             mapped = IN6_IS_ADDR_V4MAPPED(&r->server.sin6_addr);
+	int             fd = socket(mapped ? AF_INET : AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	int             ok;
+	segment        *s;
+
+	if (mapped)
+		memcpy(&four.sin_addr, &r->server.sin6_addr.s6_addr[12], 4u);
+	put16(out, (uint32_t)r->query_length);
+	memcpy(out + 2, r->query, r->query_length);
+	ok = answer != NULL && fd >= 0 &&
+	     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &wait, sizeof wait) == 0 &&
+	     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &wait, sizeof wait) == 0 &&
+	     (mapped ? connect(fd, (struct sockaddr *)&four, sizeof four) :
+	               connect(fd, (struct sockaddr *)&r->server, sizeof r->server)) == 0 &&
+	     whole(fd, out, 2u + r->query_length, 1) && whole(fd, size, 2u, 0) &&
+	     (length = get16(size)) >= 12u && whole(fd, answer, length, 0) &&
+	     get16(answer) == get16(r->query);
+	if (fd >= 0)
+		close(fd);
+	pthread_mutex_lock(&lock);
+	s = find(r->key);
+	if (s != NULL && conns[r->conn] != NULL && conns[r->conn]->used &&
+	    conns[r->conn]->generation == r->generation) {
+		if (ok) {
+			put16(answer, r->their_id);
+			conn_answer(s, conns[r->conn], answer, length);
+		} else {
+			conn_answer(s, conns[r->conn], r->truncated, r->truncated_length);
+		}
+	}
+	retrying--;
+	pthread_mutex_unlock(&lock);
+	(void)!write(wake[1], "", 1u);   /* for the poll() to send what it put in */
+	free(answer);
+	free(r);
+	return NULL;
+}
+
+/* `a`'s truncated answer, `reply`, which came over TCP: asked again over
+ * TCP. 1 where a thread has it, 0 where it is to be given as it is.
+ * Under the lock. */
+static int retry_tcp(const asked *a, const uint8_t *reply, size_t length)
+{
+	pthread_attr_t attr;
+	pthread_t      thread;
+	retry         *r;
+	int            started;
+
+	if (retrying >= MAX_RETRIES || length > sizeof r->truncated || a->query_length == 0u ||
+	    (r = calloc(1u, sizeof *r)) == NULL)
+		return 0;
+	snprintf(r->key, sizeof r->key, "%s", a->key);
+	r->conn       = a->conn;
+	r->generation = a->conn_generation;
+	r->their_id   = a->their_id;
+	r->server     = a->server;
+	memcpy(r->query, a->query, a->query_length);
+	r->query_length = a->query_length;
+	memcpy(r->truncated, reply, length);
+	r->truncated_length = length;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	started = pthread_create(&thread, &attr, retry_over_tcp, r) == 0;
+	pthread_attr_destroy(&attr);
+	if (!started) {
+		free(r);
+		return 0;
+	}
+	retrying++;
+	return 1;
 }
 
 /* What the host's resolvers answered, each sent back to the machine that
@@ -1821,8 +1954,10 @@ static void answered(void)
 		length = (size_t)n;
 		put16(reply, a->their_id);
 		if (a->conn >= 0) {
+			/* Truncated, TC set: asked again over TCP, as it came. */
 			if (conns[a->conn] != NULL && conns[a->conn]->used &&
-			    conns[a->conn]->generation == a->conn_generation)
+			    conns[a->conn]->generation == a->conn_generation &&
+			    ((reply[2] & 0x02u) == 0u || !retry_tcp(a, reply, length)))
 				conn_answer(s, conns[a->conn], reply, length);
 			continue;
 		}
