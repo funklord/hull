@@ -1,14 +1,15 @@
 #!/bin/sh
 # flip_test.sh -- Phase 1's exit (project.md section 12): one hull.conf
 # flips between docker and qemu, container to VM to emulation, and
-# deploys as a plain rsync'd directory. Not part of `make check`, which
+# deploys as a plain rsync'd directory; and since 2026-10-31 Phase 4's,
+# the same file on chroot, the native engine, held to the same. Not part of `make check`, which
 # needs neither a daemon nor KVM: `make check-flip` runs it.
 #
 # Its arguments are build/hull, the static probe and build/test/tree_tar.
 # A project directory -- the file, a rootfs holding only the probe, and a
 # data directory -- is made in $BUILD_DIR/test/flip/project, copied with
 # `rsync -a` to deployed/, and run from there unchanged with --backend
-# docker, vm and emu. The file names no backend. Each run serves a port,
+# chroot, docker, vm and emu. The file names no backend. Each run serves a port,
 # which a client on the host reaches on the machine's address, the same
 # on every engine (section 8.1).
 #
@@ -67,6 +68,12 @@ printf 'from the directory\n' > "$root/project/rootfs/etc/flip"
 # docker runs the workload as the user, so the place it writes in the
 # machine is the user's.
 chmod 755 "$root/project/rootfs/srv"
+# The user's own group, not setgid: a tree here inherits a group that is
+# not the user's primary one, which a chroot machine maps only where
+# /etc/subgid grants it (project.md section 7), and this checks engines,
+# not the host's groups.
+chgrp -R "$(id -g)" "$root/project"
+chmod -R g-s "$root/project"
 printf '%s\n' \
 	'(machine (source "dir:./rootfs") (mutable overlay) (hostname "flip")' \
 	'  (workdir "/srv") (env (WHO "flip"))' \
@@ -116,7 +123,7 @@ print("nobody greeted")' "$address" "$port" 2>&1)
 	out=$(cat "$root/$1.out")
 }
 
-for backend in docker vm emu; do
+for backend in chroot docker vm emu; do
 	flip "$backend"
 	eval "out_$backend=\$out"
 	cases=$((cases + 1))
@@ -135,13 +142,16 @@ for backend in docker vm emu; do
 done
 
 # The machine's own lines, without the plan's notes, which name the
-# engine: the same on all three.
+# engine: the same on all four.
 own() { printf '%s\n' "$1" | grep -v ': machine on '; }
 cases=$((cases + 1))
 want=$(printf '%s\n' 'WHO=flip' 'cwd=/srv' 'host=flip' 'read=from the directory' \
 	'write=ok' 'read=Success' 'write=ok' 'serving' 'served=from the host')
 [ "$(own "$out_docker")" = "$want" ] ||
 	fail "docker's machine saw otherwise" "$(own "$out_docker")"
+cases=$((cases + 1))
+[ "$(own "$out_chroot")" = "$(own "$out_docker")" ] ||
+	fail "the chroot machine differs from docker's" "$(own "$out_chroot")"
 cases=$((cases + 1))
 [ "$(own "$out_vm")" = "$(own "$out_docker")" ] ||
 	fail "the vm's machine differs from docker's" "$(own "$out_vm")"
@@ -150,15 +160,17 @@ cases=$((cases + 1))
 	fail "the emu machine differs from docker's" "$(own "$out_emu")"
 # Each said which engine and class it was.
 cases=$((cases + 1))
-printf '%s\n' "$out_docker" | grep -q 'machine on docker (ns)' &&
+printf '%s\n' "$out_chroot" | grep -q 'machine on chroot (ns)' &&
+	printf '%s\n' "$out_docker" | grep -q 'machine on docker (ns)' &&
 	printf '%s\n' "$out_vm" | grep -q 'machine on qemu (vm)' &&
 	printf '%s\n' "$out_emu" | grep -q 'machine on qemu (emu)' ||
-	fail "a run did not say its engine" "$out_docker
+	fail "a run did not say its engine" "$out_chroot
+$out_docker
 $out_vm
 $out_emu"
 
 # The overlay kept every write in the machine: the deployed tree is the
-# same bytes as before the three runs.
+# same bytes as before the four runs.
 cases=$((cases + 1))
 after=$(timeout 60 "$tree_tar" "$deployed/rootfs" | sha256sum | cut -c1-64)
 [ "$after" = "$before" ] && [ ! -e "$deployed/rootfs/srv/flipped" ] ||

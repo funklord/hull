@@ -212,7 +212,7 @@ QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf vbuilt.conf die.
 
 # What test/flip_test.sh writes: the project, and its rsync'd copy.
 FLIP_PROJECT    = hull.conf rootfs/probe rootfs/etc/flip
-FLIP_TEST_FILES = $(addprefix $(BUILD_DIR)/test/flip/, docker.out vm.out emu.out \
+FLIP_TEST_FILES = $(addprefix $(BUILD_DIR)/test/flip/, chroot.out docker.out vm.out emu.out \
                   $(addprefix project/, $(FLIP_PROJECT)) \
                   $(addprefix deployed/, $(FLIP_PROJECT) data/out))
 
