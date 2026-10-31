@@ -111,8 +111,9 @@ names = {m.name.rstrip("/"): m for m in t}
 made = names.get("tmp/made")
 print("made", t.extractfile(made).read().decode().strip() if made else "-", made.uid if made else "-")
 print("volume", "data/in" in names)
-print("shell", "bin/sh" in names)' "$root/exported.tar" 2>&1)
-[ "$said" = "$(printf 'made made here %s\nvolume False\nshell True' "$(id -u)")" ] ||
+print("shell", "bin/sh" in names)
+print("docker", ".dockerenv" in names or "sbin/docker-init" in names)' "$root/exported.tar" 2>&1)
+[ "$said" = "$(printf 'made made here %s\nvolume False\nshell True\ndocker False' "$(id -u)")" ] ||
 	fail "an export's tree is not the container's" "$said"
 cases=$((cases + 1))
 committed=$(timeout 60 "$hull" commit --tar "$root/exported.tar" dexported/1 2>&1)
@@ -153,7 +154,7 @@ import io, sys, tarfile
 src, probe, out = sys.argv[1:]
 t = tarfile.open(out, "w", format=tarfile.PAX_FORMAT)
 for m in tarfile.open(src):
-	if m.name.lstrip("./") in ("", ".dockerenv") or m.islnk():
+	if m.name.lstrip("./") in ("", ".dockerenv", "etc/hosts") or m.islnk():
 		continue
 	t.addfile(m, tarfile.open(src).extractfile(m) if m.isfile() else None)
 def add(name, uid, gid, mode, data):
@@ -163,6 +164,7 @@ def add(name, uid, gid, mode, data):
 with open(probe, "rb") as f:
 	add("probe", 0, 0, 0o755, f.read())
 add("given", 101, 102, 0o644, b"given\n")
+add("etc/hosts", 0, 0, 0o644, b"127.0.0.1 from the base\n")
 t.close()
 PYEOF
 committed=$(timeout 60 "$hull" commit --tar "$root/ownedbase.tar" ownedbase/1 2>&1)
@@ -192,6 +194,14 @@ view=$(timeout 30 "$hull" manifest show dbuilt/1 2>&1)
 	fail "a build on docker did not keep its owners, or its writes as root's" "$committed
 $built
 $(printf '%s\n' "$view" | grep -E 'given|made')"
+# And none of docker's own: no marker, no init, and the base's /etc/hosts
+# rather than the empty one docker lays over it.
+cases=$((cases + 1))
+hosts=$(timeout 30 "$hull" manifest show dbuilt/1 2>&1 | grep -F '(path "etc/hosts")')
+! printf '%s\n' "$view" | grep -qE '"\.dockerenv"|"sbin/docker-init"' &&
+	printf '%s\n' "$hosts" | grep -qF '(size 24)' ||
+	fail "a build on docker committed docker's own files" \
+		"$(printf '%s\n' "$view" | grep -E 'dockerenv|docker-init|etc/hosts')"
 # (layers "dir:..." ...): an image of as many layers, the source's tar
 # beneath and each layer's above it, docker's union making the top one
 # win; a write is the container's and lands in no layer; the same trees

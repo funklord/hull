@@ -49,6 +49,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/utsname.h>
+#include <sys/xattr.h>
 #include <sys/sysmacros.h>
 #include <dirent.h>
 #include <time.h>
@@ -80,6 +81,8 @@ struct hull_machine {
 	int              done;
 	int              export_fd;  /* (export PATH)'s file, or -1 */
 	int              upper_fd;   /* (upper PATH), its directory, or -1 */
+	char            *trees[17];  /* a dir source's trees, the source first, upper last */
+	unsigned         tree_count;
 	char             detail[512];
 };
 
@@ -1234,9 +1237,12 @@ static int read_full(int fd, uint8_t *buffer, size_t n)
 	return 0;
 }
 
+static void export_filtered(hull_machine *m, int from, char *detail, size_t cap);
+
 /* The container's root as docker export gives it, into (export PATH)'s
  * file once the workload has ended: the daemon's tar, owners and xattrs as
- * the container has them, no volume, as on chroot. Asked over HTTP/1.0 so
+ * the container has them, no volume, as on chroot, and none of docker's
+ * own files (export_filtered). Asked over HTTP/1.0 so
  * the body comes unchunked and ends with the connection. A failure empties
  * the file, which no commit takes, says why on the workload's stderr, and
  * makes the end 125, as on chroot. */
@@ -1245,7 +1251,6 @@ static void export_container(hull_machine *m, long *code)
 	char    request[256];
 	char    head[4096];
 	char    detail[512] = "";
-	uint8_t buffer[65536];
 	size_t  n = 0u;
 	int     status = 0;
 	int     fd = dial();
@@ -1265,18 +1270,8 @@ static void export_container(hull_machine *m, long *code)
 		if (sscanf(head, "HTTP/1.%*d %d", &status) != 1 || status != 200)
 			snprintf(detail, sizeof detail, "the daemon answered the export %d", status);
 	}
-	while (detail[0] == '\0') {
-		ssize_t got = read(fd, buffer, sizeof buffer);
-
-		if (got < 0 && errno == EINTR)
-			continue;
-		if (got < 0)
-			snprintf(detail, sizeof detail, "reading it: %s", strerror(errno));
-		if (got <= 0)
-			break;
-		if (send_all(m->export_fd, (const char *)buffer, (size_t)got) != 0)
-			snprintf(detail, sizeof detail, "writing it: %s", strerror(errno));
-	}
+	if (detail[0] == '\0')
+		export_filtered(m, fd, detail, sizeof detail);
 	if (detail[0] == '\0' && fsync(m->export_fd) != 0)
 		snprintf(detail, sizeof detail, "writing it: %s", strerror(errno));
 	if (fd >= 0)
@@ -1565,8 +1560,9 @@ static void write_upper(hull_machine *m, long *code)
 	size_t       n = 0u;
 	tar_in       t;
 	const char  *at;
-	static char  name[4096];
-	static char  link[4096];
+	char        *name = malloc(4096u);
+	char        *link = malloc(4096u);
+	uint8_t     *records = malloc(65536u);
 
 	/* Its mounts, which docker's list of changes names: docker's own and
 	 * each volume's destination. */
@@ -1590,6 +1586,10 @@ static void write_upper(hull_machine *m, long *code)
 	}
 	free(answer);
 	answer = NULL;
+	if (name == NULL || link == NULL || records == NULL) {
+		snprintf(detail, sizeof detail, "out of memory");
+		goto said;
+	}
 	snprintf(path, sizeof path, "/containers/%s/changes", m->id);
 	if (call("GET", path, NULL, &status, &answer) != 0 || status != 200) {
 		snprintf(detail, sizeof detail, "the daemon's list of changes: %s",
@@ -1705,17 +1705,15 @@ static void write_upper(hull_machine *m, long *code)
 		size = tar_number(t.block + 124, 12u);
 		type = (char)t.block[156];
 		if (type == 'x' || type == 'L' || type == 'K') {
-			static uint8_t records[65536];
-
-			if (size >= sizeof records || tar_data(&t, size, records, sizeof records) != 0) {
+			if (size >= 65536u || tar_data(&t, size, records, 65536u) != 0) {
 				snprintf(detail, sizeof detail, "an export's header past what hull reads");
 				goto said;
 			}
 			records[size] = '\0';
 			if (type == 'L')
-				snprintf(name, sizeof name, "%.4095s", (char *)records);
+				snprintf(name, 4096u, "%.4095s", (char *)records);
 			else if (type == 'K')
-				snprintf(link, sizeof link, "%.4095s", (char *)records);
+				snprintf(link, 4096u, "%.4095s", (char *)records);
 			else
 				for (size_t r = 0u; r < size;) {
 					unsigned long length = strtoul((char *)records + r, NULL, 10);
@@ -1725,9 +1723,9 @@ static void write_upper(hull_machine *m, long *code)
 						break;
 					records[r + length - 1u] = '\0';   /* its newline */
 					if (strncmp(field + 1, "path=", 5u) == 0)
-						snprintf(name, sizeof name, "%.4095s", field + 6);
+						snprintf(name, 4096u, "%.4095s", field + 6);
 					else if (strncmp(field + 1, "linkpath=", 9u) == 0)
-						snprintf(link, sizeof link, "%.4095s", field + 10);
+						snprintf(link, 4096u, "%.4095s", field + 10);
 					r += length;
 				}
 			continue;
@@ -1745,7 +1743,7 @@ static void write_upper(hull_machine *m, long *code)
 			prefix[155] = '\0';
 			memcpy(own, t.block, 100u);
 			own[100] = '\0';
-			snprintf(name, sizeof name, "%s%s%s", prefix, prefix[0] != '\0' ? "/" : "", own);
+			snprintf(name, 4096u, "%s%s%s", prefix, prefix[0] != '\0' ? "/" : "", own);
 		}
 		if (link[0] == '\0') {
 			memcpy(link, t.block + 157, 100u);
@@ -1821,6 +1819,241 @@ said:
 	free(kept);
 	free(gone);
 	free(answer);
+	free(name);
+	free(link);
+	free(records);
+}
+
+/* An entry's header of the export hull writes itself, ustar, its name
+ * short enough for one: 0, or -1. */
+static int export_header(int fd, const char *name, char type, unsigned mode, unsigned long long uid,
+                         unsigned long long gid, unsigned long long size, unsigned long long mtime)
+{
+	uint8_t  block[512];
+	unsigned sum = 0u;
+
+	memset(block, 0, sizeof block);
+	snprintf((char *)block, 100u, "%s", name);
+	snprintf((char *)block + 100, 8u, "%07o", mode & 07777u);
+	snprintf((char *)block + 108, 8u, "%07llo", uid & 07777777u);
+	snprintf((char *)block + 116, 8u, "%07llo", gid & 07777777u);
+	snprintf((char *)block + 124, 12u, "%011llo", size);
+	snprintf((char *)block + 136, 12u, "%011llo", mtime & 077777777777u);
+	memset(block + 148, ' ', 8u);
+	block[156] = (uint8_t)type;
+	memcpy(block + 257, "ustar", 6u);
+	memcpy(block + 263, "00", 2u);
+	for (size_t i = 0u; i < sizeof block; i++)
+		sum += block[i];
+	snprintf((char *)block + 148, 8u, "%06o", sum);
+	return send_all(fd, (const char *)block, sizeof block);
+}
+
+/* Where the machine's trees hold `relative`, "etc/hosts": the topmost
+ * tree's file into `found`, 1; 0 where none holds it or the topmost that
+ * says anything removed it, a whiteout or an opaque etc/ above it. */
+static int tree_file(const hull_machine *m, const char *relative, char *found, size_t cap)
+{
+	for (unsigned i = m->tree_count; i-- > 0u;) {
+		struct stat there;
+		char        dir[4200];
+		char        opaque[2];
+
+		snprintf(found, cap, "%s/%s", m->trees[i], relative);
+		if (lstat(found, &there) == 0) {
+			if (S_ISCHR(there.st_mode) && there.st_rdev == makedev(0, 0))
+				return 0;
+			return S_ISREG(there.st_mode);
+		}
+		snprintf(dir, sizeof dir, "%s/etc", m->trees[i]);
+		if (lgetxattr(dir, "user.overlay.opaque", opaque, sizeof opaque) == 1 && opaque[0] == 'y')
+			return 0;
+	}
+	return 0;
+}
+
+/*
+ * docker export's tar from `from` into the export's file without what
+ * docker puts in every container and no tree held: its marker
+ * /.dockerenv, its init /sbin/docker-init and a /sbin made only for it;
+ * and docker's empty /etc/hosts, /etc/hostname and /etc/resolv.conf,
+ * which an init layer lays over the image's for the files it binds there,
+ * replaced by the topmost tree's, or left out where no tree has one. So a
+ * hull build step on docker keeps its parent's /etc/resolv.conf rather
+ * than committing docker's empty one, and an export is the tree chroot's
+ * would be. A ref's source has no tree here: its three are docker's. Each
+ * other entry, with the pax or long-name headers before it, goes on as
+ * the daemon wrote it. Sets `detail` on a failure.
+ */
+static void export_filtered_into(hull_machine *m, int from, char *detail, size_t cap,
+                                 uint8_t *held, size_t held_cap, char *name, size_t name_cap);
+
+/* Its buffers its own, the machine's reader thread being one of several. */
+static void export_filtered(hull_machine *m, int from, char *detail, size_t cap)
+{
+	uint8_t *held = malloc(65536u + 1024u);
+	char    *name = malloc(4096u);
+
+	if (held == NULL || name == NULL)
+		snprintf(detail, cap, "out of memory");
+	else
+		export_filtered_into(m, from, detail, cap, held, 65536u + 1024u, name, 4096u);
+	free(held);
+	free(name);
+}
+
+static void export_filtered_into(hull_machine *m, int from, char *detail, size_t cap,
+                                 uint8_t *held, size_t held_cap, char *name, size_t name_cap)
+{
+	static const char zeroes[512];
+	size_t         held_length = 0u;
+	tar_in         t;
+	int            sbin = 0;
+	int            to = m->export_fd;
+
+	for (unsigned i = 0u; i < m->tree_count; i++) {
+		char        at[4200];
+		struct stat there;
+
+		snprintf(at, sizeof at, "%s/sbin", m->trees[i]);
+		sbin |= lstat(at, &there) == 0;
+	}
+	t.fd = from;
+	name[0] = '\0';
+	for (;;) {
+		unsigned long long size;
+		char               type;
+		char               full[4200];
+		const char        *bare;
+		size_t             length;
+		int                drop = 0;
+		static const char *const etc[] = { "/etc/hosts", "/etc/hostname", "/etc/resolv.conf",
+		                                   NULL };
+
+		if (tar_block(&t) != 0) {
+			snprintf(detail, cap, "the export ended before its end");
+			return;
+		}
+		if (t.block[0] == '\0') {
+			static const char end[1024];
+
+			if (send_all(to, end, sizeof end) != 0)
+				snprintf(detail, cap, "writing it: %s", strerror(errno));
+			return;
+		}
+		size = tar_number(t.block + 124, 12u);
+		type = (char)t.block[156];
+		if (type == 'x' || type == 'L' || type == 'g') {
+			unsigned long long blocks = (size + 511u) / 512u;
+			uint8_t           *records = held + held_length + 512u;
+
+			if (held_length + 512u + blocks * 512u > held_cap) {
+				snprintf(detail, cap, "an export's header past what hull reads");
+				return;
+			}
+			memcpy(held + held_length, t.block, 512u);
+			if (tar_data(&t, size, records, (size_t)(blocks * 512u)) != 0) {
+				snprintf(detail, cap, "the export ended before its end");
+				return;
+			}
+			held_length += 512u + (size_t)blocks * 512u;
+			if (type == 'L') {
+				snprintf(name, name_cap, "%.*s", (int)(size < name_cap ? size :
+				                                                 name_cap - 1u),
+				         (char *)records);
+			} else if (type == 'x') {
+				for (size_t r = 0u; r < size;) {
+					unsigned long field_length = strtoul((char *)records + r, NULL, 10);
+					char         *field = memchr(records + r, ' ', (size_t)(size - r));
+
+					if (field_length == 0u || field == NULL || r + field_length > size)
+						break;
+					if (strncmp(field + 1, "path=", 5u) == 0)
+						snprintf(name, name_cap, "%.*s",
+						         (int)((char *)records + r + field_length - 1 - (field + 6)),
+						         field + 6);
+					r += field_length;
+				}
+			}
+			continue;
+		}
+		if (name[0] == '\0') {
+			char prefix[156];
+			char own[101];
+
+			memcpy(prefix, t.block + 345, 155u);
+			prefix[155] = '\0';
+			memcpy(own, t.block, 100u);
+			own[100] = '\0';
+			snprintf(name, name_cap, "%s%s%s", prefix, prefix[0] != '\0' ? "/" : "", own);
+		}
+		for (bare = name; bare[0] == '.' && bare[1] == '/'; bare += 2)
+			;
+		while (*bare == '/')
+			bare++;
+		snprintf(full, sizeof full, "/%s", bare);
+		length = strlen(full);
+		while (length > 1u && full[length - 1u] == '/')
+			full[--length] = '\0';
+		drop = strcmp(full, "/.dockerenv") == 0 || strcmp(full, "/sbin/docker-init") == 0 ||
+		       (m->tree_count != 0u && !sbin && strcmp(full, "/sbin") == 0);
+		for (unsigned i = 0u; !drop && m->tree_count != 0u && etc[i] != NULL; i++) {
+			char        found[4200];
+			struct stat there;
+			int         given;
+
+			if (strcmp(full, etc[i]) != 0)
+				continue;
+			drop = 1;
+			if (tree_file(m, etc[i] + 1, found, sizeof found) && lstat(found, &there) == 0) {
+				int file = open(found, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+
+				given = file >= 0 &&
+				        export_header(to, etc[i] + 1, '0', (unsigned)there.st_mode,
+				                      there.st_uid, there.st_gid,
+				                      (unsigned long long)there.st_size,
+				                      (unsigned long long)there.st_mtime) == 0;
+				for (off_t sent = 0; given && sent < there.st_size;) {
+					char    chunk[4096];
+					ssize_t got = read(file, chunk, sizeof chunk);
+
+					if (got <= 0 || send_all(to, chunk, (size_t)got) != 0)
+						given = 0;
+					else
+						sent += got;
+				}
+				if (file >= 0)
+					close(file);
+				if (!given || (there.st_size % 512 != 0 &&
+				               send_all(to, zeroes, 512u - (size_t)(there.st_size % 512)) != 0)) {
+					snprintf(detail, cap, "%s, from the machine's tree: %s", etc[i],
+					         strerror(errno));
+					return;
+				}
+			}
+		}
+		if (drop) {
+			if (tar_data(&t, size, NULL, 0u) != 0) {
+				snprintf(detail, cap, "the export ended before its end");
+				return;
+			}
+		} else {
+			unsigned long long left = (size + 511u) / 512u;
+
+			if ((held_length != 0u && send_all(to, (const char *)held, held_length) != 0) ||
+			    send_all(to, (const char *)t.block, 512u) != 0) {
+				snprintf(detail, cap, "writing it: %s", strerror(errno));
+				return;
+			}
+			for (; left > 0u; left--)
+				if (tar_block(&t) != 0 || send_all(to, (const char *)t.block, 512u) != 0) {
+					snprintf(detail, cap, "the export ended before its end");
+					return;
+				}
+		}
+		held_length = 0u;
+		name[0] = '\0';
+	}
 }
 
 static void *read_workload(void *arg)
@@ -1877,6 +2110,8 @@ static void release(hull_machine *m)
 		close(m->export_fd);
 	if (m->upper_fd >= 0)
 		close(m->upper_fd);
+	for (unsigned i = 0u; i < m->tree_count; i++)
+		free(m->trees[i]);
 	free(m->body);
 	pthread_mutex_destroy(&m->lock);
 	pthread_cond_destroy(&m->done_cond);
@@ -1964,8 +2199,9 @@ static const char *read_owners(const char *path, char **data, hull_tree_owner **
 
 /* The image the machine runs: its ref, or its dir's import, with the
  * owners (owners PATH) gives. A reason, or NULL. */
-static const char *source_image(const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
-                                const char *upper, char *image, size_t cap)
+static const char *source_image(hull_machine *m, const hull_sexpr_doc *doc,
+                                const hull_sexpr_form *machine, const char *upper, char *image,
+                                size_t cap)
 {
 	char            *source = hull_access_value(doc, machine, "source");
 	char            *given = hull_access_value(doc, machine, "owners");
@@ -2028,8 +2264,13 @@ static const char *source_image(const hull_sexpr_doc *doc, const hull_sexpr_form
 	} else {
 		reason = "the docker adapter runs an image ref or a dir";
 	}
-	for (unsigned i = 0u; i < MAX_LAYERS; i++)
-		free(trees[i]);
+	/* Kept for the export, which takes docker's files over /etc from them. */
+	for (unsigned i = 0u; i < MAX_LAYERS; i++) {
+		if (reason == NULL && trees[0] != NULL && trees[i] != NULL)
+			m->trees[m->tree_count++] = trees[i];
+		else
+			free(trees[i]);
+	}
 	free(owners);
 	free(data);
 	free(given);
@@ -2104,7 +2345,7 @@ static hull_status docker_create(hull_core *core, hull_buf plan, hull_machine **
 	         (long)getpid(), machines_made++);
 	free(hostname);
 
-	reason = source_image(&doc, &machine, upper_at, image, sizeof image);
+	reason = source_image(m, &doc, &machine, upper_at, image, sizeof image);
 	free(upper_at);
 	if (reason == NULL)
 		reason = build(m, &doc, &machine, image);
