@@ -1682,7 +1682,8 @@ typedef struct member {
 	int       sent;          /* its run asked of the core */
 	int       up;            /* started, and ready where it says how */
 	int       ready;         /* it says how, with (ready ...) */
-	int       probing;       /* its (ready (command ...)) is running */
+	int       probing;       /* its (ready ...) is being asked */
+	unsigned  port;          /* (ready (port N)): a dial, not a command */
 	long long interval_ms;
 	long long timeout_ms;
 	long long next_ms;       /* when it is asked next, once started */
@@ -1730,9 +1731,10 @@ static long long monotonic_ms(void)
 }
 
 /* A machine's (ready ...), read before the file's text is let go: the
- * exec its command is, sent each time it is asked, and how often and for
- * how long. 1s and 5m where it does not say: a machine is asked again soon,
- * and one that boots a whole system has time to. */
+ * exec its command is, or the dial its port is, sent each time it is
+ * asked, and how often and for how long. 1s and 5m where it does not say:
+ * a machine is asked again soon, and one that boots a whole system has
+ * time to. */
 static int ready_of(const hull_spec *spec, const hull_sexpr_form *entry, member *m,
                     unsigned place, hull_msg *probe)
 {
@@ -1761,6 +1763,21 @@ static int ready_of(const hull_spec *spec, const hull_sexpr_form *entry, member 
 	    HULL_SEXPR_OK) {
 		text[length] = '\0';
 		m->timeout_ms = seconds_of(text) * 1000;
+	}
+	if (hull_spec_find(spec, &ready, "port", &found) &&
+	    hull_sexpr_child(&spec->doc, &found, &word) && hull_sexpr_next(&spec->doc, &word, &word) &&
+	    hull_sexpr_value(&spec->doc, &word, (uint8_t *)text, sizeof text - 1u, &length) ==
+	    HULL_SEXPR_OK) {
+		text[length] = '\0';
+		m->port = (unsigned)strtoul(text, NULL, 10);
+		hull_msg_raw(probe, "(4:dial");
+		hull_msg_channel(probe, PROBE_CHANNEL + 2u * place);
+		hull_msg_raw(probe, "(7:machine");
+		hull_msg_text(probe, m->id);
+		hull_msg_raw(probe, ")(4:port");
+		hull_msg_number(probe, (long long)m->port);
+		hull_msg_raw(probe, "))");
+		return probe->failed ? -1 : 0;
 	}
 	hull_spec_find(spec, &ready, "command", &command);
 	hull_msg_raw(probe, "(4:exec(4:argv");
@@ -1978,14 +1995,15 @@ static int run_all(options *o, const hull_registry *registry, hull_spec *spec, u
 				hull_msg eof = { 0 };
 
 				/* Its stdin ended at once: a command asking readiness
-				 * reads nothing. */
+				 * reads nothing. A dial has none to end. */
 				hull_msg_raw(&eof, "(3:eof");
 				hull_msg_channel(&eof, PROBE_CHANNEL + 2u * i);
 				hull_msg_raw(&eof, ")");
 				m->probing = 1;
 				m->said[0] = '\0';
 				hull_wire_send(wire.fd, &probes[i]);
-				hull_wire_send(wire.fd, &eof);
+				if (m->port == 0u)
+					hull_wire_send(wire.fd, &eof);
 				hull_msg_free(&eof);
 			}
 		}
@@ -2044,7 +2062,21 @@ static int run_all(options *o, const hull_registry *registry, hull_spec *spec, u
 			continue;
 
 		if (probe) {
-			if (hull_msg_is(&body, "data")) {
+			if (hull_msg_is(&body, "started") && m->port != 0u) {
+				hull_msg reset = { 0 };
+
+				/* Taken: the machine is up, and the connection, which
+				 * has served its purpose, is ended by a signal, which on
+				 * a dial resets it; its exit frees the channel. */
+				hull_msg_raw(&reset, "(6:signal");
+				hull_msg_channel(&reset, (uint32_t)channel);
+				hull_msg_raw(&reset, "(6:signal4:TERM))");
+				hull_wire_send(wire.fd, &reset);
+				hull_msg_free(&reset);
+				if (!stopping && !m->up &&
+				    now_up(&wire, members, requests, count, waits, m) != 0)
+					status = 125;
+			} else if (hull_msg_is(&body, "data")) {
 				hull_sexpr_form buf;
 				hull_msg        credit = { 0 };
 
@@ -2068,11 +2100,17 @@ static int run_all(options *o, const hull_registry *registry, hull_spec *spec, u
 
 				m->probing = 0;
 				m->next_ms = monotonic_ms() + m->interval_ms;
+				/* A dial taken, now ended: up already. */
+				if (m->up)
+					continue;
 				if (hull_msg_is(&body, "error")) {
 					if (hull_msg_find(&body, "reason", &value))
 						hull_msg_string(&body, &value, reason, sizeof reason);
-					snprintf(m->last, sizeof m->last, "its ready command could not run: %s",
-					         reason);
+					if (m->port != 0u)
+						snprintf(m->last, sizeof m->last, "its ready %s", reason);
+					else
+						snprintf(m->last, sizeof m->last,
+						         "its ready command could not run: %s", reason);
 					continue;
 				}
 				if (hull_msg_find(&body, "code", &value))

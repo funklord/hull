@@ -653,14 +653,35 @@ static hull_spec_status segment_across(walk *w, const hull_sexpr_form *record,
 
 /* J.1: (ready (command "pg_isready") (interval 1s) (timeout 1m)), what
  * says a machine is ready for those started after it: the command, run
- * in it every interval from its start until it exits 0, for at most the
- * timeout. */
+ * in it every interval from its start until it exits 0, or a port of its
+ * own taking a connection, (port 5432), for at most the timeout. */
 static const key ready_keys[] = {
-	{ .name = "command",  .type = STRINGS, .required = 1, .nonempty = 1 },
+	{ .name = "command",  .type = STRINGS, .nonempty = 1 },
+	{ .name = "port",     .type = PORT },
 	{ .name = "interval", .type = STRING, .value = duration },
 	{ .name = "timeout",  .type = STRING, .value = duration },
 };
-static const schema ready = TABLE(ready_keys);
+
+/* Where these sit in ready_keys, for ready_across. */
+#define READY_COMMAND 0u
+#define READY_PORT    1u
+
+/* A readiness is asked one way: a command, or a port. */
+static hull_spec_status ready_across(walk *w, const hull_sexpr_form *record,
+                                     const hull_sexpr_form *found, uint64_t present)
+{
+	int command = (present & ((uint64_t)1 << READY_COMMAND)) != 0u;
+	int port    = (present & ((uint64_t)1 << READY_PORT)) != 0u;
+
+	if (!command && !port)
+		return fail(w, HULL_SPEC_ERR_MISSING, record->offset,
+		            "a readiness is a command run in the machine, or a port of its own");
+	if (command && port)
+		return fail(w, HULL_SPEC_ERR_SHAPE, found[READY_PORT].offset,
+		            "cannot stand beside command: a readiness is asked one way");
+	return HULL_SPEC_OK;
+}
+static const schema ready = TABLE_ACROSS(ready_keys, ready_across);
 
 /* J.1 */
 static const key machine_keys[] = {

@@ -99,7 +99,7 @@ static void test_file(void)
 	   "(machines", "machines");
 	NO("(machines)", SHAPE, "(machines", "machines");
 	/* Start order: (after ...) names siblings, none itself, in no ring;
-	 * (ready ...) is a command, its interval and timeout durations; and
+	 * (ready ...) is a command or a port, its interval and timeout durations; and
 	 * neither is a lone machine's, which has no others to order. */
 	OK("(machines (web (source \"a\") (after db cache)) (db (source \"b\")"
 	   " (ready (command \"pg_isready\") (interval \"2s\") (timeout \"1m\")))"
@@ -113,7 +113,13 @@ static void test_file(void)
 	NO("(machines (web (source \"a\") (after \"db\")) (db (source \"b\")))", SHAPE, "\"db\"",
 	   "machines.web.after");
 	NO("(machines (db (source \"b\") (ready (interval \"1s\"))))", MISSING, "(ready",
-	   "machines.db.ready.command");
+	   "machines.db.ready");
+	/* Or a port of its own, one way and not both. */
+	OK("(machines (db (source \"b\") (ready (port 5432) (timeout \"30s\"))))");
+	NO("(machines (db (source \"b\") (ready (command \"x\") (port 5432))))", SHAPE, "(port",
+	   "machines.db.ready");
+	NO("(machines (db (source \"b\") (ready (port 70000))))", VALUE, "70000",
+	   "machines.db.ready.port");
 	NO("(machines (db (source \"b\") (ready (command \"x\") (timeout \"5\"))))", VALUE, "\"5\"",
 	   "machines.db.ready.timeout");
 	NO(M("(after db)"), SHAPE, "(after", "machine.after");

@@ -475,7 +475,7 @@ from a directory and scripted like any other machine.
 | speed, a build step, a test of user-space code | chroot |
 | your own kernel, modules, sysctls, netns, an init system | vm |
 | several machines on a wire of their own | chroot or vm, with `(segments …)`, mixed freely |
-| a test that waits for its server to be up | `(after server)` on it, `(ready (command …))` on the server |
+| a test that waits for its server to be up | `(after server)` on it, `(ready (port 5432))` or `(ready (command …))` on the server |
 | the same, on a host with no KVM | emu |
 | software written for DOS | dos |
 | exactly what docker gives, on a host that has it | docker |

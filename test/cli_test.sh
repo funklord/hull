@@ -1762,6 +1762,29 @@ printf '%s\n' "$out" | grep -q '^web ' && fail "a machine started after one not 
 order ordergone '(command "/probe" "exit" "0")' '(command "/probe" "present" "/data/never")'
 limit=30
 from_root 125 '^hull: web: not started: db ended before it was ready$' -f "$root/ordergone.conf"
+# Or ready by a port of its own taking a connection, since 2026-10-31,
+# which needs no tool in the image: dialed in the machine's namespace on
+# chroot, so web starts only once db serves, the file db writes just
+# before it listens there for web to find; and one that never serves is
+# given up on, the dial's refusal said.
+portready() { # NAME DB-COMMAND DB-READY
+	printf '(machines (web %s) (db %s))\n' \
+		"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (after db) (volumes (volume (host \"$root/orderdata\") (guest \"/data\"))) (command \"/probe\" \"present\" \"/data/up\" \"say\" \"web found it\")" \
+		"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (volumes (volume (host \"$root/orderdata\") (guest \"/data\"))) $2 (ready $3)" \
+		> "$root/$1.conf"
+}
+rm -f "$root/orderdata/up"
+portready portready '(command "/probe" "sleep" "2" "write" "/data/up" "serve" "tcp" "5432")' \
+	'(port 5432) (interval "1s")'
+limit=30
+from_root 0 '^web +\| web found it$' -f "$root/portready.conf"
+rm -f "$root/orderdata/up"
+portready portunready '(command "/probe" "sleep" "5")' '(port 5432) (timeout "2s")'
+limit=30
+from_root 125 '^hull: db: not ready after 2s: its ready port 5432: Connection refused$' \
+	-f "$root/portunready.conf"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^web ' && fail "a machine started after a port not ready" "$out"
 # Segments beside NAT, as a vm has them beside passt: pasta's eth0 first,
 # the segments' NICs from eth1; an addressed segment's siblings named by
 # /etc/hosts and reached by name across the core's switch, the machine
