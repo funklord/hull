@@ -3133,7 +3133,7 @@ print("172.30.%d.%d" % (h // 254, h % 254 + 1))' "$1"
 }
 bdb_at=$(bridge_at bdb)
 printf '(machines (bweb %s) (bdb %s))\n' \
-	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network bridge) (command \"/probe\" \"addr\" \"eth0\" \"sleep\" \"1\" \"dial\" \"$bdb_at\" \"80\" \"dial\" \"172.31.0.1\" \"9\" \"dial\" \"10.200.0.1\" \"8081\" \"read\" \"/etc/resolv.conf\" \"dns\" \"anything.example\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network bridge) (command \"/probe\" \"addr\" \"eth0\" \"sleep\" \"1\" \"dial\" \"$bdb_at\" \"80\" \"dial\" \"172.31.0.1\" \"9\" \"dial\" \"10.200.0.1\" \"8081\" \"read\" \"/etc/resolv.conf\" \"dns\" \"anything.example\" \"dnstcp\" \"anything.example\")" \
 	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network bridge) (command \"/probe\" \"addr\" \"eth0\" \"serve\" \"tcp\" \"80\")" \
 	> "$root/bridge2.conf"
 printf '(machine (source "dir:./rootfs") (backend chroot) (network bridge) (bridge "brtest") (command "/probe" "addr" "eth0"))\n' \
@@ -3160,10 +3160,38 @@ printf '(machine (source "dir:./rootfs") (backend chroot) (hostname "bport") (ne
 	> "$root/brserve.conf"
 # A resolver of the test's own on the namespace's loopback, which is all a
 # host with systemd-resolved gives: hull0's relay is what reaches it. It
-# answers every question with one A, 192.0.2.7.
+# answers every question with one A, 192.0.2.7, over UDP and over TCP.
 printf 'nameserver 127.0.0.53\n' > "$root/relay-resolv.conf"
 cat > "$root/fakedns.py" <<'PY'
-import socket, sys
+import socket, sys, threading
+def answer(q):
+    end = 12
+    while q[end] != 0:
+        end += 1 + q[end]
+    end += 5
+    r = q[:2] + b"\x81\x80" + q[4:6] + b"\x00\x01\x00\x00\x00\x00" + q[12:end]
+    return r + b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x05\x00\x04" + bytes([192, 0, 2, 7])
+def stream(c):
+    c.settimeout(10)
+    try:
+        while True:
+            n = c.recv(2, socket.MSG_WAITALL)
+            if len(n) < 2:
+                break
+            q = c.recv(int.from_bytes(n, "big"), socket.MSG_WAITALL)
+            r = answer(q)
+            c.sendall(len(r).to_bytes(2, "big") + r)
+    except OSError:
+        pass
+    c.close()
+def tcp():
+    t = socket.socket()
+    t.bind(("127.0.0.53", 53))
+    t.listen(4)
+    while True:
+        c, _ = t.accept()
+        threading.Thread(target=stream, args=(c,), daemon=True).start()
+threading.Thread(target=tcp, daemon=True).start()
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(("127.0.0.53", 53))
 s.settimeout(float(sys.argv[1]))
@@ -3172,13 +3200,7 @@ while True:
         q, a = s.recvfrom(4096)
     except socket.timeout:
         break
-    end = 12
-    while q[end] != 0:
-        end += 1 + q[end]
-    end += 5
-    r = q[:2] + b"\x81\x80" + q[4:6] + b"\x00\x01\x00\x00\x00\x00" + q[12:end]
-    r += b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x05\x00\x04" + bytes([192, 0, 2, 7])
-    s.sendto(r, a)
+    s.sendto(answer(q), a)
 PY
 rm -rf "${root:?}/brrun"
 mkdir -p "$root/brrun"
@@ -3249,10 +3271,11 @@ printf '%s\n' "$bridge_out" | grep -q "^bweb *| addr=eth0 $(printf '%s' "$bweb_a
 	printf '%s\n' "$bridge_out" | grep -q '^bweb *| dial 10\.200\.0\.1:8081=hello from beyond the bridge$' &&
 	printf '%s\n' "$bridge_out" | grep -q '^bweb *| read=nameserver 172\.31\.0\.1$' &&
 	printf '%s\n' "$bridge_out" | grep -q '^bweb *| dns=anything\.example 192\.0\.2\.7$' &&
+	printf '%s\n' "$bridge_out" | grep -q '^bweb *| dnstcp=anything\.example 192\.0\.2\.7$' &&
 	printf '%s\n' "$bridge_out" | grep -Eq '^hull0 +UP +172\.31\.0\.1/15' &&
 	printf '%s\n' "$bridge_out" | grep -q 'ip saddr 172\.30\.0\.0/15 oifname != "hull0" masquerade' &&
 	printf '%s\n' "$bridge_out" | grep -q '^== forward=1$' ||
-	fail "machines on hull's own bridge, as root, were not addressed, reached and NATed" "$bridge_out"
+	fail "machines on hull's own bridge, as root, were not addressed, reached, NATed and named" "$bridge_out"
 cases=$((cases + 1))
 printf '%s\n' "$bridge_out" | grep -q '^addr=eth0 none/0 up$' &&
 	printf '%s\n' "$bridge_out" | grep -q '(bridge NAME) names no interface on the host' &&

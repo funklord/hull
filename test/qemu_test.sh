@@ -539,17 +539,45 @@ for b in sys.argv[1].encode():
 h %= 256 * 254
 print("172.30.%d.%d" % (h // 254, h % 254 + 1))' vcdb)
 printf '(machines (vbweb %s) (vcdb %s))\n' \
-	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network bridge) (command \"/probe\" \"addr\" \"eth0\" \"dial\" \"172.31.0.1\" \"9\" \"dial\" \"10.200.0.1\" \"8081\" \"dial\" \"$vcdb_at\" \"80\" \"read\" \"/etc/resolv.conf\" \"dns\" \"anything.example\")" \
+	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network bridge) (command \"/probe\" \"addr\" \"eth0\" \"dial\" \"172.31.0.1\" \"9\" \"dial\" \"10.200.0.1\" \"8081\" \"dial\" \"$vcdb_at\" \"80\" \"read\" \"/etc/resolv.conf\" \"dns\" \"anything.example\" \"dnstcp\" \"anything.example\")" \
 	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network bridge) (command \"/probe\" \"serve\" \"tcp\" \"80\")" \
 	> "$root/vbridge2.conf"
 printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) (network bridge) (bridge "brtest") (command "/probe" "addr" "eth0"))\n' \
 	> "$root/vbrnamed.conf"
 # A resolver of the test's own on the namespace's loopback, which is all a
 # host with systemd-resolved gives: hull0's relay is what reaches it. It
-# answers every question with one A, 192.0.2.7.
+# answers every question with one A, 192.0.2.7, over UDP and over TCP.
 printf 'nameserver 127.0.0.53\n' > "$root/relay-resolv.conf"
 cat > "$root/fakedns.py" <<'PY'
-import socket, sys
+import socket, sys, threading
+def answer(q):
+    end = 12
+    while q[end] != 0:
+        end += 1 + q[end]
+    end += 5
+    r = q[:2] + b"\x81\x80" + q[4:6] + b"\x00\x01\x00\x00\x00\x00" + q[12:end]
+    return r + b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x05\x00\x04" + bytes([192, 0, 2, 7])
+def stream(c):
+    c.settimeout(10)
+    try:
+        while True:
+            n = c.recv(2, socket.MSG_WAITALL)
+            if len(n) < 2:
+                break
+            q = c.recv(int.from_bytes(n, "big"), socket.MSG_WAITALL)
+            r = answer(q)
+            c.sendall(len(r).to_bytes(2, "big") + r)
+    except OSError:
+        pass
+    c.close()
+def tcp():
+    t = socket.socket()
+    t.bind(("127.0.0.53", 53))
+    t.listen(4)
+    while True:
+        c, _ = t.accept()
+        threading.Thread(target=stream, args=(c,), daemon=True).start()
+threading.Thread(target=tcp, daemon=True).start()
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(("127.0.0.53", 53))
 s.settimeout(float(sys.argv[1]))
@@ -558,13 +586,7 @@ while True:
         q, a = s.recvfrom(4096)
     except socket.timeout:
         break
-    end = 12
-    while q[end] != 0:
-        end += 1 + q[end]
-    end += 5
-    r = q[:2] + b"\x81\x80" + q[4:6] + b"\x00\x01\x00\x00\x00\x00" + q[12:end]
-    r += b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x05\x00\x04" + bytes([192, 0, 2, 7])
-    s.sendto(r, a)
+    s.sendto(answer(q), a)
 PY
 rm -rf "${root:?}/vbrrun"
 mkdir -p "$root/vbrrun"
@@ -608,6 +630,7 @@ printf '%s\n' "$vbridge_out" | grep -q "^vbweb *| addr=eth0 $(printf '%s' "$vbwe
 	printf '%s\n' "$vbridge_out" | grep -q '^vbweb *| dial 10\.200\.0\.1:8081=hello from beyond the bridge$' &&
 	printf '%s\n' "$vbridge_out" | grep -q '^vbweb *| read=nameserver 172\.31\.0\.1$' &&
 	printf '%s\n' "$vbridge_out" | grep -q '^vbweb *| dns=anything\.example 192\.0\.2\.7$' &&
+	printf '%s\n' "$vbridge_out" | grep -q '^vbweb *| dnstcp=anything\.example 192\.0\.2\.7$' &&
 	printf '%s\n' "$vbridge_out" | grep -q "^vbweb *| dial $(printf '%s' "$vcdb_at" | sed 's/\./\\./g'):80=hello from the machine\$" ||
 	fail "a vm on hull0, as root, was not addressed, routed out and on one wire with a chroot machine" "$vbridge_out"
 cases=$((cases + 1))

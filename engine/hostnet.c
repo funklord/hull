@@ -12,6 +12,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -188,6 +189,8 @@ char *hull_hostnet_resolvers(void)
 
 #define RELAY_PENDING 64u    /* questions in flight at once */
 #define RELAY_WAIT_MS 5000   /* how long one waits for its answer */
+#define RELAY_STREAMS 16u    /* TCP connections relayed at once */
+#define RELAY_IDLE_MS 30000  /* how long one may sit with nothing sent */
 
 typedef struct pending {
 	int                     fd;      /* to the upstream, or -1 */
@@ -197,6 +200,9 @@ typedef struct pending {
 } pending;
 
 static int                     relay_fd = -1;
+static int                     relay_listen = -1;
+static unsigned                relay_streams;   /* under streams_lock */
+static pthread_mutex_t         streams_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct sockaddr_storage upstream;
 static socklen_t               upstream_length;
 
@@ -248,7 +254,7 @@ static int first_resolver(void)
 static void *relay(void *arg)
 {
 	pending table[RELAY_PENDING];
-	uint8_t packet[4096];
+	uint8_t packet[65535];    /* any datagram, so an EDNS answer is never cut */
 
 	(void)arg;
 	for (unsigned i = 0u; i < RELAY_PENDING; i++)
@@ -319,6 +325,82 @@ static void *relay(void *arg)
 	return NULL;
 }
 
+/* One TCP connection from a machine, its bytes copied both ways to a
+ * connection of its own to the upstream, so its length-prefixed queries
+ * and their answers pass as they are, several on one connection too (RFC
+ * 7766). It ends with either side's close, or RELAY_IDLE_MS with nothing
+ * from either, which a send stuck on an asker that reads nothing is held
+ * to as well. */
+static void *relay_stream(void *arg)
+{
+	int            asker = (int)(intptr_t)arg;
+	int            up = socket(upstream.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	struct timeval idle = { .tv_sec = RELAY_IDLE_MS / 1000 };
+	uint8_t        buffer[4096];
+
+	if (up >= 0 &&
+	    setsockopt(up, SOL_SOCKET, SO_SNDTIMEO, &idle, sizeof idle) == 0 &&
+	    setsockopt(asker, SOL_SOCKET, SO_SNDTIMEO, &idle, sizeof idle) == 0 &&
+	    connect(up, (struct sockaddr *)&upstream, upstream_length) == 0) {
+		for (;;) {
+			struct pollfd fds[2] = { { .fd = asker, .events = POLLIN },
+			                         { .fd = up, .events = POLLIN } };
+			int           from;
+			ssize_t       got;
+
+			if (poll(fds, 2, RELAY_IDLE_MS) <= 0)
+				break;
+			from = fds[0].revents != 0 ? 0 : 1;
+			got  = recv(fds[from].fd, buffer, sizeof buffer, 0);
+			if (got <= 0 || send(fds[1 - from].fd, buffer, (size_t)got, MSG_NOSIGNAL) != got)
+				break;
+		}
+	}
+	if (up >= 0)
+		close(up);
+	close(asker);
+	pthread_mutex_lock(&streams_lock);
+	relay_streams--;
+	pthread_mutex_unlock(&streams_lock);
+	return NULL;
+}
+
+/* Connections in on relay_listen, each given a thread of its own, at most
+ * RELAY_STREAMS at once; one past that is closed, and the asker's
+ * resolver tries again or another server. */
+static void *relay_accept(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		int       asker = accept4(relay_listen, NULL, NULL, SOCK_CLOEXEC);
+		int       taken = 0;
+		pthread_t thread;
+
+		if (asker < 0) {
+			if (errno != EINTR && errno != ECONNABORTED)
+				poll(NULL, 0, 100);    /* EMFILE and its kind: not a spin */
+			continue;
+		}
+		pthread_mutex_lock(&streams_lock);
+		if (relay_streams < RELAY_STREAMS) {
+			relay_streams++;
+			taken = 1;
+		}
+		pthread_mutex_unlock(&streams_lock);
+		if (taken && pthread_create(&thread, NULL, relay_stream, (void *)(intptr_t)asker) == 0) {
+			pthread_detach(thread);
+			continue;
+		}
+		if (taken) {
+			pthread_mutex_lock(&streams_lock);
+			relay_streams--;
+			pthread_mutex_unlock(&streams_lock);
+		}
+		close(asker);
+	}
+	return NULL;
+}
+
 const char *hull_hostnet_relay(char *why, size_t cap)
 {
 	static pthread_mutex_t started = PTHREAD_MUTEX_INITIALIZER;
@@ -336,14 +418,24 @@ const char *hull_hostnet_relay(char *why, size_t cap)
 		} else if ((relay_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)) < 0 ||
 		           setsockopt(relay_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0 ||
 		           bind(relay_fd, (struct sockaddr *)&at, sizeof at) != 0 ||
+		           (relay_listen = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0 ||
+		           setsockopt(relay_listen, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0 ||
+		           bind(relay_listen, (struct sockaddr *)&at, sizeof at) != 0 ||
+		           listen(relay_listen, 16) != 0 ||
 		           pthread_create(&thread, NULL, relay, NULL) != 0) {
 			snprintf(why, cap, "hull0's DNS relay: %s", strerror(errno));
 			if (relay_fd >= 0)
 				close(relay_fd);
-			relay_fd = -1;
+			if (relay_listen >= 0)
+				close(relay_listen);
+			relay_fd     = -1;
+			relay_listen = -1;
 			reason = why;
 		} else {
 			pthread_detach(thread);
+			/* Without TCP the UDP half still answers, as it did. */
+			if (pthread_create(&thread, NULL, relay_accept, NULL) == 0)
+				pthread_detach(thread);
 		}
 	}
 	pthread_mutex_unlock(&started);
