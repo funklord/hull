@@ -61,12 +61,15 @@
 #include "access.h"
 #include "builtin.h"
 #include "sha256.h"
+#include "stack.h"
 #include "tree.h"
 #include "usage.h"
 
 #define API           "/v1.41"
 #define MAX_RESPONSE  (1u << 20)
-#define MAX_LAYERS    17u   /* the source and sixteen (layers ...) above it */
+#define MAX_LAYERS    64u   /* the root's trees and its volumes' stacks, as layers */
+#define MAX_STACKS    8u    /* volumes of (layers ...) */
+#define MAX_PREFIX    16u   /* the components of a stack's guest path */
 
 struct hull_machine {
 	hull_core       *core;
@@ -81,8 +84,14 @@ struct hull_machine {
 	int              done;
 	int              export_fd;  /* (export PATH)'s file, or -1 */
 	int              upper_fd;   /* (upper PATH), its directory, or -1 */
-	char            *trees[17];  /* a dir source's trees, the source first, upper last */
+	char            *trees[MAX_LAYERS];  /* a dir source's trees, the source first, upper last */
 	unsigned         tree_count;
+	struct {
+		char      *guest;      /* "srv/data": its guest path, relative */
+		hull_stack stack;      /* its layers, upper and mode */
+		int        upper_fd;   /* the upper, held open for its writes, or -1 */
+	}                stacks[MAX_STACKS];
+	unsigned         stack_count;
 	char             detail[512];
 };
 
@@ -606,6 +615,29 @@ static const char *import_dir(const char *root, const hull_tree_owner *owners, s
 	return NULL;
 }
 
+/* One layer of an image import_layers loads: a tree, and where it is a
+ * volume's stack's, the guest path it is laid beneath, the metadata of
+ * the directories above that, and whether it is the stack's lowest,
+ * whose opaque marker hides what the root has there. */
+typedef struct layer_in {
+	const char   *tree;
+	const char   *prefix;
+	hull_tree_dir parents[MAX_PREFIX];
+	int           opaque;
+} layer_in;
+
+/* A layer's tar: the source's with its owners, a layer's or an upper's
+ * with its whiteouts docker's, a stack's beneath its guest path. */
+static int layer_tar(const layer_in *l, int source, const hull_tree_owner *owners, size_t count,
+                     hull_tree_sink sink, void *context, char *detail, size_t detail_cap)
+{
+	if (l->prefix != NULL)
+		return hull_tree_tar_under(l->tree, l->prefix, l->parents, l->opaque, sink, context,
+		                           detail, detail_cap);
+	return (source ? hull_tree_tar_owned : hull_tree_tar_layer)(l->tree, owners, count, sink,
+	                                                            context, detail, detail_cap);
+}
+
 /* A ustar header of the docker-save tar's own, for an entry hull names:
  * a short name, a file's size, nothing else; 0, or -1. */
 static int save_header(int fd, const char *name, unsigned long long size)
@@ -653,9 +685,9 @@ static unsigned long long save_entry(unsigned long long n)
  * Labelled as an import is, hull.tree the paths' SHA-256 together and
  * hull.path the source's, for gc. NULL, or why in `detail`.
  */
-static const char *import_layers(char *const *trees, unsigned count, const hull_tree_owner *owners,
-                                 size_t owner_count, char *image, size_t cap, char *detail,
-                                 size_t detail_cap)
+static const char *import_layers(const layer_in *trees, unsigned count,
+                                 const hull_tree_owner *owners, size_t owner_count, char *image,
+                                 size_t cap, char *detail, size_t detail_cap)
 {
 	reading            first[MAX_LAYERS];
 	uint8_t            digest[32];
@@ -685,10 +717,13 @@ static const char *import_layers(char *const *trees, unsigned count, const hull_
 
 		hull_sha256_init(&named);
 		for (unsigned i = 0u; i < count; i++) {
-			char       *canonical = realpath(trees[i], NULL);
-			const char *at = canonical != NULL ? canonical : trees[i];
+			char       *canonical = realpath(trees[i].tree, NULL);
+			const char *at = canonical != NULL ? canonical : trees[i].tree;
 
 			hull_sha256_update(&named, (const uint8_t *)at, strlen(at) + 1u);
+			if (trees[i].prefix != NULL)
+				hull_sha256_update(&named, (const uint8_t *)trees[i].prefix,
+				                   strlen(trees[i].prefix) + 1u);
 			if (i == 0u) {
 				where[0] = '\0';
 				for (size_t k = 0u; at[k] != '\0' && 2u * k + 2u < sizeof where; k++)
@@ -705,9 +740,8 @@ static const char *import_layers(char *const *trees, unsigned count, const hull_
 	for (unsigned i = 0u; i < count; i++) {
 		memset(&first[i], 0, sizeof first[i]);
 		hull_sha256_init(&first[i].sha);
-		if ((i == 0u ? hull_tree_tar_owned : hull_tree_tar_layer)(trees[i], owners, owner_count,
-		                                                         counted, &first[i], detail,
-		                                                         detail_cap) != 0) {
+		if (layer_tar(&trees[i], i == 0u, owners, owner_count, counted, &first[i], detail,
+		              detail_cap) != 0) {
 			free(config.data);
 			return detail;
 		}
@@ -773,9 +807,8 @@ static const char *import_layers(char *const *trees, unsigned count, const hull_
 		second.limit = first[i].length;
 		snprintf(name, sizeof name, "%u/layer.tar", i);
 		if (save_header(fd, name, first[i].length) != 0 ||
-		    (i == 0u ? hull_tree_tar_owned : hull_tree_tar_layer)(trees[i], owners, owner_count,
-		                                                         sent, &second, detail,
-		                                                         detail_cap) != 0) {
+		    layer_tar(&trees[i], i == 0u, owners, owner_count, sent, &second, detail,
+		              detail_cap) != 0) {
 			if (second.over)
 				snprintf(detail, detail_cap, "the directory changed while it was imported");
 			goto failed;
@@ -948,13 +981,21 @@ static const char *add_binds(text *t, const hull_sexpr_doc *doc, const hull_sexp
 	hull_sexpr_child(doc, entry, &item);
 	for (more = hull_sexpr_next(doc, &item, &item); more;
 	     more = hull_sexpr_next(doc, &item, &item)) {
-		char *written   = hull_access_value(doc, &item, "host");
-		char *host_path = written != NULL ? hull_access_path(doc, written) : NULL;
-		char *guest     = hull_access_value(doc, &item, "guest");
-		char *mode      = hull_access_value(doc, &item, "mode");
-		char  absolute[PATH_MAX];
-		text  bind = { 0 };
+		hull_sexpr_form layers;
+		char           *written;
+		char           *host_path;
+		char           *guest;
+		char           *mode;
+		char            absolute[PATH_MAX];
+		text            bind = { 0 };
 
+		/* A stack of layers is laid into the image (import_stacked). */
+		if (hull_access_find(doc, &item, "layers", &layers))
+			continue;
+		written   = hull_access_value(doc, &item, "host");
+		host_path = written != NULL ? hull_access_path(doc, written) : NULL;
+		guest     = hull_access_value(doc, &item, "guest");
+		mode      = hull_access_value(doc, &item, "mode");
 		free(written);
 		if (host_path == NULL || guest == NULL || realpath(host_path, absolute) == NULL) {
 			snprintf(detail, cap, "volume %s: %s", host_path != NULL ? host_path : "?",
@@ -1199,6 +1240,28 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 			}
 		}
 		add_text(&body, "]");
+	}
+	/* A read-only stack is its guest path made read-only, ReadonlyPaths,
+	 * which replaces docker's own list, so that list is given too. */
+	for (unsigned i = 0u; i < m->stack_count; i++) {
+		if (!m->stacks[i].stack.readonly)
+			continue;
+		add_text(&body, ",\"ReadonlyPaths\":[\"/proc/bus\",\"/proc/fs\",\"/proc/irq\","
+		         "\"/proc/sys\",\"/proc/sysrq-trigger\"");
+		for (unsigned k = 0u; k < m->stack_count; k++) {
+			text guest = { 0 };
+
+			if (!m->stacks[k].stack.readonly)
+				continue;
+			add_text(&guest, "/");
+			add_text(&guest, m->stacks[k].guest);
+			add_text(&body, ",");
+			add_json(&body, guest.data != NULL ? guest.data : "/");
+			body.failed |= guest.failed;
+			free(guest.data);
+		}
+		add_text(&body, "]");
+		break;
 	}
 	if (hull_access_find(doc, machine, "security", &entry)) {
 		if (hull_access_true(doc, &entry, "readonly_root"))
@@ -1529,6 +1592,31 @@ static int upper_put(int upper, const char *path, char type, unsigned mode,
 	return result;
 }
 
+/* Where a change at `full` is kept: the upper of the volume's stack it is
+ * beneath, `*relative` then its path there, or the root's upper, unless
+ * it is no write of the workload's (not_written) or a stack's own mount
+ * point. The upper's descriptor, or -1 where nothing keeps it. */
+static int upper_of(const hull_machine *m, const char *full, int added, char *const *mounts,
+                    size_t mount_count, char *const *kept, size_t kept_count,
+                    const char **relative)
+{
+	*relative = full;
+	for (unsigned k = 0u; k < m->stack_count; k++) {
+		size_t length = strlen(m->stacks[k].guest);
+
+		if (strncmp(full + 1, m->stacks[k].guest, length) != 0 ||
+		    (full[1u + length] != '\0' && full[1u + length] != '/'))
+			continue;
+		if (full[1u + length] == '\0')
+			return -1;
+		*relative = full + 1u + length;
+		return m->stacks[k].upper_fd;
+	}
+	if (m->upper_fd < 0 || not_written(full, added, mounts, mount_count, kept, kept_count))
+		return -1;
+	return m->upper_fd;
+}
+
 /*
  * (upper PATH)'s writes, kept as an overlay's upper keeps them, from the
  * container docker made of the layers with the upper on top: what the
@@ -1586,6 +1674,16 @@ static void write_upper(hull_machine *m, long *code)
 	}
 	free(answer);
 	answer = NULL;
+	/* Each volume's stack is a mount to the root's upper, as on chroot. */
+	for (unsigned k = 0u; k < m->stack_count && mount_count < 64u; k++) {
+		size_t length = strlen(m->stacks[k].guest);
+
+		if ((mounts[mount_count] = malloc(length + 2u)) != NULL) {
+			mounts[mount_count][0] = '/';
+			memcpy(mounts[mount_count] + 1, m->stacks[k].guest, length + 1u);
+			mount_count++;
+		}
+	}
 	if (name == NULL || link == NULL || records == NULL) {
 		snprintf(detail, sizeof detail, "out of memory");
 		goto said;
@@ -1639,9 +1737,11 @@ static void write_upper(hull_machine *m, long *code)
 	/* Deletions first, a path beneath one already deleted skipped. */
 	qsort(gone, gone_count, sizeof *gone, path_order);
 	for (size_t i = 0u; i < gone_count; i++) {
-		char   leaf[256];
-		int    dir;
-		size_t under = 0u;
+		char        leaf[256];
+		int         dir;
+		int         target;
+		const char *relative;
+		size_t      under = 0u;
 
 		for (size_t j = 0u; j < i; j++) {
 			size_t length = strlen(gone[j]);
@@ -1649,10 +1749,11 @@ static void write_upper(hull_machine *m, long *code)
 			if (strncmp(gone[i], gone[j], length) == 0 && gone[i][length] == '/')
 				under = 1u;
 		}
-		if (under || not_written(gone[i], 0, mounts, mount_count, kept,
-		                         kept_count))
+		if (under ||
+		    (target = upper_of(m, gone[i], 0, mounts, mount_count, kept, kept_count,
+		                       &relative)) < 0)
 			continue;
-		if ((dir = upper_parent(m->upper_fd, gone[i], leaf, sizeof leaf)) < 0) {
+		if ((dir = upper_parent(target, relative, leaf, sizeof leaf)) < 0) {
 			snprintf(detail, sizeof detail, "%.400s: not a path the upper can hold", gone[i]);
 			goto said;
 		}
@@ -1694,6 +1795,8 @@ static void write_upper(hull_machine *m, long *code)
 		char               full[4200];
 		const char        *key = full;
 		char             **found_kept;
+		const char        *relative;
+		int                target = -1;
 		int                put;
 
 		if (tar_block(&t) != 0) {
@@ -1767,9 +1870,9 @@ static void write_upper(hull_machine *m, long *code)
 		found_kept = strcmp(full, "/") != 0 ?
 		             bsearch(&key, kept, kept_count, sizeof *kept, path_order) : NULL;
 		if (found_kept != NULL &&
-		    !not_written(full, (*found_kept)[strlen(*found_kept) + 1u] == 'A', mounts, mount_count,
-		                 kept, kept_count)) {
-			put = upper_put(m->upper_fd, full, type == '\0' ? '0' : type,
+		    (target = upper_of(m, full, (*found_kept)[strlen(*found_kept) + 1u] == 'A', mounts,
+		                       mount_count, kept, kept_count, &relative)) >= 0) {
+			put = upper_put(target, relative, type == '\0' ? '0' : type,
 			                (unsigned)tar_number(t.block + 100, 8u), tar_number(t.block + 136, 12u),
 			                link, &t, type == '5' ? 0u : size);
 			if (put < 0) {
@@ -1997,6 +2100,13 @@ static void export_filtered_into(hull_machine *m, int from, char *detail, size_t
 			full[--length] = '\0';
 		drop = strcmp(full, "/.dockerenv") == 0 || strcmp(full, "/sbin/docker-init") == 0 ||
 		       (m->tree_count != 0u && !sbin && strcmp(full, "/sbin") == 0);
+		/* What a volume's stack holds is the volume's, as chroot's export
+		 * leaves a mount point empty. */
+		for (unsigned k = 0u; !drop && k < m->stack_count; k++) {
+			size_t g = strlen(m->stacks[k].guest);
+
+			drop = strncmp(full + 1, m->stacks[k].guest, g) == 0 && full[1u + g] == '/';
+		}
 		for (unsigned i = 0u; !drop && m->tree_count != 0u && etc[i] != NULL; i++) {
 			char        found[4200];
 			struct stat there;
@@ -2088,8 +2198,14 @@ static void *read_workload(void *arg)
 	if (call("POST", path, NULL, &status, &answer) == 0 && status == 200)
 		json_number(answer, "StatusCode", &code);
 	free(answer);
-	if (m->upper_fd >= 0)
-		write_upper(m, &code);
+	{
+		int keeps = m->upper_fd >= 0;
+
+		for (unsigned k = 0u; k < m->stack_count; k++)
+			keeps |= m->stacks[k].upper_fd >= 0;
+		if (keeps)
+			write_upper(m, &code);
+	}
 	if (m->export_fd >= 0)
 		export_container(m, &code);
 	pthread_mutex_lock(&m->lock);
@@ -2112,6 +2228,12 @@ static void release(hull_machine *m)
 		close(m->upper_fd);
 	for (unsigned i = 0u; i < m->tree_count; i++)
 		free(m->trees[i]);
+	for (unsigned i = 0u; i < m->stack_count; i++) {
+		free(m->stacks[i].guest);
+		hull_stack_release(&m->stacks[i].stack);
+		if (m->stacks[i].upper_fd >= 0)
+			close(m->stacks[i].upper_fd);
+	}
 	free(m->body);
 	pthread_mutex_destroy(&m->lock);
 	pthread_cond_destroy(&m->done_cond);
@@ -2199,6 +2321,127 @@ static const char *read_owners(const char *path, char **data, hull_tree_owner **
 
 /* The image the machine runs: its ref, or its dir's import, with the
  * owners (owners PATH) gives. A reason, or NULL. */
+/* The volumes of (layers ...), each its guest path relative and its
+ * stack, its upper made where missing and held open for the writes it
+ * keeps, as the root's is. A reason, or NULL. */
+static const char *read_stacks(hull_machine *m, const hull_sexpr_doc *doc,
+                               const hull_sexpr_form *machine)
+{
+	hull_sexpr_form entry;
+	hull_sexpr_form item;
+
+	if (!hull_access_find(doc, machine, "volumes", &entry))
+		return NULL;
+	hull_sexpr_child(doc, &entry, &item);
+	for (int more = hull_sexpr_next(doc, &item, &item); more;
+	     more = hull_sexpr_next(doc, &item, &item)) {
+		hull_sexpr_form layers;
+		char           *guest;
+		char           *mode;
+		const char     *at;
+		const char     *why;
+		unsigned        k = m->stack_count;
+
+		if (!hull_access_find(doc, &item, "layers", &layers))
+			continue;
+		if (k == MAX_STACKS)
+			return "there are too many volumes of layers";
+		guest = hull_access_value(doc, &item, "guest");
+		mode  = hull_access_value(doc, &item, "mode");
+		m->stacks[k].upper_fd = -1;
+		why = hull_access_stack(doc, &item, mode != NULL && strcmp(mode, "ro") == 0,
+		                        &m->stacks[k].stack);
+		free(mode);
+		m->stack_count++;
+		for (at = guest != NULL ? guest : ""; *at == '/'; at++)
+			;
+		if (why == NULL && (guest == NULL || *at == '\0' || strstr(at, "..") != NULL ||
+		                    at[strlen(at) - 1u] == '/'))
+			why = "a volume of layers is a guest path beneath /, not / itself";
+		if (why == NULL && (m->stacks[k].guest = strdup(at)) == NULL)
+			why = "out of memory";
+		free(guest);
+		if (why == NULL && m->stacks[k].stack.upper != NULL &&
+		    (((mkdir(m->stacks[k].stack.upper, 0755) != 0 && errno != EEXIST)) ||
+		     (m->stacks[k].upper_fd = open(m->stacks[k].stack.upper,
+		                                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)) < 0)) {
+			snprintf(create_detail, sizeof create_detail, "a volume's upper %s: %s",
+			         m->stacks[k].stack.upper, strerror(errno));
+			return create_detail;
+		}
+		if (why != NULL)
+			return why;
+	}
+	return NULL;
+}
+
+/* The root's trees, `count` of them, and above them each volume's stack
+ * beneath its guest path, as one image; each directory above a guest
+ * path given the topmost root tree's metadata for it, or the user's 0755
+ * where none has one. A reason, or NULL. */
+static const char *import_stacked(const hull_machine *m, char *const *trees, unsigned count,
+                                  const hull_tree_owner *owners, size_t owner_count, char *image,
+                                  size_t cap)
+{
+	layer_in   *in = calloc(MAX_LAYERS, sizeof *in);
+	unsigned    n = 0u;
+	const char *reason;
+
+	if (in == NULL)
+		return "out of memory";
+	for (unsigned i = 0u; i < count; i++)
+		in[n++].tree = trees[i];
+	for (unsigned k = 0u; k < m->stack_count; k++) {
+		const char   *guest = m->stacks[k].guest;
+		const hull_stack *stack = &m->stacks[k].stack;
+		hull_tree_dir parents[MAX_PREFIX];
+		unsigned      depth = 0u;
+
+		for (size_t i = 0u; guest[i] != '\0'; i++) {
+			char at[4200];
+
+			if (guest[i] != '/')
+				continue;
+			if (depth == MAX_PREFIX) {
+				free(in);
+				return "a volume's guest path is too deep";
+			}
+			parents[depth].mode  = 0755u;
+			parents[depth].uid   = getuid();
+			parents[depth].gid   = getgid();
+			parents[depth].mtime = 0u;
+			for (unsigned t = count; t-- > 0u;) {
+				struct stat there;
+
+				snprintf(at, sizeof at, "%s/%.*s", trees[t], (int)i, guest);
+				if (lstat(at, &there) == 0 && S_ISDIR(there.st_mode)) {
+					parents[depth].mode  = there.st_mode & 07777u;
+					parents[depth].uid   = there.st_uid;
+					parents[depth].gid   = there.st_gid;
+					parents[depth].mtime = (unsigned long long)there.st_mtime;
+					break;
+				}
+			}
+			depth++;
+		}
+		for (unsigned i = 0u; i < stack->count + (stack->upper != NULL); i++) {
+			if (n == MAX_LAYERS) {
+				free(in);
+				return "there are too many layers, the root's and its volumes' together";
+			}
+			in[n].tree   = i < stack->count ? stack->layer[i] : stack->upper;
+			in[n].prefix = guest;
+			in[n].opaque = i == 0u;
+			memcpy(in[n].parents, parents, sizeof parents);
+			n++;
+		}
+	}
+	reason = import_layers(in, n, owners, owner_count, image, cap, create_detail,
+	                       sizeof create_detail);
+	free(in);
+	return reason;
+}
+
 static const char *source_image(hull_machine *m, const hull_sexpr_doc *doc,
                                 const hull_sexpr_form *machine, const char *upper, char *image,
                                 size_t cap)
@@ -2252,15 +2495,19 @@ static const char *source_image(hull_machine *m, const hull_sexpr_doc *doc,
 			reason = "owners are given to a dir's import: an image ref keeps its own";
 		else if (layers != 0u)
 			reason = "layers and an upper lie above a dir's import: an image ref has its own";
+		else if (m->stack_count != 0u)
+			reason = "a volume's stack of layers is laid into a dir's import: an image ref "
+			         "is the daemon's";
 	} else if (source != NULL && strncmp(source, "dir:", 4u) == 0 && source[4] != '\0') {
 		root = hull_access_path(doc, source + 4);
 		trees[0] = root;
-		reason = root == NULL ? "out of memory" :
-		         layers != 0u ?
-		         import_layers(trees, 1u + layers, owners, count, image, cap, create_detail,
-		                       sizeof create_detail) :
-		         import_dir(root, owners, count, image, cap, create_detail,
-		                    sizeof create_detail);
+		if (root == NULL)
+			reason = "out of memory";
+		else if (layers == 0u && m->stack_count == 0u)
+			reason = import_dir(root, owners, count, image, cap, create_detail,
+			                    sizeof create_detail);
+		else
+			reason = import_stacked(m, trees, 1u + layers, owners, count, image, cap);
 	} else {
 		reason = "the docker adapter runs an image ref or a dir";
 	}
@@ -2345,7 +2592,9 @@ static hull_status docker_create(hull_core *core, hull_buf plan, hull_machine **
 	         (long)getpid(), machines_made++);
 	free(hostname);
 
-	reason = source_image(m, &doc, &machine, upper_at, image, sizeof image);
+	reason = read_stacks(m, &doc, &machine);
+	if (reason == NULL)
+		reason = source_image(m, &doc, &machine, upper_at, image, sizeof image);
 	free(upper_at);
 	if (reason == NULL)
 		reason = build(m, &doc, &machine, image);
@@ -2992,8 +3241,9 @@ static const hull_cap_entry entries[] = {
 	{ "ports",              HULL_SUP_NATIVE,
 	  "bound on the machine's address", NULL },
 	{ "volumes",            HULL_SUP_NATIVE,   NULL, NULL },
-	{ "volumes.layers",     HULL_SUP_REJECTED,
-	  "not yet: a stack of layers would be an overlay the daemon mounts", NULL },
+	{ "volumes.layers",     HULL_SUP_EMULATED,
+	  "laid into the dir's import beneath its guest path, hiding what is there; its upper's "
+	  "writes given back, and a read-only one docker's ReadonlyPaths", NULL },
 	{ "secrets",            HULL_SUP_NATIVE,
 	  "bound read-only from the core's tmpfs; one exposed is in the container's "
 	  "configuration too, where docker inspect shows it", NULL },

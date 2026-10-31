@@ -272,6 +272,40 @@ expect 0 '^list= d$' reuppered
 cases=$((cases + 1))
 printf '%s\n' "$out" | grep -q '^list= y$' ||
 	fail "an upper's opaque directory did not hide what lay below it" "$out"
+# (volumes (volume (guest G) (layers ...) [(upper U)] [(mode ro)])): each
+# stack laid into the import beneath G, hiding the root's own G as a
+# mount does; a kept one's writes and removals given back to its upper
+# alone; one in memory writing nowhere on disk; a read-only one refusing
+# a write, ReadonlyPaths; and an export holding G empty, as chroot's.
+rm -f "$root/stacked/data/d" "$root/stacked/data/sub/b" "$root/stacked/out.tar"
+rmdir "$root/stacked/data/sub" 2> /dev/null
+mkdir -p "$root/stacked/root/proc" "$root/stacked/root/mnt" "$root/stacked/data" \
+	"$root/stacked/seed"
+cp "$probe" "$root/stacked/root/probe"
+printf 'hidden\n' > "$root/stacked/root/mnt/under"
+printf 'c\n' > "$root/stacked/data/c"
+printf 's\n' > "$root/stacked/seed/s"
+printf '(machine (source "dir:./stacked/root") (mutable overlay) (backend docker) (hostname "dtest") %s %s)\n' \
+	'(volumes (volume (guest "/mnt") (layers "dir:./layered/template" "dir:./layered/site") (upper "./stacked/data")) (volume (guest "/var/seed") (layers "dir:./stacked/seed")) (volume (guest "/ro") (layers "dir:./layered/template") (mode ro))) (export "./stacked/out.tar")' \
+	'(command "/probe" "read" "/mnt/a" "read" "/mnt/c" "read" "/mnt/under" "write" "/mnt/d" "remove" "/mnt/sub/b" "write" "/var/seed/t" "write" "/ro/x")' \
+	> "$root/stacked.conf"
+expect 0 'volumes.layers: emulated' stacked
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^read=site$' && printf '%s\n' "$out" | grep -q '^read=c$' &&
+	printf '%s\n' "$out" | grep -q '^read=No such file or directory$' &&
+	printf '%s\n' "$out" | grep -q '^remove=ok$' &&
+	[ "$(printf '%s\n' "$out" | grep -c '^write=ok$')" = 2 ] &&
+	printf '%s\n' "$out" | grep -q '^write=Read-only file system$' &&
+	[ -f "$root/stacked/data/d" ] && [ -c "$root/stacked/data/sub/b" ] &&
+	[ -e "$root/layered/site/sub/b" ] && [ ! -e "$root/layered/site/d" ] &&
+	[ ! -e "$root/stacked/seed/t" ] && [ ! -e "$root/stacked/root/mnt/d" ] ||
+	fail "a volume's stack was not laid, kept and read-only as on chroot" \
+		"$out
+$(ls -la "$root/stacked/data" "$root/stacked/seed" 2>&1)"
+cases=$((cases + 1))
+inside=$(timeout 30 tar -tf "$root/stacked/out.tar" 2>&1 | grep -E '^(mnt|var/seed|ro)/')
+[ "$(printf '%s\n' "$inside" | sort | tr '\n' ' ')" = "mnt/ ro/ var/seed/ " ] ||
+	fail "an export held what a volume's stack holds" "$inside"
 conf upperref "(upper \"$root/layered/refupper\") (command \"true\")"
 expect 125 'layers and an upper lie above a dir.s import' upperref
 rmdir "$root/layered/refupper" 2> /dev/null
@@ -849,7 +883,7 @@ for image in $(timeout 10 docker images --filter reference=hull-dir --format '{{
 	at=$(timeout 10 docker image inspect -f '{{index .Config.Labels "hull.path"}}' "$image" 2>/dev/null |
 		python3 -c 'import sys; print(bytes.fromhex(sys.stdin.read().strip()).decode())' 2>/dev/null)
 	case $at in
-	"$root"/data/*) timeout 30 docker rmi -f "$image" > /dev/null 2>&1 ;;
+	"$root"/data/* | "$root"/stacked/*) timeout 30 docker rmi -f "$image" > /dev/null 2>&1 ;;
 	esac
 done
 

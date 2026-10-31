@@ -445,6 +445,8 @@ static int walk(writer *w, int dir, size_t base, unsigned depth)
 static int tar_tree(const char *root, int one_fs, const hull_tree_owner *owners, size_t count,
                     int overlay, hull_tree_sink sink, void *context, char *detail,
                     size_t detail_cap);
+static int tar_from(writer *w, const char *root, const char *prefix,
+                    const hull_tree_dir *parents, int opaque);
 
 int hull_tree_tar(const char *root, hull_tree_sink sink, void *context, char *detail,
                   size_t detail_cap)
@@ -468,6 +470,88 @@ int hull_tree_tar_fs(const char *root, int one_fs, hull_tree_sink sink, void *co
                      char *detail, size_t detail_cap)
 {
 	return tar_tree(root, one_fs, NULL, 0u, 0, sink, context, detail, detail_cap);
+}
+
+int hull_tree_tar_under(const char *root, const char *prefix, const hull_tree_dir *parents,
+                        int opaque, hull_tree_sink sink, void *context, char *detail,
+                        size_t detail_cap)
+{
+	writer *w = calloc(1u, sizeof *w);
+	int     status;
+
+	if (w == NULL) {
+		snprintf(detail, detail_cap, "out of memory");
+		return -1;
+	}
+	w->sink       = sink;
+	w->context    = context;
+	w->detail     = detail;
+	w->detail_cap = detail_cap;
+	w->overlay    = 1;
+	status = tar_from(w, root, prefix, parents, opaque);
+	free(w);
+	return status;
+}
+
+/* The prefix's directories, the tree's root as the last, then the tree. */
+static int tar_from(writer *w, const char *root, const char *prefix,
+                    const hull_tree_dir *parents, int opaque)
+{
+	static const uint8_t end[2u * BLOCK];
+	struct stat          top;
+	size_t               length = strlen(prefix);
+	unsigned             component = 0u;
+	int                  dir;
+	int                  status = 0;
+
+	if (length == 0u || length + 16u >= sizeof w->path || prefix[0] == '/' ||
+	    prefix[length - 1u] == '/') {
+		snprintf(w->detail, w->detail_cap, "%s: not a prefix a tree can be written beneath",
+		         prefix);
+		return -1;
+	}
+	dir = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (dir < 0 || fstat(dir, &top) != 0) {
+		snprintf(w->detail, w->detail_cap, "%s: %s", root, strerror(errno));
+		if (dir >= 0)
+			close(dir);
+		return -1;
+	}
+	w->device = top.st_dev;
+	for (size_t i = 0u; status == 0 && i <= length; i++) {
+		struct stat made;
+
+		if (i < length && prefix[i] != '/')
+			continue;
+		memcpy(w->path, prefix, i);
+		w->path[i]      = '/';
+		w->path[i + 1u] = '\0';
+		if (i == length) {
+			made = top;
+		} else {
+			memset(&made, 0, sizeof made);
+			made.st_mode  = S_IFDIR | (parents[component].mode & 07777u);
+			made.st_uid   = (uid_t)parents[component].uid;
+			made.st_gid   = (gid_t)parents[component].gid;
+			made.st_mtime = (time_t)parents[component].mtime;
+			component++;
+		}
+		status = header(w, -1, NULL, w->path, '5', &made, 0u, NULL);
+	}
+	if (status == 0 && opaque) {
+		struct stat marker = top;
+
+		memcpy(w->path + length + 1u, ".wh..wh..opq", 13u);
+		marker.st_mode = S_IFREG;
+		status = header(w, -1, NULL, w->path, '0', &marker, 0u, NULL);
+		w->path[length + 1u] = '\0';
+	}
+	if (status == 0)
+		status = walk(w, dir, length + 1u, 1u);
+	if (status == 0)
+		status = put(w, end, sizeof end);
+	close(dir);
+	return status;
 }
 
 static int tar_tree(const char *root, int one_fs, const hull_tree_owner *owners, size_t count,

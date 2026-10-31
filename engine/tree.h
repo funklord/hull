@@ -68,6 +68,24 @@ int hull_tree_tar_owned(const char *root, const hull_tree_owner *owners, size_t 
 int hull_tree_tar_layer(const char *root, const hull_tree_owner *owners, size_t count,
                         hull_tree_sink sink, void *context, char *detail, size_t detail_cap);
 
+/* A directory above a tree written beneath a prefix: its metadata. */
+typedef struct hull_tree_dir {
+	unsigned           mode;
+	unsigned long long uid;
+	unsigned long long gid;
+	unsigned long long mtime;
+} hull_tree_dir;
+
+/* hull_tree_tar_layer, the tree written beneath `prefix`, "srv/data",
+ * as a volume's stack is laid into a machine's image: each directory of
+ * the prefix above it first, `parents` giving each's metadata, one fewer
+ * than its components; then the prefix itself, the tree's root; with
+ * `opaque`, docker's .wh..wh..opq in it, so that what lies below at the
+ * prefix is hidden as a mount hides it; then what the tree holds. */
+int hull_tree_tar_under(const char *root, const char *prefix, const hull_tree_dir *parents,
+                        int opaque, hull_tree_sink sink, void *context, char *detail,
+                        size_t detail_cap);
+
 /* One entry of such a stream, for a writer that has no directory to walk,
  * as `hull push` writes a layer from a manifest: its name as the stream
  * holds it, a directory's ending in `/`; its type, '0' a file, '2' a
