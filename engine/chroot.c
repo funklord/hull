@@ -3815,8 +3815,18 @@ static hull_status chroot_signal(hull_core *core, hull_machine *m, hull_stream *
 		return HULL_OK;
 	}
 	pthread_mutex_lock(&st->lock);
-	if (!st->reaped)
+	if (st->dialed && st->out >= 0) {
+		/* A connection has no process: any signal resets it, as on
+		 * docker. Its helper is -1, and kill(-1) is every process the
+		 * user has -- which a signal here once was, `hull proxy-ssh`
+		 * forwarding the SIGHUP ssh ends its ProxyCommand with. */
+		struct linger now = { 1, 0 };
+
+		setsockopt(st->out, SOL_SOCKET, SO_LINGER, &now, sizeof now);
+		shutdown(st->out, SHUT_RDWR);
+	} else if (!st->reaped && st->helper > 0) {
 		kill(st->helper, signum);
+	}
 	pthread_mutex_unlock(&st->lock);
 	return HULL_OK;
 }
