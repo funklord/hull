@@ -272,6 +272,45 @@ static void test_set_default(void)
 		FAIL("set_default");
 }
 
+/* Root mode is offered only where no rootless engine honours the field:
+ * a root engine's own declaration does not count, a rootless one's
+ * refusal does not, and its native or emulated support does. */
+static void test_rootless(void)
+{
+	static const hull_cap_entry root_entries[] = {
+		{ "security.allow", HULL_SUP_REJECTED, "root mode's", "root" },
+		{ NULL, HULL_SUP_NATIVE, NULL, NULL } };
+	static const hull_cap_entry refusing[] = {
+		{ "security.allow", HULL_SUP_REJECTED, "no", NULL },
+		{ NULL, HULL_SUP_NATIVE, NULL, NULL } };
+	static const hull_cap_entry honouring[] = {
+		{ "security.allow", HULL_SUP_EMULATED, "in its user namespace", NULL },
+		{ NULL, HULL_SUP_NATIVE, NULL, NULL } };
+	static const hull_capabilities rooted = { .struct_size = sizeof (hull_capabilities),
+		.engine_name = "rooted", .classes = ns_only, .entries = root_entries,
+		.requires_root = 1 };
+	static const hull_capabilities refuser = { .struct_size = sizeof (hull_capabilities),
+		.engine_name = "refuser", .classes = ns_only, .entries = refusing };
+	static const hull_capabilities honourer = { .struct_size = sizeof (hull_capabilities),
+		.engine_name = "honourer", .classes = vm_only, .entries = honouring };
+	static const hull_engine rooted_engine   = ENGINE(rooted);
+	static const hull_engine refuser_engine  = ENGINE(refuser);
+	static const hull_engine honourer_engine = ENGINE(honourer);
+	hull_registry registry;
+
+	hull_registry_init(&registry, "amd64");
+	expect_add(__LINE__, &registry, &rooted_engine, HULL_REGISTRY_OK);
+	expect_add(__LINE__, &registry, &refuser_engine, HULL_REGISTRY_OK);
+	cases++;
+	if (hull_registry_rootless(&registry, "security.allow") != NULL)
+		FAIL("a root engine's declaration, or a rootless refusal, counted as rootless");
+	expect_add(__LINE__, &registry, &honourer_engine, HULL_REGISTRY_OK);
+	cases++;
+	if (hull_registry_rootless(&registry, "security.allow") != &honourer_engine ||
+	    hull_registry_rootless(&registry, "segments") != NULL)
+		FAIL("the rootless engine honouring a field was not named, or one was for another");
+}
+
 int main(void)
 {
 	alarm(60);
@@ -279,6 +318,7 @@ int main(void)
 	test_full();
 	test_choose();
 	test_set_default();
+	test_rootless();
 	printf("registry: %u cases, %u failed\n", cases, failures);
 	return failures == 0u ? 0 : 1;
 }

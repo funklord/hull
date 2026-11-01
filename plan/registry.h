@@ -73,6 +73,12 @@ hull_registry_status hull_registry_choose(const hull_registry *registry,
                                           const char *backend, hull_choice *choice,
                                           const char **reason);
 
+/* A rootless engine of `registry` that honours `field`, natively or
+ * emulated, or NULL: root mode is offered only for a field every
+ * rootless engine on the host refuses (project.md section 7), so where
+ * this names one, that engine is the way, and root is not. */
+const hull_engine *hull_registry_rootless(const hull_registry *registry, const char *field);
+
 #ifdef __cplusplus
 }
 #endif

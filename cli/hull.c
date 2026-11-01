@@ -228,6 +228,24 @@ static int root_changed(const report *r)
 	return 1;
 }
 
+/* Root mode is offered only for a field every rootless engine on the host
+ * refuses (section 7): where one honours a field the plan has root mode
+ * honour, that engine's name, said, and the field into `*field`; NULL
+ * where none does. */
+static const char *rootless_honours(const hull_registry *registry, const hull_plan *plan,
+                                    const char **field)
+{
+	for (unsigned f = 0u; f < plan->root_count; f++) {
+		const hull_engine *rootless = hull_registry_rootless(registry, plan->root_fields[f]);
+
+		if (rootless != NULL) {
+			*field = plan->root_fields[f];
+			return rootless->caps->engine_name;
+		}
+	}
+	return NULL;
+}
+
 /* Read all of `path`, or say why not. */
 static uint8_t *read_file(const char *path, size_t *length)
 {
@@ -852,6 +870,18 @@ static int resolve_one(const options *o, const hull_registry *registry, const hu
 		}
 		printf("%s: %s on %s (%s): --accept root:%s\n", o->file, shown,
 		       choice.engine->caps->engine_name, choice.class_name, hex);
+	}
+	{
+		const char *field = NULL;
+		const char *rootless = rootless_honours(registry, &plan, &field);
+
+		if (rootless != NULL) {
+			printf("%s: %s on %s (%s): root mode is not offered for %s: %s honours it "
+			       "without root\n", o->file, shown, choice.engine->caps->engine_name,
+			       choice.class_name, field, rootless);
+			r.rejected++;
+			plan.root_count = 0u;
+		}
 	}
 	if (r.rejected != 0u)
 		printf("%s: %s on %s (%s): rejected, %u field%s\n", o->file, shown,
@@ -1664,6 +1694,17 @@ static int prepare_run(options *o, const hull_registry *registry, hull_spec *spe
 	                          registry->host_arch, o->tokens, print_resolution, &r);
 	if (planned == HULL_PLAN_REJECTED && root_changed(&r))
 		return 77;
+	if (planned == HULL_PLAN_OK) {
+		const char *field = NULL;
+		const char *rootless = rootless_honours(registry, &plan, &field);
+
+		if (rootless != NULL) {
+			fprintf(stderr, "%s: %s on %s (%s): not run: root mode is not offered for %s: %s "
+			        "honours it without root\n", o->file, shown,
+			        choice.engine->caps->engine_name, choice.class_name, field, rootless);
+			return 125;
+		}
+	}
 	if (planned != HULL_PLAN_OK) {
 		fprintf(stderr, "%s: %s on %s (%s): not run: %s\n", o->file, shown,
 		        choice.engine->caps->engine_name, choice.class_name,

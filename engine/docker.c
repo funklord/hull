@@ -3804,7 +3804,8 @@ static const hull_cap_entry entries[] = {
 	{ "owners",             HULL_SUP_EMULATED,
 	  "given in the dir's import, its tar carrying each listed owner", NULL },
 	{ "init",               HULL_SUP_REJECTED,
-	  "the workload runs as the user, and an image's init wants root as PID 1", NULL },
+	  "the workload runs as the user, and an image's init wants root as PID 1, which root "
+	  "mode does not offer, chroot and the vm giving it without root", NULL },
 	{ "segments",           HULL_SUP_REJECTED,
 	  "a container's NIC is the daemon's, never on the core's switch", NULL },
 	{ "impair",             HULL_SUP_REJECTED,

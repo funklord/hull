@@ -206,3 +206,17 @@ hull_registry_status hull_registry_choose(const hull_registry *registry,
 		choice->class_name = "emu";
 	return HULL_REGISTRY_OK;
 }
+
+const hull_engine *hull_registry_rootless(const hull_registry *registry, const char *field)
+{
+	for (uint32_t i = 0u; i < registry->count; i++) {
+		const hull_capabilities *caps = registry->engines[i]->caps;
+
+		if (caps->requires_root)
+			continue;
+		for (const hull_cap_entry *e = caps->entries; e->field != NULL; e++)
+			if (strcmp(e->field, field) == 0 && e->support != HULL_SUP_REJECTED)
+				return registry->engines[i];
+	}
+	return NULL;
+}
