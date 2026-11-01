@@ -190,6 +190,11 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
 # What test/root_test.sh writes.
 ROOT_TEST_FILES = $(addprefix $(BUILD_DIR)/test/root/, root.conf root.log cap.conf changed.conf)
 ROOTVM_TEST_FILES = $(BUILD_DIR)/test/rootvm/vm.conf
+# What check-fuzz writes, but for what it finds, in $(FUZZ_DIR)/found,
+# which is kept: a crash's input is what reproduces it.
+FUZZ_FILES = $(addprefix $(BUILD_DIR)/fuzz/, json_fuzz unpack_fuzz corpus/json/manifest \
+             corpus/json/array corpus/tar/plain corpus/tar/whiteout corpus/tar/long \
+             corpus/tar/gnu corpus/tar/escape)
 
 # What test/docker_test.sh writes.
 DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf volro.conf \
@@ -274,7 +279,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all nss root install-root check check-docker check-qemu check-root check-sanitize sanitize-run check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all nss root install-root check check-docker check-qemu check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -295,6 +300,7 @@ help:
 	@echo '  check-qemu    hull run on the qemu engine, as the user, with KVM'
 	@echo '  check-root    root mode'"'"'s native grants, hull-root setuid, inside a vm'
 	@echo '  check-sanitize  the unit tests, store and pull under ASan and UBSan'
+	@echo '  check-fuzz    libFuzzer over the JSON and layer readers, FUZZ_TIME s each'
 	@echo '  check-flip    one hull.conf, rsync'"'"'d, run on chroot, vm, emu and docker'
 	@echo '  test      build and run the reader tests, the vectors, then the gate'"'"'s'
 	@echo '  vectors   the described schemas against bytes they must accept and refuse'
@@ -626,6 +632,35 @@ sanitize-run: $(filter-out $(BUILD_DIR)/test/tree_tar,$(TEST_BINS)) $(HULL)
 	ASAN_OPTIONS=detect_leaks=0 BUILD_DIR='$(BUILD_DIR)' sh test/pull_test.sh '$(HULL)' \
 		'$(SANITIZE_PROBE)' '$(SITU_MARK)'
 
+# The readers of what a registry sends -- oci/json.c, and store/unpack.c,
+# which applies a layer -- under libFuzzer with ASan and UBSan, from
+# corpora test/fuzz/seeds.py writes, each for FUZZ_TIME seconds; a crash,
+# a leak, or a path made outside the unpacked tree stops it. Needs clang
+# with libFuzzer, which the build does not, so it is a target of its own.
+# First run 2026-11-01: seven million JSON inputs clean, and a header the
+# layer cut short leaking its buffer in the unpacker, fixed.
+FUZZ_CC   ?= clang
+FUZZ_TIME ?= 60
+FUZZ_FLAGS = -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined
+FUZZ_DIR   = $(BUILD_DIR)/fuzz
+$(FUZZ_DIR)/json_fuzz: test/fuzz/json_fuzz.c oci/json.c oci/json.h
+	@mkdir -p '$(@D)'
+	$(FUZZ_CC) $(FUZZ_FLAGS) -Ioci -o $@ $(filter %.c,$^)
+
+$(FUZZ_DIR)/unpack_fuzz: test/fuzz/unpack_fuzz.c store/unpack.c $(wildcard store/*.h) \
+                         $(BUILD_DIR)/store/store.o $(BUILD_DIR)/engine/sha256.o \
+                         $(BUILD_DIR)/engine/tree.o $(SEXPR_OBJS)
+	@mkdir -p '$(@D)'
+	$(FUZZ_CC) $(FUZZ_FLAGS) $(CPPFLAGS) -o $@ $(filter %.c %.o,$^) -lz
+
+check-fuzz: $(FUZZ_DIR)/json_fuzz $(FUZZ_DIR)/unpack_fuzz
+	$(PYTHON) test/fuzz/seeds.py '$(FUZZ_DIR)/corpus'
+	mkdir -p '$(FUZZ_DIR)/work' '$(FUZZ_DIR)/found'
+	cd '$(FUZZ_DIR)/found' && ../json_fuzz -max_total_time=$(FUZZ_TIME) -max_len=4096 \
+		../corpus/json
+	cd '$(FUZZ_DIR)/found' && FUZZ_DIR='$(abspath $(FUZZ_DIR))' ../unpack_fuzz \
+		-max_total_time=$(FUZZ_TIME) -max_len=8192 -timeout=10 ../corpus/tar
+
 # Root mode's native grants with hull-root really setuid root, inside a vm
 # whose guest root is the only root it needs (project.md section 7). Not
 # in `check`, needing KVM as check-qemu does.
@@ -679,7 +714,7 @@ clean:
 	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) $(DISC_GEN) $(FRAME_GEN) \
 	        $(AGENT_BIN) $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(BUILD_DIR)/test/arm64/rootfs/probe \
-	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) \
+	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) $(FUZZ_FILES) \
 	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor
 	@# check-sanitize's own build, cleaned as this one is, by name; one level
 	@# down only, there being no sanitize/sanitize to go on to.

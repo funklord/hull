@@ -522,10 +522,11 @@ static int next_entry(gzFile gz, entry *e, char *why, size_t cap)
 		}
 		type = (char)block[156];
 		if (type == 'x' || type == 'g' || type == 'L' || type == 'K') {
-			uint8_t *data;
+			uint8_t *data = NULL;
 
 			if ((unsigned long long)size > MAX_PAX || (data = malloc((size_t)size + 1u)) == NULL ||
 			    read_exact(gz, data, (size_t)size) != 0 || skip(gz, padding((unsigned long long)size)) != 0) {
+				free(data);   /* had for a header the layer cut short */
 				free(long_name);
 				free(long_link);
 				return say(why, cap, "a layer's extended header could not be read", NULL);
