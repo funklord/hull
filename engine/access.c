@@ -296,6 +296,31 @@ const char *hull_access_stack(const hull_sexpr_doc *doc, const hull_sexpr_form *
 	return NULL;
 }
 
+int hull_access_root(const hull_sexpr_doc *doc, const char *field, char *hash, size_t cap)
+{
+	hull_sexpr_form top;
+	hull_sexpr_form root;
+	hull_sexpr_form fields;
+	hull_sexpr_form item;
+
+	if (!hull_sexpr_first(doc, &top) || !hull_access_find(doc, &top, "root", &root) ||
+	    !hull_access_find(doc, &root, "fields", &fields))
+		return 0;
+	hull_sexpr_child(doc, &fields, &item);
+	for (int more = hull_sexpr_next(doc, &item, &item); more;
+	     more = hull_sexpr_next(doc, &item, &item))
+		if (hull_sexpr_is(doc, &item, field)) {
+			if (hash != NULL) {
+				char *given = hull_access_value(doc, &root, "hash");
+
+				snprintf(hash, cap, "%s", given != NULL ? given : "");
+				free(given);
+			}
+			return 1;
+		}
+	return 0;
+}
+
 void hull_access_segment_mac(const char *address, const char *segment, unsigned index,
                              unsigned char mac[6])
 {

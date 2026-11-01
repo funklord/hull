@@ -135,7 +135,8 @@ static void resolve(resolver *r, const char *id, uint32_t offset)
 			                          r->class_name, hex) == 0)
 				snprintf(r->root_token, sizeof r->root_token, "root:%s", hex);
 		}
-		emit(r, id, r->root_token[0] != '\0' && listed_text(r->accepted, r->root_token) ?
+		emit(r, id, r->root_token[0] != '\0' && (listed_text(r->accepted, r->root_token) ||
+		                                         listed_text(r->accepted, HULL_MATRIX_ROOT_SELF)) ?
 		     HULL_OUTCOME_ACCEPTED : HULL_OUTCOME_REJECTED, entry->note,
 		     r->root_token[0] != '\0' ? r->root_token : NULL, offset);
 		return;

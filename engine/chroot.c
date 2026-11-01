@@ -69,6 +69,7 @@
 
 #include "access.h"
 #include "hostnet.h"
+#include "rootmode.h"
 #include "tree.h"
 #include "builtin.h"
 #include "usage.h"
@@ -150,6 +151,7 @@ struct hull_machine {
 	char             bridge_name[16];
 	char             bridge_address[16];  /* its address on HULL_BRIDGE, or "" */
 	int              bridge_relay;  /* asking hull0's DNS relay, the host's resolvers loopback */
+	char             bridge_root[72];  /* root mode's hash, hull-root putting it on the bridge */
 	unsigned         cpus;       /* (cpus N): N CPUs' time a second, by its scope, or 0 */
 	unsigned long long memory;   /* (memory SIZE): its scope's ceiling in bytes, or 0 */
 	hull_device      device[HULL_MAX_DEVICES];  /* (devices ...), found on the host at start */
@@ -492,15 +494,18 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	m->bridge     = source != NULL && strcmp(source, "bridge") == 0;
 	free(source);
 	/* (network bridge): a veth on a host bridge, which only root may put
-	 * there, so only a core run as root takes it; hull's own bridge, or
-	 * the one (bridge NAME) names, which must be there already. */
+	 * there: a core run as root does it itself, and root mode has
+	 * hull-root do it for a core run as the user (section 7); hull's own
+	 * bridge, or the one (bridge NAME) names, which must be there already. */
 	if (m->bridge) {
 		char *name = hull_access_value(doc, &machine, "bridge");
 
-		if (getuid() != 0) {
+		if (getuid() != 0 &&
+		    !hull_access_root(doc, "network.bridge", m->bridge_root, sizeof m->bridge_root)) {
 			free(name);
-			return "(network bridge) needs hull's core to run as root: (network nat) gives a "
-			       "network of the machine's own without it";
+			return "(network bridge) needs root: hull's core run as root, or root mode "
+			       "(--accept root:HASH, hull plan --root-hash); (network nat) gives a network "
+			       "of the machine's own without it";
 		}
 		m->bridge_own = name == NULL;
 		snprintf(m->bridge_name, sizeof m->bridge_name, "%s", name != NULL ? name : HULL_BRIDGE);
@@ -577,6 +582,12 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		    (m->resolver = strdup("nameserver " BRIDGE_GATEWAY "\n")) == NULL)
 			return "out of memory";
 		m->bridge_relay = 1;
+		/* The relay is the core's, on port 53, which a core run as the
+		 * user cannot bind and root mode does not bind for it yet. */
+		if (m->bridge_root[0] != '\0')
+			return "(network bridge) in root mode on a host whose resolvers are all its "
+			       "loopback: hull0's DNS relay needs port 53, which root mode does not bind "
+			       "yet; give the host a resolver off its loopback, or run hull's core as root";
 	}
 
 	/* (segments ...): a NIC on each in the machine's own network namespace,
@@ -2495,6 +2506,14 @@ static const char *start_bridge(const hull_machine *m, char *why, size_t cap)
 	char        near[16];
 	char        pid_text[24];
 
+	/* Root mode's: hull-root does root's part, from the plan it checks. */
+	if (m->bridge_root[0] != '\0') {
+		const char *args[] = { "bridge", m->bridge_root, pid_text, NULL };
+
+		snprintf(pid_text, sizeof pid_text, "%ld", (long)m->pid);
+		return hull_root_call(args, (const uint8_t *)m->plan, m->plan_length, why, cap) != 0 ?
+		       why : NULL;
+	}
 	if (m->bridge_own && hull_hostnet_bridge(why, cap) != NULL)
 		return why;
 	if (m->bridge_relay && hull_hostnet_relay(why, cap) != NULL)
@@ -2860,7 +2879,9 @@ static hull_status chroot_create(hull_core *core, hull_buf plan, hull_machine **
 	pthread_mutex_init(&m->lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
 	reason = read_plan(m, &doc);
-	if (reason == NULL && m->keep) {
+	/* Kept for a machine kept, which persists it, and for one hull-root
+	 * puts on a bridge, which checks it (section 7). */
+	if (reason == NULL && (m->keep || m->bridge_root[0] != '\0')) {
 		m->plan_length = plan.len;
 		if ((m->plan = malloc(plan.len)) == NULL)
 			reason = "out of memory";
@@ -4108,10 +4129,10 @@ static const hull_cap_entry entries[] = {
 	{ "network.host",           HULL_SUP_NATIVE,
 	  "the host's own network, asked for: no key is a network of the machine's own, pasta's "
 	  "NAT out", NULL },
-	{ "network.bridge",         HULL_SUP_NATIVE,
+	{ "network.bridge",         HULL_SUP_REJECTED,
 	  "a veth on hull's own bridge, hull0, NATed out, its ports forwarded by pasta from its "
-	  "127.107 address, or on the host bridge (bridge NAME) names; only with hull's core run "
-	  "as root, refused at create otherwise", NULL },
+	  "127.107 address, or on the host bridge (bridge NAME) names: root's to put there, hull "
+	  "run as root, or root mode's hull-root", "root" },
 	{ "bridge",                 HULL_SUP_NATIVE,
 	  "the host bridge (network bridge) joins, there already; the machine addresses itself",
 	  NULL },

@@ -56,6 +56,13 @@ char *hull_access_path(const hull_sexpr_doc *doc, const char *path);
 const char *hull_access_stack(const hull_sexpr_doc *doc, const hull_sexpr_form *volume,
                               int readonly, hull_stack *stack);
 
+/* Whether root mode granted `field` the machine whose plan is `doc`: the
+ * plan's (root (fields ...)), written by the planner only where `--accept
+ * root:HASH` named the machine's own hash, and run by the core only where
+ * hull-root granted it (project.md section 7). Its hash into `hash`, where
+ * `hash` is not NULL. */
+int hull_access_root(const hull_sexpr_doc *doc, const char *field, char *hash, size_t cap);
+
 /* The MAC of a machine's NIC on segment `segment`, its `index`th: qemu's
  * prefix, 52:54:00, then three bytes of FNV-1a over the machine's
  * `address`, the segment and the index, so that two machines, or two NICs

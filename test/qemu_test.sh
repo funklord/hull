@@ -529,7 +529,7 @@ printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) (network
 	> "$root/vbridged.conf"
 cases=$((cases + 1))
 out=$(cd / && timeout 60 "$hull" run -f "$root/vbridged.conf" 2>&1)
-printf '%s\n' "$out" | grep -q '(network bridge) needs hull.s core to run as root' ||
+printf '%s\n' "$out" | grep -q 'network.bridge: rejected: .*root mode.s not yet for a vm (hull run as root honours it)' ||
 	fail "a vm on a bridge was not refused to a core not run as root" "$out"
 vcdb_at=$(python3 -c '
 import sys

@@ -257,8 +257,10 @@ where nothing else is available, since it needs only user namespaces.
   are stored on disk.
 - `cpus` and `memory` are refused, not run unlimited, where the user's
   systemd manager gives no scope; a host without systemd has none yet.
-- `(network bridge)` needs a core run as root, and `(segments …)` cannot
-  go with `(network host)`, a NIC needing a namespace of the user's own.
+- `(network bridge)` needs root: a core run as root, or root mode, where
+  the host's owner lists the plan and hull-root puts the machine's NIC
+  on the bridge. `(segments …)` cannot go with `(network host)`, a NIC
+  needing a namespace of the user's own.
 - A machine whose root is the host's own `/` cannot nest a user
   namespace; any other root can.
 

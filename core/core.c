@@ -36,7 +36,6 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
-#include <spawn.h>
 #include <stdio.h>
 #include <ctype.h>
 #include <stdlib.h>
@@ -57,6 +56,7 @@
 #include "builtin.h"
 #include "core.h"
 #include "registry.h"
+#include "rootmode.h"
 #include "segment.h"
 #include "wire.h"
 
@@ -2096,72 +2096,25 @@ static void address_of(const char *id, char out[16])
 		address_at(address_slot(id), out);
 }
 
-/*
- * hull-root `op` for a machine of root mode: `start` with the plan's
- * hash and its fields, which it grants only where the host's listing
- * does, or `exec` or `stop`, which it records; every call written to the
- * host's audit log before anything is done. 0, or -1 with what it said in
- * `why`, at most `cap` bytes.
- */
+/* hull-root `op` for a machine of root mode: `start` with the plan's hash
+ * and its fields, which it grants only where the host's listing does, or
+ * `exec` or `stop`, which it records; every call written to the host's
+ * audit log before anything is done. 0, or -1 with what it said in `why`. */
 static int root_helper(const char *op, const char *hash, char *const *fields, unsigned count,
                        char *why, size_t cap)
 {
-	const char *path = getenv("HULL_ROOT_HELPER") != NULL ? getenv("HULL_ROOT_HELPER") :
-	                   HULL_ROOT_HELPER_PATH;
-	char       *argv[40];
+	const char *args[40];
 	unsigned    n = 0u;
-	int         said[2];
-	pid_t       pid;
-	int         status = 0;
-	size_t      got = 0u;
-	ssize_t     r;
-	posix_spawn_file_actions_t actions;
 
-	argv[n++] = (char *)"hull-root";
-	argv[n++] = (char *)op;
-	argv[n++] = (char *)hash;
-	for (unsigned i = 0u; i < count && n < 39u; i++)
-		argv[n++] = fields[i];
-	argv[n] = NULL;
-	why[0] = '\0';
-	if (access(path, X_OK) != 0) {
-		snprintf(why, cap, "root mode is not installed on this host: no %s (make install-root, "
-		         "as root)", path);
-		return -1;
-	}
-	if (pipe2(said, O_CLOEXEC) != 0) {
-		snprintf(why, cap, "hull-root: %s", strerror(errno));
-		return -1;
-	}
-	posix_spawn_file_actions_init(&actions);
-	posix_spawn_file_actions_adddup2(&actions, said[1], 2);
-	posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0);
-	posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
-	/* The core's environment, which a setuid hull-root reads nothing of;
-	 * run as the user, as the suites run it, it reads its listing's and
-	 * log's paths there. */
-	if (posix_spawn(&pid, path, &actions, NULL, argv, environ) != 0) {
-		posix_spawn_file_actions_destroy(&actions);
-		close(said[0]);
-		close(said[1]);
-		snprintf(why, cap, "hull-root could not be run: %s", strerror(errno));
-		return -1;
-	}
-	posix_spawn_file_actions_destroy(&actions);
-	close(said[1]);
-	while (got + 1u < cap && (r = read(said[0], why + got, cap - 1u - got)) > 0)
-		got += (size_t)r;
-	why[got] = '\0';
-	while (got > 0u && why[got - 1u] == '\n')
-		why[--got] = '\0';
-	close(said[0]);
-	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
-		;
-	if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+	/* A core run as root is root already, and asks no helper. */
+	if (geteuid() == 0)
 		return 0;
-	if (why[0] == '\0')
-		snprintf(why, cap, "hull-root refused, saying nothing");
-	return -1;
+	args[n++] = op;
+	args[n++] = hash;
+	for (unsigned i = 0u; i < count && n < 39u; i++)
+		args[n++] = fields[i];
+	args[n] = NULL;
+	return hull_root_call(args, NULL, 0u, why, cap);
 }
 
 /* The plan's (root (fields F ...) (hash H)), into `hash` and `fields`,

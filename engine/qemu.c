@@ -654,9 +654,16 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	if (m->bridge) {
 		char *name = hull_access_value(doc, &machine, "bridge");
 
+		/* Root mode puts a chroot machine's veth there (section 7); a vm's
+		 * tap is persistent, so its removal is root's too, which root mode
+		 * does not do yet. */
 		if (getuid() != 0) {
 			free(name);
-			return "(network bridge) needs hull's core to run as root: (network nat) gives a "
+			return hull_access_root(doc, "network.bridge", NULL, 0u) ?
+			       "(network bridge) for a vm in root mode is not built yet: its tap would "
+			       "outlive the run, and root mode does not remove it; hull's core run as root "
+			       "does, and root mode puts a chroot machine on a bridge" :
+			       "(network bridge) needs hull's core to run as root: (network nat) gives a "
 			       "network of the machine's own without it";
 		}
 		m->bridge_own = name == NULL;
@@ -3749,9 +3756,10 @@ static const hull_cap_entry entries[] = {
 	{ "devices.node",       HULL_SUP_REJECTED,
 	  "a host's device node has no device of a guest's to be: (usb ...), (serial ...) or "
 	  "(parallel ...) gives one", NULL },
-	{ "network.bridge",     HULL_SUP_NATIVE,
+	{ "network.bridge",     HULL_SUP_REJECTED,
 	  "a tap on hull's own bridge, hull0, NATed out, or on the host bridge (bridge NAME) "
-	  "names; only with hull's core run as root, refused at create otherwise", NULL },
+	  "names: root's to put there, hull run as root; root mode's not yet for a vm",
+	  "root:self" },
 	{ "bridge",             HULL_SUP_NATIVE,
 	  "the host bridge (network bridge) joins, there already; the guest addresses itself",
 	  NULL },

@@ -872,26 +872,10 @@ failed:
 
 /* --- the plan, as a container -------------------------------------------- */
 
-/* Whether root mode granted `field` this machine: the plan's (root (fields
- * ...)), which the planner writes only where `--accept root:HASH` named
- * this machine's hash, and the core runs only where hull-root granted it
- * (section 7). */
+/* Whether root mode granted `field` this machine (section 7). */
 static int root_granted(const hull_sexpr_doc *doc, const char *field)
 {
-	hull_sexpr_form top;
-	hull_sexpr_form root;
-	hull_sexpr_form fields;
-	hull_sexpr_form item;
-
-	if (!hull_sexpr_first(doc, &top) || !hull_access_find(doc, &top, "root", &root) ||
-	    !hull_access_find(doc, &root, "fields", &fields))
-		return 0;
-	hull_sexpr_child(doc, &fields, &item);
-	for (int more = hull_sexpr_next(doc, &item, &item); more;
-	     more = hull_sexpr_next(doc, &item, &item))
-		if (hull_sexpr_is(doc, &item, field))
-			return 1;
-	return 0;
+	return hull_access_root(doc, field, NULL, 0u);
 }
 
 /* Whether `source` is a bare image ref: none of J.1's schemes. */

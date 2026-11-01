@@ -3137,7 +3137,9 @@ fi
 # naming none refused; and ports on a named bridge refused, the machine's
 # address there being its own.
 conf bridged '(mutable overlay) (network bridge) (command "/probe" "say" "never")'
-from_root 125 '\(network bridge\) needs hull.s core to run as root: \(network nat\)' -f "$root/bridged.conf"
+# As the user, root's to give: root mode's token named at plan time
+# (section 7), hull run as root taking it for itself, as below.
+from_root 125 'network\.bridge: rejected: .*root mode.s hull-root \(--accept root:sha256:[0-9a-f]{64} honours it\)' -f "$root/bridged.conf"
 bridge_at() { # ID: the address hull's bridge gives it, from its 127.107 one
 	python3 -c '
 import sys
@@ -3306,7 +3308,7 @@ printf '%s\n' "$bridge_out" | grep -A1 '^== sshd$' | grep -q '^SSH-2\.0-hull-stu
 	fail "an sshd on hull0 was not reached at the machine's 127.107 address" "$bridge_out"
 conf brdocker '(mutable overlay) (network bridge) (bridge "mynet") (command "/probe")'
 expect 0 'machine on docker \(ns\): ok' "$hull" plan -f "$root/brdocker.conf" --backend docker
-expect 0 'machine on qemu \(vm\): ok' "$hull" plan -f "$root/brdocker.conf" --backend vm
+expect 1 'network\.bridge: rejected: .*root mode.s not yet for a vm \(hull run as root honours it\)' "$hull" plan -f "$root/brdocker.conf" --backend vm
 kill "$host_listener" 2>/dev/null
 wait "$host_listener" 2>/dev/null
 printf '(machine (source "dir:./rootfs") (backend vm) (network host) (command "/probe"))\n' \

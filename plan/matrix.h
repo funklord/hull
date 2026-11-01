@@ -73,6 +73,12 @@ int hull_matrix_root_hash(const hull_spec *spec, const hull_sexpr_form *machine,
  * the machine's hash, as `--accept root:sha256:HEX` gives it. */
 #define HULL_MATRIX_ROOT "root"
 
+/* What hull run as root accepts for itself: root is root already, so a
+ * field root mode would honour is honoured, and the core, being root,
+ * asks no helper. Given by anyone else it grants nothing, hull-root's
+ * listing deciding as ever. */
+#define HULL_MATRIX_ROOT_SELF "root:self"
+
 hull_matrix_status hull_matrix_resolve(const hull_spec *spec, const hull_sexpr_form *machine,
                                        const hull_capabilities *caps, const char *class_name,
                                        const char *host_arch, const char *const *accepted,

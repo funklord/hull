@@ -202,7 +202,10 @@ static void print_resolution(void *context, const hull_resolution *resolution)
 	        resolution->id, outcome_name(resolution->outcome));
 	if (resolution->note != NULL)
 		fprintf(r->options->stream, ": %s", resolution->note);
-	if (resolution->outcome == HULL_OUTCOME_REJECTED && resolution->token != NULL)
+	if (resolution->outcome == HULL_OUTCOME_REJECTED && resolution->token != NULL &&
+	    strcmp(resolution->token, HULL_MATRIX_ROOT_SELF) == 0)
+		fprintf(r->options->stream, " (hull run as root honours it)");
+	else if (resolution->outcome == HULL_OUTCOME_REJECTED && resolution->token != NULL)
 		fprintf(r->options->stream, " (--accept %s honours it)", resolution->token);
 	fprintf(r->options->stream, "\n");
 }
@@ -5434,6 +5437,10 @@ int main(int argc, char **argv)
 			return 2;
 		}
 	}
+	/* Run as root, hull is root already: what root mode would honour is
+	 * honoured without a listing (section 7). */
+	if (geteuid() == 0 && o.token_count < MAX_TOKENS)
+		o.tokens[o.token_count++] = HULL_MATRIX_ROOT_SELF;
 	if (strcmp(command, "check") != 0 && o.backend_count > 1u) {
 		fprintf(stderr, "hull: %s takes one backend; check takes several\n", command);
 		return strcmp(command, "run") == 0 ? 125 : 2;

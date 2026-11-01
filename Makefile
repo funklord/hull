@@ -102,7 +102,7 @@ ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/usage.o $(BUILD_DIR)/engine/sha256.o \
               $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/ip6.o $(BUILD_DIR)/engine/idmap.o \
               $(BUILD_DIR)/engine/tree.o $(BUILD_DIR)/engine/hostnet.o \
-              $(BUILD_DIR)/engine/hostdev.o
+              $(BUILD_DIR)/engine/hostdev.o $(BUILD_DIR)/engine/rootmode.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o $(BUILD_DIR)/cli/runtime.o $(BUILD_DIR)/cli/doctor.o \
               $(BUILD_DIR)/cli/import.o
 # Section 3's optional store, which only the commands that name it use.
@@ -189,6 +189,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
 
 # What test/root_test.sh writes.
 ROOT_TEST_FILES = $(addprefix $(BUILD_DIR)/test/root/, root.conf root.log cap.conf changed.conf)
+ROOTVM_TEST_FILES = $(BUILD_DIR)/test/rootvm/vm.conf
 
 # What test/docker_test.sh writes.
 DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf volro.conf \
@@ -273,7 +274,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all nss root install-root check check-docker check-qemu check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all nss root install-root check check-docker check-qemu check-root check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -292,6 +293,7 @@ help:
 	@echo '  check     style, the situ contracts, then the tests'
 	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
 	@echo '  check-qemu    hull run on the qemu engine, as the user, with KVM'
+	@echo '  check-root    root mode'"'"'s native grants, hull-root setuid, inside a vm'
 	@echo '  check-flip    one hull.conf, rsync'"'"'d, run on chroot, vm, emu and docker'
 	@echo '  test      build and run the reader tests, the vectors, then the gate'"'"'s'
 	@echo '  vectors   the described schemas against bytes they must accept and refuse'
@@ -428,11 +430,12 @@ $(NSS_LIB): nss/nss_hull.c
 install-nss: $(NSS_LIB)
 	install -D -m 0644 $(NSS_LIB) '$(DESTDIR)$(NSS_LIBDIR)/libnss_hull.so.2'
 
-# One file, its own, linked with nothing of hull's: the less a setuid
-# program holds, the less there is to trust.
-$(ROOT_BIN): root/hull_root.c
+# Its own file, with only hull's sha256, to work out a plan's hash itself,
+# and hostnet.c, the root core's own way onto a host bridge: the less a
+# setuid program holds, the less there is to trust.
+$(ROOT_BIN): root/hull_root.c engine/sha256.c engine/hostnet.c engine/sha256.h engine/hostnet.h
 	@mkdir -p '$(@D)'
-	$(CC) $(CFLAGS) $(WARNINGS) -o $@ $(filter %.c,$^)
+	$(CC) -Iengine $(CFLAGS) $(WARNINGS) -pthread -o $@ $(filter %.c,$^)
 
 # Root mode (project.md section 7), run as root: the helper setuid, and the
 # directories of its listing and its log, root's alone, which it refuses to
@@ -591,6 +594,12 @@ check-flip: $(HULL) $(AGENT_BIN) $(PROBE) $(BUILD_DIR)/test/tree_tar
 check-qemu: $(HULL) $(AGENT_BIN) $(PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/qemu_test.sh '$(HULL)' '$(PROBE)'
 
+# Root mode's native grants with hull-root really setuid root, inside a vm
+# whose guest root is the only root it needs (project.md section 7). Not
+# in `check`, needing KVM as check-qemu does.
+check-root: $(HULL) $(AGENT_BIN) $(PROBE) $(ROOT_BIN)
+	BUILD_DIR='$(BUILD_DIR)' sh test/rootvm_test.sh '$(HULL)' '$(ROOT_BIN)' '$(PROBE)'
+
 # The indentation and whitespace gate, shared verbatim with the sibling
 # projects; `docs` additionally holds project.md to the tree it describes.
 style: style-source style-docs
@@ -638,5 +647,5 @@ clean:
 	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) $(DISC_GEN) $(FRAME_GEN) \
 	        $(AGENT_BIN) $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(BUILD_DIR)/test/arm64/rootfs/probe \
-	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) \
+	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) \
 	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor
