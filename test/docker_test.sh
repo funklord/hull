@@ -3,7 +3,8 @@
 # Docker daemon this account can reach. Not part of `make check`, which
 # needs no daemon: `make check-docker` runs it.
 #
-# Its arguments are build/hull, the static probe and build/test/tree_tar.
+# Its arguments are build/hull, the static probe, build/test/tree_tar and
+# build/hull-root.
 # Uses alpine:latest, which must be present already: nothing is pulled.
 # A dir source is imported as hull-dir:<digest>, and the test removes the
 # images it made by those names, which it works out itself.
@@ -17,6 +18,7 @@ set -u
 hull=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 probe=$2
 tree_tar=$3
+root_helper=$(cd "$(dirname "$4")" && pwd)/$(basename "$4")
 dir=${BUILD_DIR:?}/test/docker
 # A core of the test's own, as in cli_test.sh.
 XDG_RUNTIME_DIR=$(cd "${BUILD_DIR:?}" && pwd)/test/run
@@ -32,6 +34,15 @@ root=$(cd "$dir" && pwd)
 # ended its 20-second wait.
 XDG_DATA_HOME=$root/data
 export XDG_DATA_HOME
+# Root mode's helper, run as the user against a listing and a log of the
+# suite's own (section 7); the core takes them from its environment when
+# it starts, so they are set before anything starts it.
+HULL_ROOT_HELPER=$root_helper
+HULL_ROOT_CONF=$root/root.conf
+HULL_ROOT_LOG=$root/root.log
+export HULL_ROOT_HELPER HULL_ROOT_CONF HULL_ROOT_LOG
+: > "$root/root.conf"
+: > "$root/root.log"
 cases=0
 failures=0
 
@@ -338,6 +349,53 @@ conf nocap '(command "sh" "-c" "touch /tmp/f && chown 1 /tmp/f && echo chown=ok 
 expect 0 '^chown=refused$' nocap
 conf cap '(command "true")' '(security (allow chown))'
 expect 125 'security\.allow: rejected: docker grants capabilities only to root' cap
+# Root mode (section 7): the same grant accepted for this machine's hash
+# is refused until the host's listing names it, then run as the
+# container's root with that capability and no other, each start in the
+# log with its verdict. A root machine is ROOT in hull ps, an exec into it
+# and its stop are logged too, and one kept past its run is refused
+# before anything is granted.
+conf rootcap '(security (allow chown))' '(command "sh" "-c" "id -u; grep CapEff /proc/self/status; touch /tmp/f && chown 1 /tmp/f && echo chown=ok")'
+token=$(cd / && timeout 10 "$hull" plan --root-hash -f "$root/rootcap.conf" 2> /dev/null | sed -n 's/.*: --accept //p')
+expect 125 'hull-root: [a-z0-9._-]+ may not start sha256:' rootcap --accept "$token"
+printf '%s %s security.allow\n' "$(id -un)" "${token#root:}" > "$root/root.conf"
+expect 0 '^chown=ok$' rootcap --accept "$token"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -qx '0' && printf '%s\n' "$out" | grep -q '^CapEff:.0000000000000001$' &&
+	[ "$(grep -c " start ${token#root:} refused security.allow\$" "$root/root.log")" = 1 ] &&
+	[ "$(grep -c " start ${token#root:} granted security.allow\$" "$root/root.log")" = 1 ] ||
+	fail "a root machine was not granted as listed, its root's with chown alone, and logged" \
+		"$out
+$(cat "$root/root.log")"
+printf '(machine (source "alpine:latest") (backend docker) (hostname "dtest-root") %s)\n' \
+	'(security (allow chown)) (command "sleep" "30")' > "$root/rootheld.conf"
+held=$(cd / && timeout 10 "$hull" plan --root-hash -f "$root/rootheld.conf" 2> /dev/null | sed -n 's/.*: --accept //p')
+printf '%s %s security.allow\n' "$(id -un)" "${held#root:}" >> "$root/root.conf"
+(cd / && exec timeout -k 2 60 "$hull" run --accept "$held" -f "$root/rootheld.conf" > /dev/null 2>&1) &
+holder=$!
+tries=0
+until timeout 10 "$hull" ps 2> /dev/null | grep -q '^dtest-root .*running ROOT$' || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+expect_ps=$(timeout 10 "$hull" ps 2>&1)
+timeout 10 "$hull" exec dtest-root true > /dev/null 2>&1
+timeout 30 "$hull" stop dtest-root > /dev/null 2>&1
+wait "$holder"
+cases=$((cases + 1))
+printf '%s\n' "$expect_ps" | grep -q '^dtest-root .*running ROOT$' &&
+	grep -q " exec ${held#root:} granted\$" "$root/root.log" &&
+	grep -q " stop ${held#root:} granted\$" "$root/root.log" ||
+	fail "a root machine was not ROOT in ps, or its exec and stop not logged" \
+		"$expect_ps
+$(cat "$root/root.log")"
+conf rootkept '(on_disconnect keep) (security (allow chown))' '(command "true")'
+kept=$(cd / && timeout 10 "$hull" plan --root-hash -f "$root/rootkept.conf" 2> /dev/null | sed -n 's/.*: --accept //p')
+printf '%s %s security.allow\n' "$(id -un)" "${kept#root:}" >> "$root/root.conf"
+expect 125 'a root machine is not kept past its run' rootkept --accept "$kept"
+cases=$((cases + 1))
+! grep -q "${kept#root:}" "$root/root.log" ||
+	fail "a kept root machine was granted before it was refused" "$(cat "$root/root.log")"
 
 # A signal is 128 and its number, from the workload or sent to hull. With
 # an init at PID 1, a SIGTERM to hull stops the machine well inside the

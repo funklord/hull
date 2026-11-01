@@ -32,6 +32,7 @@
 #include <libgen.h>
 #include <linux/openat2.h>
 #include <poll.h>
+#include <pwd.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -79,6 +80,7 @@ typedef struct options {
 	unsigned    token_count;
 	int         explain;
 	int         resolved;
+	int         root_hash;  /* plan --root-hash: each machine's, to accept */
 	FILE       *stream;  /* where reports go: stdout, or stderr under run */
 	char       *base;    /* the file's directory, absolute */
 } options;
@@ -90,12 +92,15 @@ typedef struct report {
 	const char           *machine;
 	const hull_choice    *choice;
 	unsigned              rejected;
+	unsigned              root_rejected;    /* fields only root mode would honour */
+	char                  root_token[80];   /* this machine's root:sha256:HEX */
+	char                  root_fields[512]; /* those fields, each after a space */
 } report;
 
 static void usage(FILE *out)
 {
 	fputs("usage: hull plan [-f FILE] [--backend B] [--accept TOKEN]... [--explain]"
-	      " [--resolved]\n"
+	      " [--resolved] [--root-hash]\n"
 	      "       hull check [-f FILE] --backend B[,B...] [--accept TOKEN]...\n"
 	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [NAME]\n"
 	      "       hull build [-f FILE] [--check] REF\n"
@@ -181,6 +186,14 @@ static void print_resolution(void *context, const hull_resolution *resolution)
 
 	if (resolution->outcome == HULL_OUTCOME_REJECTED)
 		r->rejected++;
+	if (resolution->outcome == HULL_OUTCOME_REJECTED && resolution->token != NULL &&
+	    strncmp(resolution->token, "root:", 5u) == 0) {
+		size_t at = strlen(r->root_fields);
+
+		r->root_rejected++;
+		snprintf(r->root_token, sizeof r->root_token, "%s", resolution->token);
+		snprintf(r->root_fields + at, sizeof r->root_fields - at, " %s", resolution->id);
+	}
 	if (resolution->outcome == HULL_OUTCOME_NATIVE && !r->options->explain)
 		return;
 	hull_sexpr_locate(&r->spec->doc, resolution->offset, &line, &column);
@@ -192,6 +205,27 @@ static void print_resolution(void *context, const hull_resolution *resolution)
 	if (resolution->outcome == HULL_OUTCOME_REJECTED && resolution->token != NULL)
 		fprintf(r->options->stream, " (--accept %s honours it)", resolution->token);
 	fprintf(r->options->stream, "\n");
+}
+
+/* Whether a root acceptance was given and this machine's is not it: its
+ * plan changed since, or another's was given. Said loudly, with the hash
+ * to accept now and the line of the host's listing that would grant it,
+ * for status 77 (section 7). */
+static int root_changed(const report *r)
+{
+	const struct passwd *who = getpwuid(getuid());
+	int                  given = 0;
+
+	for (unsigned i = 0u; r->options->tokens[i] != NULL; i++)
+		given |= strncmp(r->options->tokens[i], "root:", 5u) == 0;
+	if (!given || r->root_rejected == 0u)
+		return 0;
+	fprintf(stderr, "%s: %s on %s (%s): root mode was accepted for another plan: this one is "
+	        "--accept %s, and /etc/hull/root.conf lists it as:\n%s %s%s\n", r->options->file,
+	        r->machine, r->choice->engine->caps->engine_name, r->choice->class_name,
+	        r->root_token, who != NULL ? who->pw_name : "USER", r->root_token + 5,
+	        r->root_fields);
+	return 1;
 }
 
 /* Read all of `path`, or say why not. */
@@ -790,11 +824,11 @@ static int resolve_one(const options *o, const hull_registry *registry, const hu
 		        backend != NULL ? backend : "its own backend", reason);
 		return 2;
 	}
+	memset(&r, 0, sizeof r);
 	r.options  = o;
 	r.spec     = spec;
 	r.machine  = shown;
 	r.choice   = &choice;
-	r.rejected = 0u;
 	planned = hull_plan_build(&plan, spec, machine, name, o->base, &choice,
 	                          registry->host_arch, o->tokens, print_resolution, &r);
 	if (planned != HULL_PLAN_OK && planned != HULL_PLAN_REJECTED) {
@@ -807,13 +841,27 @@ static int resolve_one(const options *o, const hull_registry *registry, const hu
 	}
 	if (o->resolved)
 		printf("%.*s", (int)plan.length, plan.text);
+	/* The hash a pipeline accepts, printed as the token it passes. */
+	if (o->root_hash) {
+		char hex[72];
+
+		if (hull_matrix_root_hash(&plan.resolved, &plan.resolved.machine,
+		                          choice.engine->caps->engine_name, choice.class_name, hex) != 0) {
+			fprintf(stderr, "hull: out of memory\n");
+			return 2;
+		}
+		printf("%s: %s on %s (%s): --accept root:%s\n", o->file, shown,
+		       choice.engine->caps->engine_name, choice.class_name, hex);
+	}
 	if (r.rejected != 0u)
 		printf("%s: %s on %s (%s): rejected, %u field%s\n", o->file, shown,
 		       choice.engine->caps->engine_name, choice.class_name, r.rejected,
 		       r.rejected == 1u ? "" : "s");
 	else
-		printf("%s: %s on %s (%s): ok\n", o->file, shown, choice.engine->caps->engine_name,
-		       choice.class_name);
+		printf("%s: %s on %s (%s): ok%s\n", o->file, shown, choice.engine->caps->engine_name,
+		       choice.class_name, plan.root_count != 0u ? ", ROOT" : "");
+	if (root_changed(&r))
+		return 77;
 	return r.rejected != 0u;
 }
 
@@ -1607,13 +1655,15 @@ static int prepare_run(options *o, const hull_registry *registry, hull_spec *spe
 		fprintf(stderr, "%s: %s: %s\n", o->file, shown, reason);
 		return 125;
 	}
+	memset(&r, 0, sizeof r);
 	r.options  = o;
 	r.spec     = spec;
 	r.machine  = shown;
 	r.choice   = &choice;
-	r.rejected = 0u;
 	planned = hull_plan_build(&plan, spec, machine, name, o->base, &choice,
 	                          registry->host_arch, o->tokens, print_resolution, &r);
+	if (planned == HULL_PLAN_REJECTED && root_changed(&r))
+		return 77;
 	if (planned != HULL_PLAN_OK) {
 		fprintf(stderr, "%s: %s on %s (%s): not run: %s\n", o->file, shown,
 		        choice.engine->caps->engine_name, choice.class_name,
@@ -3544,14 +3594,14 @@ static int list_machines(void)
 	hull_sexpr_child(&body, &message, &item);
 	for (more = hull_sexpr_next(&body, &item, &item); more;
 	     more = hull_sexpr_next(&body, &item, &item)) {
-		const char *keys[] = { "id", "address", "engine", "class", "state" };
-		char        values[5][64] = { "", "", "", "", "" };
+		const char *keys[] = { "id", "address", "engine", "class", "state", "root" };
+		char        values[6][64] = { "", "", "", "", "", "" };
 		hull_sexpr_form head;
 
 		hull_sexpr_child(&body, &item, &head);
 		if (!hull_sexpr_is(&body, &head, "machine"))
 			continue;
-		for (unsigned k = 0u; k < 5u; k++) {
+		for (unsigned k = 0u; k < 6u; k++) {
 			hull_sexpr_form entry;
 			hull_sexpr_form name;
 			hull_sexpr_form value;
@@ -3565,8 +3615,9 @@ static int list_machines(void)
 				    hull_sexpr_next(&body, &name, &value))
 					hull_msg_string(&body, &value, values[k], sizeof values[k]);
 		}
-		printf("%-24s %-15s %-10s %-6s %s\n", values[0], values[1], values[2], values[3],
-		       values[4]);
+		/* Root mode's machine says so, after its state (section 7). */
+		printf("%-24s %-15s %-10s %-6s %s%s\n", values[0], values[1], values[2], values[3],
+		       values[4], strcmp(values[5], "true") == 0 ? " ROOT" : "");
 	}
 	hull_wire_close(&wire);
 	return 0;
@@ -5071,10 +5122,27 @@ static void list_engines(const hull_registry *registry)
 			       e->support == HULL_SUP_EMULATED ? "emulated" : "rejected");
 			if (e->note != NULL)
 				printf(": %s", e->note);
-			if (e->accept != NULL)
+			if (e->accept != NULL && strcmp(e->accept, HULL_MATRIX_ROOT) == 0)
+				printf(" (root mode: --accept root:HASH, hull plan --root-hash)");
+			else if (e->accept != NULL)
 				printf(" (--accept %s)", e->accept);
 			printf("\n");
 		}
+	}
+	/* Root mode is there only where its helper is (section 7). */
+	{
+		const char *helper = getenv("HULL_ROOT_HELPER") != NULL ? getenv("HULL_ROOT_HELPER") :
+		                     HULL_ROOT_HELPER_PATH;
+		struct stat installed;
+
+		if (stat(helper, &installed) == 0 && (installed.st_mode & S_ISUID) != 0 &&
+		    installed.st_uid == 0)
+			printf("root mode: %s, setuid root\n", helper);
+		else if (access(helper, X_OK) == 0)
+			printf("root mode: %s, not setuid root, so it grants only what the user "
+			       "could do already\n", helper);
+		else
+			printf("root mode: not installed (make install-root, as root)\n");
 	}
 }
 
@@ -5313,6 +5381,8 @@ int main(int argc, char **argv)
 			o.explain = 1;
 		} else if (strcmp(arg, "--resolved") == 0 && strcmp(command, "plan") == 0) {
 			o.resolved = 1;
+		} else if (strcmp(arg, "--root-hash") == 0 && strcmp(command, "plan") == 0) {
+			o.root_hash = 1;
 		} else if (strcmp(arg, "--check") == 0 && strcmp(command, "build") == 0) {
 			check = 1;
 		} else if ((strcmp(command, "run") == 0 || strcmp(command, "build") == 0 ||

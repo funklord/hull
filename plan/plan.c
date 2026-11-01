@@ -13,6 +13,7 @@
  * leaves nothing rejected is kept.
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include "plan.h"
@@ -344,7 +345,7 @@ static void write_machine(writer *w, const char *projection)
 /* --- judging it ---------------------------------------------------------- */
 
 typedef struct relay {
-	const hull_plan    *plan;
+	hull_plan          *plan;
 	hull_matrix_report  report;
 	void               *context;
 	unsigned            rejected;
@@ -357,6 +358,16 @@ static void forward(void *context, const hull_resolution *resolution)
 
 	if (resolution->outcome == HULL_OUTCOME_REJECTED)
 		r->rejected++;
+	/* Honoured by root mode: the plan says which, for the core to have
+	 * them granted and the engine to give them (section 7). */
+	if (resolution->outcome == HULL_OUTCOME_ACCEPTED && resolution->token != NULL &&
+	    strncmp(resolution->token, HULL_MATRIX_ROOT ":", 5u) == 0) {
+		if (r->plan->root_count < 16u && strlen(resolution->id) < 96u)
+			snprintf(r->plan->root_fields[r->plan->root_count++], 96u, "%s", resolution->id);
+		else
+			r->rejected++;   /* more than the plan can carry: refused, not dropped */
+		snprintf(r->plan->root_hash, sizeof r->plan->root_hash, "%s", resolution->token + 5);
+	}
 	if (r->report == NULL)
 		return;
 	moved.offset = hull_plan_source(r->plan, resolution->offset);
@@ -413,6 +424,7 @@ static hull_plan_status judge(writer *w, const char *projection, const char *con
 		return HULL_PLAN_ERR_INTERNAL;
 	}
 	r->rejected = 0u;
+	w->plan->root_count = 0u;
 	status = hull_matrix_resolve(&w->plan->resolved, &w->plan->resolved.machine,
 	                             w->choice->engine->caps, w->choice->class_name,
 	                             w->host_arch, accepted, forward, r);
@@ -455,8 +467,34 @@ static hull_plan_status encode(hull_plan *plan, const char *class_name, const ch
 	if (hull_sexpr_put_atom(pair, sizeof pair, &n_pair, (const uint8_t *)"engine", 6u) ||
 	    hull_sexpr_put_atom(pair, sizeof pair, &n_pair, (const uint8_t *)engine_name,
 	                        (uint32_t)strlen(engine_name)) ||
-	    hull_sexpr_put_list(entries, HULL_PLAN_TEXT, &n, pair, n_pair) ||
-	    hull_sexpr_to_canonical(&plan->resolved.doc, &plan->resolved.machine, entries,
+	    hull_sexpr_put_list(entries, HULL_PLAN_TEXT, &n, pair, n_pair))
+		return HULL_PLAN_ERR_SIZE;
+	/* (root (fields F ...) (hash sha256:HEX)): root mode's, where it
+	 * honoured a field. */
+	if (plan->root_count != 0u) {
+		uint8_t  fields[2048];
+		uint32_t n_fields = 0u;
+		uint8_t  hash[128];
+		uint32_t n_hash = 0u;
+
+		n_pair = 0u;
+		if (hull_sexpr_put_atom(fields, sizeof fields, &n_fields, (const uint8_t *)"fields", 6u))
+			return HULL_PLAN_ERR_SIZE;
+		for (unsigned i = 0u; i < plan->root_count; i++)
+			if (hull_sexpr_put_atom(fields, sizeof fields, &n_fields,
+			                        (const uint8_t *)plan->root_fields[i],
+			                        (uint32_t)strlen(plan->root_fields[i])))
+				return HULL_PLAN_ERR_SIZE;
+		if (hull_sexpr_put_atom(hash, sizeof hash, &n_hash, (const uint8_t *)"hash", 4u) ||
+		    hull_sexpr_put_atom(hash, sizeof hash, &n_hash, (const uint8_t *)plan->root_hash,
+		                        (uint32_t)strlen(plan->root_hash)) ||
+		    hull_sexpr_put_atom(pair, sizeof pair, &n_pair, (const uint8_t *)"root", 4u) ||
+		    hull_sexpr_put_list(pair, sizeof pair, &n_pair, fields, n_fields) ||
+		    hull_sexpr_put_list(pair, sizeof pair, &n_pair, hash, n_hash) ||
+		    hull_sexpr_put_list(entries, HULL_PLAN_TEXT, &n, pair, n_pair))
+			return HULL_PLAN_ERR_SIZE;
+	}
+	if (hull_sexpr_to_canonical(&plan->resolved.doc, &plan->resolved.machine, entries,
 	                            HULL_PLAN_TEXT, &n, plan->work, 2u * HULL_PLAN_TEXT) ||
 	    hull_sexpr_put_atom(items, 2u * HULL_PLAN_TEXT, &n_items, (const uint8_t *)"plan", 4u) ||
 	    hull_sexpr_put_sorted(items, 2u * HULL_PLAN_TEXT, &n_items, entries, n) ||

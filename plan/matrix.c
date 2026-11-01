@@ -10,9 +10,12 @@
  * re-checks a shape: a form that is not what J says cannot reach it.
  */
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "matrix.h"
+#include "sha256.h"
 
 #define ID_SIZE 96u
 
@@ -25,6 +28,8 @@ typedef struct resolver {
 	hull_matrix_report       report;
 	void                    *context;
 	unsigned                 rejected;
+	const hull_sexpr_form   *machine;
+	char                     root_token[80];   /* "root:sha256:HEX", made when first asked */
 } resolver;
 
 /* --- names --------------------------------------------------------------- */
@@ -119,6 +124,21 @@ static void resolve(resolver *r, const char *id, uint32_t offset)
 		return;
 	case HULL_SUP_REJECTED:
 		break;
+	}
+	/* Root mode's: honoured by this machine's own hash alone, so that an
+	 * acceptance never outlives the plan it was given for (section 7). */
+	if (entry->accept != NULL && strcmp(entry->accept, HULL_MATRIX_ROOT) == 0) {
+		if (r->root_token[0] == '\0') {
+			char hex[72];
+
+			if (hull_matrix_root_hash(r->spec, r->machine, r->caps->engine_name,
+			                          r->class_name, hex) == 0)
+				snprintf(r->root_token, sizeof r->root_token, "root:%s", hex);
+		}
+		emit(r, id, r->root_token[0] != '\0' && listed_text(r->accepted, r->root_token) ?
+		     HULL_OUTCOME_ACCEPTED : HULL_OUTCOME_REJECTED, entry->note,
+		     r->root_token[0] != '\0' ? r->root_token : NULL, offset);
+		return;
 	}
 	if (entry->accept != NULL && listed_text(r->accepted, entry->accept))
 		emit(r, id, HULL_OUTCOME_ACCEPTED, entry->note, entry->accept, offset);
@@ -386,6 +406,35 @@ static void resolve_tuning(resolver *r, const hull_sexpr_form *entry)
 
 /* --- the call ------------------------------------------------------------ */
 
+int hull_matrix_root_hash(const hull_spec *spec, const hull_sexpr_form *machine,
+                          const char *engine_name, const char *class_name, char hex[72])
+{
+	uint32_t     cap = 2u * spec->doc.length + 256u;
+	uint8_t     *canonical = malloc(cap);
+	uint8_t     *scratch = malloc(4u * cap);
+	uint32_t     length = 0u;
+	hull_sha256  h;
+	uint8_t      digest[32];
+	int          ok;
+
+	ok = canonical != NULL && scratch != NULL &&
+	     hull_sexpr_to_canonical(&spec->doc, machine, canonical, cap, &length, scratch,
+	                             4u * cap) == HULL_SEXPR_OK;
+	if (ok) {
+		hull_sha256_init(&h);
+		hull_sha256_update(&h, (const uint8_t *)"hull root 1\n", 12u);
+		hull_sha256_update(&h, (const uint8_t *)engine_name, strlen(engine_name) + 1u);
+		hull_sha256_update(&h, (const uint8_t *)class_name, strlen(class_name) + 1u);
+		hull_sha256_update(&h, canonical, length);
+		hull_sha256_final(&h, digest);
+		memcpy(hex, "sha256:", 7u);
+		hull_sha256_hex(digest, hex + 7);
+	}
+	free(canonical);
+	free(scratch);
+	return ok ? 0 : -1;
+}
+
 hull_matrix_status hull_matrix_resolve(const hull_spec *spec, const hull_sexpr_form *machine,
                                        const hull_capabilities *caps, const char *class_name,
                                        const char *host_arch, const char *const *accepted,
@@ -405,6 +454,8 @@ hull_matrix_status hull_matrix_resolve(const hull_spec *spec, const hull_sexpr_f
 	r.report     = report;
 	r.context    = context;
 	r.rejected   = 0u;
+	r.machine    = machine;
+	r.root_token[0] = '\0';
 
 	hull_sexpr_child(&spec->doc, machine, &entry);
 	for (more = hull_sexpr_next(&spec->doc, &entry, &entry); more;

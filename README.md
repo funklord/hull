@@ -391,10 +391,13 @@ machine on docker with the same machine on chroot or vm.
 **Cons**
 - **It inherits root**, from the daemon: whoever may drive dockerd is
   root by another name, which is the reason hull exists. Its declaration
-  says `runs as root`. The workload itself runs as the user, so
-  capabilities, which docker grants only to root, are refused, and an
-  image that needs root inside, an `apt-get` say, fails here; chroot maps
-  root to the user instead.
+  says `runs as root`. The workload itself runs as the user, so an image
+  that needs root inside, an `apt-get` say, fails here; chroot maps root
+  to the user instead. A capability, which docker grants only to root,
+  is root mode's alone: the host's owner lists the user and the plan's
+  hash in `/etc/hull/root.conf`, the run accepts that hash with
+  `--accept root:sha256:…`, and every start, exec and stop is written to
+  the host's audit log.
 - A directory in place, `(mutable direct)`, is its entries bound into
   the container one by one, docker being unable to bind over `/`: a new
   file at the top of the tree, or in a directory docker mounts something

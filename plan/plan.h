@@ -59,6 +59,9 @@ typedef struct hull_plan {
 	hull_plan_segment  segments[HULL_PLAN_SEGMENTS];
 	uint32_t           segment_count;
 	const char        *reason;      /* why HULL_PLAN_ERR_INTERNAL */
+	char               root_hash[72];              /* root mode's: the machine's hash, */
+	char               root_fields[16][96];        /* and the fields it honoured */
+	unsigned           root_count;
 	uint8_t            canonical[HULL_PLAN_TEXT];  /* what crosses the ABI */
 	uint32_t           canonical_length;
 	uint8_t            work[3u * HULL_PLAN_TEXT];  /* the encoding's scratch */

@@ -59,6 +59,20 @@ typedef enum hull_matrix_status {
  * order the spec gives them, so `hull plan --explain` can print the lot;
  * the status says whether any was rejected.
  */
+/*
+ * Root mode's hash of `machine` for `engine_name` and `class_name`, as
+ * "sha256:" and 64 hex digits into `hex`: over the machine as written,
+ * canonical, and the engine and class it would run on, so any change to
+ * either is a new hash, which must be listed and accepted again (section
+ * 7). 0, or -1 where memory ran out.
+ */
+int hull_matrix_root_hash(const hull_spec *spec, const hull_sexpr_form *machine,
+                          const char *engine_name, const char *class_name, char hex[72]);
+
+/* The accept token a field declared `root` is honoured by: "root:" and
+ * the machine's hash, as `--accept root:sha256:HEX` gives it. */
+#define HULL_MATRIX_ROOT "root"
+
 hull_matrix_status hull_matrix_resolve(const hull_spec *spec, const hull_sexpr_form *machine,
                                        const hull_capabilities *caps, const char *class_name,
                                        const char *host_arch, const char *const *accepted,

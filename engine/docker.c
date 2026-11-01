@@ -872,6 +872,28 @@ failed:
 
 /* --- the plan, as a container -------------------------------------------- */
 
+/* Whether root mode granted `field` this machine: the plan's (root (fields
+ * ...)), which the planner writes only where `--accept root:HASH` named
+ * this machine's hash, and the core runs only where hull-root granted it
+ * (section 7). */
+static int root_granted(const hull_sexpr_doc *doc, const char *field)
+{
+	hull_sexpr_form top;
+	hull_sexpr_form root;
+	hull_sexpr_form fields;
+	hull_sexpr_form item;
+
+	if (!hull_sexpr_first(doc, &top) || !hull_access_find(doc, &top, "root", &root) ||
+	    !hull_access_find(doc, &root, "fields", &fields))
+		return 0;
+	hull_sexpr_child(doc, &fields, &item);
+	for (int more = hull_sexpr_next(doc, &item, &item); more;
+	     more = hull_sexpr_next(doc, &item, &item))
+		if (hull_sexpr_is(doc, &item, field))
+			return 1;
+	return 0;
+}
+
 /* Whether `source` is a bare image ref: none of J.1's schemes. */
 static int is_ref(const char *source)
 {
@@ -1213,7 +1235,11 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 		add_all(&body, &exposed);
 		add_text(&body, "}");
 	}
-	addf(&body, ",\"User\":\"%u:%u\"", (unsigned)getuid(), (unsigned)getgid());
+	/* As the user, unless root mode granted a capability, which docker
+	 * gives only to a root workload: then the container's root, its
+	 * capabilities those granted (section 7). */
+	if (!root_granted(doc, "security.allow"))
+		addf(&body, ",\"User\":\"%u:%u\"", (unsigned)getuid(), (unsigned)getgid());
 	add_text(&body, ",\"Labels\":{\"hull.machine\":");
 	add_json(&body, m->name);
 	add_text(&body, "}");
@@ -1224,6 +1250,34 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	 * own: PID 1 ignores a signal it has no handler for, so a workload
 	 * there would sit through stop's SIGTERM, and nothing would reap. */
 	add_text(&body, ",\"HostConfig\":{\"Init\":true,\"CapDrop\":[\"ALL\"]");
+	if (root_granted(doc, "security.allow") && hull_access_find(doc, machine, "security", &entry)) {
+		hull_sexpr_form allow;
+		hull_sexpr_form item;
+		int             first = 1;
+
+		if (hull_access_find(doc, &entry, "allow", &allow)) {
+			add_text(&body, ",\"CapAdd\":[");
+			hull_sexpr_child(doc, &allow, &item);
+			for (int more = hull_sexpr_next(doc, &item, &item); more;
+			     more = hull_sexpr_next(doc, &item, &item)) {
+				char *name = hull_access_text(doc, &item);
+				text  upper = { 0 };
+
+				for (size_t i = 0u; name != NULL && name[i] != '\0'; i++) {
+					char c = name[i] >= 'a' && name[i] <= 'z' ? (char)(name[i] - 32) : name[i];
+
+					add(&upper, &c, 1u);
+				}
+				add_text(&body, first ? "" : ",");
+				add_json(&body, upper.data != NULL ? upper.data : "");
+				body.failed |= upper.failed || name == NULL;
+				first = 0;
+				free(upper.data);
+				free(name);
+			}
+			add_text(&body, "]");
+		}
+	}
 	/* (network none) is docker's none, lo alone; (network host) its host;
 	 * (network nat), or none given, its own bridge, as it always was;
 	 * (network bridge) that bridge said, or the docker network (bridge
@@ -3784,7 +3838,8 @@ static const hull_cap_entry entries[] = {
 	{ "devices.pci",            HULL_SUP_NATIVE,
 	  "its VFIO group's node and /dev/vfio/vfio by --device", NULL },
 	{ "security.allow",         HULL_SUP_REJECTED,
-	  "docker grants capabilities only to root, and its root is the host's", NULL },
+	  "docker grants capabilities only to root, and its root is the host's: root mode's alone, "
+	  "the container then its root with these", "root" },
 
 	/* A shared kernel sees every event and lock (6). */
 	{ "fidelity.inotify",   HULL_SUP_NATIVE,   NULL, NULL },

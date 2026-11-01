@@ -143,6 +143,11 @@ AGENT_BIN      = $(BUILD_DIR)/hull-agent
 # The hosts database for section 8.1's names, loaded by glibc into any
 # program that looks a name up: nothing of hull's but its own file.
 NSS_LIB    = $(BUILD_DIR)/libnss_hull.so.2
+# Root mode's helper (project.md section 7), installed setuid root apart
+# by install-root and by nothing else. The path hull runs it from is
+# hull_engine.h's HULL_ROOT_HELPER_PATH, which this must match.
+ROOT_BIN    = $(BUILD_DIR)/hull-root
+ROOT_HELPER ?= /usr/local/libexec/hull/hull-root
 NSS_LIBDIR ?= /usr/lib/$(shell $(CC) -print-multiarch)
 VERSION    := $(shell cat VERSION)
 
@@ -182,6 +187,9 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  cserve.conf cserve.out cheld.out cheld.in portready.conf portunready.conf) \
                  $(addprefix $(BUILD_DIR)/test/run/hull/, core.log core.lock)
 
+# What test/root_test.sh writes.
+ROOT_TEST_FILES = $(addprefix $(BUILD_DIR)/test/root/, root.conf root.log cap.conf changed.conf)
+
 # What test/docker_test.sh writes.
 DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf volro.conf \
                     rootro.conf nocap.conf cap.conf die.conf wait.conf port.conf noimage.conf \
@@ -200,7 +208,8 @@ DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf vol
                     stacked/data/c stacked/data/d stacked/data/sub/b stacked/seed/s \
                     direct/out direct/live direct/root/srv/new direct/root/probe \
                     direct/root/etc/motd direct/root/sbin dexported.conf dvolumed.conf \
-                    nested.conf nest/b/in)
+                    nested.conf nest/b/in \
+                    root.conf root.log rootcap.conf rootheld.conf rootkept.conf)
 
 # What test/qemu_test.sh writes.
 QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf vbuilt.conf die.conf nope.conf write.conf \
@@ -264,7 +273,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all nss check check-docker check-qemu check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all nss root install-root check check-docker check-qemu check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -273,10 +282,13 @@ all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL) $(AGENT_BIN)
 
 nss: $(NSS_LIB)
 
+root: $(ROOT_BIN)
+
 help:
 	@echo 'Targets:'
 	@echo '  all       build the libraries, build/hull and its agent (the default)'
 	@echo '  nss       build the NSS module, libnss_hull.so.2, for *.hull names'
+	@echo '  root      build root mode'"'"'s helper, hull-root'
 	@echo '  check     style, the situ contracts, then the tests'
 	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
 	@echo '  check-qemu    hull run on the qemu engine, as the user, with KVM'
@@ -288,6 +300,8 @@ help:
 	@echo '  hooks     install the commit-msg hook from tool/hooks/'
 	@echo '  install-nss  as root: libnss_hull.so.2 into NSS_LIBDIR, for *.hull names'
 	@echo '  install-apparmor  as root: a profile letting hull make user namespaces'
+	@echo '  install-root  as root: hull-root setuid into ROOT_HELPER, and its listing'"'"'s'
+	@echo '                and log'"'"'s directories, root'"'"'s alone'
 	@echo '  clean     remove what the build made, naming each file'
 
 # Each schema generates a header and a source in one situc run, so both are
@@ -414,6 +428,21 @@ $(NSS_LIB): nss/nss_hull.c
 install-nss: $(NSS_LIB)
 	install -D -m 0644 $(NSS_LIB) '$(DESTDIR)$(NSS_LIBDIR)/libnss_hull.so.2'
 
+# One file, its own, linked with nothing of hull's: the less a setuid
+# program holds, the less there is to trust.
+$(ROOT_BIN): root/hull_root.c
+	@mkdir -p '$(@D)'
+	$(CC) $(CFLAGS) $(WARNINGS) -o $@ $(filter %.c,$^)
+
+# Root mode (project.md section 7), run as root: the helper setuid, and the
+# directories of its listing and its log, root's alone, which it refuses to
+# trust otherwise. The listing itself is the host owner's to write.
+install-root: $(ROOT_BIN)
+	install -D -m 4755 -o root -g root $(ROOT_BIN) '$(DESTDIR)$(ROOT_HELPER)'
+	install -d -m 0755 -o root -g root '$(DESTDIR)/etc/hull'
+	install -d -m 0700 -o root -g root '$(DESTDIR)/var/log/hull'
+	@echo 'installed $(DESTDIR)$(ROOT_HELPER) setuid root; list who may use it in /etc/hull/root.conf'
+
 # The AppArmor profile that lets hull make user namespaces where a host
 # restricts them (Ubuntu 24.04). It attaches by the binary's path, and hull
 # runs from where it is built, so the path is filled in from HULL_BIN (the
@@ -447,13 +476,16 @@ $(BUILD_DIR)/test/framing_test: $(TEST_FRAMING_OBJS) $(AGENT_OBJS) $(SEXPR_OBJS)
 $(BUILD_DIR)/test/spec_test: $(TEST_SPEC_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
-$(BUILD_DIR)/test/matrix_test: $(TEST_MATRIX_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
+$(BUILD_DIR)/test/matrix_test: $(TEST_MATRIX_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS) \
+                              $(BUILD_DIR)/engine/sha256.o
 	$(CC) $(CFLAGS) -o $@ $^
 
-$(BUILD_DIR)/test/registry_test: $(TEST_REGISTRY_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
+$(BUILD_DIR)/test/registry_test: $(TEST_REGISTRY_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS) \
+                              $(BUILD_DIR)/engine/sha256.o
 	$(CC) $(CFLAGS) -o $@ $^
 
-$(BUILD_DIR)/test/plan_test: $(TEST_PLAN_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
+$(BUILD_DIR)/test/plan_test: $(TEST_PLAN_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS) \
+                              $(BUILD_DIR)/engine/sha256.o
 	$(CC) $(CFLAGS) -o $@ $^
 
 $(BUILD_DIR)/test/wire_test: $(TEST_WIRE_OBJS) $(WIRE_OBJS) $(SEXPR_OBJS)
@@ -502,7 +534,7 @@ check: style contract test
 # The reader's tests -- the spec's against every ```scheme example in
 # project.md as well -- then the gate's own suite, which travels with the
 # gate. Tests are built here and only here: a plain `make` does not.
-test: $(TEST_BINS) $(HULL) $(PROBE) $(ARM64_PROBE) $(NSS_LIB) vectors
+test: $(TEST_BINS) $(HULL) $(PROBE) $(ARM64_PROBE) $(NSS_LIB) $(ROOT_BIN) vectors
 	$(BUILD_DIR)/test/sexpr_test
 	$(BUILD_DIR)/test/framing_test
 	$(BUILD_DIR)/test/spec_test project.md
@@ -520,6 +552,7 @@ test: $(TEST_BINS) $(HULL) $(PROBE) $(ARM64_PROBE) $(NSS_LIB) vectors
 	BUILD_DIR='$(BUILD_DIR)' sh test/tree_test.sh '$(BUILD_DIR)/test/tree_tar'
 	BUILD_DIR='$(BUILD_DIR)' sh test/cli_test.sh '$(HULL)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/nss_test.sh '$(HULL)' '$(NSS_LIB)'
+	BUILD_DIR='$(BUILD_DIR)' sh test/root_test.sh '$(HULL)' '$(ROOT_BIN)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/store_test.sh '$(HULL)' '$(SITU_MARK)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/pull_test.sh '$(HULL)' '$(PROBE)' '$(SITU_MARK)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/build_test.sh '$(HULL)' '$(PROBE)' '$(SITU_MARK)'
@@ -547,9 +580,9 @@ vectors: $(SITU_MARK)
 # The docker adapter against a real daemon. Not in `check`, which needs
 # none: this one starts containers on the daemon the account can reach,
 # from alpine:latest, which it does not pull.
-check-docker: $(HULL) $(PROBE) $(BUILD_DIR)/test/tree_tar
+check-docker: $(HULL) $(PROBE) $(BUILD_DIR)/test/tree_tar $(ROOT_BIN)
 	BUILD_DIR='$(BUILD_DIR)' sh test/docker_test.sh '$(HULL)' '$(PROBE)' \
-		'$(BUILD_DIR)/test/tree_tar'
+		'$(BUILD_DIR)/test/tree_tar' '$(ROOT_BIN)'
 
 check-flip: $(HULL) $(AGENT_BIN) $(PROBE) $(BUILD_DIR)/test/tree_tar
 	BUILD_DIR='$(BUILD_DIR)' sh test/flip_test.sh '$(HULL)' '$(PROBE)' \
@@ -601,9 +634,9 @@ clean:
 	        $(SEXPR_OBJS) $(SEXPR_OBJS:.o=.d) $(GEN_SOURCES) $(GEN_HEADERS) \
 	        $(AGENT_OBJS) $(AGENT_OBJS:.o=.d) $(AGENT_GEN) \
 	        $(SPEC_OBJS) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS) $(PLAN_OBJS:.o=.d) \
-	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(STORE_OBJS) $(STORE_OBJS:.o=.d) $(OCI_OBJS) $(OCI_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) \
+	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(STORE_OBJS) $(STORE_OBJS:.o=.d) $(OCI_OBJS) $(OCI_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) $(ROOT_BIN) \
 	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) $(DISC_GEN) $(FRAME_GEN) \
 	        $(AGENT_BIN) $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(BUILD_DIR)/test/arm64/rootfs/probe \
-	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) \
+	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) \
 	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor

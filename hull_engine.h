@@ -92,6 +92,12 @@ typedef struct hull_buf {
  * ...), derived from the spec as project.md section 4.4 says -- not
  * listed here. A medium's type is checked against media_types (J.4). */
 
+/* Root mode's helper (project.md section 7), where `make install-root`
+ * puts it setuid; the Makefile's ROOT_HELPER matches. A host without it
+ * has no root mode. HULL_ROOT_HELPER in the environment names another,
+ * as the suites do, which can grant nothing the user could not. */
+#define HULL_ROOT_HELPER_PATH "/usr/local/libexec/hull/hull-root"
+
 typedef enum hull_support {
 	HULL_SUP_NATIVE   = 0,
 	HULL_SUP_EMULATED = 1,   /* honored, with declared cost               */

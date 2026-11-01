@@ -36,6 +36,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <ctype.h>
 #include <stdlib.h>
@@ -143,6 +144,7 @@ struct slot {
 	int                ssh;         /* hull/ssh/ID is written for it, (ssh true) */
 	client            *owner;       /* the frontend that ran it */
 	int                paused;      /* hull pause, and no unpause since */
+	char               root_hash[72];  /* root mode's, granted by hull-root; "" for none */
 	/* The plan's (impair ...): each segment's link, given its port
 	 * as the machine joins it. */
 	struct {
@@ -868,13 +870,24 @@ typedef struct stop_job {
 	hull_core         *core;
 	hull_machine      *handle;
 	int                timeout_ms;
+	char               root_hash[72];  /* root mode's, its stop recorded first */
 } stop_job;
+
+static int root_helper(const char *op, const char *hash, char *const *fields, unsigned count,
+                       char *why, size_t cap);
 
 static void *run_stop(void *arg)
 {
 	stop_job  *job   = arg;
 	hull_error error = { .struct_size = sizeof error };
+	char       why[1024];
 
+	/* A root machine's stop is recorded; one that cannot be is still
+	 * stopped, since leaving root running is the worse of the two, and
+	 * the core's log says so. */
+	if (job->root_hash[0] != '\0' && root_helper("stop", job->root_hash, NULL, 0u, why,
+	                                               sizeof why) != 0)
+		fprintf(stderr, "hull core: a root machine's stop was not recorded: %s\n", why);
 	job->engine->ops->stop(job->core, job->handle, job->timeout_ms, &error);
 	free(job);
 	return NULL;
@@ -908,7 +921,8 @@ static void stop_machine(slot *s, int timeout_ms)
 		free(job);
 		return;
 	}
-	*job = (stop_job){ s->engine, &s->core, s->handle, timeout_ms };
+	*job = (stop_job){ s->engine, &s->core, s->handle, timeout_ms, "" };
+	snprintf(job->root_hash, sizeof job->root_hash, "%s", s->root_hash);
 	if (pthread_create(&thread, NULL, run_stop, job) != 0) {
 		free(job);
 		return;
@@ -2082,6 +2096,101 @@ static void address_of(const char *id, char out[16])
 		address_at(address_slot(id), out);
 }
 
+/*
+ * hull-root `op` for a machine of root mode: `start` with the plan's
+ * hash and its fields, which it grants only where the host's listing
+ * does, or `exec` or `stop`, which it records; every call written to the
+ * host's audit log before anything is done. 0, or -1 with what it said in
+ * `why`, at most `cap` bytes.
+ */
+static int root_helper(const char *op, const char *hash, char *const *fields, unsigned count,
+                       char *why, size_t cap)
+{
+	const char *path = getenv("HULL_ROOT_HELPER") != NULL ? getenv("HULL_ROOT_HELPER") :
+	                   HULL_ROOT_HELPER_PATH;
+	char       *argv[40];
+	unsigned    n = 0u;
+	int         said[2];
+	pid_t       pid;
+	int         status = 0;
+	size_t      got = 0u;
+	ssize_t     r;
+	posix_spawn_file_actions_t actions;
+
+	argv[n++] = (char *)"hull-root";
+	argv[n++] = (char *)op;
+	argv[n++] = (char *)hash;
+	for (unsigned i = 0u; i < count && n < 39u; i++)
+		argv[n++] = fields[i];
+	argv[n] = NULL;
+	why[0] = '\0';
+	if (access(path, X_OK) != 0) {
+		snprintf(why, cap, "root mode is not installed on this host: no %s (make install-root, "
+		         "as root)", path);
+		return -1;
+	}
+	if (pipe2(said, O_CLOEXEC) != 0) {
+		snprintf(why, cap, "hull-root: %s", strerror(errno));
+		return -1;
+	}
+	posix_spawn_file_actions_init(&actions);
+	posix_spawn_file_actions_adddup2(&actions, said[1], 2);
+	posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0);
+	posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
+	/* The core's environment, which a setuid hull-root reads nothing of;
+	 * run as the user, as the suites run it, it reads its listing's and
+	 * log's paths there. */
+	if (posix_spawn(&pid, path, &actions, NULL, argv, environ) != 0) {
+		posix_spawn_file_actions_destroy(&actions);
+		close(said[0]);
+		close(said[1]);
+		snprintf(why, cap, "hull-root could not be run: %s", strerror(errno));
+		return -1;
+	}
+	posix_spawn_file_actions_destroy(&actions);
+	close(said[1]);
+	while (got + 1u < cap && (r = read(said[0], why + got, cap - 1u - got)) > 0)
+		got += (size_t)r;
+	why[got] = '\0';
+	while (got > 0u && why[got - 1u] == '\n')
+		why[--got] = '\0';
+	close(said[0]);
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+		;
+	if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+		return 0;
+	if (why[0] == '\0')
+		snprintf(why, cap, "hull-root refused, saying nothing");
+	return -1;
+}
+
+/* The plan's (root (fields F ...) (hash H)), into `hash` and `fields`,
+ * `*count` of them, the plan's own text: 1 where it has one. */
+static int root_of(const hull_sexpr_doc *doc, char *hash, size_t hash_cap, char **fields,
+                   unsigned *count)
+{
+	hull_sexpr_form top;
+	hull_sexpr_form root;
+	hull_sexpr_form list;
+	hull_sexpr_form item;
+	char           *given;
+
+	*count = 0u;
+	if (!hull_sexpr_first(doc, &top) || !hull_access_find(doc, &top, "root", &root))
+		return 0;
+	given = hull_access_value(doc, &root, "hash");
+	snprintf(hash, hash_cap, "%s", given != NULL ? given : "");
+	free(given);
+	if (hull_access_find(doc, &root, "fields", &list)) {
+		hull_sexpr_child(doc, &list, &item);
+		for (int more = hull_sexpr_next(doc, &item, &item); more && *count < 32u;
+		     more = hull_sexpr_next(doc, &item, &item))
+			if ((fields[*count] = hull_access_text(doc, &item)) != NULL)
+				(*count)++;
+	}
+	return 1;
+}
+
 static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
 	hull_sexpr_form    value;
@@ -2105,6 +2214,7 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	uint8_t           *addressed;
 	size_t             addressed_length;
 	hull_status        created;
+	char               granted_root[72];
 
 	if (!hull_msg_find(body, "machine", &value) || !hull_msg_string(body, &value, id, sizeof id) ||
 	    !is_label(id)) {
@@ -2125,6 +2235,46 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	if (!hull_access_machine(&plan_doc, plan.data, plan.len, &machine)) {
 		send_error(c, ch, "the plan is not a plan");
 		return;
+	}
+	/* Root mode's machine: hull-root grants it, the host's owner having
+	 * listed this user, this plan and these fields, and records it, or it
+	 * is not run (section 7). */
+	{
+		char     root_hash[72];
+		char    *fields[32];
+		unsigned field_count = 0u;
+		char     why[1024];
+		int      refused = 0;
+
+		if (root_of(&plan_doc, root_hash, sizeof root_hash, fields, &field_count)) {
+			char *kept = hull_access_value(&plan_doc, &machine, "on_disconnect");
+
+			/* A root machine ends with its run: kept, a later core would
+			 * take it back with no root mode of its own to record its
+			 * stop. Refused before hull-root is asked, so nothing is
+			 * granted for a run that does not happen. */
+			if (kept != NULL && strcmp(kept, "keep") == 0) {
+				refused = 1;
+				snprintf(why, sizeof why, "a root machine is not kept past its run: "
+				         "(on_disconnect keep) and root mode do not go together");
+			} else if (root_hash[0] == '\0') {
+				refused = 1;
+				snprintf(why, sizeof why, "the plan's root mode names no hash");
+			} else {
+				refused = root_helper("start", root_hash, fields, field_count, why,
+				                      sizeof why) != 0;
+			}
+			free(kept);
+		} else {
+			root_hash[0] = '\0';
+		}
+		for (unsigned i = 0u; i < field_count; i++)
+			free(fields[i]);
+		if (refused) {
+			send_error(c, ch, why);
+			return;
+		}
+		snprintf(granted_root, sizeof granted_root, "%s", root_hash);
 	}
 	{
 		hull_sexpr_form top;
@@ -2274,6 +2424,7 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		plan.data = with;
 		plan.len  = addressed_length;
 	}
+	snprintf(s->root_hash, sizeof s->root_hash, "%s", granted_root);
 	created = engine->ops->create(&s->core, plan, &s->handle, &error);
 	free(addressed);
 	if (created != HULL_OK) {
@@ -2421,6 +2572,15 @@ static void handle_exec(client *c, uint32_t ch, const hull_sexpr_doc *body, int 
 	if (s == NULL)
 		return;
 	ops = s->engine->ops;
+	/* Into a root machine, recorded first, or not at all (section 7). */
+	if (s->root_hash[0] != '\0' && !s->exited) {
+		char why[1024];
+
+		if (root_helper("exec", s->root_hash, NULL, 0u, why, sizeof why) != 0) {
+			send_error(c, ch, why);
+			return;
+		}
+	}
 	if (s->exited || s->handle == NULL) {
 		send_error(c, ch, "the machine is not running");
 		return;
@@ -3270,7 +3430,10 @@ static void handle_list(client *c, uint32_t ch)
 		hull_msg_text(&m, s->engine->caps->engine_name);
 		hull_msg_raw(&m, ")(2:id");
 		hull_msg_text(&m, s->id);
-		hull_msg_raw(&m, ")(5:state");
+		hull_msg_raw(&m, ")");
+		if (s->root_hash[0] != '\0')
+			hull_msg_raw(&m, "(4:root4:true)");
+		hull_msg_raw(&m, "(5:state");
 		hull_msg_text(&m, s->state);
 		hull_msg_raw(&m, "))");
 	}
