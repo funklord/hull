@@ -51,4 +51,17 @@ char *hull_hostnet_resolvers(void);
  * core's, started once, after hull0 is made. NULL, or why in `why`. */
 const char *hull_hostnet_relay(char *why, size_t cap);
 
+/* The relay's two sockets, UDP and listening TCP, bound on BRIDGE_GATEWAY
+ * port 53, which only root may bind: as root mode's hull-root binds them
+ * for a core run as the user. 0, or -1 with errno. */
+int hull_hostnet_relay_sockets(int *udp, int *tcp);
+
+/* The relay started on sockets bound already, as hull-root hands them to
+ * a core run as the user; where it runs already, they are closed. NULL,
+ * or why in `why`. */
+const char *hull_hostnet_relay_given(int udp, int tcp, char *why, size_t cap);
+
+/* Whether this core's relay runs. */
+int hull_hostnet_relay_running(void);
+
 #endif /* HULL_HOSTNET_H */

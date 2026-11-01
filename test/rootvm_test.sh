@@ -144,6 +144,23 @@ echo "status=\$?"
 echo "== no such bridge"
 as /opt/hull-root bridge "$handmade_hash" "\$target" < /srv/handmade.plan 2>&1
 echo "status=\$?"
+# hull0's DNS relay, the host's resolvers all its loopback as
+# systemd-resolved's are: hull-root binds its port 53 and hands the
+# sockets to the user's core, whose relay asks the resolver -- here a
+# probe echoing each question back, an answer of no records -- for the
+# machine.
+printf 'nameserver 127.0.0.53\n' > /etc/resolv.conf
+cp /srv/mroot/probe /bin/probe
+/bin/probe echo 127.0.0.53:53 > /tmp/echo.out 2>&1 &
+sleep 1
+printf '(machine (source "dir:/tmp/mroot") (backend chroot) (mutable overlay) (network bridge) (command "/probe" "read" "/etc/resolv.conf" "dns" "anything.example"))\n' > /tmp/r.conf
+chown 1000:1000 /tmp/r.conf
+relayed=\$(as /bin/hull plan --root-hash -f /tmp/r.conf 2> /dev/null | sed -n 's/.*: --accept //p')
+printf 'tester %s network.bridge\n' "\${relayed#root:}" >> /etc/hull/root.conf
+echo "== relayed"
+as /bin/hull run --accept "\$relayed" -f /tmp/r.conf 2>&1
+echo "status=\$?"
+printf 'nameserver 10.0.2.3\n' > /etc/resolv.conf
 echo "== listing not root's"
 chown 1000:1000 /etc/hull/root.conf
 as /bin/hull run --accept "\$token" -f /tmp/b.conf 2>&1
@@ -187,6 +204,14 @@ printf '%s\n' "$out" | grep -Eq '^target=[0-9]+$' &&
 	printf '%s\n' "$out" | sed -n '/^== no such bridge/,/^status=/p' | grep -q 'names no bridge on the host' &&
 	printf '%s\n' "$out" | sed -n '/^== listing not root/,/^status=/p' | grep -q 'is not root.s alone' ||
 	fail "hull-root did what it must refuse" "$out"
+# hull0's relay on a host whose resolvers are its loopback: the machine
+# told to ask the gateway, and its question answered through it.
+cases=$((cases + 1))
+relayed=$(printf '%s\n' "$out" | sed -n '/^== relayed/,/^status=/p')
+printf '%s\n' "$relayed" | grep -qx 'read=nameserver 172.31.0.1' &&
+	printf '%s\n' "$relayed" | grep -qx 'dns=anything.example rcode 0' &&
+	printf '%s\n' "$relayed" | grep -qx 'status=0' ||
+	fail "a root mode machine on hull0 was not answered through the relay" "$relayed"
 # The log: every grant and refusal it acted on, the bridge with its
 # machine; a refusal for another plan's bytes or another's process comes
 # before the listing is read, and is not a line.

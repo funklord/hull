@@ -9,7 +9,9 @@
  *                                   process of the user's own in network
  *                                   and user namespaces of its own, put on
  *                                   the host bridge the plan names, hull0
- *                                   made where it is its own
+ *                                   made where it is its own, and hull0's
+ *                                   DNS relay's port 53 bound and handed
+ *                                   back on fd 3 where it is asked
  *
  * Installed setuid root by `make install-root` and by nothing else; a host
  * without it has no root mode. It does the least root has to: it reads the
@@ -46,7 +48,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -323,6 +327,42 @@ static int machine_process(long pid, uid_t uid)
 	return 1;
 }
 
+/* hull0's DNS relay's two sockets, bound on its gateway's port 53, which
+ * only root may bind, handed back over fd 3 where the caller gave one and
+ * the host's resolvers are all its loopback, which a machine on the
+ * bridge could not reach: the relay then the caller's core's, run as the
+ * user (engine/hostnet.c). Nothing to do otherwise. 0, or 1 said. */
+static int relay_sockets(void)
+{
+	struct stat     given;
+	char           *resolvers = hull_hostnet_resolvers();
+	int             fds[2];
+	char            byte = 0;
+	struct iovec    v = { &byte, 1u };
+	char            control[CMSG_SPACE(sizeof fds)];
+	struct msghdr   message = { .msg_iov = &v, .msg_iovlen = 1u, .msg_control = control,
+	                            .msg_controllen = sizeof control };
+	struct cmsghdr *c;
+
+	if (resolvers != NULL || fstat(3, &given) != 0 || !S_ISSOCK(given.st_mode)) {
+		free(resolvers);
+		return 0;
+	}
+	if (hull_hostnet_relay_sockets(&fds[0], &fds[1]) != 0)
+		return fail("hull0's DNS relay's port 53", strerror(errno));
+	memset(control, 0, sizeof control);
+	c = CMSG_FIRSTHDR(&message);
+	c->cmsg_level = SOL_SOCKET;
+	c->cmsg_type  = SCM_RIGHTS;
+	c->cmsg_len   = CMSG_LEN(sizeof fds);
+	memcpy(CMSG_DATA(c), fds, sizeof fds);
+	if (sendmsg(3, &message, 0) != 1)
+		return fail("hull0's DNS relay's sockets could not be handed back", strerror(errno));
+	close(fds[0]);
+	close(fds[1]);
+	return 0;
+}
+
 /* The bridge op's root part: hull0 made where the plan names no bridge of
  * its own, then a veth whose far end is the machine's eth0, in PID's
  * namespace, and whose near end is on the bridge, as a root core's
@@ -341,7 +381,10 @@ static int bridge(const uint8_t *plan, size_t length, size_t machine, long pid)
 	if (!value_of(plan, length, machine, "network", network, sizeof network) ||
 	    strcmp(network, "bridge") != 0)
 		return fail("the plan's machine is not (network bridge)", NULL);
+	int         own = 0;
+
 	if (!value_of(plan, length, machine, "bridge", name, sizeof name)) {
+		own = 1;
 		snprintf(name, sizeof name, "%s", HULL_BRIDGE);
 		if (hull_hostnet_bridge(why, sizeof why) != NULL)
 			return fail("hull0", why);
@@ -363,7 +406,7 @@ static int bridge(const uint8_t *plan, size_t length, size_t machine, long pid)
 		    hull_hostnet_run(on, why, sizeof why) != 0)
 			return fail("the machine's veth", why);
 	}
-	return 0;
+	return own ? relay_sockets() : 0;
 }
 
 int main(int argc, char **argv)

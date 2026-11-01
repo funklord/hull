@@ -2114,7 +2114,7 @@ static int root_helper(const char *op, const char *hash, char *const *fields, un
 	for (unsigned i = 0u; i < count && n < 39u; i++)
 		args[n++] = fields[i];
 	args[n] = NULL;
-	return hull_root_call(args, NULL, 0u, why, cap);
+	return hull_root_call(args, NULL, 0u, NULL, 0u, why, cap);
 }
 
 /* The plan's (root (fields F ...) (hash H)), into `hash` and `fields`,

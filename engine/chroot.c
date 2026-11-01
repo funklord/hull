@@ -582,12 +582,6 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		    (m->resolver = strdup("nameserver " BRIDGE_GATEWAY "\n")) == NULL)
 			return "out of memory";
 		m->bridge_relay = 1;
-		/* The relay is the core's, on port 53, which a core run as the
-		 * user cannot bind and root mode does not bind for it yet. */
-		if (m->bridge_root[0] != '\0')
-			return "(network bridge) in root mode on a host whose resolvers are all its "
-			       "loopback: hull0's DNS relay needs port 53, which root mode does not bind "
-			       "yet; give the host a resolver off its loopback, or run hull's core as root";
 	}
 
 	/* (segments ...): a NIC on each in the machine's own network namespace,
@@ -2506,13 +2500,30 @@ static const char *start_bridge(const hull_machine *m, char *why, size_t cap)
 	char        near[16];
 	char        pid_text[24];
 
-	/* Root mode's: hull-root does root's part, from the plan it checks. */
+	/* Root mode's: hull-root does root's part, from the plan it checks,
+	 * and where the machine asks hull0's relay and this core runs none,
+	 * binds its port 53 and hands the sockets back, the relay then this
+	 * core's, as the user's. */
 	if (m->bridge_root[0] != '\0') {
 		const char *args[] = { "bridge", m->bridge_root, pid_text, NULL };
+		int         relay[2] = { -1, -1 };
+		int         wanted = m->bridge_relay && !hull_hostnet_relay_running();
 
 		snprintf(pid_text, sizeof pid_text, "%ld", (long)m->pid);
-		return hull_root_call(args, (const uint8_t *)m->plan, m->plan_length, why, cap) != 0 ?
-		       why : NULL;
+		if (hull_root_call(args, (const uint8_t *)m->plan, m->plan_length,
+		                   wanted ? relay : NULL, 2u, why, cap) != 0)
+			return why;
+		if (!wanted)
+			return NULL;
+		if (relay[0] < 0 || relay[1] < 0) {
+			if (relay[0] >= 0)
+				close(relay[0]);
+			if (relay[1] >= 0)
+				close(relay[1]);
+			snprintf(why, cap, "hull-root gave no socket for hull0's DNS relay");
+			return why;
+		}
+		return hull_hostnet_relay_given(relay[0], relay[1], why, cap);
 	}
 	if (m->bridge_own && hull_hostnet_bridge(why, cap) != NULL)
 		return why;

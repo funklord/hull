@@ -21,10 +21,13 @@ const char *hull_root_path(void);
  * hull-root with `args`, NULL-ended, after its own name, `input` on its
  * stdin where it is not NULL, as an op that acts on a plan is handed the
  * plan to check: 0 where it granted, or -1 with what it said, or why it
- * could not be asked, in `why`.
+ * could not be asked, in `why`. Where `fds` is not NULL, a socket on its
+ * fd 3 takes what it hands back, up to `fd_count` descriptors into `fds`,
+ * -1 where none came: what only root may make, a socket bound on a
+ * privileged port, given to a core run as the user.
  */
-int hull_root_call(const char *const *args, const uint8_t *input, size_t length, char *why,
-                   size_t cap);
+int hull_root_call(const char *const *args, const uint8_t *input, size_t length, int *fds,
+                   unsigned fd_count, char *why, size_t cap);
 
 #ifdef __cplusplus
 }

@@ -401,43 +401,105 @@ static void *relay_accept(void *arg)
 	return NULL;
 }
 
+int hull_hostnet_relay_sockets(int *udp, int *tcp)
+{
+	struct sockaddr_in at = { .sin_family = AF_INET, .sin_port = htons(53) };
+	int                one = 1;
+
+	*udp = -1;
+	*tcp = -1;
+	inet_pton(AF_INET, BRIDGE_GATEWAY, &at.sin_addr);
+	if ((*udp = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)) < 0 ||
+	    setsockopt(*udp, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0 ||
+	    bind(*udp, (struct sockaddr *)&at, sizeof at) != 0 ||
+	    (*tcp = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0 ||
+	    setsockopt(*tcp, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0 ||
+	    bind(*tcp, (struct sockaddr *)&at, sizeof at) != 0 || listen(*tcp, 16) != 0) {
+		int saved = errno;
+
+		if (*udp >= 0)
+			close(*udp);
+		if (*tcp >= 0)
+			close(*tcp);
+		*udp = -1;
+		*tcp = -1;
+		errno = saved;
+		return -1;
+	}
+	return 0;
+}
+
+static pthread_mutex_t relay_started = PTHREAD_MUTEX_INITIALIZER;
+
+int hull_hostnet_relay_running(void)
+{
+	int running;
+
+	pthread_mutex_lock(&relay_started);
+	running = relay_fd >= 0;
+	pthread_mutex_unlock(&relay_started);
+	return running;
+}
+
+/* The relay's threads on `udp` and `tcp`, bound already, under
+ * relay_started: NULL, or why, the sockets then closed. */
+static const char *serve_relay(int udp, int tcp, char *why, size_t cap)
+{
+	pthread_t thread;
+
+	if (first_resolver() != 0) {
+		snprintf(why, cap, "the host's resolv.conf names no nameserver for hull0's relay");
+		close(udp);
+		close(tcp);
+		return why;
+	}
+	relay_fd     = udp;
+	relay_listen = tcp;
+	if (pthread_create(&thread, NULL, relay, NULL) != 0) {
+		snprintf(why, cap, "hull0's DNS relay: %s", strerror(errno));
+		close(relay_fd);
+		close(relay_listen);
+		relay_fd     = -1;
+		relay_listen = -1;
+		return why;
+	}
+	pthread_detach(thread);
+	/* Without TCP the UDP half still answers, as it did. */
+	if (pthread_create(&thread, NULL, relay_accept, NULL) == 0)
+		pthread_detach(thread);
+	return NULL;
+}
+
+const char *hull_hostnet_relay_given(int udp, int tcp, char *why, size_t cap)
+{
+	const char *reason = NULL;
+
+	pthread_mutex_lock(&relay_started);
+	if (relay_fd >= 0) {
+		close(udp);
+		close(tcp);
+	} else {
+		reason = serve_relay(udp, tcp, why, cap);
+	}
+	pthread_mutex_unlock(&relay_started);
+	return reason;
+}
+
 const char *hull_hostnet_relay(char *why, size_t cap)
 {
-	static pthread_mutex_t started = PTHREAD_MUTEX_INITIALIZER;
-	struct sockaddr_in     at = { .sin_family = AF_INET, .sin_port = htons(53) };
-	const char            *reason = NULL;
-	pthread_t              thread;
-	int                    one = 1;
+	const char *reason = NULL;
+	int         udp;
+	int         tcp;
 
-	pthread_mutex_lock(&started);
+	pthread_mutex_lock(&relay_started);
 	if (relay_fd < 0) {
-		inet_pton(AF_INET, BRIDGE_GATEWAY, &at.sin_addr);
-		if (first_resolver() != 0) {
-			snprintf(why, cap, "the host's resolv.conf names no nameserver for hull0's relay");
-			reason = why;
-		} else if ((relay_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)) < 0 ||
-		           setsockopt(relay_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0 ||
-		           bind(relay_fd, (struct sockaddr *)&at, sizeof at) != 0 ||
-		           (relay_listen = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0 ||
-		           setsockopt(relay_listen, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0 ||
-		           bind(relay_listen, (struct sockaddr *)&at, sizeof at) != 0 ||
-		           listen(relay_listen, 16) != 0 ||
-		           pthread_create(&thread, NULL, relay, NULL) != 0) {
+		if (hull_hostnet_relay_sockets(&udp, &tcp) != 0) {
 			snprintf(why, cap, "hull0's DNS relay: %s", strerror(errno));
-			if (relay_fd >= 0)
-				close(relay_fd);
-			if (relay_listen >= 0)
-				close(relay_listen);
-			relay_fd     = -1;
-			relay_listen = -1;
 			reason = why;
 		} else {
-			pthread_detach(thread);
-			/* Without TCP the UDP half still answers, as it did. */
-			if (pthread_create(&thread, NULL, relay_accept, NULL) == 0)
-				pthread_detach(thread);
+			reason = serve_relay(udp, tcp, why, cap);
 		}
 	}
-	pthread_mutex_unlock(&started);
+	pthread_mutex_unlock(&relay_started);
 	return reason;
 }

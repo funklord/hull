@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -24,14 +26,15 @@ const char *hull_root_path(void)
 	return given != NULL ? given : HULL_ROOT_HELPER_PATH;
 }
 
-int hull_root_call(const char *const *args, const uint8_t *input, size_t length, char *why,
-                   size_t cap)
+int hull_root_call(const char *const *args, const uint8_t *input, size_t length, int *fds,
+                   unsigned fd_count, char *why, size_t cap)
 {
 	const char                *path = hull_root_path();
 	char                      *argv[48];
 	unsigned                   n = 0u;
 	int                        said[2] = { -1, -1 };
 	int                        fed[2] = { -1, -1 };
+	int                        given[2] = { -1, -1 };
 	pid_t                      pid;
 	int                        status = 0;
 	size_t                     got = 0u;
@@ -56,7 +59,21 @@ int hull_root_call(const char *const *args, const uint8_t *input, size_t length,
 		}
 		return -1;
 	}
+	for (unsigned i = 0u; fds != NULL && i < fd_count; i++)
+		fds[i] = -1;
+	if (fds != NULL && socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, given) != 0) {
+		snprintf(why, cap, "hull-root: %s", strerror(errno));
+		close(said[0]);
+		close(said[1]);
+		if (input != NULL) {
+			close(fed[0]);
+			close(fed[1]);
+		}
+		return -1;
+	}
 	posix_spawn_file_actions_init(&actions);
+	if (fds != NULL)
+		posix_spawn_file_actions_adddup2(&actions, given[1], 3);
 	posix_spawn_file_actions_adddup2(&actions, said[1], 2);
 	posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0);
 	if (input != NULL)
@@ -74,11 +91,17 @@ int hull_root_call(const char *const *args, const uint8_t *input, size_t length,
 			close(fed[0]);
 			close(fed[1]);
 		}
+		if (fds != NULL) {
+			close(given[0]);
+			close(given[1]);
+		}
 		snprintf(why, cap, "hull-root could not be run: %s", strerror(errno));
 		return -1;
 	}
 	posix_spawn_file_actions_destroy(&actions);
 	close(said[1]);
+	if (fds != NULL)
+		close(given[1]);
 	/* The plan whole before anything is read back: hull-root reads all of
 	 * it before it says a word. A helper gone early is a refusal. */
 	if (input != NULL) {
@@ -105,8 +128,39 @@ int hull_root_call(const char *const *args, const uint8_t *input, size_t length,
 	close(said[0]);
 	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
 		;
+	/* What it handed back, queued on the socket until it is read. */
+	if (fds != NULL) {
+		char            byte;
+		struct iovec    v = { &byte, 1u };
+		char            control[CMSG_SPACE(4u * sizeof(int))];
+		struct msghdr   message = { .msg_iov = &v, .msg_iovlen = 1u,
+		                            .msg_control = control, .msg_controllen = sizeof control };
+		struct cmsghdr *c;
+
+		if (recvmsg(given[0], &message, MSG_DONTWAIT | MSG_CMSG_CLOEXEC) > 0)
+			for (c = CMSG_FIRSTHDR(&message); c != NULL; c = CMSG_NXTHDR(&message, c))
+				if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
+					unsigned n = (unsigned)((c->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+
+					for (unsigned i = 0u; i < n; i++) {
+						int fd;
+
+						memcpy(&fd, CMSG_DATA(c) + i * sizeof(int), sizeof fd);
+						if (i < fd_count)
+							fds[i] = fd;
+						else
+							close(fd);
+					}
+				}
+		close(given[0]);
+	}
 	if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
 		return 0;
+	for (unsigned i = 0u; fds != NULL && i < fd_count; i++)
+		if (fds[i] >= 0) {
+			close(fds[i]);
+			fds[i] = -1;
+		}
 	if (why[0] == '\0')
 		snprintf(why, cap, "hull-root refused, saying nothing");
 	return -1;

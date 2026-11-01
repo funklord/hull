@@ -71,7 +71,8 @@
  *   serve P N   listen on port N, P tcp or udp, for 20 seconds at most;
  *               greet the one peer over tcp and say the line it sends,
  *               or echo the one datagram over udp and say it
- *   echo N      echo each datagram on udp port N to its sender, until
+ *   echo [A:]N  echo each datagram on udp port N, of address A where it is
+ *               given, to its sender, until
  *               one says `end`, for 20 seconds at most, naming each
  *               sender's port as it first comes, and say how many came
  *   dial A N    connect to address A, port N, over tcp within 5 seconds,
@@ -267,6 +268,19 @@ static void echo(const char *port)
 
 	memset(&at, 0, sizeof at);
 	at.sin_family = AF_INET;
+	/* ADDRESS:PORT binds that address alone, beside another's bind of the
+	 * port on another, as a resolver on 127.0.0.53 sits beside hull0's
+	 * relay; a bare PORT binds them all. */
+	if (strchr(port, ':') != NULL) {
+		char address[64];
+
+		snprintf(address, sizeof address, "%.*s", (int)(strchr(port, ':') - port), port);
+		if (inet_pton(AF_INET, address, &at.sin_addr) != 1) {
+			printf("echo=%s is no IPv4 address\n", address);
+			return;
+		}
+		port = strchr(port, ':') + 1;
+	}
 	at.sin_port   = htons((unsigned short)atoi(port));
 	if (fd < 0 || bind(fd, (struct sockaddr *)&at, sizeof at) != 0) {
 		printf("echo=%s\n", strerror(errno));
