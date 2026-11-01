@@ -2265,7 +2265,7 @@ static uplink *start_uplink(uint32_t address, unsigned prefix, const uint8_t *ad
 	uint32_t    mask = prefix == 0u ? 0u : 0xffffffffu << (32u - prefix);
 	int         pair[2];
 	int         said[2];
-	int         status;
+	int         status = -1;   /* not exited, where waitpid could not say */
 	pid_t       pid;
 	uplink     *up;
 

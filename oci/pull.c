@@ -114,7 +114,7 @@ typedef struct canon {
 
 static void put_bytes(canon *c, const void *bytes, size_t n)
 {
-	if (c->failed)
+	if (c->failed || n == 0u)   /* nothing, onto what may be no buffer yet */
 		return;
 	if (c->length + n > c->cap) {
 		size_t   want = (c->length + n) * 2u + 256u;
