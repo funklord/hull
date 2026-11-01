@@ -84,9 +84,11 @@ static void parse_subnet(const char *text, uint32_t *network, unsigned *prefix)
 	*network = (uint32_t)a << 24 | (uint32_t)b << 16 | (uint32_t)c << 8 | (uint32_t)d;
 }
 
+/* A prefix's mask; 0 for none, a segment with no IPv4 network, which a
+ * shift by 32 does not give: that is undefined in C, and x86 shifts by 0. */
 static uint32_t mask_of(unsigned prefix)
 {
-	return 0xffffffffu << (32u - prefix);
+	return prefix == 0u ? 0u : 0xffffffffu << (32u - prefix);
 }
 
 /* "address/n", which the spec has checked, into its network and prefix. */

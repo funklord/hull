@@ -166,7 +166,8 @@ static int read_dir(image *im, unsigned at)
 		}
 	}
 	closedir(d);
-	qsort(im->nodes + first, im->count - first, sizeof *im->nodes, by_id);
+	if (im->count - first > 1u)
+		qsort(im->nodes + first, im->count - first, sizeof *im->nodes, by_id);
 	for (unsigned i = first + 1u; i < im->count; i++)
 		if (strcmp(im->nodes[i - 1u].id, im->nodes[i].id) == 0)
 			return fail(im, "two names are one on a disc, which knows no case", im->nodes[i].path);

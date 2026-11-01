@@ -1884,7 +1884,8 @@ static void write_upper(hull_machine *m, long *code)
 		(*count)++;
 	}
 	/* Deletions first, a path beneath one already deleted skipped. */
-	qsort(gone, gone_count, sizeof *gone, path_order);
+	if (gone_count > 1u)
+		qsort(gone, gone_count, sizeof *gone, path_order);
 	for (size_t i = 0u; i < gone_count; i++) {
 		char        leaf[256];
 		int         dir;
@@ -1914,7 +1915,8 @@ static void write_upper(hull_machine *m, long *code)
 		}
 		close(dir);
 	}
-	qsort(kept, kept_count, sizeof *kept, path_order);
+	if (kept_count > 1u)
+		qsort(kept, kept_count, sizeof *kept, path_order);
 
 	/* What each added or changed entry is, from the export. */
 	fd = dial();
@@ -2016,7 +2018,7 @@ static void write_upper(hull_machine *m, long *code)
 				full[--length] = '\0';
 		}
 		put = 0;
-		found_kept = strcmp(full, "/") != 0 ?
+		found_kept = strcmp(full, "/") != 0 && kept_count != 0u ?
 		             bsearch(&key, kept, kept_count, sizeof *kept, path_order) : NULL;
 		if (found_kept != NULL &&
 		    (target = upper_of(m, full, (*found_kept)[strlen(*found_kept) + 1u] == 'A', mounts,

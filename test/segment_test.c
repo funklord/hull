@@ -542,7 +542,8 @@ static void send_tcp(int fd, uint8_t me, unsigned flags, uint32_t seq, uint32_t 
 	f[46] = 5u << 4;
 	f[47] = (uint8_t)flags;
 	put16(f + 48, 65535u);
-	memcpy(f + 54, data, length);
+	if (length != 0u)   /* a segment of no data may come with none */
+		memcpy(f + 54, data, length);
 	memcpy(pseudo, f + 26, 8u);
 	pseudo[8] = 0u;
 	pseudo[9] = 6u;

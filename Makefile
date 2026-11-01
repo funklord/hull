@@ -274,7 +274,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all nss root install-root check check-docker check-qemu check-root check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all nss root install-root check check-docker check-qemu check-root check-sanitize sanitize-run check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -294,6 +294,7 @@ help:
 	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
 	@echo '  check-qemu    hull run on the qemu engine, as the user, with KVM'
 	@echo '  check-root    root mode'"'"'s native grants, hull-root setuid, inside a vm'
+	@echo '  check-sanitize  the unit tests, store and pull under ASan and UBSan'
 	@echo '  check-flip    one hull.conf, rsync'"'"'d, run on chroot, vm, emu and docker'
 	@echo '  test      build and run the reader tests, the vectors, then the gate'"'"'s'
 	@echo '  vectors   the described schemas against bytes they must accept and refuse'
@@ -594,6 +595,37 @@ check-flip: $(HULL) $(AGENT_BIN) $(PROBE) $(BUILD_DIR)/test/tree_tar
 check-qemu: $(HULL) $(AGENT_BIN) $(PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/qemu_test.sh '$(HULL)' '$(PROBE)'
 
+# The unit tests, and the store and pull suites, built and run with
+# AddressSanitizer and UndefinedBehaviorSanitizer, in a build directory
+# of their own: a fault that a green run hides -- a NULL handed to qsort,
+# a shift by 32 -- stops the run there. First run 2026-11-01, which found
+# six. Not in `check`, being a second build. The probe is static, which
+# the sanitizers cannot be, so the suites get this build's own.
+SANITIZE_FLAGS = -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+                 -fno-sanitize-recover=undefined
+check-sanitize: $(PROBE)
+	$(MAKE) BUILD_DIR='$(BUILD_DIR)/sanitize' CFLAGS='$(SANITIZE_FLAGS)' \
+		SANITIZE_PROBE='$(abspath $(PROBE))' sanitize-run
+
+sanitize-run: $(filter-out $(BUILD_DIR)/test/tree_tar,$(TEST_BINS)) $(HULL)
+	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test/sexpr_test
+	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test/framing_test
+	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test/spec_test project.md
+	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test/matrix_test
+	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test/registry_test
+	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test/plan_test
+	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test/wire_test
+	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test/sha256_test
+	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test/idmap_test
+	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test/json_test
+	ASAN_OPTIONS=detect_leaks=1 BUILD_DIR='$(BUILD_DIR)' $(BUILD_DIR)/test/runtime_test
+	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test/segment_test
+	ASAN_OPTIONS=detect_leaks=1 BUILD_DIR='$(BUILD_DIR)' $(BUILD_DIR)/test/hostdev_test
+	ASAN_OPTIONS=detect_leaks=1 BUILD_DIR='$(BUILD_DIR)' $(BUILD_DIR)/test/iso_test
+	ASAN_OPTIONS=detect_leaks=0 BUILD_DIR='$(BUILD_DIR)' sh test/store_test.sh '$(HULL)' '$(SITU_MARK)'
+	ASAN_OPTIONS=detect_leaks=0 BUILD_DIR='$(BUILD_DIR)' sh test/pull_test.sh '$(HULL)' \
+		'$(SANITIZE_PROBE)' '$(SITU_MARK)'
+
 # Root mode's native grants with hull-root really setuid root, inside a vm
 # whose guest root is the only root it needs (project.md section 7). Not
 # in `check`, needing KVM as check-qemu does.
@@ -649,3 +681,6 @@ clean:
 	        $(CLI_TEST_FILES) $(PROBE) $(BUILD_DIR)/test/arm64/rootfs/probe \
 	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) \
 	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor
+	@# check-sanitize's own build, cleaned as this one is, by name; one level
+	@# down only, there being no sanitize/sanitize to go on to.
+	@if [ -d '$(BUILD_DIR)/sanitize' ]; then $(MAKE) -s BUILD_DIR='$(BUILD_DIR)/sanitize' clean; fi

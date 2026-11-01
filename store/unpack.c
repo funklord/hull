@@ -90,7 +90,8 @@ void hull_unpack_owners(hull_unpack *u, hull_owner **owners, size_t *count)
 	*count = 0u;
 	if (u == NULL)
 		return;
-	qsort(u->owners, u->owner_count, sizeof u->owners[0], owner_order);
+	if (u->owner_count > 1u)   /* none, the usual image, is no array at all */
+		qsort(u->owners, u->owner_count, sizeof u->owners[0], owner_order);
 	*owners = u->owners;
 	*count = u->owner_count;
 	u->owners = NULL;
@@ -828,7 +829,8 @@ int hull_unpack_end(hull_unpack *u, char *why, size_t cap)
 	/* Deepest first, so that no directory's mode stops one beneath it. A
 	 * directory a later layer took away, or made something else, is
 	 * passed over. */
-	qsort(u->dirs, u->dir_count, sizeof u->dirs[0], depth_order);
+	if (u->dir_count > 1u)
+		qsort(u->dirs, u->dir_count, sizeof u->dirs[0], depth_order);
 	for (size_t i = 0u; i < u->dir_count; i++) {
 		int fd = open_in(u, u->dirs[i].path, O_RDONLY | O_NOFOLLOW);
 
