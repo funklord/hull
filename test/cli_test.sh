@@ -3638,6 +3638,13 @@ mkdir -p "$root/dosroot" "$root/dosvol" "$root/home"
 printf '\264\011\272\014\001\315\041\270\000\114\315\041hello from dos\r\n$' > "$root/dosroot/HELLO.COM"
 printf '\270\003\114\315\041' > "$root/dosroot/EXIT3.COM"
 printf '\353\376' > "$root/dosroot/LOOP.COM"
+# MEM.COM: the XMS driver's total free memory -- its entry by INT 2Fh
+# AX=4310h, function 08h, DX in KB -- shifted to MB and ended with as its
+# ERRORLEVEL. INT 15h AH=88h says none where an XMS driver holds it, as
+# DOSBox's does. Measured: a machine of N MB of RAM ends N-2, the first
+# MB and the HMA not free.
+printf '\270\020\103\315\057\211\036\035\001\214\006\037\001\264\010\377\036\035\001\211\320\261\012\323\350\264\114\315\041\000\000\000\000' \
+	> "$root/dosroot/MEM.COM"
 printf 'from a volume\r\n' > "$root/dosvol/IN.TXT"
 printf 'not a directory\n' > "$root/dosfile"
 # CDCHK asks MSCDEX for the CD-ROM drives (INT 2Fh, AX 1500h) and prints
@@ -3703,6 +3710,28 @@ for dosengine in dosbox dosemu; do
 	from_root 0 '^GREETING=hi' -f "$root/dosenv.conf"
 	from_root 127 "$dosnone" -f "$root/dosnone.conf"
 	from_root 125 'guest path is its drive, /d to /z' -f "$root/dosmnt.conf"
+	# (memory ...): DOSBox's memsize, 8 MB seen as 6 free by XMS where its
+	# own 16 is seen as 14, and more than its 63 refused; a dosemu machine
+	# is refused it at plan, sizing none.
+	dosconf dosmem '(memory "8M") (command "MEM")'
+	case $dosengine in
+	dosbox)
+		dosconf dosmemdef '(command "MEM")'
+		dosconf dosmembig '(memory "64M") (command "MEM")'
+		from_root 6 '' -f "$root/dosmem.conf"
+		from_root 14 '' -f "$root/dosmemdef.conf"
+		from_root 125 'dosbox gives a DOS machine at most 63 MB of memory' -f "$root/dosmembig.conf"
+		;;
+	dosemu)
+		expect 1 'memory: rejected' "$hull" plan -f "$root/dosmem.conf"
+		;;
+	esac
+	# A stored tree as C:, which reaches the engine as the store's
+	# checkout under an overlay, as on chroot.
+	expect 0 '' "$hull" commit "$root/dosroot" dosroot/1
+	printf '(machine (source "dosroot/1") (backend %s) (command "HELLO"))\n' "$dosengine" \
+		> "$root/dosstored.conf"
+	from_root 0 '^hello from dos' -f "$root/dosstored.conf"
 	# A drive the emulator would not mount -- a volume that is a file --
 	# ends 125 with the drive named, where the command used to run
 	# without it.
@@ -3775,7 +3804,7 @@ for dosengine in dosbox dosemu; do
 	[ ! -e "$HOME/.dosbox" ] && [ ! -e "$HOME/.dosemu" ] && [ ! -e "$HOME/.config/pulse" ] ||
 		fail "$dosengine wrote into the user's HOME" "$(ls -A "$HOME")"
 	cases=$((cases + 1))
-	[ -z "$(ls -A "$root/dosroot" | grep -vxE 'HELLO\.COM|EXIT3\.COM|LOOP\.COM|CDCHK\.COM|AUDINFO\.COM')" ] ||
+	[ -z "$(ls -A "$root/dosroot" | grep -vxE 'HELLO\.COM|EXIT3\.COM|LOOP\.COM|CDCHK\.COM|AUDINFO\.COM|MEM\.COM')" ] ||
 		fail "$dosengine left something in the user's C:" "$(ls -A "$root/dosroot")"
 	cases=$((cases + 1))
 	left=$(ls -d "$XDG_RUNTIME_DIR"/hull/"$dosengine"-* 2> /dev/null)

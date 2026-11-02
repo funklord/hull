@@ -35,6 +35,7 @@ struct hull_machine {
 	char            *root;             /* drive C: */
 	int              overlay;          /* (mutable overlay): C: is a copy in `dir` */
 	char            *workdir;
+	unsigned long    memory_mib;       /* (memory ...), or 0 for the emulator's own */
 	char            *argv[HULL_DOS_MAX_ARGS];
 	char            *envp[HULL_DOS_MAX_ENV];
 	char            *volume_host[HULL_DOS_MAX_VOLUMES];
@@ -70,6 +71,7 @@ struct hull_dos_engine {
 	int         space_free;    /* paths may hold no space, the emulator splitting on one */
 	int         images;        /* it mounts a disc image, not only a directory as a disc */
 	const char *makes;         /* a directory it makes in C: for itself, or NULL */
+	unsigned    memory_most;   /* the most (memory ...) it gives, in MiB; 0 if it sizes none */
 	/* The batch and anything else the emulator reads, in m->dir: 0, or -1. */
 	int (*write_files)(const hull_machine *m);
 	/* In the child, after fork: exec the emulator, or return to fail. */

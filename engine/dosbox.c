@@ -83,6 +83,9 @@ static int write_files(const hull_machine *m)
 	ok = write_file(path, text) == 0;
 
 	at = 0u;
+	/* (memory ...): DOSBox's memsize, its megabytes of RAM. */
+	if (m->memory_mib != 0u)
+		ADD("[dosbox]\nmemsize=%lu\n\n", m->memory_mib);
 	ADD("[autoexec]\nmount c \"%s\"\nmount h \"%s\"\n", m->root, m->dir);
 	for (unsigned i = 0u; i < m->volume_count; i++)
 		ADD("mount %c \"%s\"\n", m->volume_drive[i], m->volume_host[i]);
@@ -131,6 +134,7 @@ static const hull_dos_engine flavour = {
 	.not_found    = "Illegal command: ",
 	.space_free   = 0,
 	.images       = 1,
+	.memory_most  = 63,
 	.write_files  = write_files,
 	.exec_child   = exec_child,
 	.end_code     = end_code,
@@ -173,6 +177,9 @@ static const hull_cap_entry entries[] = {
 	{ "media.tar",          HULL_SUP_REJECTED, "not yet: a tar: collection", NULL },
 	{ "media.pack",         HULL_SUP_REJECTED, "not yet: a pack: collection", NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   "a DOS machine here has no network", NULL },
+	{ "memory",             HULL_SUP_NATIVE,
+	  "DOSBox's memsize, its RAM, 1 to 63 MB; cpus has no DOSBox equivalent, cycles being "
+	  "its speed", NULL },
 	{ "security.no_new_privs", HULL_SUP_NATIVE, "set on the DOSBox process", NULL },
 	{ "on_disconnect.stop", HULL_SUP_NATIVE,   NULL, NULL },
 	{ "on_disconnect.keep", HULL_SUP_REJECTED,

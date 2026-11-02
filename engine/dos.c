@@ -305,6 +305,29 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 	m->root = real(hull_access_path(doc, source + 4));
 	free(source);
 	m->workdir = hull_access_value(doc, machine, "workdir");
+	/* J.1's memory, "16M" or bytes, in MiB, for an engine that sizes
+	 * its machine's; the matrix refuses it to one that cannot. */
+	{
+		char *memory = hull_access_value(doc, machine, "memory");
+
+		if (memory != NULL) {
+			char         *end;
+			unsigned long n = strtoul(memory, &end, 10);
+
+			m->memory_mib = *end == 'G' || *end == 'g' ? n * 1024u :
+			                *end == 'M' || *end == 'm' ? n :
+			                *end == 'K' || *end == 'k' ? n / 1024u :
+			                *end == '\0' ? n / (1024u * 1024u) : 0u;
+			free(memory);
+			if (m->memory_mib == 0u)
+				return "memory is less than a MiB, which no DOS machine here is given";
+			if (m->memory_mib > m->engine->memory_most) {
+				snprintf(m->detail, sizeof m->detail, "%s gives a DOS machine at most %u MB "
+				         "of memory", m->engine->name, m->engine->memory_most);
+				return m->detail;
+			}
+		}
+	}
 	{
 		char *mutability = hull_access_value(doc, machine, "mutable");
 
