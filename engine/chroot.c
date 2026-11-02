@@ -3152,8 +3152,9 @@ static void signal_init(hull_machine *m, int signal)
 
 	pthread_mutex_lock(&m->lock);
 	/* Handed over, a signal is the workload's, by hull's init, as without
-	 * the key; a KILL is PID 1's, which ends the namespace whole. */
-	to = m->init != NULL && !m->adopted && signal != SIGKILL && !m->done ? handed_init(m) : 0;
+	 * the key, a machine taken back by a later core as well; a KILL is
+	 * PID 1's, which ends the namespace whole. */
+	to = m->init != NULL && signal != SIGKILL && !m->done ? handed_init(m) : 0;
 	if (to > 0)
 		kill(to, signal);
 	else if (!m->done && m->adopted)
