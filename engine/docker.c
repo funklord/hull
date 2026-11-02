@@ -1449,7 +1449,7 @@ static int read_full(int fd, uint8_t *buffer, size_t n)
 	return 0;
 }
 
-static void export_filtered(hull_machine *m, int from, char *detail, size_t cap);
+static void export_filtered(hull_machine *m, int from, int to, char *detail, size_t cap);
 
 /* The container's root as docker export gives it, into (export PATH)'s
  * file once the workload has ended: the daemon's tar, owners and xattrs as
@@ -1458,20 +1458,21 @@ static void export_filtered(hull_machine *m, int from, char *detail, size_t cap)
  * the body comes unchunked and ends with the connection. A failure empties
  * the file, which no commit takes, says why on the workload's stderr, and
  * makes the end 125, as on chroot. */
-static void export_container(hull_machine *m, long *code)
+/* The container's export asked for, its answer's head read: the
+ * connection, its body the daemon's tar to its end, or -1 with why in
+ * `detail`. */
+static int export_body(const hull_machine *m, char *detail, size_t cap)
 {
-	char    request[256];
-	char    head[4096];
-	char    detail[512] = "";
-	size_t  n = 0u;
-	int     status = 0;
-	int     fd = dial();
+	char   request[256];
+	char   head[4096];
+	size_t n = 0u;
+	int    status = 0;
+	int    fd = dial();
 
 	snprintf(request, sizeof request,
 	         "GET " API "/containers/%s/export HTTP/1.0\r\nHost: docker\r\n\r\n", m->id);
 	if (fd < 0 || send_all(fd, request, strlen(request)) != 0) {
-		snprintf(detail, sizeof detail, "the Docker daemon at %s cannot be reached",
-		         socket_path());
+		snprintf(detail, cap, "the Docker daemon at %s cannot be reached", socket_path());
 	} else {
 		while (n + 1u < sizeof head && read(fd, head + n, 1u) == 1) {
 			n++;
@@ -1479,11 +1480,22 @@ static void export_container(hull_machine *m, long *code)
 				break;
 		}
 		head[n] = '\0';
-		if (sscanf(head, "HTTP/1.%*d %d", &status) != 1 || status != 200)
-			snprintf(detail, sizeof detail, "the daemon answered the export %d", status);
+		if (sscanf(head, "HTTP/1.%*d %d", &status) == 1 && status == 200)
+			return fd;
+		snprintf(detail, cap, "the daemon answered the export %d", status);
 	}
-	if (detail[0] == '\0')
-		export_filtered(m, fd, detail, sizeof detail);
+	if (fd >= 0)
+		close(fd);
+	return -1;
+}
+
+static void export_container(hull_machine *m, long *code)
+{
+	char detail[512] = "";
+	int  fd = export_body(m, detail, sizeof detail);
+
+	if (fd >= 0)
+		export_filtered(m, fd, m->export_fd, detail, sizeof detail);
 	if (detail[0] == '\0' && fsync(m->export_fd) != 0)
 		snprintf(detail, sizeof detail, "writing it: %s", strerror(errno));
 	if (fd >= 0)
@@ -2139,11 +2151,12 @@ static int tree_file(const hull_machine *m, const char *relative, char *found, s
  * other entry, with the pax or long-name headers before it, goes on as
  * the daemon wrote it. Sets `detail` on a failure.
  */
-static void export_filtered_into(hull_machine *m, int from, char *detail, size_t cap,
+static void export_filtered_into(hull_machine *m, int from, int to, char *detail, size_t cap,
                                  uint8_t *held, size_t held_cap, char *name, size_t name_cap);
 
-/* Its buffers its own, the machine's reader thread being one of several. */
-static void export_filtered(hull_machine *m, int from, char *detail, size_t cap)
+/* Its buffers its own, the machine's reader thread being one of several:
+ * the tar `from` reads, docker's own files out, written to `to`. */
+static void export_filtered(hull_machine *m, int from, int to, char *detail, size_t cap)
 {
 	uint8_t *held = malloc(65536u + 1024u);
 	char    *name = malloc(4096u);
@@ -2151,19 +2164,18 @@ static void export_filtered(hull_machine *m, int from, char *detail, size_t cap)
 	if (held == NULL || name == NULL)
 		snprintf(detail, cap, "out of memory");
 	else
-		export_filtered_into(m, from, detail, cap, held, 65536u + 1024u, name, 4096u);
+		export_filtered_into(m, from, to, detail, cap, held, 65536u + 1024u, name, 4096u);
 	free(held);
 	free(name);
 }
 
-static void export_filtered_into(hull_machine *m, int from, char *detail, size_t cap,
+static void export_filtered_into(hull_machine *m, int from, int to, char *detail, size_t cap,
                                  uint8_t *held, size_t held_cap, char *name, size_t name_cap)
 {
 	static const char zeroes[512];
 	size_t         held_length = 0u;
 	tar_in         t;
 	int            sbin = 0;
-	int            to = m->export_fd;
 
 	for (unsigned i = 0u; i < m->tree_count; i++) {
 		char        at[4200];
@@ -3394,7 +3406,28 @@ struct hull_stream {
 	pthread_mutex_t lock;
 	int           tty;     /* on a terminal: one raw stream, not frames */
 	int           dialed;  /* a connection to a port of the container's: raw */
+	/* (tree true): the container's export, filtered by `writer` into
+	 * `tree_to`, the other end of `socket`; its failure, said at the end. */
+	int           tree;
+	int           tree_to;
+	pthread_t     writer;
+	char          tree_detail[512];
 };
+
+/* The writer of a (tree true) stream: the running container's export, as
+ * (export PATH) takes it at the end, docker's own files out. */
+static void *write_tree(void *arg)
+{
+	hull_stream *st = arg;
+	int          fd = export_body(st->machine, st->tree_detail, sizeof st->tree_detail);
+
+	if (fd >= 0) {
+		export_filtered(st->machine, fd, st->tree_to, st->tree_detail, sizeof st->tree_detail);
+		close(fd);
+	}
+	close(st->tree_to);
+	return NULL;
+}
 
 static void *read_exec(void *arg)
 {
@@ -3429,6 +3462,20 @@ static void *read_exec(void *arg)
 			host->on_data(st->core, st, header[0] == 2 ? 2 : 1, buffer, n);
 			size -= (uint32_t)n;
 		}
+	}
+	/* A tree's end is its writer's: 0, or 1 with why. */
+	if (st->tree) {
+		pthread_join(st->writer, NULL);
+		if (st->tree_detail[0] != '\0') {
+			char said[600];
+			int  length = snprintf(said, sizeof said, "hull: the machine's tree: %s\n",
+			                       st->tree_detail);
+
+			if (length > 0)
+				host->on_data(st->core, st, 2, (const uint8_t *)said, (size_t)length);
+		}
+		host->on_exit(st->core, st->machine, st, st->tree_detail[0] != '\0', 0);
+		return NULL;
 	}
 	/* A connection's end is the machine's close, which is 0. */
 	if (st->dialed) {
@@ -3466,13 +3513,45 @@ static hull_status docker_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	if (hull_sexpr_open(&doc, spec.data, spec.len, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
 	    !hull_sexpr_first(&doc, &message))
 		return fail(error, HULL_ERR_UNSUPPORTED, "an exec names a command");
-	/* A running machine's tree, for `hull commit`: docker's exec runs
-	 * the container's programs and none of hull's, so it is not written
-	 * here; (export PATH) gives the tree at the machine's end. */
-	if (hull_access_true(&doc, &message, "tree"))
-		return fail(error, HULL_ERR_UNSUPPORTED, "a running docker machine is not committed "
-		            "yet: (export PATH) writes its tree when it ends, and `hull commit --tar` "
-		            "takes that");
+	/* A running machine's tree, for `hull commit`: no exec in the
+	 * container, whose programs are its own, but docker's export of it
+	 * now, filtered as (export PATH)'s, on the stream's output. */
+	if (hull_access_true(&doc, &message, "tree")) {
+		int ends[2];
+
+		if ((st = calloc(1u, sizeof *st)) == NULL)
+			return fail(error, HULL_ERR_INTERNAL, "out of memory");
+		if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, ends) != 0) {
+			free(st);
+			return fail(error, HULL_ERR_RUNTIME, "the tree's stream could not be made");
+		}
+		st->machine = m;
+		st->core    = core;
+		st->socket  = ends[0];
+		st->tree_to = ends[1];
+		st->tree    = 1;
+		st->tty     = 1;
+		st->ended   = 1;
+		shutdown(st->socket, SHUT_WR);
+		pthread_mutex_init(&st->lock, NULL);
+		if (pthread_create(&st->writer, NULL, write_tree, st) != 0) {
+			close(ends[0]);
+			close(ends[1]);
+			pthread_mutex_destroy(&st->lock);
+			free(st);
+			return fail(error, HULL_ERR_INTERNAL, "the tree's thread could not start");
+		}
+		if (pthread_create(&st->reader, NULL, read_exec, st) != 0) {
+			shutdown(st->socket, SHUT_RDWR);
+			pthread_join(st->writer, NULL);
+			close(ends[0]);
+			pthread_mutex_destroy(&st->lock);
+			free(st);
+			return fail(error, HULL_ERR_INTERNAL, "the reader thread could not start");
+		}
+		*out = st;
+		return HULL_OK;
+	}
 	if (!hull_access_find(&doc, &message, "argv", &argv))
 		return fail(error, HULL_ERR_UNSUPPORTED, "an exec names a command");
 	tty = hull_access_terminal(&doc, &message, &cols, &rows);
@@ -3755,7 +3834,7 @@ static hull_status docker_signal(hull_core *core, hull_machine *m, hull_stream *
 static hull_status docker_stream_close(hull_core *core, hull_stream *st, hull_error *error)
 {
 	docker_stream_eof(core, st, error);
-	if (!st->dialed)
+	if (!st->dialed && !st->tree)
 		signal_exec(st, SIGKILL);
 	shutdown(st->socket, SHUT_RDWR);
 	pthread_join(st->reader, NULL);

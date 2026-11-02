@@ -130,6 +130,30 @@ cases=$((cases + 1))
 committed=$(timeout 60 "$hull" commit --tar "$root/exported.tar" dexported/1 2>&1)
 printf '%s\n' "$committed" | grep -q '^dexported/1 sha256:' ||
 	fail "a docker export did not commit" "$committed"
+# hull commit of a running container: docker's export of it now,
+# filtered as (export PATH)'s -- its write there, its volume's file not,
+# and none of docker's own files.
+conf dlive '(command "sh" "-c" "echo live > /tmp/live; echo ready; sleep 30")' \
+	'(volumes (volume (host "./data") (guest "/data")))'
+rm -f "$root/dlive.out"
+(cd / && exec timeout -k 2 60 "$hull" run -f "$root/dlive.conf" > "$root/dlive.out" 2>&1) &
+runner=$!
+tries=0
+until grep -q '^ready$' "$root/dlive.out" 2>/dev/null || [ "$tries" -ge 80 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+cases=$((cases + 1))
+committed=$(timeout 60 "$hull" commit dtest dlive/1 2>&1)
+shown=$(timeout 30 "$hull" manifest show dlive/1 2>&1)
+printf '%s\n' "$committed" | grep -q '^dlive/1 sha256:' &&
+	printf '%s\n' "$shown" | grep -q '(path "tmp/live")' &&
+	printf '%s\n' "$shown" | grep -q '(path "bin/sh")' &&
+	! printf '%s\n' "$shown" | grep -qE '"data/in"|"\.dockerenv"|"sbin/docker-init"' ||
+	fail "a running container was not committed as its export is" "$committed
+$(printf '%s\n' "$shown" | grep -oE '\(path "[^"]*"\)' | head -20)"
+timeout 10 "$hull" kill -s KILL dtest > /dev/null 2>&1
+wait "$runner" 2>/dev/null
 conf unexported '(export "/proc/hull-no-such/export.tar") (command "true")'
 expect 125 "the export.s file /proc/hull-no-such/export\\.tar: No such file or directory" unexported
 # (owners PATH): owners given in the dir's import, its tar carrying them,
