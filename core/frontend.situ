@@ -37,6 +37,11 @@ const IMPAIR   = ('6' << 24) | (':' << 16) | ('i' << 8) | 'm';
 const TAMPER   = ('6' << 24) | (':' << 16) | ('t' << 8) | 'a';
 const INJECT   = ('6' << 24) | (':' << 16) | ('i' << 8) | 'n';
 const CAPTURE  = ('7' << 24) | (':' << 16) | ('c' << 8) | 'a';
+const LEASE    = ('5' << 24) | (':' << 16) | ('l' << 8) | 'e';
+const FREE     = ('4' << 24) | (':' << 16) | ('f' << 8) | 'r';
+const LEASES   = ('6' << 24) | (':' << 16) | ('l' << 8) | 'e';
+const POOLS    = ('5' << 24) | (':' << 16) | ('p' << 8) | 'o';  // PORTS's, the other way
+const SLOTS    = ('5' << 24) | (':' << 16) | ('s' << 8) | 'l';
 const STARTED  = ('7' << 24) | (':' << 16) | ('s' << 8) | 't';
 const DATA     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'a';
 const EXITED   = ('6' << 24) | (':' << 16) | ('e' << 8) | 'x';
@@ -74,6 +79,10 @@ struct client_message {
 		case TAMPER:  tamper        tamper;
 		case INJECT:  inject        inject;
 		case CAPTURE: capture       capture;
+		case LEASE:   lease_ask     lease;
+		case FREE:    free_lease    free;
+		case LEASES:  leases_ask    leases;
+		case POOLS:   pools_ask     pools;
 		case DATA:    client_data   data;
 		case EOF:     eof           eof;
 		case CREDIT:  credit        credit;
@@ -169,6 +178,53 @@ struct stop {
 	preamble u8[14] = "(10:timeout_ms";
 	atom  milliseconds;
 	preamble u8[2] = "))";
+}
+
+// A lease of `count` slots of a pool (section 4.12), waited for as a run
+// waits, `(wait N)` seconds, 0 not at all; answered `lease`, its id.
+struct lease_ask {
+	preamble u8[7] = "5:lease";
+	channel  ch;
+	preamble u8[8] = "(5:count";
+	atom  count;
+	preamble u8[8] = ")(4:pool";
+	atom  pool;
+	u8  close_pool  [must_eq = ')'];
+	peek u8  after_pool;
+	variant extra switch (after_pool) {
+		case '(':  wait_entry  has_wait;
+		default:   absent      no_wait;
+	}
+	u8  close  [must_eq = ')'];
+}
+
+struct wait_entry {
+	preamble u8[7] = "(4:wait";
+	atom  seconds;
+	u8    close  [must_eq = ')'];
+}
+
+// A lease ended by its holder, its machines stopped first; answered `done`.
+struct free_lease {
+	preamble u8[6] = "4:free";
+	channel  ch;
+	preamble u8[5] = "(2:id";
+	atom  id;
+	preamble u8[2] = "))";
+}
+
+// The leases the core holds, answered `leases`.
+struct leases_ask {
+	preamble u8[8] = "6:leases";
+	channel  ch;
+	u8  close  [must_eq = ')'];
+}
+
+// The pools the user's pools.conf names and their slots, answered `slots`.
+struct pools_ask {
+	preamble u8[7] = "5:pools";
+	channel  ch;
+	u8  close  [must_eq = ')'];
 }
 
 // The machines the core holds, answered `machines`.
@@ -403,6 +459,9 @@ struct core_message {
 		case LOST:      lost        lost;
 		case STATS:     measured    stats;
 		case PORTS:     ports       ports;
+		case LEASE:     leased      lease;
+		case LEASES:    leases      leases;
+		case SLOTS:     slots       slots;
 		case ERROR:     failure     error;
 		default:        unknown     unknown;
 	}
@@ -545,6 +604,29 @@ struct measured {
 	preamble u8[10] = ")(6:memory";
 	atom  memory;
 	preamble u8[2] = "))";
+}
+
+// `lease`'s answer: the lease's id.
+struct leased {
+	preamble u8[7] = "5:lease";
+	channel  ch;
+	preamble u8[5] = "(2:id";
+	atom  id;
+	preamble u8[2] = "))";
+}
+
+// `leases`' answer: each lease, its id, pool, count and machines, framed.
+struct leases {
+	preamble u8[8] = "6:leases";
+	channel  ch;
+	form     items[]  until ")";
+}
+
+// `pools`' answer: each pool, its capacity and its slots, framed.
+struct slots {
+	preamble u8[7] = "5:slots";
+	channel  ch;
+	form     items[]  until ")";
 }
 
 // `segment`'s answer: each port, its machine, and its counts out and in.

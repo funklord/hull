@@ -82,6 +82,7 @@ typedef struct options {
 	int         resolved;
 	int         root_hash;  /* plan --root-hash: each machine's, to accept */
 	long long   wait;       /* run --wait D in seconds, 0 --no-wait, -1 for ever (4.12) */
+	const char *lease;      /* run --lease ID: a slot of that lease's, or NULL */
 	FILE       *stream;  /* where reports go: stdout, or stderr under run */
 	char       *base;    /* the file's directory, absolute */
 } options;
@@ -111,7 +112,10 @@ static void usage(FILE *out)
 	fputs("usage: hull plan [-f FILE] [--backend B] [--accept TOKEN]... [--explain]"
 	      " [--resolved] [--root-hash]\n"
 	      "       hull check [-f FILE] --backend B[,B...] [--accept TOKEN]...\n"
-	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [--wait D|--no-wait] [NAME]\n"
+	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [--wait D|--no-wait]\n"
+	      "                [--lease ID] [NAME]\n"
+	      "       hull reserve POOL [--count N] [--wait D|--no-wait] | hull release ID\n"
+	      "       hull pool ls | hull lease ls\n"
 	      "       hull build [-f FILE] [--check] REF\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
@@ -1579,6 +1583,23 @@ static int draw_names(options *o, const hull_spec *spec, hull_names *names)
 /* `plan` with the plan's `(names ...)` for machine `id` from `names`
  * added: "names" sorts after "machine" and before what the core adds, so
  * it goes last. 0, or -1 where the plan has no room for it. */
+/* `(under ID)`, at the plan's end, before any (wait N). */
+static int add_under(hull_plan *plan, const char *id)
+{
+	char   entry[96];
+	size_t n;
+
+	if (strlen(id) > 40u)
+		return -1;
+	n = (size_t)snprintf(entry, sizeof entry, "(5:under%zu:%s))", strlen(id), id);
+	if (plan->canonical_length == 0u ||
+	    plan->canonical_length - 1u + n > sizeof plan->canonical)
+		return -1;
+	memcpy(plan->canonical + plan->canonical_length - 1u, entry, n);
+	plan->canonical_length += (uint32_t)(n - 1u);
+	return 0;
+}
+
 /* `(wait N)`, seconds, last in the plan, which no key sorts after. */
 static int add_wait(hull_plan *plan, long long seconds)
 {
@@ -1753,6 +1774,12 @@ static int prepare_run(options *o, const hull_registry *registry, hull_spec *spe
 	if (add_names(&plan, names, id) != 0) {
 		fprintf(stderr, "%s: %s: not run: its segments' names do not fit in its plan\n", o->file,
 		        shown);
+		return 125;
+	}
+	/* A slot of a lease's, `(under ID)`, which sorts after root and
+	 * before wait (section 4.12). */
+	if (o->lease != NULL && add_under(&plan, o->lease) != 0) {
+		fprintf(stderr, "%s: %s: not run: its lease does not fit in its plan\n", o->file, shown);
 		return 125;
 	}
 	/* A slot of its pool waited for so long, or not at all, where the
@@ -3859,6 +3886,181 @@ static int commit_from(const char *dir, const char *ref, const char *arch, int f
 	return 0;
 }
 
+/* --- pools and leases (section 4.12) ----------------------------------- */
+
+/* `m` asked of the core on channel 1, and its answer into `body`, what
+ * it says on fd 2 meanwhile -- a wait -- written to stderr: 0, 1 having
+ * said the core's refusal, with its status in `*status`, or 2. */
+static int ask_core(hull_wire *wire, hull_msg *m, hull_sexpr_doc *body, int *status, int start)
+{
+	int connected = connect_core(wire, start);
+
+	if (connected != 0) {
+		hull_msg_free(m);
+		if (connected == 1)
+			fprintf(stderr, "hull: no core is running, so no lease is held\n");
+		*status = connected == 1 ? 1 : 2;
+		return 1;
+	}
+	hull_wire_send(wire->fd, m);
+	hull_msg_free(m);
+	for (;;) {
+		hull_sexpr_form value;
+
+		if (hull_wire_read(wire, body) != HULL_WIRE_OK) {
+			fprintf(stderr, "hull: the core went away\n");
+			*status = 2;
+			return 1;
+		}
+		if (hull_msg_is(body, "data") && hull_msg_find(body, "buf", &value)) {
+			write_all(2, body->data + value.content, value.content_length);
+			continue;
+		}
+		if (hull_msg_is(body, "error")) {
+			char reason[512] = "an error";
+
+			if (hull_msg_find(body, "reason", &value))
+				hull_msg_string(body, &value, reason, sizeof reason);
+			fprintf(stderr, "hull: %s\n", reason);
+			*status = refused_status(reason);
+			return 1;
+		}
+		return 0;
+	}
+}
+
+/* `hull reserve POOL [--count N] [--wait D|--no-wait]`: a lease's id,
+ * alone on stdout, so that `lease=$(hull reserve ci)` takes it. */
+static int reserve(int argc, char **argv)
+{
+	hull_wire       wire;
+	hull_sexpr_doc  body;
+	hull_sexpr_form value;
+	hull_msg        m = { 0 };
+	const char     *pool = NULL;
+	long long       count = 1;
+	long long       wait = -1;
+	int             status = 0;
+	char            id[64] = "";
+
+	for (int i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--count") == 0 && i + 1 < argc)
+			count = strtoll(argv[++i], NULL, 10);
+		else if (strcmp(argv[i], "--wait") == 0 && i + 1 < argc)
+			wait = seconds_of(argv[++i]) > 0 ? seconds_of(argv[i]) : -2;
+		else if (strcmp(argv[i], "--no-wait") == 0)
+			wait = 0;
+		else if (argv[i][0] != '-' && pool == NULL)
+			pool = argv[i];
+		else
+			pool = NULL, i = argc;
+	}
+	if (pool == NULL || count < 1 || wait == -2) {
+		usage(stderr);
+		return 2;
+	}
+	hull_msg_raw(&m, "(5:lease");
+	hull_msg_channel(&m, 1u);
+	hull_msg_raw(&m, "(5:count");
+	hull_msg_number(&m, count);
+	hull_msg_raw(&m, ")(4:pool");
+	hull_msg_text(&m, pool);
+	hull_msg_raw(&m, ")");
+	if (wait >= 0) {
+		hull_msg_raw(&m, "(4:wait");
+		hull_msg_number(&m, wait);
+		hull_msg_raw(&m, ")");
+	}
+	hull_msg_raw(&m, ")");
+	/* The core is started for it, as for a run: a lease is the core's. */
+	if (ask_core(&wire, &m, &body, &status, 1) != 0)
+		return status;
+	if (!hull_msg_is(&body, "lease") || !hull_msg_find(&body, "id", &value) ||
+	    !hull_msg_string(&body, &value, id, sizeof id)) {
+		hull_wire_close(&wire);
+		fprintf(stderr, "hull: the core's answer to a lease is not one\n");
+		return 2;
+	}
+	hull_wire_close(&wire);
+	printf("%s\n", id);
+	return 0;
+}
+
+/* `hull release ID`: the lease ended, its machines stopped first. */
+static int release(const char *id)
+{
+	hull_wire      wire;
+	hull_sexpr_doc body;
+	hull_msg       m = { 0 };
+	int            status = 0;
+
+	hull_msg_raw(&m, "(4:free");
+	hull_msg_channel(&m, 1u);
+	hull_msg_raw(&m, "(2:id");
+	hull_msg_text(&m, id);
+	hull_msg_raw(&m, "))");
+	if (ask_core(&wire, &m, &body, &status, 1) != 0)
+		return status;
+	/* The answer is read before the wire it lies in is let go of. */
+	status = hull_msg_is(&body, "done") ? 0 : 2;
+	hull_wire_close(&wire);
+	return status;
+}
+
+/* `hull lease ls` and `hull pool ls`: one line a record, its columns
+ * fixed, a header first, as `hull ps` prints. */
+static int list_of(int pools)
+{
+	static const char *const lease_keys[] = { "id", "pool", "count", "machines" };
+	static const char *const pool_keys[]  = { "name", "capacity", "held", "waiting" };
+	const char *const       *keys = pools ? pool_keys : lease_keys;
+	hull_wire                wire;
+	hull_sexpr_doc           body;
+	hull_sexpr_form          message;
+	hull_sexpr_form          item;
+	hull_msg                 m = { 0 };
+	int                      status = 0;
+
+	hull_msg_raw(&m, pools ? "(5:pools" : "(6:leases");
+	hull_msg_channel(&m, 1u);
+	hull_msg_raw(&m, ")");
+	if (pools)
+		printf("%-24s %-9s %-6s %s\n", "POOL", "CAPACITY", "HELD", "WAITING");
+	else
+		printf("%-24s %-24s %-6s %s\n", "ID", "POOL", "COUNT", "MACHINES");
+	/* The core is started to say: a lease outlives the core that made
+	 * it, kept in hull/leases/, and the next one reads it back. */
+	if (ask_core(&wire, &m, &body, &status, 1) != 0)
+		return status;
+	hull_sexpr_first(&body, &message);
+	hull_sexpr_child(&body, &message, &item);
+	while (hull_sexpr_next(&body, &item, &item)) {
+		char            values[4][64] = { "", "", "", "" };
+		hull_sexpr_form head;
+
+		if (item.kind != HULL_SEXPR_LIST || !hull_sexpr_child(&body, &item, &head) ||
+		    !hull_sexpr_is(&body, &head, pools ? "pool" : "lease"))
+			continue;
+		for (unsigned k = 0u; k < 4u; k++) {
+			hull_sexpr_form value;
+
+			if (hull_access_find(&body, &item, keys[k], &value)) {
+				hull_sexpr_form name;
+				hull_sexpr_form v;
+
+				if (hull_sexpr_child(&body, &value, &name) && hull_sexpr_next(&body, &name, &v))
+					hull_msg_string(&body, &v, values[k], sizeof values[k]);
+			}
+		}
+		if (pools)
+			printf("%-24s %-9s %-6s %s\n", values[0], values[1], values[2], values[3]);
+		else
+			printf("%-24s %-24s %-6s %s\n", values[0], values[1], values[2], values[3]);
+	}
+	hull_wire_close(&wire);
+	return 0;
+}
+
 static int materialize(const char *ref, const char *dir)
 {
 	hull_store store;
@@ -5402,6 +5604,14 @@ int main(int argc, char **argv)
 		return commit(argv[4], argv[5], argv[3], 0);
 	if (strcmp(command, "materialize") == 0 && argc == 4)
 		return materialize(argv[2], argv[3]);
+	if (strcmp(command, "reserve") == 0 && argc >= 3)
+		return reserve(argc, argv);
+	if (strcmp(command, "release") == 0 && argc == 3)
+		return release(argv[2]);
+	if (strcmp(command, "lease") == 0 && argc == 3 && strcmp(argv[2], "ls") == 0)
+		return list_of(0);
+	if (strcmp(command, "pool") == 0 && argc == 3 && strcmp(argv[2], "ls") == 0)
+		return list_of(1);
 	if (strcmp(command, "images") == 0 && argc == 2)
 		return images();
 	if (strcmp(command, "diff") == 0 && argc == 4)
@@ -5574,6 +5784,8 @@ int main(int argc, char **argv)
 			}
 		} else if (strcmp(arg, "--no-wait") == 0 && strcmp(command, "run") == 0) {
 			o.wait = 0;
+		} else if (strcmp(arg, "--lease") == 0 && i + 1 < argc && strcmp(command, "run") == 0) {
+			o.lease = argv[++i];
 		} else if (strcmp(arg, "--check") == 0 && strcmp(command, "build") == 0) {
 			check = 1;
 		} else if ((strcmp(command, "run") == 0 || strcmp(command, "build") == 0 ||

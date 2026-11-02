@@ -166,3 +166,21 @@ client_message capture_without_channel 28 37 3A 63 61 70 74 75 72 65 28 36 3A 66
 # hello_commit_alone: (5:hello(2:ch1:0)(6:commit5:a-b-c)(5:proto1:1))
 # client_hello: a commit is said with its executable
 client_message hello_commit_alone 28 35 3A 68 65 6C 6C 6F 28 32 3A 63 68 31 3A 30 29 28 36 3A 63 6F 6D 6D 69 74 35 3A 61 2D 62 2D 63 29 28 35 3A 70 72 6F 74 6F 31 3A 31 29 29
+
+# Pools and leases (project.md section 4.12).
+
+# lease_no_count: (5:lease(2:ch1:7)(4:pool2:ci))
+# lease: the count is required
+client_message lease_no_count 28 35 3A 6C 65 61 73 65 28 32 3A 63 68 31 3A 37 29 28 34 3A 70 6F 6F 6C 32 3A 63 69 29 29
+
+# lease_wait_bad: (5:lease(2:ch1:7)(5:count1:1)(4:pool2:ci)(4:wake2:30))
+# lease: what follows the pool is a wait or nothing
+client_message lease_wait_bad 28 35 3A 6C 65 61 73 65 28 32 3A 63 68 31 3A 37 29 28 35 3A 63 6F 75 6E 74 31 3A 31 29 28 34 3A 70 6F 6F 6C 32 3A 63 69 29 28 34 3A 77 61 6B 65 32 3A 33 30 29 29
+
+# free_no_id: (4:free(2:ch1:7))
+# free: the lease id is required
+client_message free_no_id 28 34 3A 66 72 65 65 28 32 3A 63 68 31 3A 37 29 29
+
+# leased_no_id: (5:lease(2:ch1:7))
+# lease: its answer carries the id
+core_message leased_no_id 28 35 3A 6C 65 61 73 65 28 32 3A 63 68 31 3A 37 29 29

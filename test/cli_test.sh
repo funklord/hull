@@ -3088,6 +3088,36 @@ out=$(cd / && timeout 30 "$hull" run -f "$root/pnext.conf" 2>&1)
 	fail "a run that waits for a slot did not say so, or did not run once it freed" "$out"
 wait "$pholder" 2>/dev/null
 expect 125 'pool nosuchpool is not one the user.s pools.conf names' "$hull" run -f "$root/pnowhere.conf"
+# Leases: a pool of two, one slot leased and its id alone on stdout; the
+# lease and the pool listed; a machine run under the lease, a second
+# refused it; a lease of more than the pool has refused; the lease's
+# file in hull/leases, which a later core reads back; and released, gone.
+printf '(pools (tpool (capacity 2)))\n' > "$root/home/.config/hull/pools.conf"
+cases=$((cases + 1))
+lease=$(timeout 20 "$hull" reserve tpool 2>&1)
+printf '%s\n' "$lease" | grep -Eqx 'lease-[0-9a-f]{8}' ||
+	fail "hull reserve did not print a lease's id alone" "$lease"
+expect 0 "^$lease +tpool +1 +0\$" "$hull" lease ls
+expect 0 '^tpool +2 +1 +0$' "$hull" pool ls
+conf plow '(pool "tpool") (hostname "plow") (command "/probe" "say" "ready" "sleep" "3")'
+rm -f "$root/plow.out"
+(cd / && exec timeout -k 2 30 "$hull_abs" run --lease "$lease" -f "$root/plow.conf" > "$root/plow.out" 2>&1) &
+plow=$!
+tries=0
+until grep -q '^ready$' "$root/plow.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+expect 0 "^$lease +tpool +1 +1\$" "$hull" lease ls
+expect 125 "lease $lease.s 1 slots are in use" "$hull" run --lease "$lease" -f "$root/pnext.conf"
+wait "$plow" 2>/dev/null
+expect 125 'pool tpool has 2 slots, and the lease asks 3' "$hull" reserve tpool --count 3
+cases=$((cases + 1))
+[ -f "$XDG_RUNTIME_DIR/hull/leases/$lease" ] ||
+	fail "a lease was not kept in hull/leases" "$(ls "$XDG_RUNTIME_DIR/hull/leases" 2>&1)"
+expect 0 '' "$hull" release "$lease"
+expect 0 '^tpool +2 +0 +0$' "$hull" pool ls
+expect 125 'no such lease is held' "$hull" release "$lease"
 rm -f "$root/home/.config/hull/pools.conf"
 # cpus and memory: a systemd scope the init is moved into before its
 # workload, asked of the manager by busctl. Faked here, with a core of its
