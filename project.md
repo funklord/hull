@@ -1156,7 +1156,7 @@ Open:
 - **It needs a terminal,** and says so without one.
 - **Measured:** in `test/cli_test.sh` and `test/qemu_test.sh`, the probe stands in as the machine's `/bin/sh` and says what it was given. In `test/docker_test.sh`, alpine's own shell is typed at through `script` and reports its TERM and its terminal.
 - **Sabotage,** baseline first, in scratch copies. Breaking each of these failed a named case: passing TERM, the terminal, the login, and the refusal without a terminal. Passing TERM failed on docker's real shell as well.
-- **Not yet, and why:** §8.1's first half, proxying to the machine's sshd when it runs one. What that buys is the machine's own SSH identity, its host key, and nothing provisions or pins host keys until Phase 2 (§12). Until then, a machine that publishes port 22 is reached with `ssh -p PORT` on its address.
+- **Built since, in §8.1:** proxying to the machine's own sshd, which this entry listed as not yet. `(ssh true)` has the agent supervise the image's sshd on the guest's port 22 with a host key the core keeps per machine, and `hull ssh` and `hull proxy-ssh` reach it, held in `test/qemu_test.sh` with a stub sshd. What §8.1 leaves is a hull-bundled sshd for a bare rootfs, the holder's.
 
 ### 4.11 The qemu engine, and the guest agent
 
