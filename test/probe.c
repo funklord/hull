@@ -78,6 +78,9 @@
  *   dial A N    connect to address A, port N, over tcp within 5 seconds,
  *               and say, after A:N, the first line it sends or why it
  *               could not
+ *   listening N exit 0 where a tcp socket listens on port N, else 1,
+ *               saying nothing: a (ready ...) check that, unlike a dial,
+ *               spends none of a one-peer serve's connection
  *   pour N B    listen on tcp port N, for 20 seconds at most, and send
  *               the one peer B bytes of spew's, then close; a peer that
  *               goes is said, SIGPIPE being ignored from then on
@@ -362,6 +365,35 @@ static void serve(const char *proto, const char *port)
 		close(peer);
 	}
 	close(fd);
+}
+
+/* Whether a tcp socket, of either family, listens on `port`: a line of
+ * /proc/net/tcp or tcp6 whose local port is it, its state 0A, LISTEN. */
+static int listening(const char *port)
+{
+	unsigned want = (unsigned)strtoul(port, NULL, 10);
+
+	for (int i = 0; i < 2; i++) {
+		FILE *table = fopen(i == 0 ? "/proc/net/tcp" : "/proc/net/tcp6", "r");
+		char  line[512];
+
+		while (table != NULL && fgets(line, sizeof line, table) != NULL) {
+			char     local[64];
+			unsigned state;
+			char    *colon;
+
+			if (sscanf(line, " %*s %63s %*s %x", local, &state) != 2 || state != 0x0Au ||
+			    (colon = strrchr(local, ':')) == NULL)
+				continue;
+			if ((unsigned)strtoul(colon + 1, NULL, 16) == want) {
+				fclose(table);
+				return 1;
+			}
+		}
+		if (table != NULL)
+			fclose(table);
+	}
+	return 0;
 }
 
 static void dial(const char *address, const char *port)
@@ -1441,6 +1473,8 @@ int main(int argc, char **argv)
 		} else if (strcmp(step, "echo") == 0) {
 			echo(arg);
 			i++;
+		} else if (strcmp(step, "listening") == 0) {
+			return listening(arg) ? 0 : 1;
 		} else if (strcmp(step, "dial") == 0 && i + 2 < argc) {
 			dial(arg, argv[i + 2]);
 			i += 2;

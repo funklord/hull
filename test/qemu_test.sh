@@ -399,11 +399,21 @@ conf loner "(backend vm) (mutable overlay) (hostname \"loner\") (segments \"else
 	'(command "/probe" "link" "eth1" "hear" "eth1")'
 # The core's descriptors, counted before and after: each port goes once
 # its qemu has, which it does only if the core keeps no end of its own.
+# Given 20 s to settle, a qemu's end being slow to be reaped on a loaded
+# host; a count that does not, lists what the core holds. The anchor is on
+# a segment of its own, so that the core's switch, whose thread and wake
+# pipe last as long as the core, is running before the first count: a
+# core new since the last segment case, which a loaded host's idle-out
+# gives, otherwise counted the switch's pipe as kept.
 # A chroot machine that waits holds the core meanwhile, which would
 # otherwise leave a second after the last machine, and be counted gone.
 # Its ceiling is well above the cases' own: at a load of 212 they outlived
 # its 120 s, and the core idled out before its descriptors were counted.
-conf anchor '(backend chroot) (hostname "anchor") (command "/probe" "say" "ready" "wait")'
+# It sleeps to just under that ceiling, killed when the cases are done:
+# the probe's `wait` ends at 20 s whatever the ceiling, which at a load of
+# 80 the segment cases outlived, the core counted gone again.
+conf anchor "(backend chroot) (hostname \"anchor\") (segments \"anchor-$$\")" \
+	'(command "/probe" "say" "ready" "sleep" "280")'
 (cd / && exec timeout 300 "$hull" run -f "$root/anchor.conf" > "$root/anchor.out" 2>&1) &
 anchored=$!
 tries=0
@@ -440,7 +450,7 @@ name=loner
 has 0 '^hear=nothing$'
 tries=0
 fds_after=$(ls "/proc/$core/fd" 2>/dev/null | wc -l)
-while [ "$fds_after" -ne "$fds_before" ] && [ "$tries" -lt 20 ]; do
+while [ "$fds_after" -ne "$fds_before" ] && [ "$tries" -lt 80 ]; do
 	tries=$((tries + 1))
 	sleep 0.25
 	fds_after=$(ls "/proc/$core/fd" 2>/dev/null | wc -l)
@@ -449,7 +459,8 @@ cases=$((cases + 1))
 [ -n "$core" ] && [ -d "/proc/$core" ] && [ "$fds_before" -gt 0 ] &&
 	[ "$fds_after" -eq "$fds_before" ] ||
 	fail "the core kept descriptors of a segment's machines" \
-		"core ${core:-none}: $fds_before before, $fds_after after"
+		"core ${core:-none}: $fds_before before, $fds_after after
+$(ls -l "/proc/$core/fd" 2>&1)"
 # A chroot machine and a vm on one segment: the chroot's tap and the
 # vm's NIC frame alike on the core's switch, so the chroot hears the vm
 # from the vm's own MAC; and the core keeps no end of the chroot's port.
@@ -467,7 +478,7 @@ cases=$((cases + 1))
 	fail "a chroot machine did not hear a vm on its segment" "vm $shouter_mac: $(cat "$root/mixhear.out")"
 tries=0
 fds_after=$(ls "/proc/$core/fd" 2>/dev/null | wc -l)
-while [ "$fds_after" -ne "$fds_before" ] && [ "$tries" -lt 20 ]; do
+while [ "$fds_after" -ne "$fds_before" ] && [ "$tries" -lt 80 ]; do
 	tries=$((tries + 1))
 	sleep 0.25
 	fds_after=$(ls "/proc/$core/fd" 2>/dev/null | wc -l)
@@ -475,7 +486,8 @@ done
 cases=$((cases + 1))
 [ -d "/proc/$core" ] && [ "$fds_after" -eq "$fds_before" ] ||
 	fail "the core kept descriptors of a chroot machine's segment" \
-		"core ${core:-none}: $fds_before before, $fds_after after"
+		"core ${core:-none}: $fds_before before, $fds_after after
+$(ls -l "/proc/$core/fd" 2>&1)"
 # (devices (serial ...)): a host serial port behind the guest's ttyS0. A
 # pty stands in for the port, its far end held here: the guest's line
 # reaches it through qemu, as a board's console would. And a device no
@@ -540,8 +552,8 @@ for b in sys.argv[1].encode():
 h %= 256 * 254
 print("172.30.%d.%d" % (h // 254, h % 254 + 1))' vcdb)
 printf '(machines (vbweb %s) (vcdb %s))\n' \
-	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network bridge) (command \"/probe\" \"addr\" \"eth0\" \"dial\" \"172.31.0.1\" \"9\" \"dial\" \"10.200.0.1\" \"8081\" \"dial\" \"$vcdb_at\" \"80\" \"read\" \"/etc/resolv.conf\" \"dns\" \"anything.example\" \"dnstcp\" \"anything.example\")" \
-	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network bridge) (command \"/probe\" \"serve\" \"tcp\" \"80\")" \
+	"(source \"dir:./rootfs\") (backend vm) (mutable overlay) (network bridge) (after vcdb) (command \"/probe\" \"addr\" \"eth0\" \"dial\" \"172.31.0.1\" \"9\" \"dial\" \"10.200.0.1\" \"8081\" \"dial\" \"$vcdb_at\" \"80\" \"read\" \"/etc/resolv.conf\" \"dns\" \"anything.example\" \"dnstcp\" \"anything.example\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network bridge) (ready (command \"/probe\" \"listening\" \"80\") (interval \"1s\") (timeout \"60s\")) (command \"/probe\" \"serve\" \"tcp\" \"80\")" \
 	> "$root/vbridge2.conf"
 printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) (network bridge) (bridge "brtest") (command "/probe" "addr" "eth0"))\n' \
 	> "$root/vbrnamed.conf"
@@ -1444,7 +1456,10 @@ else
 	# hull ssh prefers the machine's own sshd where (ssh true) gave it one:
 	# on a terminal of its own (script), it reaches the stub over proxy-ssh
 	# rather than giving the agent's exec shell. The stub speaks the banner
-	# and closes, so the ssh client reports the connection, not a shell.
+	# and closes, so the ssh client reports the connection, not a shell --
+	# in whichever words the race between that close and the client's next
+	# write gives: a closed connection, or, on a loaded host, its write's
+	# broken pipe.
 	sshout=$(HULL="$hull" XDG_RUNTIME_DIR="$sshrt" timeout 30 \
 		script -qec '"$HULL" ssh qssh' /dev/null 2>&1 < /dev/null | tr -d '\r')
 	XDG_RUNTIME_DIR="$sshrt" timeout 30 "$hull" stop qssh > /dev/null 2>&1
@@ -1467,7 +1482,8 @@ else
 	esac
 	cases=$((cases + 1))
 	case $sshout in
-	*SSH-2.0-hull-stub*|*"Connection closed"*|*kex_exchange_identification*) ;;
+	*SSH-2.0-hull-stub*|*"Connection closed"*|*kex_exchange_identification*|\
+	*"ssh_dispatch_run_fatal: Connection to UNKNOWN port 65535: Broken pipe"*) ;;
 	*) fail "hull ssh did not use the machine's own sshd for an (ssh true) machine" "$sshout" ;;
 	esac
 	# The host key is machine state: a second run reuses the one kept under
