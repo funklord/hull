@@ -447,6 +447,9 @@ mkdir -p "$root/rootfs/srv"
 # must read a known, benign key rather than whatever the account has. Set
 # before the first run below, which starts the core that reads it.
 export HOME="$root/home"
+# And its config, where pools.conf is read (section 4.12), whatever the
+# account's XDG_CONFIG_HOME says.
+export XDG_CONFIG_HOME="$root/home/.config"
 mkdir -p "$root/home/.ssh"
 chmod 700 "$root/home/.ssh"
 printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5hulltestkey hull-test\n' > "$root/home/.ssh/id_ed25519.pub"
@@ -3053,6 +3056,39 @@ out=$(timeout 30 "$hull" commit nosuchmachine live/2 2>&1)
 	! printf '%s\n' "$out" | grep -q 'ends before its end' ||
 	fail "a commit of no machine was not refused by its reason alone" "$out"
 rm -rf "${root:?}/livevol"
+# Pools (section 4.12): a pool of one slot, held by a machine that sleeps.
+# A run that does not wait is refused at once, 75; one that waits a second
+# says it waits, then is refused, 75; one that waits for ever says so and
+# runs once the slot frees. A pool pools.conf does not name is refused.
+mkdir -p "$root/home/.config/hull"
+printf '(pools (tpool (capacity 1)))\n' > "$root/home/.config/hull/pools.conf"
+conf pholder '(pool "tpool") (hostname "pholder") (command "/probe" "say" "ready" "sleep" "4")'
+conf pnext '(pool "tpool") (hostname "pnext") (command "/probe" "say" "ran")'
+conf pnowhere '(pool "nosuchpool") (hostname "pnowhere") (command "/probe" "say" "ran")'
+expect 0 'pool: native: hull.s own' "$hull" plan --explain -f "$root/pnext.conf"
+rm -f "$root/pholder.out"
+(cd / && exec timeout -k 2 30 "$hull_abs" run -f "$root/pholder.conf" > "$root/pholder.out" 2>&1) &
+pholder=$!
+tries=0
+until grep -q '^ready$' "$root/pholder.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+expect 75 'no slot of pool tpool: 1 of 1 in use, and the run does not wait' \
+	"$hull" run --no-wait -f "$root/pnext.conf"
+cases=$((cases + 1))
+out=$(cd / && timeout 30 "$hull" run --wait 1s -f "$root/pnext.conf" 2>&1)
+[ $? = 75 ] && printf '%s\n' "$out" | grep -q 'waiting for a slot of pool tpool: 1 of 1 in use, place 1 in line' &&
+	printf '%s\n' "$out" | grep -q 'no slot of pool tpool within 1s' ||
+	fail "a run that waits a second for a slot did not say so and end 75" "$out"
+cases=$((cases + 1))
+out=$(cd / && timeout 30 "$hull" run -f "$root/pnext.conf" 2>&1)
+[ $? = 0 ] && printf '%s\n' "$out" | grep -q 'waiting for a slot of pool tpool' &&
+	printf '%s\n' "$out" | grep -qx 'ran' ||
+	fail "a run that waits for a slot did not say so, or did not run once it freed" "$out"
+wait "$pholder" 2>/dev/null
+expect 125 'pool nosuchpool is not one the user.s pools.conf names' "$hull" run -f "$root/pnowhere.conf"
+rm -f "$root/home/.config/hull/pools.conf"
 # cpus and memory: a systemd scope the init is moved into before its
 # workload, asked of the manager by busctl. Faked here, with a core of its
 # own so that it sees the fake on its PATH: what it is asked, a manager

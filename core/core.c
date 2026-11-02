@@ -136,6 +136,7 @@ struct slot {
 	const hull_engine *engine;
 	char               class_name[8];
 	char               arch[16];       /* the plan's (arch ...), or "" for the host's */
+	char               pool[64];       /* the plan's (pool ...), or "" for none (4.12) */
 	hull_core          core;
 	hull_machine      *handle;
 	char               state[16];
@@ -1993,8 +1994,7 @@ static const char *named_of(slot *s, const hull_sexpr_doc *doc, const hull_sexpr
 			free(flag);
 			flag = hull_access_find(doc, &names, segment, &record) ?
 			       hull_access_value(doc, &record, "advertise_lifetime") : NULL;
-			s->named[s->named_count].lifetime =
-				flag != NULL ? (unsigned)strtoul(flag, NULL, 10) : 0u;
+			s->named[s->named_count].lifetime = flag != NULL ? (unsigned)strtoul(flag, NULL, 10) : 0u;
 			free(flag);
 			flag = hull_access_find(doc, &names, segment, &record) ?
 			       hull_access_value(doc, &record, "gateway") : NULL;
@@ -2155,6 +2155,189 @@ static int root_of(const hull_sexpr_doc *doc, char *hash, size_t hash_cap, char 
 	return 1;
 }
 
+/* --- pools (section 4.12) ------------------------------------------------ */
+
+/* A run waiting for a slot of its pool, first come first served: its
+ * request whole, its frontend's, and how long it waits. */
+#define MAX_WAITING 64u
+#define NOTICE_MS   60000LL
+
+typedef struct waiting {
+	int       used;
+	unsigned  client;
+	unsigned  generation;
+	uint32_t  ch;
+	uint8_t  *body;
+	size_t    length;
+	char      pool[64];
+	long long since;
+	long long until;      /* when it gives up, or 0 for never */
+	long long noticed;    /* when it last said it waits */
+} waiting;
+
+static waiting   waiters[MAX_WAITING];
+static int       admitting;   /* handle_run called by admit_waiting: its turn has come */
+static long long monotonic_ms(void);
+static void      handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body);
+
+/* A pool's capacity, from the user's pools.conf, `(pools (NAME (capacity
+ * N)) ...)`: N, 0 where the file names the pool with no capacity, or -1
+ * where it does not name it, or there is no file. Read at each run, so
+ * what the file says is what a run meets, with no state of the core's. */
+static long long pool_capacity(const char *pool)
+{
+	const char     *config = getenv("XDG_CONFIG_HOME");
+	const char     *home   = getenv("HOME");
+	char            path[4200];
+	uint8_t        *text;
+	size_t          length = 0u;
+	hull_sexpr_doc  doc;
+	hull_sexpr_form top;
+	hull_sexpr_form entry;
+	long long       capacity = -1;
+	FILE           *file;
+
+	if (config != NULL && config[0] == '/')
+		snprintf(path, sizeof path, "%s/hull/pools.conf", config);
+	else if (home != NULL)
+		snprintf(path, sizeof path, "%s/.config/hull/pools.conf", home);
+	else
+		return -1;
+	if ((file = fopen(path, "re")) == NULL)
+		return -1;
+	text = malloc(65536u);
+	if (text != NULL)
+		length = fread(text, 1u, 65536u, file);
+	fclose(file);
+	if (text != NULL &&
+	    hull_sexpr_open(&doc, text, length, HULL_SEXPR_READABLE, NULL) == HULL_SEXPR_OK &&
+	    hull_sexpr_first(&doc, &top) && hull_access_find(&doc, &top, pool, &entry)) {
+		hull_sexpr_form found;
+		hull_sexpr_form head;
+		hull_sexpr_form value;
+		uint8_t         n[24];
+		size_t          n_length = 0u;
+
+		/* The file is written by hand, its numbers bare: read as the
+		 * spec's values are, not as a canonical plan's atoms. */
+		capacity = 0;
+		if (hull_access_find(&doc, &entry, "capacity", &found) &&
+		    hull_sexpr_child(&doc, &found, &head) && hull_sexpr_next(&doc, &head, &value) &&
+		    hull_sexpr_value(&doc, &value, n, sizeof n - 1u, &n_length) == HULL_SEXPR_OK) {
+			n[n_length] = '\0';
+			capacity = strtoll((const char *)n, NULL, 10);
+		}
+	}
+	free(text);
+	return capacity;
+}
+
+/* The machines in `pool` now, each a slot of it while it runs. */
+static unsigned in_pool(const char *pool)
+{
+	unsigned n = 0u;
+
+	for (unsigned i = 0u; i < MAX_MACHINES; i++)
+		n += machines[i].used && !machines[i].exited && strcmp(machines[i].pool, pool) == 0;
+	return n;
+}
+
+/* Whether a run of `pool` waits already, so that one coming later waits
+ * behind it rather than taking a slot that freed for it. */
+static unsigned waiting_in(const char *pool)
+{
+	unsigned n = 0u;
+
+	for (unsigned i = 0u; i < MAX_WAITING; i++)
+		n += waiters[i].used && strcmp(waiters[i].pool, pool) == 0;
+	return n;
+}
+
+/* A waiting run's place in its pool's line, from 1. */
+static unsigned place_of(const waiting *w)
+{
+	unsigned place = 1u;
+
+	for (unsigned i = 0u; i < MAX_WAITING; i++)
+		place += waiters[i].used && &waiters[i] != w && strcmp(waiters[i].pool, w->pool) == 0 &&
+		         waiters[i].since < w->since;
+	return place;
+}
+
+/* What a wait says on the run's stderr, where a log shows it: the pool,
+ * its slots, the run's place, and how long it has waited. */
+static void say_waiting(waiting *w, long long capacity)
+{
+	char line[256];
+	int  n = snprintf(line, sizeof line, "hull: waiting for a slot of pool %s: %u of %lld in use, "
+	                  "place %u in line, waited %llds\n", w->pool, in_pool(w->pool), capacity,
+	                  place_of(w), (monotonic_ms() - w->since) / 1000);
+
+	if (n > 0)
+		send_data(&clients[w->client], w->ch, 2, (const uint8_t *)line, (size_t)n);
+	w->noticed = monotonic_ms();
+}
+
+/* Each pool's first waiting run: run where its pool has a slot, given up
+ * where its wait has ended, and said again each minute; and any whose
+ * frontend has gone let go of. Again while anything moved, since a run
+ * that went may be followed by the next in its line. */
+static void admit_waiting(void)
+{
+	int moved = 1;
+
+	while (moved) {
+		long long now = monotonic_ms();
+
+		moved = 0;
+		/* Each, wherever it is in its line: gone with its frontend,
+		 * given up at its end, or told again that it waits. */
+		for (unsigned i = 0u; i < MAX_WAITING; i++) {
+			waiting *w = &waiters[i];
+
+			if (!w->used)
+				continue;
+			if (!clients[w->client].used || client_generation[w->client] != w->generation) {
+				free(w->body);
+				*w = (waiting){ 0 };
+			} else if (w->until != 0 && now >= w->until) {
+				char why[200];
+
+				snprintf(why, sizeof why, "no slot of pool %s within %llds", w->pool,
+				         (w->until - w->since) / 1000);
+				send_error(&clients[w->client], w->ch, why);
+				free(w->body);
+				*w = (waiting){ 0 };
+			} else if (now - w->noticed >= NOTICE_MS) {
+				say_waiting(w, pool_capacity(w->pool));
+			}
+		}
+		/* The first in each line, where its pool has a slot now. */
+		for (unsigned i = 0u; i < MAX_WAITING && !moved; i++) {
+			waiting  *w = &waiters[i];
+			long long capacity;
+
+			if (!w->used || place_of(w) != 1u)
+				continue;
+			capacity = pool_capacity(w->pool);
+			if (capacity <= 0 || in_pool(w->pool) < (unsigned)capacity) {
+				waiting        taken = *w;
+				hull_sexpr_doc doc;
+
+				*w = (waiting){ 0 };
+				if (hull_sexpr_open(&doc, taken.body, taken.length, HULL_SEXPR_CANONICAL,
+				                    NULL) == HULL_SEXPR_OK) {
+					admitting = 1;
+					handle_run(&clients[taken.client], taken.ch, &doc);
+					admitting = 0;
+				}
+				free(taken.body);
+				moved = 1;
+			}
+		}
+	}
+}
+
 static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
 	hull_sexpr_form    value;
@@ -2179,6 +2362,7 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	size_t             addressed_length;
 	hull_status        created;
 	char               granted_root[72];
+	char               pool_name[64];
 
 	if (!hull_msg_find(body, "machine", &value) || !hull_msg_string(body, &value, id, sizeof id) ||
 	    !is_label(id)) {
@@ -2199,6 +2383,67 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	if (!hull_access_machine(&plan_doc, plan.data, plan.len, &machine)) {
 		send_error(c, ch, "the plan is not a plan");
 		return;
+	}
+	/* Its pool's slot, or its place in the pool's line (section 4.12):
+	 * before root mode is asked, so that a run that waits is granted and
+	 * recorded only once its turn comes. */
+	pool_name[0] = '\0';
+	{
+		char *pool = hull_access_value(&plan_doc, &machine, "pool");
+
+		if (pool != NULL) {
+			long long capacity = pool_capacity(pool);
+
+			snprintf(pool_name, sizeof pool_name, "%s", pool);
+			free(pool);
+			if (capacity < 0) {
+				char why[300];
+
+				snprintf(why, sizeof why, "pool %s is not one the user's pools.conf names: "
+				         "(pools (%s (capacity N))) in ~/.config/hull/pools.conf",
+				         pool_name, pool_name);
+				send_error(c, ch, why);
+				return;
+			}
+			if (capacity > 0 && (in_pool(pool_name) >= (unsigned)capacity ||
+			                     (!admitting && waiting_in(pool_name) > 0))) {
+				hull_sexpr_form top;
+				char           *text;
+				long long       wait = -1;
+				waiting        *w = NULL;
+
+				hull_sexpr_first(&plan_doc, &top);
+				if ((text = hull_access_value(&plan_doc, &top, "wait")) != NULL)
+					wait = strtoll(text, NULL, 10);
+				free(text);
+				if (wait == 0) {
+					char why[300];
+
+					snprintf(why, sizeof why, "no slot of pool %s: %u of %lld in use, and the "
+					         "run does not wait", pool_name, in_pool(pool_name), capacity);
+					send_error(c, ch, why);
+					return;
+				}
+				for (unsigned i = 0u; i < MAX_WAITING && w == NULL; i++)
+					if (!waiters[i].used)
+						w = &waiters[i];
+				if (w == NULL || (w->body = malloc(body->length)) == NULL) {
+					send_error(c, ch, "the core keeps as many runs waiting as it can");
+					return;
+				}
+				memcpy(w->body, body->data, body->length);
+				w->used       = 1;
+				w->length     = body->length;
+				w->client     = (unsigned)(c - clients);
+				w->generation = client_generation[w->client];
+				w->ch         = ch;
+				w->since      = monotonic_ms();
+				w->until      = wait > 0 ? w->since + wait * 1000 : 0;
+				snprintf(w->pool, sizeof w->pool, "%s", pool_name);
+				say_waiting(w, capacity);
+				return;
+			}
+		}
 	}
 	/* Root mode's machine: hull-root grants it, the host's owner having
 	 * listed this user, this plan and these fields, and records it, or it
@@ -2317,6 +2562,7 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	snprintf(s->address, sizeof s->address, "%s", address);
 	snprintf(s->class_name, sizeof s->class_name, "%s", class_name);
 	snprintf(s->state, sizeof s->state, "creating");
+	snprintf(s->pool, sizeof s->pool, "%s", pool_name);
 	free(class_name);
 	/* Its arch, for what is committed of it while it runs; the host's is
 	 * said by saying none. */
@@ -4019,6 +4265,7 @@ int hull_core_run(const char *host_arch)
 				fds[n++]  = (struct pollfd){ clients[i].wire.fd, events, 0 };
 			}
 		}
+		admit_waiting();
 		busy = any_clients() || running_machines();
 		if (!busy) {
 			long long waited = monotonic_ms() - idle_since;

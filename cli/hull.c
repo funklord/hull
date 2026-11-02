@@ -81,6 +81,7 @@ typedef struct options {
 	int         explain;
 	int         resolved;
 	int         root_hash;  /* plan --root-hash: each machine's, to accept */
+	long long   wait;       /* run --wait D in seconds, 0 --no-wait, -1 for ever (4.12) */
 	FILE       *stream;  /* where reports go: stdout, or stderr under run */
 	char       *base;    /* the file's directory, absolute */
 } options;
@@ -97,12 +98,20 @@ typedef struct report {
 	char                  root_fields[512]; /* those fields, each after a space */
 } report;
 
+/* A run the core refused: 75, EX_TEMPFAIL, where its pool had no slot
+ * within its wait, which a pipeline may try again (section 4.12); else
+ * 125, as every refusal before it. The statuses are an interface. */
+static int refused_status(const char *reason)
+{
+	return strncmp(reason, "no slot of pool ", 16u) == 0 ? 75 : 125;
+}
+
 static void usage(FILE *out)
 {
 	fputs("usage: hull plan [-f FILE] [--backend B] [--accept TOKEN]... [--explain]"
 	      " [--resolved] [--root-hash]\n"
 	      "       hull check [-f FILE] --backend B[,B...] [--accept TOKEN]...\n"
-	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [NAME]\n"
+	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [--wait D|--no-wait] [NAME]\n"
 	      "       hull build [-f FILE] [--check] REF\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
@@ -1293,7 +1302,7 @@ static int follow(hull_wire *wire, uint32_t ch, const char *stop_id)
 			if (hull_msg_find(&body, "reason", &value))
 				hull_msg_string(&body, &value, reason, sizeof reason);
 			fprintf(stderr, "hull: %s\n", reason);
-			return 125;
+			return refused_status(reason);
 		} else if (hull_msg_is(&body, "eof") || hull_msg_is(&body, "done")) {
 			return 0;
 		}
@@ -1570,6 +1579,22 @@ static int draw_names(options *o, const hull_spec *spec, hull_names *names)
 /* `plan` with the plan's `(names ...)` for machine `id` from `names`
  * added: "names" sorts after "machine" and before what the core adds, so
  * it goes last. 0, or -1 where the plan has no room for it. */
+/* `(wait N)`, seconds, last in the plan, which no key sorts after. */
+static int add_wait(hull_plan *plan, long long seconds)
+{
+	char   entry[40];
+	size_t n;
+
+	snprintf(entry, sizeof entry, "%lld", seconds);
+	n = (size_t)snprintf(entry, sizeof entry, "(4:wait%zu:%lld))", strlen(entry), seconds);
+	if (plan->canonical_length == 0u ||
+	    plan->canonical_length - 1u + n > sizeof plan->canonical)
+		return -1;
+	memcpy(plan->canonical + plan->canonical_length - 1u, entry, n);
+	plan->canonical_length += (uint32_t)(n - 1u);
+	return 0;
+}
+
 static int add_names(hull_plan *plan, const hull_names *names, const char *id)
 {
 	unsigned member;
@@ -1728,6 +1753,13 @@ static int prepare_run(options *o, const hull_registry *registry, hull_spec *spe
 	if (add_names(&plan, names, id) != 0) {
 		fprintf(stderr, "%s: %s: not run: its segments' names do not fit in its plan\n", o->file,
 		        shown);
+		return 125;
+	}
+	/* A slot of its pool waited for so long, or not at all, where the
+	 * core would otherwise wait for one for ever (section 4.12): last,
+	 * as no key sorts after it. */
+	if (o->wait >= 0 && add_wait(&plan, o->wait) != 0) {
+		fprintf(stderr, "%s: %s: not run: its wait does not fit in its plan\n", o->file, shown);
 		return 125;
 	}
 	link_notices(o, shown, plan.canonical, plan.canonical_length);
@@ -2255,7 +2287,7 @@ static int run_all(options *o, const hull_registry *registry, hull_spec *spec, u
 			if (hull_msg_find(&body, "reason", &value))
 				hull_msg_string(&body, &value, reason, sizeof reason);
 			fprintf(stderr, "hull: %s: %s\n", m->name, reason);
-			ended = 125;
+			ended = refused_status(reason);
 		} else if (hull_msg_is(&body, "eof") || hull_msg_is(&body, "done")) {
 			ended = 0;
 		}
@@ -3325,7 +3357,7 @@ next_pass:
 			 * engine the step names. */
 			if (ok && has_run) {
 				text_buf conf = { 0 };
-				options  sub = { 0 };
+				options  sub = { .wait = -1 };
 				char     conf_path[4600];
 				char     workdir[4096] = "/";
 				FILE    *f;
@@ -5320,6 +5352,7 @@ int main(int argc, char **argv)
 	int           check  = 0;
 
 	memset(&o, 0, sizeof o);
+	o.wait = -1;
 	/* A service account's job, as a CI server runs one, has no login and
 	 * so no XDG_RUNTIME_DIR: one is chosen, once, here, for the core and
 	 * the engines it starts, and nothing is said of it unless it fails. */
@@ -5534,6 +5567,13 @@ int main(int argc, char **argv)
 			o.resolved = 1;
 		} else if (strcmp(arg, "--root-hash") == 0 && strcmp(command, "plan") == 0) {
 			o.root_hash = 1;
+		} else if (strcmp(arg, "--wait") == 0 && i + 1 < argc && strcmp(command, "run") == 0) {
+			if ((o.wait = seconds_of(argv[++i])) <= 0) {
+				fprintf(stderr, "hull: --wait is a duration: 30s, 5m, 2h\n");
+				return 2;
+			}
+		} else if (strcmp(arg, "--no-wait") == 0 && strcmp(command, "run") == 0) {
+			o.wait = 0;
 		} else if (strcmp(arg, "--check") == 0 && strcmp(command, "build") == 0) {
 			check = 1;
 		} else if ((strcmp(command, "run") == 0 || strcmp(command, "build") == 0 ||

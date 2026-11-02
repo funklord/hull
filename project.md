@@ -1332,9 +1332,11 @@ Three needed more:
 
 ---
 
-### 4.12 Pools, leases and hardware — design, not yet built
+### 4.12 Pools, leases and hardware — software pools built, leases and hardware design
 
-**Asked for by the holder 2026-10-22: a limited collection of machines that can be allocated and reserved, real hardware among them, behind an interface like a test runner's.** Nothing below is written yet; it is the design to build from, and its open questions are the holder's.
+**Asked for by the holder 2026-10-22: a limited collection of machines that can be allocated and reserved, real hardware among them, behind an interface like a test runner's.** What follows is the design to build from, and its open questions are the holder's; the first piece of its order is built, below.
+
+**Built 2026-11-02, the first piece: software pools with a capacity and a queue in the per-user core.** `(pool "ci")` on a machine, a J.1 key, hull's own; `~/.config/hull/pools.conf` (`$XDG_CONFIG_HOME`'s where set) names each pool, `(pools (ci (capacity 4)))`, read by the core at each run so the file is what a run meets, with no state of the core's. A slot is one running machine. A run whose pool is full waits in the core, first come first served: said on its stderr when it starts to wait -- *waiting for a slot of pool ci: 4 of 4 in use, place 1 in line, waited 0s* -- and again each minute, a run that comes while others wait taking its place behind them rather than a slot freed for them; it runs when a slot frees, which the core looks for each second. `hull run --wait D` gives up after D, `--no-wait` at once, each with *no slot of pool ci …* and status 75, EX_TEMPFAIL, the status the design fixes; a pool the file does not name, or no file, is refused, 125. Nothing waits without saying so and nothing ends that its caller gave no end, the scripted-use rules below. The wait reaches the core as `(wait N)`, seconds, last in the plan, whose entries the run message frames and does not read, so the protocol is unchanged. A pool's capacity is counted in machines only: a budget of memory and cpus is the open question below, and leases, `hull reserve`, `hull pool ls` and the `hw` engine are the rest of the order. **Measured** in `test/cli_test.sh`, a pool of one held by a sleeping machine: a run with `--no-wait` refused at once, 75; one with `--wait 1s` saying it waits and refused, 75; one waiting for ever saying so and running once the slot freed; a pool not named refused; the plan reporting `pool` as hull's own.
 
 **Why software machines want it too.** Every host has limits a run does not see today: a KVM guest's memory is a hard allocation, docker and chroot machines share the CPUs and the disk, and a CI host wants N jobs at once and no more. hull starts whatever it is asked to, so the host is what gives way. A pool makes the limit a thing the core enforces, and gives software machines and boards on a bench one interface, so a test written against a pool of qemu machines runs unchanged against a pool of real boards.
 
@@ -2184,6 +2186,7 @@ with the same schema per machine (machines in one file form a segment, Appendix 
 | `hostname` | string | machine name | Also the ingress DNS label `<name>.hull` (§8.1) |
 | `after` | machine names | none | In `(machines …)` only: the machine starts once each named sibling is up -- started, and ready where it says how. A name not in the file, the machine itself, or a ring is refused (§4.8) |
 | `ready` | `(ready (command …) (interval "D") (timeout "D"))` or `(ready (port N) …)` | interval `1s`, timeout `5m` | In `(machines …)` only: when the machine is up for those `after` it -- its command, run in it, exiting 0, or its own port N taking a connection, one of the two; asked from its start, every interval, and the run stopped at the timeout (§4.8) |
+| `pool` | label | none, unlimited | The pool a machine takes a slot of (§4.12), which the user's `~/.config/hull/pools.conf` names with its capacity, `(pools (ci (capacity 4)))`; hull's own, asked of no engine. A run whose pool is full waits, saying so on stderr and again each minute, until a slot frees: `hull run --wait D` gives up after D, `--no-wait` at once, each ending 75. A pool the file does not name is refused |
 
 ## J.2 `(security …)` (§7)
 

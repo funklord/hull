@@ -741,6 +741,7 @@ static const key machine_keys[] = {
 	{ .name = "devices",       .type = RECORD, .record = &devices },
 	{ .name = "after",         .type = SYMBOLS, .nonempty = 1, .value = label },
 	{ .name = "ready",         .type = RECORD, .record = &ready },
+	{ .name = "pool",          .type = STRING, .value = label },
 };
 static hull_spec_status machine_across(walk *w, const hull_sexpr_form *record,
                                        const hull_sexpr_form *found, uint64_t present);

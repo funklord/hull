@@ -485,11 +485,13 @@ hull_matrix_status hull_matrix_resolve(const hull_spec *spec, const hull_sexpr_f
 			resolve_record(&r, "devices", &entry);
 		else if (hull_sexpr_is(&spec->doc, &key, "backend") ||
 		         hull_sexpr_is(&spec->doc, &key, "restart") ||
-		         hull_sexpr_is(&spec->doc, &key, "env_file")) {
+		         hull_sexpr_is(&spec->doc, &key, "env_file") ||
+		         hull_sexpr_is(&spec->doc, &key, "pool")) {
 			char id[ID_SIZE];
 
 			/* Hull's own: backend chose the engine, the systemd generator
-			 * reads restart, and the core folds env_file into env. */
+			 * reads restart, the core folds env_file into env, and it
+			 * admits a machine to its pool (section 4.12). */
 			join_form(&r, id, NULL, &key);
 			emit(&r, id, HULL_OUTCOME_NATIVE, "hull's own, not the engine's", NULL,
 			     entry.offset);
