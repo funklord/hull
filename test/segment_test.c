@@ -945,8 +945,33 @@ int main(void)
 		expect("down, nothing to y", y, 0);
 		check("down counted as lost into y", counted("lossy", "y", HULL_SEGMENT_IN).lost == 1u &&
 		      counted("lossy", "x", HULL_SEGMENT_OUT).passed == 2u);
-		close(x);
+		/* y's port gone, x's not: y's counts kept, said gone, as it left
+		 * them; x's still its port's. Two seconds for the switch to see
+		 * the close. */
 		close(y);
+		{
+			hull_segment_counts counts[8];
+			int                 gone_y = -1;
+			int                 live_x = -1;
+
+			for (int tries = 0; gone_y < 0 && tries < 200; tries++) {
+				int n = hull_segment_counts_of("lossy", counts, 8u);
+
+				for (int i = 0; i < n; i++)
+					if (strcmp(counts[i].machine, "y") == 0 && counts[i].gone)
+						gone_y = i;
+				if (gone_y < 0)
+					poll(NULL, 0u, 10);
+			}
+			for (int i = 0; gone_y >= 0 && i < hull_segment_counts_of("lossy", counts, 8u); i++)
+				if (strcmp(counts[i].machine, "x") == 0)
+					live_x = i;
+			check("a gone port's counts kept, said gone",
+			      gone_y >= 0 && live_x >= 0 && !counts[live_x].gone &&
+			      counts[gone_y].way[HULL_SEGMENT_IN].lost == 1u &&
+			      counts[gone_y].way[HULL_SEGMENT_OUT].passed == 1u);
+		}
+		close(x);
 	}
 	{
 		/* Every machine's rule, a machine's own over it, and a port

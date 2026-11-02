@@ -3311,7 +3311,7 @@ static void handle_segment(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	static const char *const names[] = { "bytes", "corrupted", "duplicated", "frames", "full",
 	                                     "injected", "lost", "matched", "overflow", "passed",
 	                                     "passed_bytes", "replayed", "tampered", "too_big" };
-	static hull_segment_counts counts[64];
+	static hull_segment_counts counts[512];
 	hull_sexpr_form value;
 	hull_msg        m = { 0 };
 	char            name[512];
@@ -3336,8 +3336,11 @@ static void handle_segment(client *c, uint32_t ch, const hull_sexpr_doc *body)
 			const hull_segment_count *w;
 			uint64_t                  of[14];
 
-			if (part == 0)
+			if (part == 0) {
 				hull_msg_raw(&m, "(4:port");
+				if (counts[i].gone)
+					hull_msg_raw(&m, "(4:gone4:true)");
+			}
 			if (part == 1) {
 				hull_msg_raw(&m, "(7:machine");
 				hull_msg_text(&m, counts[i].machine);

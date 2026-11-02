@@ -166,6 +166,11 @@ typedef struct segment {
 	capture  capture;
 	unsigned every;     /* seconds between router advertisements sent unasked; 0, none */
 	uint64_t next_ra;   /* when the next of those is due */
+	/* What each port that has gone counted, by its machine, summed where
+	 * one machine came and went more than once: kept while the segment
+	 * is, so a test reads a machine's counts after it ended. */
+	hull_segment_counts gone[MAX_PORTS];
+	unsigned            gone_count;
 } segment;
 
 /* A question .1 asked on for a machine, until its answer or MAX_ASKED_NS:
@@ -2556,12 +2561,44 @@ static void free_port(port *p)
 	free(p);
 }
 
-/* `s`'s port `i` gone: the last moved into its place, and the addresses
- * learned on either told so. */
+/* `from`'s counts added to `to`'s. */
+static void add_count(hull_segment_count *to, const hull_segment_count *from)
+{
+	to->frames += from->frames;
+	to->bytes += from->bytes;
+	to->passed += from->passed;
+	to->passed_bytes += from->passed_bytes;
+	to->lost += from->lost;
+	to->duplicated += from->duplicated;
+	to->corrupted += from->corrupted;
+	to->too_big += from->too_big;
+	to->overflow += from->overflow;
+	to->full += from->full;
+	to->matched += from->matched;
+	to->tampered += from->tampered;
+	to->replayed += from->replayed;
+	to->injected += from->injected;
+}
+
+/* `s`'s port `i` gone: what it counted kept by its machine, the last
+ * moved into its place, and the addresses learned on either told so. */
 static void remove_port(segment *s, unsigned i)
 {
 	unsigned last = s->port_count - 1u;
+	unsigned g;
 
+	for (g = 0u; g < s->gone_count && strcmp(s->gone[g].machine, s->ports[i]->machine) != 0; g++)
+		;
+	if (g == s->gone_count && g < MAX_PORTS) {
+		memset(&s->gone[g], 0, sizeof s->gone[g]);
+		snprintf(s->gone[g].machine, sizeof s->gone[g].machine, "%s", s->ports[i]->machine);
+		s->gone[g].gone = 1;
+		s->gone_count++;
+	}
+	if (g < s->gone_count) {
+		add_count(&s->gone[g].way[HULL_SEGMENT_OUT], &s->ports[i]->way[HULL_SEGMENT_OUT].count);
+		add_count(&s->gone[g].way[HULL_SEGMENT_IN], &s->ports[i]->way[HULL_SEGMENT_IN].count);
+	}
 	free_port(s->ports[i]);
 	s->ports[i] = s->ports[last];
 	s->ports[last] = NULL;
@@ -3152,7 +3189,11 @@ int hull_segment_counts_of(const char *key, hull_segment_counts *out, unsigned c
 		snprintf(out[n].machine, sizeof out[n].machine, "%s", s->ports[i]->machine);
 		out[n].way[HULL_SEGMENT_OUT] = s->ports[i]->way[HULL_SEGMENT_OUT].count;
 		out[n].way[HULL_SEGMENT_IN]  = s->ports[i]->way[HULL_SEGMENT_IN].count;
+		out[n].gone = 0;
 	}
+	/* Then the ports that have gone, each as its machine left it. */
+	for (unsigned g = 0u; g < s->gone_count && n < cap; g++, n++)
+		out[n] = s->gone[g];
 	pthread_mutex_unlock(&lock);
 	return (int)n;
 }

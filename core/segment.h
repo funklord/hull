@@ -105,6 +105,7 @@ typedef struct hull_segment_count {
 typedef struct hull_segment_counts {
 	char               machine[64];
 	hull_segment_count way[2];   /* HULL_SEGMENT_OUT, HULL_SEGMENT_IN */
+	int                gone;     /* its port has gone: what it counted, kept */
 } hull_segment_counts;
 
 /*

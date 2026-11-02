@@ -5153,8 +5153,9 @@ static int segment_command(int argc, char **argv)
 		hull_sexpr_form name;
 		hull_sexpr_form field;
 		hull_sexpr_form ways[2];
-		char            machine[64] = "?";
+		char            machine[80] = "?";
 		int             found = 0;
+		int             gone = 0;
 
 		if (item.kind != HULL_SEXPR_LIST || !hull_sexpr_child(&body, &item, &name) ||
 		    !hull_sexpr_is(&body, &name, "port"))
@@ -5168,11 +5169,16 @@ static int segment_command(int argc, char **argv)
 				continue;
 			if (hull_sexpr_is(&body, &key, "machine") && hull_sexpr_next(&body, &key, &value))
 				hull_msg_string(&body, &value, machine, sizeof machine);
+			else if (hull_sexpr_is(&body, &key, "gone"))
+				gone = 1;
 			else if (hull_sexpr_is(&body, &key, "out"))
 				ways[0] = field, found |= 1;
 			else if (hull_sexpr_is(&body, &key, "in"))
 				ways[1] = field, found |= 2;
 		}
+		/* A machine that has left the segment, its counts as it left. */
+		if (gone)
+			strncat(machine, " (gone)", sizeof machine - strlen(machine) - 1u);
 		if (found & 1)
 			print_way(&body, &ways[0], machine, "out");
 		if (found & 2)
