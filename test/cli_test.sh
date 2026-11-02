@@ -3787,6 +3787,46 @@ for dosengine in dosbox dosemu; do
 		from_root 6 '' -f "$root/dosmem.conf"
 		from_root 14 '' -f "$root/dosmemdef.conf"
 		from_root 125 'dosbox gives a DOS machine at most 63 MB of memory' -f "$root/dosmembig.conf"
+		# (display window): DOSBox's own window on the run's X display,
+		# a private Xvfb on a display number nothing holds, killed by its
+		# pid after, the window's title waited for, as DOSBox names it a
+		# moment after making it; and none where DISPLAY is not set.
+		dosconf doswin '(display window) (command "LOOP")'
+		expect 1 'display\.window: rejected' "$hull" plan --backend chroot -f "$root/doswin.conf"
+		winx=""
+		for n in $(seq 140 199); do
+			[ -e "/tmp/.X$n-lock" ] || [ -e "/tmp/.X11-unix/X$n" ] || { winx=$n; break; }
+		done
+		if command -v Xvfb > /dev/null 2>&1 && command -v xwininfo > /dev/null 2>&1 &&
+		   [ -n "$winx" ]; then
+			timeout 60 Xvfb ":$winx" -ac -nolisten tcp > /dev/null 2>&1 &
+			xvfb=$!
+			sleep 2
+			(cd / && DISPLAY=":$winx" exec timeout -k 2 30 "$hull_abs" run -f "$root/doswin.conf" \
+				> /dev/null 2>&1) &
+			winrun=$!
+			tries=0
+			until xwininfo -display ":$winx" -root -tree 2>/dev/null | grep -q 'Program: *LOOP' ||
+			      [ "$tries" -ge 40 ]; do
+				tries=$((tries + 1))
+				sleep 0.25
+			done
+			cases=$((cases + 1))
+			xwininfo -display ":$winx" -root -tree 2>/dev/null | grep -q 'Program: *LOOP' ||
+				fail "(display window) gave no DOSBox window on the run's display" \
+					"$(xwininfo -display ":$winx" -root -tree 2>&1 | head -20)"
+			winid=$("$hull" ps | awk '$3 == "dosbox" {print $1; exit}')
+			timeout 10 "$hull" kill -s KILL "${winid:-none}" > /dev/null 2>&1
+			wait "$winrun" 2>/dev/null
+			kill "$xvfb" 2>/dev/null
+			wait "$xvfb" 2>/dev/null
+		else
+			echo "cli: (display window) not measured: no Xvfb or xwininfo, or no free display"
+		fi
+		cases=$((cases + 1))
+		out=$(cd / && env -u DISPLAY timeout 30 "$hull" run -f "$root/doswin.conf" 2>&1)
+		[ $? = 125 ] && printf '%s\n' "$out" | grep -q 'needs an X display, and the run gave none' ||
+			fail "(display window) with no DISPLAY was not refused" "$out"
 		;;
 	dosemu)
 		expect 1 'memory: rejected' "$hull" plan -f "$root/dosmem.conf"

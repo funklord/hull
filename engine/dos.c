@@ -69,6 +69,8 @@ static void release(hull_machine *m)
 {
 	free(m->root);
 	free(m->workdir);
+	free(m->display);
+	free(m->xauthority);
 	for (unsigned i = 0u; i < HULL_DOS_MAX_ARGS; i++)
 		free(m->argv[i]);
 	for (unsigned i = 0u; i < HULL_DOS_MAX_ENV; i++)
@@ -305,6 +307,24 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 	m->root = real(hull_access_path(doc, source + 4));
 	free(source);
 	m->workdir = hull_access_value(doc, machine, "workdir");
+	/* (display window): the screen the run's frontend gave, its own
+	 * DISPLAY, the core's being whoever started it. */
+	{
+		char           *display = hull_access_value(doc, machine, "display");
+		hull_sexpr_form top;
+		hull_sexpr_form screen;
+
+		if (display != NULL && strcmp(display, "window") == 0) {
+			if (!hull_sexpr_first(doc, &top) || !hull_access_find(doc, &top, "screen", &screen) ||
+			    (m->display = hull_access_value(doc, &screen, "display")) == NULL) {
+				free(display);
+				return "(display window) needs an X display, and the run gave none: DISPLAY is "
+				       "not set where hull ran";
+			}
+			m->xauthority = hull_access_value(doc, &screen, "xauthority");
+		}
+		free(display);
+	}
 	/* J.1's memory, "16M" or bytes, in MiB, for an engine that sizes
 	 * its machine's; the matrix refuses it to one that cannot. */
 	{

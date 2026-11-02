@@ -36,6 +36,8 @@ struct hull_machine {
 	int              overlay;          /* (mutable overlay): C: is a copy in `dir` */
 	char            *workdir;
 	unsigned long    memory_mib;       /* (memory ...), or 0 for the emulator's own */
+	char            *display;          /* (display window): the run's X display, or NULL */
+	char            *xauthority;       /* and its authority file, or NULL */
 	char            *argv[HULL_DOS_MAX_ARGS];
 	char            *envp[HULL_DOS_MAX_ENV];
 	char            *volume_host[HULL_DOS_MAX_VOLUMES];

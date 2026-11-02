@@ -112,10 +112,28 @@ static void exec_child(const hull_machine *m)
 	snprintf(path_entry, sizeof path_entry, "PATH=%s",
 	         path != NULL ? path : "/usr/local/bin:/usr/bin:/bin");
 	{
+		char        display[300];
+		char        xauthority[4200];
 		char *const argv[] = { "dosbox", "-conf", conf, NULL };
-		char *const envp[] = { home, path_entry, "SDL_VIDEODRIVER=dummy",
-		                       "SDL_AUDIODRIVER=dummy", NULL };
+		char       *envp[] = { home, path_entry, "SDL_VIDEODRIVER=dummy", "SDL_AUDIODRIVER=dummy",
+		                       NULL, NULL, NULL, NULL };
 
+		/* (display window): its screen a window on the run's display,
+		 * its sound still none. Measured, X11 had SDL ask for a session
+		 * bus, D-Bus making .dbus/ in its HOME, the machine's directory,
+		 * to autolaunch one, and Mesa wrote its shader cache there: the
+		 * directory was left behind. Neither is wanted, so neither is
+		 * let start. */
+		if (m->display != NULL) {
+			snprintf(display, sizeof display, "DISPLAY=%s", m->display);
+			envp[2] = display;
+			envp[4] = "DBUS_SESSION_BUS_ADDRESS=disabled:";
+			envp[5] = "MESA_SHADER_CACHE_DISABLE=true";
+			if (m->xauthority != NULL) {
+				snprintf(xauthority, sizeof xauthority, "XAUTHORITY=%s", m->xauthority);
+				envp[6] = xauthority;
+			}
+		}
 		hull_access_execute(argv, envp);
 	}
 }
@@ -177,6 +195,9 @@ static const hull_cap_entry entries[] = {
 	{ "media.tar",          HULL_SUP_REJECTED, "not yet: a tar: collection", NULL },
 	{ "media.pack",         HULL_SUP_REJECTED, "not yet: a pack: collection", NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   "a DOS machine here has no network", NULL },
+	{ "display.window",     HULL_SUP_NATIVE,
+	  "DOSBox's own window on the X display the run was given, DISPLAY where hull ran; "
+	  "its sound still none", NULL },
 	{ "memory",             HULL_SUP_NATIVE,
 	  "DOSBox's memsize, its RAM, 1 to 63 MB; cpus has no DOSBox equivalent, cycles being "
 	  "its speed", NULL },

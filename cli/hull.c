@@ -1583,6 +1583,32 @@ static int draw_names(options *o, const hull_spec *spec, hull_names *names)
 /* `plan` with the plan's `(names ...)` for machine `id` from `names`
  * added: "names" sorts after "machine" and before what the core adds, so
  * it goes last. 0, or -1 where the plan has no room for it. */
+/* `(screen (display D) (xauthority F)?)` at the plan's end, from this
+ * process's DISPLAY and XAUTHORITY; nothing where DISPLAY is not set. */
+static int add_screen(hull_plan *plan)
+{
+	const char *display = getenv("DISPLAY");
+	const char *authority = getenv("XAUTHORITY");
+	char        entry[4600];
+	int         n;
+
+	if (display == NULL || display[0] == '\0')
+		return 0;
+	if (strlen(display) > 200u || (authority != NULL && strlen(authority) > 4096u))
+		return -1;
+	n = snprintf(entry, sizeof entry, "(6:screen(7:display%zu:%s)", strlen(display), display);
+	if (authority != NULL && authority[0] != '\0')
+		n += snprintf(entry + n, sizeof entry - (size_t)n, "(10:xauthority%zu:%s)",
+		              strlen(authority), authority);
+	n += snprintf(entry + n, sizeof entry - (size_t)n, "))");
+	if (plan->canonical_length == 0u ||
+	    plan->canonical_length - 1u + (size_t)n > sizeof plan->canonical)
+		return -1;
+	memcpy(plan->canonical + plan->canonical_length - 1u, entry, (size_t)n);
+	plan->canonical_length += (uint32_t)(n - 1);
+	return 0;
+}
+
 /* `(under ID)`, at the plan's end, before any (wait N). */
 static int add_under(hull_plan *plan, const char *id)
 {
@@ -1773,6 +1799,16 @@ static int prepare_run(options *o, const hull_registry *registry, hull_spec *spe
 
 	if (add_names(&plan, names, id) != 0) {
 		fprintf(stderr, "%s: %s: not run: its segments' names do not fit in its plan\n", o->file,
+		        shown);
+		return 125;
+	}
+	/* (display window): this run's own X display, and its authority,
+	 * as `(screen ...)`, which sorts after root and before under, the
+	 * core's being whoever started it. None where DISPLAY is not set,
+	 * which the engine then says. */
+	if (memmem(plan.canonical, plan.canonical_length, "(7:display6:window)", 19u) != NULL &&
+	    add_screen(&plan) != 0) {
+		fprintf(stderr, "%s: %s: not run: its display does not fit in its plan\n", o->file,
 		        shown);
 		return 125;
 	}

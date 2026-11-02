@@ -405,6 +405,7 @@ static const char *const projection_values[] = { "auto", "bind", "passthrough", 
 static const char *const restart_values[]    = { "no", "on-failure", "always", NULL };
 static const char *const disconnect_values[] = { "stop", "keep", NULL };
 static const char *const network_values[]    = { "bridge", "host", "nat", "none", NULL };
+static const char *const display_values[]    = { "window", NULL };
 static const char *const proto_values[]      = { "tcp", "udp", NULL };
 static const char *const mode_values[]       = { "rw", "ro", NULL };
 static const char *const expose_values[]     = { "env", NULL };
@@ -742,6 +743,7 @@ static const key machine_keys[] = {
 	{ .name = "after",         .type = SYMBOLS, .nonempty = 1, .value = label },
 	{ .name = "ready",         .type = RECORD, .record = &ready },
 	{ .name = "pool",          .type = STRING, .value = label },
+	{ .name = "display",       .type = CHOICE, .choices = display_values },
 };
 static hull_spec_status machine_across(walk *w, const hull_sexpr_form *record,
                                        const hull_sexpr_form *found, uint64_t present);
