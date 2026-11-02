@@ -128,6 +128,7 @@ struct hull_machine {
 	char            *volume_host[MAX_VOLUMES];
 	int              volume_readonly[MAX_VOLUMES];
 	hull_stack       volume_stack[MAX_VOLUMES];  /* a volume of (layers ...), or count 0 */
+	const char      *volume_block[MAX_VOLUMES];  /* (block ...): its filesystem's module, else NULL */
 	int              staged;     /* a volume is a stack: mounted host-side, as the root's */
 	unsigned         volume_count;
 	struct in_addr   address;                /* section 8.1's, the core's */
@@ -611,7 +612,8 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		hull_sexpr_child(doc, &entry, &item);
 		for (more = hull_sexpr_next(doc, &item, &item); more;
 		     more = hull_sexpr_next(doc, &item, &item)) {
-			char       *host_path = hull_access_value(doc, &item, "host");
+			char       *block     = hull_access_value(doc, &item, "block");
+			char       *host_path = block != NULL ? block : hull_access_value(doc, &item, "host");
 			char       *mode      = hull_access_value(doc, &item, "mode");
 			const char *why;
 
@@ -640,6 +642,14 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			free(host_path);
 			if (m->volume_host[i] == NULL)
 				return "a volume is missing its host path";
+			/* An image is a drive the guest mounts, so the guest
+			 * needs its filesystem's module: known here, from the
+			 * image, rather than found by trying them there. */
+			if (block != NULL &&
+			    (m->volume_block[i] = hull_access_filesystem(m->volume_host[i], NULL)) == NULL)
+				return "a volume's block is not an image of a filesystem the guest mounts: "
+				       "ext2, 3 or 4, xfs, btrfs, vfat, iso9660, squashfs or erofs, the "
+				       "filesystem at its first byte and not a disk of partitions";
 		}
 	}
 
@@ -859,7 +869,11 @@ static int same_module(const char *a, size_t length, const char *b)
 	return i == length && b[i] == '\0';
 }
 
-/* The agent's modules, then `extra`'s, a machine's devices' drivers. */
+/* The agent's modules, then `extra`'s, a machine's devices' drivers. One
+ * of `extra` led by '?' is a soft dependency, which modprobe would have
+ * found through modules.softdep and an alias, and the guest has no
+ * modprobe: taken where the host has it as a module, and passed over
+ * where it does not, built in or not there at all. */
 static const char *find_modules(const char *release, const char *const *extra,
                                 unsigned extra_count, module_list *list)
 {
@@ -886,6 +900,7 @@ static const char *find_modules(const char *release, const char *const *extra,
 	for (unsigned i = 0u; i < extra_count && wanted_count < sizeof wanted / sizeof wanted[0]; i++)
 		wanted[wanted_count++] = extra[i];
 	for (unsigned w = 0u; w < wanted_count && reason == NULL; w++) {
+		int      soft = wanted[w][0] == '?';
 		unsigned i;
 
 		/* A line is `path: dependency...`; the module's name is the
@@ -900,9 +915,12 @@ static const char *find_modules(const char *release, const char *const *extra,
 			for (name = colon; name > lines[i] && name[-1] != '/'; name--)
 				;
 			ko = strstr(name, ".ko");
-			if (ko != NULL && ko < colon && same_module(name, (size_t)(ko - name), wanted[w]))
+			if (ko != NULL && ko < colon &&
+			    same_module(name, (size_t)(ko - name), wanted[w] + soft))
 				break;
 		}
+		if (i == count && soft)
+			continue;
 		if (i == count) {
 			reason = w < sizeof base / sizeof base[0] ?
 			         "the host kernel has no 9p, vsock, virtio_net or overlay module for the guest" :
@@ -1061,6 +1079,26 @@ static const char *write_initramfs(const hull_machine *m, const char *release, i
 			at = strlen(links);
 			if (d->host.named[0] != '\0')
 				snprintf(links + at, sizeof links - at, "%s %s\n", d->host.named, guest);
+		}
+	}
+	/* An image volume's drive, and the filesystem each is. ext4, xfs,
+	 * btrfs and erofs check their metadata with the crypto API's crc32c,
+	 * a soft dependency: without it ext4's mount fails ENOENT. */
+	for (unsigned i = 0u; i < m->volume_count && load_modules; i++) {
+		const char *module = m->volume_block[i];
+		const char *wanted[] = { "virtio_blk", "?crc32c_generic", module };
+		unsigned    k;
+
+		if (module == NULL)
+			continue;
+		for (unsigned w = 0u; w < 3u; w++) {
+			if (w == 1u && (strcmp(module, "squashfs") == 0 || strcmp(module, "isofs") == 0 ||
+			                strcmp(module, "vfat") == 0))
+				continue;
+			for (k = 0u; k < extra_count && strcmp(extra[k], wanted[w]) != 0; k++)
+				;
+			if (k == extra_count && extra_count < MAX_MODULES)
+				extra[extra_count++] = wanted[w];
 		}
 	}
 	if (load_modules && (reason = find_modules(release, extra, extra_count, &list)) != NULL) {
@@ -1576,6 +1614,19 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int
 	for (unsigned i = 0u; i < m->volume_count; i++) {
 		char staged[4300];
 
+		/* An image is a virtio disk, found in the guest by its
+		 * serial, the tag a share would have had. */
+		if (m->volume_block[i] != NULL) {
+			escaped(path, sizeof path, m->volume_host[i]);
+			snprintf(fsdev[i], sizeof fsdev[i], "file=%s,format=raw,if=none,id=v%u%s", path,
+			         i, m->volume_readonly[i] ? ",readonly=on" : "");
+			snprintf(device[i], sizeof device[i], "virtio-blk-pci,drive=v%u,serial=v%u", i, i);
+			argv[n++] = "-drive";
+			argv[n++] = fsdev[i];
+			argv[n++] = "-device";
+			argv[n++] = device[i];
+			continue;
+		}
 		snprintf(staged, sizeof staged, "%s/v%u/merged", m->dir, i);
 		escaped(path, sizeof path, m->volume_stack[i].count > 0u ? staged : m->volume_host[i]);
 		snprintf(fsdev[i], sizeof fsdev[i], "local,id=v%u,path=%s,security_model=none%s", i,
@@ -3730,6 +3781,9 @@ static const hull_cap_entry entries[] = {
 	{ "volumes",            HULL_SUP_NATIVE,   "a 9p share each", NULL },
 	{ "volumes.layers",     HULL_SUP_NATIVE,
 	  "an overlay mounted host-side, in qemu's namespace, and shared", NULL },
+	{ "volumes.block",      HULL_SUP_NATIVE,
+	  "a virtio disk the agent mounts: one filesystem, not a disk of partitions, which no "
+	  "other machine may have open", NULL },
 	{ "secrets",            HULL_SUP_NATIVE,
 	  "placed by the agent on a tmpfs under one at the machine's /run, which it must "
 	  "have", NULL },

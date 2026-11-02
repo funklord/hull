@@ -169,6 +169,10 @@ static void test_ids(void)
 	NO("(machine (source \"dir:.\") (volumes (volume (host \"a\") (guest \"/b\"))"
 	   " (volume (guest \"/c\") (layers \"dir:./t\")) (volume (guest \"/d\") (layers \"dir:./u\"))))",
 	   &qemu, "vm", "source.dir.direct:n volumes:n volumes.layers:r");
+	/* And an image, once, after a stack. */
+	NO("(machine (source \"dir:.\") (volumes (volume (block \"a.img\") (guest \"/b\"))"
+	   " (volume (guest \"/c\") (layers \"dir:./t\")) (volume (block \"d.img\") (guest \"/d\"))))",
+	   &qemu, "vm", "source.dir.direct:n volumes:n volumes.layers:r volumes.block:r");
 	NO("(machine (source \"dir:.\") (security (readonly_root true) (no_new_privs false)"
 	   " (allow net_admin)))", &qemu, "vm",
 	   "source.dir.direct:n security.readonly_root:n security.allow:r");

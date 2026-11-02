@@ -428,13 +428,16 @@ static hull_spec_status volume_across(walk *w, const hull_sexpr_form *record,
 
 /* (volume (host "./data") (guest "/var/data") (mode rw)), or a stack of
  * directories in place of the one: (volume (guest "/etc") (layers
- * "dir:./etc-template" "dir:./etc-site") (upper "./etc-data")), 3.7. */
+ * "dir:./etc-template" "dir:./etc-site") (upper "./etc-data")), or a
+ * filesystem image the guest mounts: (volume (block "disk.img") (guest
+ * "/mnt") (mode ro)), 3.7. */
 static const key volume_keys[] = {
 	{ .name = "host",   .type = STRING, .value = nonempty },
 	{ .name = "guest",  .type = STRING, .required = 1, .value = absolute },
 	{ .name = "mode",   .type = CHOICE, .choices = mode_values },
 	{ .name = "layers", .type = STRINGS, .nonempty = 1, .value = nonempty },
 	{ .name = "upper",  .type = STRING, .value = nonempty },
+	{ .name = "block",  .type = STRING, .value = nonempty },
 };
 static const schema volume = TABLE_ACROSS(volume_keys, volume_across);
 
@@ -443,6 +446,7 @@ static const schema volume = TABLE_ACROSS(volume_keys, volume_across);
 #define VOLUME_MODE   2u
 #define VOLUME_LAYERS 3u
 #define VOLUME_UPPER  4u
+#define VOLUME_BLOCK  5u
 
 /* Devices passed through (section 4.13): one USB device, by its ids, by
  * the port it is plugged into, or both. */
@@ -1411,10 +1415,16 @@ static hull_spec_status volume_across(walk *w, const hull_sexpr_form *record,
 	unsigned    at = VOLUME_LAYERS;
 	size_t      saved;
 
-	if (!(present & ((uint64_t)1 << VOLUME_HOST)) && !(present & ((uint64_t)1 << VOLUME_LAYERS)))
+	if (!(present & ((uint64_t)1 << VOLUME_HOST)) && !(present & ((uint64_t)1 << VOLUME_LAYERS)) &&
+	    !(present & ((uint64_t)1 << VOLUME_BLOCK)))
 		return fail(w, HULL_SPEC_ERR_MISSING, record->offset,
-		            "a volume is a host directory or a stack of layers: host or layers");
-	if ((present & ((uint64_t)1 << VOLUME_HOST)) && (present & ((uint64_t)1 << VOLUME_LAYERS))) {
+		            "a volume is a host directory, a stack of layers or an image: host, "
+		            "layers or block");
+	if ((present & ((uint64_t)1 << VOLUME_BLOCK)) &&
+	    (present & (((uint64_t)1 << VOLUME_HOST) | ((uint64_t)1 << VOLUME_LAYERS)))) {
+		at = VOLUME_BLOCK;
+		why = "cannot stand beside host or layers: a volume is one of the three";
+	} else if ((present & ((uint64_t)1 << VOLUME_HOST)) && (present & ((uint64_t)1 << VOLUME_LAYERS))) {
 		why = "cannot stand beside host: a volume is one directory or a stack of them";
 	} else if ((present & ((uint64_t)1 << VOLUME_UPPER)) && !(present & ((uint64_t)1 << VOLUME_LAYERS))) {
 		at = VOLUME_UPPER;
@@ -1432,7 +1442,7 @@ static hull_spec_status volume_across(walk *w, const hull_sexpr_form *record,
 	}
 	if (why == NULL)
 		return HULL_SPEC_OK;
-	saved = push_text(w, at == VOLUME_UPPER ? "upper" : "layers");
+	saved = push_text(w, volume_keys[at].name);
 	fail(w, HULL_SPEC_ERR_SHAPE, found[at].offset, why);
 	pop(w, saved);
 	return HULL_SPEC_ERR_SHAPE;

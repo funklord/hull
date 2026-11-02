@@ -3804,6 +3804,9 @@ static const hull_cap_entry entries[] = {
 	{ "volumes.layers",     HULL_SUP_EMULATED,
 	  "laid into the dir's import beneath its guest path, hiding what is there; its upper's "
 	  "writes given back, and a read-only one docker's ReadonlyPaths", NULL },
+	{ "volumes.block",      HULL_SUP_REJECTED,
+	  "docker mounts no image file into a container; --backend vm mounts it in the guest, "
+	  "as the user", NULL },
 	{ "secrets",            HULL_SUP_NATIVE,
 	  "bound read-only from the core's tmpfs; one exposed is in the container's "
 	  "configuration too, where docker inspect shows it", NULL },

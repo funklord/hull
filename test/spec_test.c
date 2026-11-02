@@ -334,6 +334,16 @@ static void test_records(void)
 	   SHAPE, "(upper", "machine.volumes.volume.upper");
 	NO(M("(volumes (volume (guest \"/etc\") (layers)))"), SHAPE, "(layers)",
 	   "machine.volumes.volume.layers");
+	/* A volume that is a filesystem image, 3.7. */
+	OK(M("(volumes (volume (block \"disk.img\") (guest \"/mnt\") (mode ro)))"));
+	NO(M("(volumes (volume (block \"disk.img\") (host \"./a\") (guest \"/mnt\")))"), SHAPE,
+	   "(block", "machine.volumes.volume.block");
+	NO(M("(volumes (volume (block \"disk.img\") (guest \"/mnt\") (layers \"dir:./t\")))"),
+	   SHAPE, "(block", "machine.volumes.volume.block");
+	NO(M("(volumes (volume (block \"disk.img\") (guest \"/mnt\") (upper \"./d\")))"), SHAPE,
+	   "(upper", "machine.volumes.volume.upper");
+	NO(M("(volumes (volume (block \"\") (guest \"/mnt\")))"), VALUE, "\"\"",
+	   "machine.volumes.volume.block");
 	OK(M("(media (medium (type cdrom) (source \"dir:./cd\")))"));
 	NO(M("(media (medium (type cdrom) (source \"./cd\")))"), VALUE, "\"./cd\"",
 	   "machine.media.medium.source");

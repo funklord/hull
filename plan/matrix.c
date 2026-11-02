@@ -500,18 +500,26 @@ hull_matrix_status hull_matrix_resolve(const hull_spec *spec, const hull_sexpr_f
 			/* ports, volumes, env, secrets: the key, once. */
 			join_form(&r, id, NULL, &key);
 			resolve(&r, id, entry.offset);
-			/* A volume that is a stack of layers (3.7) asks for more
-			 * than a directory: once, at the first. */
+			/* A volume that is a stack of layers or an image (3.7)
+			 * asks for more than a directory: each kind once, at its
+			 * first. */
 			if (hull_sexpr_is(&spec->doc, &key, "volumes")) {
-				hull_sexpr_form item = first;
-				hull_sexpr_form layers;
+				static const char *const kinds[][2] = {
+					{ "layers", "volumes.layers" },
+					{ "block",  "volumes.block" },
+				};
 
-				do {
-					if (hull_spec_find(spec, &item, "layers", &layers)) {
-						resolve(&r, "volumes.layers", layers.offset);
-						break;
-					}
-				} while (hull_sexpr_next(&spec->doc, &item, &item));
+				for (unsigned k = 0u; k < 2u; k++) {
+					hull_sexpr_form item = first;
+					hull_sexpr_form found;
+
+					do {
+						if (hull_spec_find(spec, &item, kinds[k][0], &found)) {
+							resolve(&r, kinds[k][1], found.offset);
+							break;
+						}
+					} while (hull_sexpr_next(&spec->doc, &item, &item));
+				}
 			}
 		} else {
 			resolve_entry(&r, NULL, &entry);

@@ -4125,6 +4125,9 @@ static const hull_cap_entry entries[] = {
 	  "in place", NULL },
 	{ "volumes.layers",         HULL_SUP_NATIVE,
 	  "an overlay mounted at the guest path, staged in the machine's namespace", NULL },
+	{ "volumes.block",          HULL_SUP_REJECTED,
+	  "mounting an image is the host kernel's and needs root; --backend vm mounts it in "
+	  "the guest's, as the user", NULL },
 	{ "secrets",                HULL_SUP_NATIVE,
 	  "on a tmpfs the machine mounts at /run, which the dir must have; one exposed is "
 	  "in the env of the workload and of every exec", NULL },

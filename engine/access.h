@@ -56,6 +56,15 @@ char *hull_access_path(const hull_sexpr_doc *doc, const char *path);
 const char *hull_access_stack(const hull_sexpr_doc *doc, const hull_sexpr_form *volume,
                               int readonly, hull_stack *stack);
 
+/* The filesystem a volume's (block PATH) image holds, by its superblock's
+ * magic: ext2, 3 or 4, xfs, btrfs, squashfs, erofs, iso9660 or vfat. The
+ * kernel module that mounts it, and its type for mount(2) into `type`
+ * where that is not NULL; or NULL where it is none of these, a disk of
+ * partitions among them, or cannot be read. The engine reads it on the
+ * host, to put the module in the guest's initramfs and to refuse what the
+ * guest could not mount; the agent reads it in the guest, to mount by it. */
+const char *hull_access_filesystem(const char *path, const char **type);
+
 /* Whether root mode granted `field` the machine whose plan is `doc`: the
  * plan's (root (fields ...)), written by the planner only where `--accept
  * root:HASH` named the machine's own hash, and run by the core only where

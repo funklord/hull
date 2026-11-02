@@ -55,6 +55,7 @@
 #define _GNU_SOURCE
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -120,6 +121,8 @@ static int    no_new_privs;
 static int    applied;     /* the spec is applied: the root is the machine's */
 static int    ssh_enabled; /* (ssh true): supervise the image's own sshd */
 static char   ssh_bin[256]; /* the image's sshd the agent found, absolute */
+static char  *images[MAX_VOLUMES]; /* each (block ...) volume's guest path, to unmount */
+static unsigned image_count;
 
 /* A process the host follows on a channel: the workload on 0, each exec
  * on its own. */
@@ -208,6 +211,18 @@ static void power_off(void)
 		}
 	}
 	sync();
+	/* An image volume is unmounted, the last first, so that its
+	 * filesystem is left clean: ext4 marks its journal as needing
+	 * recovery while mounted, and a later machine mounting it read-only,
+	 * on a read-only disk, could not replay it. One still busy is made
+	 * read-only, which leaves it as clean. An image's init unmounts its
+	 * own as it shuts down. */
+	while (image_count > 0u) {
+		const char *at = images[--image_count];
+
+		if (umount(at) != 0)
+			mount(NULL, at, NULL, MS_REMOUNT | MS_RDONLY, NULL);
+	}
 	reboot(RB_POWER_OFF);
 	for (;;)
 		pause();
@@ -652,6 +667,59 @@ static int share(const char *tag, const char *at, int readonly)
 {
 	return mount(tag, at, "9p", readonly ? MS_RDONLY : 0u,
 	             "trans=virtio,version=9p2000.L,msize=262144");
+}
+
+/* The virtio disk whose serial is `tag`, an image volume's, mounted at
+ * `at` as the filesystem its superblock says, which the engine read on
+ * the host to put its module here. Its disk may still be probing: looked
+ * for for two seconds. 0, or -1 with errno: ENODEV where there is no such
+ * disk, EMEDIUMTYPE where it holds no filesystem hull knows. */
+static int mount_block(const char *tag, const char *at, int readonly)
+{
+	struct timespec tenth = { 0, 100000000L };
+	char            node[300] = "";
+	const char     *type;
+
+	for (int tries = 0; node[0] == '\0' && tries < 20; tries++) {
+		DIR           *block = opendir("/sys/block");
+		struct dirent *disk;
+
+		while (block != NULL && node[0] == '\0' && (disk = readdir(block)) != NULL) {
+			char  path[300];
+			char  serial[64];
+			FILE *file;
+
+			if (strncmp(disk->d_name, "vd", 2u) != 0)
+				continue;
+			snprintf(path, sizeof path, "/sys/block/%s/serial", disk->d_name);
+			if ((file = fopen(path, "r")) == NULL)
+				continue;
+			if (fgets(serial, sizeof serial, file) != NULL) {
+				serial[strcspn(serial, "\n")] = '\0';
+				if (strcmp(serial, tag) == 0)
+					snprintf(node, sizeof node, "/dev/%s", disk->d_name);
+			}
+			fclose(file);
+		}
+		if (block != NULL)
+			closedir(block);
+		if (node[0] == '\0')
+			nanosleep(&tenth, NULL);
+	}
+	if (node[0] == '\0') {
+		errno = ENODEV;
+		return -1;
+	}
+	if (hull_access_filesystem(node, &type) == NULL) {
+		errno = EMEDIUMTYPE;
+		return -1;
+	}
+	/* Read-only, a journal an earlier machine left unreplayed is not
+	 * replayed, which a read-only disk would refuse: the image is read
+	 * as it was last made clean. */
+	return mount(node, at, type, readonly ? MS_RDONLY : 0u,
+	             readonly && (strcmp(type, "ext4") == 0 || strcmp(type, "xfs") == 0) ?
+	             "norecovery" : NULL);
 }
 
 /* The directory as an overlay at /machine: its share read-only beneath,
@@ -1140,11 +1208,13 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 		hull_sexpr_child(doc, &entry, &item);
 		for (more = hull_sexpr_next(doc, &item, &item); more;
 		     more = hull_sexpr_next(doc, &item, &item)) {
-			char  tag[16];
-			char  at[4200];
-			char *guest = hull_access_value(doc, &item, "guest");
-			char *mode  = hull_access_value(doc, &item, "mode");
-			int   readonly = mode != NULL && strcmp(mode, "ro") == 0;
+			hull_sexpr_form found;
+			char            tag[16];
+			char            at[4200];
+			char           *guest = hull_access_value(doc, &item, "guest");
+			char           *mode  = hull_access_value(doc, &item, "mode");
+			int             readonly = mode != NULL && strcmp(mode, "ro") == 0;
+			int             block = hull_access_find(doc, &item, "block", &found);
 
 			free(mode);
 			if (guest == NULL || guest[0] != '/' || strstr(guest, "..") != NULL ||
@@ -1158,8 +1228,19 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 			/* A guest path that is not there is made, where the root
 			 * can be written. */
 			make_path(at);
-			if (share(tag, at, readonly) != 0)
-				return "a volume could not be mounted";
+			if (block ? mount_block(tag, at, readonly) != 0 : share(tag, at, readonly) != 0) {
+				static char reason_[4400];
+
+				snprintf(reason_, sizeof reason_, "%s could not be mounted at %s: %s",
+				         block ? "a volume's image" : "a volume", at + strlen("/machine"),
+				         errno == ENODEV && block ? "its disk is not in the machine" :
+				         errno == EMEDIUMTYPE && block ? "the guest's kernel mounts no "
+				                                         "filesystem it holds" :
+				         strerror(errno));
+				return reason_;
+			}
+			if (block && !readonly)
+				images[image_count++] = strdup(at + strlen("/machine"));
 		}
 	}
 	if (names != NULL &&

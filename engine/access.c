@@ -601,3 +601,47 @@ const char *hull_access_devices(const hull_sexpr_doc *doc, const hull_sexpr_form
 	}
 	return NULL;
 }
+
+/* Whether `length` bytes at `offset` of `fd` are `magic`. */
+static int magic_at(int fd, off_t offset, const void *magic, size_t length)
+{
+	uint8_t got[16];
+
+	return pread(fd, got, length, offset) == (ssize_t)length && memcmp(got, magic, length) == 0;
+}
+
+const char *hull_access_filesystem(const char *path, const char **type)
+{
+	static const struct {
+		off_t       offset;
+		const char *magic;
+		size_t      length;
+		const char *module;
+		const char *type;
+	} known[] = {
+		{ 1080,    "\x53\xef",          2u, "ext4",     "ext4" },
+		{ 0,       "XFSB",              4u, "xfs",      "xfs" },
+		{ 0x10040, "_BHRfS_M",          8u, "btrfs",    "btrfs" },
+		{ 0,       "hsqs",              4u, "squashfs", "squashfs" },
+		{ 1024,    "\xe2\xe1\xf5\xe0",  4u, "erofs",    "erofs" },
+		{ 0x8001,  "CD001",             5u, "isofs",    "iso9660" },
+		/* A FAT boot sector names its type at 54 (FAT12 and 16) or
+		 * 82 (FAT32); a partition table names neither. */
+		{ 54,      "FAT",               3u, "vfat",     "vfat" },
+		{ 82,      "FAT",               3u, "vfat",     "vfat" },
+	};
+	const char *module = NULL;
+	int         fd = open(path, O_RDONLY | O_CLOEXEC);
+
+	if (fd < 0)
+		return NULL;
+	for (size_t i = 0u; i < sizeof known / sizeof known[0] && module == NULL; i++) {
+		if (magic_at(fd, known[i].offset, known[i].magic, known[i].length)) {
+			module = known[i].module;
+			if (type != NULL)
+				*type = known[i].type;
+		}
+	}
+	close(fd);
+	return module;
+}

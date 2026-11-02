@@ -991,6 +991,47 @@ name=volro
 boot volro
 has 0 '^write=Read-only file system$'
 
+# A volume that is a filesystem image, made by mke2fs -d as the user: a
+# virtio disk the agent finds by its serial and mounts, read and written
+# in place and left clean; read-only, refused a write; and an image of no
+# filesystem refused before any machine is made.
+rm -f "$root/vol.img" "$root/junk.img"
+mkdir -p "$root/imgseed"
+printf 'from the image\n' > "$root/imgseed/in"
+cases=$((cases + 1))
+/usr/sbin/mke2fs -q -t ext4 -d "$root/imgseed" "$root/vol.img" 8M > /dev/null 2>&1 ||
+	fail "mke2fs could not make the image" ""
+conf volblk "(backend vm) (volumes (volume (block \"$root/vol.img\") (guest \"/img\")))" \
+	'(command "/probe" "read" "/img/in" "write" "/img/out")'
+name=volblk
+boot volblk
+has 0 '^read=from the image$'
+has 0 '^write=ok$'
+cases=$((cases + 1))
+/usr/sbin/debugfs -R 'stat /out' "$root/vol.img" 2>&1 | grep -q 'Type: regular' ||
+	fail "a write in an image volume did not reach the image" \
+		"$(/usr/sbin/debugfs -R 'ls -l /' "$root/vol.img" 2>&1)"
+# Unmounted as the machine ended, so its journal needs no recovery, which
+# the read-only mount below could not give it.
+cases=$((cases + 1))
+/usr/sbin/dumpe2fs -h "$root/vol.img" 2>/dev/null | grep '^Filesystem features:' | grep -q needs_recovery &&
+	fail "an image volume was left needing recovery" \
+		"$(/usr/sbin/dumpe2fs -h "$root/vol.img" 2>&1 | grep -E 'features|state')"
+conf volblkro "(backend vm) (volumes (volume (block \"$root/vol.img\") (guest \"/img\") (mode ro)))" \
+	'(command "/probe" "read" "/img/in" "write" "/img/again")'
+name=volblkro
+boot volblkro
+has 0 '^read=from the image$'
+has 0 '^write=Read-only file system$'
+head -c 1048576 /dev/zero > "$root/junk.img"
+conf volblkjunk "(backend vm) (volumes (volume (block \"$root/junk.img\") (guest \"/img\")))" \
+	'(command "/probe" "say" "no")'
+name=volblkjunk
+boot volblkjunk
+has 125 'not an image of a filesystem the guest mounts'
+rm -f "$root/vol.img" "$root/junk.img" "$root/imgseed/in"
+rmdir "$root/imgseed"
+
 # The network, out, through passt as the user: the machine's own lo, the
 # host's DNS, and the host's address; but not the host's loopback. Two
 # listeners on the host, each taking one connection within 15 seconds,
