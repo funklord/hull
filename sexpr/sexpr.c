@@ -167,12 +167,75 @@ static hull_sexpr_status frame_readable(const hull_sexpr_doc *doc, uint32_t at,
 	return HULL_SEXPR_ERR_SYNTAX;
 }
 
+/* A canonical form's extent in a document hull_sexpr_open() has passed,
+ * by stepping over its tokens: each atom by its length, each list by its
+ * parentheses. Only for a checked document, whose every token both
+ * witnesses have already judged; 0 where it would run past the end,
+ * which a checked document cannot. */
+static uint32_t checked_extent(const hull_sexpr_doc *doc, uint32_t at)
+{
+	const uint8_t *d = doc->data;
+	uint32_t       i = at;
+	uint32_t       depth = 0u;
+
+	do {
+		if (i >= doc->length)
+			return 0u;
+		if (d[i] == '(') {
+			depth++;
+			i++;
+		} else if (d[i] == ')') {
+			depth--;
+			i++;
+		} else {
+			uint64_t n = 0u;
+
+			while (i < doc->length && d[i] >= '0' && d[i] <= '9')
+				n = n * 10u + (uint64_t)(d[i++] - '0');
+			if (i >= doc->length || d[i] != ':' || n > doc->length - i - 1u)
+				return 0u;
+			i += 1u + (uint32_t)n;
+		}
+	} while (depth > 0u);
+	return i - at;
+}
+
 static hull_sexpr_status frame_canonical(const hull_sexpr_doc *doc, uint32_t at,
                                          hull_sexpr_form *out, const char **reason)
 {
 	situ_msg_t  msg;
 	situ_view_t view;
 	situ_view_t arm;
+
+	/* Read again once open has passed it: situ framed every form of it
+	 * then, and the walk witnessed every list's end, so a form is found
+	 * by its tokens rather than judged a second time. Without this a
+	 * document was judged once at every level it is nested under: a
+	 * manifest of 30,115 entries, 5.9 MB, took 3.8 s to walk. */
+	if (doc->checked) {
+		uint32_t extent = checked_extent(doc, at);
+
+		if (extent == 0u) {
+			*reason = "a form that does not fit in the input";
+			return HULL_SEXPR_ERR_SYNTAX;
+		}
+		out->offset = at;
+		out->extent = extent;
+		if (doc->data[at] == '(') {
+			out->kind           = HULL_SEXPR_LIST;
+			out->content        = at + 1u;
+			out->content_length = 0u;
+		} else {
+			uint32_t colon = at;
+
+			while (doc->data[colon] != ':')
+				colon++;
+			out->kind           = HULL_SEXPR_ATOM;
+			out->content        = colon + 1u;
+			out->content_length = at + extent - colon - 1u;
+		}
+		return HULL_SEXPR_OK;
+	}
 
 	bind(doc, &msg);
 	if (hull_sexpr_c_form_view(&msg, at, doc->length - at, &view) != SITU_OK) {
@@ -268,9 +331,10 @@ hull_sexpr_status hull_sexpr_open(hull_sexpr_doc *doc, const uint8_t *data,
 	const char       *reason;
 	hull_sexpr_status status;
 
-	doc->data   = data;
-	doc->length = 0u;
-	doc->syntax = syntax;
+	doc->data    = data;
+	doc->length  = 0u;
+	doc->syntax  = syntax;
+	doc->checked = 0;
 	if (length > UINT32_MAX) {
 		locate(doc, error, HULL_SEXPR_ERR_SIZE, 0u, "a document larger than 4 GiB");
 		return HULL_SEXPR_ERR_SIZE;
@@ -296,6 +360,7 @@ hull_sexpr_status hull_sexpr_open(hull_sexpr_doc *doc, const uint8_t *data,
 				       "canonical form holds exactly one form, and this holds none");
 				return HULL_SEXPR_ERR_SYNTAX;
 			}
+			doc->checked = 1;
 			return HULL_SEXPR_OK;
 		}
 		if (doc->data[at] == ')') {
@@ -326,7 +391,15 @@ hull_sexpr_status hull_sexpr_open(hull_sexpr_doc *doc, const uint8_t *data,
 		if (depth == 0u)
 			top++;
 
-		status = frame(doc, at, doc->length, &form, &reason);
+		/* A list is judged by situ once, whole, at its `)`, against the
+		 * end the walk finds: framing it at its `(` as well judged every
+		 * list twice, and a list's framing is its whole extent's. */
+		if (doc->data[at] == '(') {
+			form.kind = HULL_SEXPR_LIST;
+			status    = HULL_SEXPR_OK;
+		} else {
+			status = frame(doc, at, doc->length, &form, &reason);
+		}
 		if (status != HULL_SEXPR_OK) {
 			locate(doc, error, status, at, reason);
 			return status;

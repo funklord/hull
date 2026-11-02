@@ -111,6 +111,25 @@ static int read_all(int fd, void *data, size_t length)
 	return 0;
 }
 
+/* A file of the store's own, in its tmp/, gone once closed: what a pack
+ * stages is as large as the tree, and belongs beside the objects, on the
+ * filesystem that holds them, not in /tmp -- a tmpfs, or one nearly full,
+ * as a measurement of a 796 MB tree found it. */
+static FILE *store_temp(const hull_store *store)
+{
+	char  path[4200];
+	int   fd;
+	FILE *file;
+
+	snprintf(path, sizeof path, "%s/tmp/pack.XXXXXX", store->root);
+	if ((fd = mkostemp(path, O_CLOEXEC)) < 0)
+		return NULL;
+	unlink(path);
+	if ((file = fdopen(fd, "w+")) == NULL)
+		close(fd);
+	return file;
+}
+
 static int by_digest(const void *a, const void *b)
 {
 	return memcmp(((const object *)a)->digest, ((const object *)b)->digest, 32u);
@@ -247,7 +266,7 @@ int hull_store_pack(hull_store *store, const char *name, int out, char hex[65], 
 	if ((cctx = ZSTD_createCCtx()) == NULL ||
 	    ZSTD_isError(ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, PACK_LEVEL)) ||
 	    ZSTD_isError(ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1)) ||
-	    (data = tmpfile()) == NULL) {
+	    (data = store_temp(store)) == NULL) {
 		say(why, cap, "the pack's compressor could not be made", NULL);
 		goto done;
 	}
@@ -434,7 +453,7 @@ int hull_store_unpack(hull_store *store, int in, const char *ref, char hex[65], 
 	/* Each object through a file of its own, into the store, checked
 	 * against its digest there. */
 	for (uint32_t i = 0u; i < count; i++) {
-		if ((made = tmpfile()) == NULL ||
+		if ((made = store_temp(store)) == NULL ||
 		    decompress_into(dctx, in, objects[i].frame, objects[i].length, fileno(made)) != 0) {
 			say(why, cap, "an object of the pack is cut or not what its index says", NULL);
 			goto done;
