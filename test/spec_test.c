@@ -302,6 +302,9 @@ static void test_records(void)
 	   SHAPE, "(advertise_every", "machine.segments.wire.advertise_every");
 	NO(M("(segments (wire (subnet6 \"fd42:99::/64\") (advertise true) (advertise_every \"30\")))"),
 	   VALUE, "\"30\"", "machine.segments.wire.advertise_every");
+	OK(M("(segments (wire (subnet6 \"fd42:99::/64\") (advertise true) (advertise_lifetime \"60s\")))"));
+	NO(M("(segments (wire (subnet6 \"fd42:99::/64\") (advertise_lifetime \"60s\")))"), SHAPE,
+	   "(advertise_lifetime", "machine.segments.wire.advertise_lifetime");
 	NO(M("(segments (wire (subnet6 \"fd42:99::/80\") (advertise true)))"), SHAPE, "(advertise true)",
 	   "machine.segments.wire.advertise");
 	NO(M("(segments (wire (subnet \"10.99.0.0/24\") (advertise true)))"), SHAPE, "(advertise true)",

@@ -49,6 +49,7 @@ typedef struct hull_names_segment {
 	int      has6;                          /* given an IPv6 network */
 	int      advertise;                     /* (advertise true): hull's router advertisements */
 	unsigned every;                         /* (advertise_every D) in seconds, the least asked; 0 none */
+	unsigned lifetime;                      /* (advertise_lifetime D) in seconds, the least; 0 for ever */
 	int      gateway;                       /* (gateway true): a way out through .1 */
 	uint8_t  network6[16];
 	unsigned prefix6;
@@ -80,7 +81,8 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
  * and without the IPv4 three where it has only that, `(advertise
  * true)` where any machine on it asks hull to advertise its network,
  * `(advertise_every N)`, seconds, the least any asks, where they also ask
- * it sent unasked, and
+ * it sent unasked, `(advertise_lifetime N)`, seconds, the least any asks
+ * of its prefix's lifetimes, and
  * `(gateway true)` where any asks for a way out through .1. Its length; 0 where it is
  * on none, and -1 where `cap` is too small.
  */

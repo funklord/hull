@@ -168,6 +168,12 @@ int hull_segment_port_named(const char *key, const char *machine, uint32_t addre
  */
 int hull_segment_advertise_every(const char *key, unsigned seconds);
 
+/* The prefix's valid and preferred lifetimes in `key`'s router
+ * advertisements, `seconds`, the least any machine asks, where they are
+ * otherwise for ever: so a machine's SLAAC address ages out once they
+ * stop. 0, or -1 where there is no such segment. */
+int hull_segment_advertise_lifetime(const char *key, unsigned seconds);
+
 /*
  * The resolvers .1 asks on to, `count` of them, at most three: IPv4
  * addresses and their UDP ports, in place of /etc/resolv.conf's, for a

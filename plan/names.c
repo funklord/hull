@@ -189,6 +189,8 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 			char                subnet6[64];
 			char                advertise[8];
 			char                every[16];
+			char                lifetime[16];
+			unsigned            lasts = 0u;
 			unsigned            seconds = 0u;
 			char                gateway[8];
 			uint32_t            network = 0u;
@@ -208,10 +210,13 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 				parse_subnet6(subnet6, network6, &prefix6);
 			if (!entry_text(spec, &item, "advertise", advertise, sizeof advertise) ||
 			    !entry_text(spec, &item, "gateway", gateway, sizeof gateway) ||
-			    !entry_text(spec, &item, "advertise_every", every, sizeof every))
+			    !entry_text(spec, &item, "advertise_every", every, sizeof every) ||
+			    !entry_text(spec, &item, "advertise_lifetime", lifetime, sizeof lifetime))
 				return refuse(names, "a segment of %s cannot be read%s", ids[i], "");
 			if (every[0] != '\0' && strcmp(advertise, "true") == 0)
 				seconds = seconds_of(every);
+			if (lifetime[0] != '\0' && strcmp(advertise, "true") == 0)
+				lasts = seconds_of(lifetime);
 			s = find(names, name);
 			/* Advertised where any machine asks it: one advertiser on a
 			 * segment, hull at ::1, whoever names it; and a gateway the
@@ -221,6 +226,9 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 			/* Sent unasked as often as the most eager machine asks. */
 			if (s != NULL && seconds != 0u && (s->every == 0u || seconds < s->every))
 				s->every = seconds;
+			/* And its prefix lives as long as the least any asks. */
+			if (s != NULL && lasts != 0u && (s->lifetime == 0u || lasts < s->lifetime))
+				s->lifetime = lasts;
 			if (s != NULL && strcmp(gateway, "true") == 0)
 				s->gateway = 1;
 			/* Each family's network named by any machine is the segment's;
@@ -272,6 +280,7 @@ int hull_names_draw(hull_names *names, const hull_spec *spec,
 			snprintf(s->name, sizeof s->name, "%s", name);
 			s->advertise = strcmp(advertise, "true") == 0;
 			s->every     = seconds;
+			s->lifetime  = lasts;
 			s->gateway   = strcmp(gateway, "true") == 0;
 			s->has4    = subnet[0] != '\0';
 			s->network = network;
@@ -453,6 +462,14 @@ long hull_names_entry(const hull_names *names, unsigned member, uint8_t *data, s
 			snprintf(text_every, sizeof text_every, "%u", s->every);
 			put(&o, "(15:advertise_every", 19u);
 			put_atom(&o, text_every);
+			put(&o, ")", 1u);
+		}
+		if (s->advertise && s->lifetime != 0u) {
+			char text_lifetime[16];
+
+			snprintf(text_lifetime, sizeof text_lifetime, "%u", s->lifetime);
+			put(&o, "(18:advertise_lifetime", 22u);
+			put_atom(&o, text_lifetime);
 			put(&o, ")", 1u);
 		}
 		if (s->gateway)

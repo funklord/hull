@@ -165,6 +165,7 @@ typedef struct segment {
 	source   sources[MAX_SOURCES];
 	capture  capture;
 	unsigned every;     /* seconds between router advertisements sent unasked; 0, none */
+	unsigned lifetime;  /* the prefix's lifetimes in them, seconds; 0 for ever */
 	uint64_t next_ra;   /* when the next of those is due */
 	/* What each port that has gone counted, by its machine, summed where
 	 * one machine came and went more than once: kept while the segment
@@ -1265,7 +1266,8 @@ static void send_advert(segment *s, unsigned to, const uint8_t mac[6], const pee
  * outright; the prefix, on-link and for SLAAC; ::1 as its DNS server
  * (RDNSS, RFC 8106) and
  * `hull` to search (DNSSL). The lifetimes are for ever, as the network's
- * is the segment's while it is there; so it is sent unasked only where a
+ * is the segment's while it is there, unless (advertise_lifetime D) gives
+ * the prefix one that ends; so it is sent unasked only where a
  * plan asks it, (advertise_every D), for a machine that starts to accept
  * advertisements after its kernel solicited (send_unasked). */
 static void send_ra(segment *s, unsigned to, const uint8_t mac[6], const peer *asker)
@@ -1298,12 +1300,18 @@ static void send_ra(segment *s, unsigned to, const uint8_t mac[6], const peer *a
 	o[1] = 1u;
 	memcpy(o + 2, hull_mac, 6u);
 	o += 8;
-	/* Prefix information: the network, on-link and autonomous. */
+	/* Prefix information: the network, on-link and autonomous, valid and
+	 * preferred for ever, or for (advertise_lifetime D). */
 	o[0] = 3u;
 	o[1] = 4u;
 	o[2] = (uint8_t)prefix6;
 	o[3] = 0xc0u;
-	memset(o + 4, 0xff, 8u);
+	if (s->lifetime == 0u) {
+		memset(o + 4, 0xff, 8u);
+	} else {
+		put32(o + 4, s->lifetime);
+		put32(o + 8, s->lifetime);
+	}
 	memcpy(o + 16, network6, 16u);
 	o += 32;
 	/* RDNSS: ::1, hull's DNS. */
@@ -2877,6 +2885,18 @@ int hull_segment_advertise_every(const char *key, unsigned seconds)
 		return -1;
 	(void)!write(wake[1], "", 1u);   /* for the poll() to take its timer */
 	return 0;
+}
+
+int hull_segment_advertise_lifetime(const char *key, unsigned seconds)
+{
+	segment *s;
+
+	pthread_mutex_lock(&lock);
+	s = find(key);
+	if (s != NULL && seconds != 0u && (s->lifetime == 0u || seconds < s->lifetime))
+		s->lifetime = seconds;
+	pthread_mutex_unlock(&lock);
+	return s == NULL ? -1 : 0;
 }
 
 void hull_segment_resolvers(const char *const *servers, const unsigned *ports, unsigned count)

@@ -604,6 +604,7 @@ static const key segment_keys[] = {
 	{ .name = "advertise", .type = BOOLEAN },
 	{ .name = "gateway", .type = BOOLEAN },
 	{ .name = "advertise_every", .type = STRING, .value = duration },
+	{ .name = "advertise_lifetime", .type = STRING, .value = duration },
 };
 static const schema segment = TABLE_ACROSS(segment_keys, segment_across);
 
@@ -611,6 +612,7 @@ static const schema segment = TABLE_ACROSS(segment_keys, segment_across);
 #define SEGMENT_SUBNET6   1u
 #define SEGMENT_ADVERTISE 2u
 #define SEGMENT_EVERY     4u
+#define SEGMENT_LIFETIME  5u
 
 /* Whether the record's `at` key, present, is `true`. */
 static int given_true(const walk *w, const hull_sexpr_form *found, uint64_t present, unsigned at)
@@ -628,7 +630,8 @@ static int given_true(const walk *w, const hull_sexpr_form *found, uint64_t pres
 /* Given subnet, subnet6 or both; (advertise true), hull's router
  * advertisements for SLAAC, only of an IPv6 network of /64, the one
  * length SLAAC makes an address in (RFC 4862 5.5.3), and
- * (advertise_every "30s"), the same sent unasked as well, only beside it.
+ * (advertise_every "30s"), the same sent unasked as well, and
+ * (advertise_lifetime "60s"), its prefix's lifetimes, only beside it.
  * (gateway true), a way out through .1 and ::1, takes either network. */
 static hull_spec_status segment_across(walk *w, const hull_sexpr_form *record,
                                        const hull_sexpr_form *found, uint64_t present)
@@ -643,11 +646,14 @@ static hull_spec_status segment_across(walk *w, const hull_sexpr_form *record,
 		return fail(w, HULL_SPEC_ERR_MISSING, record->offset,
 		            "a segment hull addresses is given its subnet, its subnet6, or both");
 	if (!given_true(w, found, present, SEGMENT_ADVERTISE)) {
-		if (!(present & ((uint64_t)1 << SEGMENT_EVERY)))
+		unsigned at = present & ((uint64_t)1 << SEGMENT_EVERY) ? SEGMENT_EVERY : SEGMENT_LIFETIME;
+
+		if (!(present & ((uint64_t)1 << at)))
 			return HULL_SPEC_OK;
-		saved = push_text(w, "advertise_every");
-		fail(w, HULL_SPEC_ERR_SHAPE, found[SEGMENT_EVERY].offset,
-		     "sends hull's router advertisements unasked, which needs (advertise true)");
+		saved = push_text(w, segment_keys[at].name);
+		fail(w, HULL_SPEC_ERR_SHAPE, found[at].offset, at == SEGMENT_EVERY ?
+		     "sends hull's router advertisements unasked, which needs (advertise true)" :
+		     "is the lifetime of hull's router advertisements, which needs (advertise true)");
 		pop(w, saved);
 		return HULL_SPEC_ERR_SHAPE;
 	}

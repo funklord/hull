@@ -593,6 +593,18 @@ static void test_names(void)
 	        NULL)
 		FAIL("advertise_every was not the least, or not in its place: %s", entry_of(&names, 2u));
 
+	/* (advertise_lifetime D) the same: the least asked, after
+	 * advertise_every. */
+	cases++;
+	if (draw_file("(machines " SEG("a", "(n (subnet6 \"fd03::/64\") (advertise true)"
+	                                    " (advertise_every \"30s\") (advertise_lifetime \"5m\"))")
+	              SEG("b", "(n (subnet6 \"fd03::/64\") (advertise true) (advertise_lifetime \"90s\"))")
+	              ")", &names) != 0 ||
+	    names.segment[0].lifetime != 90u ||
+	    strstr(entry_of(&names, 0u),
+	           ")(15:advertise_every2:30)(18:advertise_lifetime2:90)(6:hosts6(") == NULL)
+		FAIL("advertise_lifetime was not the least, or not in its place: %s", entry_of(&names, 0u));
+
 	/* (gateway true) the same: one machine's asks it of the segment, and
 	 * it is written after advertise, before the hosts. */
 	cases++;

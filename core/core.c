@@ -167,6 +167,7 @@ struct slot {
 		unsigned prefix6;         /* 0 where it has no IPv6 network */
 		int      advertise;       /* hull advertises the IPv6 network there */
 		unsigned every;           /* and unasked every this many seconds; 0, only asked */
+		unsigned lifetime;        /* its prefix's lifetimes, seconds; 0 for ever */
 		int      gateway;         /* .1 its way out, where it has none of its own */
 		hull_segment_host *hosts;   /* the plan's, every machine it names there */
 		unsigned           host_count;
@@ -418,6 +419,7 @@ static int on_segment(hull_core *core, const char *key, char *why, size_t cap)
 	unsigned                 prefix6    = 0u;
 	int                      advertise  = 0;
 	unsigned                 every      = 0u;
+	unsigned                 lifetime   = 0u;
 	int                      gateway    = 0;
 	const hull_segment_host *hosts      = NULL;
 	unsigned                 host_count = 0u;
@@ -431,6 +433,7 @@ static int on_segment(hull_core *core, const char *key, char *why, size_t cap)
 			prefix6    = s->named[i].prefix6;
 			advertise  = s->named[i].advertise;
 			every      = s->named[i].every;
+			lifetime   = s->named[i].lifetime;
 			gateway    = s->named[i].gateway;
 			hosts      = s->named[i].hosts;
 			host_count = s->named[i].host_count;
@@ -443,6 +446,8 @@ static int on_segment(hull_core *core, const char *key, char *why, size_t cap)
 	                             gateway, s->forwards || gateway, hosts, host_count, why, cap);
 	if (fd >= 0 && advertise && every != 0u)
 		hull_segment_advertise_every(key, every);
+	if (fd >= 0 && advertise && lifetime != 0u)
+		hull_segment_advertise_lifetime(key, lifetime);
 
 	/* Before the machine runs, so that its first frame meets its link. */
 	for (unsigned i = 0u; fd >= 0 && i < s->link_count; i++) {
@@ -1985,6 +1990,11 @@ static const char *named_of(slot *s, const hull_sexpr_doc *doc, const hull_sexpr
 			flag = hull_access_find(doc, &names, segment, &record) ?
 			       hull_access_value(doc, &record, "advertise_every") : NULL;
 			s->named[s->named_count].every = flag != NULL ? (unsigned)strtoul(flag, NULL, 10) : 0u;
+			free(flag);
+			flag = hull_access_find(doc, &names, segment, &record) ?
+			       hull_access_value(doc, &record, "advertise_lifetime") : NULL;
+			s->named[s->named_count].lifetime =
+				flag != NULL ? (unsigned)strtoul(flag, NULL, 10) : 0u;
 			free(flag);
 			flag = hull_access_find(doc, &names, segment, &record) ?
 			       hull_access_value(doc, &record, "gateway") : NULL;

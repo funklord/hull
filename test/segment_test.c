@@ -1575,6 +1575,23 @@ int main(void)
 					      memcmp(r + 22, link_local, 16u) == 0 && r[53] == 1u && r[38] == 0xffu &&
 					      r[o + 8u] == 3u && memcmp(r + o + 24u, self6, 8u) == 0);
 				}
+				/* The prefix's lifetimes for ever, until (advertise_lifetime
+				 * D) asks them to end: then D, valid and preferred. */
+				{
+					static const uint8_t ever[8] = { 0xff, 0xff, 0xff, 0xff,
+					                                 0xff, 0xff, 0xff, 0xff };
+					static const uint8_t ninety[8] = { 0, 0, 0, 90, 0, 0, 0, 90 };
+
+					check("a prefix's lifetimes for ever, where none is asked",
+					      n >= o + 80u && memcmp(r + o + 12u, ever, 8u) == 0);
+					check("a lifetime, on no segment, refused",
+					      hull_segment_advertise_lifetime("nosuch", 90u) == -1);
+					check("a lifetime of 90 seconds asked",
+					      hull_segment_advertise_lifetime("ra6", 90u) == 0);
+					n = next_raw(a, r, sizeof r, 1600);
+					check("the next advertisement's prefix valid and preferred for 90 seconds",
+					      n >= o + 80u && r[54] == 134u && memcmp(r + o + 12u, ninety, 8u) == 0);
+				}
 				close(a);
 			}
 		}
