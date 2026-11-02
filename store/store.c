@@ -783,11 +783,49 @@ static int read_tar(hull_store *store, walk *w, int fd, const char *const *drop,
 			}
 			continue;
 		}
-		snprintf(name, sizeof name, "%s", pax.path != NULL ? pax.path : "");
-		if (pax.path == NULL) {
-			memcpy(name, block, 100u);
-			name[100] = '\0';
+		/* GNU tar's own long name and long link, its default past 100
+		 * bytes: the next entry's, as a pax header's path and linkpath. */
+		if (type == 'L' || type == 'K') {
+			char *text = size < PATH_MAX ? malloc((size_t)size + 1u) : NULL;
+			int   ok = text != NULL && read_all(fd, (uint8_t *)text, (size_t)size) == 0 &&
+			         skip_bytes(fd, (512u - size % 512u) % 512u) == 0;
+
+			if (!ok) {
+				free(text);
+				say(w->why, w->why_cap, "the tree's tar", "a GNU long name could not be read");
+				goto fail;
+			}
+			text[size] = '\0';
+			if (type == 'L') {
+				free(pax.path);
+				pax.path = text;
+			} else {
+				free(pax.link);
+				pax.link = text;
+			}
+			continue;
 		}
+		snprintf(name, sizeof name, "%s", pax.path != NULL ? pax.path : "");
+		/* ustar's name, after its prefix where it has one: a path past
+		 * 100 bytes split at a slash, as POSIX writers split it. Only in
+		 * POSIX's header, "ustar\0": GNU's, "ustar  ", keeps times there. */
+		if (pax.path == NULL) {
+			char base[101];
+
+			memcpy(base, block, 100u);
+			base[100] = '\0';
+			if (block[345] != 0 && memcmp(block + 257, "ustar", 6u) == 0)
+				snprintf(name, sizeof name, "%.155s/%s", (const char *)block + 345, base);
+			else
+				snprintf(name, sizeof name, "%s", base);
+		}
+		/* A tree tarred as `tar -C DIR -cf X .` names everything from ./,
+		 * and the root itself ./: the root is the manifest's, not an
+		 * entry of it, and the rest are named from it. */
+		while (name[0] == '.' && name[1] == '/')
+			memmove(name, name + 2, strlen(name + 2) + 1u);
+		if (strcmp(name, ".") == 0)
+			name[0] = '\0';
 		snprintf(link, sizeof link, "%s", pax.link != NULL ? pax.link : "");
 		if (pax.link == NULL) {
 			memcpy(link, block + 157, 100u);

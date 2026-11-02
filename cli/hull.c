@@ -620,6 +620,81 @@ static int rewrite_order(const void *a, const void *b)
  * an image ref for docker. With `create` the checkout is made, as a run
  * needs; a plan only names it. Returns 0, or -1 having said why.
  */
+static int open_store(hull_store *store, int create);
+
+/* The tarball `given` names, relative to the file `file` where it is not
+ * absolute, committed to the store as `tar/` and the first 32 hex digits
+ * of its bytes' sha256, its arch the machine's or the host's; that ref
+ * into `ref`. 0, or -1 having said why. */
+static int tar_ref(const char *file, const hull_spec *spec, const hull_sexpr_form *machine,
+                   const char *given, char *ref, size_t cap)
+{
+	char            path[4400];
+	char            arch[64];
+	char            why[4400] = "";
+	uint8_t         chunk[65536];
+	uint8_t         digest[32];
+	char            hex[65];
+	hull_sha256     h;
+	hull_sexpr_form entry;
+	hull_sexpr_form head;
+	hull_sexpr_form value;
+	hull_store      store;
+	hull_commit     made;
+	ssize_t         n;
+	int             fd;
+	int             status;
+
+	if (given[0] == '/') {
+		snprintf(path, sizeof path, "%s", given);
+	} else {
+		const char *slash = strrchr(file, '/');
+
+		snprintf(path, sizeof path, "%.*s%s", slash != NULL ? (int)(slash - file + 1) : 0, file,
+		         given);
+	}
+	if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0) {
+		fprintf(stderr, "%s: tar:%s: %s\n", file, given, strerror(errno));
+		return -1;
+	}
+	hull_sha256_init(&h);
+	while ((n = read(fd, chunk, sizeof chunk)) > 0)
+		hull_sha256_update(&h, chunk, (size_t)n);
+	hull_sha256_final(&h, digest);
+	hull_sha256_hex(digest, hex);
+	snprintf(ref, cap, "tar/%.32s", hex);
+	snprintf(arch, sizeof arch, "%s", host_arch());
+	if (hull_spec_find(spec, machine, "arch", &entry) && hull_sexpr_child(&spec->doc, &entry, &head) &&
+	    hull_sexpr_next(&spec->doc, &head, &value) && value.content_length < sizeof arch &&
+	    !hull_sexpr_is(&spec->doc, &value, "host")) {
+		memcpy(arch, spec->doc.data + value.content, value.content_length);
+		arch[value.content_length] = '\0';
+	}
+	if (n < 0 || lseek(fd, 0, SEEK_SET) != 0 || (status = open_store(&store, 1)) != 0) {
+		fprintf(stderr, "%s: tar:%s: it cannot be read again for the store\n", file, given);
+		close(fd);
+		return -1;
+	}
+	{
+		hull_commit_extra extra = { 0 };
+		char              provenance[200];
+
+		snprintf(provenance, sizeof provenance, "(10:provenance(7:builder%zu:%s))",
+		         strlen(HULL_BUILDER), HULL_BUILDER);
+		extra.provenance = (const uint8_t *)provenance;
+		extra.provenance_length = strlen(provenance);
+		status = hull_store_commit_tar(&store, fd, arch, ref, NULL, &extra, &made, why,
+		                               sizeof why);
+	}
+	hull_store_close(&store);
+	close(fd);
+	if (status != 0) {
+		fprintf(stderr, "%s: tar:%s: %s\n", file, given, why);
+		return -1;
+	}
+	return 0;
+}
+
 static int store_sources(const char *file, uint8_t *data, size_t *length, int create)
 {
 	static rewrite  rewrites[MAX_REWRITES];
@@ -667,6 +742,17 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 			continue;
 		memcpy(name, spec.doc.data + value.content, value.content_length);
 		name[value.content_length] = '\0';
+		/* A tar: source, a tree as a tarball -- an export, a docker
+		 * export, a release -- committed to the store as `tar/HASH`, its
+		 * content's, owners and all, and run as the stored tree it then
+		 * is, on every engine. Committed on its first plan or run, a
+		 * commit of the same bytes again being the same ref. */
+		if (strncmp(name, "tar:", 4u) == 0 && name[4] != '\0') {
+			if (tar_ref(file, &spec, &machines[i], name + 4, name, sizeof name) != 0) {
+				result = -1;
+				break;
+			}
+		}
 		for (unsigned k = 0u; k < sizeof schemes / sizeof schemes[0]; k++)
 			schemed |= strncmp(name, schemes[k], strlen(schemes[k])) == 0;
 		if (schemed)

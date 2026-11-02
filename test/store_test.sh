@@ -519,6 +519,42 @@ data += b"\0" * (-len(data) % 512)
 open(sys.argv[2], "wb").write(data)' "$root/owned.tar" "$root/unended.tar"
 expect 1 'commit: the tree.s tar: it ends before its end$' "$hull" commit --tar "$root/unended.tar" tarred/unended
 expect 1 'no such ref' "$hull" manifest show tarred/unended
+# Each common writer's way of naming: `tar -C DIR -cf X .`'s, every name
+# from ./ and the root itself ./, the root not an entry; POSIX ustar's,
+# a long name split into its prefix; and GNU's, a long name and a long
+# link target as records of their own.
+timeout 30 python3 - "$root" <<'PYEOF3'
+import io, sys, tarfile
+long_dir = "d" * 90 + "/" + "e" * 40
+for name, fmt in (("dotted", tarfile.GNU_FORMAT), ("ustar", tarfile.USTAR_FORMAT),
+                  ("gnu", tarfile.GNU_FORMAT)):
+	t = tarfile.open(sys.argv[1] + "/" + name + ".tar", "w", format=fmt)
+	def add(path, kind, data=b"", link=""):
+		i = tarfile.TarInfo(path)
+		i.type, i.mode, i.size, i.linkname = kind, 0o755 if kind == tarfile.DIRTYPE else 0o644, len(data), link
+		t.addfile(i, io.BytesIO(data) if data else None)
+	if name == "dotted":
+		add("./", tarfile.DIRTYPE)
+		add("./etc", tarfile.DIRTYPE)
+		add("./etc/motd", tarfile.REGTYPE, b"hi\n")
+	else:
+		add(long_dir, tarfile.DIRTYPE)
+		add(long_dir + "/file", tarfile.REGTYPE, b"deep\n")
+		if name == "gnu":
+			add("link", tarfile.SYMTYPE, link=long_dir + "/file")
+	t.close()
+PYEOF3
+long_dir="$(printf 'd%.0s' $(seq 90))/$(printf 'e%.0s' $(seq 40))"
+expect 0 '' "$hull" commit --tar "$root/dotted.tar" tarnames/dotted
+expect 0 '\(path "etc/motd"\)' "$hull" manifest show tarnames/dotted
+cases=$((cases + 1))
+timeout 30 "$hull" manifest show tarnames/dotted | grep -qE '\(path "\.?/?"\)|\(path "\./' &&
+	fail "a tar named from ./ kept ./ or the root as an entry" "$(timeout 30 "$hull" manifest show tarnames/dotted)"
+expect 0 '' "$hull" commit --tar "$root/ustar.tar" tarnames/ustar
+expect 0 "\\(path \"$long_dir/file\"\\)" "$hull" manifest show tarnames/ustar
+expect 0 '' "$hull" commit --tar "$root/gnu.tar" tarnames/gnu
+expect 0 "\\(path \"$long_dir/file\"\\)" "$hull" manifest show tarnames/gnu
+expect 0 "\\(target \"$long_dir/file\"\\)" "$hull" manifest show tarnames/gnu
 
 # The test's core leaves once idle, before its directory goes.
 tries=0

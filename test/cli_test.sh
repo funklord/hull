@@ -3056,6 +3056,16 @@ out=$(timeout 30 "$hull" commit nosuchmachine live/2 2>&1)
 	! printf '%s\n' "$out" | grep -q 'ends before its end' ||
 	fail "a commit of no machine was not refused by its reason alone" "$out"
 rm -rf "${root:?}/livevol"
+# A tar: source, a tree as a tarball made the common way, `tar -C DIR -cf
+# X .`: committed to the store by its content, as tar/HASH, and run as
+# the stored tree it then is.
+rm -f "$root/rootfs.tar"
+tar -C "$root/rootfs" -cf "$root/rootfs.tar" .
+printf '(machine (source "tar:./rootfs.tar") (backend chroot) (command "/probe" "say" "from a tar"))\n' \
+	> "$root/fromtar.conf"
+from_root 0 '^from a tar$' -f "$root/fromtar.conf"
+expect 0 '^tar/[0-9a-f]{32} ' "$hull" images
+rm -f "$root/rootfs.tar"
 # Pools (section 4.12): a pool of one slot, held by a machine that sleeps.
 # A run that does not wait is refused at once, 75; one that waits a second
 # says it waits, then is refused, 75; one that waits for ever says so and
