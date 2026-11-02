@@ -69,7 +69,6 @@ typedef struct hull_sexpr_doc {
 	const uint8_t      *data;
 	uint32_t            length;
 	hull_sexpr_syntax   syntax;
-	int                 checked;  /* hull_sexpr_open() walked it whole and passed it */
 } hull_sexpr_doc;
 
 /* A form: offsets into the document, valid for as long as it is. */
