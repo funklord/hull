@@ -86,6 +86,7 @@
 
 #include "ip6.h"
 #include "access.h"
+#include "tree.h"
 #include "wire.h"
 
 /* The commit, where the build that made this one wrote it, as hull's. */
@@ -1362,6 +1363,23 @@ static void close_input(channel *c)
 /* Fork `argv` for channel `ch`, with the machine's environment, workdir
  * and no_new_privs, `cwd` and `extra` over them. On a terminal of `size`
  * when `size` is not NULL; with stdin from /dev/null when `input` is 0. */
+/* hull_tree_tar_fs's sink for an exec of (tree true): stdout, whole. */
+static int tree_out(void *context, const uint8_t *data, size_t n)
+{
+	(void)context;
+	while (n > 0u) {
+		ssize_t wrote = write(1, data, n);
+
+		if (wrote < 0 && errno == EINTR)
+			continue;
+		if (wrote <= 0)
+			return -1;
+		data += wrote;
+		n -= (size_t)wrote;
+	}
+	return 0;
+}
+
 static const char *spawn(uint32_t ch, char *const *argv, const char *cwd, char *const *extra,
                          const struct winsize *size, int input)
 {
@@ -1446,6 +1464,18 @@ static const char *spawn(uint32_t ch, char *const *argv, const char *cwd, char *
 			prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 		if (ch == 0u && notices[0] != '\0' && write(2, notices, strlen(notices)) < 0) {
 			/* its stderr is gone; nothing to tell */
+		}
+		/* (tree true): no command, the machine's root as a tar on
+		 * stdout, by the writer an (export PATH) uses, for `hull commit`
+		 * of a running machine. */
+		if (argv[0] == NULL) {
+			char detail[600];
+			int  failed = chdir("/") != 0 ||
+			              hull_tree_tar_fs("/", 1, tree_out, NULL, detail, sizeof detail) != 0;
+
+			if (failed)
+				fprintf(stderr, "hull: the machine's tree: %s\n", detail);
+			_exit(failed ? 1 : 0);
 		}
 		hull_access_execute(argv, envp);
 		fprintf(stderr, "hull agent: %s: %s\n", argv[0], strerror(errno));
@@ -1873,7 +1903,8 @@ static const char *connect_port(const hull_sexpr_doc *body, uint32_t ch)
 	return NULL;
 }
 
-/* `(exec (argv ...) (ch n) (cwd p)? (env ...)? (tty ...) (user u)?)`. */
+/* `(exec (argv ...) (ch n) (cwd p)? (env ...)? (tty ...) (user u)?)`, or
+ * `(tree true)` in place of the argv: the machine's root as a tar. */
 static const char *exec(const hull_sexpr_doc *body, const hull_sexpr_form *message, uint32_t ch)
 {
 	hull_sexpr_form entry;
@@ -1891,16 +1922,17 @@ static const char *exec(const hull_sexpr_doc *body, const hull_sexpr_form *messa
 		return "channel 0 is the workload's";
 	if (hull_access_find(body, message, "user", &entry))
 		return "an exec as another user is not supported yet";
-	hull_access_find(body, message, "argv", &entry);
-	hull_sexpr_child(body, &entry, &item);
-	for (more = hull_sexpr_next(body, &item, &item); more && reason == NULL;
-	     more = hull_sexpr_next(body, &item, &item)) {
-		if (n == MAX_ARGS)
-			reason = "the command has too many arguments";
-		else if ((argv[n++] = hull_access_text(body, &item)) == NULL)
-			reason = "an argument holds a NUL byte";
+	if (hull_access_find(body, message, "argv", &entry)) {
+		hull_sexpr_child(body, &entry, &item);
+		for (more = hull_sexpr_next(body, &item, &item); more && reason == NULL;
+		     more = hull_sexpr_next(body, &item, &item)) {
+			if (n == MAX_ARGS)
+				reason = "the command has too many arguments";
+			else if ((argv[n++] = hull_access_text(body, &item)) == NULL)
+				reason = "an argument holds a NUL byte";
+		}
 	}
-	if (reason == NULL && n == 0u)
+	if (reason == NULL && n == 0u && !hull_access_true(body, message, "tree"))
 		reason = "an exec names a command";
 	n = 0u;
 	if (reason == NULL && hull_access_find(body, message, "env", &entry)) {

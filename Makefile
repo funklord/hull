@@ -137,7 +137,8 @@ HULL        = $(BUILD_DIR)/hull
 # the engine writes holds nothing else, and beside hull, where the engine
 # looks for it.
 AGENT_BIN_OBJS = $(BUILD_DIR)/agent/agent.o $(WIRE_OBJS) $(BUILD_DIR)/engine/access.o \
-                 $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/ip6.o
+                 $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/ip6.o \
+                 $(BUILD_DIR)/engine/tree.o
 AGENT_BIN      = $(BUILD_DIR)/hull-agent
 
 # The hosts database for section 8.1's names, loaded by glibc into any

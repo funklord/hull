@@ -3322,7 +3322,8 @@ static int answered(hull_machine *m, hull_stream *st, char *reason, size_t cap)
 }
 
 /* The core's request, `(exec (argv ...) (ch n) (machine id) (tty ...))`,
- * as the agent's: the argv, a channel of this machine's, the terminal. */
+ * as the agent's: the argv, or (tree true), a channel of this machine's,
+ * the terminal. */
 static hull_status qemu_exec(hull_core *core, hull_machine *m, hull_buf spec, hull_stream **out,
                              hull_error *error)
 {
@@ -3337,8 +3338,11 @@ static hull_status qemu_exec(hull_core *core, hull_machine *m, hull_buf spec, hu
 
 	if (!m->started || wait_done(m, 0))
 		return fail(error, HULL_ERR_GONE, "the machine is not running");
+	/* The command's words, or (tree true), each passed on as it is. */
 	if (hull_sexpr_open(&doc, spec.data, spec.len, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
-	    !hull_sexpr_first(&doc, &message) || !hull_access_find(&doc, &message, "argv", &argv))
+	    !hull_sexpr_first(&doc, &message) ||
+	    (!hull_access_find(&doc, &message, "argv", &argv) &&
+	     !hull_access_find(&doc, &message, "tree", &argv)))
 		return fail(error, HULL_ERR_UNSUPPORTED, "an exec names a command");
 	if ((st = new_stream(m, core, &why)) == NULL)
 		return fail(error, why, why == HULL_ERR_BUSY ?

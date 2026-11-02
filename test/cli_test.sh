@@ -2974,6 +2974,38 @@ done
 expect 0 '^addr=eth0 10\.0\.2\.15/24 up$' "$hull" exec natexec /probe addr eth0
 expect 0 '' "$hull" kill -s KILL natexec
 wait "$natexec" 2>/dev/null
+# hull commit of a running machine: its root as it is now, written by
+# the engine in the machine as (export PATH) writes it at its end -- the
+# workload's write in its overlay's memory there, a volume's file not --
+# and a name no machine has refused with the exec's reason alone.
+rm -rf "${root:?}/livevol" "$root/livecommit.out"
+mkdir -p "$root/livevol"
+printf 'v\n' > "$root/livevol/fromvolume"
+conf livecommit '(mutable overlay) (hostname "livecommit") (on_disconnect stop)' \
+	"(volumes (volume (host \"$root/livevol\") (guest \"/mnt\")))" \
+	'(command "/probe" "write" "/made-live" "say" "ready" "wait")'
+(cd / && exec timeout -k 2 30 "$hull_abs" run -f "$root/livecommit.conf" > "$root/livecommit.out" 2>&1) &
+livecommit=$!
+tries=0
+until grep -q '^ready$' "$root/livecommit.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+expect 0 '^live/1 sha256:[0-9a-f]{64}$' "$hull" commit livecommit live/1
+expect 0 '\(path "made-live"\)' "$hull" manifest show live/1
+cases=$((cases + 1))
+out=$(timeout 30 "$hull" manifest show live/1 2>&1)
+printf '%s\n' "$out" | grep -q '(path "mnt")' &&
+	! printf '%s\n' "$out" | grep -q 'fromvolume' ||
+	fail "a running machine's commit took its volume's file, or not its mount point" "$out"
+expect 0 '' "$hull" kill -s KILL livecommit
+wait "$livecommit" 2>/dev/null
+cases=$((cases + 1))
+out=$(timeout 30 "$hull" commit nosuchmachine live/2 2>&1)
+[ $? = 1 ] && printf '%s\n' "$out" | grep -q 'no such machine' &&
+	! printf '%s\n' "$out" | grep -q 'ends before its end' ||
+	fail "a commit of no machine was not refused by its reason alone" "$out"
+rm -rf "${root:?}/livevol"
 # cpus and memory: a systemd scope the init is moved into before its
 # workload, asked of the manager by busctl. Faked here, with a core of its
 # own so that it sees the fake on its PATH: what it is asked, a manager

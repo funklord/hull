@@ -3464,7 +3464,16 @@ static hull_status docker_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	int             rows = 0;
 
 	if (hull_sexpr_open(&doc, spec.data, spec.len, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
-	    !hull_sexpr_first(&doc, &message) || !hull_access_find(&doc, &message, "argv", &argv))
+	    !hull_sexpr_first(&doc, &message))
+		return fail(error, HULL_ERR_UNSUPPORTED, "an exec names a command");
+	/* A running machine's tree, for `hull commit`: docker's exec runs
+	 * the container's programs and none of hull's, so it is not written
+	 * here; (export PATH) gives the tree at the machine's end. */
+	if (hull_access_true(&doc, &message, "tree"))
+		return fail(error, HULL_ERR_UNSUPPORTED, "a running docker machine is not committed "
+		            "yet: (export PATH) writes its tree when it ends, and `hull commit --tar` "
+		            "takes that");
+	if (!hull_access_find(&doc, &message, "argv", &argv))
 		return fail(error, HULL_ERR_UNSUPPORTED, "an exec names a command");
 	tty = hull_access_terminal(&doc, &message, &cols, &rows);
 	add_text(&body, "{\"AttachStdin\":true,\"AttachStdout\":true,\"AttachStderr\":true,");

@@ -1045,6 +1045,28 @@ has 125 'not an image of a filesystem the guest mounts'
 rm -f "$root/vol.img" "$root/junk.img" "$root/imgseed/in"
 rmdir "$root/imgseed"
 
+# hull commit of a running vm: its root as it is now, a tar the agent
+# writes in the guest, the workload's write in its overlay's memory there.
+rm -f "$root/vlive.out"
+conf vlive '(backend vm) (mutable overlay) (hostname "vlive")' \
+	'(command "/probe" "write" "/made-in-vm" "say" "ready" "sleep" "60")'
+(cd / && exec timeout -k 2 120 "$hull" run -f "$root/vlive.conf" > "$root/vlive.out" 2>&1) &
+vlive=$!
+tries=0
+until grep -q '^ready$' "$root/vlive.out" 2>/dev/null || [ "$tries" -ge 240 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+vid=$(timeout 10 "$hull" ps | awk '$3 == "qemu" && $5 == "running" {print $1; exit}')
+cases=$((cases + 1))
+committed=$(timeout 90 "$hull" commit "${vid:-none}" vlive/1 2>&1)
+shown=$(timeout 30 "$hull" manifest show vlive/1 2>&1)
+printf '%s\n' "$committed" | grep -Eq '^vlive/1 sha256:[0-9a-f]{64}$' &&
+	printf '%s\n' "$shown" | grep -q '(path "made-in-vm")' ||
+	fail "a running vm was not committed with its own write" "$vid $committed $shown"
+timeout 30 "$hull" stop "${vid:-none}" > /dev/null 2>&1
+wait "$vlive"
+
 # The network, out, through passt as the user: the machine's own lo, the
 # host's DNS, and the host's address; but not the host's loopback. Two
 # listeners on the host, each taking one connection within 15 seconds,

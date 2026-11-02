@@ -115,7 +115,7 @@ static void usage(FILE *out)
 	      "       hull ssh ID | hull proxy-ssh HOST\n"
 	      "       hull ssh-config [--remove] | hull gc\n"
 	      "       hull systemd [-f FILE] [NAME]\n"
-	      "       hull commit [--arch A] DIR REF | hull commit --tar FILE REF\n"
+	      "       hull commit [--arch A] DIR|ID REF | hull commit --tar FILE REF\n"
 	      "       hull materialize REF DIR | hull images\n"
 	      "       hull diff REF REF | hull tag REF NEW | hull tag -d REF\n"
 	      "       hull manifest show REF | hull manifest compile [REF]\n"
@@ -3687,23 +3687,98 @@ static int open_store(hull_store *store, int create)
 
 /* `hull commit`: a directory, or with `tar` a tar of engine/tree.c's shape
  * from the file `dir` names, `-` for stdin, its owners kept. */
+static int exec_in(const char *id, char **argv, int argc, int tty, unsigned port);
+static int commit_from(const char *dir, const char *ref, const char *arch, int fd, int quiet);
+
+/* The running machine `id`'s root as a tar, from an exec of (tree true)
+ * in a child whose output is the pipe `*fd` reads: the child's pid, or -1
+ * said. */
+static pid_t tree_of(const char *id, int *fd)
+{
+	int   ends[2];
+	pid_t child;
+
+	if (pipe2(ends, O_CLOEXEC) != 0 || (child = fork()) < 0) {
+		fprintf(stderr, "hull: commit: %s\n", strerror(errno));
+		return -1;
+	}
+	if (child == 0) {
+		int none = open("/dev/null", O_RDONLY);
+
+		if (none < 0 || dup2(none, 0) < 0 || dup2(ends[1], 1) < 0)
+			_exit(125);
+		_exit(exec_in(id, NULL, 0, 0, 0u));
+	}
+	close(ends[1]);
+	*fd = ends[0];
+	return child;
+}
+
+/* `hull commit DIR REF`, `--tar FILE REF`, or a running machine's root,
+ * `hull commit NAME REF` where NAME is no directory: what it is now,
+ * written by the machine's engine as (export PATH) writes it at its end,
+ * its volumes, /proc, /sys and /dev out. A tar its writer did not finish
+ * is refused, so no ref is made of part of one. */
 static int commit(const char *dir, const char *ref, const char *arch, int tar)
 {
-	hull_store  store;
-	hull_commit made;
-	char        why[4400] = "";
-	int         status;
-	int         fd = -1;
+	struct stat is;
+	pid_t       child = -1;
+	int         ended = 0;
 
-	if (tar && (fd = strcmp(dir, "-") == 0 ? 0 : open(dir, O_RDONLY | O_CLOEXEC)) < 0) {
-		fprintf(stderr, "hull: commit: %s: %s\n", dir, strerror(errno));
-		return 1;
+	if (!tar && stat(dir, &is) != 0 && errno == ENOENT && strchr(dir, '/') == NULL) {
+		int fd;
+		int status;
+
+		if ((child = tree_of(dir, &fd)) < 0)
+			return 1;
+		status = commit_from(dir, ref, arch, fd, 1);
+		close(fd);
+		while (waitpid(child, &ended, 0) < 0 && errno == EINTR)
+			;
+		/* The exec's own refusal, said by it, is the reason: what the
+		 * store then says of an empty or cut tar is only its echo. */
+		if (!WIFEXITED(ended) || WEXITSTATUS(ended) != 0) {
+			if (status == 0)
+				fprintf(stderr, "hull: commit: the machine's tree did not end as a tar "
+				        "should\n");
+			return 1;
+		}
+		if (status != 0)
+			return commit_from(NULL, NULL, NULL, -1, 2);
+		return 0;
 	}
-	if ((status = open_store(&store, 1)) != 0) {
+	if (tar) {
+		int fd = strcmp(dir, "-") == 0 ? 0 : open(dir, O_RDONLY | O_CLOEXEC);
+
+		if (fd < 0) {
+			fprintf(stderr, "hull: commit: %s: %s\n", dir, strerror(errno));
+			return 1;
+		}
+		ended = commit_from(NULL, ref, arch, fd, 0);
 		if (fd > 0)
 			close(fd);
-		return status;
+		return ended;
 	}
+	return commit_from(dir, ref, arch, -1, 0);
+}
+
+/* The commit itself: of the directory `dir` where `fd` is -1, else of the
+ * tar `fd` reads. `quiet` 1 keeps a failure's reason for a call with
+ * `quiet` 2 to say, once its caller knows it is the reason. */
+static int commit_from(const char *dir, const char *ref, const char *arch, int fd, int quiet)
+{
+	static char why[4400];
+	hull_store  store;
+	hull_commit made;
+	int         status;
+
+	if (quiet == 2) {
+		fprintf(stderr, "hull: commit: %s\n", why);
+		return 1;
+	}
+	why[0] = '\0';
+	if ((status = open_store(&store, 1)) != 0)
+		return status;
 	{
 		char              provenance[200];
 		hull_commit_extra extra = { 0 };
@@ -3713,15 +3788,14 @@ static int commit(const char *dir, const char *ref, const char *arch, int tar)
 		         strlen(HULL_BUILDER), HULL_BUILDER);
 		extra.provenance = (const uint8_t *)provenance;
 		extra.provenance_length = strlen(provenance);
-		status = tar ? hull_store_commit_tar(&store, fd, arch, ref, NULL, &extra, &made, why,
-		                                     sizeof why) :
-		               hull_store_commit(&store, dir, arch, ref, &extra, &made, why, sizeof why);
+		status = fd >= 0 ? hull_store_commit_tar(&store, fd, arch, ref, NULL, &extra, &made, why,
+		                                         sizeof why) :
+		                   hull_store_commit(&store, dir, arch, ref, &extra, &made, why, sizeof why);
 	}
 	hull_store_close(&store);
-	if (fd > 0)
-		close(fd);
 	if (status != 0) {
-		fprintf(stderr, "hull: commit: %s\n", why);
+		if (!quiet)
+			fprintf(stderr, "hull: commit: %s\n", why);
 		return 1;
 	}
 	printf("%s sha256:%s\n", ref, made.manifest);
@@ -4135,10 +4209,16 @@ static int exec_in(const char *id, char **argv, int argc, int tty, unsigned port
 		hull_msg_number(&request, (long long)port);
 		hull_msg_raw(&request, "))");
 	} else {
-		hull_msg_raw(&request, "(4:exec(4:argv");
-		for (int i = 0; i < argc; i++)
-			hull_msg_text(&request, argv[i]);
-		hull_msg_raw(&request, ")");
+		/* No argv is (tree true): the machine's root as a tar on the
+		 * output, for commit_machine. */
+		if (argv == NULL) {
+			hull_msg_raw(&request, "(4:exec(4:tree4:true)");
+		} else {
+			hull_msg_raw(&request, "(4:exec(4:argv");
+			for (int i = 0; i < argc; i++)
+				hull_msg_text(&request, argv[i]);
+			hull_msg_raw(&request, ")");
+		}
 		hull_msg_channel(&request, 1u);
 		hull_msg_raw(&request, "(7:machine");
 		hull_msg_text(&request, id);

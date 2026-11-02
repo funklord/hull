@@ -3606,6 +3606,23 @@ static hull_status chroot_dial(hull_core *core, hull_machine *m, uint16_t port,
 	return HULL_OK;
 }
 
+/* hull_tree_tar_fs's sink for an exec of (tree true): stdout, whole. */
+static int tree_out(void *context, const uint8_t *data, size_t n)
+{
+	(void)context;
+	while (n > 0u) {
+		ssize_t wrote = write(1, data, n);
+
+		if (wrote < 0 && errno == EINTR)
+			continue;
+		if (wrote <= 0)
+			return -1;
+		data += wrote;
+		n -= (size_t)wrote;
+	}
+	return 0;
+}
+
 /* The helper: into the machine, then the command. */
 static void run_helper(const hull_machine *m, char *const *argv, const int *ns, int root,
                        int in, int out, int err, int tty, int report, int status_pipe)
@@ -3647,6 +3664,20 @@ static void run_helper(const hull_machine *m, char *const *argv, const int *ns, 
 			child_fail(report, "the command's terminal");
 		if (m->no_new_privs && prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) != 0)
 			child_fail(report, "no_new_privs");
+		/* (tree true): no command, but the machine's root as a tar on
+		 * stdout, as it is now, by the writer (export PATH) uses, so a
+		 * running machine is committed as it would be at its end. */
+		if (argv[0] == NULL) {
+			char detail[600];
+			int  failed;
+
+			close(report);
+			failed = chdir("/") != 0 ||
+			         hull_tree_tar_fs("/", 1, tree_out, NULL, detail, sizeof detail) != 0;
+			if (failed)
+				dprintf(2, "hull: the machine's tree: %s\n", detail);
+			_exit(failed ? 1 : 0);
+		}
 		hull_access_execute(argv, (char *const *)m->envp);
 		child_fail(report, argv[0]);
 	}
@@ -3729,6 +3760,18 @@ static int read_argv(hull_buf spec, char **argv, struct winsize *size)
 	return n != 0u && !more;
 }
 
+/* Whether an exec is `(tree true)`: no command, the machine's root as a
+ * tar on its stdout, for `hull commit` of a running machine. */
+static int exec_tree(hull_buf spec)
+{
+	hull_sexpr_doc  doc;
+	hull_sexpr_form message;
+
+	return hull_sexpr_open(&doc, spec.data, spec.len, HULL_SEXPR_CANONICAL, NULL) ==
+	               HULL_SEXPR_OK && hull_sexpr_first(&doc, &message) &&
+	       hull_access_true(&doc, &message, "tree");
+}
+
 static void free_argv(char **argv)
 {
 	for (unsigned i = 0u; argv[i] != NULL; i++)
@@ -3757,7 +3800,7 @@ static hull_status chroot_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	pthread_mutex_unlock(&m->lock);
 	if (!m->started || done)
 		return fail(error, HULL_ERR_GONE, "the machine is not running");
-	if (!read_argv(spec, argv, &size)) {
+	if (!read_argv(spec, argv, &size) && !(argv[0] == NULL && exec_tree(spec))) {
 		free_argv(argv);
 		return fail(error, HULL_ERR_UNSUPPORTED, "an exec names a command");
 	}

@@ -155,7 +155,7 @@ struct resume {
 // `hull exec`, on a channel the host allocated for it.
 struct exec {
 	preamble u8[6] = "4:exec";
-	argv_entry   argv;
+	command_entry  command;
 	channel      ch;
 	peek u32  after_ch;
 	variant cwd switch (after_ch) {
@@ -437,7 +437,30 @@ struct channel {
 	u8    close  [must_eq = ')'];
 }
 
-// The words of `exec`'s command, and what a `hello` offers.
+// What `exec` runs: `(argv ...)`, a command's words; or `(tree true)`, no
+// command, the machine's root as a tar on its output, for `hull commit` of
+// a running machine.
+struct command_entry {
+	preamble u8[3] = "(4:";
+	peek u8  kind;
+	variant value switch (kind) {
+		case 'a':  argv_words  argv;
+		case 't':  tree_flag   tree;
+		default:   error;
+	}
+}
+
+struct argv_words {
+	preamble u8[4] = "argv";
+	atom  words[]  until ")";
+}
+
+struct tree_flag {
+	preamble u8[10] = "tree4:true";
+	u8  close  [must_eq = ')'];
+}
+
+// What a `hello` offers.
 struct argv_entry {
 	preamble u8[7] = "(4:argv";
 	atom  words[]  until ")";
