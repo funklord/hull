@@ -74,6 +74,7 @@
 
 #include "access.h"
 #include "hostnet.h"
+#include "rootmode.h"
 #include "usage.h"
 #include "stack.h"
 #include "builtin.h"
@@ -155,6 +156,9 @@ struct hull_machine {
 	char             bridge_name[16];
 	char             bridge_address[16];   /* its address on HULL_BRIDGE, or "" */
 	char             tap[16];      /* the tap's name on the bridge, once made, or "" */
+	char             bridge_root[72];  /* root mode's hash, hull-root handing the tap over */
+	uint8_t         *plan;         /* the plan, whole, for hull-root to check, in root mode */
+	size_t           plan_length;
 	int              bridge_relay; /* asking hull0's DNS relay, the host's resolvers loopback */
 	hull_device      device[HULL_MAX_DEVICES];  /* (devices ...), found on the host at start */
 	unsigned         device_count;
@@ -400,6 +404,7 @@ static void release(hull_machine *m)
 	free(m->export);
 	free(m->kernel_path);
 	free(m->spec);
+	free(m->plan);
 	free(m->names);
 	forget_secrets(m);
 	forget_ssh(m);
@@ -660,21 +665,17 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	m->bridge     = text != NULL && strcmp(text, "bridge") == 0;
 	free(text);
 	/* (network bridge): a tap on a host bridge, which only root may put
-	 * there, so only a core run as root takes it, as chroot's veth. */
+	 * there: a core run as root makes it, as chroot's veth, or in root
+	 * mode hull-root does and hands it over (section 7). */
 	if (m->bridge) {
 		char *name = hull_access_value(doc, &machine, "bridge");
 
-		/* Root mode puts a chroot machine's veth there (section 7); a vm's
-		 * tap is persistent, so its removal is root's too, which root mode
-		 * does not do yet. */
-		if (getuid() != 0) {
+		if (getuid() != 0 &&
+		    !hull_access_root(doc, "network.bridge", m->bridge_root, sizeof m->bridge_root)) {
 			free(name);
-			return hull_access_root(doc, "network.bridge", NULL, 0u) ?
-			       "(network bridge) for a vm in root mode is not built yet: its tap would "
-			       "outlive the run, and root mode does not remove it; hull's core run as root "
-			       "does, and root mode puts a chroot machine on a bridge" :
-			       "(network bridge) needs hull's core to run as root: (network nat) gives a "
-			       "network of the machine's own without it";
+			return "(network bridge) needs root: hull's core run as root, or root mode "
+			       "(--accept root:HASH, hull plan --root-hash); (network nat) gives a network "
+			       "of the machine's own without it";
 		}
 		m->bridge_own = name == NULL;
 		snprintf(m->bridge_name, sizeof m->bridge_name, "%s", name != NULL ? name : HULL_BRIDGE);
@@ -1207,6 +1208,67 @@ static pid_t holder_of(ino_t inode)
 	return found;
 }
 
+/* Root mode's tap, which hull-root makes on the bridge the plan names,
+ * from the plan it checks, and hands back: qemu takes it at NETWORK_FD.
+ * It is not persistent, so it goes with the qemu holding it and nothing
+ * is removed after; a retry's qemu is handed a new one. Where the machine
+ * asks hull0's relay and this core runs none, hull-root binds its port 53
+ * and hands those sockets back too, the relay then this core's. NULL, or
+ * why in m->detail. */
+static const char *root_tap(hull_machine *m)
+{
+	const char *args[] = { "tap", m->bridge_root, NULL };
+	int         fds[3] = { -1, -1, -1 };
+	int         wanted = 0;
+
+	m->network = -1;
+	m->passt = 0;
+	if (m->bridge_own) {
+		char *resolvers = hull_hostnet_resolvers();
+
+		m->bridge_relay = resolvers == NULL;
+		free(resolvers);
+		wanted = m->bridge_relay && !hull_hostnet_relay_running();
+	}
+	if (hull_root_call(args, m->plan, m->plan_length, fds, 3u, m->detail,
+	                   sizeof m->detail) != 0)
+		return m->detail;
+	m->network = fds[0];
+	if (m->network < 0) {
+		snprintf(m->detail, sizeof m->detail, "hull-root gave no tap for (network bridge)");
+		return m->detail;
+	}
+	if (!wanted || (fds[1] < 0 && fds[2] < 0)) {
+		if (fds[1] >= 0)
+			close(fds[1]);
+		if (fds[2] >= 0)
+			close(fds[2]);
+		/* A relay another machine's start has begun meanwhile serves
+		 * this one too; one asked for and not given is said. */
+		if (wanted && !hull_hostnet_relay_running()) {
+			close(m->network);
+			m->network = -1;
+			snprintf(m->detail, sizeof m->detail,
+			         "hull-root gave no socket for hull0's DNS relay");
+			return m->detail;
+		}
+		return NULL;
+	}
+	if (fds[1] < 0 || fds[2] < 0) {
+		close(fds[1] >= 0 ? fds[1] : fds[2]);
+		close(m->network);
+		m->network = -1;
+		snprintf(m->detail, sizeof m->detail, "hull-root gave no socket for hull0's DNS relay");
+		return m->detail;
+	}
+	if (hull_hostnet_relay_given(fds[1], fds[2], m->detail, sizeof m->detail) != NULL) {
+		close(m->network);
+		m->network = -1;
+		return m->detail;
+	}
+	return NULL;
+}
+
 static const char *start_network(hull_machine *m)
 {
 	char        log[4200];
@@ -1226,6 +1288,8 @@ static const char *start_network(hull_machine *m)
 	 * as so that qemu, in a user namespace of its own, may open it; on the
 	 * bridge, up. Persistent, so it is removed with the machine (release).
 	 * Made once, a retry's qemu taking the same. */
+	if (m->bridge && m->bridge_root[0] != '\0')
+		return root_tap(m);
 	if (m->bridge) {
 		const char *ip = hull_hostnet_ip();
 		char        owner[24];
@@ -1478,7 +1542,9 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int
 	snprintf(memory, sizeof memory, "%lu", m->memory_mib);
 	snprintf(cpus, sizeof cpus, "%u", m->cpus);
 	snprintf(vsock, sizeof vsock, "vhost-vsock-pci,guest-cid=%u", cid);
-	if (m->bridge)
+	if (m->bridge && m->bridge_root[0] != '\0')
+		snprintf(netdev, sizeof netdev, "tap,id=net,fd=%d", NETWORK_FD);
+	else if (m->bridge)
 		snprintf(netdev, sizeof netdev, "tap,id=net,ifname=%s,script=no,downscript=no", m->tap);
 	else
 		snprintf(netdev, sizeof netdev, "stream,id=net,addr.type=fd,addr.str=%d", NETWORK_FD);
@@ -2361,6 +2427,16 @@ static hull_status qemu_create(hull_core *core, hull_buf plan, hull_machine **ou
 	if ((reason = read_plan(m, &doc)) != NULL) {
 		release(m);
 		return fail(error, HULL_ERR_UNSUPPORTED, reason);
+	}
+	/* Root mode's tap is hull-root's, which checks the plan it is given
+	 * against the hash it was granted for. */
+	if (m->bridge_root[0] != '\0') {
+		if ((m->plan = malloc(plan.len)) == NULL) {
+			release(m);
+			return fail(error, HULL_ERR_INTERNAL, "out of memory");
+		}
+		memcpy(m->plan, plan.data, plan.len);
+		m->plan_length = plan.len;
 	}
 	*out = m;
 	host->on_state(core, m, "created");
@@ -3834,8 +3910,8 @@ static const hull_cap_entry entries[] = {
 	  "(parallel ...) gives one", NULL },
 	{ "network.bridge",     HULL_SUP_REJECTED,
 	  "a tap on hull's own bridge, hull0, NATed out, or on the host bridge (bridge NAME) "
-	  "names: root's to put there, hull run as root; root mode's not yet for a vm",
-	  "root:self" },
+	  "names: root's to put there, hull run as root, or root mode's hull-root, whose tap "
+	  "goes with qemu", "root" },
 	{ "bridge",             HULL_SUP_NATIVE,
 	  "the host bridge (network bridge) joins, there already; the guest addresses itself",
 	  NULL },

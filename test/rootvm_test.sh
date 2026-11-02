@@ -13,7 +13,9 @@
 # script installs hull-root setuid on a tmpfs, makes /etc/hull and
 # /var/log/hull root's alone, and then as the user `tester` asks for a
 # chroot machine on hull0 by root mode, and calls hull-root directly with
-# what it must refuse. Every line the guest prints is checked here.
+# what it must refuse; then a vm nested in it on hull0, by the host's own
+# qemu, its firmware and kernel shared read-only. Every line the guest
+# prints is checked here.
 #
 # The vm runs under `timeout`; the guest's script has no loop but the one
 # over /proc, which ends with the list. It leaves vm.conf, named in FILES,
@@ -67,7 +69,8 @@ place() { # FROM TO: a binary, and every library it links
 	done
 }
 missing=""
-for tool in sh cp chown chmod mkdir cat sed mount setpriv ip env unshare sleep tr head; do
+for tool in sh cp chown chmod mkdir cat sed mount setpriv ip env unshare sleep tr head grep \
+	qemu-system-x86_64; do
 	at=$(command -v "$tool" 2> /dev/null || ls /usr/sbin/$tool /sbin/$tool 2> /dev/null | head -1)
 	case $at in
 	/*) place "$at" "/bin/$tool" ;;
@@ -86,6 +89,7 @@ fi
 cp "$rootfs/usr/sbin/modprobe" "$rootfs/sbin/modprobe"
 place "$hull" /bin/hull
 place "$helper" /bin/hull-root
+place "$(dirname "$hull")/hull-agent" /bin/hull-agent
 cp "$probe" "$rootfs/srv/mroot/probe"
 printf 'root:x:0:0::/root:/bin/sh\ntester:x:1000:1000::/tmp:/bin/sh\n' > "$rootfs/etc/passwd"
 printf 'root:x:0:\ntester:x:1000:\n' > "$rootfs/etc/group"
@@ -165,13 +169,29 @@ echo "== listing not root's"
 chown 1000:1000 /etc/hull/root.conf
 as /bin/hull run --accept "\$token" -f /tmp/b.conf 2>&1
 echo "status=\$?"
+# A vm on hull0, nested in this one, its tap hull-root's, made from the
+# plan it checks and handed over, not persistent: gone with its qemu. The
+# listing root's alone again, after the case above.
+chown 0:0 /etc/hull/root.conf
+modprobe kvm_intel 2> /dev/null || modprobe kvm_amd 2> /dev/null
+modprobe -a tun vhost_vsock && chmod 666 /dev/kvm /dev/vhost-vsock /dev/net/tun && echo kvm=ok
+printf '(machine (source "dir:/tmp/mroot") (backend vm) (mutable overlay) (network bridge) (command "/probe" "addr" "eth0" "ping" "172.31.0.1"))\n' > /tmp/v.conf
+chown 1000:1000 /tmp/v.conf
+vtoken=\$(as /bin/hull plan --root-hash -f /tmp/v.conf 2> /dev/null | sed -n 's/.*: --accept //p')
+echo "vtoken=\$vtoken"
+printf 'tester %s network.bridge\n' "\${vtoken#root:}" >> /etc/hull/root.conf
+echo "== vm"
+as /bin/hull run --accept "\$vtoken" -f /tmp/v.conf 2>&1
+echo "status=\$?"
+echo "== taps=\$(ip -br link | sed -n 's/^\(hullt[0-9]*\)[ @].*/\1/p' | head -1)"
 echo "== log"
 cat /var/log/hull/root.log
 EOF
 
-printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) (security (no_new_privs false)) (command "/bin/sh" "/srv/run.sh"))\n' \
+# The host's qemu firmware and kernel, read-only, for the vm nested in it.
+printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) (memory "2G") (cpus 2) (security (no_new_privs false)) (volumes (volume (host "/usr/share/qemu") (guest "/usr/share/qemu") (mode ro)) (volume (host "/usr/share/seabios") (guest "/usr/share/seabios") (mode ro)) (volume (host "/boot") (guest "/boot") (mode ro))) (command "/bin/sh" "/srv/run.sh"))\n' \
 	> "$root/vm.conf"
-out=$(cd / && timeout -k 2 300 "$hull" run -f "$root/vm.conf" 2>&1)
+out=$(cd / && timeout -k 2 400 "$hull" run -f "$root/vm.conf" 2>&1)
 got=$?
 token=$(printf '%s\n' "$out" | sed -n 's/^token=root://p')
 
@@ -212,6 +232,18 @@ printf '%s\n' "$relayed" | grep -qx 'read=nameserver 172.31.0.1' &&
 	printf '%s\n' "$relayed" | grep -qx 'dns=anything.example rcode 0' &&
 	printf '%s\n' "$relayed" | grep -qx 'status=0' ||
 	fail "a root mode machine on hull0 was not answered through the relay" "$relayed"
+# A vm on hull0 in root mode, nested: its tap hull-root's, the guest
+# addressed on hull0 and its gateway answering, and no tap left once its
+# qemu has gone.
+cases=$((cases + 1))
+vtoken=$(printf '%s\n' "$out" | sed -n 's/^vtoken=root://p')
+vm=$(printf '%s\n' "$out" | sed -n '/^== vm$/,/^status=/p')
+printf '%s\n' "$out" | grep -qx 'kvm=ok' &&
+	printf '%s\n' "$vm" | grep -Eq '^addr=eth0 172\.(30|31)\.[0-9]+\.[0-9]+/15 up$' &&
+	printf '%s\n' "$vm" | grep -qx 'ping=172.31.0.1 ok' &&
+	printf '%s\n' "$vm" | grep -qx 'status=0' &&
+	printf '%s\n' "$out" | grep -qx '== taps=' ||
+	fail "a root mode vm was not put on hull0 by its tap, or its tap was left" "$out"
 # The log: every grant and refusal it acted on, the bridge with its
 # machine; a refusal for another plan's bytes or another's process comes
 # before the listing is read, and is not a line.
@@ -220,7 +252,8 @@ log=$(printf '%s\n' "$out" | sed -n '/^== log/,$p')
 printf '%s\n' "$log" | grep -q " start $token refused network.bridge\$" &&
 	printf '%s\n' "$log" | grep -q " start $token granted network.bridge\$" &&
 	printf '%s\n' "$log" | grep -Eq " bridge $token granted network.bridge machine=[0-9]+\$" &&
-	printf '%s\n' "$log" | grep -Eq " bridge $handmade_hash granted network.bridge machine=[0-9]+\$" ||
+	printf '%s\n' "$log" | grep -Eq " bridge $handmade_hash granted network.bridge machine=[0-9]+\$" &&
+	printf '%s\n' "$log" | grep -q " tap $vtoken granted network.bridge\$" ||
 	fail "the audit log is not what was granted and refused" "$log"
 
 case $rootfs in

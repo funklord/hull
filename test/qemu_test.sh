@@ -518,7 +518,8 @@ boot vmusb
 has 125 'no USB device ffff:fffe is plugged in'
 
 # (network bridge) on a vm: a tap on a host bridge, which only root may
-# put there, so only a core run as root takes it; as this user, refused.
+# put there, so only a core run as root takes it, or root mode, whose
+# token the refusal names (check-root runs that); as this user, refused.
 # As root in a user namespace of its own, unshare -rmn, whose network is
 # its own: a vm on hull0 given its drawn address, the gateway and an
 # address beyond the bridge reached by its route out, and a chroot
@@ -529,7 +530,7 @@ printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) (network
 	> "$root/vbridged.conf"
 cases=$((cases + 1))
 out=$(cd / && timeout 60 "$hull" run -f "$root/vbridged.conf" 2>&1)
-printf '%s\n' "$out" | grep -q 'network.bridge: rejected: .*root mode.s not yet for a vm (hull run as root honours it)' ||
+printf '%s\n' "$out" | grep -q 'network.bridge: rejected: .*whose tap goes with qemu (--accept root:sha256:[0-9a-f]* honours it)' ||
 	fail "a vm on a bridge was not refused to a core not run as root" "$out"
 vcdb_at=$(python3 -c '
 import sys

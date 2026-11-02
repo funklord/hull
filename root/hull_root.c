@@ -12,6 +12,12 @@
  *                                   made where it is its own, and hull0's
  *                                   DNS relay's port 53 bound and handed
  *                                   back on fd 3 where it is asked
+ *   hull-root tap HASH              the plan on stdin: a tap on the host
+ *                                   bridge the plan names, as for bridge,
+ *                                   handed back on fd 3 for a vm's qemu,
+ *                                   the relay's sockets after it where
+ *                                   asked; not persistent, so it goes when
+ *                                   the last descriptor of it closes
  *
  * Installed setuid root by `make install-root` and by nothing else; a host
  * without it has no root mode. It does the least root has to: it reads the
@@ -48,11 +54,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <linux/if_tun.h>
 
 #include "hostnet.h"
 #include "sha256.h"
@@ -327,40 +336,91 @@ static int machine_process(long pid, uid_t uid)
 	return 1;
 }
 
-/* hull0's DNS relay's two sockets, bound on its gateway's port 53, which
- * only root may bind, handed back over fd 3 where the caller gave one and
- * the host's resolvers are all its loopback, which a machine on the
- * bridge could not reach: the relay then the caller's core's, run as the
- * user (engine/hostnet.c). Nothing to do otherwise. 0, or 1 said. */
-static int relay_sockets(void)
+/* `fds`, `count` of them, handed back to the caller over fd 3. 0, or 1
+ * said. */
+static int hand_back(const int *fds, unsigned count, const char *what)
 {
-	struct stat     given;
-	char           *resolvers = hull_hostnet_resolvers();
-	int             fds[2];
 	char            byte = 0;
 	struct iovec    v = { &byte, 1u };
-	char            control[CMSG_SPACE(sizeof fds)];
+	char            control[CMSG_SPACE(3u * sizeof(int))];
 	struct msghdr   message = { .msg_iov = &v, .msg_iovlen = 1u, .msg_control = control,
-	                            .msg_controllen = sizeof control };
+	                            .msg_controllen = CMSG_SPACE(count * sizeof(int)) };
 	struct cmsghdr *c;
+
+	memset(control, 0, sizeof control);
+	c = CMSG_FIRSTHDR(&message);
+	c->cmsg_level = SOL_SOCKET;
+	c->cmsg_type  = SCM_RIGHTS;
+	c->cmsg_len   = CMSG_LEN(count * sizeof(int));
+	memcpy(CMSG_DATA(c), fds, count * sizeof(int));
+	if (sendmsg(3, &message, 0) != 1)
+		return fail(what, strerror(errno));
+	return 0;
+}
+
+/* hull0's DNS relay's two sockets, bound on its gateway's port 53, which
+ * only root may bind, into `fds`, where the caller gave a socket on fd 3
+ * and the host's resolvers are all its loopback, which a machine on the
+ * bridge could not reach: the relay then the caller's core's, run as the
+ * user (engine/hostnet.c). How many, 0 or 2, or -1 said. */
+static int relay_sockets(int fds[2])
+{
+	struct stat given;
+	char       *resolvers = hull_hostnet_resolvers();
 
 	if (resolvers != NULL || fstat(3, &given) != 0 || !S_ISSOCK(given.st_mode)) {
 		free(resolvers);
 		return 0;
 	}
-	if (hull_hostnet_relay_sockets(&fds[0], &fds[1]) != 0)
-		return fail("hull0's DNS relay's port 53", strerror(errno));
-	memset(control, 0, sizeof control);
-	c = CMSG_FIRSTHDR(&message);
-	c->cmsg_level = SOL_SOCKET;
-	c->cmsg_type  = SCM_RIGHTS;
-	c->cmsg_len   = CMSG_LEN(sizeof fds);
-	memcpy(CMSG_DATA(c), fds, sizeof fds);
-	if (sendmsg(3, &message, 0) != 1)
-		return fail("hull0's DNS relay's sockets could not be handed back", strerror(errno));
+	if (hull_hostnet_relay_sockets(&fds[0], &fds[1]) != 0) {
+		fail("hull0's DNS relay's port 53", strerror(errno));
+		return -1;
+	}
+	return 2;
+}
+
+/* The bridge the plan's machine joins, into `name`: hull0, made, where it
+ * names none, `*own` then 1; else the host bridge (bridge NAME) names,
+ * which must be one already. 0, or 1 said. */
+static int plan_bridge(const uint8_t *plan, size_t length, size_t machine, char *name,
+                       size_t cap, int *own)
+{
+	char        network[16];
+	char        why[512];
+	char        sys[64 + IF_NAMESIZE];
+	struct stat is;
+
+	if (!value_of(plan, length, machine, "network", network, sizeof network) ||
+	    strcmp(network, "bridge") != 0)
+		return fail("the plan's machine is not (network bridge)", NULL);
+	*own = 0;
+	if (!value_of(plan, length, machine, "bridge", name, cap)) {
+		*own = 1;
+		snprintf(name, cap, "%s", HULL_BRIDGE);
+		if (hull_hostnet_bridge(why, sizeof why) != NULL)
+			return fail("hull0", why);
+	} else {
+		snprintf(sys, sizeof sys, "/sys/class/net/%s/bridge", name);
+		if (strchr(name, '/') != NULL || if_nametoindex(name) == 0 || stat(sys, &is) != 0)
+			return fail("(bridge NAME) names no bridge on the host", name);
+	}
+	if (hull_hostnet_ip() == NULL)
+		return fail("ip is not installed", NULL);
+	return 0;
+}
+
+/* The relay's sockets handed back, where they are asked for. 0, or 1 said. */
+static int relay_back(void)
+{
+	int fds[2];
+	int count = relay_sockets(fds);
+
+	if (count <= 0)
+		return count < 0;
+	count = hand_back(fds, 2u, "hull0's DNS relay's sockets could not be handed back");
 	close(fds[0]);
 	close(fds[1]);
-	return 0;
+	return count;
 }
 
 /* The bridge op's root part: hull0 made where the plan names no bridge of
@@ -373,28 +433,11 @@ static int bridge(const uint8_t *plan, size_t length, size_t machine, long pid)
 	char        near[24];
 	char        pid_text[24];
 	char        why[512];
-	char        sys[64 + IF_NAMESIZE];
-	struct stat is;
 	const char *ip = hull_hostnet_ip();
-	char        network[16];
+	int         own;
 
-	if (!value_of(plan, length, machine, "network", network, sizeof network) ||
-	    strcmp(network, "bridge") != 0)
-		return fail("the plan's machine is not (network bridge)", NULL);
-	int         own = 0;
-
-	if (!value_of(plan, length, machine, "bridge", name, sizeof name)) {
-		own = 1;
-		snprintf(name, sizeof name, "%s", HULL_BRIDGE);
-		if (hull_hostnet_bridge(why, sizeof why) != NULL)
-			return fail("hull0", why);
-	} else {
-		snprintf(sys, sizeof sys, "/sys/class/net/%s/bridge", name);
-		if (strchr(name, '/') != NULL || if_nametoindex(name) == 0 || stat(sys, &is) != 0)
-			return fail("(bridge NAME) names no bridge on the host", name);
-	}
-	if (ip == NULL)
-		return fail("ip is not installed", NULL);
+	if (plan_bridge(plan, length, machine, name, sizeof name, &own) != 0)
+		return 1;
 	snprintf(near, sizeof near, "hb%ld", pid);
 	snprintf(pid_text, sizeof pid_text, "%ld", pid);
 	{
@@ -406,7 +449,63 @@ static int bridge(const uint8_t *plan, size_t length, size_t machine, long pid)
 		    hull_hostnet_run(on, why, sizeof why) != 0)
 			return fail("the machine's veth", why);
 	}
-	return own ? relay_sockets() : 0;
+	return own ? relay_back() : 0;
+}
+
+/* The tap op's root part: a tap of the kernel's naming, hullt0, hullt1,
+ * ..., on the bridge the plan names, up, and handed back on fd 3, with
+ * the relay's sockets after it where they are asked for. Not persistent:
+ * it is the descriptor's, so it goes from the bridge and the host when
+ * the vm's qemu, holding the last of it, ends, and root removes nothing
+ * afterwards, where the persistent tap a core run as root makes is
+ * removed with the machine. 0, or 1 said. */
+static int tap(const uint8_t *plan, size_t length, size_t machine)
+{
+	char         name[IF_NAMESIZE];
+	char         why[512];
+	struct ifreq request;
+	int          own;
+	int          fds[3];
+	int          count = 1;
+	int          failed;
+	struct stat  given;
+
+	if (fstat(3, &given) != 0 || !S_ISSOCK(given.st_mode))
+		return fail("the tap op hands its tap back on fd 3, and there is no socket there",
+		            NULL);
+	if (plan_bridge(plan, length, machine, name, sizeof name, &own) != 0)
+		return 1;
+	if ((fds[0] = open("/dev/net/tun", O_RDWR | O_CLOEXEC)) < 0)
+		return fail("/dev/net/tun", strerror(errno));
+	memset(&request, 0, sizeof request);
+	request.ifr_flags = IFF_TAP | IFF_NO_PI;
+	snprintf(request.ifr_name, sizeof request.ifr_name, "hullt%%d");
+	if (ioctl(fds[0], TUNSETIFF, &request) != 0) {
+		close(fds[0]);
+		return fail("the machine's tap", strerror(errno));
+	}
+	{
+		const char *on[] = { hull_hostnet_ip(), "link", "set", request.ifr_name, "master", name,
+		                     "up", NULL };
+
+		if (hull_hostnet_run(on, why, sizeof why) != 0) {
+			close(fds[0]);
+			return fail("the machine's tap", why);
+		}
+	}
+	if (own) {
+		int relay = relay_sockets(fds + 1);
+
+		if (relay < 0) {
+			close(fds[0]);
+			return 1;
+		}
+		count += relay;
+	}
+	failed = hand_back(fds, (unsigned)count, "the machine's tap could not be handed back");
+	for (int i = 0; i < count; i++)
+		close(fds[i]);
+	return failed;
 }
 
 int main(int argc, char **argv)
@@ -419,6 +518,8 @@ int main(int argc, char **argv)
 	struct passwd  *who = getpwuid(uid);
 	const char     *op = argc > 1 ? argv[1] : "";
 	int             bridging = strcmp(op, "bridge") == 0;
+	int             tapping = strcmp(op, "tap") == 0;
+	int             planned = bridging || tapping;  /* an op that acts, on its plan */
 	char           *bridge_field[] = { (char *)"network.bridge" };
 	char *const    *fields = argv + 3;
 	int             field_count = argc - 3;
@@ -437,11 +538,11 @@ int main(int argc, char **argv)
 	int             at;
 
 	if (argc < 3 || (strcmp(op, "start") != 0 && strcmp(op, "exec") != 0 &&
-	                 strcmp(op, "stop") != 0 && !bridging) ||
-	    ((strcmp(op, "exec") == 0 || strcmp(op, "stop") == 0) && argc != 3) ||
+	                 strcmp(op, "stop") != 0 && !planned) ||
+	    ((strcmp(op, "exec") == 0 || strcmp(op, "stop") == 0 || tapping) && argc != 3) ||
 	    (bridging && argc != 4) || argc > 3 + MAX_FIELDS)
 		return fail("usage", "hull-root start HASH FIELD... | exec HASH | stop HASH | "
-		            "bridge HASH PID < PLAN");
+		            "bridge HASH PID < PLAN | tap HASH < PLAN");
 	if (!is_hash(argv[2]))
 		return fail("not a plan's hash", argv[2]);
 	if (bridging) {
@@ -450,6 +551,9 @@ int main(int argc, char **argv)
 		pid = strtol(argv[3], &end, 10);
 		if (*end != '\0' || pid <= 1 || !made_of(argv[3], "0123456789", 10u))
 			return fail("not a process", argv[3]);
+		fields      = bridge_field;
+		field_count = 1;
+	} else if (tapping) {
 		fields      = bridge_field;
 		field_count = 1;
 	} else {
@@ -469,7 +573,7 @@ int main(int argc, char **argv)
 
 	/* An op that acts takes its plan whole, and acts only where the plan's
 	 * own hash is the one asked for, worked out here from its bytes. */
-	if (bridging) {
+	if (planned) {
 		char    hex[72];
 		ssize_t got = 0;
 
@@ -482,7 +586,7 @@ int main(int argc, char **argv)
 			return fail("the plan on stdin is not a plan", NULL);
 		if (strcmp(hex, argv[2]) != 0)
 			return fail("the plan on stdin is not the plan asked for", hex);
-		if (!machine_process(pid, uid))
+		if (bridging && !machine_process(pid, uid))
 			return fail("not a machine of this user's, in namespaces of its own", argv[3]);
 	}
 
@@ -530,12 +634,12 @@ int main(int argc, char **argv)
 		fputc('\n', stderr);
 		return 77;
 	}
-	if (!bridging)
+	if (!planned)
 		return 0;
 	/* Root's part, wholly root's: its own ids and no environment of the
 	 * caller's for the tools it runs. */
 	if (setuid_run && (setresgid(0, 0, 0) != 0 || setresuid(0, 0, 0) != 0 || clearenv() != 0 ||
 	                   setenv("PATH", "/usr/sbin:/usr/bin:/sbin:/bin", 1) != 0))
 		return fail("root's own ids and environment cannot be had", strerror(errno));
-	return bridge(plan, plan_length, machine, pid);
+	return bridging ? bridge(plan, plan_length, machine, pid) : tap(plan, plan_length, machine);
 }
