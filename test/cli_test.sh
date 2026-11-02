@@ -2413,10 +2413,11 @@ sleep 1
 # A kept machine handed to its image's init, (init PATH), taken back by
 # the next core -- its init's socket's peer is still PID 1, which listened
 # on it before the hand-over -- and its stop reaching the workload by
-# hull's init as before the core went, not PID 1, which ignores a TERM,
-# after the kill.
+# hull's init as before the core went, not PID 1, which ignores a TERM.
+# The workload says the signal it caught, which a loaded host cannot
+# blur as it does a stop's time: 15, or 0 after 20 s with none.
 printf '(machine (source "dir:./initroot") (backend chroot) (init "/sbin/init") %s)\n' \
-	'(hostname "ikept") (on_disconnect keep) (command "/probe" "say" "up" "sleep" "25")' \
+	'(hostname "ikept") (on_disconnect keep) (command "/probe" "say" "up" "trap")' \
 	> "$root/ikept.conf"
 (cd / && exec timeout -k 2 40 "$hull_abs" run -f "$root/ikept.conf" > /dev/null 2>&1) &
 keeper=$!
@@ -2434,12 +2435,11 @@ printf '%s\n' "$out" | grep -q '^ikept .*running$' ||
 	fail "a kept machine handed to its init was not taken back" "$out
 $(tail -5 "$XDG_RUNTIME_DIR/hull/core.log")"
 expect 0 '^target=/sbin/init$' "$hull" exec ikept /probe target /proc/1/exe
-started=$(date +%s)
 timeout 30 "$hull" stop --timeout 8 ikept > /dev/null 2>&1
-took=$(( $(date +%s) - started ))
 cases=$((cases + 1))
-[ "$took" -lt 6 ] ||
-	fail "a stop of a taken-back machine handed to its init took ${took}s: its TERM missed the workload" ""
+out=$(timeout 20 "$hull" logs ikept 2>&1)
+printf '%s\n' "$out" | grep -qx 'signal=15' ||
+	fail "a stop of a taken-back machine handed to its init missed the workload" "$out"
 # A kept file whose pid is not its machine's init, as once the pid has
 # gone to another process, is forgotten, and that process let be: a
 # sleep of the test's own, read by a core that starts once the last has
