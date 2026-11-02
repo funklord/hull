@@ -1859,6 +1859,7 @@ Unknown message types are answered with `(error (ch n) (reason unsupported))` ra
 - Agent crash ⇒ PID 1 dies ⇒ guest kernel panics ⇒ hypervisor reports exit ⇒ host surfaces "machine died: agent" with the last log tail it had streamed. Nothing hangs.
 - Host process crash ⇒ vsock closes ⇒ agent's policy is spec-driven: `(on_disconnect stop)` (default: workload is torn down, mirroring ns-backend child-process semantics) or `keep` (for systemd-managed machines that should survive a CLI restart and be re-adopted via `hull attach`).
 - Exit codes are reported exactly (code + signal), so `hull run; echo $?` is backend-identical — this is a conformance-suite assertion, not a hope.
+- **An exec the agent never says the end of does not hold the core, since 2026-11-02.** Closing a stream -- its client gone, a `hull ssh` or `proxy-ssh` killed -- sends the agent a kill and waited, without a bound, for the stream's end before joining its deliverer. Found on a host at load 80: the qemu suite's `script` around `hull ssh` timed out, the kill went unanswered, and the core's main thread sat in `qemu_stream_close`'s join for good, deaf to SIGTERM, its vm and passt left behind; a backtrace showed the deliverer in its wait for an end. The end is now waited for ten seconds, as `answered` waits for a start, and a stream not ended by then is let go of as lost, its forwarded socket shut, as a machine gone lets go of every stream. Why the agent did not answer that kill is not known: not reproduced on demand, the load being what made it.
 
 ---
 

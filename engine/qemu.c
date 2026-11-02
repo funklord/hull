@@ -3426,8 +3426,30 @@ static hull_status qemu_stream_close(hull_core *core, hull_stream *st, hull_erro
 	pthread_mutex_lock(&m->lock);
 	over = st->exited || st->lost;
 	pthread_mutex_unlock(&m->lock);
-	if (!over)
+	if (!over) {
+		struct timespec deadline;
+
 		kill_stream(m, st);
+		/* Its end is the agent's to say, within ten seconds; one that
+		 * does not say it is let go of as lost, as a machine gone lets
+		 * go of every stream, so that its deliverer ends. Waited for
+		 * without a bound, a kill the agent never answered held the
+		 * core here for good -- deaf to SIGTERM, its vm and passt left
+		 * behind -- measured on a host at load 80. */
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_sec += 10;
+		pthread_mutex_lock(&m->lock);
+		while (!st->exited && !st->lost &&
+		       pthread_cond_timedwait(&st->changed, &m->lock, &deadline) == 0)
+			;
+		if (!st->exited && !st->lost) {
+			st->lost = 1;
+			if (st->forwarded)
+				shutdown(st->sink, SHUT_RDWR);
+			pthread_cond_broadcast(&st->changed);
+		}
+		pthread_mutex_unlock(&m->lock);
+	}
 	pthread_join(st->deliverer, NULL);
 	drop_stream(m, st);
 	free_stream(st);
