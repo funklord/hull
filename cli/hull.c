@@ -116,6 +116,7 @@ static void usage(FILE *out)
 	      "                [--lease ID] [NAME]\n"
 	      "       hull reserve POOL [--count N] [--wait D|--no-wait] | hull release ID\n"
 	      "       hull pool ls | hull lease ls\n"
+	      "       hull pack DIR|REF FILE | hull unpack FILE|- DIR\n"
 	      "       hull build [-f FILE] [--check] REF\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
@@ -4183,6 +4184,101 @@ static int list_of(int pools)
 	return 0;
 }
 
+/* `hull pack SRC FILE` (section 3.13): the tree SRC is, a directory --
+ * committed first, its owners as a commit takes them -- or a stored ref,
+ * as one file, its manifest's hash printed. */
+static int pack(const char *source, const char *file)
+{
+	hull_store  store;
+	struct stat is;
+	char        name[200];
+	char        hex[65];
+	char        why[4400] = "";
+	int         status;
+	int         fd;
+
+	if ((status = open_store(&store, 1)) != 0)
+		return status;
+	if (stat(source, &is) == 0 && S_ISDIR(is.st_mode)) {
+		hull_commit       made;
+		hull_commit_extra extra = { 0 };
+		char              provenance[200];
+
+		snprintf(provenance, sizeof provenance, "(10:provenance(7:builder%zu:%s))",
+		         strlen(HULL_BUILDER), HULL_BUILDER);
+		extra.provenance = (const uint8_t *)provenance;
+		extra.provenance_length = strlen(provenance);
+		if (hull_store_commit(&store, source, host_arch(), NULL, &extra, &made, why,
+		                      sizeof why) != 0) {
+			hull_store_close(&store);
+			fprintf(stderr, "hull: pack: %s\n", why);
+			return 1;
+		}
+		snprintf(name, sizeof name, "sha256:%s", made.manifest);
+	} else {
+		snprintf(name, sizeof name, "%s", source);
+	}
+	if ((fd = open(file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)) < 0) {
+		hull_store_close(&store);
+		fprintf(stderr, "hull: pack: %s: %s\n", file, strerror(errno));
+		return 1;
+	}
+	status = hull_store_pack(&store, name, fd, hex, why, sizeof why);
+	hull_store_close(&store);
+	if (close(fd) != 0 && status == 0)
+		snprintf(why, sizeof why, "%s: %s", file, strerror(errno)), status = -1;
+	if (status != 0) {
+		unlink(file);
+		fprintf(stderr, "hull: pack: %s\n", why);
+		return 1;
+	}
+	printf("%s sha256:%s\n", file, hex);
+	return 0;
+}
+
+/* `hull unpack FILE DIR`: the pack into the store, as pack/ and its
+ * manifest's hash's first 32 hex digits, every object and the manifest
+ * checked, then materialized into DIR. */
+static int unpack(const char *file, const char *dir)
+{
+	hull_store store;
+	char       ref[64];
+	char       hex[65];
+	char       why[4400] = "";
+	uint64_t   skipped = 0u;
+	int        status;
+	int        fd = strcmp(file, "-") == 0 ? 0 : open(file, O_RDONLY | O_CLOEXEC);
+
+	if (fd < 0) {
+		fprintf(stderr, "hull: unpack: %s: %s\n", file, strerror(errno));
+		return 1;
+	}
+	if ((status = open_store(&store, 1)) != 0) {
+		if (fd > 0)
+			close(fd);
+		return status;
+	}
+	status = hull_store_unpack(&store, fd, NULL, hex, why, sizeof why);
+	if (fd > 0)
+		close(fd);
+	if (status == 0) {
+		char given[80];
+
+		snprintf(ref, sizeof ref, "pack/%.32s", hex);
+		snprintf(given, sizeof given, "sha256:%s", hex);
+		status = hull_store_tag(&store, given, ref, hex, why, sizeof why);
+	}
+	if (status == 0)
+		status = hull_store_materialize(&store, ref, dir, &skipped, why, sizeof why);
+	hull_store_close(&store);
+	if (status != 0) {
+		fprintf(stderr, "hull: unpack: %s\n", why);
+		return 1;
+	}
+	printf("%s sha256:%s\n", ref, hex);
+	return 0;
+}
+
 static int materialize(const char *ref, const char *dir)
 {
 	hull_store store;
@@ -5726,6 +5822,10 @@ int main(int argc, char **argv)
 		return commit(argv[4], argv[5], argv[3], 0);
 	if (strcmp(command, "materialize") == 0 && argc == 4)
 		return materialize(argv[2], argv[3]);
+	if (strcmp(command, "pack") == 0 && argc == 4)
+		return pack(argv[2], argv[3]);
+	if (strcmp(command, "unpack") == 0 && argc == 4)
+		return unpack(argv[2], argv[3]);
 	if (strcmp(command, "reserve") == 0 && argc >= 3)
 		return reserve(argc, argv);
 	if (strcmp(command, "release") == 0 && argc == 3)

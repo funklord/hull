@@ -92,6 +92,29 @@ int hull_store_commit_tar(hull_store *store, int fd, const char *arch, const cha
  * read whole and checked: its hex into `hex`. 0, or -1 with `why`. */
 int hull_store_resolve(hull_store *store, const char *name, char hex[65], char *why, size_t cap);
 
+/* For a pack (store/pack.c): a manifest's canonical bytes by name, freed
+ * by the caller; an object by its digest, opened, and whether it is
+ * executable; an object added from the next `size` bytes of `fd`, refused
+ * where they are not `digest`'s; and a manifest added as it is, by its
+ * sha256, `ref` set to it where not NULL. Each 0, or -1 with why. */
+int hull_store_manifest_of(hull_store *store, const char *name, char hex[65], uint8_t **data,
+                           size_t *length, char *why, size_t cap);
+int hull_store_object_open(hull_store *store, const uint8_t digest[32], int *executable);
+int hull_store_object_put(hull_store *store, int fd, uint64_t size, int executable,
+                          const uint8_t digest[32], char *why, size_t cap);
+int hull_store_manifest_put(hull_store *store, const uint8_t *data, size_t length,
+                            const char *ref, char hex[65], char *why, size_t cap);
+
+/* A pack (project.md section 3.13), the tree `name` names written to
+ * `out` whole -- its manifest and every object it names, each a zstd
+ * frame, behind an index -- its manifest's hash into `hex`; and a pack
+ * read from `in` into the store, every object and the manifest checked
+ * against their names, `ref` set to it. Each 0, or -1 with why. */
+int hull_store_pack(hull_store *store, const char *name, int out, char hex[65], char *why,
+                    size_t cap);
+int hull_store_unpack(hull_store *store, int in, const char *ref, char hex[65], char *why,
+                      size_t cap);
+
 /* The manifest `name` names, with `runtime`, a canonical `(7:runtime
  * ...)`, in place of its own or where one goes: its entries and its
  * provenance as they were. Stored, named by no ref, its hex into `hex`. 0,

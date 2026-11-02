@@ -1922,6 +1922,66 @@ static void show_form(FILE *out, const hull_sexpr_doc *doc, const hull_sexpr_for
 	fputc(')', out);
 }
 
+/* --- for a pack (store/pack.c) --------------------------------------------- */
+
+int hull_store_manifest_of(hull_store *store, const char *name, char hex[65], uint8_t **data,
+                           size_t *length, char *why, size_t cap)
+{
+	flock(store->lock, LOCK_SH);
+	*data = name_manifest(store, name, hex, why, cap) == 0 ?
+	        read_manifest(store, hex, length, why, cap) : NULL;
+	flock(store->lock, LOCK_UN);
+	return *data != NULL ? 0 : -1;
+}
+
+int hull_store_object_open(hull_store *store, const uint8_t digest[32], int *executable)
+{
+	char        hex[65];
+	char        path[4300];
+	struct stat st;
+	int         fd;
+
+	hex_of(digest, hex);
+	snprintf(path, sizeof path, "%s/objects/sha256/%.2s/%s", store->root, hex, hex);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd >= 0 && executable != NULL)
+		*executable = fstat(fd, &st) == 0 && (st.st_mode & 0111) != 0;
+	return fd;
+}
+
+int hull_store_object_put(hull_store *store, int fd, uint64_t size, int executable,
+                          const uint8_t digest[32], char *why, size_t cap)
+{
+	struct stat st = { .st_mode = executable ? 0755 : 0644 };
+	uint8_t     got[32];
+	int         made;
+
+	if (store_object_of(store, fd, size, &st, got, &made, why, cap) != 0)
+		return -1;
+	if (memcmp(got, digest, 32u) != 0) {
+		char hex[65];
+
+		hex_of(digest, hex);
+		return say(why, cap, hex, "the object's bytes are not the object its name says");
+	}
+	return 0;
+}
+
+int hull_store_manifest_put(hull_store *store, const uint8_t *data, size_t length,
+                            const char *ref, char hex[65], char *why, size_t cap)
+{
+	buf  b = { .data = (uint8_t *)data, .length = length, .cap = length };
+	int  result;
+
+	if (ref != NULL && !is_ref(ref))
+		return say(why, cap, "a ref is names of letters, digits and ._-:@, joined by /", NULL);
+	flock(store->lock, LOCK_EX);
+	result = store_manifest(store, &b, hex, why, cap) == 0 &&
+	         (ref == NULL || set_ref(store, ref, hex, why, cap) == 0) ? 0 : -1;
+	flock(store->lock, LOCK_UN);
+	return result;
+}
+
 int hull_store_resolve(hull_store *store, const char *name, char hex[65], char *why, size_t cap)
 {
 	uint8_t *data;

@@ -106,12 +106,12 @@ ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o $(BUILD_DIR)/cli/runtime.o $(BUILD_DIR)/cli/doctor.o \
               $(BUILD_DIR)/cli/import.o
 # Section 3's optional store, which only the commands that name it use.
-STORE_OBJS  = $(BUILD_DIR)/store/store.o $(BUILD_DIR)/store/unpack.o
+STORE_OBJS  = $(BUILD_DIR)/store/store.o $(BUILD_DIR)/store/unpack.o $(BUILD_DIR)/store/pack.o
 # Section 3.5's border: what `hull pull` reads a registry with.
 OCI_OBJS    = $(BUILD_DIR)/oci/json.o $(BUILD_DIR)/oci/https.o $(BUILD_DIR)/oci/remote.o \
               $(BUILD_DIR)/oci/pull.o $(BUILD_DIR)/oci/push.o
 # The holder's choice, 2026-10-21 (section 3.5): TLS by OpenSSL, layers by zlib.
-PULL_LIBS   = -lssl -lcrypto -lz
+PULL_LIBS   = -lssl -lcrypto -lz -lzstd
 
 # The per-user core, and the frontend protocol it speaks (section 4.10),
 # validated by C situ generates from core/frontend.situ.

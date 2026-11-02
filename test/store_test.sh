@@ -556,6 +556,54 @@ expect 0 '' "$hull" commit --tar "$root/gnu.tar" tarnames/gnu
 expect 0 "\\(path \"$long_dir/file\"\\)" "$hull" manifest show tarnames/gnu
 expect 0 "\\(target \"$long_dir/file\"\\)" "$hull" manifest show tarnames/gnu
 
+# A pack (section 3.13): a stored tree as one file and back -- the same
+# bytes for the same tree, its manifest's hash printed and kept, a tree
+# unpacked equal to the one packed; and a pack with one byte of an object
+# changed, or cut short, refused, no ref made.
+expect 0 '^'"$root"'/one\.hull sha256:[0-9a-f]{64}$' "$hull" pack one/tree:1 "$root/one.hull"
+expect 0 '' "$hull" pack one/tree:1 "$root/again.hull"
+cases=$((cases + 1))
+cmp -s "$root/one.hull" "$root/again.hull" || fail "one tree packed twice gave two packs" ""
+packed=$(timeout 30 "$hull" manifest show one/tree:1 2>&1 | head -1)
+rm -rf "${root:?}/unpacked"
+expect 0 '^pack/[0-9a-f]{32} sha256:[0-9a-f]{64}$' "$hull" unpack "$root/one.hull" "$root/unpacked"
+rm -rf "${root:?}/direct"
+expect 0 '' "$hull" materialize one/tree:1 "$root/direct"
+# Every entry's path, kind, mode and size the same, and every file's
+# bytes; diff cannot compare the tree's fifo, which the listing does.
+cases=$((cases + 1))
+[ "$(cd "$root/direct" && find . -printf '%P %y %m %s\n' | sort)" = \
+  "$(cd "$root/unpacked" && find . -printf '%P %y %m %s\n' | sort)" ] &&
+	diff -r --no-dereference -x pipe "$root/direct" "$root/unpacked" > /dev/null 2>&1 ||
+	fail "a tree unpacked is not the tree packed" \
+		"$(diff -r --no-dereference -x pipe "$root/direct" "$root/unpacked" 2>&1 | head)"
+cases=$((cases + 1))
+[ "$(head -c 8 "$root/one.hull")" = HULLPACK ] || fail "a pack does not open with its magic" ""
+size=$(stat -c %s "$root/one.hull")
+timeout 30 python3 -c '
+import sys
+data = bytearray(open(sys.argv[1], "rb").read())
+data[-3] ^= 0xff
+open(sys.argv[2], "wb").write(data)' "$root/one.hull" "$root/bad.hull"
+head -c $((size - 7)) "$root/one.hull" > "$root/cut.hull"
+# Intact bytes under another name: the first index entry's digest, its
+# last byte changed, so zstd's own checksum passes and only the object's
+# digest can refuse it.
+timeout 30 python3 -c '
+import sys
+data = bytearray(open(sys.argv[1], "rb").read())
+data[32 + 31] ^= 0x01
+open(sys.argv[2], "wb").write(data)' "$root/one.hull" "$root/renamed.hull"
+rm -rf "${root:?}/badout" "${root:?}/cutout"
+expect 1 'unpack: an object of the pack is cut or not what its index says' "$hull" unpack "$root/bad.hull" "$root/badout"
+expect 1 'unpack: an object of the pack is cut or not what its index says' "$hull" unpack "$root/cut.hull" "$root/cutout"
+expect 1 'unpack: it is not a Hull pack' "$hull" unpack "$root/owned.tar" "$root/cutout"
+expect 1 'unpack: [0-9a-f]{64}: the object.s bytes are not the object its name says' \
+	"$hull" unpack "$root/renamed.hull" "$root/cutout"
+rm -f "$root/one.hull" "$root/again.hull" "$root/bad.hull" "$root/cut.hull" "$root/renamed.hull"
+chmod -R u+w "$root/unpacked" "$root/direct" 2>/dev/null
+rm -rf "${root:?}/unpacked" "${root:?}/direct"
+
 # The test's core leaves once idle, before its directory goes.
 tries=0
 while [ -S "$XDG_RUNTIME_DIR/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
