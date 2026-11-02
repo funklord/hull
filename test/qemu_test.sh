@@ -1067,6 +1067,26 @@ printf '%s\n' "$committed" | grep -Eq '^vlive/1 sha256:[0-9a-f]{64}$' &&
 timeout 30 "$hull" stop "${vid:-none}" > /dev/null 2>&1
 wait "$vlive"
 
+# (projection block), section 3.9: the root an ext4 image of the
+# directory, built by mke2fs -d as the machine starts, a virtio disk the
+# agent mounts; the machine's write the image's, and not the directory's.
+# (mutable direct) under it, with no writeback, refused at plan.
+conf vblock '(backend vm) (mutable overlay) (projection block)' \
+	'(command "/probe" "write" "/made-on-block" "read" "/proc/mounts")'
+name=vblock
+boot vblock 120
+has 0 '^read=/dev/vda / ext4 rw'
+has 0 '^write=ok$'
+cases=$((cases + 1))
+[ ! -e "$root/rootfs/made-on-block" ] ||
+	fail "a block projection's write reached the directory" ""
+printf '(machine (source "dir:./rootfs") (backend vm) (mutable direct) (projection block) (command "/probe"))\n' \
+	> "$root/vblockdirect.conf"
+cases=$((cases + 1))
+out=$(cd / && timeout 20 "$hull" plan -f "$root/vblockdirect.conf" 2>&1)
+[ $? = 1 ] && printf '%s\n' "$out" | grep -q 'writeback: rejected: (mutable direct) under a block projection needs' ||
+	fail "(mutable direct) under a block projection was not refused" "$out"
+
 # The network, out, through passt as the user: the machine's own lo, the
 # host's DNS, and the host's address; but not the host's loopback. Two
 # listeners on the host, each taking one connection within 15 seconds,

@@ -116,6 +116,7 @@ struct hull_machine {
 	char            *root;         /* the dir source, without "dir:" */
 	int              readonly_root;
 	int              overlay;      /* (mutable overlay): the share is read-only */
+	int              block_root;   /* (projection block): the root a disk image of the tree */
 	char            *layer_path[MAX_VOLUMES];  /* (layers ...): read-only, each above the last */
 	unsigned         layer_count;
 	char            *upper;        /* (upper PATH): the overlay's writes, kept */
@@ -547,6 +548,16 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			       "a root that is not read-only";
 		m->host_overlay = 1;
 	}
+	/* (projection block), section 3.9: the root an ext4 image of the
+	 * directory, built as the machine starts, its writes the image's and
+	 * gone with it -- so of a directory alone, under (mutable overlay),
+	 * the planner refusing (mutable direct) without a writeback. */
+	text = hull_access_value(doc, &machine, "projection");
+	m->block_root = text != NULL && strcmp(text, "block") == 0;
+	free(text);
+	if (m->block_root && (m->host_overlay || m->owners != NULL))
+		return "a block projection's root is built from the directory alone: layers, an upper, "
+		       "owners and an export are a host-side overlay's";
 
 	/* (tuning (vm (kernel ...))): the kernel the vm boots, in place of the
 	 * host's. vm's tuning applies under emu too (section 4), so the (vm ...)
@@ -1002,6 +1013,72 @@ static int kernel_release(const char *image, char *out, size_t cap)
 	return i > 0u;
 }
 
+/* The bytes `root`'s tree takes, roughly: each entry's blocks and an
+ * inode's worth, for sizing the image it is built into. */
+static unsigned long long tree_bytes(const char *root, unsigned depth)
+{
+	DIR               *dir = depth < 64u ? opendir(root) : NULL;
+	struct dirent     *entry;
+	unsigned long long total = 4096u;
+
+	while (dir != NULL && (entry = readdir(dir)) != NULL) {
+		char        path[4200];
+		struct stat st;
+
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue;
+		snprintf(path, sizeof path, "%s/%s", root, entry->d_name);
+		if (lstat(path, &st) != 0)
+			continue;
+		total += (unsigned long long)st.st_blocks * 512u + 4096u;
+		if (S_ISDIR(st.st_mode))
+			total += tree_bytes(path, depth + 1u);
+	}
+	if (dir != NULL)
+		closedir(dir);
+	return total;
+}
+
+/* (projection block): root.img in the machine's directory, an ext4 image
+ * of the directory by mke2fs -d, as the user, which reads the tree as
+ * files and needs no mount. Its UUID, hash seed and time are fixed, and
+ * mke2fs takes the tree in sorted order, so one tree gives one image's
+ * bytes (section 3.9's rule 1), measured on two copies made in opposite
+ * orders. Sized for the tree and a quarter again, and 256 MiB for what
+ * the machine writes, sparse. NULL, or why in m->detail. */
+static const char *build_root_image(hull_machine *m)
+{
+	static const char *const uuid = "68756c6c-726f-6f74-0000-000000000001";
+	const char        *mke2fs = access("/usr/sbin/mke2fs", X_OK) == 0 ? "/usr/sbin/mke2fs" :
+	                            access("/sbin/mke2fs", X_OK) == 0 ? "/sbin/mke2fs" : NULL;
+	unsigned long long bytes = tree_bytes(m->root, 0u);
+	char               image[4300];
+	char               size[32];
+	char               seed[80];
+
+	if (mke2fs == NULL) {
+		snprintf(m->detail, sizeof m->detail, "(projection block) builds its image with mke2fs, "
+		         "which is not installed (e2fsprogs)");
+		return m->detail;
+	}
+	snprintf(image, sizeof image, "%s/root.img", m->dir);
+	snprintf(size, sizeof size, "%lluk", (bytes + bytes / 4u + (256ull << 20)) / 1024u);
+	snprintf(seed, sizeof seed, "hash_seed=%s", uuid);
+	{
+		const char *argv[] = { "env", "E2FSPROGS_FAKE_TIME=1", mke2fs, "-q", "-F", "-t", "ext4",
+		                       "-U", uuid, "-E", seed, "-d", m->root, image, size, NULL };
+		char        said[400];
+
+		if (hull_hostnet_run(argv, said, sizeof said) != 0) {
+			said[strcspn(said, "\n")] = '\0';
+			snprintf(m->detail, sizeof m->detail, "the root's image could not be built: %s",
+			         said);
+			return m->detail;
+		}
+	}
+	return NULL;
+}
+
 static const char *write_initramfs(const hull_machine *m, const char *release, int load_modules)
 {
 	const char *dir = m->dir;
@@ -1081,6 +1158,13 @@ static const char *write_initramfs(const hull_machine *m, const char *release, i
 			if (d->host.named[0] != '\0')
 				snprintf(links + at, sizeof links - at, "%s %s\n", d->host.named, guest);
 		}
+	}
+	/* A block projection's root: its disk, ext4 and the crc32c ext4
+	 * asks for, as an image volume's. */
+	if (m->block_root && load_modules && extra_count + 3u <= MAX_MODULES) {
+		extra[extra_count++] = "virtio_blk";
+		extra[extra_count++] = "?crc32c_generic";
+		extra[extra_count++] = "ext4";
 	}
 	/* An image volume's drive, and the filesystem each is. ext4, xfs,
 	 * btrfs and erofs check their metadata with the crypto API's crc32c,
@@ -1673,10 +1757,25 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int
 			argv[n++] = device_device[i];
 		}
 	}
-	argv[n++] = "-fsdev";
-	argv[n++] = root;
-	argv[n++] = "-device";
-	argv[n++] = "virtio-9p-pci,fsdev=root,mount_tag=root";
+	/* The root: the directory shared, or under (projection block) its
+	 * image, a virtio disk by the tag the share would have had. */
+	if (m->block_root) {
+		char image[4300];
+
+		snprintf(image, sizeof image, "%s/root.img", m->dir);
+		escaped(path, sizeof path, image);
+		snprintf(root, sizeof root, "file=%s,format=raw,if=none,id=rootdisk%s", path,
+		         m->readonly_root ? ",readonly=on" : "");
+		argv[n++] = "-drive";
+		argv[n++] = root;
+		argv[n++] = "-device";
+		argv[n++] = "virtio-blk-pci,drive=rootdisk,serial=root";
+	} else {
+		argv[n++] = "-fsdev";
+		argv[n++] = root;
+		argv[n++] = "-device";
+		argv[n++] = "virtio-9p-pci,fsdev=root,mount_tag=root";
+	}
 	for (unsigned i = 0u; i < m->volume_count; i++) {
 		char staged[4300];
 
@@ -2475,6 +2574,7 @@ static void mark_adopted_dir(const char *dir, int on)
 static void remove_files(const char *dir)
 {
 	static const char *const files[] = { "initrd", "console.log", "qemu.log", "passt.log",
+	                                     "root.img",
 	                                     "passt.pid" /* written by a core before 2026-10-21 */ };
 	char path[4200];
 
@@ -2730,6 +2830,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		break;
 	}
 	if ((reason = make_dir(m)) != NULL ||
+	    (m->block_root && (reason = build_root_image(m)) != NULL) ||
 	    (reason = write_initramfs(m, release, load_modules)) != NULL ||
 	    (reason = open_listeners(m)) != NULL) {
 		if (reason != m->detail)
@@ -3951,6 +4052,9 @@ static const hull_cap_entry entries[] = {
 	  "vm:inotify-poll" },
 
 	{ "projection.passthrough", HULL_SUP_NATIVE, NULL, NULL },
+	{ "projection.block",       HULL_SUP_NATIVE,
+	  "an ext4 image of the directory, built by mke2fs -d as it starts, a virtio disk the "
+	  "agent mounts; the machine's writes the image's, gone with it", NULL },
 	{ "writeback.none",         HULL_SUP_NATIVE, NULL, NULL },
 
 	/* Kept while the core runs; qemu dies with it, as a chroot machine

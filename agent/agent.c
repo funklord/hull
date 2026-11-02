@@ -1186,11 +1186,27 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	/* A read-only root has nothing for an overlay to hold, so it is the
 	 * share itself, read-only, either way. */
 	mkdir("/machine", 0755);
-	if (layered && !readonly_root) {
-		if ((reason = overlay()) != NULL)
-			return reason;
-	} else if (share("root", "/machine", readonly_root) != 0) {
-		return "the machine's directory could not be mounted";
+	/* (projection block): the root an image the engine built from the
+	 * tree for this run, a virtio disk by the tag a share would have,
+	 * its writes the image's and gone with it -- scratch, as an overlay
+	 * laid here is (section 3.9). */
+	{
+		char *projection = hull_access_value(doc, machine, "projection");
+		int   block_root = projection != NULL && strcmp(projection, "block") == 0;
+
+		free(projection);
+		if (block_root) {
+			if (mount_block("root", "/machine", readonly_root) != 0) {
+				say("the root's image", strerror(errno));
+				return "the machine's root image could not be mounted";
+			}
+			layered = 1;
+		} else if (layered && !readonly_root) {
+			if ((reason = overlay()) != NULL)
+				return reason;
+		} else if (share("root", "/machine", readonly_root) != 0) {
+			return "the machine's directory could not be mounted";
+		}
 	}
 	/* The machine's resolv.conf names passt's DNS, as docker writes
 	 * its own; only over a file, since a link would be followed here,
