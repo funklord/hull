@@ -3613,7 +3613,9 @@ done:
 
 /* Whether a core answers, without starting one; or would, holding the
  * machines a core that went kept for it. */
-static int list_machines(void)
+/* `hull ps`; or with `want`, nothing printed, and that machine's arch
+ * into `arch`, "" where it says none, the host's: 0 where it is listed. */
+static int list_machines(const char *want, char *arch, size_t cap)
 {
 	hull_wire      wire;
 	hull_sexpr_doc body;
@@ -3623,6 +3625,8 @@ static int list_machines(void)
 	int            status = connect_core(&wire, 0);
 
 	if (status == 1) {
+		if (want != NULL)
+			return 1;
 		printf("%-24s %-15s %-10s %-6s %s\n", "ID", "ADDRESS", "ENGINE", "CLASS", "STATE");
 		return 0;
 	}
@@ -3633,19 +3637,20 @@ static int list_machines(void)
 		hull_wire_close(&wire);
 		return 2;
 	}
-	printf("%-24s %-15s %-10s %-6s %s\n", "ID", "ADDRESS", "ENGINE", "CLASS", "STATE");
+	if (want == NULL)
+		printf("%-24s %-15s %-10s %-6s %s\n", "ID", "ADDRESS", "ENGINE", "CLASS", "STATE");
 	hull_sexpr_first(&body, &message);
 	hull_sexpr_child(&body, &message, &item);
 	for (more = hull_sexpr_next(&body, &item, &item); more;
 	     more = hull_sexpr_next(&body, &item, &item)) {
-		const char *keys[] = { "id", "address", "engine", "class", "state", "root" };
-		char        values[6][64] = { "", "", "", "", "", "" };
+		const char *keys[] = { "id", "address", "engine", "class", "state", "root", "arch" };
+		char        values[7][64] = { "", "", "", "", "", "", "" };
 		hull_sexpr_form head;
 
 		hull_sexpr_child(&body, &item, &head);
 		if (!hull_sexpr_is(&body, &head, "machine"))
 			continue;
-		for (unsigned k = 0u; k < 6u; k++) {
+		for (unsigned k = 0u; k < 7u; k++) {
 			hull_sexpr_form entry;
 			hull_sexpr_form name;
 			hull_sexpr_form value;
@@ -3659,12 +3664,19 @@ static int list_machines(void)
 				    hull_sexpr_next(&body, &name, &value))
 					hull_msg_string(&body, &value, values[k], sizeof values[k]);
 		}
+		if (want != NULL) {
+			if (strcmp(values[0], want) != 0)
+				continue;
+			snprintf(arch, cap, "%s", values[6]);
+			hull_wire_close(&wire);
+			return 0;
+		}
 		/* Root mode's machine says so, after its state (section 7). */
 		printf("%-24s %-15s %-10s %-6s %s%s\n", values[0], values[1], values[2], values[3],
 		       values[4], strcmp(values[5], "true") == 0 ? " ROOT" : "");
 	}
 	hull_wire_close(&wire);
-	return 0;
+	return want != NULL ? 1 : 0;
 }
 
 /* `hull gc`: what the engines keep that nothing wants, reclaimed by the
@@ -3726,9 +3738,16 @@ static int commit(const char *dir, const char *ref, const char *arch, int tar)
 	int         ended = 0;
 
 	if (!tar && stat(dir, &is) != 0 && errno == ENOENT && strchr(dir, '/') == NULL) {
-		int fd;
-		int status;
+		char own[64] = "";
+		int  fd;
+		int  status;
 
+		/* Its arch where --arch says none: a machine of a foreign one,
+		 * its programs that arch's, is stored as it, as a pull is. */
+		if (arch == NULL && list_machines(dir, own, sizeof own) == 0 && own[0] != '\0')
+			arch = own;
+		if (arch == NULL)
+			arch = host_arch();
 		if ((child = tree_of(dir, &fd)) < 0)
 			return 1;
 		status = commit_from(dir, ref, arch, fd, 1);
@@ -3747,6 +3766,8 @@ static int commit(const char *dir, const char *ref, const char *arch, int tar)
 			return commit_from(NULL, NULL, NULL, -1, 2);
 		return 0;
 	}
+	if (arch == NULL)
+		arch = host_arch();
 	if (tar) {
 		int fd = strcmp(dir, "-") == 0 ? 0 : open(dir, O_RDONLY | O_CLOEXEC);
 
@@ -5331,13 +5352,13 @@ int main(int argc, char **argv)
 	if (strcmp(command, "core") == 0 && argc == 2)
 		return hull_core_run(host_arch());
 	if (strcmp(command, "ps") == 0 && argc == 2)
-		return list_machines();
+		return list_machines(NULL, NULL, 0u);
 	if (strcmp(command, "gc") == 0 && argc == 2)
 		return collect();
 	if (strcmp(command, "commit") == 0 && argc == 4)
-		return commit(argv[2], argv[3], host_arch(), 0);
+		return commit(argv[2], argv[3], NULL, 0);
 	if (strcmp(command, "commit") == 0 && argc == 5 && strcmp(argv[2], "--tar") == 0)
-		return commit(argv[3], argv[4], host_arch(), 1);
+		return commit(argv[3], argv[4], NULL, 1);
 	if (strcmp(command, "commit") == 0 && argc == 6 && strcmp(argv[2], "--arch") == 0)
 		return commit(argv[4], argv[5], argv[3], 0);
 	if (strcmp(command, "materialize") == 0 && argc == 4)

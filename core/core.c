@@ -135,6 +135,7 @@ struct slot {
 	char               address[16]; /* section 8.1's, from the id */
 	const hull_engine *engine;
 	char               class_name[8];
+	char               arch[16];       /* the plan's (arch ...), or "" for the host's */
 	hull_core          core;
 	hull_machine      *handle;
 	char               state[16];
@@ -2307,6 +2308,15 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	snprintf(s->class_name, sizeof s->class_name, "%s", class_name);
 	snprintf(s->state, sizeof s->state, "creating");
 	free(class_name);
+	/* Its arch, for what is committed of it while it runs; the host's is
+	 * said by saying none. */
+	{
+		char *arch = hull_access_value(&plan_doc, &machine, "arch");
+
+		if (arch != NULL && strcmp(arch, "host") != 0)
+			snprintf(s->arch, sizeof s->arch, "%s", arch);
+		free(arch);
+	}
 	on_disconnect = hull_access_value(&plan_doc, &machine, "on_disconnect");
 	s->keep = on_disconnect != NULL && strcmp(on_disconnect, "keep") == 0;
 	free(on_disconnect);
@@ -3377,6 +3387,10 @@ static void handle_list(client *c, uint32_t ch)
 			continue;
 		hull_msg_raw(&m, "(7:machine(7:address");
 		hull_msg_text(&m, s->address);
+		if (s->arch[0] != '\0') {
+			hull_msg_raw(&m, ")(4:arch");
+			hull_msg_text(&m, s->arch);
+		}
 		hull_msg_raw(&m, ")(5:class");
 		hull_msg_text(&m, s->class_name);
 		hull_msg_raw(&m, ")(6:engine");

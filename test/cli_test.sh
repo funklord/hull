@@ -1687,6 +1687,23 @@ if [ -x "$arm64_probe" ] && [ -x /usr/bin/qemu-aarch64 ]; then
 		> "$root/armtree.conf"
 	limit=60
 	expect 0 '^arch=aarch64$' "$hull" run -f "$root/armtree.conf"
+	# A running arm64 machine committed with no --arch: stored as arm64,
+	# its arch the machine's, as the core lists it, not the host's.
+	printf '(machine (source "dir:../arm64/rootfs") (backend chroot) (mutable overlay) (arch arm64) (hostname "armlive") (on_disconnect stop) (command "/probe" "say" "ready" "wait"))\n' \
+		> "$root/armlive.conf"
+	rm -f "$root/armlive.out"
+	(cd / && exec timeout -k 2 30 "$hull_abs" run -f "$root/armlive.conf" > "$root/armlive.out" 2>&1) &
+	armlive=$!
+	tries=0
+	until grep -q '^ready$' "$root/armlive.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+	armid=$("$hull" ps | awk '$3 == "chroot" && $5 == "running" {print $1; exit}')
+	expect 0 '^armlive/1 sha256:' "$hull" commit "${armid:-none}" armlive/1
+	expect 0 '\(arch arm64\)' "$hull" manifest show armlive/1
+	timeout 10 "$hull" kill -s KILL "${armid:-none}" > /dev/null 2>&1
+	wait "$armlive" 2>/dev/null
 else
 	echo "cli: arm64 on chroot not measured: no arm64 probe (aarch64-linux-gnu-gcc) or no qemu-aarch64"
 fi
