@@ -3066,6 +3066,14 @@ printf '(machine (source "tar:./rootfs.tar") (backend chroot) (command "/probe" 
 from_root 0 '^from a tar$' -f "$root/fromtar.conf"
 expect 0 '^tar/[0-9a-f]{32} ' "$hull" images
 rm -f "$root/rootfs.tar"
+# And a pack: source, the same tree packed by hull pack, read into the
+# store as pack/HASH and run.
+expect 0 '' "$hull" pack "$root/rootfs" "$root/rootfs.hull"
+printf '(machine (source "pack:./rootfs.hull") (backend chroot) (command "/probe" "say" "from a pack"))\n' \
+	> "$root/frompack.conf"
+from_root 0 '^from a pack$' -f "$root/frompack.conf"
+expect 0 '^pack/[0-9a-f]{32} ' "$hull" images
+rm -f "$root/rootfs.hull"
 # Pools (section 4.12): a pool of one slot, held by a machine that sleeps.
 # A run that does not wait is refused at once, 75; one that waits a second
 # says it waits, then is refused, 75; one that waits for ever says so and

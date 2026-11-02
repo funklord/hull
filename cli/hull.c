@@ -696,6 +696,51 @@ static int tar_ref(const char *file, const hull_spec *spec, const hull_sexpr_for
 	return 0;
 }
 
+/* The pack `given` names, relative to the file `file` where it is not
+ * absolute, read into the store and named `pack/` and its manifest hash's
+ * first 32 hex digits; that ref into `ref`. 0, or -1 having said why. */
+static int pack_ref(const char *file, const char *given, char *ref, size_t cap)
+{
+	char       path[4400];
+	char       hex[65];
+	char       why[4400] = "";
+	hull_store store;
+	int        fd;
+	int        status;
+
+	if (given[0] == '/') {
+		snprintf(path, sizeof path, "%s", given);
+	} else {
+		const char *slash = strrchr(file, '/');
+
+		snprintf(path, sizeof path, "%.*s%s", slash != NULL ? (int)(slash - file + 1) : 0, file,
+		         given);
+	}
+	if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0) {
+		fprintf(stderr, "%s: pack:%s: %s\n", file, given, strerror(errno));
+		return -1;
+	}
+	if (open_store(&store, 1) != 0) {
+		close(fd);
+		return -1;
+	}
+	status = hull_store_unpack(&store, fd, NULL, hex, why, sizeof why);
+	close(fd);
+	if (status == 0) {
+		char from[80];
+
+		snprintf(ref, cap, "pack/%.32s", hex);
+		snprintf(from, sizeof from, "sha256:%s", hex);
+		status = hull_store_tag(&store, from, ref, hex, why, sizeof why);
+	}
+	hull_store_close(&store);
+	if (status != 0) {
+		fprintf(stderr, "%s: pack:%s: %s\n", file, given, why);
+		return -1;
+	}
+	return 0;
+}
+
 static int store_sources(const char *file, uint8_t *data, size_t *length, int create)
 {
 	static rewrite  rewrites[MAX_REWRITES];
@@ -750,6 +795,15 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 		 * commit of the same bytes again being the same ref. */
 		if (strncmp(name, "tar:", 4u) == 0 && name[4] != '\0') {
 			if (tar_ref(file, &spec, &machines[i], name + 4, name, sizeof name) != 0) {
+				result = -1;
+				break;
+			}
+		}
+		/* A pack: source (section 3.13), read into the store as
+		 * pack/HASH, its manifest's, each object checked, and run as the
+		 * stored tree it then is, as a tar: source is. */
+		if (strncmp(name, "pack:", 5u) == 0 && name[5] != '\0') {
+			if (pack_ref(file, name + 5, name, sizeof name) != 0) {
 				result = -1;
 				break;
 			}
