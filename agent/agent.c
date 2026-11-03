@@ -1639,6 +1639,8 @@ static int signal_named(const char *name)
 	return 0;
 }
 
+static void settle(channel *c);
+
 /* The agent reaps what it signals, so a pid it holds is still the
  * process's own. */
 static void signal_channel(channel *c, int number)
@@ -1656,6 +1658,12 @@ static void signal_channel(channel *c, int number)
 		close_fd(&c->in);
 		close_fd(&c->out);
 		c->queued = 0u;
+		/* Done now, said now: the main loop settles a connection only
+		 * after a poll, and with nothing else to wake it that poll is
+		 * for ever. ssh signals its ProxyCommand as it exits, so this
+		 * is how most `hull proxy-ssh` sessions end, and one in a few
+		 * left the frontend waiting until the machine went. */
+		settle(c);
 	} else if (c != NULL && !c->reaped) {
 		kill(c->pid, number);
 	}
