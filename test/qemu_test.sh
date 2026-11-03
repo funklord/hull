@@ -2159,6 +2159,7 @@ rm -rf "${shm:?}"
 # offline, the case says so.
 nokernel=$(mktemp -d "$root/run-nokernel.XXXXXX")
 fetchedrun=$(mktemp -d "$root/run-fetched.XXXXXX")
+chosenrun=$(mktemp -d "$root/run-chosen.XXXXXX")
 mkdir -p "$root/cache-empty"
 krelease=$(sed -n 's/^#define HULL_KERNEL_RELEASE "\(.*\)"$/\1/p' engine/kernel.h)
 printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) %s)\n' \
@@ -2185,6 +2186,20 @@ else
 	has 0 '^fetched$'
 	has 0 '^list= kernel modules\.alias '
 	refute_out '^list=.* (build|source)( |$)'
+	# (kernel fetched): that kernel by choice, where the host's can be
+	# read, on a core of its own started with the host's /boot; native,
+	# so no emulated line.
+	printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) %s %s)\n' \
+		'(tuning (vm (kernel fetched)))' \
+		"(command \"/probe\" \"say\" \"chosen\" \"list\" \"/lib/modules/$krelease\")" \
+		> "$root/vchosen.conf"
+	name='(kernel fetched)'
+	out=$(cd / && XDG_RUNTIME_DIR=$chosenrun XDG_CACHE_HOME="$root/cache" timeout 60 \
+		"$hull" run -f "$root/vchosen.conf" 2>&1)
+	got=$?
+	has 0 '^chosen$'
+	refute_out '^list=.* (build|source)( |$)'
+	refute_out 'vm\.kernel\.(bundled|fetched): emulated'
 	# Fetched again, at once: it is there.
 	name='kernel fetch, again'
 	out=$(XDG_CACHE_HOME="$root/cache" timeout 30 "$hull" kernel fetch 2>&1)
@@ -2192,14 +2207,14 @@ else
 	has 0 "^$root/cache/hull/kernel-[0-9]"
 	refute_out 'fetching'
 fi
-for run in "$nokernel" "$fetchedrun"; do
+for run in "$nokernel" "$fetchedrun" "$chosenrun"; do
 	tries=0
 	while [ -S "$run/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
 		tries=$((tries + 1))
 		sleep 0.25
 	done
 done
-rm -rf "${nokernel:?}" "${fetchedrun:?}"
+rm -rf "${nokernel:?}" "${fetchedrun:?}" "${chosenrun:?}"
 
 # hull export --bootable (section 3.13): a tree as a disk image that boots
 # by itself under UEFI, here qemu with OVMF and no hull: Limine, the host's

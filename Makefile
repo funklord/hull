@@ -239,7 +239,7 @@ QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf vbuilt.conf die.
                   home/.ssh/id_ed25519.pub \
                   qticks.out vgateway.conf gwlisten.out vgateway6.conf \
                   bootroot/probe bootroot/sbin/booted bootroot/etc/owned boot.img boot2.img \
-                  boot.serial bootowned.view cache/hull/limine-11.4.1/BOOTX64.EFI vfetched.conf)
+                  boot.serial bootowned.view cache/hull/limine-11.4.1/BOOTX64.EFI vfetched.conf vchosen.conf)
 
 # What test/flip_test.sh writes: the project, and its rsync'd copy.
 FLIP_PROJECT    = hull.conf rootfs/probe rootfs/etc/flip

@@ -236,6 +236,7 @@ static void test_values(void)
 
 	/* The kernel's two shapes. */
 	OK(M("(tuning (vm (kernel bundled)))"));
+	OK(M("(tuning (vm (kernel fetched)))"));
 	OK(M("(tuning (vm (kernel \"path:./bzImage\")))"));
 	NO(M("(tuning (vm (kernel \"./bzImage\")))"), VALUE, "\"./bzImage\"",
 	   "machine.tuning.vm.kernel");

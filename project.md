@@ -474,7 +474,7 @@ One file describes a machine. Multi-machine files, compose-style, are the same s
   (tuning
     (vm                          ; CLASS-level tuning: applies to whichever vm engine runs
       (profile micro)            ; micro (microVM; qemu & native engines) | full (full machine type)
-      (kernel bundled))          ; bundled | image | "path:./bzImage"
+      (kernel bundled))          ; bundled | fetched | image | "path:./bzImage"
     (qemu                        ; ENGINE-level tuning: overrides class-level when this engine runs
       (accel auto))              ; auto | kvm | tcg
     (virtualbox
@@ -2014,8 +2014,8 @@ The bundled kernel is the vm backend's biggest liability (§11.1); this is the c
   - About 108 MB fetched and 121 MB kept; 10 s here. A second fetch finds it there and fetches nothing.
 - **When it is used:** where the user cannot read the host's kernel, the engine boots the fetched one, and its modules come from the cache wherever the host's would: the initramfs, `modules.alias` for a USB device's drivers, and the guest's `/lib/modules` share. Where neither kernel is there, the start is refused, naming the command. The download is the command's, not the engine's, so a `hull run` never reaches the network unasked.
 - **The generic kernel, not Debian's cloud kernel:** the cloud kernel has no 9p (`CONFIG_9P_FS` unset in its config, read 2026-11-03), and a vm's root and volumes are 9p shares. It has virtiofs, which hull does not use yet.
+- **`(kernel fetched)`, the same day:** the fetched kernel by choice where the host's can be read, the same kernel on every host, which is this appendix's aim. Native, as `path:` and `image` are; refused at start, naming the command, where nothing is fetched. **Measured:** a vm under it on a core with the host's `/boot` readable has the package's module directory, and no emulated line; with the choice ignored, the case failed.
 - **Not yet:**
-  - `(kernel fetched)` as a spec value, to choose it where the host's is readable: the same kernel on every host, which is this appendix's aim;
   - the pin moving by itself: an old version leaves Debian's pool, and the fetch then says so and names the pin to move;
   - arm64.
 - **Measured** in `test/qemu_test.sh`, with `HULL_BOOT_DIR` standing in for an unreadable `/boot`:

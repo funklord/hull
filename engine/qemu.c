@@ -129,6 +129,7 @@ struct hull_machine {
 	int              many;         /* the user's subordinate range mapped, not one uid */
 	char            *kernel_path;  /* (kernel "path:FILE"): bring your own, else the host's */
 	int              kernel_image; /* (kernel image): the image's own /hull/kernel */
+	int              kernel_fetched; /* (kernel fetched): `hull kernel fetch`'s, on any host */
 	char            *volume_host[MAX_VOLUMES];
 	int              volume_readonly[MAX_VOLUMES];
 	hull_stack       volume_stack[MAX_VOLUMES];  /* a volume of (layers ...), or count 0 */
@@ -577,6 +578,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 				return "the kernel's path cannot be read";
 		} else {
 			m->kernel_image = strcmp(text, "image") == 0;
+			m->kernel_fetched = strcmp(text, "fetched") == 0;
 			free(text);
 		}
 	}
@@ -2802,15 +2804,19 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		snprintf(kbuf, sizeof kbuf, "%s/vmlinuz-%s",
 		         boot != NULL && boot[0] == '/' ? boot : "/boot", name.release);
 		snprintf(mbuf, sizeof mbuf, "/lib/modules/%s", name.release);
-		if (access(kbuf, R_OK) != 0) {
+		/* (kernel fetched) asks for that one wherever the host's can be
+		 * read: the same kernel on every host, Appendix F's aim. */
+		if (m->kernel_fetched || access(kbuf, R_OK) != 0) {
 			if (hull_kernel_dir(fetched, sizeof fetched) != 0)
 				fetched[0] = '\0';
 			snprintf(kbuf, sizeof kbuf, "%s/boot/vmlinuz-%s", fetched, HULL_KERNEL_RELEASE);
 			snprintf(mbuf, sizeof mbuf, "%s/lib/modules/%s", fetched, HULL_KERNEL_RELEASE);
 			if (fetched[0] == '\0' || access(kbuf, R_OK) != 0)
-				return fail(error, HULL_ERR_RUNTIME, "the host's kernel cannot be read by the "
-				            "user, and no kernel has been fetched: `hull kernel fetch` "
-				            "downloads Debian's, once");
+				return fail(error, HULL_ERR_RUNTIME, m->kernel_fetched ?
+				            "(kernel fetched) wants the kernel `hull kernel fetch` downloads, "
+				            "and none has been fetched" :
+				            "the host's kernel cannot be read by the user, and no kernel has "
+				            "been fetched: `hull kernel fetch` downloads Debian's, once");
 		}
 		kernel = kbuf;
 		load_modules = 1;
@@ -4093,6 +4099,9 @@ static const hull_cap_entry entries[] = {
 	{ "vm.kernel.path",      HULL_SUP_NATIVE,
 	  "the kernel at the given path, booted as given; its modules are the host's for its "
 	  "release where it has them, else it must have its guest drivers built in", NULL },
+	{ "vm.kernel.fetched",   HULL_SUP_NATIVE,
+	  "the kernel `hull kernel fetch` put in the user's cache, Debian's, pinned: the same "
+	  "kernel on every host, its modules its own", NULL },
 	{ "vm.kernel.image",     HULL_SUP_NATIVE,
 	  "the image's own /hull/kernel, booted as given; a different kernel version per machine, "
 	  "its modules the host's for its release where it has them, else built in", NULL },

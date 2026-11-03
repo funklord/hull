@@ -30,7 +30,7 @@ typedef enum value_type {
 	COUNT,     /* a whole number, from 1 */
 	PORT,      /* a whole number, from 1 to 65535 */
 	NUMBER,    /* a positive decimal: 2, 1.5 */
-	KERNEL,    /* bundled, image, or "path:<file>" */
+	KERNEL,    /* bundled, fetched, image, or "path:<file>" */
 	RECORD,    /* (key (entry ...) ...), held to `record` */
 	ENTRIES,   /* a plural key holding (singular ...) records */
 	MAP,       /* names the user chooses: (name ...) records, or (name "value") */
@@ -1115,11 +1115,12 @@ static hull_spec_status check_value(walk *w, const hull_sexpr_form *entry,
 
 			if (!has_scheme(w->doc->data + value.content, value.content_length, schemes))
 				return fail(w, HULL_SPEC_ERR_VALUE, value.offset,
-				            "must be bundled, image or \"path:<file>\"");
+				            "must be bundled, fetched, image or \"path:<file>\"");
 		} else if (!hull_sexpr_is(w->doc, &value, "bundled") &&
+		           !hull_sexpr_is(w->doc, &value, "fetched") &&
 		           !hull_sexpr_is(w->doc, &value, "image")) {
 			return fail(w, HULL_SPEC_ERR_VALUE, value.offset,
-			            "must be bundled, image or \"path:<file>\"");
+			            "must be bundled, fetched, image or \"path:<file>\"");
 		}
 		return HULL_SPEC_OK;
 	case RECORD:
