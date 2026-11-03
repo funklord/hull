@@ -2208,6 +2208,103 @@ static void finish(void)
 	farewell();
 }
 
+/* --- a bootable export --------------------------------------------------- */
+
+/*
+ * `hull export --bootable` (section 3.13) puts /hull/boot in the image's
+ * initramfs: `root NAME`, the GPT name of the partition holding the tree,
+ * and `init PATH`, what becomes PID 1 in it. There is no host to speak
+ * to: the agent mounts that partition, moves the kernel's filesystems
+ * into it, makes it / as switch_root does and runs the tree's own init
+ * there, the modules it loaded staying loaded. Should nothing be
+ * runnable it says so and powers off, rather than panic the kernel.
+ */
+static void boot_standalone(FILE *boot)
+{
+	struct timespec tenth = { 0, 100000000L };
+	char            line[256];
+	char            root[256] = "";
+	char            init[256] = "/sbin/init";
+	char            node[300] = "";
+	const char     *type;
+
+	while (fgets(line, sizeof line, boot) != NULL) {
+		line[strcspn(line, "\n")] = '\0';
+		if (strncmp(line, "root ", 5u) == 0)
+			snprintf(root, sizeof root, "%s", line + 5);
+		else if (strncmp(line, "init ", 5u) == 0 && line[5] == '/')
+			snprintf(init, sizeof init, "%s", line + 5);
+	}
+	fclose(boot);
+	/* The disk may still be probing, as mount_block waits for one. */
+	for (int tries = 0; root[0] != '\0' && node[0] == '\0' && tries < 50; tries++) {
+		DIR           *block = opendir("/sys/class/block");
+		struct dirent *each;
+
+		while (block != NULL && node[0] == '\0' && (each = readdir(block)) != NULL) {
+			char  path[300];
+			char  field[128];
+			FILE *uevent;
+
+			if (each->d_name[0] == '.')
+				continue;
+			snprintf(path, sizeof path, "/sys/class/block/%s/uevent", each->d_name);
+			if ((uevent = fopen(path, "r")) == NULL)
+				continue;
+			while (fgets(field, sizeof field, uevent) != NULL) {
+				field[strcspn(field, "\n")] = '\0';
+				if (strncmp(field, "PARTNAME=", 9u) == 0 && strcmp(field + 9, root) == 0)
+					snprintf(node, sizeof node, "/dev/%s", each->d_name);
+			}
+			fclose(uevent);
+		}
+		if (block != NULL)
+			closedir(block);
+		if (node[0] == '\0')
+			nanosleep(&tenth, NULL);
+	}
+	mkdir("/machine", 0755);
+	if (node[0] == '\0') {
+		say("boot: no partition is named", root);
+	} else if (hull_access_filesystem(node, &type) == NULL) {
+		say("boot: no filesystem the agent knows on", node);
+	} else if (mount(node, "/machine", type, 0u, NULL) != 0) {
+		say("boot: the root could not be mounted", strerror(errno));
+	} else {
+		const char *const places[] = { "/dev", "/proc", "/sys" };
+		const char *const inits[] = { init, "/sbin/init", "/etc/init", "/bin/init", "/bin/sh" };
+
+		for (unsigned i = 0u; i < 3u; i++) {
+			char at[64];
+
+			snprintf(at, sizeof at, "/machine%s", places[i]);
+			if (mount(places[i], at, NULL, MS_MOVE, NULL) != 0)
+				umount2(places[i], MNT_DETACH);
+		}
+		if (chdir("/machine") != 0 || mount(".", "/", NULL, MS_MOVE, NULL) != 0 ||
+		    chroot(".") != 0 || chdir("/") != 0) {
+			say("boot: the root could not become /", strerror(errno));
+		} else {
+			/* The kernel's own order after the one named, as it
+			 * tries init= and then these. */
+			for (unsigned i = 0u; i < sizeof inits / sizeof inits[0]; i++) {
+				char *const argv[] = { (char *)inits[i], NULL };
+
+				if (i > 0u && strcmp(inits[i], init) == 0)
+					continue;
+				execv(inits[i], argv);
+				if (i == 0u)
+					say(init, strerror(errno));
+			}
+			say("boot", "the tree has no init it can run");
+		}
+	}
+	sync();
+	reboot(RB_POWER_OFF);
+	for (;;)
+		pause();
+}
+
 int main(int argc, char **argv)
 {
 	sigset_t       mask;
@@ -2240,6 +2337,12 @@ int main(int argc, char **argv)
 		}
 	}
 	load_modules();
+	{
+		FILE *boot = fopen("/hull/boot", "r");
+
+		if (boot != NULL)
+			boot_standalone(boot);
+	}
 	link_devices();
 	read_notices();
 	network();

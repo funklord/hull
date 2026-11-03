@@ -301,7 +301,7 @@ Rules that keep block projections honest:
 3. **Need is declared, not discovered.** `(projection auto)` (default) lets the plan step choose per engine; a spec that needs passthrough-hostile semantics declares them — `(fidelity inotify flock odirect)` — and the plan either selects a projection satisfying every declared need or rejects with the reason. Fidelity gaps become matrix rows, found at plan time instead of by 2 a.m. breakage.
 **Built 2026-11-02 on qemu, the first engine to declare `projection.block`:** the root an ext4 image of the directory, `root.img` in the machine's directory, built by `mke2fs -d` as the user as the machine starts -- no mount, the tree read as files -- and attached as a virtio disk with the serial the root share's tag would have had, which the agent mounts as an image volume's (§3.7); the machine's writes are the image's and go with it, so it runs under `(mutable overlay)`, and rule 2 above keeps `(mutable direct)` out. Its UUID, hash seed and creation time are fixed and mke2fs takes the tree in sorted order, so one tree gives one image's bytes, rule 1, measured on two copies of a tree made in opposite orders; it is built afresh each run, not yet cached by the tree's hash. Sized as the tree and a quarter again, and 256 MiB for writes, sparse. A filesystem made by mke2fs has its `lost+found`, which the machine sees. Layers, an upper, owners and an export, a host-side overlay's, are refused beside it. **Measured** in `test/qemu_test.sh`: the guest's `/` is `/dev/vda`, ext4, read-write, a write there made and not in the directory; `(mutable direct)` under it refused at plan. **Sabotage,** the agent ignoring the projection, the machine not starting. Not yet: `(writeback sync-on-stop)`, the cache, and any other engine.
 
-4. **Self-containment is an export, not a mode.** When a machine must leave Hull — boot under plain QEMU, ship to a cloud, run under VirtualBox on someone else's laptop — `hull export --bootable <machine> disk.img` emits a standalone image (partition table, bootloader, kernel, tree) as a deliberate border artifact, exactly like OCI push: a copy that leaves the truth behind, and says so.
+4. **Self-containment is an export, not a mode.** When a machine must leave Hull — boot under plain QEMU, ship to a cloud, run under VirtualBox on someone else's laptop — `hull export --bootable <machine> disk.img` emits a standalone image (partition table, bootloader, kernel, tree) as a deliberate border artifact, exactly like OCI push: a copy that leaves the truth behind, and says so. **Built 2026-11-03 for UEFI, §3.13.**
 
 ### 3.10 Media sources — file collections for what we used to store as images
 
@@ -390,6 +390,27 @@ A machine's content has exactly one identity (its manifest hash / tree hash) and
 
 - **Import** — the §3.11 one-algorithm path: qcow2, VMDK, VHD/VHDX, VDI, raw disks, ISO/BIN-CUE, OVA/OVF appliances, OCI/docker-save tarballs, Vagrant boxes → decompose into a collection (files + metadata + patch), provably lossless, re-exportable to the original format bit-exact when the projector permits.
 - **Attach** — run a foreign image *in place*, no conversion: `(source "image:./disk.vmdk")` hands the file to an engine that speaks it natively (vmware↔VMDK, hyperv↔VHDX, qemu↔qcow2/raw, virtualbox↔VDI). Attach trades away inspectability and dir-workflows for zero-cost onboarding of existing VMs — declared per engine in its capability table, and `hull import` is always one command away when the user wants the files-first benefits.
+
+**The bootable export, principle 4's border artifact, built 2026-11-03: `hull export --bootable SRC IMAGE [--init PATH]`** (`cli/export.c`). SRC is a directory, committed first as `hull pack` commits one, or a stored ref; IMAGE is a raw GPT disk that boots by itself under UEFI -- plain QEMU with OVMF, VirtualBox in EFI mode, a cloud that takes a raw disk -- with nothing of hull's on the host:
+
+| Part | What it holds | Made by |
+|---|---|---|
+| GPT | a protective MBR, both headers and both entry arrays | `cli/export.c` itself, so one tree gives one layout |
+| `hull-esp`, FAT32 | Limine's `BOOTX64.EFI`, `limine.conf`, the host's kernel, an initramfs | `mkfs.vfat --invariant`, mtools with fixed times |
+| `hull-root-HEX8`, ext4 | the tree, its manifest's owners kept | `mke2fs -d` reading `hull_store_layer()`'s tar |
+
+- **Rootless throughout:** no loop mount, no root. The tree goes to mke2fs as the tar a push would send, so root's files are root's in the image and an explicit owner keeps its ids, which `mke2fs -d DIR` as the user cannot give; mke2fs reads a tar through libarchive.
+- **The initramfs is a vm's** -- the agent and the modules that mount a block root -- plus `/hull/boot`, naming the tree's partition by its GPT name and its init. With it the agent waits for no host: it finds the partition by `PARTNAME` in the block devices' uevents, mounts it, moves `/dev`, `/proc` and `/sys` into it, makes it `/` and execs the init, then the kernel's own order (`/sbin/init`, `/etc/init`, `/bin/init`, `/bin/sh`). With none runnable it says so and powers off rather than panic.
+- **Deterministic:** the partition GUIDs and the ext4 UUID and hash seed come from the tree's manifest hash, mke2fs's time is fixed, and the ESP's files and directories have fixed times. Two exports of one tree are the same bytes.
+- **Limine is downloaded, not shipped** (§9's dependency rule): its UEFI loader, from the `v11.4.1-binary` tag, into `$XDG_CACHE_HOME/hull/limine-11.4.1/`, its sha256 checked on every use. 11.4.1 is the newest Limine with prebuilt binaries: from 12.0 a release is source alone. Following 12.x would mean building Limine on the user's machine (nasm and a cross-capable compiler) at first use, which is the holder's call; moving the pin is a one-line change with its digest.
+- **The kernel is the host's** `/boot/vmlinuz-RELEASE`, as a vm boots, and its modules are those the initramfs loads: the disk, ext4 and the network card. The tree holds none of the kernel's, so a workload needing another module needs the tree's own kernel, which is Appendix F's question.
+- **Not yet:** BIOS boot, which Limine's `bios-install` tool would write and which is code built on the user's machine; and a machine name for SRC, the spec's source and init taken from it.
+- **Measured** in `test/qemu_test.sh`, under qemu with OVMF and no hull:
+  - a directory exported and booted, its init seeing itself PID 1 on an ext4 root it can write, root's files `0:0`;
+  - a second export the same bytes;
+  - a stored tree whose view gave `etc/owned` to `101:102`, booted with those ids;
+  - an init the tree lacks said on the console and powered off;
+  - a relative `--init` refused.
 
 ### 3.14 Why files beat loop-mounted images — the technical case
 

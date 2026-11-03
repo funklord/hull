@@ -55,6 +55,7 @@
 #include "builtin.h"
 #include "core.h"
 #include "doctor.h"
+#include "export.h"
 #include "import.h"
 #include "matrix.h"
 #include "names.h"
@@ -117,6 +118,7 @@ static void usage(FILE *out)
 	      "       hull reserve POOL [--count N] [--wait D|--no-wait] | hull release ID\n"
 	      "       hull pool ls | hull lease ls\n"
 	      "       hull pack DIR|REF FILE | hull unpack FILE|- DIR\n"
+	      "       hull export --bootable DIR|REF IMAGE [--init PATH]\n"
 	      "       hull build [-f FILE] [--check] REF\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
@@ -4238,21 +4240,13 @@ static int list_of(int pools)
 	return 0;
 }
 
-/* `hull pack SRC FILE` (section 3.13): the tree SRC is, a directory --
- * committed first, its owners as a commit takes them -- or a stored ref,
- * as one file, its manifest's hash printed. */
-static int pack(const char *source, const char *file)
+/* The stored tree SRC names: a directory committed first, its owners as a
+ * commit takes them, or a stored ref as it is. 0, or -1 with `why`. */
+static int tree_name(hull_store *store, const char *source, char *name, size_t cap, char *why,
+                     size_t why_cap)
 {
-	hull_store  store;
 	struct stat is;
-	char        name[200];
-	char        hex[65];
-	char        why[4400] = "";
-	int         status;
-	int         fd;
 
-	if ((status = open_store(&store, 1)) != 0)
-		return status;
 	if (stat(source, &is) == 0 && S_ISDIR(is.st_mode)) {
 		hull_commit       made;
 		hull_commit_extra extra = { 0 };
@@ -4262,15 +4256,57 @@ static int pack(const char *source, const char *file)
 		         strlen(HULL_BUILDER), HULL_BUILDER);
 		extra.provenance = (const uint8_t *)provenance;
 		extra.provenance_length = strlen(provenance);
-		if (hull_store_commit(&store, source, host_arch(), NULL, &extra, &made, why,
-		                      sizeof why) != 0) {
-			hull_store_close(&store);
-			fprintf(stderr, "hull: pack: %s\n", why);
-			return 1;
-		}
-		snprintf(name, sizeof name, "sha256:%s", made.manifest);
+		if (hull_store_commit(store, source, host_arch(), NULL, &extra, &made, why,
+		                      why_cap) != 0)
+			return -1;
+		snprintf(name, cap, "sha256:%s", made.manifest);
 	} else {
-		snprintf(name, sizeof name, "%s", source);
+		snprintf(name, cap, "%s", source);
+	}
+	return 0;
+}
+
+/* `hull export --bootable SRC IMAGE [--init PATH]` (section 3.13): the
+ * tree SRC is as a disk image that boots by itself, PATH its PID 1,
+ * /sbin/init unless said. */
+static int export_bootable(const char *source, const char *image, const char *init)
+{
+	hull_store store;
+	char       name[200];
+	char       why[4400] = "";
+	int        status;
+
+	if ((status = open_store(&store, 1)) != 0)
+		return status;
+	if (tree_name(&store, source, name, sizeof name, why, sizeof why) != 0 ||
+	    hull_export_bootable(&store, name, image, init, why, sizeof why) != 0) {
+		hull_store_close(&store);
+		fprintf(stderr, "hull: export: %s\n", why);
+		return 1;
+	}
+	hull_store_close(&store);
+	printf("%s\n", image);
+	return 0;
+}
+
+/* `hull pack SRC FILE` (section 3.13): the tree SRC is, a directory --
+ * committed first, its owners as a commit takes them -- or a stored ref,
+ * as one file, its manifest's hash printed. */
+static int pack(const char *source, const char *file)
+{
+	hull_store store;
+	char       name[200];
+	char       hex[65];
+	char       why[4400] = "";
+	int        status;
+	int        fd;
+
+	if ((status = open_store(&store, 1)) != 0)
+		return status;
+	if (tree_name(&store, source, name, sizeof name, why, sizeof why) != 0) {
+		hull_store_close(&store);
+		fprintf(stderr, "hull: pack: %s\n", why);
+		return 1;
 	}
 	if ((fd = open(file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)) < 0) {
 		hull_store_close(&store);
@@ -5876,6 +5912,11 @@ int main(int argc, char **argv)
 		return commit(argv[4], argv[5], argv[3], 0);
 	if (strcmp(command, "materialize") == 0 && argc == 4)
 		return materialize(argv[2], argv[3]);
+	if (strcmp(command, "export") == 0 && argc == 5 && strcmp(argv[2], "--bootable") == 0)
+		return export_bootable(argv[3], argv[4], "/sbin/init");
+	if (strcmp(command, "export") == 0 && argc == 7 && strcmp(argv[2], "--bootable") == 0 &&
+	    strcmp(argv[5], "--init") == 0)
+		return export_bootable(argv[3], argv[4], argv[6]);
 	if (strcmp(command, "pack") == 0 && argc == 4)
 		return pack(argv[2], argv[3]);
 	if (strcmp(command, "unpack") == 0 && argc == 4)

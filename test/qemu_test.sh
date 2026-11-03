@@ -2147,6 +2147,93 @@ left=$(ls -A "$shm/hull/secrets" 2>&1; ls -d "$shm"/hull/qemu-* 2>/dev/null)
 [ -z "$left" ] || fail "a vm's secrets or its directory were left" "$left"
 rm -rf "${shm:?}"
 
+# hull export --bootable (section 3.13): a tree as a disk image that boots
+# by itself under UEFI, here qemu with OVMF and no hull: Limine, the host's
+# kernel, the agent as the initramfs's init, which mounts the tree's
+# partition and hands it to the tree's own init, the probe as `booted`,
+# which says what it booted into and powers off. Limine is fetched once
+# into a cache of the suite's, kept between runs; offline, or without
+# OVMF, the case says so and is not counted.
+ovmf=
+for f in /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd; do
+	[ -r "$f" ] && ovmf=$f && break
+done
+mkdir -p "$root/bootroot/sbin" "$root/bootroot/etc" "$root/bootroot/dev" "$root/bootroot/proc" \
+	"$root/bootroot/sys" "$root/bootroot/run"
+cp "$probe" "$root/bootroot/probe"
+cp "$probe" "$root/bootroot/sbin/booted"
+printf 'owned\n' > "$root/bootroot/etc/owned"
+export XDG_CACHE_HOME="$root/cache"
+name=export
+out=$(cd "$root" && timeout 120 "$hull" export --bootable ./bootroot boot.img --init /sbin/booted 2>&1)
+got=$?
+if [ -z "$ovmf" ]; then
+	printf 'qemu: a bootable export not booted: no OVMF firmware\n'
+elif [ "$got" -ne 0 ] && printf '%s\n' "$out" | grep -q "Limine's loader"; then
+	printf 'qemu: a bootable export not made: %s\n' "$out"
+else
+	has 0 'boot\.img$'
+	# One tree, one image: the second export is the first's bytes,
+	# compared before the first is booted, which writes to it.
+	name='export, again'
+	out=$(cd "$root" && timeout 120 "$hull" export --bootable ./bootroot boot2.img \
+		--init /sbin/booted 2>&1)
+	got=$?
+	has 0 'boot2\.img$'
+	cases=$((cases + 1))
+	cmp -s "$root/boot.img" "$root/boot2.img" ||
+		fail "two exports of one tree differ" "$(cmp "$root/boot.img" "$root/boot2.img" 2>&1)"
+	# Booted, with nothing of hull's: what the tree's init saw, its root
+	# the tree's partition, writable, root's files root's.
+	rm -f "$root/boot.serial"
+	timeout 90 qemu-system-x86_64 -machine q35 -m 512 -enable-kvm -bios "$ovmf" \
+		-drive "file=$root/boot.img,format=raw,if=virtio" -display none -net none \
+		-serial "file:$root/boot.serial" -no-reboot >/dev/null 2>&1
+	got=$?
+	out=$(tr -d '\r' < "$root/boot.serial" 2>&1 | grep -a -E 'booted|hull agent|Kernel panic')
+	name='export, booted'
+	has 0 '^booted pid=1 root=ext4 writable=yes owned=0:0 probe=0:0$'
+	# A stored tree's explicit owners, as its manifest has them: the
+	# view edited to give etc/owned to 101:102 and compiled back.
+	timeout 30 "$hull" commit "$root/bootroot" boot/tree:1 >/dev/null 2>&1
+	timeout 30 "$hull" manifest show boot/tree:1 2>/dev/null |
+		sed 's|(owner root) (path "etc/owned")|(owner (gid 102) (uid 101)) (path "etc/owned")|' \
+		> "$root/bootowned.view"
+	timeout 30 "$hull" manifest compile boot/tree:2 < "$root/bootowned.view" >/dev/null 2>&1
+	name='export, owners'
+	out=$(cd "$root" && timeout 120 "$hull" export --bootable boot/tree:2 boot2.img \
+		--init /sbin/booted 2>&1)
+	got=$?
+	has 0 'boot2\.img$'
+	rm -f "$root/boot.serial"
+	timeout 90 qemu-system-x86_64 -machine q35 -m 512 -enable-kvm -bios "$ovmf" \
+		-drive "file=$root/boot2.img,format=raw,if=virtio" -display none -net none \
+		-serial "file:$root/boot.serial" -no-reboot >/dev/null 2>&1
+	got=$?
+	out=$(tr -d '\r' < "$root/boot.serial" 2>&1 | grep -a -E 'booted|hull agent|Kernel panic')
+	has 0 '^booted pid=1 root=ext4 writable=yes owned=101:102 probe=0:0$'
+	# An init the tree does not have: refused at its exec in the guest,
+	# said, and the machine off rather than the kernel panicking.
+	name='export, no init'
+	out=$(cd "$root" && timeout 120 "$hull" export --bootable ./bootroot boot2.img \
+		--init /sbin/nothing 2>&1)
+	got=$?
+	has 0 'boot2\.img$'
+	rm -f "$root/boot.serial"
+	timeout 90 qemu-system-x86_64 -machine q35 -m 512 -enable-kvm -bios "$ovmf" \
+		-drive "file=$root/boot2.img,format=raw,if=virtio" -display none -net none \
+		-serial "file:$root/boot.serial" -no-reboot >/dev/null 2>&1
+	got=$?
+	out=$(tr -d '\r' < "$root/boot.serial" 2>&1 | grep -a -E 'booted|hull agent|Kernel panic')
+	has 0 'hull agent: boot: the tree has no init it can run'
+	name='export, relative init'
+	out=$(cd "$root" && timeout 30 "$hull" export --bootable ./bootroot boot2.img \
+		--init sbin/booted 2>&1)
+	got=$?
+	has 1 'not an absolute path'
+fi
+rm -f "$root/boot.img" "$root/boot2.img" "$root/boot.serial"
+
 # Nothing left: no qemu of this suite's, no passt, no machine directory.
 cases=$((cases + 1))
 sleep 2

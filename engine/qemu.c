@@ -117,6 +117,7 @@ struct hull_machine {
 	int              readonly_root;
 	int              overlay;      /* (mutable overlay): the share is read-only */
 	int              block_root;   /* (projection block): the root a disk image of the tree */
+	const char      *boot;         /* a bootable export's /hull/boot, else NULL */
 	char            *layer_path[MAX_VOLUMES];  /* (layers ...): read-only, each above the last */
 	unsigned         layer_count;
 	char            *upper;        /* (upper PATH): the overlay's writes, kept */
@@ -1224,6 +1225,8 @@ static const char *write_initramfs(const hull_machine *m, const char *release, i
 	entry(&a, "hull/modules", 0100644u, 0u, 0u, (const uint8_t *)names, strlen(names));
 	entry(&a, "hull/devices", 0100644u, 0u, 0u, (const uint8_t *)links, strlen(links));
 	entry(&a, "hull/notices", 0100644u, 0u, 0u, (const uint8_t *)notices, strlen(notices));
+	if (m->boot != NULL)
+		entry(&a, "hull/boot", 0100644u, 0u, 0u, (const uint8_t *)m->boot, strlen(m->boot));
 	entry(&a, "TRAILER!!!", 0u, 0u, 0u, NULL, 0u);
 	for (unsigned i = 0u; i < list.count; i++)
 		free(list.path[i]);
@@ -4121,6 +4124,38 @@ static const hull_engine engine = {
 	.caps        = &caps,
 	.ops         = &ops,
 };
+
+/* A bootable export's kernel and initramfs (section 3.13): the host's own
+ * kernel, as a vm boots, its path into `kernel`, and `dir`/initrd, the
+ * agent and the modules that mount a block root, with `boot` as its
+ * /hull/boot, which makes the agent boot the tree's init rather than wait
+ * for a host. NULL, or why in `detail`. */
+const char *hull_qemu_boot_files(const char *dir, const char *boot, char *kernel, size_t cap,
+                                 char *detail, size_t detail_cap)
+{
+	static hull_machine m;
+	struct utsname      name;
+	const char         *reason;
+
+	if (uname(&name) != 0 || strcmp(name.machine, "x86_64") != 0) {
+		snprintf(detail, detail_cap, "a bootable image is made on an x86_64 host, of its kernel");
+		return detail;
+	}
+	snprintf(kernel, cap, "/boot/vmlinuz-%s", name.release);
+	if (access(kernel, R_OK) != 0) {
+		snprintf(detail, detail_cap, "the host's kernel, %s, cannot be read", kernel);
+		return detail;
+	}
+	memset(&m, 0, sizeof m);
+	snprintf(m.dir, sizeof m.dir, "%s", dir);
+	m.block_root = 1;
+	m.boot       = boot;
+	if ((reason = write_initramfs(&m, name.release, 1)) != NULL) {
+		snprintf(detail, detail_cap, "%s", reason);
+		return detail;
+	}
+	return NULL;
+}
 
 const hull_engine *hull_engine_qemu(const hull_host_ops *host_ops)
 {

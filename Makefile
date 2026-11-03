@@ -104,7 +104,7 @@ ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/tree.o $(BUILD_DIR)/engine/hostnet.o \
               $(BUILD_DIR)/engine/hostdev.o $(BUILD_DIR)/engine/rootmode.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o $(BUILD_DIR)/cli/runtime.o $(BUILD_DIR)/cli/doctor.o \
-              $(BUILD_DIR)/cli/import.o
+              $(BUILD_DIR)/cli/import.o $(BUILD_DIR)/cli/export.o
 # Section 3's optional store, which only the commands that name it use.
 STORE_OBJS  = $(BUILD_DIR)/store/store.o $(BUILD_DIR)/store/unpack.o $(BUILD_DIR)/store/pack.o
 # Section 3.5's border: what `hull pull` reads a registry with.
@@ -236,7 +236,9 @@ QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf vbuilt.conf die.
                   qssh.conf qssh.out qnossh.conf qimg.conf qimg.out \
                   sshroot/probe sshroot/usr/sbin/sshd nosshroot/probe \
                   home/.ssh/id_ed25519.pub \
-                  qticks.out vgateway.conf gwlisten.out vgateway6.conf)
+                  qticks.out vgateway.conf gwlisten.out vgateway6.conf \
+                  bootroot/probe bootroot/sbin/booted bootroot/etc/owned boot.img boot2.img \
+                  boot.serial bootowned.view cache/hull/limine-11.4.1/BOOTX64.EFI)
 
 # What test/flip_test.sh writes: the project, and its rsync'd copy.
 FLIP_PROJECT    = hull.conf rootfs/probe rootfs/etc/flip

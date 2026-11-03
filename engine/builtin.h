@@ -27,6 +27,12 @@ const hull_engine *hull_engine_chroot(const hull_host_ops *host);
 const hull_engine *hull_engine_dosbox(const hull_host_ops *host);
 const hull_engine *hull_engine_dosemu(const hull_host_ops *host);
 
+/* A bootable export's kernel, the host's, its path into `kernel`, and
+ * `dir`/initrd, whose /hull/boot is `boot` (engine/qemu.c). NULL, or why
+ * in `detail`. */
+const char *hull_qemu_boot_files(const char *dir, const char *boot, char *kernel, size_t cap,
+                                 char *detail, size_t detail_cap);
+
 #ifdef __cplusplus
 }
 #endif

@@ -129,6 +129,7 @@
 #include <sys/prctl.h>
 #include <sys/reboot.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/sysmacros.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
@@ -1135,6 +1136,29 @@ int main(int argc, char **argv)
 				(void)!write(peer, "SSH-2.0-hull-stub\r\n", 19u);
 				close(peer);
 			}
+		}
+		/* A bootable export's init, for its test: what it booted into,
+		 * on the console, whether / can be written, then off. */
+		if (strcmp(base, "booted") == 0) {
+			struct stat  owned;
+			struct statfs root;
+			int          fd = open("/booted", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+			printf("booted pid=%d", (int)getpid());
+			if (statfs("/", &root) == 0)
+				printf(" root=%s", root.f_type == 0xef53 ? "ext4" : "other");
+			printf(" writable=%s", fd >= 0 ? "yes" : "no");
+			if (lstat("/etc/owned", &owned) == 0)
+				printf(" owned=%u:%u", (unsigned)owned.st_uid, (unsigned)owned.st_gid);
+			if (lstat("/probe", &owned) == 0)
+				printf(" probe=%u:%u", (unsigned)owned.st_uid, (unsigned)owned.st_gid);
+			printf("\n");
+			fflush(stdout);
+			if (fd >= 0)
+				close(fd);
+			sync();
+			reboot(RB_POWER_OFF);
+			return 1;
 		}
 		if (getpid() == 1 && argc == 1) {
 			for (;;)
