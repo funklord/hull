@@ -139,6 +139,7 @@ static void usage(FILE *out)
 	      "       hull materialize REF DIR | hull images\n"
 	      "       hull diff REF REF | hull tag REF NEW | hull tag -d REF\n"
 	      "       hull manifest show REF | hull manifest compile [REF]\n"
+	      "       hull manifest composefs REF FILE\n"
 	      "       hull pull [--arch A] IMAGE [REF] | hull push REF IMAGE\n"
 	      "       hull import DOCKERFILE|COMPOSE-FILE\n"
 	      "       hull up [-f COMPOSE-FILE] [--backend B] [NAME]\n"
@@ -4609,6 +4610,38 @@ static int show_manifest(const char *name)
 	return 0;
 }
 
+/* `hull manifest composefs REF FILE`: the tree REF names as a composefs
+ * EROFS image in FILE (section 3.2), made new, for an overlay over the
+ * store's objects to serve. */
+static int composefs_manifest(const char *name, const char *file)
+{
+	hull_store store;
+	char       why[4400] = "";
+	int        status;
+	int        fd;
+
+	if ((status = open_store(&store, 0)) != 0) {
+		if (status == 1)
+			fprintf(stderr, "hull: manifest: there is no store, so no %s\n", name);
+		return 1;
+	}
+	if ((fd = open(file, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0) {
+		fprintf(stderr, "hull: manifest: %s: %s\n", file, strerror(errno));
+		hull_store_close(&store);
+		return 1;
+	}
+	status = hull_store_composefs(&store, name, fd, why, sizeof why);
+	hull_store_close(&store);
+	if (close(fd) != 0 && status == 0)
+		snprintf(why, sizeof why, "%s: %s", file, strerror(errno)), status = -1;
+	if (status != 0) {
+		unlink(file);
+		fprintf(stderr, "hull: manifest: %s\n", why);
+		return 1;
+	}
+	return 0;
+}
+
 /* `hull manifest compile [REF]`: a readable manifest view on stdin, made
  * canonical and stored (its sha256 printed), tagged REF where one is given.
  * The view's way back: `hull manifest show X | edit | hull manifest compile
@@ -6043,6 +6076,8 @@ int main(int argc, char **argv)
 		return pull(argv[2], argc == 4 ? argv[3] : argv[2], NULL);
 	if (strcmp(command, "manifest") == 0 && argc == 4 && strcmp(argv[2], "show") == 0)
 		return show_manifest(argv[3]);
+	if (strcmp(command, "manifest") == 0 && argc == 5 && strcmp(argv[2], "composefs") == 0)
+		return composefs_manifest(argv[3], argv[4]);
 	if (strcmp(command, "manifest") == 0 && (argc == 3 || argc == 4) &&
 	    strcmp(argv[2], "compile") == 0)
 		return compile_manifest(argc == 4 ? argv[3] : NULL);

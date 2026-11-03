@@ -2187,6 +2187,500 @@ static unsigned long long id_of(const hull_sexpr_doc *doc, const hull_sexpr_form
 	return field(doc, owner, key, &value) ? number(doc, &value) : 0u;
 }
 
+/* --- composefs: a manifest as an EROFS image (section 3.2) --------------- */
+
+/*
+ * The tree a manifest names as an EROFS image in the composefs form: its
+ * directories, symlinks, devices and fifos whole, and each regular file
+ * as its size, mode and owner with no data of its own -- a chunk-based
+ * inode whose one chunk is a hole -- and overlayfs's metacopy and a
+ * redirect to its object, `/ab/abcdef...` beneath objects/sha256. An
+ * overlay with that directory as a data-only lower layer, `lowerdir=
+ * IMAGE::OBJECTS` with metacopy=on and redirect_dir=on, then serves each
+ * file's bytes from the store, every machine of the same image sharing
+ * one copy. Written here because no composefs tool is packaged for the
+ * hosts hull targets; the layout is the kernel's (fs/erofs/erofs_fs.h).
+ * Every inode extended, 64 bytes, its xattrs inline after it; each kept
+ * within one block; directories and symlink targets in plain blocks
+ * after the inodes. Timestamps are 0, as a manifest has none.
+ */
+#define EROFS_BLOCK          4096u
+#define EROFS_MAGIC          0xE0F5E1E2u
+#define EROFS_CHUNKED_FILE   0x00000004u   /* feature_incompat */
+#define EROFS_FLAT_PLAIN     0u
+#define EROFS_CHUNK_BASED    4u
+#define EROFS_NULL_ADDR      0xFFFFFFFFu
+#define EROFS_XATTR_USER     1u
+#define EROFS_XATTR_TRUSTED  4u
+#define EROFS_XATTR_SECURITY 6u
+
+typedef struct erofs_xattr {
+	uint8_t        index;
+	const uint8_t *name;     /* after its prefix */
+	size_t         name_len;
+	const uint8_t *value;
+	size_t         value_len;
+} erofs_xattr;
+
+typedef struct erofs_node {
+	const uint8_t *path;     /* in the manifest */
+	size_t         path_len;
+	const uint8_t *leaf;
+	size_t         leaf_len;
+	uint32_t       mode;     /* type and permission bits */
+	uint32_t       uid;
+	uint32_t       gid;
+	uint64_t       size;
+	uint32_t       rdev;
+	char           redirect[72];   /* "/ab/<hex>" for a regular file with bytes */
+	const uint8_t *target;
+	size_t         target_len;
+	erofs_xattr    xattrs[16];
+	unsigned       xattr_count;
+	size_t         parent;
+	size_t         children;  /* its subdirectories, for nlink */
+	uint64_t       record;    /* offset of its inode */
+	uint32_t       nid;
+	uint32_t       record_size;
+	uint32_t       xattr_size;
+	uint32_t       block;     /* its data's first block, directories and symlinks */
+	uint64_t       data_size;
+} erofs_node;
+
+static void le16(uint8_t *at, uint32_t v) { at[0] = (uint8_t)v; at[1] = (uint8_t)(v >> 8); }
+static void le32(uint8_t *at, uint32_t v) { le16(at, v); le16(at + 2, v >> 16); }
+static void le64(uint8_t *at, uint64_t v) { le32(at, (uint32_t)v); le32(at + 4, (uint32_t)(v >> 32)); }
+
+static int erofs_path_order(const void *a, const void *b)
+{
+	const erofs_node *x = a;
+	const erofs_node *y = b;
+	size_t            n = x->path_len < y->path_len ? x->path_len : y->path_len;
+	int               c = memcmp(x->path, y->path, n);
+
+	return c != 0 ? c : (x->path_len > y->path_len) - (x->path_len < y->path_len);
+}
+
+/* A directory's entry, for its sorted listing. */
+typedef struct erofs_dirent {
+	const uint8_t *name;
+	size_t         name_len;
+	size_t         node;
+} erofs_dirent;
+
+static int erofs_name_order(const void *a, const void *b)
+{
+	const erofs_dirent *x = a;
+	const erofs_dirent *y = b;
+	size_t              n = x->name_len < y->name_len ? x->name_len : y->name_len;
+	int                 c = memcmp(x->name, y->name, n);
+
+	return c != 0 ? c : (x->name_len > y->name_len) - (x->name_len < y->name_len);
+}
+
+static uint8_t erofs_file_type(uint32_t mode)
+{
+	switch (mode & S_IFMT) {
+	case S_IFREG: return 1u;
+	case S_IFDIR: return 2u;
+	case S_IFCHR: return 3u;
+	case S_IFBLK: return 4u;
+	case S_IFIFO: return 5u;
+	case S_IFSOCK: return 6u;
+	case S_IFLNK: return 7u;
+	default: return 0u;
+	}
+}
+
+/* A directory's listing, ".", ".." and its children, sorted. NULL where
+ * memory runs out. */
+static erofs_dirent *erofs_listing(const erofs_node *nodes, size_t count, size_t dir, size_t *n)
+{
+	erofs_dirent *list = malloc((count + 2u) * sizeof *list);
+	size_t        k = 0u;
+
+	if (list == NULL)
+		return NULL;
+	list[k++] = (erofs_dirent){ (const uint8_t *)".", 1u, dir };
+	list[k++] = (erofs_dirent){ (const uint8_t *)"..", 2u, nodes[dir].parent };
+	for (size_t i = 1u; i < count; i++)
+		if (nodes[i].parent == dir)
+			list[k++] = (erofs_dirent){ nodes[i].leaf, nodes[i].leaf_len, i };
+	qsort(list, k, sizeof *list, erofs_name_order);
+	*n = k;
+	return list;
+}
+
+/* A directory's data size: its entries packed into blocks, a block
+ * started where the next would not fit. */
+static uint64_t erofs_dir_size(const erofs_dirent *list, size_t n)
+{
+	uint64_t whole = 0u;
+	size_t   used = 0u;
+
+	for (size_t i = 0u; i < n; i++) {
+		size_t cost = 12u + list[i].name_len;
+
+		if (used + cost > EROFS_BLOCK) {
+			whole += EROFS_BLOCK;
+			used = 0u;
+		}
+		used += cost;
+	}
+	return whole + used;
+}
+
+int hull_store_composefs(hull_store *store, const char *name, int out, char *why, size_t cap)
+{
+	char            hex[65];
+	uint8_t        *data = NULL;
+	size_t          length;
+	hull_sexpr_doc  doc;
+	hull_sexpr_form entries;
+	hull_sexpr_form entry;
+	erofs_node     *nodes = NULL;
+	size_t          count = 1u;     /* the root, which no entry names */
+	size_t          room = 0u;
+	uint8_t        *image = NULL;
+	uint64_t        at;
+	uint32_t        meta_blocks;
+	uint32_t        next_block;
+	int             more;
+	int             result = -1;
+
+	flock(store->lock, LOCK_SH);
+	if (name_manifest(store, name, hex, why, cap) != 0 ||
+	    (data = read_manifest(store, hex, &length, why, cap)) == NULL)
+		goto done;
+	if (!open_entries(&doc, data, length, &entries)) {
+		say(why, cap, name, "its manifest is not one");
+		goto done;
+	}
+	/* The nodes: the root first, then every entry. */
+	more = hull_sexpr_child(&doc, &entries, &entry);
+	for (more = more && hull_sexpr_next(&doc, &entry, &entry); more;
+	     more = hull_sexpr_next(&doc, &entry, &entry))
+		room++;
+	if ((nodes = calloc(room + 1u, sizeof *nodes)) == NULL) {
+		say(why, cap, name, "out of memory");
+		goto done;
+	}
+	nodes[0].mode = S_IFDIR | 0755u;
+	nodes[0].path = (const uint8_t *)"";
+	more = hull_sexpr_child(&doc, &entries, &entry);
+	for (more = more && hull_sexpr_next(&doc, &entry, &entry); more;
+	     more = hull_sexpr_next(&doc, &entry, &entry)) {
+		erofs_node     *n = &nodes[count];
+		hull_sexpr_form value;
+		hull_sexpr_form owner;
+		hull_sexpr_form xattrs;
+		char            kind[16] = "";
+		uint32_t        perm;
+
+		memset(n, 0, sizeof *n);   /* a kind not written leaves its node to the next */
+
+		if (!field(&doc, &entry, "path", &value) || value.content_length == 0u ||
+		    memchr(doc.data + value.content, '\0', value.content_length) != NULL) {
+			say(why, cap, name, "an entry has no path");
+			goto done;
+		}
+		n->path = doc.data + value.content;
+		n->path_len = value.content_length;
+		if (field(&doc, &entry, "kind", &value) && value.content_length < sizeof kind)
+			memcpy(kind, doc.data + value.content, value.content_length);
+		perm = field(&doc, &entry, "mode", &value) ? (uint32_t)(number(&doc, &value) & 07777u) : 0644u;
+		if (find(&doc, &entry, "owner", &owner)) {
+			hull_sexpr_form who;
+
+			if (hull_sexpr_child(&doc, &owner, &who) && hull_sexpr_next(&doc, &who, &who) &&
+			    who.kind == HULL_SEXPR_LIST) {
+				n->uid = (uint32_t)id_of(&doc, &owner, "uid");
+				n->gid = (uint32_t)id_of(&doc, &owner, "gid");
+			}
+		}
+		if (strcmp(kind, "dir") == 0) {
+			n->mode = S_IFDIR | perm;
+		} else if (strcmp(kind, "reg") == 0) {
+			n->mode = S_IFREG | perm;
+			n->size = field(&doc, &entry, "size", &value) ? number(&doc, &value) : 0u;
+			if (n->size > 0u) {
+				char object[65];
+
+				if (!field(&doc, &entry, "object", &value) || value.content_length != 32u) {
+					say(why, cap, name, "a regular file has no object");
+					goto done;
+				}
+				hex_of(doc.data + value.content, object);
+				snprintf(n->redirect, sizeof n->redirect, "/%.2s/%s", object, object);
+			}
+		} else if (strcmp(kind, "symlink") == 0) {
+			n->mode = S_IFLNK | 0777u;
+			if (field(&doc, &entry, "target", &value)) {
+				n->target = doc.data + value.content;
+				n->target_len = value.content_length;
+			}
+		} else if (strcmp(kind, "fifo") == 0) {
+			n->mode = S_IFIFO | perm;
+		} else if (strcmp(kind, "dev") == 0) {
+			hull_sexpr_form dev;
+			unsigned        major_ = 0u;
+			unsigned        minor_ = 0u;
+			int             block_ = 0;
+
+			if (find(&doc, &entry, "dev", &dev)) {
+				major_ = (unsigned)id_of(&doc, &dev, "major");
+				minor_ = (unsigned)id_of(&doc, &dev, "minor");
+				block_ = field(&doc, &dev, "type", &value) && hull_sexpr_is(&doc, &value, "b");
+			}
+			n->mode = (block_ ? S_IFBLK : S_IFCHR) | perm;
+			/* The kernel's new_encode_dev(). */
+			n->rdev = (minor_ & 0xffu) | (major_ << 8) | ((minor_ & ~0xffu) << 12);
+		} else {
+			continue;  /* a kind this version does not write */
+		}
+		/* Its xattrs, user.* and security.*, as the manifest keeps them. */
+		if (find(&doc, &entry, "xattrs", &xattrs)) {
+			hull_sexpr_form pair;
+			int             more_x = hull_sexpr_child(&doc, &xattrs, &pair);
+
+			for (more_x = more_x && hull_sexpr_next(&doc, &pair, &pair); more_x && n->xattr_count < 14u;
+			     more_x = hull_sexpr_next(&doc, &pair, &pair)) {
+				hull_sexpr_form key;
+				hull_sexpr_form val;
+				erofs_xattr    *x = &n->xattrs[n->xattr_count];
+				const uint8_t  *k;
+
+				if (!hull_sexpr_child(&doc, &pair, &key) || !hull_sexpr_next(&doc, &key, &val))
+					continue;
+				k = doc.data + key.content;
+				if (key.content_length > 5u && memcmp(k, "user.", 5u) == 0)
+					*x = (erofs_xattr){ EROFS_XATTR_USER, k + 5, key.content_length - 5u,
+					                    doc.data + val.content, val.content_length };
+				else if (key.content_length > 9u && memcmp(k, "security.", 9u) == 0)
+					*x = (erofs_xattr){ EROFS_XATTR_SECURITY, k + 9, key.content_length - 9u,
+					                    doc.data + val.content, val.content_length };
+				else
+					continue;
+				if (x->name_len > 255u || x->value_len > 65535u)
+					continue;
+				n->xattr_count++;
+			}
+		}
+		if (n->redirect[0] != '\0') {
+			n->xattrs[n->xattr_count++] = (erofs_xattr){ EROFS_XATTR_TRUSTED,
+				(const uint8_t *)"overlay.metacopy", 16u, (const uint8_t *)"", 0u };
+			n->xattrs[n->xattr_count++] = (erofs_xattr){ EROFS_XATTR_TRUSTED,
+				(const uint8_t *)"overlay.redirect", 16u, (const uint8_t *)n->redirect,
+				strlen(n->redirect) };
+		}
+		count++;
+	}
+	/* Each node's parent, by its path's directory, which sorts before it
+	 * in the manifest's bytewise order. */
+	qsort(nodes + 1, count - 1u, sizeof *nodes, erofs_path_order);
+	for (size_t i = 1u; i < count; i++) {
+		erofs_node    *n = &nodes[i];
+		const uint8_t *slash = NULL;
+
+		for (size_t k = n->path_len; k > 0u && slash == NULL; k--)
+			if (n->path[k - 1u] == '/')
+				slash = n->path + k - 1u;
+		n->leaf = slash != NULL ? slash + 1 : n->path;
+		n->leaf_len = n->path_len - (size_t)(n->leaf - n->path);
+		if (slash == NULL) {
+			n->parent = 0u;
+		} else {
+			erofs_node  key = { 0 };
+			erofs_node *found;
+
+			key.path = n->path;
+			key.path_len = (size_t)(slash - n->path);
+			found = bsearch(&key, nodes + 1, count - 1u, sizeof *nodes, erofs_path_order);
+			if (found == NULL || (found->mode & S_IFMT) != S_IFDIR) {
+				say(why, cap, name, "an entry's directory is not in the manifest");
+				goto done;
+			}
+			n->parent = (size_t)(found - nodes);
+		}
+		if ((n->mode & S_IFMT) == S_IFDIR)
+			nodes[n->parent].children++;
+	}
+	/* The inodes' places: from block 1, each record its inode, xattrs and
+	 * a regular file's one chunk address, in 32-byte units, never across a
+	 * block. */
+	at = EROFS_BLOCK;
+	for (size_t i = 0u; i < count; i++) {
+		erofs_node *n = &nodes[i];
+		uint32_t    size = 64u;
+
+		if (n->xattr_count > 0u) {
+			n->xattr_size = 12u;
+			for (unsigned x = 0u; x < n->xattr_count; x++)
+				n->xattr_size += (uint32_t)((4u + n->xattrs[x].name_len + n->xattrs[x].value_len + 3u) & ~3u);
+		}
+		size += n->xattr_size;
+		if (n->redirect[0] != '\0')
+			size += 4u;
+		size = (size + 31u) & ~31u;
+		if (size > EROFS_BLOCK) {
+			say(why, cap, name, "an entry's xattrs do not fit a block");
+			goto done;
+		}
+		if (at % EROFS_BLOCK + size > EROFS_BLOCK)
+			at = (at / EROFS_BLOCK + 1u) * EROFS_BLOCK;
+		n->record = at;
+		n->record_size = size;
+		n->nid = (uint32_t)((at - EROFS_BLOCK) / 32u);
+		at += size;
+	}
+	if (nodes[0].nid != 0u || (at - EROFS_BLOCK) / 32u > UINT32_MAX) {
+		say(why, cap, name, "the tree has too many entries for one image");
+		goto done;
+	}
+	meta_blocks = (uint32_t)((at + EROFS_BLOCK - 1u) / EROFS_BLOCK);
+	/* The data blocks: each directory's listing, each symlink's target. */
+	next_block = meta_blocks;
+	for (size_t i = 0u; i < count; i++) {
+		erofs_node *n = &nodes[i];
+
+		if ((n->mode & S_IFMT) == S_IFDIR) {
+			size_t        k;
+			erofs_dirent *list = erofs_listing(nodes, count, i, &k);
+
+			if (list == NULL) {
+				say(why, cap, name, "out of memory");
+				goto done;
+			}
+			n->data_size = erofs_dir_size(list, k);
+			free(list);
+		} else if ((n->mode & S_IFMT) == S_IFLNK) {
+			n->data_size = n->target_len;
+		} else {
+			continue;
+		}
+		n->block = next_block;
+		next_block += (uint32_t)((n->data_size + EROFS_BLOCK - 1u) / EROFS_BLOCK);
+	}
+	if ((image = calloc(next_block, EROFS_BLOCK)) == NULL) {
+		say(why, cap, name, "out of memory");
+		goto done;
+	}
+	/* The superblock, at 1024. */
+	{
+		uint8_t *sb = image + 1024;
+
+		le32(sb + 0, EROFS_MAGIC);
+		sb[12] = 12u;                         /* blkszbits */
+		le16(sb + 14, nodes[0].nid);          /* root_nid */
+		le64(sb + 16, count);                 /* inos */
+		le32(sb + 36, next_block);            /* blocks */
+		le32(sb + 40, 1u);                    /* meta_blkaddr */
+		le32(sb + 80, EROFS_CHUNKED_FILE);    /* feature_incompat */
+		memcpy(sb + 64, "hull", 4u);          /* volume_name */
+	}
+	for (size_t i = 0u; i < count; i++) {
+		erofs_node *n = &nodes[i];
+		uint8_t    *r = image + n->record;
+		uint32_t    layout = EROFS_FLAT_PLAIN;
+		uint32_t    nlink = (n->mode & S_IFMT) == S_IFDIR ? 2u + (uint32_t)n->children : 1u;
+
+		if (n->redirect[0] != '\0')
+			layout = EROFS_CHUNK_BASED;
+		le16(r + 0, 1u | (layout << 1));     /* extended */
+		le16(r + 2, n->xattr_size > 0u ? 1u + (n->xattr_size - 12u) / 4u : 0u);
+		le16(r + 4, n->mode);
+		le64(r + 8, (n->mode & S_IFMT) == S_IFREG ? n->size : n->data_size);
+		if (layout == EROFS_CHUNK_BASED) {
+			unsigned bits = 0u;
+
+			while (bits < 31u && ((uint64_t)EROFS_BLOCK << bits) < n->size)
+				bits++;
+			le16(r + 16, bits);                /* one chunk covers the file */
+		} else if ((n->mode & S_IFMT) == S_IFCHR || (n->mode & S_IFMT) == S_IFBLK) {
+			le32(r + 16, n->rdev);
+		} else if (n->data_size > 0u) {
+			le32(r + 16, n->block);
+		}
+		le32(r + 20, n->nid);                  /* i_ino */
+		le32(r + 24, n->uid);
+		le32(r + 28, n->gid);
+		le32(r + 44, nlink);
+		if (n->xattr_size > 0u) {
+			uint8_t *x = r + 64 + 12;          /* after the 12-byte header */
+
+			for (unsigned k = 0u; k < n->xattr_count; k++) {
+				const erofs_xattr *e = &n->xattrs[k];
+
+				x[0] = (uint8_t)e->name_len;
+				x[1] = e->index;
+				le16(x + 2, (uint32_t)e->value_len);
+				memcpy(x + 4, e->name, e->name_len);
+				memcpy(x + 4 + e->name_len, e->value, e->value_len);
+				x += (4u + e->name_len + e->value_len + 3u) & ~3u;
+			}
+		}
+		if (layout == EROFS_CHUNK_BASED)
+			le32(r + 64 + n->xattr_size, EROFS_NULL_ADDR);   /* its one chunk, a hole */
+		if ((n->mode & S_IFMT) == S_IFLNK && n->target_len > 0u)
+			memcpy(image + (uint64_t)n->block * EROFS_BLOCK, n->target, n->target_len);
+		if ((n->mode & S_IFMT) == S_IFDIR) {
+			size_t        k;
+			erofs_dirent *list = erofs_listing(nodes, count, i, &k);
+			uint8_t      *block = image + (uint64_t)n->block * EROFS_BLOCK;
+			size_t        first = 0u;
+
+			if (list == NULL) {
+				say(why, cap, name, "out of memory");
+				goto done;
+			}
+			/* Block by block: the dirents, then the names after them. */
+			while (first < k) {
+				size_t last = first;
+				size_t used = 0u;
+				size_t name_at;
+
+				while (last < k && used + 12u + list[last].name_len <= EROFS_BLOCK)
+					used += 12u + list[last++].name_len;
+				name_at = (last - first) * 12u;
+				for (size_t d = first; d < last; d++) {
+					uint8_t *de = block + (d - first) * 12u;
+
+					le64(de, nodes[list[d].node].nid);
+					le16(de + 8, (uint32_t)name_at);
+					de[10] = erofs_file_type(nodes[list[d].node].mode);
+					memcpy(block + name_at, list[d].name, list[d].name_len);
+					name_at += list[d].name_len;
+				}
+				first = last;
+				block += EROFS_BLOCK;
+			}
+			free(list);
+		}
+	}
+	{
+		size_t total = (size_t)next_block * EROFS_BLOCK;
+
+		for (size_t done_ = 0u; done_ < total;) {
+			ssize_t wrote = write(out, image + done_, total - done_);
+
+			if (wrote < 0 && errno == EINTR)
+				continue;
+			if (wrote <= 0) {
+				say(why, cap, "the image", strerror(errno));
+				goto done;
+			}
+			done_ += (size_t)wrote;
+		}
+	}
+	result = 0;
+done:
+	flock(store->lock, LOCK_UN);
+	free(image);
+	free(nodes);
+	free(data);
+	return result;
+}
+
 int hull_store_layer(hull_store *store, const char *name,
                      int (*sink)(void *context, const uint8_t *data, size_t n), void *context,
                      char arch[64], char *why, size_t cap)

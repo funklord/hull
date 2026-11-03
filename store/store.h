@@ -214,6 +214,12 @@ int hull_unpack_end(hull_unpack *u, char *why, size_t cap);
  * its name as it goes. The manifest's arch into `arch`. 0, or -1 with
  * `why`, an owner of class `user`, which has no number in an image, among
  * the refusals. */
+/* The tree `name` names, a ref or sha256:HEX, as a composefs EROFS image
+ * to `out` (section 3.2): its regular files a size, an owner and a
+ * redirect to their objects, served by an overlay whose data-only lower
+ * layer is the store's objects/sha256. 0, or -1 with `why`. */
+int hull_store_composefs(hull_store *store, const char *name, int out, char *why, size_t cap);
+
 int hull_store_layer(hull_store *store, const char *name,
                      int (*sink)(void *context, const uint8_t *data, size_t n), void *context,
                      char arch[64], char *why, size_t cap);

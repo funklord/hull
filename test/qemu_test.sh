@@ -1702,6 +1702,82 @@ else
 	rm -f "$root/home/.ssh/dbkey" "$root/home/.ssh/dbkey.pub"
 	rm -rf "$dbrt"
 fi
+# A stored tree as a composefs image (section 3.2): `hull manifest
+# composefs` writes the EROFS image, and in a vm, whose root may mount
+# what a user cannot, the image mounted and an overlay laid over it with
+# the store's objects as its data-only lower layer gives back the tree:
+# every file's bytes, mode, type and size the same as the directory it
+# was committed from, its symlink followed, its fifo a fifo, and a
+# program run from it. The root is busybox and the C library it links,
+# and the modules erofs and a loop device need, uncompressed for
+# busybox's insmod, from the host's, which the guest runs.
+busybox=$(command -v busybox 2>/dev/null)
+modules=/lib/modules/$(uname -r)/kernel
+if [ -z "$busybox" ] || [ ! -r "$modules/fs/erofs/erofs.ko.xz" ] || ! command -v xz > /dev/null; then
+	printf 'qemu: composefs not tried: no busybox, xz or erofs module here\n'
+else
+	rm -rf "$root/cfs"
+	mkdir -p "$root/cfs/tree/etc" "$root/cfs/tree/a/deep" "$root/cfs/tree/bin" "$root/cfs/image" \
+		"$root/cfs/store"
+	printf 'hello composefs\n' > "$root/cfs/tree/etc/greeting"
+	head -c 100000 /dev/urandom > "$root/cfs/tree/a/big.bin"
+	: > "$root/cfs/tree/a/empty"
+	ln -s ../etc/greeting "$root/cfs/tree/a/link"
+	mkfifo "$root/cfs/tree/a/fifo"
+	chmod 600 "$root/cfs/tree/etc/greeting"
+	for i in $(seq 1 300); do printf '%s' "$i" > "$root/cfs/tree/a/deep/a-longish-name-$i"; done
+	cp "$busybox" "$root/cfs/tree/bin/busybox"
+	r=$root/cfs/root
+	mkdir -p "$r/bin" "$r/proc" "$r/dev" "$r/sys" "$r/m" "$r/t" "$r/cfs" "$r/objects" "$r/mods"
+	cp "$busybox" "$r/bin/busybox"
+	for a in sh mount insmod find sha256sum sort stat cat; do ln -s busybox "$r/bin/$a"; done
+	for lib in $(ldd "$busybox" | sed -n 's/.*=> \(\/[^ ]*\) .*/\1/p; s/^[[:space:]]*\(\/[^ ]*\) .*/\1/p'); do
+		mkdir -p "$r$(dirname "$lib")"
+		cp -L "$lib" "$r$lib"
+	done
+	for m in crypto/crc32c_generic lib/libcrc32c fs/erofs/erofs drivers/block/loop; do
+		xz -dc "$modules/$m.ko.xz" > "$r/mods/$(basename "$m").ko"
+	done
+	cat > "$r/check.sh" <<'CHECK'
+for m in crc32c_generic libcrc32c erofs loop; do insmod /mods/$m.ko || echo "insmod $m failed"; done
+mount -t erofs -o ro /cfs/tree.erofs /m || exit 3
+mount -t overlay overlay -o ro,lowerdir=/m::/objects,metacopy=on,redirect_dir=on /t || exit 4
+cd /t
+find . -type f -exec sha256sum {} + | sort
+find . ! -type d -exec stat -c '%n %a %f %s' {} + | sort
+find . -mindepth 1 -type d -exec stat -c '%n %a' {} + | sort
+echo "link=$(cat /t/a/link)"
+/t/bin/busybox echo ran from the overlay
+CHECK
+	cases=$((cases + 1))
+	made=$(XDG_DATA_HOME="$root/cfs/store" timeout 60 "$hull" commit "$root/cfs/tree" cfs/tree:1 2>&1 &&
+		XDG_DATA_HOME="$root/cfs/store" timeout 60 "$hull" manifest composefs cfs/tree:1 \
+			"$root/cfs/image/tree.erofs" 2>&1)
+	[ -s "$root/cfs/image/tree.erofs" ] || fail "hull manifest composefs made no image" "$made"
+	# Sorted bytewise, as busybox sorts in the machine.
+	want=$(cd "$root/cfs/tree" && export LC_ALL=C && { find . -type f -exec sha256sum {} + | sort
+		find . ! -type d -exec stat -c '%n %a %f %s' {} + | sort
+		find . -mindepth 1 -type d -exec stat -c '%n %a' {} + | sort; })
+	printf '(machine (source "dir:./cfs/root") (backend vm) (mutable overlay) %s %s %s)\n' \
+		'(volumes (volume (host "./cfs/image") (guest "/cfs") (mode ro))' \
+		'(volume (host "./cfs/store/hull/store/objects/sha256") (guest "/objects") (mode ro)))' \
+		'(command "/bin/sh" "/check.sh")' > "$root/cfs.conf"
+	out=$(cd / && timeout 90 "$hull" run -f "$root/cfs.conf" 2>&1 | grep -v ': machine on ')
+	got=$(printf '%s\n' "$out" | grep -v '^link=\|^ran from\|insmod')
+	# A directory's size is its filesystem's own, so directories are held
+	# by their paths and modes alone.
+	cases=$((cases + 1))
+	printf '%s\n' "$want" > "$root/cfs/want"
+	printf '%s\n' "$got" > "$root/cfs/got"
+	cmp -s "$root/cfs/want" "$root/cfs/got" ||
+		fail "the composefs mount did not give back the tree" \
+			"$(diff "$root/cfs/want" "$root/cfs/got" 2>&1 | head -20)"
+	cases=$((cases + 1))
+	printf '%s\n' "$out" | grep -q '^link=hello composefs$' &&
+		printf '%s\n' "$out" | grep -q '^ran from the overlay$' ||
+		fail "a symlink or a program through the composefs mount" "$out"
+fi
+
 # A udp port: each client its own flow, each datagram whole, an empty one
 # too, and the machine's replies to the client that sent. A datagram the
 # machine is not yet listening for is dropped, as udp's are, and the
