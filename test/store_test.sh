@@ -604,6 +604,34 @@ rm -f "$root/one.hull" "$root/again.hull" "$root/bad.hull" "$root/cut.hull" "$ro
 chmod -R u+w "$root/unpacked" "$root/direct" 2>/dev/null
 rm -rf "${root:?}/unpacked" "${root:?}/direct"
 
+# The composefs image (section 3.2), read apart from hull and from the
+# kernel by erofs-utils where it is installed: fsck finds nothing wrong,
+# and dump.erofs reads each kind of entry as it was committed -- a regular
+# file its size, owner and mode with no data of its own, chunked, and the
+# redirect to its object; a symlink its target; a directory its entries.
+if command -v fsck.erofs > /dev/null && command -v dump.erofs > /dev/null; then
+	rm -rf "$root/cfs"
+	mkdir -p "$root/cfs/a/deep"
+	printf 'hello\n' > "$root/cfs/a/hello"
+	head -c 50000 /dev/zero | tr '\0' x > "$root/cfs/a/big"
+	chmod 640 "$root/cfs/a/big"
+	ln -s hello "$root/cfs/a/link"
+	for i in $(seq 1 400); do printf '%s' "$i" > "$root/cfs/a/deep/n-$i"; done
+	"$hull" commit "$root/cfs" cfs/t:1 > /dev/null 2>&1
+	expect 0 '' "$hull" manifest composefs cfs/t:1 "$root/cfs.erofs"
+	expect 0 '' fsck.erofs "$root/cfs.erofs"
+	expect 0 '^Size: 50000 ' dump.erofs --path=/a/big "$root/cfs.erofs"
+	expect 0 'Access: 0640' dump.erofs --path=/a/big "$root/cfs.erofs"
+	expect 0 'Layout: 4 ' dump.erofs --path=/a/big "$root/cfs.erofs"
+	expect 0 'Uid: 0 +Gid: 0' dump.erofs --path=/a/big "$root/cfs.erofs"
+	expect 0 '^Size: 5 ' dump.erofs --path=/a/link "$root/cfs.erofs"
+	expect 0 'n-400' dump.erofs --path=/a/deep --ls "$root/cfs.erofs"
+	expect 1 'File exists' "$hull" manifest composefs cfs/t:1 "$root/cfs.erofs"
+	rm -rf "$root/cfs" "$root/cfs.erofs"
+else
+	printf 'store: the composefs image not read apart: no erofs-utils\n'
+fi
+
 # The test's core leaves once idle, before its directory goes.
 tries=0
 while [ -S "$XDG_RUNTIME_DIR/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
