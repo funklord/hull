@@ -2277,8 +2277,12 @@ static int listen_host(void)
 	address.svm_cid    = VMADDR_CID_ANY;
 	address.svm_port   = AGENT_PORT;
 	if (fd < 0 || bind(fd, (struct sockaddr *)&address, sizeof address) != 0 ||
-	    listen(fd, 1) != 0)
+	    listen(fd, 1) != 0) {
+		/* Not left open: keep calls this again while no host comes. */
+		if (fd >= 0)
+			close(fd);
 		return -1;
+	}
 	return fd;
 }
 

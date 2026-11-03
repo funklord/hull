@@ -391,6 +391,7 @@ static int build_esp(const char *work, const char *loader, const char *kernel, c
 	char                 setting[4400];
 	unsigned long long   bytes;
 	FILE                *file;
+	int                  written;
 	struct timespec      times[2] = { { FAT_TIME, 0 }, { FAT_TIME, 0 } };
 
 	if (tool("mkfs.vfat", mkfs, sizeof mkfs) == NULL) {
@@ -408,17 +409,25 @@ static int build_esp(const char *work, const char *loader, const char *kernel, c
 	path_of(rc, sizeof rc, work, "mtoolsrc");
 	/* The kernel's console is the screen and the first serial port, the
 	 * latter last, so it is /dev/console: what a headless qemu shows. */
-	if ((file = fopen(conf, "w")) == NULL ||
-	    fprintf(file, "timeout: 0\n\n/hull\n    protocol: linux\n    path: boot():/vmlinuz\n"
-	            "    module_path: boot():/initrd\n    cmdline: console=tty0 console=ttyS0\n") < 0 ||
-	    fclose(file) != 0) {
+	if ((file = fopen(conf, "w")) == NULL) {
+		snprintf(why, cap, "limine.conf could not be written");
+		return -1;
+	}
+	/* Closed whether the write went or not, so a failed one leaks nothing. */
+	written = fprintf(file, "timeout: 0\n\n/hull\n    protocol: linux\n    path: boot():/vmlinuz\n"
+	                  "    module_path: boot():/initrd\n    cmdline: console=tty0 console=ttyS0\n") >= 0;
+	if ((fclose(file) != 0) | !written) {
 		snprintf(why, cap, "limine.conf could not be written");
 		return -1;
 	}
 	/* mtools reads ~/.mtoolsrc where there is one: an empty one of its
 	 * own instead, and no check of a FAT it just made. */
-	if ((file = fopen(rc, "w")) == NULL || fputs("mtools_skip_check=1\n", file) < 0 ||
-	    fclose(file) != 0) {
+	if ((file = fopen(rc, "w")) == NULL) {
+		snprintf(why, cap, "the ESP's mtools configuration could not be written");
+		return -1;
+	}
+	written = fputs("mtools_skip_check=1\n", file) >= 0;
+	if ((fclose(file) != 0) | !written) {
 		snprintf(why, cap, "the ESP's mtools configuration could not be written");
 		return -1;
 	}
