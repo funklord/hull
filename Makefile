@@ -147,6 +147,17 @@ AGENT_BIN      = $(BUILD_DIR)/hull-agent
 # built from the objects' names, its generated C the same files.
 AGENT_SOURCES  = $(patsubst $(BUILD_DIR)/%.o,%.c,$(patsubst $(BUILD_DIR)/situ/situ.o,$(SITU_DIR)/runtime/c/situ.c,$(patsubst $(GEN_DIR)/%.o,$(GEN_DIR)/%.c,$(AGENT_BIN_OBJS) $(SEXPR_OBJS))))
 
+# hull's own kernel for a vm (Appendix F), beside hull as its agent is,
+# where `(kernel hull)` boots it: Linux at a pinned stable version, its
+# tarball checked against the sha256 kernel.org signs, tinyconfig with
+# kernel/x86_64.config merged, every driver a hull vm needs built in.
+# Built by `make kernel` alone, it being a long build and a download.
+KERNEL_VERSION = 6.12.107
+KERNEL_SHA256  = a5f8c5be3fde2d6d9ca14e9631642cf1f44487143f11059da730dcd5892e307a
+KERNEL_TAR     = $(BUILD_DIR)/kernel/linux-$(KERNEL_VERSION).tar.xz
+KERNEL_SRC     = $(BUILD_DIR)/kernel/linux-$(KERNEL_VERSION)
+KERNEL_BIN     = $(BUILD_DIR)/vmlinuz-hull
+
 # The hosts database for section 8.1's names, loaded by glibc into any
 # program that looks a name up: nothing of hull's but its own file.
 NSS_LIB    = $(BUILD_DIR)/libnss_hull.so.2
@@ -290,7 +301,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all nss root install-root check check-docker check-qemu check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all kernel nss root install-root check check-docker check-qemu check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -304,6 +315,7 @@ root: $(ROOT_BIN)
 help:
 	@echo 'Targets:'
 	@echo '  all       build the libraries, build/hull and its agent (the default)'
+	@echo '  kernel    build the vm kernel of hull'"'"'s own, vmlinuz-hull, from Linux $(KERNEL_VERSION)'
 	@echo '  nss       build the NSS module, libnss_hull.so.2, for *.hull names'
 	@echo '  root      build root mode'"'"'s helper, hull-root'
 	@echo '  check     style, the situ contracts, then the tests'
@@ -435,6 +447,27 @@ $(HULL): $(CLI_OBJS) $(CORE_OBJS) $(ENGINE_OBJS) $(STORE_OBJS) $(OCI_OBJS) $(PLA
 
 $(AGENT_BIN): $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
 	$(CC) -static $(CFLAGS) -o $@ $^
+
+kernel: $(KERNEL_BIN)
+
+$(KERNEL_TAR):
+	@mkdir -p '$(@D)'
+	curl -sSfL -o '$@.part' 'https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$(KERNEL_VERSION).tar.xz'
+	echo '$(KERNEL_SHA256)  $@.part' | sha256sum -c --quiet
+	mv '$@.part' '$@'
+
+# The source extracted once; a fragment option that did not take, which
+# merge_config.sh only warns of, stops the build.
+$(KERNEL_BIN): $(KERNEL_TAR) kernel/x86_64.config
+	test -d '$(KERNEL_SRC)' || tar -C '$(BUILD_DIR)/kernel' -xf '$(KERNEL_TAR)'
+	$(MAKE) -C '$(KERNEL_SRC)' tinyconfig > /dev/null
+	cd '$(KERNEL_SRC)' && scripts/kconfig/merge_config.sh -m .config '$(abspath kernel/x86_64.config)' > /dev/null
+	$(MAKE) -C '$(KERNEL_SRC)' olddefconfig > /dev/null
+	@for option in $$(grep '^CONFIG_' kernel/x86_64.config); do \
+		grep -qx "$$option" '$(KERNEL_SRC)/.config' || { echo "kernel: $$option did not take" >&2; exit 1; }; \
+	done
+	$(MAKE) -C '$(KERNEL_SRC)' bzImage
+	cp '$(KERNEL_SRC)/arch/x86/boot/bzImage' '$@'
 
 # Its native objects first, which make the generated sources and headers.
 $(BUILD_DIR)/hull-agent-arm64: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
@@ -727,7 +760,7 @@ clean:
 	        $(SPEC_OBJS) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS) $(PLAN_OBJS:.o=.d) \
 	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(STORE_OBJS) $(STORE_OBJS:.o=.d) $(OCI_OBJS) $(OCI_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) $(ROOT_BIN) \
 	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) $(DISC_GEN) $(FRAME_GEN) \
-	        $(AGENT_BIN) $(BUILD_DIR)/hull-agent-arm64 \
+	        $(AGENT_BIN) $(BUILD_DIR)/hull-agent-arm64 $(KERNEL_BIN) \
 	        $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(BUILD_DIR)/test/arm64/rootfs/probe \
 	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) $(FUZZ_FILES) \

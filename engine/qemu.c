@@ -133,6 +133,7 @@ struct hull_machine {
 	char            *kernel_path;  /* (kernel "path:FILE"): bring your own, else the host's */
 	int              kernel_image; /* (kernel image): the image's own /hull/kernel */
 	int              kernel_fetched; /* (kernel fetched): `hull kernel fetch`'s, on any host */
+	int              kernel_hull;  /* (kernel hull): vmlinuz-hull beside hull, `make kernel`'s */
 	char            *volume_host[MAX_VOLUMES];
 	int              volume_readonly[MAX_VOLUMES];
 	hull_stack       volume_stack[MAX_VOLUMES];  /* a volume of (layers ...), or count 0 */
@@ -611,6 +612,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		} else {
 			m->kernel_image = strcmp(text, "image") == 0;
 			m->kernel_fetched = strcmp(text, "fetched") == 0;
+			m->kernel_hull = strcmp(text, "hull") == 0;
 			free(text);
 		}
 	}
@@ -2866,7 +2868,18 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	/* An arm64 machine boots the arm64 kernel `hull kernel fetch --arch
 	 * arm64` put in the cache, with its modules, the host's being amd64's;
 	 * a kernel given by path is booted as given. */
-	if (m->arm64 && m->kernel_path == NULL && !m->kernel_image) {
+	if (m->kernel_hull) {
+		/* hull's own (Appendix F): every driver built in, so no modules. */
+		if (!agent_path(kbuf, sizeof kbuf, 0) || strrchr(kbuf, '/') == NULL)
+			return fail(error, HULL_ERR_RUNTIME, "hull's own kernel cannot be found");
+		snprintf(strrchr(kbuf, '/'), sizeof kbuf - (size_t)(strrchr(kbuf, '/') - kbuf),
+		         "/vmlinuz-hull");
+		if (access(kbuf, R_OK) != 0)
+			return fail(error, HULL_ERR_RUNTIME, "(kernel hull) boots vmlinuz-hull beside hull, "
+			            "and there is none: `make kernel` builds it");
+		kernel = kbuf;
+		load_modules = 0;
+	} else if (m->arm64 && m->kernel_path == NULL && !m->kernel_image) {
 		const hull_kernel_pin *pin = hull_kernel_pin_of("arm64");
 		char                   fetched[4096];
 
@@ -4213,6 +4226,9 @@ static const hull_cap_entry entries[] = {
 	{ "vm.kernel.fetched",   HULL_SUP_NATIVE,
 	  "the kernel `hull kernel fetch` put in the user's cache, Debian's, pinned: the same "
 	  "kernel on every host, its modules its own", NULL },
+	{ "vm.kernel.hull",      HULL_SUP_NATIVE,
+	  "hull's own kernel, vmlinuz-hull beside hull, `make kernel`'s: Linux with every driver a "
+	  "hull vm uses built in, so no modules", NULL },
 	{ "vm.kernel.image",     HULL_SUP_NATIVE,
 	  "the image's own /hull/kernel, booted as given; a different kernel version per machine, "
 	  "its modules the host's for its release where it has them, else built in", NULL },

@@ -2436,6 +2436,46 @@ for run in "$nokernel" "$fetchedrun" "$chosenrun"; do
 done
 rm -rf "${nokernel:?}" "${fetchedrun:?}" "${chosenrun:?}"
 
+# hull's own kernel (Appendix F): `make kernel` builds vmlinuz-hull beside
+# hull, Linux with every driver a hull vm uses built in, and (kernel hull)
+# boots it, with no modules. Where it is not built, a hull with no kernel
+# beside it is refused naming the target; where it is, a machine runs on
+# it to its end -- which needed ACPI, the guest otherwise halting and
+# qemu running on -- and its /proc/version is not Debian's.
+rm -rf "$root/nokernelbin"
+mkdir -p "$root/nokernelbin"
+cp "$hull" "$(dirname "$hull")/hull-agent" "$root/nokernelbin/"
+printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) %s %s)\n' \
+	'(tuning (vm (kernel hull)))' '(command "/probe" "say" "own kernel" "read" "/proc/version" "exit" "4")' \
+	> "$root/vhull.conf"
+khnone=$(mktemp -d "$root/run-khnone.XXXXXX")
+name='(kernel hull) with no vmlinuz-hull beside hull'
+out=$(cd / && XDG_RUNTIME_DIR=$khnone timeout 60 "$root/nokernelbin/hull" run -f "$root/vhull.conf" 2>&1)
+got=$?
+has 125 '`make kernel` builds it'
+if [ -r "$(dirname "$hull")/vmlinuz-hull" ]; then
+	khrun=$(mktemp -d "$root/run-kh.XXXXXX")
+	name='a vm on hull'"'"'s own kernel'
+	out=$(cd / && XDG_RUNTIME_DIR=$khrun timeout 60 "$hull" run -f "$root/vhull.conf" 2>&1)
+	got=$?
+	has 4 '^own kernel$'
+	has 4 '^read=Linux version '
+	refute_out '^read=Linux version .*deb13'
+	runs="$khnone $khrun"
+else
+	printf 'qemu: hull'"'"'s own kernel not tried: `make kernel` has not built vmlinuz-hull\n'
+	runs=$khnone
+fi
+for run in $runs; do
+	tries=0
+	while [ -S "$run/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+	rm -rf "${run:?}"
+done
+rm -rf "${root:?}/nokernelbin"
+
 # Phase 2's exit, its ARM half (section 12): an arm64 directory rootfs on
 # x86 under emu, qemu-system-aarch64's virt machine booting Debian's arm64
 # kernel, which `hull kernel fetch --arch arm64` puts in the cache, with

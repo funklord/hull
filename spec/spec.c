@@ -1115,12 +1115,13 @@ static hull_spec_status check_value(walk *w, const hull_sexpr_form *entry,
 
 			if (!has_scheme(w->doc->data + value.content, value.content_length, schemes))
 				return fail(w, HULL_SPEC_ERR_VALUE, value.offset,
-				            "must be bundled, fetched, image or \"path:<file>\"");
+				            "must be bundled, fetched, hull, image or \"path:<file>\"");
 		} else if (!hull_sexpr_is(w->doc, &value, "bundled") &&
 		           !hull_sexpr_is(w->doc, &value, "fetched") &&
+		           !hull_sexpr_is(w->doc, &value, "hull") &&
 		           !hull_sexpr_is(w->doc, &value, "image")) {
 			return fail(w, HULL_SPEC_ERR_VALUE, value.offset,
-			            "must be bundled, fetched, image or \"path:<file>\"");
+			            "must be bundled, fetched, hull, image or \"path:<file>\"");
 		}
 		return HULL_SPEC_OK;
 	case RECORD:
