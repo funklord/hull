@@ -752,6 +752,55 @@ static const char *overlay(void)
 	return NULL;
 }
 
+/* A composefs root (section 3.2): the image, a file in the share tagged
+ * cfs, mounted as erofs, and an overlay over it with the root share, the
+ * store's objects, as its data-only lower layer, whose files the image's
+ * redirect to; above them a tmpfs for the machine's writes, its root
+ * taking the image root's owner and mode, unless the root is read-only.
+ * A reason it cannot be, or NULL. */
+static const char *composefs_root(const char *image, int readonly)
+{
+	char        at[4300];
+	char        options[256];
+	const char *leaf = strrchr(image, '/');
+	struct stat top;
+
+	mkdir("/hull/cfs", 0755);
+	mkdir("/hull/meta", 0755);
+	mkdir("/hull/objects", 0755);
+	if (leaf == NULL || share("cfs", "/hull/cfs", 1) != 0)
+		return "the composefs image's directory could not be mounted";
+	snprintf(at, sizeof at, "/hull/cfs%s", leaf);
+	if (mount(at, "/hull/meta", "erofs", MS_RDONLY, NULL) != 0) {
+		say("composefs", strerror(errno));
+		return "the composefs image could not be mounted as erofs";
+	}
+	if (share("root", "/hull/objects", 1) != 0)
+		return "the store's objects could not be mounted";
+	if (readonly) {
+		snprintf(options, sizeof options,
+		         "lowerdir=/hull/meta::/hull/objects,metacopy=on,redirect_dir=on");
+	} else {
+		mkdir("/hull/upper", 0755);
+		if (mount("tmpfs", "/hull/upper", "tmpfs", 0u, "mode=0755") != 0 ||
+		    mkdir("/hull/upper/data", 0755) != 0 || mkdir("/hull/upper/work", 0700) != 0 ||
+		    stat("/hull/meta", &top) != 0 ||
+		    chown("/hull/upper/data", top.st_uid, top.st_gid) != 0 ||
+		    chmod("/hull/upper/data", top.st_mode & 07777) != 0) {
+			say("composefs", strerror(errno));
+			return "the composefs root's upper layer could not be made";
+		}
+		snprintf(options, sizeof options,
+		         "lowerdir=/hull/meta::/hull/objects,upperdir=/hull/upper/data,"
+		         "workdir=/hull/upper/work,metacopy=on,redirect_dir=on");
+	}
+	if (mount("overlay", "/machine", "overlay", readonly ? MS_RDONLY : 0u, options) != 0) {
+		say("composefs", strerror(errno));
+		return "the composefs root's overlay could not be mounted";
+	}
+	return NULL;
+}
+
 /* Make `path`, and what leads to it, as directories. */
 static void make_path(char *path)
 {
@@ -1196,8 +1245,18 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 		char *projection = hull_access_value(doc, machine, "projection");
 		int   block_root = projection != NULL && strcmp(projection, "block") == 0;
 
+		char *source = hull_access_value(doc, machine, "source");
+		char  image[4200] = "";   /* a composefs: source's image */
+
+		if (source != NULL && strncmp(source, "composefs:", 10u) == 0)
+			snprintf(image, sizeof image, "%s", source + 10);
+		free(source);
 		free(projection);
-		if (block_root) {
+		if (image[0] != '\0') {
+			if ((reason = composefs_root(image, readonly_root)) != NULL)
+				return reason;
+			layered = 1;
+		} else if (block_root) {
 			if (mount_block("root", "/machine", readonly_root) != 0) {
 				say("the root's image", strerror(errno));
 				return "the machine's root image could not be mounted";

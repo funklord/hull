@@ -220,6 +220,12 @@ int hull_unpack_end(hull_unpack *u, char *why, size_t cap);
  * layer is the store's objects/sha256. 0, or -1 with `why`. */
 int hull_store_composefs(hull_store *store, const char *name, int out, char *why, size_t cap);
 
+/* Where the composefs image of the tree `name` names is kept, the store's
+ * mounts/HEX.erofs, into `path`; with `create`, written there first where
+ * it is not. 0, or -1 with `why`. */
+int hull_store_composefs_image(hull_store *store, const char *name, int create, char *path,
+                               size_t path_cap, char *why, size_t cap);
+
 int hull_store_layer(hull_store *store, const char *name,
                      int (*sink)(void *context, const uint8_t *data, size_t n), void *context,
                      char arch[64], char *why, size_t cap);

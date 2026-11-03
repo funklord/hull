@@ -2681,6 +2681,51 @@ done:
 	return result;
 }
 
+int hull_store_composefs_image(hull_store *store, const char *name, int create, char *path,
+                               size_t path_cap, char *why, size_t cap)
+{
+	char hex[65];
+	char dir[4200];
+	char temporary[4300];
+	int  fd;
+
+	flock(store->lock, LOCK_SH);
+	if (name_manifest(store, name, hex, why, cap) != 0) {
+		flock(store->lock, LOCK_UN);
+		return -1;
+	}
+	flock(store->lock, LOCK_UN);
+	snprintf(dir, sizeof dir, "%s/mounts", store->root);
+	if (snprintf(path, path_cap, "%s/%s.erofs", dir, hex) >= (int)path_cap)
+		return say(why, cap, name, "the store's path is too long");
+	if (!create || access(path, R_OK) == 0)
+		return 0;
+	if (mkdir(dir, 0755) != 0 && errno != EEXIST)
+		return say(why, cap, dir, strerror(errno));
+	/* Beside it and renamed in, so it is whole or absent; another run
+	 * making it meanwhile makes the same bytes. */
+	snprintf(temporary, sizeof temporary, "%s/.%s.XXXXXX", dir, hex);
+	if ((fd = mkstemp(temporary)) < 0)
+		return say(why, cap, temporary, strerror(errno));
+	why[0] = '\0';
+	if (hull_store_composefs(store, name, fd, why, cap) != 0 || fchmod(fd, 0644) != 0) {
+		int saved = errno;
+
+		close(fd);
+		unlink(temporary);
+		if (why[0] == '\0')
+			say(why, cap, path, strerror(saved));
+		return -1;
+	}
+	if (close(fd) != 0 || rename(temporary, path) != 0) {
+		int saved = errno;
+
+		unlink(temporary);
+		return say(why, cap, path, strerror(saved));
+	}
+	return 0;
+}
+
 int hull_store_layer(hull_store *store, const char *name,
                      int (*sink)(void *context, const uint8_t *data, size_t n), void *context,
                      char arch[64], char *why, size_t cap)
@@ -3055,6 +3100,25 @@ int hull_store_gc(hull_store *store, uint64_t *manifests, uint64_t *objects,
 			if (strlen(entry->d_name) == 64u && !set_has(&kept_manifests, entry->d_name) &&
 			    hull_store_remove_tree(dirfd(dir), entry->d_name) == 0)
 				(*checkouts)++;
+		closedir(dir);
+	}
+	/* A composefs image (section 3.2) of a manifest no ref reaches, by the
+	 * same rule as a checkout's: a machine still running on it reads its
+	 * objects, which this gc has taken already if no ref reaches them.
+	 * Disposable, made again from the manifest; not counted, gc's report
+	 * being of the store's own. */
+	snprintf(path, sizeof path, "%s/mounts", store->root);
+	if ((dir = opendir(path)) != NULL) {
+		while ((entry = readdir(dir)) != NULL) {
+			char hex[65];
+
+			if (strlen(entry->d_name) != 70u || strcmp(entry->d_name + 64, ".erofs") != 0)
+				continue;
+			memcpy(hex, entry->d_name, 64u);
+			hex[64] = '\0';
+			if (!set_has(&kept_manifests, hex))
+				unlinkat(dirfd(dir), entry->d_name, 0);
+		}
 		closedir(dir);
 	}
 	/* What a commit or a checkout that went left in tmp/: none is under

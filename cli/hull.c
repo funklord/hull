@@ -748,7 +748,55 @@ static int pack_ref(const char *file, const char *given, char *ref, size_t cap)
 	return 0;
 }
 
-static int store_sources(const char *file, uint8_t *data, size_t *length, int create)
+/* Whether a stored source on this machine is mounted as a composefs image
+ * rather than checked out (section 3.2): where every backend it may run
+ * on is the qemu engine's, vm or emu, whose guest mounts the image as
+ * root, and it names nothing a composefs root refuses -- layers, an
+ * upper, an export, the image's own kernel. The backends are the
+ * command's where it names any, else the machine's own. */
+static int composefs_machine(const hull_spec *spec, const hull_sexpr_form *machine,
+                             const char *const *backends, unsigned backend_count)
+{
+	static const char *const refused[] = { "layers", "upper", "export", NULL };
+	hull_sexpr_form          entry;
+	hull_sexpr_form          head;
+	hull_sexpr_form          value;
+	const char              *given[1];
+	char                     own[32] = "";
+
+	for (unsigned i = 0u; refused[i] != NULL; i++)
+		if (hull_spec_find(spec, machine, refused[i], &entry))
+			return 0;
+	if (hull_spec_find(spec, machine, "tuning", &entry)) {
+		hull_sexpr_form vm;
+		hull_sexpr_form item;
+
+		hull_sexpr_child(&spec->doc, &entry, &item);
+		for (int more = hull_sexpr_next(&spec->doc, &item, &item); more;
+		     more = hull_sexpr_next(&spec->doc, &item, &item))
+			if (hull_sexpr_child(&spec->doc, &item, &vm) && hull_sexpr_is(&spec->doc, &vm, "vm") &&
+			    memmem(spec->doc.data + item.offset, item.extent, "image", 5u) != NULL)
+				return 0;
+	}
+	if (backend_count == 0u) {
+		if (!hull_spec_find(spec, machine, "backend", &entry) ||
+		    !hull_sexpr_child(&spec->doc, &entry, &head) ||
+		    !hull_sexpr_next(&spec->doc, &head, &value) || value.content_length >= sizeof own)
+			return 0;
+		memcpy(own, spec->doc.data + value.content, value.content_length);
+		given[0] = own;
+		backends = given;
+		backend_count = 1u;
+	}
+	for (unsigned i = 0u; i < backend_count; i++)
+		if (strcmp(backends[i], "vm") != 0 && strcmp(backends[i], "emu") != 0 &&
+		    strcmp(backends[i], "qemu") != 0)
+			return 0;
+	return 1;
+}
+
+static int store_sources(const char *file, uint8_t *data, size_t *length, int create,
+                         const char *const *backends, unsigned backend_count)
 {
 	static rewrite  rewrites[MAX_REWRITES];
 	static hull_sexpr_form machines[HULL_NAMES_MEMBERS];
@@ -787,6 +835,7 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 		size_t                   runtime_length = 0u;
 		text_buf                 source = { 0 };
 		int                      has_mutable;
+		int                      cfs;
 		int                      schemed = 0;
 
 		if (!hull_spec_find(&spec, &machines[i], "source", &entry) ||
@@ -843,8 +892,11 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 				break;
 			}
 		}
-		if (create && hull_store_checkout(&store, name, 1, path, sizeof path, &skipped, why,
-		                                  sizeof why) != 0) {
+		cfs = composefs_machine(&spec, &machines[i], backends, backend_count);
+		if (cfs ? hull_store_composefs_image(&store, name, create, path, sizeof path, why,
+		                                     sizeof why) != 0 :
+		          create && hull_store_checkout(&store, name, 1, path, sizeof path, &skipped, why,
+		                                        sizeof why) != 0) {
 			fprintf(stderr, "%s: %s: %s\n", file, name, why);
 			result = -1;
 			break;
@@ -866,7 +918,7 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 			break;
 		/* From the value to the end of the entry, so that the overlay is
 		 * an entry of the machine's own, after the source. */
-		add_text(&source, "\"dir:");
+		add_text(&source, cfs ? "\"composefs:" : "\"dir:");
 		add_text(&source, path);
 		add_text(&source, "\")");
 		if (!has_mutable)
@@ -923,7 +975,8 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 		 * which makes no checkout, names none. The list is a sibling of the
 		 * checkout, written only on a real run and only where the manifest
 		 * gives an explicit owner. */
-		if (create) {
+		/* A composefs image holds its owners itself. */
+		if (create && !cfs) {
 			{
 				char owners_file[4500];
 				int  list;
@@ -1071,7 +1124,7 @@ static int resolve_all(const options *o, const hull_registry *registry)
 	data = spec_text(o->file, &length);
 	if (data == NULL)
 		return 2;
-	if (store_sources(o->file, data, &length, 0) != 0) {
+	if (store_sources(o->file, data, &length, 0, o->backends, o->backend_count) != 0) {
 		free(data);
 		return 2;
 	}
@@ -2649,7 +2702,7 @@ static int run(options *o, const hull_registry *registry, const char *name)
 	data = spec_text(o->file, &length);
 	if (data == NULL)
 		return 125;
-	if (store_sources(o->file, data, &length, 1) != 0) {
+	if (store_sources(o->file, data, &length, 1, o->backends, o->backend_count) != 0) {
 		free(data);
 		return 125;
 	}
@@ -4326,7 +4379,7 @@ static int export_machine(const char *file, const char *name, const char *image)
 
 	if ((data = spec_text(file, &length)) == NULL)
 		return 125;
-	if (store_sources(file, data, &length, 1) != 0) {
+	if (store_sources(file, data, &length, 1, NULL, 0u) != 0) {
 		free(data);
 		return 125;
 	}

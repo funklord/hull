@@ -1776,6 +1776,40 @@ CHECK
 	printf '%s\n' "$out" | grep -q '^link=hello composefs$' &&
 		printf '%s\n' "$out" | grep -q '^ran from the overlay$' ||
 		fail "a symlink or a program through the composefs mount" "$out"
+	# A stored tree run by its ref on a vm is mounted so by hull itself,
+	# no checkout made: the frontend writes the image to the store's
+	# mounts/ and names it as the source, the engine shares it and the
+	# objects, and the agent mounts both, a tmpfs above for the writes.
+	# On chroot the same file is a checkout as before, and gc takes the
+	# image with the ref.
+	XDG_DATA_HOME="$root/cfs/store" timeout 60 "$hull" commit "$r" cfs/root:1 > /dev/null 2>&1
+	printf '(machine (source "cfs/root:1") (backend vm) %s)\n' \
+		'(command "/bin/sh" "-c" "cat /proc/mounts; echo written > /w; cat /w")' > "$root/cfsref.conf"
+	cases=$((cases + 1))
+	out=$(XDG_DATA_HOME="$root/cfs/store" timeout 30 "$hull" plan --explain -f "$root/cfsref.conf" 2>&1)
+	printf '%s\n' "$out" | grep -q 'source\.composefs\.overlay: native' ||
+		fail "a stored source on vm was not planned as composefs" "$out"
+	cases=$((cases + 1))
+	out=$(XDG_DATA_HOME="$root/cfs/store" timeout 30 "$hull" plan --explain -f "$root/cfsref.conf" \
+		--backend chroot 2>&1)
+	printf '%s\n' "$out" | grep -q 'source\.dir\.overlay' ||
+		fail "a stored source on chroot was not a checkout" "$out"
+	out=$(cd / && XDG_DATA_HOME="$root/cfs/store" timeout 90 "$hull" run -f "$root/cfsref.conf" 2>&1)
+	cases=$((cases + 1))
+	printf '%s\n' "$out" | grep -q '^overlay / overlay .*lowerdir=/hull/meta::/hull/objects' &&
+		printf '%s\n' "$out" | grep -q '^written$' ||
+		fail "a stored tree on vm did not run on its composefs image" "$out"
+	cases=$((cases + 1))
+	[ -n "$(ls "$root/cfs/store/hull/store/mounts/" 2>/dev/null)" ] &&
+		[ ! -e "$root/cfs/store/hull/store/checkouts" ] ||
+		fail "a composefs run made no image, or made a checkout" \
+			"$(ls -R "$root/cfs/store/hull/store" 2>&1 | head)"
+	XDG_DATA_HOME="$root/cfs/store" timeout 30 "$hull" tag -d cfs/root:1 > /dev/null 2>&1
+	XDG_DATA_HOME="$root/cfs/store" timeout 30 "$hull" tag -d cfs/tree:1 > /dev/null 2>&1
+	XDG_DATA_HOME="$root/cfs/store" timeout 60 "$hull" gc > /dev/null 2>&1
+	cases=$((cases + 1))
+	[ -z "$(ls "$root/cfs/store/hull/store/mounts/" 2>/dev/null)" ] ||
+		fail "gc left the image of a tree no ref reaches" "$(ls "$root/cfs/store/hull/store/mounts/")"
 fi
 
 # A udp port: each client its own flow, each datagram whole, an empty one

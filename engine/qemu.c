@@ -119,6 +119,7 @@ struct hull_machine {
 	int              readonly_root;
 	int              overlay;      /* (mutable overlay): the share is read-only */
 	int              block_root;   /* (projection block): the root a disk image of the tree */
+	char            *composefs;    /* a composefs: source, its image; root is then the objects */
 	const char      *boot;         /* a bootable export's /hull/boot, else NULL */
 	char            *layer_path[MAX_VOLUMES];  /* (layers ...): read-only, each above the last */
 	unsigned         layer_count;
@@ -395,6 +396,7 @@ static void release(hull_machine *m)
 		hull_hostnet_run(del, quiet, sizeof quiet);
 	}
 	free(m->root);
+	free(m->composefs);
 	for (unsigned i = 0u; i < m->volume_count; i++)
 		free(m->volume_host[i]);
 	for (unsigned i = 0u; i < m->volume_count; i++)
@@ -460,12 +462,29 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	free(text);
 
 	text = hull_access_value(doc, &machine, "source");
-	if (text == NULL || strncmp(text, "dir:", 4u) != 0 || text[4] == '\0') {
+	/* A composefs: source (section 3.2), a stored tree's image the
+	 * frontend wrote to the store's mounts/: the root share is the
+	 * store's objects, which the image's files redirect to, and the
+	 * image's directory a share beside it, for the agent to mount. */
+	if (text != NULL && strncmp(text, "composefs:", 10u) == 0 && text[10] != '\0') {
+		char *slash;
+
+		m->composefs = hull_access_path(doc, text + 10);
 		free(text);
-		return "the qemu engine runs only a dir source so far";
+		if (m->composefs == NULL || (slash = strrchr(m->composefs, '/')) == NULL ||
+		    slash - m->composefs < 7 || strncmp(slash - 7, "/mounts", 7u) != 0)
+			return "a composefs source is an image in a store's mounts/";
+		if ((m->root = malloc(strlen(m->composefs) + 32u)) == NULL)
+			return "out of memory";
+		snprintf(m->root, strlen(m->composefs) + 32u, "%.*s/objects/sha256",
+		         (int)(slash - 7 - m->composefs), m->composefs);
+	} else if (text == NULL || strncmp(text, "dir:", 4u) != 0 || text[4] == '\0') {
+		free(text);
+		return "the qemu engine runs only a dir or composefs source so far";
+	} else {
+		m->root = hull_access_path(doc, text + 4);
+		free(text);
 	}
-	m->root = hull_access_path(doc, text + 4);
-	free(text);
 	if (m->root == NULL)
 		return "out of memory";
 
@@ -562,6 +581,9 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	if (m->block_root && (m->host_overlay || m->owners != NULL))
 		return "a block projection's root is built from the directory alone: layers, an upper, "
 		       "owners and an export are a host-side overlay's";
+	if (m->composefs != NULL && (m->block_root || m->host_overlay || m->owners != NULL))
+		return "a composefs root is the image over the store's objects: a block projection, "
+		       "layers, an upper, owners and an export are a directory's";
 
 	/* (tuning (vm (kernel ...))): the kernel the vm boots, in place of the
 	 * host's. vm's tuning applies under emu too (section 4), so the (vm ...)
@@ -583,6 +605,10 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			free(text);
 		}
 	}
+
+	if (m->kernel_image && m->composefs != NULL)
+		return "(kernel image) reads the tree's /hull/kernel, which a composefs root holds as "
+		       "a redirect: give the kernel by path";
 
 	/* A guest has the PC's ports: four serial and three parallel. */
 	{
@@ -1164,6 +1190,12 @@ static const char *write_initramfs(const hull_machine *m, const char *modules, i
 				snprintf(links + at, sizeof links - at, "%s %s\n", d->host.named, guest);
 		}
 	}
+	/* A composefs root: erofs for its image, the crc32c erofs's
+	 * libcrc32c asks for, and overlay, which is loaded already. */
+	if (m->composefs != NULL && load_modules && extra_count + 2u <= MAX_MODULES) {
+		extra[extra_count++] = "?crc32c_generic";
+		extra[extra_count++] = "erofs";
+	}
 	/* A block projection's root: its disk, ext4 and the crc32c ext4
 	 * asks for, as an image volume's. */
 	if (m->block_root && load_modules && extra_count + 3u <= MAX_MODULES) {
@@ -1614,6 +1646,8 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        modules_at[4200];
 	char        sshd[9000];
 	char        sshd_at[4200];
+	char        cfs[9000];
+	char        cfs_at[4200];
 	char        segment_netdev[MAX_SEGMENTS][64];
 	char        segment_device[MAX_SEGMENTS][96];
 	char        fsdev[MAX_VOLUMES][9000];
@@ -1621,7 +1655,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        path[8500];
 	char        device_chardev[HULL_MAX_DEVICES][600];
 	char        device_device[HULL_MAX_DEVICES][96];
-	const char *argv[68 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS + 4u * HULL_MAX_DEVICES + 2u];
+	const char *argv[72 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS + 4u * HULL_MAX_DEVICES + 2u];
 	unsigned    serial = 0u;
 	unsigned    parallel = 0u;
 	int         usb = 0;
@@ -1849,6 +1883,20 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	 * from, and getrandom() in it, an sshd's first of all, blocked past a
 	 * minute here (section 8.1). Its driver is a module on the host's
 	 * kernel, loaded where there is one. */
+	/* A composefs root's image, its directory read-only: the agent
+	 * mounts the image as erofs, over the objects the root share is. */
+	if (m->composefs != NULL) {
+		char dir_[4200];
+
+		snprintf(dir_, sizeof dir_, "%.*s", (int)(strrchr(m->composefs, '/') - m->composefs),
+		         m->composefs);
+		escaped(cfs_at, sizeof cfs_at, dir_);
+		snprintf(cfs, sizeof cfs, "local,id=cfs,path=%s,security_model=none,readonly=on", cfs_at);
+		argv[n++] = "-fsdev";
+		argv[n++] = cfs;
+		argv[n++] = "-device";
+		argv[n++] = "virtio-9p-pci,fsdev=cfs,mount_tag=cfs";
+	}
 	argv[n++] = "-device";
 	argv[n++] = "virtio-rng-pci";
 	argv[n++] = "-device";
@@ -4027,6 +4075,9 @@ static const hull_cap_entry entries[] = {
 	 * overlayfs in the guest, whose upper layer is a tmpfs there rather
 	 * than section 3.7's upper/ on the host. */
 	{ "source.dir.direct",  HULL_SUP_NATIVE,   NULL, NULL },
+	{ "source.composefs.overlay", HULL_SUP_NATIVE,
+	  "a stored tree's composefs image mounted in the guest over the store's objects, "
+	  "no tree copied; writes in a tmpfs there", NULL },
 	{ "source.dir.overlay", HULL_SUP_EMULATED,
 	  "an overlayfs in the guest; writes are held in the machine's memory and go with it",
 	  NULL },
