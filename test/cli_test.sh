@@ -3732,6 +3732,16 @@ if [ -z "$busybox" ] || [ ! -x "$(printf '%s\n' "$fetched" | tail -1)/usr/sbin/d
 	printf 'cli: fetched sshd on chroot not tried: %s\n' \
 		"${busybox:-no busybox}; $(printf '%s\n' "$fetched" | tail -1)"
 else
+	# A pin the pool no longer has is taken from Debian's snapshot, each
+	# package still held to its sha256: a pool named that has nothing.
+	rm -rf "$root/cache-snapshot"
+	limit=300
+	expect 0 'taking it from Debian.s snapshot' env XDG_CACHE_HOME="$root/cache-snapshot" \
+		HULL_DEBIAN_POOL=https://deb.debian.org/debian/pool/hull-none/ "$hull" sshd fetch
+	cases=$((cases + 1))
+	[ -x "$root/cache-snapshot/hull/dropbear-2025.89-1~deb13u1/usr/sbin/dropbear" ] ||
+		fail "the snapshot's packages did not make the sshd's tree" "$(ls -R "$root/cache-snapshot" 2>&1 | head)"
+	rm -rf "$root/cache-snapshot"
 	chmod 700 "$dbshm"
 	rm -rf "$root/dbroot"
 	mkdir -p "$root/dbroot/bin" "$root/dbroot/etc" "$root/dbroot/run" "$root/dbroot/tmp" \

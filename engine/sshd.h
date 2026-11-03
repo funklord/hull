@@ -27,10 +27,9 @@
 #include <unistd.h>
 
 #define HULL_SSHD_VERSION "2025.89-1~deb13u1"
-#define HULL_SSHD_POOL    "https://deb.debian.org/debian/pool/main/"
 
 typedef struct hull_sshd_package {
-	const char *path;   /* under HULL_SSHD_POOL */
+	const char *path;   /* under kernel.h's HULL_DEBIAN_POOL and _SNAPSHOT */
 	const char *sha256; /* the .deb's */
 } hull_sshd_package;
 

@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "kernel.h"
 #include "kernel_fetch.h"
 #include "sha256.h"
 #include "sshd.h"
@@ -199,14 +200,13 @@ int hull_sshd_fetch(char *why, size_t cap)
 	if ((u = hull_unpack_begin(tree, why, cap)) == NULL)
 		goto done;
 	fprintf(stderr, "hull: fetching Debian's dropbear %s and what it links, about 4 MB, from %s\n",
-	        HULL_SSHD_VERSION, HULL_SSHD_POOL);
+	        HULL_SSHD_VERSION, HULL_DEBIAN_POOL);
 	for (size_t i = 0u; i < count; i++) {
-		char url[600];
-		int  fd;
-		int  applied;
+		int fd;
+		int applied;
 
-		snprintf(url, sizeof url, "%s%s", HULL_SSHD_POOL, hull_sshd_packages[i].path);
-		if (hull_fetch_deb(url, hull_sshd_packages[i].sha256, deb, tar, why, cap) != 0)
+		if (hull_fetch_deb(hull_sshd_packages[i].path, hull_sshd_packages[i].sha256, deb, tar,
+		                   why, cap) != 0)
 			goto done;
 		if ((fd = open(tar, O_RDONLY | O_CLOEXEC)) < 0) {
 			snprintf(why, cap, "%s: %s", tar, strerror(errno));

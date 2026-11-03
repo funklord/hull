@@ -135,28 +135,82 @@ static int unxz(int in, off_t offset, uint64_t size, int out, char *why, size_t 
 	return 0;
 }
 
-int hull_fetch_deb(const char *url, const char *sha256, const char *deb, const char *tar,
+/* `url` into `d`, from the start, following a redirect within the same
+ * scheme up to four times, as the snapshot answers with one to the file by
+ * its sha1. The final status into `status`. 0, or -1 with `why`. */
+static int get_following(const char *url, download *d, int *status, char *why, size_t cap)
+{
+	char at[4400];
+
+	snprintf(at, sizeof at, "%s", url);
+	for (int hops = 0; hops < 5; hops++) {
+		hull_https_response got = { 0 };
+
+		if (ftruncate(d->fd, 0) != 0 || lseek(d->fd, 0, SEEK_SET) != 0) {
+			snprintf(why, cap, "the download could not be begun again: %s", strerror(errno));
+			return -1;
+		}
+		hull_sha256_init(&d->hash);
+		why[0] = '\0';
+		if (hull_https_get(at, NULL, &got, downloaded, d, why, cap) != 0)
+			return -1;
+		*status = got.status;
+		if (got.status < 300 || got.status > 399 || got.location[0] == '\0')
+			return 0;
+		if (got.location[0] == '/') {
+			char        host[256];
+			const char *rest = got.location;
+
+			if (hull_https_host(at, host, sizeof host) != 0) {
+				snprintf(why, cap, "%s redirected, and its host cannot be read", at);
+				return -1;
+			}
+			snprintf(at, sizeof at, "https://%s%s", host, rest);
+		} else if (strncmp(got.location, "https://", 8u) == 0) {
+			snprintf(at, sizeof at, "%s", got.location);
+		} else {
+			snprintf(why, cap, "%s redirected to %s, which is not https", at, got.location);
+			return -1;
+		}
+	}
+	snprintf(why, cap, "%s redirected more than four times", url);
+	return -1;
+}
+
+int hull_fetch_deb(const char *path, const char *sha256, const char *deb, const char *tar,
                    char *why, size_t cap)
 {
-	char                hex[65];
-	uint8_t             digest[32];
-	hull_https_response got = { 0 };
-	download            d;
-	off_t               offset;
-	uint64_t            size;
-	int                 out;
-	int                 status = -1;
+	const char              *pool = getenv("HULL_DEBIAN_POOL");
+	const char              *bases[2] = { HULL_DEBIAN_POOL, HULL_DEBIAN_SNAPSHOT };
+	char                     hex[65];
+	char                     url[1024] = "";
+	uint8_t                  digest[32];
+	download                 d;
+	off_t                    offset;
+	uint64_t                 size;
+	int                      out;
+	int                      got = 0;
+	int                      status = -1;
 
 	if ((d.fd = open(deb, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0) {
 		snprintf(why, cap, "%s: %s", deb, strerror(errno));
 		return -1;
 	}
-	hull_sha256_init(&d.hash);
-	why[0] = '\0';
-	if (hull_https_get(url, NULL, &got, downloaded, &d, why, cap) != 0 || got.status != 200) {
-		if (why[0] == '\0')
-			snprintf(why, cap, "%s answered %d: the pinned package may have left the archive, "
-			         "and its pin wants moving", url, got.status);
+	/* HULL_DEBIAN_POOL names another pool, as HULL_BOOT_DIR another
+	 * /boot: a test's, one that has nothing, to hold the snapshot to it. */
+	if (pool != NULL && strncmp(pool, "https://", 8u) == 0)
+		bases[0] = pool;
+	/* The pool first, the snapshot where the pool no longer has it. */
+	for (unsigned i = 0u; i < sizeof bases / sizeof bases[0] && got != 200; i++) {
+		snprintf(url, sizeof url, "%s%s", bases[i], path);
+		if (get_following(url, &d, &got, why, cap) != 0)
+			goto done;
+		if (got != 200 && i == 0u)
+			fprintf(stderr, "hull: %s answered %d: taking it from Debian's snapshot\n", url, got);
+	}
+	if (got != 200) {
+		snprintf(why, cap, "%s answered %d, and the pool no longer has it either: the pin "
+		         "wants moving", url, got);
 		goto done;
 	}
 	hull_sha256_final(&d.hash, digest);
@@ -235,9 +289,9 @@ int hull_kernel_fetch(char *why, size_t cap)
 	snprintf(tar, sizeof tar, "%s/data.tar", work);
 	snprintf(tree, sizeof tree, "%s/tree", work);
 
-	fprintf(stderr, "hull: fetching Debian's kernel %s, about 108 MB: %s\n", HULL_KERNEL_VERSION,
-	        HULL_KERNEL_URL);
-	if (hull_fetch_deb(HULL_KERNEL_URL, HULL_KERNEL_SHA256, deb, tar, why, cap) != 0)
+	fprintf(stderr, "hull: fetching Debian's kernel %s, about 108 MB: %s%s\n", HULL_KERNEL_VERSION,
+	        HULL_DEBIAN_POOL, HULL_KERNEL_PATH);
+	if (hull_fetch_deb(HULL_KERNEL_PATH, HULL_KERNEL_SHA256, deb, tar, why, cap) != 0)
 		goto done;
 	if ((out = open(tar, O_RDONLY | O_CLOEXEC)) < 0) {
 		snprintf(why, cap, "%s: %s", tar, strerror(errno));

@@ -12,10 +12,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* Where a pinned package is fetched from: Debian's pool, which keeps only
+ * the versions a release still has, then the snapshot of the archive as
+ * it stood when the pins were taken, which keeps every version for good.
+ * A point release moves libc6 or the kernel on, and the pool's copy goes;
+ * the snapshot's does not. Every pin is in this snapshot, checked when it
+ * was set; a pin moved later is checked against a newer one. */
+#define HULL_DEBIAN_POOL     "https://deb.debian.org/debian/pool/main/"
+#define HULL_DEBIAN_SNAPSHOT "https://snapshot.debian.org/archive/debian/20261102T000000Z/pool/main/"
+
 #define HULL_KERNEL_VERSION "6.12.107-1"
 #define HULL_KERNEL_RELEASE "6.12.107+deb13-amd64"
-#define HULL_KERNEL_URL     "https://deb.debian.org/debian/pool/main/l/linux/" \
-                            "linux-image-6.12.107+deb13-amd64-unsigned_6.12.107-1_amd64.deb"
+#define HULL_KERNEL_PATH    "l/linux/linux-image-6.12.107+deb13-amd64-unsigned_6.12.107-1_amd64.deb"
 #define HULL_KERNEL_SHA256  "7d13cd82a1d377e40826c313f5dbbdb2edf1b48c713a375e4cfe5e207749cb4e"
 
 /* The fetched kernel's directory, $XDG_CACHE_HOME/hull/kernel-VERSION or
