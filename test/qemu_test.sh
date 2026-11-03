@@ -2618,6 +2618,32 @@ else
 	got=$?
 	out=$(tr -d '\r' < "$root/boot.serial" 2>&1 | grep -a -E 'booted|hull agent|Kernel panic')
 	has 0 '^booted pid=1 root=ext4 writable=yes owned=101:102 probe=0:0$'
+	# Where the host's kernel cannot be read, as on Ubuntu, the export
+	# takes the kernel `hull kernel fetch` put in the cache, as a vm does,
+	# and boots; with none fetched either, it is refused naming the
+	# command. HULL_BOOT_DIR stands for the unreadable /boot.
+	name='export, the fetched kernel'
+	out=$(cd "$root" && HULL_BOOT_DIR=/nonexistent timeout 120 "$hull" export --bootable ./bootroot \
+		boot2.img --init /sbin/booted 2>&1)
+	got=$?
+	if [ -r "$root/cache/hull/kernel-$(sed -n 's/^#define HULL_KERNEL_VERSION "\(.*\)"$/\1/p' engine/kernel.h)/boot/vmlinuz-$krelease" ]; then
+		has 0 'boot2\.img$'
+		rm -f "$root/boot.serial"
+		timeout 90 qemu-system-x86_64 -machine q35 -m 512 -enable-kvm -bios "$ovmf" \
+			-drive "file=$root/boot2.img,format=raw,if=virtio" -display none -net none \
+			-serial "file:$root/boot.serial" -no-reboot >/dev/null 2>&1
+		got=$?
+		out=$(tr -d '\r' < "$root/boot.serial" 2>&1 | grep -a -E 'booted|hull agent|Kernel panic|Linux version')
+		has 0 '^booted pid=1 root=ext4 writable=yes'
+		has 0 'Linux version .*deb13'
+	else
+		printf 'qemu: an export on the fetched kernel not tried: none fetched\n'
+	fi
+	name='export, no kernel to read and none fetched'
+	out=$(cd "$root" && HULL_BOOT_DIR=/nonexistent XDG_CACHE_HOME="$root/cache-empty" timeout 60 \
+		"$hull" export --bootable ./bootroot boot2.img --init /sbin/booted 2>&1)
+	got=$?
+	has 1 'no kernel has been fetched: `hull kernel fetch`'
 	# An init the tree does not have: refused at its exec in the guest,
 	# said, and the machine off rather than the kernel panicking.
 	name='export, no init'

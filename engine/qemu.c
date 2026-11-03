@@ -4292,23 +4292,40 @@ const char *hull_qemu_boot_files(const char *dir, const char *boot, char *kernel
 {
 	static hull_machine m;
 	struct utsname      name;
-	char                modules[600];
+	char                modules[4400];
 	const char         *reason;
 
 	if (uname(&name) != 0 || strcmp(name.machine, "x86_64") != 0) {
 		snprintf(detail, detail_cap, "a bootable image is made on an x86_64 host, of its kernel");
 		return detail;
 	}
-	snprintf(kernel, cap, "/boot/vmlinuz-%s", name.release);
-	if (access(kernel, R_OK) != 0) {
-		snprintf(detail, detail_cap, "the host's kernel, %s, cannot be read", kernel);
-		return detail;
+	/* The host's own where the user may read it, else the kernel `hull
+	 * kernel fetch` put in the cache, with its modules, as a vm boots
+	 * (Appendix F): Ubuntu keeps /boot/vmlinuz root's alone. HULL_BOOT_DIR
+	 * names another /boot, as the engine reads it, for the test of that. */
+	{
+		const char *boot_dir = getenv("HULL_BOOT_DIR");
+		char        fetched[4096];
+
+		snprintf(kernel, cap, "%s/vmlinuz-%s",
+		         boot_dir != NULL && boot_dir[0] == '/' ? boot_dir : "/boot", name.release);
+		snprintf(modules, sizeof modules, "/lib/modules/%s", name.release);
+		if (access(kernel, R_OK) != 0) {
+			if (hull_kernel_dir(fetched, sizeof fetched) != 0)
+				fetched[0] = '\0';
+			snprintf(kernel, cap, "%s/boot/vmlinuz-%s", fetched, HULL_KERNEL_RELEASE);
+			snprintf(modules, sizeof modules, "%s/lib/modules/%s", fetched, HULL_KERNEL_RELEASE);
+			if (fetched[0] == '\0' || access(kernel, R_OK) != 0) {
+				snprintf(detail, detail_cap, "the host's kernel cannot be read by the user, and "
+				         "no kernel has been fetched: `hull kernel fetch` downloads Debian's, once");
+				return detail;
+			}
+		}
 	}
 	memset(&m, 0, sizeof m);
 	snprintf(m.dir, sizeof m.dir, "%s", dir);
 	m.block_root = 1;
 	m.boot       = boot;
-	snprintf(modules, sizeof modules, "/lib/modules/%s", name.release);
 	if ((reason = write_initramfs(&m, modules, 1)) != NULL) {
 		snprintf(detail, detail_cap, "%s", reason);
 		return detail;

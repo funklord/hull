@@ -458,7 +458,7 @@ int hull_export_bootable(hull_store *store, const char *name, const char *image,
 	char                     work[4200];
 	char                     tar[4300], root[4300], esp[4300];
 	char                     mke2fs[300];
-	char                     kernel[600];
+	char                     kernel[4400];
 	char                     loader[4300];
 	char                     hex[65];
 	char                     arch[64] = "";
