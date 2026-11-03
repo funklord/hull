@@ -244,6 +244,12 @@ done:
 
 int hull_kernel_fetch(char *why, size_t cap)
 {
+	return hull_kernel_fetch_arch("amd64", why, cap);
+}
+
+int hull_kernel_fetch_arch(const char *arch, char *why, size_t cap)
+{
+	const hull_kernel_pin *pin = hull_kernel_pin_of(arch);
 	char                dir[4096];
 	char                work[4200];
 	char                deb[4300], tar[4300], tree[4300], from[4400], to[4400], made[4400];
@@ -255,11 +261,15 @@ int hull_kernel_fetch(char *why, size_t cap)
 	int                 status = -1;
 	struct stat         is;
 
-	if (hull_kernel_dir(dir, sizeof dir) != 0) {
+	if (pin == NULL) {
+		snprintf(why, cap, "hull fetches no kernel for %s", arch);
+		return -1;
+	}
+	if (hull_kernel_dir_of(arch, dir, sizeof dir) != 0) {
 		snprintf(why, cap, "neither XDG_CACHE_HOME nor HOME names a place for the kernel");
 		return -1;
 	}
-	snprintf(made, sizeof made, "%s/boot/vmlinuz-%s", dir, HULL_KERNEL_RELEASE);
+	snprintf(made, sizeof made, "%s/boot/vmlinuz-%s", dir, pin->release);
 	if (access(made, R_OK) == 0) {
 		printf("%s\n", dir);
 		return 0;
@@ -289,9 +299,9 @@ int hull_kernel_fetch(char *why, size_t cap)
 	snprintf(tar, sizeof tar, "%s/data.tar", work);
 	snprintf(tree, sizeof tree, "%s/tree", work);
 
-	fprintf(stderr, "hull: fetching Debian's kernel %s, about 108 MB: %s%s\n", HULL_KERNEL_VERSION,
-	        HULL_DEBIAN_POOL, HULL_KERNEL_PATH);
-	if (hull_fetch_deb(HULL_KERNEL_PATH, HULL_KERNEL_SHA256, deb, tar, why, cap) != 0)
+	fprintf(stderr, "hull: fetching Debian's %s kernel %s, about %u MB: %s%s\n", arch,
+	        HULL_KERNEL_VERSION, pin->megabytes, HULL_DEBIAN_POOL, pin->path);
+	if (hull_fetch_deb(pin->path, pin->sha256, deb, tar, why, cap) != 0)
 		goto done;
 	if ((out = open(tar, O_RDONLY | O_CLOEXEC)) < 0) {
 		snprintf(why, cap, "%s: %s", tar, strerror(errno));
@@ -330,7 +340,7 @@ int hull_kernel_fetch(char *why, size_t cap)
 		}
 	}
 	{
-		const char *const argv[] = { depmod, "-b", tree, HULL_KERNEL_RELEASE, NULL };
+		const char *const argv[] = { depmod, "-b", tree, pin->release, NULL };
 		char              said[400];
 
 		if (hull_hostnet_run(argv, said, sizeof said) != 0) {

@@ -142,6 +142,10 @@ AGENT_BIN_OBJS = $(BUILD_DIR)/agent/agent.o $(WIRE_OBJS) $(BUILD_DIR)/engine/acc
                  $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/ip6.o \
                  $(BUILD_DIR)/engine/tree.o
 AGENT_BIN      = $(BUILD_DIR)/hull-agent
+# The same agent for an arm64 machine under emu, beside it, where a cross
+# compiler is installed (ARM64_CC, below): its sources the native one's,
+# built from the objects' names, its generated C the same files.
+AGENT_SOURCES  = $(patsubst $(BUILD_DIR)/%.o,%.c,$(patsubst $(BUILD_DIR)/situ/situ.o,$(SITU_DIR)/runtime/c/situ.c,$(patsubst $(GEN_DIR)/%.o,$(GEN_DIR)/%.c,$(AGENT_BIN_OBJS) $(SEXPR_OBJS))))
 
 # The hosts database for section 8.1's names, loaded by glibc into any
 # program that looks a name up: nothing of hull's but its own file.
@@ -257,6 +261,7 @@ PROBE = $(BUILD_DIR)/test/cli/rootfs/probe
 # the suite says the case is not measured.
 ARM64_CC    ?= aarch64-linux-gnu-gcc
 ARM64_PROBE := $(if $(shell command -v $(ARM64_CC) 2>/dev/null),$(BUILD_DIR)/test/arm64/rootfs/probe)
+AGENT_ARM64 := $(if $(shell command -v $(ARM64_CC) 2>/dev/null),$(BUILD_DIR)/hull-agent-arm64)
 
 TEST_SPEC_OBJS    = $(BUILD_DIR)/test/spec_test.o
 TEST_MATRIX_OBJS  = $(BUILD_DIR)/test/matrix_test.o
@@ -290,7 +295,7 @@ CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icor
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
 # which is installed apart, as root: `make nss`, or `make install-nss`.
-all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL) $(AGENT_BIN)
+all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL) $(AGENT_BIN) $(AGENT_ARM64)
 
 nss: $(NSS_LIB)
 
@@ -430,6 +435,10 @@ $(HULL): $(CLI_OBJS) $(CORE_OBJS) $(ENGINE_OBJS) $(STORE_OBJS) $(OCI_OBJS) $(PLA
 
 $(AGENT_BIN): $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
 	$(CC) -static $(CFLAGS) -o $@ $^
+
+# Its native objects first, which make the generated sources and headers.
+$(BUILD_DIR)/hull-agent-arm64: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
+	$(ARM64_CC) -static $(CPPFLAGS) $(CFLAGS) -o $@ $(AGENT_SOURCES)
 
 # One file, its own: only the _nss_hull_ entry points are visible.
 $(NSS_LIB): nss/nss_hull.c
@@ -604,7 +613,7 @@ check-flip: $(HULL) $(AGENT_BIN) $(PROBE) $(BUILD_DIR)/test/tree_tar
 	BUILD_DIR='$(BUILD_DIR)' sh test/flip_test.sh '$(HULL)' '$(PROBE)' \
 		'$(BUILD_DIR)/test/tree_tar'
 
-check-qemu: $(HULL) $(AGENT_BIN) $(PROBE)
+check-qemu: $(HULL) $(AGENT_BIN) $(PROBE) $(AGENT_ARM64) $(ARM64_PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/qemu_test.sh '$(HULL)' '$(PROBE)'
 
 # The unit tests, and the store and pull suites, built and run with
@@ -718,7 +727,8 @@ clean:
 	        $(SPEC_OBJS) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS) $(PLAN_OBJS:.o=.d) \
 	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(STORE_OBJS) $(STORE_OBJS:.o=.d) $(OCI_OBJS) $(OCI_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) $(ROOT_BIN) \
 	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) $(DISC_GEN) $(FRAME_GEN) \
-	        $(AGENT_BIN) $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
+	        $(AGENT_BIN) $(BUILD_DIR)/hull-agent-arm64 \
+	        $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(BUILD_DIR)/test/arm64/rootfs/probe \
 	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) $(FUZZ_FILES) \
 	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor

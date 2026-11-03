@@ -8,6 +8,10 @@
  * printed; at once where it is there already. 0, or -1 with `why`. */
 int hull_kernel_fetch(char *why, size_t cap);
 
+/* The same for `arch`'s pinned kernel, amd64's or arm64's, into its own
+ * directory (engine/kernel.h). */
+int hull_kernel_fetch_arch(const char *arch, char *why, size_t cap);
+
 /* The Debian package at `path` under the pool, or where the pool has it
  * no longer under the snapshot (engine/kernel.h), downloaded to `deb` and
  * checked against `sha256`, its data.tar.xz decompressed into `tar`, a new

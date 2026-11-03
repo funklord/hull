@@ -2436,6 +2436,63 @@ for run in "$nokernel" "$fetchedrun" "$chosenrun"; do
 done
 rm -rf "${nokernel:?}" "${fetchedrun:?}" "${chosenrun:?}"
 
+# Phase 2's exit, its ARM half (section 12): an arm64 directory rootfs on
+# x86 under emu, qemu-system-aarch64's virt machine booting Debian's arm64
+# kernel, which `hull kernel fetch --arch arm64` puts in the cache, with
+# the agent built for arm64 beside hull. Each run on a core of its own,
+# the engine reading the cache from the core's environment. Where qemu's
+# aarch64 system emulator, the cross-built agent or the arm64 probe is
+# missing, or the archive cannot be reached, it is said and not run.
+arm64_probe=${BUILD_DIR:?}/test/arm64/rootfs/probe
+if ! command -v qemu-system-aarch64 > /dev/null || [ ! -x "$(dirname "$hull")/hull-agent-arm64" ] ||
+   [ ! -x "$arm64_probe" ]; then
+	printf 'qemu: arm64 under emu not tried: no qemu-system-aarch64, hull-agent-arm64 or arm64 probe\n'
+else
+	rm -rf "$root/a64root"
+	mkdir -p "$root/a64root/proc" "$root/a64root/dev" "$root/a64root/sys"
+	cp "$arm64_probe" "$root/a64root/probe"
+	printf '(machine (source "dir:./a64root") (backend emu) (arch arm64) (hostname "qa64") %s)\n' \
+		'(command "/probe" "say" "from arm64" "host" "read" "/proc/sys/kernel/arch" "exit" "5")' \
+		> "$root/a64.conf"
+	a64none=$(mktemp -d "$root/run-a64none.XXXXXX")
+	a64run=$(mktemp -d "$root/run-a64.XXXXXX")
+	name='an arm64 machine with no arm64 kernel fetched'
+	out=$(cd / && XDG_RUNTIME_DIR=$a64none XDG_CACHE_HOME="$root/cache-empty" timeout 60 \
+		"$hull" run -f "$root/a64.conf" 2>&1)
+	got=$?
+	has 125 '`hull kernel fetch --arch arm64` downloads it'
+	name='kernel fetch --arch arm64'
+	out=$(XDG_CACHE_HOME="$root/cache" timeout 300 "$hull" kernel fetch --arch arm64 2>&1)
+	got=$?
+	if [ "$got" -ne 0 ] && printf '%s\n' "$out" | grep -q 'answered\|could not\|resolve\|connect'; then
+		printf 'qemu: arm64 under emu not tried: %s\n' "$out"
+	else
+		has 0 "^$root/cache/hull/kernel-arm64-[0-9]"
+		name='an arm64 machine under emu'
+		out=$(cd / && XDG_RUNTIME_DIR=$a64run XDG_CACHE_HOME="$root/cache" timeout 300 \
+			"$hull" run -f "$root/a64.conf" 2>&1)
+		got=$?
+		has 5 '^from arm64$'
+		has 5 '^host=qa64$'
+		has 5 '^read=aarch64$'
+	fi
+	# Only emu runs another arch: on vm, refused at plan.
+	printf '(machine (source "dir:./a64root") (backend vm) (arch arm64) (command "/probe"))\n' \
+		> "$root/a64vm.conf"
+	name='(arch arm64) on vm'
+	out=$(timeout 30 "$hull" plan -f "$root/a64vm.conf" 2>&1)
+	got=$?
+	has 1 'only the emu class runs an arch other than the host'
+	for run in "$a64none" "$a64run"; do
+		tries=0
+		while [ -S "$run/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+			tries=$((tries + 1))
+			sleep 0.25
+		done
+	done
+	rm -rf "${a64none:?}" "${a64run:?}"
+fi
+
 # hull export --bootable (section 3.13): a tree as a disk image that boots
 # by itself under UEFI, here qemu with OVMF and no hull: Limine, the host's
 # kernel, the agent as the initramfs's init, which mounts the tree's

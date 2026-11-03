@@ -120,7 +120,7 @@ static void usage(FILE *out)
 	      "       hull reserve POOL [--count N] [--wait D|--no-wait] | hull release ID\n"
 	      "       hull pool ls | hull lease ls\n"
 	      "       hull pack DIR|REF FILE | hull unpack FILE|- DIR\n"
-	      "       hull export --bootable DIR|REF IMAGE [--init PATH] | hull kernel fetch\n"
+	      "       hull export --bootable DIR|REF IMAGE [--init PATH] | hull kernel fetch [--arch ARCH]\n"
 	      "       hull sshd fetch\n"
 	      "       hull export --bootable -f FILE [NAME] IMAGE\n"
 	      "       hull build [-f FILE] [--check] REF\n"
@@ -6074,10 +6074,11 @@ int main(int argc, char **argv)
 		return commit(argv[4], argv[5], argv[3], 0);
 	if (strcmp(command, "materialize") == 0 && argc == 4)
 		return materialize(argv[2], argv[3]);
-	if (strcmp(command, "kernel") == 0 && argc == 3 && strcmp(argv[2], "fetch") == 0) {
+	if (strcmp(command, "kernel") == 0 && (argc == 3 || (argc == 5 && strcmp(argv[3], "--arch") == 0)) &&
+	    strcmp(argv[2], "fetch") == 0) {
 		char why[4400] = "";
 
-		if (hull_kernel_fetch(why, sizeof why) != 0) {
+		if (hull_kernel_fetch_arch(argc == 5 ? argv[4] : "amd64", why, sizeof why) != 0) {
 			fprintf(stderr, "hull: kernel fetch: %s\n", why);
 			return 1;
 		}
