@@ -297,10 +297,15 @@ expect 2 'no services' "$hull" import "$dir/noservices.yml"
 cases=$((cases + 1))
 out=$(timeout 20 "$hull" doctor 2>&1)
 got=$?
-bad=$(printf '%s\n' "$out" | grep -Ev '^(ok|missing|limited|absent) +[a-zA-Z/]|^  fix \(as root\): .')
+bad=$(printf '%s\n' "$out" | grep -Ev '^(ok|missing|limited|absent) +[a-zA-Z/]|^  fix \(as (root|the user)\): .')
 [ "$got" = 0 ] && [ -z "$bad" ] && [ -n "$out" ] ||
 	fail "hull doctor exited $got, or a line is not a check's" "$out"
 expect 0 '^ok +user namespaces$' "$hull" doctor
+# A vm's kernel: where the host's cannot be read, as on Ubuntu, and none
+# has been fetched, the fix is the user's own command (Appendix F).
+expect 0 '^ok +a vm.s kernel, the host.s: /' "$hull" doctor
+expect 0 '^  fix \(as the user\): hull kernel fetch$' \
+	env HULL_BOOT_DIR=/nonexistent XDG_CACHE_HOME="$dir/nocache" "$hull" doctor
 # A tool is found on PATH, and said where.
 mkdir -p "$dir/tools"
 printf '#!/bin/sh\n' > "$dir/tools/squashfuse"

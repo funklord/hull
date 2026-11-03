@@ -56,6 +56,7 @@
 #include "core.h"
 #include "doctor.h"
 #include "export.h"
+#include "kernel_fetch.h"
 #include "import.h"
 #include "matrix.h"
 #include "names.h"
@@ -118,7 +119,7 @@ static void usage(FILE *out)
 	      "       hull reserve POOL [--count N] [--wait D|--no-wait] | hull release ID\n"
 	      "       hull pool ls | hull lease ls\n"
 	      "       hull pack DIR|REF FILE | hull unpack FILE|- DIR\n"
-	      "       hull export --bootable DIR|REF IMAGE [--init PATH]\n"
+	      "       hull export --bootable DIR|REF IMAGE [--init PATH] | hull kernel fetch\n"
 	      "       hull build [-f FILE] [--check] REF\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
@@ -5912,6 +5913,15 @@ int main(int argc, char **argv)
 		return commit(argv[4], argv[5], argv[3], 0);
 	if (strcmp(command, "materialize") == 0 && argc == 4)
 		return materialize(argv[2], argv[3]);
+	if (strcmp(command, "kernel") == 0 && argc == 3 && strcmp(argv[2], "fetch") == 0) {
+		char why[4400] = "";
+
+		if (hull_kernel_fetch(why, sizeof why) != 0) {
+			fprintf(stderr, "hull: kernel fetch: %s\n", why);
+			return 1;
+		}
+		return 0;
+	}
 	if (strcmp(command, "export") == 0 && argc == 5 && strcmp(argv[2], "--bootable") == 0)
 		return export_bootable(argv[3], argv[4], "/sbin/init");
 	if (strcmp(command, "export") == 0 && argc == 7 && strcmp(argv[2], "--bootable") == 0 &&

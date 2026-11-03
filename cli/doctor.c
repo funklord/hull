@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include "doctor.h"
+#include "kernel.h"
 
 #define TMPFS_MAGIC 0x01021994
 #define RAMFS_MAGIC 0x858458f6
@@ -252,6 +253,35 @@ static void device(const char *path, const char *what, const char *name)
 	fix(text);
 }
 
+/* A vm's kernel: the host's own where the user may read it, else one
+ * `hull kernel fetch` put in the cache (Appendix F). Not root's to fix. */
+static void vm_kernel(void)
+{
+	struct utsname host;
+	const char    *boot = getenv("HULL_BOOT_DIR");
+	char           path[4400];
+	char           fetched[4096];
+
+	if (uname(&host) != 0)
+		return;
+	/* HULL_BOOT_DIR names another /boot, as the engine reads it. */
+	snprintf(path, sizeof path, "%s/vmlinuz-%s",
+	         boot != NULL && boot[0] == '/' ? boot : "/boot", host.release);
+	if (access(path, R_OK) == 0) {
+		line("ok", "a vm's kernel, the host's", path);
+		return;
+	}
+	if (hull_kernel_dir(fetched, sizeof fetched) == 0) {
+		snprintf(path, sizeof path, "%s/boot/vmlinuz-%s", fetched, HULL_KERNEL_RELEASE);
+		if (access(path, R_OK) == 0) {
+			line("ok", "a vm's kernel, fetched", path);
+			return;
+		}
+	}
+	line("missing", "a vm's kernel", "the host's cannot be read by this user, and none is fetched");
+	printf("  fix (as the user): hull kernel fetch\n");
+}
+
 static int runtime(const char *why)
 {
 	const char   *dir = getenv("XDG_RUNTIME_DIR");
@@ -316,6 +346,7 @@ int hull_doctor(const char *runtime_why)
 	device("/dev/kvm", "vm and emu machines (/dev/kvm)", name);
 	device("/dev/vhost-vsock", "a vm's agent (/dev/vhost-vsock)", name);
 	device("/dev/fuse", "FUSE, an image read or changed without a mount (/dev/fuse)", name);
+	vm_kernel();
 	usable = runtime(runtime_why) && usable;
 	tool("passt", "a vm's network");
 	tool("qemu-system-x86_64", "vm and emu machines on x86_64");

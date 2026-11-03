@@ -1188,7 +1188,7 @@ Open:
 
 **The qemu engine runs vm and emu machines as the user, on the host's own kernel: `engine/qemu.c`.** Nothing it does asks for root.
 
-- **What a user needs:** `/dev/kvm` for vm and `/dev/vhost-vsock` for both, which Debian opens to every user, a readable `/boot/vmlinuz` of the running kernel, and `passt` for the network.
+- **What a user needs:** `/dev/kvm` for vm and `/dev/vhost-vsock` for both, which Debian opens to every user, a readable `/boot/vmlinuz` of the running kernel or, since 2026-11-03, a kernel `hull kernel fetch` has put in the user's cache (Appendix F), and `passt` for the network.
 - **The machine:** a q35 machine with the host's kernel and an initramfs the engine writes for it into `$XDG_RUNTIME_DIR/hull/qemu-<pid>-<n>/`. The initramfs holds the guest agent as `/init` and the modules the agent loads to reach its directory and the host.
 - **The modules:** the kernel's 9p, vsock, virtio_net and overlay modules, with what `modules.dep` says they need, loaded in modprobe's order. They are xz-compressed, which the kernel decompresses itself, so the agent hands them over as they are.
 - **The rest of the host's modules, since 2026-10-22,** are the guest's too, since its kernel is the host's: `/lib/modules/<release>` is a share of its own, read-only to qemu and to the agent, mounted at that path in the machine, so that a workload's own `modprobe` finds what it asks for, as a test of network software loads `mac80211_hwsim`, `hci_vhci` or `pppoe` (netcfgd's VM tier, its `tool/vm/payload/capability.sh`, is the caller this is for). Its place is made only above `(mutable overlay)`, whose upper layer is the guest's tmpfs; in a directory used in place it would be made in the user's own tree unasked, so there the share is mounted only where the directory has the place already, and a machine without one boots without it. The workload needs its own `modprobe`, kmod's, to use them. **Measured** in `test/qemu_test.sh`: the probe, with no modprobe, loads `mac80211_hwsim` and the four modules `modules.dep` says it needs, in modprobe's order, and `/sys/class/ieee80211` then holds `phy0` and `phy1`; a write under the share is refused; and a machine on a directory in place leaves no `lib` in it. **Sabotage,** baseline first, in scratch copies: breaking each of these failed a named case: the share not given to qemu, not mounted by the agent, its place made in a directory used in place, its place never made, and the share writable both to qemu and to the agent. Writable to either alone survived, the other's read-only holding, which is two locks rather than a gap; the run that made qemu's alone writable failed, but on `hull stats`'s CPU figure, a timing case of its own, and not on the share, so it is counted as surviving.
@@ -2003,6 +2003,27 @@ The bundled kernel is the vm backend's biggest liability (§11.1); this is the c
 - **CVE response:** subscribe to the LTS stable queue; a kernel-only patch release channel (`hull self-update --kernel-only`) decouples security updates from feature releases. Because the config is tiny, the honest expectation is that most kernel CVEs don't apply — each advisory gets a public applies/doesn't-apply note.
 - **Escape hatches, in order of preference:** `(kernel "path:./bzImage")` (bring your own), `(kernel image)` (the image ships `/hull/kernel`, for kernel-testing workloads — this is also how you run a *different kernel version per machine*, something Docker structurally cannot do), and the vm `full` profile for full-distro kernels.
 - Non-goal: general module support in the microVM kernel. A workload needing arbitrary modules is a full-VM workload; the matrix says so.
+
+**The first kernel hull provides, built 2026-11-03: fetched, not built** (`cli/kernel_fetch.c`, the pin in `engine/kernel.h`). Under §9's dependency rule, by the holder's word of 2026-11-02, a kernel is downloaded when needed rather than shipped. The plan above, a tiny reproducible kernel of hull's own, is not replaced; this serves the case that was blocking users now.
+
+- **Why now:** a vm boots the host's own `/boot/vmlinuz-RELEASE`, and Ubuntu keeps it `0600` root's, so a rootless vm could not boot there at all.
+- **What:** `hull kernel fetch` downloads Debian's generic amd64 kernel package, pinned by version (`6.12.107-1`) and by the package's sha256, into `$XDG_CACHE_HOME/hull/kernel-VERSION/`:
+  - its `data.tar.xz` is read out of the `.deb`'s ar archive by hull itself and decompressed by the system's liblzma;
+  - its tar is unpacked by the store's layer reader;
+  - its modules are moved from `usr/lib/modules` to `lib/modules` and indexed by the host's `depmod -b`.
+  - About 108 MB fetched and 121 MB kept; 10 s here. A second fetch finds it there and fetches nothing.
+- **When it is used:** where the user cannot read the host's kernel, the engine boots the fetched one, and its modules come from the cache wherever the host's would: the initramfs, `modules.alias` for a USB device's drivers, and the guest's `/lib/modules` share. Where neither kernel is there, the start is refused, naming the command. The download is the command's, not the engine's, so a `hull run` never reaches the network unasked.
+- **The generic kernel, not Debian's cloud kernel:** the cloud kernel has no 9p (`CONFIG_9P_FS` unset in its config, read 2026-11-03), and a vm's root and volumes are 9p shares. It has virtiofs, which hull does not use yet.
+- **Not yet:**
+  - `(kernel fetched)` as a spec value, to choose it where the host's is readable: the same kernel on every host, which is this appendix's aim;
+  - the pin moving by itself: an old version leaves Debian's pool, and the fetch then says so and names the pin to move;
+  - arm64.
+- **Measured** in `test/qemu_test.sh`, with `HULL_BOOT_DIR` standing in for an unreadable `/boot`:
+  - with nothing fetched, the start is refused, naming `hull kernel fetch`;
+  - the fetch puts the kernel in the suite's cache;
+  - a vm boots on it with its module directory the package's, which has no `build` or `source` link where the host's install has both;
+  - a second fetch downloads nothing.
+- **Sabotage:** the engine reading `/boot` whatever `HULL_BOOT_DIR` said failed the refusal and both module-directory cases.
 
 ---
 

@@ -80,6 +80,7 @@
 #include "builtin.h"
 #include "wire.h"
 #include "idmap.h"
+#include "kernel.h"
 #include "tree.h"
 
 #define MAX_VOLUMES  64u
@@ -887,7 +888,7 @@ static int same_module(const char *a, size_t length, const char *b)
  * found through modules.softdep and an alias, and the guest has no
  * modprobe: taken where the host has it as a module, and passed over
  * where it does not, built in or not there at all. */
-static const char *find_modules(const char *release, const char *const *extra,
+static const char *find_modules(const char *modules, const char *const *extra,
                                 unsigned extra_count, module_list *list)
 {
 	static const char *const base[] = { "9p", "9pnet_virtio", "vmw_vsock_virtio_transport",
@@ -901,7 +902,7 @@ static const char *find_modules(const char *release, const char *const *extra,
 	size_t      length = 0u;
 	const char *reason = NULL;
 
-	snprintf(path, sizeof path, "/lib/modules/%s/modules.dep", release);
+	snprintf(path, sizeof path, "%s/modules.dep", modules);
 	dep = (char *)slurp(path, &length);
 	if (dep == NULL)
 		return "the host kernel's modules.dep cannot be read";
@@ -1080,7 +1081,7 @@ static const char *build_root_image(hull_machine *m)
 	return NULL;
 }
 
-static const char *write_initramfs(const hull_machine *m, const char *release, int load_modules)
+static const char *write_initramfs(const hull_machine *m, const char *modules, int load_modules)
 {
 	const char *dir = m->dir;
 	const char *extra[MAX_MODULES];
@@ -1134,7 +1135,7 @@ static const char *write_initramfs(const hull_machine *m, const char *release, i
 				extra[0] = "xhci_pci";
 				extra_count++;
 			}
-			snprintf(aliases, sizeof aliases, "/lib/modules/%s/modules.alias", release);
+			snprintf(aliases, sizeof aliases, "%s/modules.alias", modules);
 			got = hull_hostdev_usb_drivers(HULL_SYSFS_USB, d->host.port, aliases,
 			                               &drivers[extra_count][0], sizeof drivers[0],
 			                               MAX_MODULES - extra_count);
@@ -1187,7 +1188,7 @@ static const char *write_initramfs(const hull_machine *m, const char *release, i
 				extra[extra_count++] = wanted[w];
 		}
 	}
-	if (load_modules && (reason = find_modules(release, extra, extra_count, &list)) != NULL) {
+	if (load_modules && (reason = find_modules(modules, extra, extra_count, &list)) != NULL) {
 		free(data);
 		return reason;
 	}
@@ -1210,7 +1211,7 @@ static const char *write_initramfs(const hull_machine *m, const char *release, i
 		char        name[300];
 
 		base = base != NULL ? base + 1 : list.path[i];
-		snprintf(path, sizeof path, "/lib/modules/%s/%s", release, list.path[i]);
+		snprintf(path, sizeof path, "%s/%s", modules, list.path[i]);
 		data = slurp(path, &length);
 		if (data == NULL) {
 			a.failed = 1;
@@ -1591,7 +1592,7 @@ static int write_map(const char *path, const char *format, unsigned id)
 
 /* Fork qemu for `m`, with `cid` for its vsock device. Its stdout and
  * stderr go to qemu.log. */
-static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int load_modules,
+static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir, int load_modules,
                    uint32_t cid)
 {
 	uid_t       uid = getuid();   /* read here: unmapped once unshared */
@@ -1811,7 +1812,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *release, int
 	 * mac80211_hwsim or pppoe. A path kernel the host has no modules for is
 	 * taken to have its drivers built in, and gets no share. */
 	if (load_modules) {
-		snprintf(path, sizeof path, "/lib/modules/%s", release);
+		snprintf(path, sizeof path, "%s", modules_dir);
 		escaped(modules_at, sizeof modules_at, path);
 		snprintf(modules, sizeof modules,
 		         "local,id=modules,path=%s,security_model=none,readonly=on", modules_at);
@@ -2747,8 +2748,8 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	struct utsname name;
 	const char    *reason;
 	const char    *kernel;         /* the -kernel file */
-	const char    *release;        /* its release, for its modules on the host */
-	char           kbuf[512];      /* the host kernel's path, for bundled */
+	char           mbuf[4300] = "";   /* its modules, the host's or the fetched kernel's */
+	char           kbuf[4300];     /* the host kernel's path, for bundled */
 	char           ibuf[4200];     /* the image's /hull/kernel, for (kernel image) */
 	char           rbuf[256];      /* a path kernel's release */
 	int            load_modules;   /* the host has this release's modules */
@@ -2782,19 +2783,36 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 			            "(kernel image) wants the image's own /hull/kernel, and it has none" :
 			            "the kernel at (kernel \"path:...\") cannot be read");
 		if (kernel_release(kernel, rbuf, sizeof rbuf)) {
-			char dep[600];
+			char dep[4400];
 
-			release = rbuf;
-			snprintf(dep, sizeof dep, "/lib/modules/%s/modules.dep", release);
+			snprintf(mbuf, sizeof mbuf, "/lib/modules/%s", rbuf);
+			snprintf(dep, sizeof dep, "%s/modules.dep", mbuf);
 			load_modules = access(dep, R_OK) == 0;
 		} else {
-			release = "";
 			load_modules = 0;
 		}
 	} else {
-		snprintf(kbuf, sizeof kbuf, "/boot/vmlinuz-%s", name.release);
+		/* The host's own, where the user may read it; else the kernel
+		 * `hull kernel fetch` put in the user's cache (Appendix F), as
+		 * Ubuntu keeps /boot/vmlinuz root's alone. HULL_BOOT_DIR names
+		 * another /boot, for the test of that. */
+		const char *boot = getenv("HULL_BOOT_DIR");
+		char        fetched[4096];
+
+		snprintf(kbuf, sizeof kbuf, "%s/vmlinuz-%s",
+		         boot != NULL && boot[0] == '/' ? boot : "/boot", name.release);
+		snprintf(mbuf, sizeof mbuf, "/lib/modules/%s", name.release);
+		if (access(kbuf, R_OK) != 0) {
+			if (hull_kernel_dir(fetched, sizeof fetched) != 0)
+				fetched[0] = '\0';
+			snprintf(kbuf, sizeof kbuf, "%s/boot/vmlinuz-%s", fetched, HULL_KERNEL_RELEASE);
+			snprintf(mbuf, sizeof mbuf, "%s/lib/modules/%s", fetched, HULL_KERNEL_RELEASE);
+			if (fetched[0] == '\0' || access(kbuf, R_OK) != 0)
+				return fail(error, HULL_ERR_RUNTIME, "the host's kernel cannot be read by the "
+				            "user, and no kernel has been fetched: `hull kernel fetch` "
+				            "downloads Debian's, once");
+		}
 		kernel = kbuf;
-		release = name.release;
 		load_modules = 1;
 	}
 
@@ -2834,7 +2852,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	}
 	if ((reason = make_dir(m)) != NULL ||
 	    (m->block_root && (reason = build_root_image(m)) != NULL) ||
-	    (reason = write_initramfs(m, release, load_modules)) != NULL ||
+	    (reason = write_initramfs(m, mbuf, load_modules)) != NULL ||
 	    (reason = open_listeners(m)) != NULL) {
 		if (reason != m->detail)
 			snprintf(m->detail, sizeof m->detail, "%s", reason);
@@ -2862,7 +2880,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 			m->network = -1;
 			break;
 		}
-		m->qemu = spawn(m, kernel, release, load_modules, cid);
+		m->qemu = spawn(m, kernel, mbuf, load_modules, cid);
 		close(m->network);
 		m->network = -1;
 		close_segments(m);
@@ -4135,6 +4153,7 @@ const char *hull_qemu_boot_files(const char *dir, const char *boot, char *kernel
 {
 	static hull_machine m;
 	struct utsname      name;
+	char                modules[600];
 	const char         *reason;
 
 	if (uname(&name) != 0 || strcmp(name.machine, "x86_64") != 0) {
@@ -4150,7 +4169,8 @@ const char *hull_qemu_boot_files(const char *dir, const char *boot, char *kernel
 	snprintf(m.dir, sizeof m.dir, "%s", dir);
 	m.block_root = 1;
 	m.boot       = boot;
-	if ((reason = write_initramfs(&m, name.release, 1)) != NULL) {
+	snprintf(modules, sizeof modules, "/lib/modules/%s", name.release);
+	if ((reason = write_initramfs(&m, modules, 1)) != NULL) {
 		snprintf(detail, detail_cap, "%s", reason);
 		return detail;
 	}

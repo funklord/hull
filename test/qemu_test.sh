@@ -99,6 +99,12 @@ has() {
 	fi
 }
 
+# refute_out PATTERN: no line of the last boot's matches it.
+refute_out() {
+	cases=$((cases + 1))
+	! printf '%s\n' "$out" | grep -Eq -- "$1" || fail "$name: a line matches /$1/" "$out"
+}
+
 # address_of ID: section 8.1's address, worked here rather than taken
 # from the core: FNV-1a of the id, modulo 256 * 254, as x * 254 + y - 1.
 xcase() { # STATUS PATTERN COMMAND...: an exec, as has() checks a boot
@@ -284,10 +290,6 @@ else
 	has 0 '^load=ok$'
 	has 0 '^list= phy0 phy1$'
 	has 0 '^write=Read-only file system$'
-	refute_out() { # PATTERN: no line of the last boot's matches it
-		cases=$((cases + 1))
-		! printf '%s\n' "$out" | grep -Eq -- "$1" || fail "$name: a line matches /$1/" "$out"
-	}
 	refute_out '^load=[^o]'
 fi
 conf inplace '(backend vm)' '(command "/probe" "say" "booted")'
@@ -2146,6 +2148,58 @@ cases=$((cases + 1))
 left=$(ls -A "$shm/hull/secrets" 2>&1; ls -d "$shm"/hull/qemu-* 2>/dev/null)
 [ -z "$left" ] || fail "a vm's secrets or its directory were left" "$left"
 rm -rf "${shm:?}"
+
+# Appendix F's fetched kernel: where the host's kernel cannot be read, as
+# Ubuntu keeps /boot/vmlinuz root's alone, a vm boots the Debian kernel
+# `hull kernel fetch` put in the user's cache, with its own modules.
+# HULL_BOOT_DIR stands for an unreadable /boot, so each machine here gets
+# a core of its own, started with it and its cache: a core outlives the
+# run that started it, and a second run would otherwise reach the first's.
+# The kernel is fetched once into the suite's cache, kept between runs;
+# offline, the case says so.
+nokernel=$(mktemp -d "$root/run-nokernel.XXXXXX")
+fetchedrun=$(mktemp -d "$root/run-fetched.XXXXXX")
+mkdir -p "$root/cache-empty"
+krelease=$(sed -n 's/^#define HULL_KERNEL_RELEASE "\(.*\)"$/\1/p' engine/kernel.h)
+printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) %s)\n' \
+	"(command \"/probe\" \"say\" \"fetched\" \"list\" \"/lib/modules/$krelease\")" \
+	> "$root/vfetched.conf"
+name='a vm with no kernel to read'
+out=$(cd / && XDG_RUNTIME_DIR=$nokernel XDG_CACHE_HOME="$root/cache-empty" \
+	HULL_BOOT_DIR=/nonexistent timeout 60 "$hull" run -f "$root/vfetched.conf" 2>&1)
+got=$?
+has 125 'no kernel has been fetched: `hull kernel fetch`'
+name='kernel fetch'
+out=$(XDG_CACHE_HOME="$root/cache" timeout 300 "$hull" kernel fetch 2>&1)
+got=$?
+if [ "$got" -ne 0 ] && printf '%s\n' "$out" | grep -q 'answered\|could not\|resolve\|connect'; then
+	printf 'qemu: the fetched kernel not tried: %s\n' "$out"
+else
+	has 0 "^$root/cache/hull/kernel-[0-9]"
+	# Its modules are its own: Debian's package has no build or source
+	# link in its module directory, where the host's install has both.
+	name='a vm on the fetched kernel'
+	out=$(cd / && XDG_RUNTIME_DIR=$fetchedrun XDG_CACHE_HOME="$root/cache" \
+		HULL_BOOT_DIR=/nonexistent timeout 60 "$hull" run -f "$root/vfetched.conf" 2>&1)
+	got=$?
+	has 0 '^fetched$'
+	has 0 '^list= kernel modules\.alias '
+	refute_out '^list=.* (build|source)( |$)'
+	# Fetched again, at once: it is there.
+	name='kernel fetch, again'
+	out=$(XDG_CACHE_HOME="$root/cache" timeout 30 "$hull" kernel fetch 2>&1)
+	got=$?
+	has 0 "^$root/cache/hull/kernel-[0-9]"
+	refute_out 'fetching'
+fi
+for run in "$nokernel" "$fetchedrun"; do
+	tries=0
+	while [ -S "$run/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+done
+rm -rf "${nokernel:?}" "${fetchedrun:?}"
 
 # hull export --bootable (section 3.13): a tree as a disk image that boots
 # by itself under UEFI, here qemu with OVMF and no hull: Limine, the host's
