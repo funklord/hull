@@ -1246,6 +1246,17 @@ static const char *write_initramfs(const hull_machine *m, const char *modules, i
 		extra[extra_count++] = "?crc32c_generic";
 		extra[extra_count++] = "ext4";
 	}
+	/* A bootable export boots on machines other than qemu's, whose disks
+	 * are not virtio: a SATA controller, as VirtualBox's and most PCs'
+	 * are, its older IDE one, the SCSI disk layer both report through, and
+	 * NVMe. Without them the agent found no partition under VirtualBox,
+	 * measured. Each optional, a kernel that builds one in having none. */
+	if (m->boot != NULL && load_modules && extra_count + 4u <= MAX_MODULES) {
+		extra[extra_count++] = "?ahci";
+		extra[extra_count++] = "?ata_piix";
+		extra[extra_count++] = "?sd_mod";
+		extra[extra_count++] = "?nvme";
+	}
 	/* An image volume's drive, and the filesystem each is. ext4, xfs,
 	 * btrfs and erofs check their metadata with the crypto API's crc32c,
 	 * a soft dependency: without it ext4's mount fails ENOENT. */

@@ -423,7 +423,11 @@ static void clean(const char *work)
 
 /* The ESP, `esp.img` in `work`: FAT32 with Limine as the removable-media
  * loader, BOOTX64.EFI, beside limine.conf, the kernel and the initramfs.
- * mkfs.vfat's --invariant and fixed mtimes make one input one image. */
+ * mkfs.vfat's --invariant and fixed mtimes make one input one image:
+ * every file and directory 2000-01-01 by SOURCE_DATE_EPOCH, mtools'
+ * time for what it makes, not the source's -- Limine built by `make
+ * limine` carries the hour it was built, which made two builds two
+ * images. */
 static int build_esp(const char *work, const char *loader, const char *kernel, char *why,
                      size_t cap)
 {
@@ -486,19 +490,19 @@ static int build_esp(const char *work, const char *loader, const char *kernel, c
 		                               "-n", "HULL-ESP", "-C", esp, size, NULL };
 		const char *const dirs[] = { "env", setting, "SOURCE_DATE_EPOCH=946684800", mmd, "-i",
 		                             esp, "::/EFI", "::/EFI/BOOT", NULL };
-		const char *const efi[] = { "env", setting, mcopy, "-m", "-i", esp, loader,
-		                            "::/EFI/BOOT/BOOTX64.EFI", NULL };
-		const char *const files[] = { "env", setting, mcopy, "-m", "-i", esp, kernel,
-		                              "::/vmlinuz", NULL };
-		const char *const rest[] = { "env", setting, mcopy, "-m", "-i", esp, initrd, conf,
-		                             "::/", NULL };
+		const char *const efi[] = { "env", setting, "SOURCE_DATE_EPOCH=946684800", mcopy, "-i",
+		                            esp, loader, "::/EFI/BOOT/BOOTX64.EFI", NULL };
+		const char *const files[] = { "env", setting, "SOURCE_DATE_EPOCH=946684800", mcopy, "-i",
+		                              esp, kernel, "::/vmlinuz", NULL };
+		const char *const rest[] = { "env", setting, "SOURCE_DATE_EPOCH=946684800", mcopy, "-i",
+		                             esp, initrd, conf, "::/", NULL };
 		char              built[4200];
 		char              stage[4300];
 		int               bios = limine_built(built, sizeof built) == 0 &&
 		                         snprintf(stage, sizeof stage, "%s/limine-bios.sys", built) > 0 &&
 		                         access(stage, R_OK) == 0;
-		const char *const bios_files[] = { "env", setting, mcopy, "-m", "-i", esp, stage,
-		                                   "::/", NULL };
+		const char *const bios_files[] = { "env", setting, "SOURCE_DATE_EPOCH=946684800",
+		                                   mcopy, "-i", esp, stage, "::/", NULL };
 
 		if (run(format, "the ESP could not be made", why, cap) != 0 ||
 		    run(dirs, "the ESP's directories could not be made", why, cap) != 0 ||

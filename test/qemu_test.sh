@@ -2617,7 +2617,10 @@ elif [ "$got" -ne 0 ] && printf '%s\n' "$out" | grep -q "Limine's loader"; then
 else
 	has 0 'boot\.img$'
 	# One tree, one image: the second export is the first's bytes,
-	# compared before the first is booted, which writes to it.
+	# compared before the first is booted, which writes to it -- with
+	# the built Limine's files touched between, so a source's mtime
+	# reaching the ESP shows, as `make limine`'s did.
+	[ -d "$(dirname "$hull")/limine" ] && touch "$(dirname "$hull")/limine/"*
 	name='export, again'
 	out=$(cd "$root" && timeout 120 "$hull" export --bootable ./bootroot boot2.img \
 		--init /sbin/booted 2>&1)
@@ -2672,6 +2675,25 @@ else
 	else
 		printf 'qemu: a bootable export not booted by a BIOS: no make limine\n'
 	fi
+	# On a SATA disk, as VirtualBox and most PCs give one, not virtio:
+	# the initramfs carries the AHCI and SCSI disk drivers for it.
+	# Without them the agent finds no partition, measured under
+	# VirtualBox before they were added. q35's own AHCI controller, and
+	# an image no OVMF has booted: OVMF with no variable store writes
+	# NvVars to the ESP, naming the disk it booted, and a later boot from
+	# another controller follows it to its shell, measured.
+	(cd "$root" && timeout 120 "$hull" export --bootable ./bootroot boot3.img \
+		--init /sbin/booted > /dev/null 2>&1)
+	rm -f "$root/boot.serial"
+	timeout 90 qemu-system-x86_64 -machine q35 -m 512 -enable-kvm -bios "$ovmf" \
+		-drive "file=$root/boot3.img,format=raw,if=none,id=sata" \
+		-device ide-hd,drive=sata,bus=ide.0 -display none -net none \
+		-serial "file:$root/boot.serial" -no-reboot >/dev/null 2>&1
+	got=$?
+	rm -f "$root/boot3.img"
+	out=$(tr -d '\r' < "$root/boot.serial" 2>&1 | grep -a -E 'booted|hull agent|Kernel panic')
+	name='export, booted from a SATA disk'
+	has 0 '^booted pid=1 root=ext4 writable=yes owned=0:0 probe=0:0$'
 	# A stored tree's explicit owners, as its manifest has them: the
 	# view edited to give etc/owned to 101:102 and compiled back.
 	timeout 30 "$hull" commit "$root/bootroot" boot/tree:1 >/dev/null 2>&1
