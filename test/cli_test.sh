@@ -3100,12 +3100,12 @@ done
 expect 75 'no slot of pool tpool: 1 of 1 in use, and the run does not wait' \
 	"$hull" run --no-wait -f "$root/pnext.conf"
 cases=$((cases + 1))
-out=$(cd / && timeout 30 "$hull" run --wait 1s -f "$root/pnext.conf" 2>&1)
+out=$(cd / && timeout 30 "$hull_abs" run --wait 1s -f "$root/pnext.conf" 2>&1)
 [ $? = 75 ] && printf '%s\n' "$out" | grep -q 'waiting for a slot of pool tpool: 1 of 1 in use, place 1 in line' &&
 	printf '%s\n' "$out" | grep -q 'no slot of pool tpool within 1s' ||
 	fail "a run that waits a second for a slot did not say so and end 75" "$out"
 cases=$((cases + 1))
-out=$(cd / && timeout 30 "$hull" run -f "$root/pnext.conf" 2>&1)
+out=$(cd / && timeout 30 "$hull_abs" run -f "$root/pnext.conf" 2>&1)
 [ $? = 0 ] && printf '%s\n' "$out" | grep -q 'waiting for a slot of pool tpool' &&
 	printf '%s\n' "$out" | grep -qx 'ran' ||
 	fail "a run that waits for a slot did not say so, or did not run once it freed" "$out"
@@ -3847,7 +3847,7 @@ for dosengine in dosbox dosemu; do
 			echo "cli: (display window) not measured: no Xvfb or xwininfo, or no free display"
 		fi
 		cases=$((cases + 1))
-		out=$(cd / && env -u DISPLAY timeout 30 "$hull" run -f "$root/doswin.conf" 2>&1)
+		out=$(cd / && env -u DISPLAY timeout 30 "$hull_abs" run -f "$root/doswin.conf" 2>&1)
 		[ $? = 125 ] && printf '%s\n' "$out" | grep -q 'needs an X display, and the run gave none' ||
 			fail "(display window) with no DISPLAY was not refused" "$out"
 		;;
