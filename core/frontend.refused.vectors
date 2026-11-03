@@ -184,3 +184,6 @@ client_message free_no_id 28 34 3A 66 72 65 65 28 32 3A 63 68 31 3A 37 29 29
 # leased_no_id: (5:lease(2:ch1:7))
 # lease: its answer carries the id
 core_message leased_no_id 28 35 3A 6C 65 61 73 65 28 32 3A 63 68 31 3A 37 29 29
+
+# exec_tree_false: (4:exec(4:tree5:false)(2:ch1:7)(7:machine3:web)(3:tty5:false))
+client_message exec_tree_false 28 34 3A 65 78 65 63 28 34 3A 74 72 65 65 35 3A 66 61 6C 73 65 29 28 32 3A 63 68 31 3A 37 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 28 33 3A 74 74 79 35 3A 66 61 6C 73 65 29 29

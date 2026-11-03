@@ -85,3 +85,6 @@ host_message resume_no_token 28 36 3A 72 65 73 75 6D 65 28 32 3A 63 68 31 3A 30 
 # resume_on_1: (6:resume(2:ch1:1)(5:token4:abcd))
 # control: resume is on channel 0
 host_message resume_on_1 28 36 3A 72 65 73 75 6D 65 28 32 3A 63 68 31 3A 31 29 28 35 3A 74 6F 6B 65 6E 34 3A 61 62 63 64 29 29
+
+# exec_tree_false: (4:exec(4:tree5:false)(2:ch1:3)(3:tty5:false))
+host_message exec_tree_false 28 34 3A 65 78 65 63 28 34 3A 74 72 65 65 35 3A 66 61 6C 73 65 29 28 32 3A 63 68 31 3A 33 29 28 33 3A 74 74 79 35 3A 66 61 6C 73 65 29 29
