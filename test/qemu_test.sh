@@ -1594,7 +1594,113 @@ else
 	cases=$((cases + 1))
 	{ [ "$nocode" != 0 ] && printf '%s\n' "$noout" | grep -q 'has no sshd'; } ||
 		fail "(ssh true) on an image with no sshd was not refused at start" "$nocode: $noout"
+	cases=$((cases + 1))
+	printf '%s\n' "$noout" | grep -q 'none has been fetched: `hull sshd fetch`' ||
+		fail "(ssh true) with no sshd anywhere did not name hull sshd fetch" "$noout"
 	rm -rf "$sshrt"
+fi
+# The fetched sshd (section 8.1 item 3): `hull sshd fetch` puts Debian's
+# dropbear, what it links and OpenSSH's sftp-server in the cache, and a vm
+# whose image has no sshd is given it. Its root is busybox and the C
+# library it links, copied from the host, a passwd naming root and no sshd:
+# real ssh logs in as root by a key of the test's, scp goes both ways (scp
+# is sftp since OpenSSH 9) and sftp lists, against the machine's own host
+# key pinned, each session ending as its command does. A core of its own,
+# since the engine finds the cache by the core's environment; its runtime
+# a tmpfs, the host key being private.
+dbrt=$(mktemp -d /dev/shm/hull-qdb.XXXXXX 2>/dev/null)
+busybox=$(command -v busybox 2>/dev/null)
+if [ -z "$dbrt" ] || [ -z "$busybox" ]; then
+	printf 'qemu: fetched sshd cases not tried: no tmpfs under /dev/shm, or no busybox\n'
+	[ -z "$dbrt" ] || rmdir "$dbrt"
+else
+	chmod 700 "$dbrt"
+	cases=$((cases + 1))
+	fetched=$(XDG_CACHE_HOME="$root/cache" timeout 120 "$hull" sshd fetch 2>&1)
+	code=$?
+	{ [ "$code" = 0 ] && [ -x "$(printf '%s\n' "$fetched" | tail -1)/usr/sbin/dropbear" ]; } ||
+		fail "hull sshd fetch did not put dropbear in the cache" "$code: $fetched"
+	again=$(XDG_CACHE_HOME="$root/cache" timeout 20 "$hull" sshd fetch 2>&1)
+	cases=$((cases + 1))
+	case $again in
+	*fetching*) fail "a second hull sshd fetch fetched again" "$again" ;;
+	esac
+	rm -rf "$root/dbroot"
+	mkdir -p "$root/dbroot/bin" "$root/dbroot/etc" "$root/dbroot/run" "$root/dbroot/tmp" \
+		"$root/dbroot/proc" "$root/dbroot/dev" "$root/dbroot/sys" "$root/dbroot/root"
+	cp "$busybox" "$root/dbroot/bin/busybox"
+	for a in sh cat id sleep; do
+		ln -s busybox "$root/dbroot/bin/$a"
+	done
+	# What busybox links, at the paths the host's loader gave.
+	for lib in $(ldd "$busybox" | sed -n 's/.*=> \(\/[^ ]*\) .*/\1/p; s/^[[:space:]]*\(\/[^ ]*\) .*/\1/p'); do
+		mkdir -p "$root/dbroot$(dirname "$lib")"
+		cp -L "$lib" "$root/dbroot$lib"
+	done
+	printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/dbroot/etc/passwd"
+	chmod 755 "$root/dbroot"
+	rm -f "$root/home/.ssh/dbkey" "$root/home/.ssh/dbkey.pub"
+	ssh-keygen -q -t ed25519 -N '' -C hull-test-db -f "$root/home/.ssh/dbkey"
+	printf '(machine (source "dir:./dbroot") (backend vm) (mutable overlay) (hostname "qdb") %s %s)\n' \
+		'(ssh true)' '(command "/bin/sh" "-c" "echo ready; exec sleep 300")' > "$root/qdb.conf"
+	{
+		printf 'Host qdb.hull\n'
+		printf '  ProxyCommand env XDG_RUNTIME_DIR=%s %s proxy-ssh %%h\n' "$dbrt" "$hull"
+		printf '  User root\n  IdentityFile %s\n  IdentitiesOnly yes\n' "$root/home/.ssh/dbkey"
+		printf '  BatchMode yes\n  ConnectTimeout 10\n  LogLevel error\n'
+		printf '  StrictHostKeyChecking yes\n  UserKnownHostsFile %s\n' "$root/qdb.known"
+	} > "$root/qdb.ssh"
+	rm -f "$root/qdb.out" "$root/qdb.known" "$root/qdb.sent" "$root/qdb.back"
+	(cd / && exec env XDG_RUNTIME_DIR="$dbrt" XDG_CACHE_HOME="$root/cache" timeout -k 2 300 \
+		"$hull" run -f "$root/qdb.conf" > "$root/qdb.out" 2>&1) &
+	runner=$!
+	tries=0
+	until grep -q '^ready$' "$root/qdb.out" 2>/dev/null || [ "$tries" -ge 60 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+	# The machine's host key, kept under the data home, is the one known:
+	# a login that succeeds is one whose key matched it.
+	printf 'qdb.hull %s\n' "$(cut -d' ' -f1,2 "$root/data/hull/machines/qdb/host_key.pub" 2>&1)" \
+		> "$root/qdb.known"
+	# dropbear converts the key and starts once the guest's kernel has its
+	# randomness, a few seconds after the workload is ready.
+	tries=0
+	until timeout 10 ssh -F "$root/qdb.ssh" qdb.hull true < /dev/null 2>/dev/null ||
+	      [ "$tries" -ge 40 ]; do
+		tries=$((tries + 1))
+		sleep 0.5
+	done
+	who=$(timeout 10 ssh -F "$root/qdb.ssh" qdb.hull 'id -u; echo "[$LD_LIBRARY_PATH]"' < /dev/null 2>&1)
+	printf 'sent by scp\n' > "$root/qdb.sent"
+	timeout 10 scp -F "$root/qdb.ssh" "$root/qdb.sent" qdb.hull:/tmp/sent < /dev/null > /dev/null 2>&1
+	landed=$(timeout 10 ssh -F "$root/qdb.ssh" qdb.hull cat /tmp/sent < /dev/null 2>&1)
+	listed=$(printf 'ls /tmp\n' | timeout 10 sftp -F "$root/qdb.ssh" -b - qdb.hull 2>&1)
+	timeout 10 scp -F "$root/qdb.ssh" qdb.hull:/etc/passwd "$root/qdb.back" < /dev/null > /dev/null 2>&1
+	XDG_RUNTIME_DIR="$dbrt" timeout 30 "$hull" stop qdb > /dev/null 2>&1
+	wait "$runner"
+	cases=$((cases + 1))
+	[ "$who" = "$(printf '0\n[]')" ] ||
+		fail "ssh did not log in as root through the fetched dropbear, its loader's path unseen" \
+			"$who; $(cat "$root/qdb.out")"
+	cases=$((cases + 1))
+	[ "$landed" = 'sent by scp' ] || fail "scp to the fetched dropbear did not land" "$landed"
+	cases=$((cases + 1))
+	printf '%s\n' "$listed" | grep -q '/tmp/sent' || fail "sftp to the fetched dropbear did not list" "$listed"
+	cases=$((cases + 1))
+	cmp -s "$root/qdb.back" "$root/dbroot/etc/passwd" ||
+		fail "scp from the fetched dropbear did not bring the file back" "$(cat "$root/qdb.back" 2>&1)"
+	# Refused at start, saying why, where dropbear would take no key: a /
+	# that others may write.
+	chmod 775 "$root/dbroot"
+	cases=$((cases + 1))
+	out=$(cd / && XDG_RUNTIME_DIR="$dbrt" timeout -k 2 60 "$hull" run -f "$root/qdb.conf" 2>&1)
+	code=$?
+	{ [ "$code" != 0 ] && printf '%s\n' "$out" | grep -q 'chmod go-w'; } ||
+		fail "(ssh true) under dropbear on a / others may write was not refused" "$code: $out"
+	chmod 755 "$root/dbroot"
+	rm -f "$root/home/.ssh/dbkey" "$root/home/.ssh/dbkey.pub"
+	rm -rf "$dbrt"
 fi
 # A udp port: each client its own flow, each datagram whole, an empty one
 # too, and the machine's replies to the client that sent. A datagram the

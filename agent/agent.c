@@ -85,6 +85,7 @@
 #include <linux/vm_sockets.h>
 
 #include "ip6.h"
+#include "sshd.h"
 #include "access.h"
 #include "tree.h"
 #include "wire.h"
@@ -122,6 +123,7 @@ static int    no_new_privs;
 static int    applied;     /* the spec is applied: the root is the machine's */
 static int    ssh_enabled; /* (ssh true): supervise the image's own sshd */
 static char   ssh_bin[256]; /* the image's sshd the agent found, absolute */
+static int    ssh_fetched; /* none in the image: `hull sshd fetch`'s dropbear */
 static char  *images[MAX_VOLUMES]; /* each (block ...) volume's guest path, to unmount */
 static unsigned image_count;
 
@@ -1306,6 +1308,11 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 			return "(ssh true) asked for, but no ssh material was delivered";
 		if ((reason = place_ssh(doc, ssh)) != NULL)
 			return reason;
+		/* The fetched sshd, where the engine shared it: used only where
+		 * the image has none (below). */
+		if (mkdir("/machine/run/hull/sshd", 0755) == 0 &&
+		    share("sshd", "/machine/run/hull/sshd", 1) != 0)
+			rmdir("/machine/run/hull/sshd");
 	}
 	/* The kernel's filesystems inside, where the machine has a place for
 	 * them; then the directory becomes /. */
@@ -1324,18 +1331,22 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	    chroot(".") != 0 || chdir("/") != 0)
 		return "the machine's directory could not become its root";
 	/* The image's own sshd, now that its root is in place: the first of the
-	 * usual two paths that is executable. Absent, (ssh true) is refused
-	 * here rather than run silently without one (section 6). Bundling one
-	 * for a bare rootfs is a later increment (section 8.1). */
+	 * usual two paths that is executable. Absent, the dropbear `hull sshd
+	 * fetch` put beside the machine (section 8.1 item 3), which logs in as
+	 * the image's root: a root with no passwd entry for root, or a / that
+	 * others may write, which dropbear holds against every key, is refused
+	 * here rather than given an sshd no key can log in to. Neither, and
+	 * (ssh true) is refused rather than run silently without one
+	 * (section 6). */
 	if (ssh_enabled) {
-		static const char *const where[] = { "/usr/sbin/sshd", "/usr/bin/sshd", NULL };
-		unsigned                 i;
+		const char *found;
 
-		for (i = 0u; where[i] != NULL && access(where[i], X_OK) != 0; i++)
-			;
-		if (where[i] == NULL)
-			return "(ssh true): the image has no sshd at /usr/sbin/sshd or /usr/bin/sshd";
-		snprintf(ssh_bin, sizeof ssh_bin, "%s", where[i]);
+		if ((reason = hull_sshd_choose(&found)) != NULL)
+			return reason;
+		if (found != NULL)
+			snprintf(ssh_bin, sizeof ssh_bin, "%s", found);
+		else
+			ssh_fetched = 1;
 	}
 	applied = 1;
 	return NULL;
@@ -1591,17 +1602,30 @@ static const char *hand_over(void)
 	return NULL;
 }
 
-/* The image's sshd, supervised beside the workload: a child off every
- * channel, so its exit is reaped like any orphan and never ends the machine
- * (which only channel 0 does). It reads its host key, authorized_keys and
- * config from the tmpfs place_ssh made, by absolute path. */
+/* The image's sshd, or the fetched dropbear, supervised beside the
+ * workload: a child off every channel, so its exit is reaped like any
+ * orphan and never ends the machine (which only channel 0 does). It reads
+ * its host key, authorized_keys and config from the tmpfs place_ssh made,
+ * by absolute path. */
 static void start_sshd(void)
 {
-	pid_t child = fork();
+	pid_t    child = fork();
+	sigset_t none;
 
 	if (child != 0)
 		return;
+	/* The agent's SIGCHLD is blocked for its signalfd, and a blocked mask
+	 * survives exec: an sshd that inherits it never hears a login's shell
+	 * exit, so every session held open until the machine went. */
+	sigemptyset(&none);
+	sigprocmask(SIG_SETMASK, &none, NULL);
+	signal(SIGCHLD, SIG_DFL);
+	signal(SIGPIPE, SIG_DFL);
 	setsid();
+	if (ssh_fetched) {
+		hull_sshd_exec_dropbear("22");
+		_exit(127);
+	}
 	execl(ssh_bin, "sshd", "-D", "-e", "-f", "/run/hull/ssh/config",
 	      "-h", "/run/hull/ssh/host_key", (char *)NULL);
 	_exit(127);

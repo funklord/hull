@@ -135,18 +135,65 @@ static int unxz(int in, off_t offset, uint64_t size, int out, char *why, size_t 
 	return 0;
 }
 
-int hull_kernel_fetch(char *why, size_t cap)
+int hull_fetch_deb(const char *url, const char *sha256, const char *deb, const char *tar,
+                   char *why, size_t cap)
 {
-	char                dir[4096];
-	char                work[4200];
-	char                deb[4300], tar[4300], tree[4300], from[4400], to[4400], made[4400];
 	char                hex[65];
-	char                depmod[64] = "/usr/sbin/depmod";
 	uint8_t             digest[32];
 	hull_https_response got = { 0 };
 	download            d;
 	off_t               offset;
 	uint64_t            size;
+	int                 out;
+	int                 status = -1;
+
+	if ((d.fd = open(deb, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0) {
+		snprintf(why, cap, "%s: %s", deb, strerror(errno));
+		return -1;
+	}
+	hull_sha256_init(&d.hash);
+	why[0] = '\0';
+	if (hull_https_get(url, NULL, &got, downloaded, &d, why, cap) != 0 || got.status != 200) {
+		if (why[0] == '\0')
+			snprintf(why, cap, "%s answered %d: the pinned package may have left the archive, "
+			         "and its pin wants moving", url, got.status);
+		goto done;
+	}
+	hull_sha256_final(&d.hash, digest);
+	hull_sha256_hex(digest, hex);
+	if (strcmp(hex, sha256) != 0) {
+		snprintf(why, cap, "the package from %s is not the one pinned: sha256 %s, wanted %s",
+		         url, hex, sha256);
+		goto done;
+	}
+	/* Its files: data.tar.xz out of the .deb, decompressed. */
+	if (ar_member(d.fd, "data.tar.xz", &offset, &size) != 0) {
+		snprintf(why, cap, "the package from %s holds no data.tar.xz", url);
+		goto done;
+	}
+	if ((out = open(tar, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0) {
+		snprintf(why, cap, "%s: %s", tar, strerror(errno));
+		goto done;
+	}
+	if (unxz(d.fd, offset, size, out, why, cap) != 0) {
+		close(out);
+		unlink(tar);
+		goto done;
+	}
+	close(out);
+	status = 0;
+done:
+	close(d.fd);
+	unlink(deb);
+	return status;
+}
+
+int hull_kernel_fetch(char *why, size_t cap)
+{
+	char                dir[4096];
+	char                work[4200];
+	char                deb[4300], tar[4300], tree[4300], from[4400], to[4400], made[4400];
+	char                depmod[64] = "/usr/sbin/depmod";
 	uint64_t            skipped = 0u;
 	hull_unpack        *u;
 	int                 fd;
@@ -190,46 +237,12 @@ int hull_kernel_fetch(char *why, size_t cap)
 
 	fprintf(stderr, "hull: fetching Debian's kernel %s, about 108 MB: %s\n", HULL_KERNEL_VERSION,
 	        HULL_KERNEL_URL);
-	if ((d.fd = open(deb, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0) {
-		snprintf(why, cap, "%s: %s", deb, strerror(errno));
+	if (hull_fetch_deb(HULL_KERNEL_URL, HULL_KERNEL_SHA256, deb, tar, why, cap) != 0)
 		goto done;
-	}
-	hull_sha256_init(&d.hash);
-	why[0] = '\0';
-	if (hull_https_get(HULL_KERNEL_URL, NULL, &got, downloaded, &d, why, cap) != 0 ||
-	    got.status != 200) {
-		if (why[0] == '\0')
-			snprintf(why, cap, "%s answered %d: the pinned kernel may have left the archive, "
-			         "and the pin in engine/kernel.h wants moving", HULL_KERNEL_URL, got.status);
-		close(d.fd);
-		goto done;
-	}
-	hull_sha256_final(&d.hash, digest);
-	hull_sha256_hex(digest, hex);
-	if (strcmp(hex, HULL_KERNEL_SHA256) != 0) {
-		snprintf(why, cap, "the kernel from %s is not the one pinned: sha256 %s, wanted %s",
-		         HULL_KERNEL_URL, hex, HULL_KERNEL_SHA256);
-		close(d.fd);
-		goto done;
-	}
-	/* Its files: data.tar.xz out of the .deb, decompressed. */
-	if (ar_member(d.fd, "data.tar.xz", &offset, &size) != 0) {
-		snprintf(why, cap, "the kernel's package holds no data.tar.xz");
-		close(d.fd);
-		goto done;
-	}
-	if ((out = open(tar, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0) {
+	if ((out = open(tar, O_RDONLY | O_CLOEXEC)) < 0) {
 		snprintf(why, cap, "%s: %s", tar, strerror(errno));
-		close(d.fd);
 		goto done;
 	}
-	if (unxz(d.fd, offset, size, out, why, cap) != 0) {
-		close(out);
-		close(d.fd);
-		goto done;
-	}
-	close(d.fd);
-	unlink(deb);
 	if (mkdir(tree, 0755) != 0) {
 		snprintf(why, cap, "%s: %s", tree, strerror(errno));
 		close(out);

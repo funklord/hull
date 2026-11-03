@@ -306,6 +306,9 @@ expect 0 '^ok +user namespaces$' "$hull" doctor
 expect 0 '^ok +a vm.s kernel, the host.s: /' "$hull" doctor
 expect 0 '^  fix \(as the user\): hull kernel fetch$' \
 	env HULL_BOOT_DIR=/nonexistent XDG_CACHE_HOME="$dir/nocache" "$hull" doctor
+# The sshd for an image with none: its fix where nothing is fetched.
+expect 0 '^  fix \(as the user\): hull sshd fetch$' \
+	env XDG_CACHE_HOME="$dir/nocache" "$hull" doctor
 # A tool is found on PATH, and said where.
 mkdir -p "$dir/tools"
 printf '#!/bin/sh\n' > "$dir/tools/squashfuse"
@@ -3713,6 +3716,74 @@ while [ -S "$shm/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
 	tries=$((tries + 1))
 	sleep 0.25
 done
+
+# (ssh true) on chroot where the image has no sshd: the dropbear `hull sshd
+# fetch` puts in the cache (section 8.1 item 3), on the machine's address
+# at the high port as an image's sshd is. Its root is busybox and the C
+# library it links, copied from the host, with a passwd naming root. Real
+# ssh logs in as root by a key of the test's, the machine's host key
+# pinned; scp sends a file and sftp lists it. A core of its own, the cache
+# being read by the core, on a tmpfs for the host key. The fetch reaches
+# Debian's archive: where it cannot, the cases are said, not tried.
+dbshm=$(mktemp -d /dev/shm/hull-cli-db.XXXXXX)
+busybox=$(command -v busybox 2>/dev/null)
+fetched=$(XDG_CACHE_HOME="$root/cache" timeout 60 "$hull" sshd fetch 2>&1)
+if [ -z "$busybox" ] || [ ! -x "$(printf '%s\n' "$fetched" | tail -1)/usr/sbin/dropbear" ]; then
+	printf 'cli: fetched sshd on chroot not tried: %s\n' \
+		"${busybox:-no busybox}; $(printf '%s\n' "$fetched" | tail -1)"
+else
+	chmod 700 "$dbshm"
+	rm -rf "$root/dbroot"
+	mkdir -p "$root/dbroot/bin" "$root/dbroot/etc" "$root/dbroot/run" "$root/dbroot/tmp" \
+		"$root/dbroot/proc" "$root/dbroot/dev" "$root/dbroot/root"
+	cp "$busybox" "$root/dbroot/bin/busybox"
+	for a in sh cat id sleep; do
+		ln -s busybox "$root/dbroot/bin/$a"
+	done
+	for lib in $(ldd "$busybox" | sed -n 's/.*=> \(\/[^ ]*\) .*/\1/p; s/^[[:space:]]*\(\/[^ ]*\) .*/\1/p'); do
+		mkdir -p "$root/dbroot$(dirname "$lib")"
+		cp -L "$lib" "$root/dbroot$lib"
+	done
+	printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/dbroot/etc/passwd"
+	chmod 755 "$root/dbroot"
+	rm -f "$root/home/.ssh/dbkey" "$root/home/.ssh/dbkey.pub"
+	ssh-keygen -q -t ed25519 -N '' -C hull-test-db -f "$root/home/.ssh/dbkey"
+	printf '(machine (source "dir:./dbroot") (backend chroot) (mutable overlay) (hostname "cdb") %s %s)\n' \
+		'(ssh true)' '(command "/bin/sh" "-c" "echo ready; exec sleep 60")' > "$root/cdb.conf"
+	{
+		printf 'Host cdb.hull\n'
+		printf '  ProxyCommand env XDG_RUNTIME_DIR=%s %s proxy-ssh %%h\n' "$dbshm" "$hull_abs"
+		printf '  User root\n  IdentityFile %s\n  IdentitiesOnly yes\n' "$root/home/.ssh/dbkey"
+		printf '  BatchMode yes\n  ConnectTimeout 10\n  LogLevel error\n'
+		printf '  StrictHostKeyChecking yes\n  UserKnownHostsFile %s\n' "$root/cdb.known"
+	} > "$root/cdb.ssh"
+	rm -f "$root/cdb.out" "$root/cdb.sent"
+	(cd / && exec env XDG_RUNTIME_DIR="$dbshm" XDG_CACHE_HOME="$root/cache" timeout -k 2 60 \
+		"$hull_abs" run -f "$root/cdb.conf" > "$root/cdb.out" 2>&1) &
+	cdber=$!
+	tries=0
+	until grep -q '^ready$' "$root/cdb.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+	printf 'cdb.hull %s\n' "$(cut -d' ' -f1,2 "$XDG_DATA_HOME/hull/machines/cdb/host_key.pub" 2>&1)" \
+		> "$root/cdb.known"
+	tries=0
+	until timeout 10 ssh -F "$root/cdb.ssh" cdb.hull true < /dev/null 2>/dev/null ||
+	      [ "$tries" -ge 20 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+	expect 0 '^0 \[\]$' ssh -F "$root/cdb.ssh" cdb.hull 'echo "$(id -u) [$LD_LIBRARY_PATH]"'
+	printf 'sent by scp\n' > "$root/cdb.sent"
+	expect 0 '' scp -F "$root/cdb.ssh" "$root/cdb.sent" cdb.hull:/tmp/sent
+	expect 0 '^sent by scp$' ssh -F "$root/cdb.ssh" cdb.hull cat /tmp/sent
+	expect 0 '/tmp/sent' sh -c 'printf "ls /tmp\n" | sftp -F "$1" -b - cdb.hull' sh "$root/cdb.ssh"
+	env XDG_RUNTIME_DIR="$dbshm" "$hull" stop cdb > /dev/null 2>&1
+	wait "$cdber" 2>/dev/null
+	rm -f "$root/home/.ssh/dbkey" "$root/home/.ssh/dbkey.pub"
+fi
+rm -rf "${dbshm:?}"
 
 # The dos class, on each engine of it installed here, DOSBox and dosemu2:
 # the directory as C:, a program's output through DOS and its exit status,

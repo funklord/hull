@@ -76,6 +76,7 @@
 #include "stack.h"
 #include "idmap.h"
 #include "ip6.h"
+#include "sshd.h"
 
 #define MAX_ARGS    256u
 #define MAX_ENV     256u
@@ -185,7 +186,7 @@ struct hull_machine {
 	int              done;
 	hull_usage       spent;      /* finished execs', which their helpers reaped */
 	unsigned char    stats[128]; /* what stats() last gave */
-	char             detail[256];
+	char             detail[512];
 };
 
 static const hull_host_ops *host;
@@ -829,6 +830,14 @@ static void child_fail(int report, const char *step)
 	size_t length = n < 0 ? 0u : (size_t)n < sizeof message ? (size_t)n : sizeof message - 1u;
 
 	if (write(report, message, length) < 0)
+		_exit(127);
+	_exit(127);
+}
+
+/* A refusal said whole, where no errno is its reason. */
+static void child_refuse(int report, const char *reason)
+{
+	if (write(report, reason, strlen(reason)) < 0)
 		_exit(127);
 	_exit(127);
 }
@@ -1886,9 +1895,12 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	int              volumes[MAX_VOLUMES];
 	int              secrets = -1;
 	int              ssh_tree = -1;
+	int              sshd_tree = -1;   /* `hull sshd fetch`'s, for an image with no sshd */
 	int              hosts_tree = -1;
 	int              resolver_tree = -1;
 	const char      *ssh_bin = NULL;  /* the image's sshd, once found after the pivot */
+	int              ssh_fetched = 0; /* none in the image: the fetched dropbear serves */
+	char             ssh_listen[80];  /* its ADDRESS:PORT */
 	int              null = open("/dev/null", O_RDWR | O_CLOEXEC);
 	int              out[2];
 	int              err[2];
@@ -2047,10 +2059,25 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		                                           MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV |
 		                                           MOUNT_ATTR_NOEXEC };
 
+		struct mount_attr fetched = { .attr_set = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID |
+		                                          MOUNT_ATTR_NODEV };
+		char              dir[4096];
+		char              dropbear[4200];
+
 		ssh_tree = open_tree(AT_FDCWD, m->ssh_dir, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
 		if (ssh_tree < 0 ||
 		    mount_setattr(ssh_tree, "", AT_EMPTY_PATH, &readonly, sizeof readonly) != 0)
 			child_fail(report, "the ssh material");
+		/* The fetched sshd, read-only, used where the image has none
+		 * (below); not fetched, it is not there. */
+		if (hull_sshd_dir(dir, sizeof dir) == 0 &&
+		    snprintf(dropbear, sizeof dropbear, "%s/%s", dir, HULL_SSHD_DROPBEAR) > 0 &&
+		    access(dropbear, R_OK) == 0) {
+			sshd_tree = open_tree(AT_FDCWD, dir, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+			if (sshd_tree < 0 ||
+			    mount_setattr(sshd_tree, "", AT_EMPTY_PATH, &fetched, sizeof fetched) != 0)
+				child_fail(report, "the fetched sshd");
+		}
 	}
 	if (m->hostname != NULL && sethostname(m->hostname, strlen(m->hostname)) != 0)
 		child_fail(report, "sethostname");
@@ -2241,12 +2268,12 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		 * the machine's own 127.107 address on a high port -- the chroot
 		 * user is unprivileged on the shared host net, so not port 22
 		 * (section 8.1). The image's sshd, found at the usual place, serves
-		 * it; absent, (ssh true) is refused here rather than run without one. */
-		static const char *const where[] = { "/usr/sbin/sshd", "/usr/bin/sshd", NULL };
-		char  config[1024];
-		int   fd;
-		int   n;
-		unsigned i;
+		 * it, or else the fetched dropbear; neither, and (ssh true) is
+		 * refused here rather than run without one. */
+		char        config[1024];
+		const char *reason;
+		int         fd;
+		int         n;
 
 		if (mkdir("/run/hull/ssh", 0700) != 0 ||
 		    move_mount(ssh_tree, "", AT_FDCWD, "/run/hull/ssh", MOVE_MOUNT_F_EMPTY_PATH) != 0)
@@ -2260,11 +2287,17 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		if (n <= 0 || n >= (int)sizeof config || fd < 0 || write(fd, config, (size_t)n) != n)
 			child_fail(report, "the ssh config");
 		close(fd);
-		for (i = 0u; where[i] != NULL && access(where[i], X_OK) != 0; i++)
-			;
-		if (where[i] == NULL)
-			child_fail(report, "(ssh true): the image has no sshd at /usr/sbin/sshd or /usr/bin/sshd");
-		ssh_bin = where[i];
+		if (sshd_tree >= 0 &&
+		    (mkdir(HULL_SSHD_GUEST, 0755) != 0 ||
+		     move_mount(sshd_tree, "", AT_FDCWD, HULL_SSHD_GUEST, MOVE_MOUNT_F_EMPTY_PATH) != 0))
+			child_fail(report, "the fetched sshd");
+		if ((reason = hull_sshd_choose(&ssh_bin)) != NULL)
+			child_refuse(report, reason);
+		if (ssh_bin == NULL) {
+			snprintf(ssh_listen, sizeof ssh_listen, "%s:%d",
+			         m->nat || m->bridge ? "0.0.0.0" : m->address_text, HULL_SSH_PORT);
+			ssh_fetched = 1;
+		}
 	}
 	if (chdir(m->workdir) != 0)
 		child_fail(report, "workdir");
@@ -2286,7 +2319,7 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	 * in relay). It binds the machine's address on HULL_SSH_PORT per its
 	 * config; its own stdio goes nowhere, since it is supervised, not a
 	 * stream. */
-	if (ssh_bin != NULL) {
+	if (ssh_bin != NULL || ssh_fetched) {
 		pid_t sshd = bare_fork();
 
 		if (sshd == 0) {
@@ -2301,7 +2334,10 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 			 * the -e logs go nowhere, as a supervised child's should. */
 			if (setsid() < 0)
 				_exit(126);
-			execl(ssh_bin, "sshd", "-D", "-e", "-f", "/run/hull/ssh.conf", (char *)NULL);
+			if (ssh_fetched)
+				hull_sshd_exec_dropbear(ssh_listen);
+			else
+				execl(ssh_bin, "sshd", "-D", "-e", "-f", "/run/hull/ssh.conf", (char *)NULL);
 			_exit(127);
 		}
 	}
@@ -4211,9 +4247,10 @@ static const hull_cap_entry entries[] = {
 	{ "memory",                 HULL_SUP_NATIVE,
 	  "a ceiling, a systemd scope's MemoryMax", NULL },
 	{ "ssh",                    HULL_SUP_NATIVE,
-	  "the image's own sshd, supervised at a high port on the machine's 127.107 address, "
-	  "bound there on the host network and forwarded there by pasta under NAT; refused with "
-	  "(network none) and at start if the image has no sshd", NULL },
+	  "the image's own sshd, or where it has none the dropbear `hull sshd fetch` keeps, "
+	  "supervised at a high port on the machine's 127.107 address, bound there on the host "
+	  "network and forwarded there by pasta under NAT; refused with (network none) and at "
+	  "start where there is neither", NULL },
 	{ "segments",               HULL_SUP_NATIVE,
 	  "a tap each in the machine's own network namespace, relayed to the core's switch: eth1 "
 	  "on after pasta's eth0 under NAT, eth0 on with (network none); refused with (network "

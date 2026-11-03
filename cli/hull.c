@@ -57,6 +57,7 @@
 #include "doctor.h"
 #include "export.h"
 #include "kernel_fetch.h"
+#include "sshd_fetch.h"
 #include "import.h"
 #include "matrix.h"
 #include "names.h"
@@ -120,6 +121,7 @@ static void usage(FILE *out)
 	      "       hull pool ls | hull lease ls\n"
 	      "       hull pack DIR|REF FILE | hull unpack FILE|- DIR\n"
 	      "       hull export --bootable DIR|REF IMAGE [--init PATH] | hull kernel fetch\n"
+	      "       hull sshd fetch\n"
 	      "       hull export --bootable -f FILE [NAME] IMAGE\n"
 	      "       hull build [-f FILE] [--check] REF\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
@@ -5992,6 +5994,15 @@ int main(int argc, char **argv)
 
 		if (hull_kernel_fetch(why, sizeof why) != 0) {
 			fprintf(stderr, "hull: kernel fetch: %s\n", why);
+			return 1;
+		}
+		return 0;
+	}
+	if (strcmp(command, "sshd") == 0 && argc == 3 && strcmp(argv[2], "fetch") == 0) {
+		char why[4400] = "";
+
+		if (hull_sshd_fetch(why, sizeof why) != 0) {
+			fprintf(stderr, "hull: sshd fetch: %s\n", why);
 			return 1;
 		}
 		return 0;

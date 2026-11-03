@@ -81,6 +81,7 @@
 #include "wire.h"
 #include "idmap.h"
 #include "kernel.h"
+#include "sshd.h"
 #include "tree.h"
 
 #define MAX_VOLUMES  64u
@@ -1611,6 +1612,8 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        root[9000];
 	char        modules[9000];
 	char        modules_at[4200];
+	char        sshd[9000];
+	char        sshd_at[4200];
 	char        segment_netdev[MAX_SEGMENTS][64];
 	char        segment_device[MAX_SEGMENTS][96];
 	char        fsdev[MAX_VOLUMES][9000];
@@ -1618,7 +1621,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        path[8500];
 	char        device_chardev[HULL_MAX_DEVICES][600];
 	char        device_device[HULL_MAX_DEVICES][96];
-	const char *argv[64 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS + 4u * HULL_MAX_DEVICES + 2u];
+	const char *argv[68 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS + 4u * HULL_MAX_DEVICES + 2u];
 	unsigned    serial = 0u;
 	unsigned    parallel = 0u;
 	int         usb = 0;
@@ -1822,6 +1825,24 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		argv[n++] = modules;
 		argv[n++] = "-device";
 		argv[n++] = "virtio-9p-pci,fsdev=modules,mount_tag=modules";
+	}
+	/* (ssh true)'s fallback, the sshd `hull sshd fetch` put in the cache,
+	 * shared read-only for the agent to run where the image has no sshd of
+	 * its own (section 8.1 item 3). Not fetched, there is no share, and the
+	 * agent says so if the image needs it. */
+	if (m->ssh.data != NULL && hull_sshd_dir(path, sizeof path) == 0) {
+		char dropbear[8600];
+
+		snprintf(dropbear, sizeof dropbear, "%s/%s", path, HULL_SSHD_DROPBEAR);
+		if (access(dropbear, R_OK) == 0) {
+			escaped(sshd_at, sizeof sshd_at, path);
+			snprintf(sshd, sizeof sshd,
+			         "local,id=sshd,path=%s,security_model=none,readonly=on", sshd_at);
+			argv[n++] = "-fsdev";
+			argv[n++] = sshd;
+			argv[n++] = "-device";
+			argv[n++] = "virtio-9p-pci,fsdev=sshd,mount_tag=sshd";
+		}
 	}
 	/* Randomness for the guest's kernel from the host's: a guest on a
 	 * processor with no RDRAND has only its own few interrupts to seed
@@ -4056,9 +4077,9 @@ static const hull_cap_entry entries[] = {
 	  NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   "no NIC: lo alone in the guest", NULL },
 	{ "ssh",                HULL_SUP_NATIVE,
-	  "the agent supervises the image's own sshd on the guest's port 22, with a host key, "
-	  "the user's authorized_keys and a config the core delivers; refused at start if the "
-	  "image has no sshd", NULL },
+	  "the agent supervises the image's own sshd on the guest's port 22, or where it has "
+	  "none the dropbear `hull sshd fetch` keeps, with a host key and the user's "
+	  "authorized_keys the core delivers; refused at start where there is neither", NULL },
 	{ "export",             HULL_SUP_EMULATED,
 	  "the merged tree taken host-side in qemu's namespaces once the workload ends, the "
 	  "overlay mounted there for it", NULL },

@@ -29,6 +29,7 @@
 
 #include "doctor.h"
 #include "kernel.h"
+#include "sshd.h"
 
 #define TMPFS_MAGIC 0x01021994
 #define RAMFS_MAGIC 0x858458f6
@@ -282,6 +283,25 @@ static void vm_kernel(void)
 	printf("  fix (as the user): hull kernel fetch\n");
 }
 
+/* (ssh true)'s sshd for an image with none, which `hull sshd fetch` puts
+ * in the cache (section 8.1 item 3). Absent rather than missing: only a
+ * machine whose image has no sshd of its own needs it. */
+static void fetched_sshd(void)
+{
+	char dir[4096];
+	char path[4200];
+
+	if (hull_sshd_dir(dir, sizeof dir) == 0) {
+		snprintf(path, sizeof path, "%s/%s", dir, HULL_SSHD_DROPBEAR);
+		if (access(path, R_OK) == 0) {
+			line("ok", "an sshd for an image with none, fetched", dir);
+			return;
+		}
+	}
+	line("absent", "an sshd for an image with none", "(ssh true) needs the image's own until fetched");
+	printf("  fix (as the user): hull sshd fetch\n");
+}
+
 static int runtime(const char *why)
 {
 	const char   *dir = getenv("XDG_RUNTIME_DIR");
@@ -347,6 +367,7 @@ int hull_doctor(const char *runtime_why)
 	device("/dev/vhost-vsock", "a vm's agent (/dev/vhost-vsock)", name);
 	device("/dev/fuse", "FUSE, an image read or changed without a mount (/dev/fuse)", name);
 	vm_kernel();
+	fetched_sshd();
 	usable = runtime(runtime_why) && usable;
 	tool("passt", "a vm's network");
 	tool("qemu-system-x86_64", "vm and emu machines on x86_64");
