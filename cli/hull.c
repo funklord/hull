@@ -5176,16 +5176,15 @@ static int ssh_into(const char *id)
 		fprintf(stderr, "hull: ssh needs a terminal on stdin\n");
 		return 125;
 	}
-	/* Prefer the machine's own sshd where one runs (section 8.1 item 2):
-	 * a (ssh true)-provisioned one, known by its persistent host key and
-	 * pinned; else an image's own, found by a port-22 probe and left to
-	 * the user's own known_hosts. A login shell over the agent otherwise,
-	 * or where there is no ssh client. */
-	if (machine_host_pub(id, pub, sizeof pub)) {
-		if ((rc = ssh_client(id, pub)) >= 0)
-			return rc;
-	} else if (machine_sshd_open(id)) {
-		if ((rc = ssh_client(id, NULL)) >= 0)
+	/* Prefer the machine's own sshd where one runs (section 8.1 item 2),
+	 * found by a port-22 probe: pinned to its persistent host key where
+	 * (ssh true) gave it one, else left to the user's own known_hosts. A
+	 * login shell over the agent otherwise, or where there is no ssh
+	 * client. The key alone is not enough: it outlives the run that made
+	 * it, and a later run of the machine without (ssh true) has no sshd,
+	 * where `hull ssh` met a refused port 22 rather than its shell. */
+	if (machine_sshd_open(id)) {
+		if ((rc = ssh_client(id, machine_host_pub(id, pub, sizeof pub) ? pub : NULL)) >= 0)
 			return rc;
 	}
 	if (term == NULL || term[0] == '\0')
