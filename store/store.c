@@ -45,6 +45,7 @@
 #include "sha256.h"
 #include "store.h"
 #include "tree.h"
+#include "verity.h"
 
 /* --- a growing buffer ------------------------------------------------------ */
 
@@ -2233,6 +2234,7 @@ typedef struct erofs_node {
 	uint64_t       size;
 	uint32_t       rdev;
 	char           redirect[72];   /* "/ab/<hex>" for a regular file with bytes */
+	uint8_t        metacopy[36];   /* overlayfs's, with the object's fs-verity digest */
 	const uint8_t *target;
 	size_t         target_len;
 	erofs_xattr    xattrs[16];
@@ -2330,6 +2332,59 @@ static uint64_t erofs_dir_size(const erofs_dirent *list, size_t n)
 	return whole + used;
 }
 
+/* overlayfs's metacopy value for an object (struct ovl_metacopy): version
+ * 0, its length, no flags, SHA-256 (1), then the object's fs-verity digest,
+ * the object read whole for it, its bytes checked against its name and its
+ * size against the manifest's -- so what the image pins is what the tree
+ * holds, and a mount with verity=require refuses any other bytes. 0, or -1
+ * with `why`. */
+static int object_metacopy(hull_store *store, const char *hex, uint64_t size, uint8_t value[36],
+                           char *why, size_t cap)
+{
+	static uint8_t buffer[1 << 16];
+	char           path[4200];
+	hull_verity   *v = malloc(sizeof *v);
+	hull_sha256    h;
+	uint8_t        digest[32];
+	char           named[65];
+	uint64_t       read_ = 0u;
+	ssize_t        got;
+	int            fd;
+
+	snprintf(path, sizeof path, "%s/objects/sha256/%.2s/%s", store->root, hex, hex);
+	if (v == NULL)
+		return say(why, cap, hex, "out of memory");
+	if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0) {
+		free(v);
+		return say(why, cap, path, strerror(errno));
+	}
+	hull_sha256_init(&h);
+	hull_verity_init(v, size);
+	while ((got = read(fd, buffer, sizeof buffer)) != 0) {
+		if (got < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		hull_sha256_update(&h, buffer, (size_t)got);
+		hull_verity_update(v, buffer, (size_t)got);
+		read_ += (uint64_t)got;
+	}
+	close(fd);
+	hull_sha256_final(&h, digest);
+	hull_sha256_hex(digest, named);
+	if (got < 0 || read_ != size || strcmp(named, hex) != 0 || hull_verity_final(v, value + 4) != 0) {
+		free(v);
+		return say(why, cap, path, got < 0 ? strerror(errno) : "the object does not hold its bytes");
+	}
+	free(v);
+	value[0] = 0u;
+	value[1] = 36u;
+	value[2] = 0u;
+	value[3] = 1u;
+	return 0;
+}
+
 int hull_store_composefs(hull_store *store, const char *name, int out, char *why, size_t cap)
 {
 	char            hex[65];
@@ -2412,6 +2467,8 @@ int hull_store_composefs(hull_store *store, const char *name, int out, char *why
 				}
 				hex_of(doc.data + value.content, object);
 				snprintf(n->redirect, sizeof n->redirect, "/%.2s/%s", object, object);
+				if (object_metacopy(store, object, n->size, n->metacopy, why, cap) != 0)
+					goto done;
 			}
 		} else if (strcmp(kind, "symlink") == 0) {
 			n->mode = S_IFLNK | 0777u;
@@ -2468,7 +2525,7 @@ int hull_store_composefs(hull_store *store, const char *name, int out, char *why
 		}
 		if (n->redirect[0] != '\0') {
 			n->xattrs[n->xattr_count++] = (erofs_xattr){ EROFS_XATTR_TRUSTED,
-				(const uint8_t *)"overlay.metacopy", 16u, (const uint8_t *)"", 0u };
+				(const uint8_t *)"overlay.metacopy", 16u, n->metacopy, sizeof n->metacopy };
 			n->xattrs[n->xattr_count++] = (erofs_xattr){ EROFS_XATTR_TRUSTED,
 				(const uint8_t *)"overlay.redirect", 16u, (const uint8_t *)n->redirect,
 				strlen(n->redirect) };
@@ -2681,6 +2738,83 @@ done:
 	return result;
 }
 
+int hull_store_composefs_objects(hull_store *store, const char *name, const char *dir,
+                                 uint64_t *count, uint64_t *bytes, char *why, size_t cap)
+{
+	char            hex[65];
+	uint8_t        *data = NULL;
+	size_t          length;
+	hull_sexpr_doc  doc;
+	hull_sexpr_form entries;
+	hull_sexpr_form entry;
+	int             more;
+	int             result = -1;
+
+	*count = 0u;
+	*bytes = 0u;
+	if (mkdir(dir, 0755) != 0)
+		return say(why, cap, dir, strerror(errno));
+	/* Shared, so no gc takes an object between its listing and its link. */
+	flock(store->lock, LOCK_SH);
+	if (name_manifest(store, name, hex, why, cap) != 0 ||
+	    (data = read_manifest(store, hex, &length, why, cap)) == NULL)
+		goto done;
+	if (!open_entries(&doc, data, length, &entries)) {
+		say(why, cap, name, "its manifest is not one");
+		goto done;
+	}
+	more = hull_sexpr_child(&doc, &entries, &entry);
+	for (more = more && hull_sexpr_next(&doc, &entry, &entry); more;
+	     more = hull_sexpr_next(&doc, &entry, &entry)) {
+		hull_sexpr_form value;
+		char            object[65];
+		char            from[4200];
+		char            to[4200];
+		uint64_t        size;
+
+		if (!field(&doc, &entry, "kind", &value) || !hull_sexpr_is(&doc, &value, "reg") ||
+		    (size = field(&doc, &entry, "size", &value) ? number(&doc, &value) : 0u) == 0u)
+			continue;
+		if (!field(&doc, &entry, "object", &value) || value.content_length != 32u) {
+			say(why, cap, name, "a regular file has no object");
+			goto done;
+		}
+		hex_of(doc.data + value.content, object);
+		snprintf(from, sizeof from, "%s/objects/sha256/%.2s/%s", store->root, object, object);
+		snprintf(to, sizeof to, "%s/%.2s", dir, object);
+		if (mkdir(to, 0755) != 0 && errno != EEXIST) {
+			say(why, cap, to, strerror(errno));
+			goto done;
+		}
+		snprintf(to, sizeof to, "%s/%.2s/%s", dir, object, object);
+		if (link(from, to) != 0) {
+			if (errno == EEXIST)
+				continue;   /* two files of one content */
+			say(why, cap, from, strerror(errno));
+			goto done;
+		}
+		(*count)++;
+		*bytes += size;
+	}
+	result = 0;
+done:
+	flock(store->lock, LOCK_UN);
+	free(data);
+	if (result != 0) {
+		char        parent[4200];
+		const char *slash = strrchr(dir, '/');
+		int         fd;
+
+		snprintf(parent, sizeof parent, "%.*s", slash != NULL ? (int)(slash - dir) : 1,
+		         slash != NULL ? dir : ".");
+		if ((fd = open(slash == dir ? "/" : parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) >= 0) {
+			hull_store_remove_tree(fd, slash != NULL ? slash + 1 : dir);
+			close(fd);
+		}
+	}
+	return result;
+}
+
 int hull_store_composefs_image(hull_store *store, const char *name, int create, char *path,
                                size_t path_cap, char *why, size_t cap)
 {
@@ -2696,7 +2830,10 @@ int hull_store_composefs_image(hull_store *store, const char *name, int create, 
 	}
 	flock(store->lock, LOCK_UN);
 	snprintf(dir, sizeof dir, "%s/mounts", store->root);
-	if (snprintf(path, path_cap, "%s/%s.erofs", dir, hex) >= (int)path_cap)
+	/* Format 2, whose metacopy carries the fs-verity digest: an image of
+	 * the first, written before 2026-11-03 without one, is not taken for
+	 * it, and gc sweeps it as it sweeps any image of mounts/. */
+	if (snprintf(path, path_cap, "%s/%s.2.erofs", dir, hex) >= (int)path_cap)
 		return say(why, cap, name, "the store's path is too long");
 	if (!create || access(path, R_OK) == 0)
 		return 0;
@@ -3102,17 +3239,20 @@ int hull_store_gc(hull_store *store, uint64_t *manifests, uint64_t *objects,
 				(*checkouts)++;
 		closedir(dir);
 	}
-	/* A composefs image (section 3.2) of a manifest no ref reaches, by the
-	 * same rule as a checkout's: a machine still running on it reads its
-	 * objects, which this gc has taken already if no ref reaches them.
-	 * Disposable, made again from the manifest; not counted, gc's report
-	 * being of the store's own. */
+	/* A composefs image (section 3.2) of a manifest no ref reaches, and
+	 * anything else made from one there, `HEX.` and a suffix -- its objects
+	 * disk, an image of an older format -- by the same rule as a
+	 * checkout's: a machine still running on it reads its objects, which
+	 * this gc has taken already if no ref reaches them. Disposable, made
+	 * again from the manifest; not counted, gc's report being of the
+	 * store's own. */
 	snprintf(path, sizeof path, "%s/mounts", store->root);
 	if ((dir = opendir(path)) != NULL) {
 		while ((entry = readdir(dir)) != NULL) {
 			char hex[65];
 
-			if (strlen(entry->d_name) != 70u || strcmp(entry->d_name + 64, ".erofs") != 0)
+			if (strlen(entry->d_name) < 66u || entry->d_name[64] != '.' ||
+			    strspn(entry->d_name, "0123456789abcdef") != 64u)
 				continue;
 			memcpy(hex, entry->d_name, 64u);
 			hex[64] = '\0';

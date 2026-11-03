@@ -99,7 +99,7 @@ ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/dosbox.o $(BUILD_DIR)/engine/dosemu.o $(BUILD_DIR)/engine/iso.o \
               $(GEN_DIR)/disc.o \
               $(BUILD_DIR)/engine/access.o \
-              $(BUILD_DIR)/engine/usage.o $(BUILD_DIR)/engine/sha256.o \
+              $(BUILD_DIR)/engine/usage.o $(BUILD_DIR)/engine/sha256.o $(BUILD_DIR)/engine/verity.o \
               $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/ip6.o $(BUILD_DIR)/engine/idmap.o \
               $(BUILD_DIR)/engine/tree.o $(BUILD_DIR)/engine/hostnet.o \
               $(BUILD_DIR)/engine/hostdev.o $(BUILD_DIR)/engine/rootmode.o
@@ -292,6 +292,7 @@ TEST_REGISTRY_OBJS = $(BUILD_DIR)/test/registry_test.o
 TEST_PLAN_OBJS    = $(BUILD_DIR)/test/plan_test.o
 TEST_WIRE_OBJS    = $(BUILD_DIR)/test/wire_test.o
 TEST_SHA256_OBJS  = $(BUILD_DIR)/test/sha256_test.o
+TEST_VERITY_OBJS  = $(BUILD_DIR)/test/verity_test.o
 TEST_TREE_OBJS    = $(BUILD_DIR)/test/tree_tar.o
 TEST_JSON_OBJS    = $(BUILD_DIR)/test/json_test.o
 TEST_RUNTIME_OBJS = $(BUILD_DIR)/test/runtime_test.o
@@ -300,13 +301,13 @@ TEST_HOSTDEV_OBJS = $(BUILD_DIR)/test/hostdev_test.o
 TEST_ISO_OBJS     = $(BUILD_DIR)/test/iso_test.o
 TEST_IDMAP_OBJS   = $(BUILD_DIR)/test/idmap_test.o
 TEST_OBJS = $(TEST_SEXPR_OBJS) $(TEST_FRAMING_OBJS) $(TEST_SPEC_OBJS) $(TEST_MATRIX_OBJS) \
-            $(TEST_REGISTRY_OBJS) $(TEST_PLAN_OBJS) $(TEST_WIRE_OBJS) $(TEST_SHA256_OBJS) \
+            $(TEST_REGISTRY_OBJS) $(TEST_PLAN_OBJS) $(TEST_WIRE_OBJS) $(TEST_SHA256_OBJS) $(TEST_VERITY_OBJS) \
             $(TEST_TREE_OBJS) $(TEST_JSON_OBJS) $(TEST_RUNTIME_OBJS) $(TEST_SEGMENT_OBJS) \
             $(TEST_HOSTDEV_OBJS) $(TEST_ISO_OBJS) $(TEST_IDMAP_OBJS)
 TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
             $(BUILD_DIR)/test/spec_test $(BUILD_DIR)/test/matrix_test \
             $(BUILD_DIR)/test/registry_test $(BUILD_DIR)/test/plan_test \
-            $(BUILD_DIR)/test/wire_test $(BUILD_DIR)/test/sha256_test \
+            $(BUILD_DIR)/test/wire_test $(BUILD_DIR)/test/sha256_test $(BUILD_DIR)/test/verity_test \
             $(BUILD_DIR)/test/tree_tar $(BUILD_DIR)/test/json_test $(BUILD_DIR)/test/runtime_test \
             $(BUILD_DIR)/test/segment_test $(BUILD_DIR)/test/hostdev_test \
             $(BUILD_DIR)/test/iso_test $(BUILD_DIR)/test/idmap_test
@@ -587,6 +588,9 @@ $(BUILD_DIR)/test/idmap_test: $(TEST_IDMAP_OBJS) $(BUILD_DIR)/engine/idmap.o
 $(BUILD_DIR)/test/sha256_test: $(TEST_SHA256_OBJS) $(BUILD_DIR)/engine/sha256.o
 	$(CC) $(CFLAGS) -o $@ $^
 
+$(BUILD_DIR)/test/verity_test: $(TEST_VERITY_OBJS) $(BUILD_DIR)/engine/verity.o $(BUILD_DIR)/engine/sha256.o
+	$(CC) $(CFLAGS) -o $@ $^
+
 $(BUILD_DIR)/test/tree_tar: $(TEST_TREE_OBJS) $(BUILD_DIR)/engine/tree.o
 	$(CC) $(CFLAGS) -o $@ $^
 
@@ -633,6 +637,7 @@ test: $(TEST_BINS) $(HULL) $(PROBE) $(ARM64_PROBE) $(NSS_LIB) $(ROOT_BIN) vector
 	$(BUILD_DIR)/test/plan_test
 	$(BUILD_DIR)/test/wire_test
 	$(BUILD_DIR)/test/sha256_test
+	$(BUILD_DIR)/test/verity_test
 	$(BUILD_DIR)/test/idmap_test
 	$(BUILD_DIR)/test/json_test
 	BUILD_DIR='$(BUILD_DIR)' $(BUILD_DIR)/test/runtime_test
@@ -702,6 +707,7 @@ sanitize-run: $(filter-out $(BUILD_DIR)/test/tree_tar,$(TEST_BINS)) $(HULL)
 	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test/plan_test
 	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test/wire_test
 	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test/sha256_test
+	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test/verity_test
 	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test/idmap_test
 	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test/json_test
 	ASAN_OPTIONS=detect_leaks=1 BUILD_DIR='$(BUILD_DIR)' $(BUILD_DIR)/test/runtime_test
@@ -728,7 +734,7 @@ $(FUZZ_DIR)/json_fuzz: test/fuzz/json_fuzz.c oci/json.c oci/json.h
 	$(FUZZ_CC) $(FUZZ_FLAGS) -Ioci -o $@ $(filter %.c,$^)
 
 $(FUZZ_DIR)/unpack_fuzz: test/fuzz/unpack_fuzz.c store/unpack.c $(wildcard store/*.h) \
-                         $(BUILD_DIR)/store/store.o $(BUILD_DIR)/engine/sha256.o \
+                         $(BUILD_DIR)/store/store.o $(BUILD_DIR)/engine/sha256.o $(BUILD_DIR)/engine/verity.o \
                          $(BUILD_DIR)/engine/tree.o $(SEXPR_OBJS)
 	@mkdir -p '$(@D)'
 	$(FUZZ_CC) $(FUZZ_FLAGS) $(CPPFLAGS) -o $@ $(filter %.c %.o,$^) -lz

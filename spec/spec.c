@@ -480,6 +480,7 @@ static const schema devices = TABLE(device_keys);
 static const key security_keys[] = {
 	{ .name = "readonly_root", .type = BOOLEAN },
 	{ .name = "no_new_privs",  .type = BOOLEAN },
+	{ .name = "verity",        .type = BOOLEAN },
 	{ .name = "allow",         .type = SYMBOLS },
 };
 static const schema security = TABLE(security_keys);

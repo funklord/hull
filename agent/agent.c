@@ -82,6 +82,7 @@
 #include <net/route.h>
 #include <netinet/in.h>
 
+#include <linux/fsverity.h>
 #include <linux/vm_sockets.h>
 
 #include "ip6.h"
@@ -758,7 +759,60 @@ static const char *overlay(void)
  * redirect to; above them a tmpfs for the machine's writes, its root
  * taking the image root's owner and mode, unless the root is read-only.
  * A reason it cannot be, or NULL. */
-static const char *composefs_root(const char *image, int readonly)
+/* fs-verity on every object of the disk at /hull/objects, `ab/abcdef...`,
+ * as root may on its own filesystem: the kernel builds each Merkle tree
+ * and from then on checks every read of the file against it. A file
+ * already so is left. A reason it cannot be, or NULL. */
+static const char *enable_verity(void)
+{
+	DIR           *top = opendir("/hull/objects");
+	struct dirent *sub;
+
+	if (top == NULL)
+		return "the objects disk could not be read";
+	while ((sub = readdir(top)) != NULL) {
+		char           dir_path[300];
+		DIR           *dir;
+		struct dirent *object;
+
+		/* `ab`, two hex digits: ".." is two characters too. */
+		if (strlen(sub->d_name) != 2u || sub->d_name[0] == '.')
+			continue;
+		snprintf(dir_path, sizeof dir_path, "/hull/objects/%s", sub->d_name);
+		if ((dir = opendir(dir_path)) == NULL)
+			continue;
+		while ((object = readdir(dir)) != NULL) {
+			struct fsverity_enable_arg arg;
+			int                        fd;
+
+			if (object->d_name[0] == '.')
+				continue;
+			memset(&arg, 0, sizeof arg);
+			arg.version = 1u;
+			arg.hash_algorithm = FS_VERITY_HASH_ALG_SHA256;
+			arg.block_size = 4096u;
+			if ((fd = openat(dirfd(dir), object->d_name, O_RDONLY | O_CLOEXEC)) < 0 ||
+			    (ioctl(fd, FS_IOC_ENABLE_VERITY, &arg) != 0 && errno != EEXIST)) {
+				static char reason[160];
+
+				snprintf(reason, sizeof reason,
+				         "fs-verity could not be enabled on the tree's objects: %s",
+				         strerror(errno));
+				if (fd >= 0)
+					close(fd);
+				closedir(dir);
+				closedir(top);
+				return reason;
+			}
+			close(fd);
+		}
+		closedir(dir);
+	}
+	closedir(top);
+	return NULL;
+}
+
+static const char *composefs_root(const char *image, int readonly, int verity)
 {
 	char        at[4300];
 	char        options[256];
@@ -775,11 +829,25 @@ static const char *composefs_root(const char *image, int readonly)
 		say("composefs", strerror(errno));
 		return "the composefs image could not be mounted as erofs";
 	}
-	if (share("root", "/hull/objects", 1) != 0)
+	/* The objects: the store's share, or, with fs-verity, the disk of
+	 * them the engine attached, verity enabled on each and every file's
+	 * digest then required to be the one the image pins. */
+	if (verity) {
+		const char *reason;
+
+		if (mount_block("objects", "/hull/objects", 0) != 0) {
+			say("verity", strerror(errno));
+			return "the tree's objects disk could not be mounted";
+		}
+		if ((reason = enable_verity()) != NULL)
+			return reason;
+	} else if (share("root", "/hull/objects", 1) != 0) {
 		return "the store's objects could not be mounted";
+	}
 	if (readonly) {
 		snprintf(options, sizeof options,
-		         "lowerdir=/hull/meta::/hull/objects,metacopy=on,redirect_dir=on");
+		         "lowerdir=/hull/meta::/hull/objects,metacopy=on,redirect_dir=on%s",
+		         verity ? ",verity=require" : "");
 	} else {
 		mkdir("/hull/upper", 0755);
 		if (mount("tmpfs", "/hull/upper", "tmpfs", 0u, "mode=0755") != 0 ||
@@ -792,7 +860,8 @@ static const char *composefs_root(const char *image, int readonly)
 		}
 		snprintf(options, sizeof options,
 		         "lowerdir=/hull/meta::/hull/objects,upperdir=/hull/upper/data,"
-		         "workdir=/hull/upper/work,metacopy=on,redirect_dir=on");
+		         "workdir=/hull/upper/work,metacopy=on,redirect_dir=on%s",
+		         verity ? ",verity=require" : "");
 	}
 	if (mount("overlay", "/machine", "overlay", readonly ? MS_RDONLY : 0u, options) != 0) {
 		say("composefs", strerror(errno));
@@ -1159,6 +1228,7 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	unsigned        n = 0u;
 	unsigned        volumes = 0u;
 	int             readonly_root = 0;
+	int             verity = 0;
 	int             layered;
 	int             more;
 
@@ -1211,6 +1281,7 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	}
 	if (hull_access_find(doc, machine, "security", &security)) {
 		readonly_root = hull_access_true(doc, &security, "readonly_root");
+		verity = hull_access_true(doc, &security, "verity");
 		no_new_privs  = hull_access_true(doc, &security, "no_new_privs");
 	}
 	hostname = hull_access_value(doc, machine, "hostname");
@@ -1253,7 +1324,7 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 		free(source);
 		free(projection);
 		if (image[0] != '\0') {
-			if ((reason = composefs_root(image, readonly_root)) != NULL)
+			if ((reason = composefs_root(image, readonly_root, verity)) != NULL)
 				return reason;
 			layered = 1;
 		} else if (block_root) {

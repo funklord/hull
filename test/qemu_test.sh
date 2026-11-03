@@ -1782,6 +1782,7 @@ CHECK
 	# objects, and the agent mounts both, a tmpfs above for the writes.
 	# On chroot the same file is a checkout as before, and gc takes the
 	# image with the ref.
+	printf 'VERITYMARK guarded\n' > "$r/guarded"
 	XDG_DATA_HOME="$root/cfs/store" timeout 60 "$hull" commit "$r" cfs/root:1 > /dev/null 2>&1
 	printf '(machine (source "cfs/root:1") (backend vm) %s)\n' \
 		'(command "/bin/sh" "-c" "cat /proc/mounts; echo written > /w; cat /w")' > "$root/cfsref.conf"
@@ -1804,6 +1805,62 @@ CHECK
 		[ ! -e "$root/cfs/store/hull/store/checkouts" ] ||
 		fail "a composefs run made no image, or made a checkout" \
 			"$(ls -R "$root/cfs/store/hull/store" 2>&1 | head)"
+	# fs-verity (section 3.2): (security (verity true)) on the same tree,
+	# its objects on an ext4 disk with the verity feature the frontend
+	# makes beside the image, verity enabled by the agent on each and
+	# required by the overlay against the digests the image pins. A file
+	# reads as committed, on the host's kernel and on hull's own where
+	# it is built; then the disk's copy of it changed by a byte, which
+	# the guest refuses to read, where without verity it would read the
+	# changed byte. Planned on qemu alone, and refused on a dir source.
+	printf '(machine (source "cfs/root:1") (backend vm) (security (verity true)) %s %s)\n' \
+		'(command "/bin/sh" "-c" "cat /proc/mounts; cat /guarded; echo status=$?")' \
+		'(tuning (vm (kernel KERNEL)))' > "$root/cfsverity.in"
+	for kernel in bundled hull; do
+		if [ "$kernel" = hull ] && [ ! -r "$(dirname "$hull")/vmlinuz-hull" ]; then
+			printf 'qemu: fs-verity on hull'"'"'s own kernel not tried: no vmlinuz-hull\n'
+			continue
+		fi
+		sed "s/KERNEL/$kernel/" "$root/cfsverity.in" > "$root/cfsverity.conf"
+		out=$(cd / && XDG_DATA_HOME="$root/cfs/store" timeout 90 "$hull" run -f "$root/cfsverity.conf" 2>&1)
+		cases=$((cases + 1))
+		printf '%s\n' "$out" | grep -q '^overlay / overlay .*verity=require' &&
+			printf '%s\n' "$out" | grep -q '^VERITYMARK guarded$' &&
+			printf '%s\n' "$out" | grep -q '^status=0$' ||
+			fail "a stored tree with (verity true) on (kernel $kernel) did not read as committed" "$out"
+	done
+	disk=$(ls "$root/cfs/store/hull/store/mounts/"*.objects.ext4 2>/dev/null)
+	cases=$((cases + 1))
+	if [ -z "$disk" ] || ! python3 -I -c '
+import sys
+b = bytearray(open(sys.argv[1], "rb").read())
+i = b.find(b"VERITYMARK guarded")
+if i < 0:
+    sys.exit(1)
+b[i] = ord("X")
+open(sys.argv[1], "wb").write(b)
+' "$disk"; then
+		fail "no objects disk holding the guarded file" "$(ls "$root/cfs/store/hull/store/mounts/")"
+	else
+		sed "s/KERNEL/bundled/" "$root/cfsverity.in" > "$root/cfsverity.conf"
+		out=$(cd / && XDG_DATA_HOME="$root/cfs/store" timeout 90 "$hull" run -f "$root/cfsverity.conf" 2>&1)
+		printf '%s\n' "$out" | grep -q "guarded.*Input/output error" &&
+			printf '%s\n' "$out" | grep -q '^status=1$' &&
+			! printf '%s\n' "$out" | grep -q 'XERITYMARK' ||
+			fail "a changed object read under (verity true)" "$out"
+	fi
+	cases=$((cases + 1))
+	out=$(XDG_DATA_HOME="$root/cfs/store" timeout 30 "$hull" plan -f "$root/cfsverity.conf" \
+		--backend chroot 2>&1)
+	[ $? -ne 0 ] && printf '%s\n' "$out" | grep -q 'security\.verity' ||
+		fail "(verity true) was planned on chroot" "$out"
+	cases=$((cases + 1))
+	printf '(machine (source "dir:%s") (backend vm) (security (verity true)) %s)\n' "$r" \
+		'(command "/bin/true")' > "$root/dirverity.conf"
+	out=$(cd / && timeout 60 "$hull" run -f "$root/dirverity.conf" 2>&1)
+	[ $? -ne 0 ] && printf '%s\n' "$out" | grep -q 'checks a stored tree' ||
+		fail "(verity true) on a dir source was not refused" "$out"
+	rm -f "$root/cfsverity.in" "$root/cfsverity.conf" "$root/dirverity.conf"
 	XDG_DATA_HOME="$root/cfs/store" timeout 30 "$hull" tag -d cfs/root:1 > /dev/null 2>&1
 	XDG_DATA_HOME="$root/cfs/store" timeout 30 "$hull" tag -d cfs/tree:1 > /dev/null 2>&1
 	XDG_DATA_HOME="$root/cfs/store" timeout 60 "$hull" gc > /dev/null 2>&1

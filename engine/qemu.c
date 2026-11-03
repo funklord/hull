@@ -121,6 +121,7 @@ struct hull_machine {
 	int              overlay;      /* (mutable overlay): the share is read-only */
 	int              block_root;   /* (projection block): the root a disk image of the tree */
 	char            *composefs;    /* a composefs: source, its image; root is then the objects */
+	char            *verity_disk;  /* (security (verity true)): its objects as ext4, beside it */
 	const char      *boot;         /* a bootable export's /hull/boot, else NULL */
 	char            *layer_path[MAX_VOLUMES];  /* (layers ...): read-only, each above the last */
 	unsigned         layer_count;
@@ -399,6 +400,7 @@ static void release(hull_machine *m)
 	}
 	free(m->root);
 	free(m->composefs);
+	free(m->verity_disk);
 	for (unsigned i = 0u; i < m->volume_count; i++)
 		free(m->volume_host[i]);
 	for (unsigned i = 0u; i < m->volume_count; i++)
@@ -496,8 +498,28 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	if (m->root == NULL)
 		return "out of memory";
 
-	if (hull_access_find(doc, &machine, "security", &entry))
+	if (hull_access_find(doc, &machine, "security", &entry)) {
 		m->readonly_root = hull_access_true(doc, &entry, "readonly_root");
+		/* fs-verity (section 3.2): each file of a stored tree checked as
+		 * it is read against the digest its composefs image pins, from
+		 * the ext4 disk of its objects the frontend made beside the
+		 * image, HEX.objects.ext4, there being none on the host. */
+		if (hull_access_true(doc, &entry, "verity")) {
+			size_t stem;
+
+			if (m->composefs == NULL || (stem = strlen(m->composefs)) < 8u ||
+			    strcmp(m->composefs + stem - 8u, ".2.erofs") != 0)
+				return "(security (verity true)) checks a stored tree's files against its "
+				       "composefs image: the source is not one";
+			if ((m->verity_disk = malloc(stem + 16u)) == NULL)
+				return "out of memory";
+			snprintf(m->verity_disk, stem + 16u, "%.*s.objects.ext4", (int)(stem - 8u),
+			         m->composefs);
+			if (access(m->verity_disk, R_OK) != 0)
+				return "(security (verity true)): the tree's objects disk is not beside its "
+				       "image; the frontend makes it, from a stored source";
+		}
+	}
 	text = hull_access_value(doc, &machine, "mutable");
 	m->overlay = text != NULL && strcmp(text, "overlay") == 0;
 	free(text);
@@ -1212,6 +1234,11 @@ static const char *write_initramfs(const hull_machine *m, const char *modules, i
 		extra[extra_count++] = "?crc32c_generic";
 		extra[extra_count++] = "erofs";
 	}
+	/* fs-verity's objects disk, ext4 on a virtio disk; crc32c above. */
+	if (m->verity_disk != NULL && load_modules && extra_count + 2u <= MAX_MODULES) {
+		extra[extra_count++] = "virtio_blk";
+		extra[extra_count++] = "ext4";
+	}
 	/* A block projection's root: its disk, ext4 and the crc32c ext4
 	 * asks for, as an image volume's. */
 	if (m->block_root && load_modules && extra_count + 3u <= MAX_MODULES) {
@@ -1664,6 +1691,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        sshd_at[4200];
 	char        cfs[9000];
 	char        cfs_at[4200];
+	char        verity_drive[4400];
 	char        segment_netdev[MAX_SEGMENTS][64];
 	char        segment_device[MAX_SEGMENTS][96];
 	char        fsdev[MAX_VOLUMES][9000];
@@ -1671,7 +1699,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        path[8500];
 	char        device_chardev[HULL_MAX_DEVICES][600];
 	char        device_device[HULL_MAX_DEVICES][96];
-	const char *argv[72 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS + 4u * HULL_MAX_DEVICES + 2u];
+	const char *argv[76 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS + 4u * HULL_MAX_DEVICES + 2u];
 	unsigned    serial = 0u;
 	unsigned    parallel = 0u;
 	int         usb = 0;
@@ -1912,6 +1940,18 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		argv[n++] = cfs;
 		argv[n++] = "-device";
 		argv[n++] = "virtio-9p-pci,fsdev=cfs,mount_tag=cfs";
+	}
+	/* fs-verity's objects disk, written only in a snapshot qemu discards:
+	 * the guest enables verity on each file, which writes its Merkle
+	 * tree, and the store's disk stays as made, for every machine of it. */
+	if (m->verity_disk != NULL) {
+		escaped(cfs_at, sizeof cfs_at, m->verity_disk);
+		snprintf(verity_drive, sizeof verity_drive,
+		         "file=%s,format=raw,if=none,id=objects,snapshot=on", cfs_at);
+		argv[n++] = "-drive";
+		argv[n++] = verity_drive;
+		argv[n++] = "-device";
+		argv[n++] = "virtio-blk-pci,drive=objects,serial=objects";
 	}
 	argv[n++] = "-device";
 	argv[n++] = "virtio-rng-pci";
@@ -4121,6 +4161,9 @@ static const hull_cap_entry entries[] = {
 	{ "source.composefs.overlay", HULL_SUP_NATIVE,
 	  "a stored tree's composefs image mounted in the guest over the store's objects, "
 	  "no tree copied; writes in a tmpfs there", NULL },
+	{ "security.verity",    HULL_SUP_NATIVE,
+	  "each file of a stored tree checked against the fs-verity digest its composefs image "
+	  "pins, its objects on an ext4 disk with verity in the guest", NULL },
 	{ "source.dir.overlay", HULL_SUP_EMULATED,
 	  "an overlayfs in the guest; writes are held in the machine's memory and go with it",
 	  NULL },

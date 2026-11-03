@@ -56,6 +56,7 @@
 #include "core.h"
 #include "doctor.h"
 #include "export.h"
+#include "hostnet.h"
 #include "kernel_fetch.h"
 #include "sshd_fetch.h"
 #include "import.h"
@@ -795,6 +796,94 @@ static int composefs_machine(const hull_spec *spec, const hull_sexpr_form *machi
 	return 1;
 }
 
+/* Whether the machine asks `(security (verity true))`. */
+static int wants_verity(const hull_spec *spec, const hull_sexpr_form *machine)
+{
+	hull_sexpr_form security;
+	hull_sexpr_form item;
+	hull_sexpr_form head;
+	hull_sexpr_form value;
+
+	if (!hull_spec_find(spec, machine, "security", &security) ||
+	    !hull_sexpr_child(&spec->doc, &security, &item))
+		return 0;
+	for (int more = hull_sexpr_next(&spec->doc, &item, &item); more;
+	     more = hull_sexpr_next(&spec->doc, &item, &item))
+		if (hull_sexpr_child(&spec->doc, &item, &head) && hull_sexpr_is(&spec->doc, &head, "verity") &&
+		    hull_sexpr_next(&spec->doc, &head, &value) && hull_sexpr_is(&spec->doc, &value, "true"))
+			return 1;
+	return 0;
+}
+
+/* A verity machine's objects disk (section 3.2): the objects of its tree
+ * as an ext4 filesystem with the verity feature, beside its image as
+ * HEX.objects.ext4, where the guest enables fs-verity on each and mounts
+ * them as the overlay's data layer with verity=require -- no filesystem
+ * of the host's can hold verity without root. Made once, by mke2fs as
+ * the user, from links to the objects in the store's tmp/; sized for the
+ * bytes, the Merkle trees the guest adds, about a 127th, and a block or
+ * three a file. */
+static int verity_disk(hull_store *store, const char *name, const char *image, char *why,
+                       size_t cap)
+{
+	const char *mke2fs = access("/usr/sbin/mke2fs", X_OK) == 0 ? "/usr/sbin/mke2fs" :
+	                     access("/sbin/mke2fs", X_OK) == 0 ? "/sbin/mke2fs" : NULL;
+	char        disk[4200];
+	char        partial[4300];
+	char        staging[4200];
+	char        size[32];
+	char        inodes[32];
+	uint64_t    count;
+	uint64_t    bytes;
+	size_t      stem = strlen(image);
+	const char *mounts_slash;
+	int         status;
+
+	if (stem < 8u || strcmp(image + stem - 8u, ".2.erofs") != 0 ||
+	    (mounts_slash = strrchr(image, '/')) == NULL || mounts_slash - image < 7)
+		return snprintf(why, cap, "the source is not a composefs image of the store's"), -1;
+	snprintf(disk, sizeof disk, "%.*s.objects.ext4", (int)(stem - 8u), image);
+	if (access(disk, R_OK) == 0)
+		return 0;
+	if (mke2fs == NULL)
+		return snprintf(why, cap, "(security (verity true)) puts the tree's objects on an "
+		                "ext4 disk, made by mke2fs, which is not installed (e2fsprogs)"), -1;
+	/* tmp/ beside mounts/, which gc empties of what a run left. */
+	snprintf(staging, sizeof staging, "%.*s/tmp/verity-%ld", (int)(mounts_slash - image - 7),
+	         image, (long)getpid());
+	if (hull_store_composefs_objects(store, name, staging, &count, &bytes, why, cap) != 0)
+		return -1;
+	snprintf(size, sizeof size, "%lluk",
+	         (unsigned long long)((bytes + bytes / 64u + count * 3u * 4096u) / 1024u + 16384u));
+	snprintf(inodes, sizeof inodes, "%llu", (unsigned long long)(count + 512u));
+	snprintf(partial, sizeof partial, "%s.%ld", disk, (long)getpid());
+	{
+		const char *const argv[] = { "env", "E2FSPROGS_FAKE_TIME=1", mke2fs, "-q", "-F", "-t",
+		                             "ext4", "-b", "4096", "-O", "verity,^has_journal", "-N",
+		                             inodes, "-d", staging, partial, size, NULL };
+
+		status = hull_hostnet_run(argv, why, cap);
+	}
+	{
+		const char *leaf = strrchr(staging, '/');
+		char        tmp[4200];
+		int         fd;
+
+		snprintf(tmp, sizeof tmp, "%.*s", (int)(leaf - staging), staging);
+		if ((fd = open(tmp, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) >= 0) {
+			hull_store_remove_tree(fd, leaf + 1);
+			close(fd);
+		}
+	}
+	if (status != 0 || rename(partial, disk) != 0) {
+		if (status == 0)
+			snprintf(why, cap, "%s: %s", disk, strerror(errno));
+		unlink(partial);
+		return -1;
+	}
+	return 0;
+}
+
 static int store_sources(const char *file, uint8_t *data, size_t *length, int create,
                          const char *const *backends, unsigned backend_count)
 {
@@ -894,7 +983,9 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 		}
 		cfs = composefs_machine(&spec, &machines[i], backends, backend_count);
 		if (cfs ? hull_store_composefs_image(&store, name, create, path, sizeof path, why,
-		                                     sizeof why) != 0 :
+		                                     sizeof why) != 0 ||
+		          (create && wants_verity(&spec, &machines[i]) &&
+		           verity_disk(&store, name, path, why, sizeof why) != 0) :
 		          create && hull_store_checkout(&store, name, 1, path, sizeof path, &skipped, why,
 		                                        sizeof why) != 0) {
 			fprintf(stderr, "%s: %s: %s\n", file, name, why);

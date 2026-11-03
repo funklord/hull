@@ -206,6 +206,28 @@ void hull_owners_free(hull_owner *owners, size_t count);
  * 0, or -1 with `why`. */
 int hull_unpack_end(hull_unpack *u, char *why, size_t cap);
 
+/* The tree `name` names, a ref or sha256:HEX, as a composefs EROFS image
+ * to `out` (section 3.2): its regular files a size, an owner and a
+ * redirect to their objects, served by an overlay whose data-only lower
+ * layer is the store's objects/sha256, and each object's fs-verity digest
+ * in its metacopy, every object read and checked against its name for it.
+ * 0, or -1 with `why`. */
+int hull_store_composefs(hull_store *store, const char *name, int out, char *why, size_t cap);
+
+/* Where the composefs image of the tree `name` names is kept, the store's
+ * mounts/HEX.2.erofs, into `path`; with `create`, written there first
+ * where it is not. 0, or -1 with `why`. */
+int hull_store_composefs_image(hull_store *store, const char *name, int create, char *path,
+                               size_t path_cap, char *why, size_t cap);
+
+/* The objects of the tree `name` names, each regular file's once, linked
+ * into the new directory `dir` as composefs's lower layer has them,
+ * `ab/abcdef...`, for a filesystem made from them (an fs-verity run's,
+ * section 3.2). Their count and their bytes into `count` and `bytes`. 0,
+ * or -1 with `why`, `dir` then removed. */
+int hull_store_composefs_objects(hull_store *store, const char *name, const char *dir,
+                                 uint64_t *count, uint64_t *bytes, char *why, size_t cap);
+
 /* The tree `name` names, a ref or sha256:HEX, as one OCI layer, an
  * uncompressed tar, to `sink`, which takes it a piece at a time and
  * returns 0 to go on: the manifest's entries in its order, each directory
@@ -214,18 +236,6 @@ int hull_unpack_end(hull_unpack *u, char *why, size_t cap);
  * its name as it goes. The manifest's arch into `arch`. 0, or -1 with
  * `why`, an owner of class `user`, which has no number in an image, among
  * the refusals. */
-/* The tree `name` names, a ref or sha256:HEX, as a composefs EROFS image
- * to `out` (section 3.2): its regular files a size, an owner and a
- * redirect to their objects, served by an overlay whose data-only lower
- * layer is the store's objects/sha256. 0, or -1 with `why`. */
-int hull_store_composefs(hull_store *store, const char *name, int out, char *why, size_t cap);
-
-/* Where the composefs image of the tree `name` names is kept, the store's
- * mounts/HEX.erofs, into `path`; with `create`, written there first where
- * it is not. 0, or -1 with `why`. */
-int hull_store_composefs_image(hull_store *store, const char *name, int create, char *path,
-                               size_t path_cap, char *why, size_t cap);
-
 int hull_store_layer(hull_store *store, const char *name,
                      int (*sink)(void *context, const uint8_t *data, size_t n), void *context,
                      char arch[64], char *why, size_t cap);
