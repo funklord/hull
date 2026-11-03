@@ -2252,6 +2252,26 @@ else
 	cases=$((cases + 1))
 	cmp -s "$root/boot.img" "$root/boot2.img" ||
 		fail "two exports of one tree differ" "$(cmp "$root/boot.img" "$root/boot2.img" 2>&1)"
+	# From a spec: the machine's own source and init, a dir: relative to
+	# the file, the same tree and init, so the same bytes; and a member
+	# of (machines ...) by its name.
+	printf '(machine (source "dir:./bootroot") (init "/sbin/booted"))\n' > "$root/bootspec.conf"
+	printf '(machines (other (source "dir:./rootfs")) %s)\n' \
+		'(bootme (source "dir:./bootroot") (init "/sbin/booted"))' > "$root/bootset.conf"
+	for spec in "bootspec.conf" "bootset.conf bootme"; do
+		name="export -f $spec"
+		# shellcheck disable=SC2086
+		out=$(cd / && timeout 120 "$hull" export --bootable -f "$root/"$spec "$root/boot2.img" 2>&1)
+		got=$?
+		has 0 'boot2\.img$'
+		cases=$((cases + 1))
+		cmp -s "$root/boot.img" "$root/boot2.img" ||
+			fail "$name: not the image of its tree and init" "$(cmp "$root/boot.img" "$root/boot2.img" 2>&1)"
+	done
+	name='export -f, no name for a set'
+	out=$(cd / && timeout 30 "$hull" export --bootable -f "$root/bootset.conf" "$root/boot2.img" 2>&1)
+	got=$?
+	has 125 'no such machine'
 	# Booted, with nothing of hull's: what the tree's init saw, its root
 	# the tree's partition, writable, root's files root's.
 	rm -f "$root/boot.serial"

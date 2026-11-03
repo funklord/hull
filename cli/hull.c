@@ -120,6 +120,7 @@ static void usage(FILE *out)
 	      "       hull pool ls | hull lease ls\n"
 	      "       hull pack DIR|REF FILE | hull unpack FILE|- DIR\n"
 	      "       hull export --bootable DIR|REF IMAGE [--init PATH] | hull kernel fetch\n"
+	      "       hull export --bootable -f FILE [NAME] IMAGE\n"
 	      "       hull build [-f FILE] [--check] REF\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
@@ -4290,6 +4291,79 @@ static int export_bootable(const char *source, const char *image, const char *in
 	return 0;
 }
 
+/* The one value of `key` in the spec's machine, allocated, or NULL. */
+static char *spec_value(hull_spec *spec, const hull_sexpr_form *machine, const char *key)
+{
+	hull_sexpr_form entry;
+	hull_sexpr_form head;
+	hull_sexpr_form value;
+
+	if (!hull_spec_find(spec, machine, key, &entry) ||
+	    !hull_sexpr_child(&spec->doc, &entry, &head) ||
+	    !hull_sexpr_next(&spec->doc, &head, &value))
+		return NULL;
+	return strndup((const char *)spec->doc.data + value.content, value.content_length);
+}
+
+/* `hull export --bootable -f FILE [NAME] IMAGE`: the machine's own source
+ * and init, from its spec -- a dir: source relative to the file, as a run
+ * reads it, committed first; a tar: or pack: one committed as a run
+ * commits it; a stored ref as it is. */
+static int export_machine(const char *file, const char *name, const char *image)
+{
+	hull_spec       spec;
+	hull_spec_error error;
+	hull_sexpr_form machine;
+	uint8_t        *data;
+	size_t          length;
+	char           *source;
+	char           *init;
+	char            path[4400];
+	int             status;
+
+	if ((data = spec_text(file, &length)) == NULL)
+		return 125;
+	if (store_sources(file, data, &length, 1) != 0) {
+		free(data);
+		return 125;
+	}
+	if (hull_spec_open(&spec, data, length, &error) != HULL_SPEC_OK) {
+		fprintf(stderr, "%s:%u:%u: %s%s%s\n", file, error.line, error.column, error.path,
+		        error.path[0] != '\0' ? ": " : "", error.reason);
+		free(data);
+		return 125;
+	}
+	if (spec.has_machine && name == NULL) {
+		machine = spec.machine;
+	} else if (!(spec.has_machines && name != NULL &&
+	             hull_spec_find(&spec, &spec.machines, name, &machine))) {
+		fprintf(stderr, "%s: %s\n", file, spec.has_machines ?
+		        "no such machine in (machines ...)" :
+		        name != NULL ? "a single machine takes no name" : "there is no machine to export");
+		free(data);
+		return 125;
+	}
+	source = spec_value(&spec, &machine, "source");
+	init   = spec_value(&spec, &machine, "init");
+	if (source == NULL) {
+		fprintf(stderr, "%s: the machine names no source\n", file);
+		status = 125;
+	} else if (strncmp(source, "dir:", 4u) == 0 && source[4] != '/') {
+		const char *slash = strrchr(file, '/');
+
+		snprintf(path, sizeof path, "%.*s%s", slash != NULL ? (int)(slash - file + 1) : 0,
+		         file, source + 4);
+		status = export_bootable(path, image, init != NULL ? init : "/sbin/init");
+	} else {
+		status = export_bootable(strncmp(source, "dir:", 4u) == 0 ? source + 4 : source, image,
+		                         init != NULL ? init : "/sbin/init");
+	}
+	free(source);
+	free(init);
+	free(data);
+	return status;
+}
+
 /* `hull pack SRC FILE` (section 3.13): the tree SRC is, a directory --
  * committed first, its owners as a commit takes them -- or a stored ref,
  * as one file, its manifest's hash printed. */
@@ -5922,6 +5996,9 @@ int main(int argc, char **argv)
 		}
 		return 0;
 	}
+	if (strcmp(command, "export") == 0 && (argc == 6 || argc == 7) &&
+	    strcmp(argv[2], "--bootable") == 0 && strcmp(argv[3], "-f") == 0)
+		return export_machine(argv[4], argc == 7 ? argv[5] : NULL, argv[argc - 1]);
 	if (strcmp(command, "export") == 0 && argc == 5 && strcmp(argv[2], "--bootable") == 0)
 		return export_bootable(argv[3], argv[4], "/sbin/init");
 	if (strcmp(command, "export") == 0 && argc == 7 && strcmp(argv[2], "--bootable") == 0 &&
