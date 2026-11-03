@@ -214,6 +214,13 @@ struct argv_entry size=8.. access=Sequential mutate=Shifting address=Unstable re
   argv_entry.words[].length              offset=FrameStatic(0x00) size=Bounded(1, 10) align=Aligned(8) repr=TextConverted atomic=AtomicWord mutate=Shifting
   argv_entry.words[].bytes               offset=Scanned size=Bounded(0, 4294967295) align=Unaligned repr=MemoryIdentical atomic=AtomicWord access=Sequential mutate=Shifting address=Unstable
 
+struct argv_words size=5.. access=Sequential mutate=Shifting address=Unstable repr=TextConverted atomic=NonAtomic effect=EffectOnRead
+  argv_words.<reserved0>                 offset=AbsoluteStatic(0x00) size=Fixed(4) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic
+  argv_words.words                       offset=AbsoluteStatic(0x04) size=Unbounded align=Aligned(4) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting effect=EffectOnRead
+  argv_words.words[]                     offset=FrameStatic(0x00) size=Bounded(1, 4294967305) align=Aligned(8) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
+  argv_words.words[].length              offset=FrameStatic(0x00) size=Bounded(1, 10) align=Aligned(8) repr=TextConverted atomic=AtomicWord mutate=Shifting
+  argv_words.words[].bytes               offset=Scanned size=Bounded(0, 4294967295) align=Unaligned repr=MemoryIdentical atomic=AtomicWord access=Sequential mutate=Shifting address=Unstable
+
 struct atom size=1..4294967305 access=Sequential mutate=Shifting address=Unstable repr=TextConverted
   atom.length                            offset=AbsoluteStatic(0x00) size=Bounded(1, 10) align=Aligned(8) repr=TextConverted atomic=AtomicWord mutate=Shifting
   atom.bytes                             offset=Scanned size=Bounded(0, 4294967295) align=Unaligned repr=MemoryIdentical atomic=AtomicWord access=Sequential mutate=Shifting address=Unstable
@@ -230,6 +237,20 @@ struct channel size=7..4294967311 access=Sequential mutate=Shifting address=Unst
   channel.id.length                      offset=AbsoluteStatic(0x05) size=Bounded(1, 10) align=Aligned(1) repr=TextConverted atomic=NonAtomic mutate=Shifting
   channel.id.bytes                       offset=Scanned size=Bounded(0, 4294967295) align=Unaligned repr=MemoryIdentical atomic=AtomicWord access=Sequential mutate=Shifting address=Unstable
   channel.close                          offset=Dynamic size=Fixed(1) align=Unaligned repr=MemoryIdentical atomic=AtomicWord address=Unstable
+
+struct command_entry size=8.. access=Sequential mutate=Shifting address=Unstable repr=TextConverted atomic=NonAtomic effect=EffectOnRead
+  command_entry.<reserved0>              offset=AbsoluteStatic(0x00) size=Fixed(3) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic
+  command_entry.kind                     offset=AbsoluteStatic(0x03) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  command_entry.value                    offset=AbsoluteStatic(0x03) size=Unbounded align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting
+  command_entry.value.argv               offset=AbsoluteStatic(0x03) size=Unbounded align=Aligned(1) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable effect=EffectOnRead
+  command_entry.value.argv.<reserved0>   offset=AbsoluteStatic(0x03) size=Fixed(4) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
+  command_entry.value.argv.words         offset=AbsoluteStatic(0x07) size=Unbounded align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting effect=EffectOnRead
+  command_entry.value.argv.words[]       offset=FrameStatic(0x03) size=Bounded(1, 4294967305) align=Aligned(1) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
+  command_entry.value.argv.words[].length offset=FrameStatic(0x03) size=Bounded(1, 10) align=Aligned(1) repr=TextConverted atomic=NonAtomic mutate=Shifting
+  command_entry.value.argv.words[].bytes offset=Scanned size=Bounded(0, 4294967295) align=Unaligned repr=MemoryIdentical atomic=AtomicWord access=Sequential mutate=Shifting address=Unstable
+  command_entry.value.tree               offset=AbsoluteStatic(0x03) size=Fixed(11) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
+  command_entry.value.tree.<reserved0>   offset=AbsoluteStatic(0x03) size=Fixed(10) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
+  command_entry.value.tree.close         offset=AbsoluteStatic(0x0D) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
 
 struct connect size=26..8589934648 access=Sequential mutate=Shifting address=Unstable repr=TextConverted atomic=NonAtomic
   connect.<reserved0>                    offset=AbsoluteStatic(0x00) size=Fixed(9) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic
@@ -301,12 +322,19 @@ struct eof size=13..4294967317 access=Sequential mutate=Shifting address=Unstabl
 
 struct exec size=36.. access=Sequential mutate=Shifting address=Unstable repr=TextConverted atomic=NonAtomic effect=EffectOnRead
   exec.<reserved0>                       offset=AbsoluteStatic(0x00) size=Fixed(6) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic
-  exec.argv                              offset=AbsoluteStatic(0x06) size=Unbounded align=Aligned(2) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable effect=EffectOnRead
-  exec.argv.<reserved0>                  offset=AbsoluteStatic(0x06) size=Fixed(7) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
-  exec.argv.words                        offset=AbsoluteStatic(0x0D) size=Unbounded align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting effect=EffectOnRead
-  exec.argv.words[]                      offset=FrameStatic(0x06) size=Bounded(1, 4294967305) align=Aligned(2) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
-  exec.argv.words[].length               offset=FrameStatic(0x06) size=Bounded(1, 10) align=Aligned(2) repr=TextConverted atomic=NonAtomic mutate=Shifting
-  exec.argv.words[].bytes                offset=Scanned size=Bounded(0, 4294967295) align=Unaligned repr=MemoryIdentical atomic=AtomicWord access=Sequential mutate=Shifting address=Unstable
+  exec.command                           offset=AbsoluteStatic(0x06) size=Unbounded align=Aligned(2) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable effect=EffectOnRead
+  exec.command.<reserved0>               offset=AbsoluteStatic(0x06) size=Fixed(3) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
+  exec.command.kind                      offset=AbsoluteStatic(0x09) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
+  exec.command.value                     offset=AbsoluteStatic(0x09) size=Unbounded align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting
+  exec.command.value.argv                offset=AbsoluteStatic(0x09) size=Unbounded align=Aligned(1) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable effect=EffectOnRead
+  exec.command.value.argv.<reserved0>    offset=AbsoluteStatic(0x09) size=Fixed(4) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
+  exec.command.value.argv.words          offset=AbsoluteStatic(0x0D) size=Unbounded align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting effect=EffectOnRead
+  exec.command.value.argv.words[]        offset=FrameStatic(0x09) size=Bounded(1, 4294967305) align=Aligned(1) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
+  exec.command.value.argv.words[].length offset=FrameStatic(0x09) size=Bounded(1, 10) align=Aligned(1) repr=TextConverted atomic=NonAtomic mutate=Shifting
+  exec.command.value.argv.words[].bytes  offset=Scanned size=Bounded(0, 4294967295) align=Unaligned repr=MemoryIdentical atomic=AtomicWord access=Sequential mutate=Shifting address=Unstable
+  exec.command.value.tree                offset=AbsoluteStatic(0x09) size=Fixed(11) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
+  exec.command.value.tree.<reserved0>    offset=AbsoluteStatic(0x09) size=Fixed(10) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
+  exec.command.value.tree.close          offset=AbsoluteStatic(0x13) size=Fixed(1) align=Aligned(1) repr=MemoryIdentical atomic=AtomicWord
   exec.ch                                offset=Dynamic size=Bounded(7, 4294967311) align=Unaligned repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
   exec.ch.<reserved0>                    offset=FrameStatic(0x00) size=Fixed(5) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic address=FrameStable
   exec.ch.id                             offset=FrameStatic(0x05) size=Bounded(1, 4294967305) align=Aligned(1) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
@@ -535,12 +563,19 @@ struct host_message size=5.. access=Sequential mutate=Shifting address=Unstable 
   host_message.body.start.<reserved2>    offset=Dynamic size=Fixed(2) align=Unaligned repr=MemoryIdentical atomic=NonAtomic address=Unstable
   host_message.body.exec                 offset=AbsoluteStatic(0x01) size=Unbounded align=Aligned(1) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable effect=EffectOnRead
   host_message.body.exec.<reserved0>     offset=AbsoluteStatic(0x01) size=Fixed(6) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
-  host_message.body.exec.argv            offset=AbsoluteStatic(0x07) size=Unbounded align=Aligned(1) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable effect=EffectOnRead
-  host_message.body.exec.argv.<reserved0> offset=AbsoluteStatic(0x07) size=Fixed(7) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
-  host_message.body.exec.argv.words      offset=AbsoluteStatic(0x0E) size=Unbounded align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting effect=EffectOnRead
-  host_message.body.exec.argv.words[]    offset=FrameStatic(0x07) size=Bounded(1, 4294967305) align=Aligned(1) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
-  host_message.body.exec.argv.words[].length offset=FrameStatic(0x07) size=Bounded(1, 10) align=Aligned(1) repr=TextConverted atomic=NonAtomic mutate=Shifting
-  host_message.body.exec.argv.words[].bytes offset=Scanned size=Bounded(0, 4294967295) align=Unaligned repr=MemoryIdentical atomic=AtomicWord access=Sequential mutate=Shifting address=Unstable
+  host_message.body.exec.command         offset=AbsoluteStatic(0x07) size=Unbounded align=Aligned(1) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable effect=EffectOnRead
+  host_message.body.exec.command.<reserved0> offset=AbsoluteStatic(0x07) size=Fixed(3) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic
+  host_message.body.exec.command.kind    offset=AbsoluteStatic(0x0A) size=Fixed(1) align=Aligned(2) repr=MemoryIdentical atomic=AtomicWord
+  host_message.body.exec.command.value   offset=AbsoluteStatic(0x0A) size=Unbounded align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting
+  host_message.body.exec.command.value.argv offset=AbsoluteStatic(0x0A) size=Unbounded align=Aligned(2) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable effect=EffectOnRead
+  host_message.body.exec.command.value.argv.<reserved0> offset=AbsoluteStatic(0x0A) size=Fixed(4) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
+  host_message.body.exec.command.value.argv.words offset=AbsoluteStatic(0x0E) size=Unbounded align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic mutate=Shifting effect=EffectOnRead
+  host_message.body.exec.command.value.argv.words[] offset=FrameStatic(0x0A) size=Bounded(1, 4294967305) align=Aligned(2) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
+  host_message.body.exec.command.value.argv.words[].length offset=FrameStatic(0x0A) size=Bounded(1, 10) align=Aligned(2) repr=TextConverted atomic=NonAtomic mutate=Shifting
+  host_message.body.exec.command.value.argv.words[].bytes offset=Scanned size=Bounded(0, 4294967295) align=Unaligned repr=MemoryIdentical atomic=AtomicWord access=Sequential mutate=Shifting address=Unstable
+  host_message.body.exec.command.value.tree offset=AbsoluteStatic(0x0A) size=Fixed(11) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
+  host_message.body.exec.command.value.tree.<reserved0> offset=AbsoluteStatic(0x0A) size=Fixed(10) align=Aligned(2) repr=MemoryIdentical atomic=NonAtomic
+  host_message.body.exec.command.value.tree.close offset=AbsoluteStatic(0x14) size=Fixed(1) align=Aligned(4) repr=MemoryIdentical atomic=AtomicWord
   host_message.body.exec.ch              offset=Dynamic size=Bounded(7, 4294967311) align=Unaligned repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
   host_message.body.exec.ch.<reserved0>  offset=FrameStatic(0x01) size=Fixed(5) align=Aligned(1) repr=MemoryIdentical atomic=NonAtomic address=FrameStable
   host_message.body.exec.ch.id           offset=FrameStatic(0x06) size=Bounded(1, 4294967305) align=Aligned(2) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
@@ -956,6 +991,10 @@ struct tail_entry size=2.. access=Sequential mutate=Shifting address=Unstable re
   tail_entry.values[].body.as_atom       offset=FrameStatic(0x00) size=Bounded(1, 4294967305) align=Aligned(8) repr=TextConverted atomic=NonAtomic access=Sequential mutate=Shifting address=Unstable
   tail_entry.values[].body.as_atom.length offset=FrameStatic(0x00) size=Bounded(1, 10) align=Aligned(8) repr=TextConverted atomic=AtomicWord mutate=Shifting
   tail_entry.values[].body.as_atom.bytes offset=Scanned size=Bounded(0, 4294967295) align=Unaligned repr=MemoryIdentical atomic=AtomicWord access=Sequential mutate=Shifting address=Unstable
+
+struct tree_flag size=11 atomic=NonAtomic
+  tree_flag.<reserved0>                  offset=AbsoluteStatic(0x00) size=Fixed(10) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic
+  tree_flag.close                        offset=AbsoluteStatic(0x0A) size=Fixed(1) align=Aligned(2) repr=MemoryIdentical atomic=AtomicWord
 
 struct tty_entry size=14..8589934633 access=Sequential mutate=Shifting address=Unstable repr=TextConverted atomic=NonAtomic
   tty_entry.<reserved0>                  offset=AbsoluteStatic(0x00) size=Fixed(6) align=Aligned(8) repr=MemoryIdentical atomic=NonAtomic
