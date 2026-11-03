@@ -2599,6 +2599,22 @@ else
 	out=$(tr -d '\r' < "$root/boot.serial" 2>&1 | grep -a -E 'booted|hull agent|Kernel panic')
 	name='export, booted'
 	has 0 '^booted pid=1 root=ext4 writable=yes owned=0:0 probe=0:0$'
+	# The same image under a BIOS, qemu's SeaBIOS, where `make limine`
+	# has built Limine 12 beside hull: its MBR code and its second stage
+	# in the BIOS boot partition. The fetched 11.x boots UEFI alone, so
+	# without the build the case says so and is not counted.
+	if [ -x "$(dirname "$hull")/limine/limine" ]; then
+		rm -f "$root/boot.serial"
+		timeout 90 qemu-system-x86_64 -machine q35 -m 512 -enable-kvm \
+			-drive "file=$root/boot.img,format=raw,if=virtio" -display none -net none \
+			-serial "file:$root/boot.serial" -no-reboot >/dev/null 2>&1
+		got=$?
+		out=$(tr -d '\r' < "$root/boot.serial" 2>&1 | grep -a -E 'booted|hull agent|Kernel panic')
+		name='export, booted by a BIOS'
+		has 0 '^booted pid=1 root=ext4 writable=yes owned=0:0 probe=0:0$'
+	else
+		printf 'qemu: a bootable export not booted by a BIOS: no make limine\n'
+	fi
 	# A stored tree's explicit owners, as its manifest has them: the
 	# view edited to give etc/owned to 101:102 and compiled back.
 	timeout 30 "$hull" commit "$root/bootroot" boot/tree:1 >/dev/null 2>&1

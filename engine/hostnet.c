@@ -64,7 +64,22 @@ int hull_hostnet_run(const char *const *argv, char *why, size_t cap)
 		snprintf(why, cap, "%s: %s", argv[0], strerror(errno));
 		return -1;
 	}
-	got = read(said[0], why, cap - 1u);
+	/* Read to the end, keeping the first of it: a single read and a close
+	 * killed a tool that writes more than once by SIGPIPE, measured on
+	 * Limine's bios-install, which said its first line and died. */
+	got = 0;
+	for (;;) {
+		char    rest[512];
+		ssize_t n = (size_t)got < cap - 1u ? read(said[0], why + got, cap - 1u - (size_t)got)
+		                                   : read(said[0], rest, sizeof rest);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;
+		if ((size_t)got < cap - 1u)
+			got += n;
+	}
 	close(said[0]);
 	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
 		;

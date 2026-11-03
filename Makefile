@@ -158,6 +158,18 @@ KERNEL_TAR     = $(BUILD_DIR)/kernel/linux-$(KERNEL_VERSION).tar.xz
 KERNEL_SRC     = $(BUILD_DIR)/kernel/linux-$(KERNEL_VERSION)
 KERNEL_BIN     = $(BUILD_DIR)/vmlinuz-hull
 
+# Limine from source (section 3.13), beside hull in limine/, where
+# `hull export --bootable` takes it in place of the fetched 11.x UEFI
+# loader: 12.x, with its BIOS stages and the tool that installs them, so
+# an exported image boots under a BIOS as well. GNU binutils for the
+# target tools, the default being LLVM's. Built by `make limine` alone.
+LIMINE_VERSION = 12.9.6
+LIMINE_SHA256  = 6a4477636e108bcaaa88d7749f43dc3d3ba09a7d548244f3b1e847d27bc1b9a4
+LIMINE_TAR     = $(BUILD_DIR)/limine-src/limine-$(LIMINE_VERSION).tar.xz
+LIMINE_SRC     = $(BUILD_DIR)/limine-src/limine-$(LIMINE_VERSION)
+LIMINE_FILES   = $(BUILD_DIR)/limine/BOOTX64.EFI $(BUILD_DIR)/limine/limine-bios.sys \
+                 $(BUILD_DIR)/limine/limine
+
 # The hosts database for section 8.1's names, loaded by glibc into any
 # program that looks a name up: nothing of hull's but its own file.
 NSS_LIB    = $(BUILD_DIR)/libnss_hull.so.2
@@ -301,7 +313,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all kernel nss root install-root check check-docker check-qemu check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all kernel limine nss root install-root check check-docker check-qemu check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -315,6 +327,7 @@ root: $(ROOT_BIN)
 help:
 	@echo 'Targets:'
 	@echo '  all       build the libraries, build/hull and its agent (the default)'
+	@echo '  limine    build Limine $(LIMINE_VERSION) from source, for BIOS-bootable exports'
 	@echo '  kernel    build the vm kernel of hull'"'"'s own, vmlinuz-hull, from Linux $(KERNEL_VERSION)'
 	@echo '  nss       build the NSS module, libnss_hull.so.2, for *.hull names'
 	@echo '  root      build root mode'"'"'s helper, hull-root'
@@ -468,6 +481,25 @@ $(KERNEL_BIN): $(KERNEL_TAR) kernel/x86_64.config
 	done
 	$(MAKE) -C '$(KERNEL_SRC)' bzImage
 	cp '$(KERNEL_SRC)/arch/x86/boot/bzImage' '$@'
+
+limine: $(LIMINE_FILES)
+
+$(LIMINE_TAR):
+	@mkdir -p '$(@D)'
+	curl -sSfL -o '$@.part' 'https://github.com/Limine-Bootloader/Limine/releases/download/v$(LIMINE_VERSION)/limine-$(LIMINE_VERSION).tar.xz'
+	echo '$(LIMINE_SHA256)  $@.part' | sha256sum -c --quiet
+	mv '$@.part' '$@'
+
+$(LIMINE_SRC)/bin/limine: $(LIMINE_TAR)
+	test -d '$(LIMINE_SRC)' || tar -C '$(BUILD_DIR)/limine-src' -xf '$(LIMINE_TAR)'
+	cd '$(LIMINE_SRC)' && ./configure --enable-bios --enable-uefi-x86-64 \
+		CC_FOR_TARGET=gcc LD_FOR_TARGET=ld OBJCOPY_FOR_TARGET=objcopy \
+		OBJDUMP_FOR_TARGET=objdump READELF_FOR_TARGET=readelf > /dev/null
+	$(MAKE) -C '$(LIMINE_SRC)'
+
+$(LIMINE_FILES): $(LIMINE_SRC)/bin/limine
+	@mkdir -p '$(@D)'
+	cp '$(LIMINE_SRC)/bin/$(@F)' '$@'
 
 # Its native objects first, which make the generated sources and headers.
 $(BUILD_DIR)/hull-agent-arm64: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
@@ -760,7 +792,7 @@ clean:
 	        $(SPEC_OBJS) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS) $(PLAN_OBJS:.o=.d) \
 	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(STORE_OBJS) $(STORE_OBJS:.o=.d) $(OCI_OBJS) $(OCI_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) $(ROOT_BIN) \
 	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) $(DISC_GEN) $(FRAME_GEN) \
-	        $(AGENT_BIN) $(BUILD_DIR)/hull-agent-arm64 $(KERNEL_BIN) \
+	        $(AGENT_BIN) $(BUILD_DIR)/hull-agent-arm64 $(KERNEL_BIN) $(LIMINE_FILES) \
 	        $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(BUILD_DIR)/test/arm64/rootfs/probe \
 	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) $(FUZZ_FILES) \

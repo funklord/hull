@@ -129,7 +129,40 @@ static int pinned(const char *path)
 /* Limine's UEFI loader, in the user's cache, fetched where it is not
  * there or not what it is pinned to: its path into `out`. A download is
  * said on stderr, since a build that reaches the network says so. */
+static int limine_fetched(char *out, size_t cap, char *why, size_t why_cap);
+
+/* The directory beside the running hull where `make limine` puts Limine
+ * built from source, 12.x: BOOTX64.EFI, limine-bios.sys and the limine
+ * tool. 0, or -1 where there is no such place. */
+static int limine_built(char *out, size_t cap)
+{
+	char    self[4096];
+	ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1u);
+	char   *slash;
+
+	if (n <= 0)
+		return -1;
+	self[n] = '\0';
+	if ((slash = strrchr(self, '/')) == NULL)
+		return -1;
+	*slash = '\0';
+	return snprintf(out, cap, "%s/limine", self) < (int)cap ? 0 : -1;
+}
+
 static int limine(char *out, size_t cap, char *why, size_t why_cap)
+{
+	char built[4200];
+
+	/* Built from source by `make limine`, the newest, where it is. */
+	if (limine_built(built, sizeof built) == 0 &&
+	    snprintf(out, cap, "%s/BOOTX64.EFI", built) < (int)cap && access(out, R_OK) == 0)
+		return 0;
+	return limine_fetched(out, cap, why, why_cap);
+}
+
+/* Limine's UEFI loader as released prebuilt, 11.4.1's, fetched into the
+ * cache, where none is built. */
+static int limine_fetched(char *out, size_t cap, char *why, size_t why_cap)
 {
 	const char         *cache = getenv("XDG_CACHE_HOME");
 	const char         *home = getenv("HOME");
@@ -330,6 +363,7 @@ static int write_gpt(int fd, uint64_t sectors, uint64_t esp_first, uint64_t esp_
 	uint8_t        disk[16];
 	uint8_t        esp[16];
 	uint8_t        root[16];
+	uint8_t        bios[16];
 	uint32_t       crc;
 	uint64_t       last = sectors - 1u;
 
@@ -337,13 +371,21 @@ static int write_gpt(int fd, uint64_t sectors, uint64_t esp_first, uint64_t esp_
 	memcpy(disk, digest, 16u);
 	memcpy(esp, digest + 16, 16u);
 	memcpy(root, digest + 8, 16u);
+	memcpy(bios, digest + 4, 16u);
 	disk[7] = (uint8_t)((disk[7] & 0x0fu) | 0x40u), disk[8] = (uint8_t)((disk[8] & 0x3fu) | 0x80u);
 	esp[7]  = (uint8_t)((esp[7] & 0x0fu) | 0x40u), esp[8] = (uint8_t)((esp[8] & 0x3fu) | 0x80u);
 	root[7] = (uint8_t)((root[7] & 0x0fu) | 0x40u), root[8] = (uint8_t)((root[8] & 0x3fu) | 0x80u);
+	bios[7] = (uint8_t)((bios[7] & 0x0fu) | 0x40u), bios[8] = (uint8_t)((bios[8] & 0x3fu) | 0x80u);
 	memset(entries, 0, sizeof entries);
 	entry(entries, "C12A7328-F81F-11D2-BA4B-00A0C93EC93B", esp, esp_first, esp_last, "hull-esp");
 	entry(entries + 128, "0FC63DAF-8483-4772-8E79-3D69D8477DE4", root, root_first, root_last,
 	      root_name);
+	/* A BIOS boot partition in the gap before the ESP, third so the ESP
+	 * and the root keep their numbers: where Limine's second stage goes
+	 * for a BIOS to boot the disk, GPT having no room of its own for it.
+	 * Empty where no BIOS loader is installed, and nothing to UEFI. */
+	entry(entries + 256, "21686148-6449-6E6F-744E-656564454649", bios, 34u, esp_first - 1u,
+	      "hull-bios");
 	crc = (uint32_t)crc32(0L, entries, sizeof entries);
 
 	/* The protective MBR: one partition of type 0xEE over the disk. */
@@ -450,12 +492,21 @@ static int build_esp(const char *work, const char *loader, const char *kernel, c
 		                              "::/vmlinuz", NULL };
 		const char *const rest[] = { "env", setting, mcopy, "-m", "-i", esp, initrd, conf,
 		                             "::/", NULL };
+		char              built[4200];
+		char              stage[4300];
+		int               bios = limine_built(built, sizeof built) == 0 &&
+		                         snprintf(stage, sizeof stage, "%s/limine-bios.sys", built) > 0 &&
+		                         access(stage, R_OK) == 0;
+		const char *const bios_files[] = { "env", setting, mcopy, "-m", "-i", esp, stage,
+		                                   "::/", NULL };
 
 		if (run(format, "the ESP could not be made", why, cap) != 0 ||
 		    run(dirs, "the ESP's directories could not be made", why, cap) != 0 ||
 		    run(efi, "Limine could not be put on the ESP", why, cap) != 0 ||
 		    run(files, "the kernel could not be put on the ESP", why, cap) != 0 ||
-		    run(rest, "the initramfs could not be put on the ESP", why, cap) != 0)
+		    run(rest, "the initramfs could not be put on the ESP", why, cap) != 0 ||
+		    (bios && run(bios_files, "Limine's BIOS stage could not be put on the ESP", why,
+		                 cap) != 0))
 			return -1;
 	}
 	return 0;
@@ -576,6 +627,24 @@ int hull_export_bootable(hull_store *store, const char *name, const char *image,
 		snprintf(why, cap, "%s: %s", image, strerror(errno));
 		unlink(image);
 		goto done;
+	}
+	/* BIOS boot too, where Limine is built from source: its tool writes
+	 * the MBR's boot code and its second stage to the BIOS boot
+	 * partition, the third. The fetched 11.x has no tool, so its images
+	 * boot under UEFI alone. */
+	{
+		char built[4200];
+		char tool[4300];
+
+		if (limine_built(built, sizeof built) == 0 &&
+		    snprintf(tool, sizeof tool, "%s/limine", built) > 0 && access(tool, X_OK) == 0) {
+			const char *const argv[] = { tool, "bios-install", image, "3", NULL };
+
+			if (run(argv, "Limine's BIOS boot could not be installed", why, cap) != 0) {
+				unlink(image);
+				goto done;
+			}
+		}
 	}
 	status = 0;
 done:
