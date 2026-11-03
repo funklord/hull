@@ -431,18 +431,16 @@ expect 0 'no machine to plan, only a build$' "$hull" plan -f "$dir/build.conf"
 expect 2 'bad\.conf:1:11: machine\.sauce: is not a key here$' "$hull" plan -f "$dir/bad.conf"
 expect 2 'missing\.conf: No such file' "$hull" plan -f "$dir/missing.conf"
 
-# Section 4's example is refused on every engine that runs. On ns it is
-# refused for one field, (ssh true): the docker adapter provisions no
-# sshd, and says so rather than run without one (section 8.1). On vm and
-# emu it is one field, its image source: the qemu engine provisions
-# (ssh true) from the image's own sshd since 2026-10-25, and its port is
-# forwarded.
+# Section 4's example. On vm and emu it is refused for one field, its
+# image source: the qemu engine provisions (ssh true) from the image's own
+# sshd or the fetched dropbear, and its port is forwarded. On docker it
+# plans whole since 2026-11-03, (ssh true) given the fetched dropbear;
+# until then it was refused for that field alone (section 8.1).
 expect 1 'example\.conf: machine on qemu \(emu\): rejected, 1 field$' \
 	"$hull" check -f "$dir/example.conf" --backend vm,emu
-expect 1 'example\.conf: machine on docker \(ns\): rejected, 1 field$' \
+expect 0 'example\.conf: machine on docker \(ns\): ok$' \
 	"$hull" check -f "$dir/example.conf" --backend docker
-expect 1 'example\.conf:[0-9]+:[0-9]+: machine on docker \(ns\): ssh: rejected' \
-	"$hull" check -f "$dir/example.conf" --backend docker
+refute 'ssh: rejected' "$hull" check -f "$dir/example.conf" --backend docker
 expect 1 'example\.conf:[0-9]+:[0-9]+: machine on qemu \(vm\): virtualbox: ignored' \
 	"$hull" check -f "$dir/example.conf" --backend vm
 

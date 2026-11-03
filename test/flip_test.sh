@@ -219,5 +219,98 @@ else
 	printf 'flip: no Docker daemon with alpine here: docker not run\n'
 fi
 
+# Section 8.1's promise, goal 7: the same SSH into the same machine on
+# every engine, its host key the machine's and not the backend's, so that
+# switching never trips known_hosts. One project of busybox and the C
+# library it links, a passwd naming root and no sshd, given (ssh true):
+# the dropbear `hull sshd fetch` keeps serves it on each engine. One
+# known_hosts, written from the machine's key once, after its first run,
+# with strict checking: a login on any engine whose key differed would be
+# refused. A core of its own on a tmpfs, the key being private, with a
+# HOME, data home and cache of the test's, never the account's. The fetch
+# reaches Debian's archive: where it cannot, this is said, not run.
+busybox=$(command -v busybox 2>/dev/null)
+sshrt=$(mktemp -d /dev/shm/hull-flipssh.XXXXXX 2>/dev/null)
+fetched=$(XDG_CACHE_HOME="$root/cache" timeout 120 "$hull" sshd fetch 2>&1)
+if [ -z "$busybox" ] || [ -z "$sshrt" ] ||
+   [ ! -x "$(printf '%s\n' "$fetched" | tail -1)/usr/sbin/dropbear" ]; then
+	printf 'flip: ssh across engines not run: %s\n' \
+		"${busybox:-no busybox}; ${sshrt:-no tmpfs}; $(printf '%s\n' "$fetched" | tail -1)"
+	[ -z "$sshrt" ] || rmdir "$sshrt"
+else
+	chmod 700 "$sshrt"
+	ssh_env="XDG_RUNTIME_DIR=$sshrt HOME=$root/sshhome XDG_DATA_HOME=$root/sshdata XDG_CACHE_HOME=$root/cache"
+	rm -rf -- "${root:?}/sshproject" "${root:?}/sshhome" "${root:?}/sshdata"
+	mkdir -p "$root/sshhome/.ssh" "$root/sshdata"
+	chmod 700 "$root/sshhome/.ssh"
+	ssh-keygen -q -t ed25519 -N '' -C hull-flip -f "$root/sshhome/.ssh/id_ed25519" < /dev/null
+	r=$root/sshproject/rootfs
+	mkdir -p "$r/bin" "$r/etc" "$r/run" "$r/tmp" "$r/proc" "$r/dev" "$r/sys" "$r/root"
+	cp "$busybox" "$r/bin/busybox"
+	for a in sh id hostname sleep cat; do
+		ln -s busybox "$r/bin/$a"
+	done
+	for lib in $(ldd "$busybox" | sed -n 's/.*=> \(\/[^ ]*\) .*/\1/p; s/^[[:space:]]*\(\/[^ ]*\) .*/\1/p'); do
+		mkdir -p "$r$(dirname "$lib")"
+		cp -L "$lib" "$r$lib"
+	done
+	printf 'root:x:0:0:root:/root:/bin/sh\n' > "$r/etc/passwd"
+	chgrp -R "$(id -g)" "$root/sshproject"
+	chmod -R g-s,go-w "$root/sshproject"
+	printf '%s\n' '(machine (source "dir:./rootfs") (mutable overlay) (hostname "flipssh") (ssh true)' \
+		'  (command "/bin/sh" "-c" "echo ready; exec sleep 300"))' > "$root/sshproject/hull.conf"
+	{
+		printf 'Host flipssh.hull\n'
+		printf '  ProxyCommand env XDG_RUNTIME_DIR=%s %s proxy-ssh %%h\n' "$sshrt" "$hull"
+		printf '  User root\n  IdentityFile %s\n  IdentitiesOnly yes\n' "$root/sshhome/.ssh/id_ed25519"
+		printf '  BatchMode yes\n  ConnectTimeout 10\n  LogLevel error\n'
+		printf '  StrictHostKeyChecking yes\n  UserKnownHostsFile %s\n' "$root/flipssh.known"
+	} > "$root/flipssh.ssh"
+	rm -f "$root/flipssh.known"
+	sshimage=$(timeout 60 "$tree_tar" "$r" | sha256sum | cut -c1-64)
+	ssh_had_image=0
+	[ "$docker_up" = 1 ] &&
+		timeout 10 docker image inspect "hull-dir:$sshimage" > /dev/null 2>&1 && ssh_had_image=1
+	keysum=
+	for backend in chroot vm emu $([ "$docker_up" = 1 ] && echo docker); do
+		rm -f "$root/flipssh-$backend.out"
+		(cd / && exec env $ssh_env timeout -k 2 300 "$hull" run -f "$root/sshproject/hull.conf" \
+			--backend "$backend" > "$root/flipssh-$backend.out" 2>&1) &
+		runner=$!
+		tries=0
+		until grep -q '^ready$' "$root/flipssh-$backend.out" 2>/dev/null || [ "$tries" -ge 240 ]; do
+			tries=$((tries + 1))
+			sleep 0.25
+		done
+		# The known_hosts, once, from the machine's key after its first run.
+		[ -f "$root/flipssh.known" ] ||
+			printf 'flipssh.hull %s\n' "$(cut -d' ' -f1,2 "$root/sshdata/hull/machines/flipssh/host_key.pub" 2>&1)" \
+				> "$root/flipssh.known"
+		[ -n "$keysum" ] ||
+			keysum=$(sha256sum "$root/sshdata/hull/machines/flipssh/host_key" 2>&1 | cut -c1-64)
+		tries=0
+		until timeout 15 ssh -F "$root/flipssh.ssh" flipssh.hull true < /dev/null 2>/dev/null ||
+		      [ "$tries" -ge 40 ]; do
+			tries=$((tries + 1))
+			sleep 0.5
+		done
+		said=$(timeout 15 ssh -F "$root/flipssh.ssh" flipssh.hull 'echo "$(id -u) on $(hostname)"' \
+			< /dev/null 2>&1)
+		env $ssh_env timeout 30 "$hull" stop flipssh > /dev/null 2>&1
+		wait "$runner"
+		cases=$((cases + 1))
+		[ "$said" = "0 on flipssh" ] ||
+			fail "$backend: ssh with the machine's key pinned did not log in" \
+				"$said; $(cat "$root/flipssh-$backend.out")"
+	done
+	cases=$((cases + 1))
+	[ "$(sha256sum "$root/sshdata/hull/machines/flipssh/host_key" 2>&1 | cut -c1-64)" = "$keysum" ] ||
+		fail "the machine's host key changed across engines" "$keysum"
+	if [ "$docker_up" = 1 ] && [ "$ssh_had_image" = 0 ]; then
+		timeout 30 docker rmi "hull-dir:$sshimage" > /dev/null 2>&1
+	fi
+	rm -rf -- "${sshrt:?}" "${root:?}/sshhome/.ssh"
+fi
+
 printf 'flip: %d cases, %d failed\n' "$cases" "$failures"
 [ "$failures" = 0 ]

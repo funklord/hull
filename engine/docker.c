@@ -64,6 +64,7 @@
 #include "stack.h"
 #include "tree.h"
 #include "usage.h"
+#include "sshd.h"
 
 #define API           "/v1.41"
 #define MAX_RESPONSE  (1u << 20)
@@ -95,6 +96,7 @@ struct hull_machine {
 	char            *direct;     /* (mutable direct): the directory bound in, or NULL */
 	char            *direct_binds;  /* its entries' binds, frame_direct's, as JSON strings */
 	size_t           direct_binds_length;
+	char            *ssh_dir;    /* (ssh true): the core's material, for the fetched dropbear */
 	char             detail[512];
 };
 
@@ -1234,13 +1236,29 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	 * own: PID 1 ignores a signal it has no handler for, so a workload
 	 * there would sit through stop's SIGTERM, and nothing would reap. */
 	add_text(&body, ",\"HostConfig\":{\"Init\":true,\"CapDrop\":[\"ALL\"]");
-	if (root_granted(doc, "security.allow") && hull_access_find(doc, machine, "security", &entry)) {
+	{
 		hull_sexpr_form allow;
 		hull_sexpr_form item;
 		int             first = 1;
+		int             ssh = hull_access_true(doc, machine, "ssh");
+		int             allowed = root_granted(doc, "security.allow") &&
+		                          hull_access_find(doc, machine, "security", &entry) &&
+		                          hull_access_find(doc, &entry, "allow", &allow);
 
-		if (hull_access_find(doc, &entry, "allow", &allow)) {
+		if (allowed || ssh)
 			add_text(&body, ",\"CapAdd\":[");
+		/* (ssh true): the two dropbear needs to take a login to its
+		 * user's groups and id, root's to root's included -- without
+		 * them every session ended "Error changing user group". The
+		 * holder's word, 2026-11-03. Only the container's bounding set
+		 * gains them: the workload runs as the user, under
+		 * no-new-privileges, and cannot raise them; the sshd's execs run
+		 * as the container's root, which does. */
+		if (ssh) {
+			add_text(&body, "\"SETGID\",\"SETUID\"");
+			first = 0;
+		}
+		if (allowed) {
 			hull_sexpr_child(doc, &allow, &item);
 			for (int more = hull_sexpr_next(doc, &item, &item); more;
 			     more = hull_sexpr_next(doc, &item, &item)) {
@@ -1259,8 +1277,9 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 				free(upper.data);
 				free(name);
 			}
-			add_text(&body, "]");
 		}
+		if (allowed || ssh)
+			add_text(&body, "]");
 	}
 	/* (network none) is docker's none, lo alone; (network host) its host;
 	 * (network nat), or none given, its own bridge, as it always was;
@@ -1340,6 +1359,38 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 		binds.failed |= bind.failed;
 		free(bind.data);
 		free(value);
+	}
+	/* (ssh true): the dropbear `hull sshd fetch` keeps, read-only at the
+	 * place its rewritten paths name (engine/sshd.h); its material goes in
+	 * once the container runs (start_sshd). Only for a machine of an
+	 * image: that material is root's in the container, to satisfy
+	 * dropbear, and a directory used in place would take root's files into
+	 * the user's tree. */
+	if (reason == NULL && hull_access_true(doc, machine, "ssh")) {
+		char dir[4096];
+		char dropbear[4200];
+
+		if ((m->ssh_dir = hull_access_value(doc, &top, "ssh_dir")) == NULL)
+			reason = "(ssh true): the plan gives the machine no ssh material";
+		else if (m->direct != NULL)
+			reason = "(ssh true) on docker is for a machine of an image: with (mutable direct) "
+			         "its sshd's root-owned files would be made in the user's directory";
+		else if (hull_sshd_dir(dir, sizeof dir) != 0 ||
+		         snprintf(dropbear, sizeof dropbear, "%s/%s", dir, HULL_SSHD_DROPBEAR) <= 0 ||
+		         access(dropbear, R_OK) != 0)
+			reason = "(ssh true) on docker runs the dropbear `hull sshd fetch` downloads, and "
+			         "none has been fetched";
+		else {
+			text bind = { 0 };
+
+			add_text(&bind, dir);
+			add_text(&bind, ":" HULL_SSHD_GUEST ":ro");
+			if (binds.length != 0u)
+				add_text(&binds, ",");
+			add_json(&binds, bind.data != NULL ? bind.data : "");
+			binds.failed |= bind.failed;
+			free(bind.data);
+		}
 	}
 	if (binds.length != 0u) {
 		add_text(&body, ",\"Binds\":[");
@@ -2393,6 +2444,7 @@ static void release(hull_machine *m)
 		free(m->trees[i]);
 	free(m->direct);
 	free(m->direct_binds);
+	free(m->ssh_dir);
 	for (unsigned i = 0u; i < m->stack_count; i++) {
 		free(m->stacks[i].guest);
 		hull_stack_release(&m->stacks[i].stack);
@@ -3193,6 +3245,202 @@ static hull_status docker_create(hull_core *core, hull_buf plan, hull_machine **
 }
 
 /* Attach, then start: attached first, nothing the workload writes is lost. */
+/* --- (ssh true): the fetched dropbear in a container ------------------ */
+
+/* One ustar entry's header, root's, into `t`; a file's `n` bytes after it,
+ * padded to its block. */
+static void tar_entry(text *t, const char *name, unsigned mode, char type, const char *data,
+                      size_t n)
+{
+	char     header[512];
+	unsigned sum = 0u;
+
+	memset(header, 0, sizeof header);
+	snprintf(header, 100u, "%s", name);
+	snprintf(header + 100, 8u, "%07o", mode);
+	snprintf(header + 108, 8u, "%07o", 0u);
+	snprintf(header + 116, 8u, "%07o", 0u);
+	snprintf(header + 124, 12u, "%011lo", (unsigned long)n);
+	snprintf(header + 136, 12u, "%011lo", 0ul);
+	memset(header + 148, ' ', 8u);
+	header[156] = type;
+	memcpy(header + 257, "ustar", 6u);
+	memcpy(header + 263, "00", 2u);
+	for (unsigned i = 0u; i < sizeof header; i++)
+		sum += (unsigned char)header[i];
+	snprintf(header + 148, 8u, "%06o", sum);
+	header[155] = ' ';
+	add(t, header, sizeof header);
+	if (n > 0u) {
+		char zeroes[512] = { 0 };
+
+		add(t, data, n);
+		if (n % 512u != 0u)
+			add(t, zeroes, 512u - n % 512u);
+	}
+}
+
+/* A tar to `path` in the container, extracted by the daemon as root, so
+ * its owners are the tar's. 0, or -1 with the daemon's words in `detail`. */
+static int put_archive(hull_machine *m, const char *path, const text *tar)
+{
+	text  request = { 0 };
+	char *answer = NULL;
+	int   status = 0;
+	int   fd = dial();
+
+	if (fd < 0)
+		return -1;
+	addf(&request, "PUT " API "/containers/%s/archive?path=%s HTTP/1.1\r\nHost: docker\r\n"
+	     "Connection: close\r\nContent-Type: application/x-tar\r\nContent-Length: %zu\r\n\r\n",
+	     m->id, path, tar->length);
+	add(&request, tar->data, tar->length);
+	if (request.failed || send_all(fd, request.data, request.length) != 0 ||
+	    read_answer(fd, &status, &answer) != 0 || status != 200) {
+		daemon_says(m->detail, sizeof m->detail, "(ssh true): the material", status, answer);
+		free(request.data);
+		free(answer);
+		return -1;
+	}
+	free(request.data);
+	free(answer);
+	return 0;
+}
+
+/* `argv` run in the container as its root, with dropbear's libraries on
+ * the path, detached; with `wait`, until it ends, and its status. 0, or -1
+ * with `detail`. */
+static int exec_root(hull_machine *m, const char *const *argv, int wait, long *code)
+{
+	text  body = { 0 };
+	char  path[200];
+	char  id[96];
+	char *answer = NULL;
+	int   status = 0;
+
+	add_text(&body, "{\"User\":\"0\",\"Env\":[\"LD_LIBRARY_PATH=" HULL_SSHD_GUEST "/"
+	         HULL_SSHD_LIBS "\"],\"Cmd\":[");
+	for (unsigned i = 0u; argv[i] != NULL; i++) {
+		if (i > 0u)
+			add_text(&body, ",");
+		add_json(&body, argv[i]);
+	}
+	add_text(&body, "]}");
+	snprintf(path, sizeof path, "/containers/%s/exec", m->id);
+	if (body.failed || call("POST", path, body.data, &status, &answer) != 0 || status != 201 ||
+	    !json_string(answer, "Id", id, sizeof id)) {
+		daemon_says(m->detail, sizeof m->detail, "(ssh true): exec", status, answer);
+		free(body.data);
+		free(answer);
+		return -1;
+	}
+	free(body.data);
+	free(answer);
+	snprintf(path, sizeof path, "/exec/%s/start", id);
+	if (call("POST", path, "{\"Detach\":true}", &status, &answer) != 0 || status != 200) {
+		daemon_says(m->detail, sizeof m->detail, "(ssh true): exec start", status, answer);
+		free(answer);
+		return -1;
+	}
+	free(answer);
+	/* Polled for its end, ten seconds at most. */
+	for (int tries = 0; wait && tries < 100; tries++) {
+		struct timespec tenth = { 0, 100000000L };
+
+		snprintf(path, sizeof path, "/exec/%s/json", id);
+		if (call("GET", path, NULL, &status, &answer) == 0 && status == 200 &&
+		    strstr(answer, "\"Running\":false") != NULL) {
+			*code = -1;
+			json_number(answer, "ExitCode", code);
+			free(answer);
+			return 0;
+		}
+		free(answer);
+		answer = NULL;
+		nanosleep(&tenth, NULL);
+	}
+	if (wait) {
+		snprintf(m->detail, sizeof m->detail, "(ssh true): %s did not end", argv[0]);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * (ssh true) on docker, once the container runs: the machine's host key
+ * and the user's authorized_keys, from the core's material, into a
+ * directory of root's at /.hull-ssh -- dropbear takes no key from a file
+ * another user owns, and the core's are the user's; and it holds every
+ * directory above that one to the same, so its parent is /, which docker
+ * makes root's, where the image's /run may be the user's, as a dir's
+ * import has it -- the key
+ * converted to dropbear's form by the fetched dropbearconvert, then the
+ * fetched dropbear on the container's port 22, where docker's dial
+ * reaches. 0, or -1 with `detail`.
+ */
+static int start_sshd(hull_machine *m)
+{
+	static const char *const convert[] = {
+		HULL_SSHD_GUEST "/" HULL_SSHD_LOADER, "--library-path", HULL_SSHD_GUEST "/" HULL_SSHD_LIBS,
+		HULL_SSHD_GUEST "/" HULL_SSHD_CONVERT, "openssh", "dropbear",
+		"/.hull-ssh/host_key", "/.hull-ssh/key", NULL
+	};
+	static const char *const serve[] = {
+		HULL_SSHD_GUEST "/" HULL_SSHD_DROPBEAR, "-F", "-E", "-s", "-r", "/.hull-ssh/key",
+		"-p", "22", "-D", "/.hull-ssh", "-P", "/.hull-ssh/pid", NULL
+	};
+	static const char *const files[] = { "host_key", "authorized_keys" };
+	text tar = { 0 };
+	long code = -1;
+	int  result = -1;
+
+	tar_entry(&tar, ".hull-ssh/", 0700u, '5', NULL, 0u);
+	for (unsigned i = 0u; i < 2u; i++) {
+		char        path[4400];
+		char        name[64];
+		char       *data = NULL;
+		struct stat st;
+		int         fd;
+
+		snprintf(path, sizeof path, "%s/%s", m->ssh_dir, files[i]);
+		fd = open(path, O_RDONLY | O_CLOEXEC);
+		if (fd < 0 || fstat(fd, &st) != 0 || st.st_size > 1 << 20 ||
+		    (data = malloc((size_t)st.st_size + 1u)) == NULL ||
+		    read(fd, data, (size_t)st.st_size) != (ssize_t)st.st_size) {
+			snprintf(m->detail, sizeof m->detail, "(ssh true): the core's %s cannot be read",
+			         files[i]);
+			if (fd >= 0)
+				close(fd);
+			free(data);
+			goto done;
+		}
+		close(fd);
+		snprintf(name, sizeof name, ".hull-ssh/%s", files[i]);
+		tar_entry(&tar, name, 0600u, '0', data, (size_t)st.st_size);
+		explicit_bzero(data, (size_t)st.st_size);
+		free(data);
+	}
+	{
+		char zeroes[1024] = { 0 };
+
+		add(&tar, zeroes, sizeof zeroes);
+	}
+	if (tar.failed)
+		snprintf(m->detail, sizeof m->detail, "(ssh true): out of memory");
+	else if (put_archive(m, "/", &tar) == 0 && exec_root(m, convert, 1, &code) == 0) {
+		if (code != 0)
+			snprintf(m->detail, sizeof m->detail, "(ssh true): the machine's host key could not "
+			         "be converted for dropbear (%ld)", code);
+		else if (exec_root(m, serve, 0, &code) == 0)
+			result = 0;
+	}
+done:
+	if (tar.data != NULL)
+		explicit_bzero(tar.data, tar.length);
+	free(tar.data);
+	return result;
+}
+
 static hull_status docker_start(hull_core *core, hull_machine *m, hull_error *error)
 {
 	char    path[160];
@@ -3239,6 +3487,8 @@ static hull_status docker_start(hull_core *core, hull_machine *m, hull_error *er
 		return fail(error, HULL_ERR_INTERNAL, "the reader thread could not start");
 	}
 	m->started = 1;
+	if (m->ssh_dir != NULL && start_sshd(m) != 0)
+		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	host->on_state(core, m, "running");
 	return HULL_OK;
 }
@@ -3898,6 +4148,10 @@ static const hull_cap_entry entries[] = {
 	{ "secrets",            HULL_SUP_NATIVE,
 	  "bound read-only from the core's tmpfs; one exposed is in the container's "
 	  "configuration too, where docker inspect shows it", NULL },
+	{ "ssh",                HULL_SUP_NATIVE,
+	  "the dropbear `hull sshd fetch` keeps, run as the container's root on its port 22, "
+	  "with the machine's host key and the user's authorized_keys; for a machine of an "
+	  "image, refused at start with (mutable direct) or where none is fetched", NULL },
 	{ "hostname",           HULL_SUP_NATIVE,   NULL, NULL },
 
 	/* ns: cgroups, memory a ceiling (6). */

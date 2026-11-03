@@ -1037,6 +1037,85 @@ for image in $(timeout 10 docker images --filter reference=hull-dir --format '{{
 	esac
 done
 
+# (ssh true) on docker, section 8.1: the dropbear `hull sshd fetch` keeps,
+# run as the container's root with SETGID and SETUID in the container's
+# bounding set, which it needs to log a session in; the workload, as the
+# user, holds none of them. Real ssh logs in as root by a key of the
+# test's with the machine's host key pinned, scp sends a file, sftp lists
+# it. Refused, saying why, with (mutable direct). A core of its own on a
+# tmpfs, the key being private, with a HOME and cache of the test's. The
+# fetch reaches Debian's archive: where it cannot, this is said, not run.
+sshrt=$(mktemp -d /dev/shm/hull-dssh.XXXXXX 2>/dev/null)
+fetched=$(XDG_CACHE_HOME="$root/cache" timeout 120 "$hull" sshd fetch 2>&1)
+if [ -z "$sshrt" ] || [ ! -x "$(printf '%s\n' "$fetched" | tail -1)/usr/sbin/dropbear" ]; then
+	printf 'docker: (ssh true) not run: %s\n' "${sshrt:-no tmpfs}; $(printf '%s\n' "$fetched" | tail -1)"
+	[ -z "$sshrt" ] || rmdir "$sshrt"
+else
+	chmod 700 "$sshrt"
+	ssh_env="XDG_RUNTIME_DIR=$sshrt HOME=$root/sshhome XDG_CACHE_HOME=$root/cache"
+	rm -rf -- "${root:?}/sshhome"
+	mkdir -p "$root/sshhome/.ssh"
+	chmod 700 "$root/sshhome/.ssh"
+	ssh-keygen -q -t ed25519 -N '' -C hull-docker -f "$root/sshhome/.ssh/id_ed25519" < /dev/null
+	printf '(machine (source "alpine:latest") (backend docker) (hostname "dtest") %s %s)\n' \
+		'(ssh true)' '(command "/bin/sh" "-c" "echo ready; exec sleep 120")' > "$root/dssh.conf"
+	{
+		printf 'Host dtest.hull\n'
+		printf '  ProxyCommand env XDG_RUNTIME_DIR=%s %s proxy-ssh %%h\n' "$sshrt" "$hull"
+		printf '  User root\n  IdentityFile %s\n  IdentitiesOnly yes\n' "$root/sshhome/.ssh/id_ed25519"
+		printf '  BatchMode yes\n  ConnectTimeout 10\n  LogLevel error\n'
+		printf '  StrictHostKeyChecking yes\n  UserKnownHostsFile %s\n' "$root/dssh.known"
+	} > "$root/dssh.ssh"
+	rm -f "$root/dssh.out" "$root/dssh.known"
+	(cd / && exec env $ssh_env timeout -k 2 150 "$hull" run -f "$root/dssh.conf" \
+		> "$root/dssh.out" 2>&1) &
+	runner=$!
+	tries=0
+	until grep -q '^ready$' "$root/dssh.out" 2>/dev/null || [ "$tries" -ge 80 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+	printf 'dtest.hull %s\n' "$(cut -d' ' -f1,2 "$root/data/hull/machines/dtest/host_key.pub" 2>&1)" \
+		> "$root/dssh.known"
+	tries=0
+	until timeout 10 ssh -F "$root/dssh.ssh" dtest.hull true < /dev/null 2>/dev/null ||
+	      [ "$tries" -ge 20 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+	who=$(timeout 10 ssh -F "$root/dssh.ssh" dtest.hull 'echo "$(id -u) [$LD_LIBRARY_PATH]"' \
+		< /dev/null 2>&1)
+	printf 'sent by scp\n' > "$root/dssh.sent"
+	timeout 10 scp -F "$root/dssh.ssh" "$root/dssh.sent" dtest.hull:/tmp/sent < /dev/null > /dev/null 2>&1
+	landed=$(timeout 10 ssh -F "$root/dssh.ssh" dtest.hull cat /tmp/sent < /dev/null 2>&1)
+	listed=$(printf 'ls /tmp\n' | timeout 10 sftp -F "$root/dssh.ssh" -b - dtest.hull 2>&1)
+	caps=$(env $ssh_env timeout 10 "$hull" exec dtest grep CapEff /proc/self/status 2>&1)
+	env $ssh_env timeout 30 "$hull" stop dtest > /dev/null 2>&1
+	wait "$runner"
+	cases=$((cases + 1))
+	[ "$who" = '0 []' ] ||
+		fail "(ssh true) on docker did not log in as root, its loader's path unseen" \
+			"$who; $(cat "$root/dssh.out")"
+	cases=$((cases + 1))
+	[ "$landed" = 'sent by scp' ] || fail "scp to docker's dropbear did not land" "$landed"
+	cases=$((cases + 1))
+	printf '%s\n' "$listed" | grep -q '/tmp/sent' || fail "sftp to docker's dropbear did not list" "$listed"
+	cases=$((cases + 1))
+	printf '%s\n' "$caps" | grep -q 'CapEff:.0000000000000000$' ||
+		fail "the workload of an (ssh true) container holds a capability" "$caps"
+	# A directory used in place is refused: the sshd's root-owned files
+	# would be made in the user's own tree.
+	mkdir -p "$root/direct/sshdir"
+	printf '(machine (source "dir:./direct/sshdir") (backend docker) (mutable direct) (hostname "dtest") %s)\n' \
+		'(ssh true) (command "/bin/sh" "-c" "true")' > "$root/dsshdir.conf"
+	cases=$((cases + 1))
+	out=$(cd / && env $ssh_env timeout -k 2 60 "$hull" run -f "$root/dsshdir.conf" 2>&1)
+	got=$?
+	{ [ "$got" = 125 ] && printf '%s\n' "$out" | grep -q 'with (mutable direct) its sshd.s root-owned'; } ||
+		fail "(ssh true) on docker with (mutable direct) was not refused" "$got: $out"
+	rm -rf -- "${sshrt:?}" "${root:?}/sshhome/.ssh"
+fi
+
 # Nothing left on the daemon.
 cases=$((cases + 1))
 left=$(timeout 10 docker ps -a --filter name=hull-dtest- --format '{{.Names}}')
