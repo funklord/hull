@@ -148,7 +148,8 @@ rm -f "$root/data/out" "$root/rootfs/written"
 conf run '(backend vm) (hostname "qtest") (workdir "/srv") (env (GREETING "hi")) (memory "256M") (cpus 2)' \
 	'(command "/probe" "say" "out" "err" "to stderr" "env" "GREETING" "cwd" "host" "uid" "nnp"' \
 	'"session" "read" "/sys/devices/system/cpu/online" "read" "/proc/meminfo"' \
-	'"read" "/sys/devices/system/clocksource/clocksource0/available_clocksource" "exit" "3")'
+	'"read" "/sys/devices/system/clocksource/clocksource0/available_clocksource"' \
+	'"read" "/sys/class/misc/hw_random/rng_current" "exit" "3")'
 name=run
 boot run
 has 3 '^out$'
@@ -165,6 +166,9 @@ has 3 '^read=MemTotal: +(1[5-9][0-9]|2[0-6][0-9])[0-9]{3} kB$'
 has 3 'vm\.kernel\.bundled: emulated: the host.s own kernel'
 # Accelerated: KVM gives the guest its clock.
 has 3 '^read=kvm-clock'
+# The host's randomness, by virtio-rng: without it a guest on a processor
+# with no RDRAND had no crng a minute in, and an sshd waited on it.
+has 3 '^read=virtio_rng\.0$'
 cases=$((cases + 1))
 if (cd / && timeout 60 "$hull" run -f "$root/run.conf" 2>/dev/null) | grep -q '^to stderr$'; then
 	fail "stderr reached stdout" ""

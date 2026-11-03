@@ -894,7 +894,7 @@ static const char *find_modules(const char *modules, const char *const *extra,
                                 unsigned extra_count, module_list *list)
 {
 	static const char *const base[] = { "9p", "9pnet_virtio", "vmw_vsock_virtio_transport",
-	                                    "virtio_net", "overlay" };
+	                                    "virtio_net", "overlay", "?virtio-rng" };
 	const char *wanted[sizeof base / sizeof base[0] + MAX_MODULES];
 	unsigned    wanted_count = 0u;
 	char        path[512];
@@ -1823,6 +1823,13 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		argv[n++] = "-device";
 		argv[n++] = "virtio-9p-pci,fsdev=modules,mount_tag=modules";
 	}
+	/* Randomness for the guest's kernel from the host's: a guest on a
+	 * processor with no RDRAND has only its own few interrupts to seed
+	 * from, and getrandom() in it, an sshd's first of all, blocked past a
+	 * minute here (section 8.1). Its driver is a module on the host's
+	 * kernel, loaded where there is one. */
+	argv[n++] = "-device";
+	argv[n++] = "virtio-rng-pci";
 	argv[n++] = "-device";
 	argv[n++] = vsock;
 	if (!m->no_network) {
