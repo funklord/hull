@@ -182,7 +182,7 @@ struct hull_machine {
 	int              adopted;      /* taken back: qemu is not this process's child */
 	int              pidfd;        /* qemu's, when adopted, else -1 */
 	uint32_t         cid;          /* its vsock context id; 0, the serial port's agent.sock */
-	int              transport;    /* (tuning (qemu (transport ...))): 0 auto, 1 vsock, 2 serial */
+	int              transport;    /* (tuning (qemu (transport ...))): 0 auto, 1 vsock, 2 serial, 3 uart */
 	int              agent_listen; /* the serial port's socket, bound, while qemu is forked */
 	uint8_t          token[32];    /* what a host after this one resumes with */
 	char             persisted[4800];  /* what persist() last gave */
@@ -646,7 +646,8 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	if (hull_access_find(doc, &machine, "tuning", &entry) &&
 	    hull_access_find(doc, &entry, "qemu", &item) &&
 	    (text = hull_access_value(doc, &item, "transport")) != NULL) {
-		m->transport = strcmp(text, "vsock") == 0 ? 1 : strcmp(text, "serial") == 0 ? 2 : 0;
+		m->transport = strcmp(text, "vsock") == 0 ? 1 : strcmp(text, "serial") == 0 ? 2 :
+		               strcmp(text, "uart") == 0 ? 3 : 0;
 		free(text);
 	}
 
@@ -842,6 +843,11 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	if (m->keep && m->segment_count != 0u)
 		return "a machine on a segment cannot outlive the core, whose switch the segment is: "
 		       "(on_disconnect keep) and (segments ...) do not go together";
+	/* A UART never says its host has gone, so the agent could not tell a
+	 * core taken away from one still there. */
+	if (m->transport == 3 && m->keep)
+		return "(on_disconnect keep) needs a channel that says when its host goes: "
+		       "(transport uart) does not";
 
 	/* The spec the agent applies is the plan's own (machine ...). */
 	m->spec_length = machine.extent;
@@ -1823,6 +1829,11 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		snprintf(m->append, sizeof m->append, "%s", m->no_network ?
 		         "console=hvc0 quiet panic=-1" : "console=hvc0 quiet panic=-1 hull.passt=1");
 	}
+	/* (transport uart): the agent told its port, a UART having no name;
+	 * the first ISA serial port, the console being hvc0. */
+	if (m->transport == 3)
+		snprintf(m->append + strlen(m->append), sizeof m->append - strlen(m->append),
+		         " hull.host=ttyS0");
 	argv[n++] = m->append;
 	argv[n++] = "-device";
 	argv[n++] = "virtio-serial-pci";
@@ -1995,7 +2006,8 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		argv[n++] = "-chardev";
 		argv[n++] = agent_chardev;
 		argv[n++] = "-device";
-		argv[n++] = "virtserialport,chardev=agent,name=hull.agent";
+		argv[n++] = m->transport == 3 ? "isa-serial,chardev=agent" :
+		                                "virtserialport,chardev=agent,name=hull.agent";
 	}
 	if (!m->no_network) {
 		argv[n++] = "-netdev";
@@ -2237,7 +2249,7 @@ static void last_line(const hull_machine *m, const char *file, char *out, size_t
  * auto), the default, takes vsock where it is open to the user. */
 static int transport(const hull_machine *m)
 {
-	if (m->transport == 2)
+	if (m->transport >= 2)
 		return 0;
 	return m->transport == 1 || access("/dev/vhost-vsock", R_OK | W_OK) == 0;
 }
@@ -2254,6 +2266,30 @@ static int agent_address(const hull_machine *m, struct sockaddr_un *address, int
 		return -1;
 	snprintf(address->sun_path, sizeof address->sun_path, "/proc/self/fd/%d/agent.sock", *dir);
 	return 0;
+}
+
+/* Read from a UART's socket to the agent's ready line, before `deadline`,
+ * what comes before it -- the line's tail of an earlier open, a byte the
+ * firmware wrote -- thrown away. 1 where it came. */
+static int uart_ready(hull_machine *m, int fd, time_t deadline)
+{
+	static const char ready[] = "hull-agent ready\n";
+	size_t            matched = 0u;
+
+	while (matched < sizeof ready - 1u && !qemu_gone(m)) {
+		struct pollfd one = { fd, POLLIN, 0 };
+		long          left = (long)(deadline - time(NULL));
+		char          c;
+
+		if (left <= 0 || poll(&one, 1u, 500) < 0)
+			return 0;
+		if (one.revents == 0)
+			continue;
+		if (read(fd, &c, 1u) != 1)
+			return 0;
+		matched = c == ready[matched] ? matched + 1u : c == ready[0] ? 1u : 0u;
+	}
+	return matched == sizeof ready - 1u;
 }
 
 /* The serial port's socket bound and listening, for qemu. -1 where not. */
@@ -2299,6 +2335,12 @@ static int dial(hull_machine *m, uint32_t cid)
 				break;
 			if (connect(fd, (struct sockaddr *)&address, sizeof address) == 0) {
 				close(dir);
+				/* A UART: nothing sent before the agent says it may be,
+				 * its open clearing the FIFO what came before went into. */
+				if (m->transport == 3 && !uart_ready(m, fd, deadline)) {
+					close(fd);
+					return -1;
+				}
 				return fd;
 			}
 			close(fd);
@@ -4422,6 +4464,8 @@ static const hull_cap_entry entries[] = {
 	{ "qemu.transport.vsock",  HULL_SUP_NATIVE, "needs /dev/vhost-vsock open to the user", NULL },
 	{ "qemu.transport.serial", HULL_SUP_NATIVE, "a virtio-serial port, its socket in the "
 	  "machine's own directory", NULL },
+	{ "qemu.transport.uart",   HULL_SUP_NATIVE, "a 16550 UART, for a kernel with no "
+	  "virtio-serial; no (on_disconnect keep)", NULL },
 	{ "emu.cores_scale",     HULL_SUP_NATIVE,  NULL, NULL },
 
 	{ NULL,                 HULL_SUP_NATIVE,   NULL, NULL },

@@ -2385,6 +2385,31 @@ cases=$((cases + 1))
 out=$(timeout 30 "$hull" attach qsadopt 2>&1)
 got=$?
 [ "$got" = 5 ] || fail "a taken-back serial vm's exit was $got, wanted 5" "$out"
+# (transport uart): the agent over a 16550 UART, as a machine with no
+# virtio-serial has it -- VirtualBox's. An 8250's open clears its FIFO,
+# so the host waits for the agent's ready line before it sends; without
+# that the hello was lost and the run ended "did not answer". A run, an
+# exec in it, its exit; and keep refused, a UART never saying its host
+# has gone.
+conf uart '(backend vm) (hostname "quart") (tuning (qemu (transport uart)))' \
+	'(command "/probe" "say" "over a uart" "sleep" "6" "exit" "4")'
+(cd / && exec timeout -k 2 60 "$hull" run -f "$root/uart.conf" > "$root/uart.out" 2>&1) &
+runner=$!
+await quart
+cases=$((cases + 1))
+out=$(timeout 20 "$hull" exec quart /probe say "exec in it" 2>&1)
+[ "$out" = "exec in it" ] || fail "an exec over a uart said '$out'" ""
+wait "$runner"
+got=$?
+out=$(cat "$root/uart.out")
+name='a run over a uart'
+has 4 '^over a uart$'
+conf uartkeep '(backend vm) (on_disconnect keep) (tuning (qemu (transport uart)))' \
+	'(command "/probe" "say" "no")'
+name='(on_disconnect keep) over a uart'
+boot uartkeep
+has 125 'says when its host goes'
+rm -f "$root/uart.out"
 # A kept vm whose workload ends while no core holds it waits for the next
 # core, and its exit is that core's to report: 7 here, a second after its
 # core is killed.

@@ -412,7 +412,7 @@ static const char *const expose_values[]     = { "env", NULL };
 static const char *const profile_values[]    = { "micro", "full", NULL };
 static const char *const cpu_values[]        = { "host", "migratable", NULL };
 static const char *const accel_values[]      = { "auto", "kvm", "tcg", NULL };
-static const char *const transport_values[]  = { "auto", "vsock", "serial", NULL };
+static const char *const transport_values[]  = { "auto", "vsock", "serial", "uart", NULL };
 
 #define TABLE(keys) { keys, (unsigned)(sizeof keys / sizeof keys[0]), NULL }
 #define TABLE_ACROSS(keys, across) { keys, (unsigned)(sizeof keys / sizeof keys[0]), across }

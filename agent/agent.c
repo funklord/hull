@@ -2345,11 +2345,26 @@ static char host_port[300];
  * writes is its, not the next host's, and a port carries no boundary
  * between them as a new vsock connection does. */
 static int  port_dropped;
+/* The host's port is a UART, named by hull.host= on the kernel's command
+ * line: a machine that gives no virtio-serial port, VirtualBox's. */
+static int  port_uart;
+/* What the agent says on a UART once it may be written to (listen_host). */
+#define UART_READY "hull-agent ready\n"
 
 static void find_host_port(void)
 {
-	DIR           *ports = opendir("/sys/class/virtio-ports");
+	DIR           *ports;
 	struct dirent *port;
+	char           named[64];
+
+	/* hull.host=ttyS1: a UART, which carries no name of its own. */
+	if (cmdline_value("hull.host", named, sizeof named) && strncmp(named, "tty", 3u) == 0 &&
+	    strchr(named, '/') == NULL) {
+		snprintf(host_port, sizeof host_port, "/dev/%s", named);
+		port_uart = 1;
+		return;
+	}
+	ports = opendir("/sys/class/virtio-ports");
 
 	while (ports != NULL && host_port[0] == '\0' && (port = readdir(ports)) != NULL) {
 		char  path[300];
@@ -2379,8 +2394,29 @@ static int listen_host(void)
 	struct sockaddr_vm address;
 	int                fd;
 
-	if (host_port[0] != '\0')
-		return open(host_port, O_RDWR | O_CLOEXEC);
+	if (host_port[0] != '\0') {
+		int            port = open(host_port, O_RDWR | O_NOCTTY | O_CLOEXEC);
+		struct termios raw;
+
+		/* A UART raw: no line discipline between the host's frames and
+		 * the wire, no echo of them back, and no hangup from a modem
+		 * line that is not there. */
+		if (port >= 0 && port_uart && tcgetattr(port, &raw) == 0) {
+			cfmakeraw(&raw);
+			raw.c_cflag |= CLOCAL | CREAD;
+			cfsetispeed(&raw, B115200);
+			cfsetospeed(&raw, B115200);
+			tcsetattr(port, TCSANOW, &raw);
+			/* Opening an 8250 clears its FIFO, and what came before the
+			 * line was raw may have been echoed: so the host waits for this
+			 * line, below the wire, before it sends a byte (engine/qemu.c
+			 * dial). Anything it sent before is thrown away here. */
+			tcflush(port, TCIOFLUSH);
+			if (write(port, UART_READY, sizeof UART_READY - 1u) < 0)
+				say(host_port, strerror(errno));
+		}
+		return port;
+	}
 	fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
 
 	memset(&address, 0, sizeof address);
@@ -2642,7 +2678,9 @@ int main(int argc, char **argv)
 				hull_wire_close(&host);
 			drop_channels();
 			listener = listen_host();
-			port_dropped = host_port[0] != '\0';
+			/* A virtio port says when its host hangs up; a UART never
+			 * does, so after a drop it is taken as it is. */
+			port_dropped = host_port[0] != '\0' && !port_uart;
 			if (listener < 0)
 				say("vsock", strerror(errno));
 		}
