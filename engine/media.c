@@ -592,10 +592,12 @@ static int read_fat(walk *w, uint64_t base, const char *prefix, int *found, char
  * A Linux filesystem's tree, read-only: a file's blocks found by its
  * extents or its indirect blocks, each run a piece, as FAT's clusters. Every
  * block number is checked against the filesystem, a directory is walked
- * once, and what cannot be read is the diff's. Regular files only: a link
- * or a device has no bytes of its own for a layout to place, and is in the
- * patch with the inode it is. Owners and modes likewise, so `files/` is what
- * the filesystem holds and not yet how it holds it.
+ * once, and what cannot be read is the diff's. A file keeps its mode, and a
+ * symbolic link is one, whose target no layout places, so that the tree
+ * runs as a machine; a device has no bytes of its own and an owner no place
+ * in a tree the user owns, and both are in the patch with the inode they
+ * are. A file's mode gains the owner's read and write, which reassembling
+ * it needs.
  */
 #define EXT_MAX_RUNS  65536u
 #define EXT_MAX_DIR   (16u << 20)
@@ -799,6 +801,34 @@ static int ext_name(const uint8_t *id, size_t length, char *out, size_t cap)
 	return strcmp(out, ".") != 0 && strcmp(out, "..") != 0;
 }
 
+/* The symbolic link of the inode at `path`: its target in the inode where
+ * it is short, else its first block. A link is not followed here and
+ * places nothing, so a target that leaves the tree is the machine's own
+ * business, as it was on the disk. */
+static void ext_link(walk *w, const ext *e, const uint8_t inode[128], ext_run *runs,
+                     const char *path)
+{
+	uint64_t size = (uint64_t)le32(inode + 108) << 32 | le32(inode + 4);
+	uint32_t flags = le32(inode + 32);
+	char     target[4097];
+	size_t   count;
+
+	if (size == 0u || size >= sizeof target)
+		return;
+	if (size < 60u && (flags & 0x80000u) == 0u) {
+		memcpy(target, inode + 40, (size_t)size);
+	} else {
+		uint64_t n;
+
+		if (ext_runs(w, e, inode, &n, runs, &count) != 0 || count == 0u || runs[0].logical != 0u ||
+		    read_all(w->image, target, (size_t)size, e->base + runs[0].physical * e->block) != 0)
+			return;
+	}
+	target[size] = '\0';
+	if (strlen(target) == size)
+		(void)!symlink(target, path);
+}
+
 /* The regular file of the inode to `path`, a piece a run. */
 static int ext_file(walk *w, const ext *e, const uint8_t inode[128], ext_run *runs,
                     const char *path, const char *relative)
@@ -820,6 +850,7 @@ static int ext_file(walk *w, const ext *e, const uint8_t inode[128], ext_run *ru
 		unlink(path);
 		return 0;
 	}
+	(void)!fchmod(fd, (mode_t)(le16(inode) & 0777u) | 0600u);
 	if (size == 0u) {
 		close(fd);
 		return place(w, 0u, 0u, relative);
@@ -911,6 +942,8 @@ static int ext_directory(walk *w, const ext *e, uint64_t number, const char *rel
 					status = ext_directory(w, e, entry, next, depth + 1u, runs);
 			} else if (kind == 0x8000u && w->count < MAX_FILES) {
 				status = ext_file(w, e, child, runs, path, next);
+			} else if (kind == 0xA000u) {
+				ext_link(w, e, child, runs, path);
 			}
 		}
 		at += length;

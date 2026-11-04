@@ -1,13 +1,14 @@
 #!/bin/sh
 # media_test.sh -- `hull media import`, `verify` and `export` (project.md
 # section 3.10): a disc as plain files and back, byte for byte. Its
-# argument is build/hull. The disc is iso.py's, which shares no code with
-# hull. It writes only under $BUILD_DIR/test/media, removed at its start
-# and its end, and each command is under `timeout`.
+# arguments are build/hull and the static probe. The disc is iso.py's,
+# which shares no code with hull. It writes only under $BUILD_DIR/test/media,
+# removed at its start and its end, and each command is under `timeout`.
 
 set -u
 
-hull=$1
+hull=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+probe=$2
 dir=${BUILD_DIR:?}/test/media
 case $dir in
 */test/media) ;;
@@ -228,14 +229,24 @@ if [ -n "$mke2fs" ]; then
 	printf 'hi\n' > "$dir/tree/sub/lib++ name"
 	: > "$dir/tree/empty"
 	ln -s big.bin "$dir/tree/link"
+	long=sub/deep/../deep/../deep/../deep/../deep/../deep/../deep/../deep/../deep/small
+	ln -s "$long" "$dir/tree/long"
+	printf '#!/bin/sh\n' > "$dir/tree/run"
+	chmod 755 "$dir/tree/run"
 	dd if=/dev/urandom of="$dir/tree/holed" bs=4096 count=1 seek=100 2>/dev/null
 	for fs in ext2:1024 ext3:4096 ext4:4096; do
 		type=${fs%:*}
 		"$mke2fs" -q -F -t "$type" -b "${fs#*:}" -L HULLFS -d "$dir/tree" "$dir/$type.img" 16M
 		media import "$dir/$type.img" "$dir/$type"
 		check "$type imported" "$got" 0 "$out"
-		diff -r -x link -x lost+found "$dir/tree" "$dir/$type/files" > "$dir/differs" 2>&1
+		diff -r -x lost+found "$dir/tree" "$dir/$type/files" > "$dir/differs" 2>&1
 		check "$type's tree is the tree" "$?" 0 "$(cat "$dir/differs")"
+		[ "$(readlink "$dir/$type/files/link")" = big.bin ]
+		check "$type's link is a link" "$?" 0 "$(ls -la "$dir/$type/files" 2>&1)"
+		[ "$(readlink "$dir/$type/files/long")" = "$long" ]
+		check "$type's long link is a link" "$?" 0 "$(ls -la "$dir/$type/files" 2>&1)"
+		[ -x "$dir/$type/files/run" ]
+		check "$type's file keeps its mode" "$?" 0 "$(ls -la "$dir/$type/files" 2>&1)"
 		grep -q '(volume "HULLFS")' "$dir/$type/media.conf"
 		check "$type's label is read" "$?" 0 "$(cat "$dir/$type/media.conf")"
 		media export "$dir/$type" "$dir/$type.again"
@@ -243,6 +254,22 @@ if [ -n "$mke2fs" ]; then
 		cmp -s "$dir/$type.img" "$dir/$type.again"
 		check "$type is itself" "$?" 0 ''
 	done
+	# And the point of it: a disk's tree is a machine's source, the program
+	# reached through its link and run by its mode.
+	mkdir -p "$dir/app/bin" "$dir/app/proc" "$dir/app/dev" "$dir/app/sys" "$dir/run"
+	chmod 700 "$dir/run"
+	cp "$probe" "$dir/app/bin/probe"
+	ln -s bin/probe "$dir/app/go"
+	"$mke2fs" -q -F -t ext4 -d "$dir/app" "$dir/app.img" 16M
+	media import "$dir/app.img" "$dir/appcol"
+	check 'a disk with a program imported' "$got" 0 "$out"
+	printf '(machine (backend chroot) (source "dir:%s/appcol/files") (mutable overlay) (network none) (command "/go" "say" "from a disk image"))\n' \
+		"$(cd "$dir" && pwd)" > "$dir/app.conf"
+	out=$(XDG_RUNTIME_DIR=$(cd "$dir" && pwd)/run HULL_CORE_IDLE=1 timeout 60 "$hull" run -f "$dir/app.conf" 2>&1)
+	got=$?
+	check 'it runs as a machine' "$got" 0 "$out"
+	printf '%s\n' "$out" | grep -q '^from a disk image$'
+	check 'and says so' "$?" 0 "$out"
 	cases=$((cases + 1))
 	patch=$(find "$dir/ext4/quirks" -type f -printf '%s\n' | awk '{ n += $1 } END { print n + 0 }')
 	[ "$patch" -lt 1000000 ] ||

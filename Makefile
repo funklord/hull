@@ -647,7 +647,7 @@ test: $(TEST_BINS) $(HULL) $(PROBE) $(ARM64_PROBE) $(NSS_LIB) $(ROOT_BIN) vector
 	BUILD_DIR='$(BUILD_DIR)' $(BUILD_DIR)/test/hostdev_test
 	BUILD_DIR='$(BUILD_DIR)' $(BUILD_DIR)/test/iso_test
 	BUILD_DIR='$(BUILD_DIR)' sh test/tree_test.sh '$(BUILD_DIR)/test/tree_tar'
-	BUILD_DIR='$(BUILD_DIR)' sh test/media_test.sh '$(HULL)'
+	BUILD_DIR='$(BUILD_DIR)' sh test/media_test.sh '$(HULL)' '$(PROBE)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/cli_test.sh '$(HULL)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/nss_test.sh '$(HULL)' '$(NSS_LIB)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/root_test.sh '$(HULL)' '$(ROOT_BIN)'
