@@ -3731,14 +3731,28 @@ if [ -z "$busybox" ] || [ ! -x "$(printf '%s\n' "$fetched" | tail -1)/usr/sbin/d
 		"${busybox:-no busybox}; $(printf '%s\n' "$fetched" | tail -1)"
 else
 	# A pin the pool no longer has is taken from Debian's snapshot, each
-	# package still held to its sha256: a pool named that has nothing.
+	# package still held to its sha256: a pool named that has nothing. The
+	# snapshot's server is often down, answering 503 or 504, which says
+	# nothing of hull: said, as the fetch above is, not failed.
 	rm -rf "$root/cache-snapshot"
 	limit=300
-	expect 0 'taking it from Debian.s snapshot' env XDG_CACHE_HOME="$root/cache-snapshot" \
-		HULL_DEBIAN_POOL=https://deb.debian.org/debian/pool/hull-none/ "$hull" sshd fetch
-	cases=$((cases + 1))
-	[ -x "$root/cache-snapshot/hull/dropbear-2025.89-1~deb13u1/usr/sbin/dropbear" ] ||
-		fail "the snapshot's packages did not make the sshd's tree" "$(ls -R "$root/cache-snapshot" 2>&1 | head)"
+	snapshot=$(env XDG_CACHE_HOME="$root/cache-snapshot" \
+		HULL_DEBIAN_POOL=https://deb.debian.org/debian/pool/hull-none/ \
+		timeout 300 "$hull" sshd fetch 2>&1)
+	got=$?
+	case $snapshot in
+	*'snapshot.debian.org'*' answered 5'[0-9][0-9]*)
+		printf 'cli: the snapshot fallback not tried: its server answered an error\n'
+		;;
+	*)
+		cases=$((cases + 1))
+		[ "$got" = 0 ] && printf '%s\n' "$snapshot" | grep -q 'taking it from Debian.s snapshot' ||
+			fail "an sshd fetch from the snapshot exited $got" "$snapshot"
+		cases=$((cases + 1))
+		[ -x "$root/cache-snapshot/hull/dropbear-2025.89-1~deb13u1/usr/sbin/dropbear" ] ||
+			fail "the snapshot's packages did not make the sshd's tree" "$(ls -R "$root/cache-snapshot" 2>&1 | head)"
+		;;
+	esac
 	rm -rf "$root/cache-snapshot"
 	chmod 700 "$dbshm"
 	rm -rf "$root/dbroot"
