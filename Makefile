@@ -757,7 +757,7 @@ check-fuzz: $(FUZZ_DIR)/json_fuzz $(FUZZ_DIR)/unpack_fuzz $(FUZZ_DIR)/media_fuzz
 	cd '$(FUZZ_DIR)/found' && FUZZ_DIR='$(abspath $(FUZZ_DIR))' ../unpack_fuzz \
 		-max_total_time=$(FUZZ_TIME) -max_len=8192 -timeout=10 ../corpus/tar
 	cd '$(FUZZ_DIR)/found' && FUZZ_DIR='$(abspath $(FUZZ_DIR))' ../media_fuzz \
-		-max_total_time=$(FUZZ_TIME) -max_len=16384 -timeout=10 ../corpus/disc
+		-max_total_time=$(FUZZ_TIME) -max_len=65536 -timeout=10 ../corpus/disc
 
 # Root mode's native grants with hull-root really setuid root, inside a vm
 # whose guest root is the only root it needs (project.md section 7). Not

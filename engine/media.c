@@ -29,6 +29,7 @@
 #include "sha256.h"
 
 #define SECTOR      2048u
+#define DISK_UNIT   512u      /* a layout's sector on a disk, whatever its filesystem's */
 #define MAX_DEPTH   32u
 #define MAX_FILES   200000u
 #define MAX_DIRS    50000u
@@ -418,7 +419,8 @@ static int fat_file(walk *w, const fat *f, uint32_t cluster, uint64_t size, cons
 			run += cluster_bytes;
 		}
 		piece = run < size - done ? run : size - done;
-		if (place_piece(w, fat_sector(f, start), piece, done, size, relative) != 0) {
+		if (place_piece(w, fat_sector(f, start) * f->bytes_per_sector / DISK_UNIT, piece, done, size,
+		                relative) != 0) {
 			close(fd);
 			return -1;
 		}
@@ -560,7 +562,7 @@ static int read_fat(walk *w, uint64_t base, const char *prefix, int *found, char
 		free(f.table);
 		return 0;
 	}
-	w->unit = (unsigned)f.bytes_per_sector;
+	w->unit = DISK_UNIT;
 	*found = 1;
 	/* Each volume's clusters are its own. */
 	w->dirs = 0u;
@@ -581,6 +583,383 @@ static int read_fat(walk *w, uint64_t base, const char *prefix, int *found, char
 		free(root);
 	}
 	free(f.table);
+	return status;
+}
+
+/* --- ext2, ext3, ext4 --------------------------------------------------------- */
+
+/*
+ * A Linux filesystem's tree, read-only: a file's blocks found by its
+ * extents or its indirect blocks, each run a piece, as FAT's clusters. Every
+ * block number is checked against the filesystem, a directory is walked
+ * once, and what cannot be read is the diff's. Regular files only: a link
+ * or a device has no bytes of its own for a layout to place, and is in the
+ * patch with the inode it is. Owners and modes likewise, so `files/` is what
+ * the filesystem holds and not yet how it holds it.
+ */
+#define EXT_MAX_RUNS  65536u
+#define EXT_MAX_DIR   (16u << 20)
+
+typedef struct ext_run {
+	uint64_t logical;     /* in the file, in blocks */
+	uint64_t physical;
+	uint64_t count;
+} ext_run;
+
+typedef struct ext {
+	uint64_t base;
+	uint64_t block;       /* its size */
+	uint64_t blocks;
+	uint64_t inodes;
+	uint64_t inodes_per_group;
+	uint64_t inode_size;
+	uint64_t descriptors;  /* where the group descriptors are, in bytes */
+	uint64_t descriptor_size;
+	uint64_t groups;
+	int      wide;         /* 64bit */
+} ext;
+
+static int ext_read_block(walk *w, const ext *e, uint64_t number, uint8_t *to)
+{
+	if (number == 0u || number >= e->blocks)
+		return -1;
+	return read_all(w->image, to, (size_t)e->block, e->base + number * e->block);
+}
+
+static int ext_add(ext_run *runs, size_t *count, uint64_t logical, uint64_t physical, uint64_t n,
+                   const ext *e)
+{
+	if (n == 0u || physical == 0u || physical >= e->blocks || n > e->blocks - physical ||
+	    *count == EXT_MAX_RUNS)
+		return -1;
+	if (*count > 0u) {
+		ext_run *last = &runs[*count - 1u];
+
+		if (last->logical + last->count == logical && last->physical + last->count == physical) {
+			last->count += n;
+			return 0;
+		}
+	}
+	runs[*count].logical  = logical;
+	runs[*count].physical = physical;
+	runs[*count].count    = n;
+	(*count)++;
+	return 0;
+}
+
+/* An extent tree's node, `depth` levels at most above its leaves. */
+static int ext_extents(walk *w, const ext *e, const uint8_t *node, size_t bytes, unsigned depth,
+                       ext_run *runs, size_t *count)
+{
+	unsigned entries;
+	unsigned level;
+
+	if (bytes < 12u || le16(node) != 0xF30Au)
+		return -1;
+	entries = le16(node + 2);
+	level   = le16(node + 6);
+	if (level > depth || 12u + (size_t)entries * 12u > bytes)
+		return -1;
+	for (unsigned i = 0u; i < entries; i++) {
+		const uint8_t *entry = node + 12u + (size_t)i * 12u;
+
+		if (level == 0u) {
+			unsigned length = le16(entry + 4);
+			uint64_t start = (uint64_t)le16(entry + 6) << 32 | le32(entry + 8);
+
+			/* Past 32768, allocated and not written: it reads as zeros,
+			 * a hole, the diff's only if the disk says otherwise. */
+			if (length > 32768u)
+				continue;
+			if (ext_add(runs, count, le32(entry), start, length, e) != 0)
+				return -1;
+		} else {
+			uint64_t child = (uint64_t)le16(entry + 8) << 32 | le32(entry + 4);
+			uint8_t *next = malloc((size_t)e->block);
+			int      status;
+
+			if (next == NULL)
+				return -1;
+			status = ext_read_block(w, e, child, next) != 0 ? -1 :
+			         ext_extents(w, e, next, (size_t)e->block, level - 1u, runs, count);
+			free(next);
+			if (status != 0)
+				return -1;
+		}
+	}
+	return 0;
+}
+
+/* An indirect block's pointers, `levels` above the data, from `logical`. */
+static int ext_indirect(walk *w, const ext *e, uint64_t number, unsigned levels, uint64_t *logical,
+                        uint64_t limit, ext_run *runs, size_t *count)
+{
+	uint64_t per = e->block / 4u;
+	uint8_t *block = malloc((size_t)e->block);
+	int      status = 0;
+
+	if (block == NULL)
+		return -1;
+	if (number == 0u) {
+		/* A hole: its span passed over. */
+		uint64_t span = 1u;
+
+		for (unsigned i = 0u; i < levels; i++)
+			span *= per;
+		*logical += span;
+		free(block);
+		return 0;
+	}
+	if (ext_read_block(w, e, number, block) != 0) {
+		free(block);
+		return -1;
+	}
+	for (uint64_t i = 0u; i < per && *logical < limit && status == 0; i++) {
+		uint64_t next = le32(block + 4u * i);
+
+		if (levels > 1u) {
+			status = ext_indirect(w, e, next, levels - 1u, logical, limit, runs, count);
+		} else {
+			if (next != 0u)
+				status = ext_add(runs, count, *logical, next, 1u, e);
+			(*logical)++;
+		}
+	}
+	free(block);
+	return status;
+}
+
+/* The inode `number` into `inode`, 128 bytes of it. */
+static int ext_inode(walk *w, const ext *e, uint64_t number, uint8_t inode[128])
+{
+	uint8_t  descriptor[64];
+	uint64_t group;
+	uint64_t index;
+	uint64_t table;
+
+	if (number == 0u || number > e->inodes)
+		return -1;
+	group = (number - 1u) / e->inodes_per_group;
+	index = (number - 1u) % e->inodes_per_group;
+	if (group >= e->groups ||
+	    read_all(w->image, descriptor, (size_t)(e->descriptor_size < 64u ? e->descriptor_size : 64u),
+	             e->base + e->descriptors + group * e->descriptor_size) != 0)
+		return -1;
+	table = le32(descriptor + 8);
+	if (e->wide && e->descriptor_size >= 64u)
+		table |= (uint64_t)le32(descriptor + 40) << 32;
+	if (table == 0u || table >= e->blocks)
+		return -1;
+	return read_all(w->image, inode, 128u, e->base + table * e->block + index * e->inode_size);
+}
+
+/* The inode's blocks as runs, its size in *size. -1 where they are not to
+ * be trusted, or its data sits in the inode, which is the diff's. */
+static int ext_runs(walk *w, const ext *e, const uint8_t inode[128], uint64_t *size, ext_run *runs,
+                    size_t *count)
+{
+	uint32_t flags = le32(inode + 32);
+
+	*size  = (uint64_t)le32(inode + 108) << 32 | le32(inode + 4);
+	*count = 0u;
+	if ((flags & 0x10000000u) != 0u)
+		return -1;
+	if ((flags & 0x80000u) != 0u)
+		return ext_extents(w, e, inode + 40, 60u, 5u, runs, count);
+	{
+		uint64_t blocks = (*size + e->block - 1u) / e->block;
+		uint64_t logical = 0u;
+
+		for (unsigned i = 0u; i < 12u && logical < blocks; i++, logical++) {
+			uint64_t number = le32(inode + 40 + 4u * i);
+
+			if (number != 0u && ext_add(runs, count, logical, number, 1u, e) != 0)
+				return -1;
+		}
+		for (unsigned level = 1u; level <= 3u && logical < blocks; level++)
+			if (ext_indirect(w, e, le32(inode + 40 + 48 + 4u * (level - 1u)), level, &logical,
+			                 blocks, runs, count) != 0)
+				return -1;
+	}
+	return 0;
+}
+
+/* A filesystem's name for a file as a path of one: anything but what a
+ * layout line or a path cannot hold. */
+static int ext_name(const uint8_t *id, size_t length, char *out, size_t cap)
+{
+	if (length == 0u || length >= cap || id[0] == '@')
+		return 0;
+	for (size_t i = 0u; i < length; i++) {
+		if (id[i] < 0x20u || id[i] == '/' || id[i] == 0x7Fu)
+			return 0;
+		out[i] = (char)id[i];
+	}
+	out[length] = '\0';
+	return strcmp(out, ".") != 0 && strcmp(out, "..") != 0;
+}
+
+/* The regular file of the inode to `path`, a piece a run. */
+static int ext_file(walk *w, const ext *e, const uint8_t inode[128], ext_run *runs,
+                    const char *path, const char *relative)
+{
+	static uint8_t buffer[COPY_BYTES];
+	size_t         count;
+	uint64_t       size;
+	size_t         first = w->count;
+	int            fd;
+
+	/* Past the image's size it is a hole or a lie, and either way not
+	 * something to make on this disk. */
+	if (ext_runs(w, e, inode, &size, runs, &count) != 0 || size > w->bytes)
+		return 0;
+	if ((fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644)) < 0)
+		return 0;
+	if (ftruncate(fd, (off_t)size) != 0) {
+		close(fd);
+		unlink(path);
+		return 0;
+	}
+	if (size == 0u) {
+		close(fd);
+		return place(w, 0u, 0u, relative);
+	}
+	for (size_t i = 0u; i < count; i++) {
+		uint64_t offset = runs[i].logical * e->block;
+		uint64_t at = e->base + runs[i].physical * e->block;
+		uint64_t piece = runs[i].count * e->block;
+
+		if (offset >= size)
+			break;
+		if (piece > size - offset)
+			piece = size - offset;
+		if (place_piece(w, at / DISK_UNIT, piece, offset, size, relative) != 0) {
+			close(fd);
+			return -1;
+		}
+		for (uint64_t done = 0u; done < piece;) {
+			size_t n = piece - done < sizeof buffer ? (size_t)(piece - done) : sizeof buffer;
+
+			if (read_all(w->image, buffer, n, at + done) != 0 ||
+			    write_all(fd, buffer, n, offset + done) != 0) {
+				close(fd);
+				unlink(path);
+				for (size_t k = first; k < w->count; k++)
+					free(w->files[k].path);
+				w->count = first;
+				return 0;
+			}
+			done += n;
+		}
+	}
+	return close(fd);
+}
+
+static int ext_directory(walk *w, const ext *e, uint64_t number, const char *relative,
+                         unsigned depth, ext_run *runs)
+{
+	uint8_t  inode[128];
+	uint64_t size;
+	size_t   count;
+	uint8_t *bytes;
+	int      status = 0;
+
+	if (depth > MAX_DEPTH || w->dirs == MAX_DIRS || ext_inode(w, e, number, inode) != 0 ||
+	    (le16(inode) & 0xF000u) != 0x4000u || ext_runs(w, e, inode, &size, runs, &count) != 0 ||
+	    size > EXT_MAX_DIR)
+		return 0;
+	for (unsigned i = 0u; i < w->dirs; i++)
+		if (w->dir_extents[i] == number)
+			return 0;
+	w->dir_extents[w->dirs++] = number;
+	if ((bytes = calloc(1u, (size_t)size + 1u)) == NULL)
+		return -1;
+	for (size_t i = 0u; i < count; i++) {
+		uint64_t offset = runs[i].logical * e->block;
+		uint64_t n = runs[i].count * e->block;
+
+		if (offset >= size)
+			continue;
+		if (n > size - offset)
+			n = size - offset;
+		if (read_all(w->image, bytes + offset, (size_t)n, e->base + runs[i].physical * e->block) != 0) {
+			free(bytes);
+			return 0;
+		}
+	}
+	for (uint64_t at = 0u; at + 8u <= size && status == 0;) {
+		uint64_t entry = le32(bytes + at);
+		unsigned length = le16(bytes + at + 4);
+		size_t   name_length = bytes[at + 6];
+		uint8_t  child[128];
+		char     name[256];
+		char     next[4096];
+		char     path[8400];
+
+		if (length < 8u || (length & 3u) != 0u || at + length > size)
+			break;
+		if (entry != 0u && 8u + name_length <= length &&
+		    ext_name(bytes + at + 8, name_length, name, sizeof name) &&
+		    (size_t)snprintf(next, sizeof next, "%s%s%s", relative, relative[0] != '\0' ? "/" : "",
+		                     name) < sizeof next &&
+		    ext_inode(w, e, entry, child) == 0) {
+			unsigned kind = le16(child) & 0xF000u;
+
+			snprintf(path, sizeof path, "%s/%s", w->root, next);
+			if (kind == 0x4000u) {
+				if (mkdir(path, 0755) == 0)
+					status = ext_directory(w, e, entry, next, depth + 1u, runs);
+			} else if (kind == 0x8000u && w->count < MAX_FILES) {
+				status = ext_file(w, e, child, runs, path, next);
+			}
+		}
+		at += length;
+	}
+	free(bytes);
+	return status;
+}
+
+/* A filesystem's tree, as read_fat. */
+static int read_ext(walk *w, uint64_t base, const char *prefix, int *found, char *volume, size_t cap)
+{
+	uint8_t  super[1024];
+	ext      e;
+	uint64_t per_group;
+	ext_run *runs;
+	int      status;
+
+	memset(&e, 0, sizeof e);
+	if (w->bytes < base + 2048u || read_all(w->image, super, sizeof super, base + 1024u) != 0 ||
+	    le16(super + 56) != 0xEF53u || le32(super + 24) > 6u)
+		return 0;
+	e.base             = base;
+	e.block            = 1024u << le32(super + 24);
+	e.wide             = (le32(super + 96) & 0x80u) != 0u;
+	e.blocks           = le32(super + 4) | (e.wide ? (uint64_t)le32(super + 0x150) << 32 : 0u);
+	e.inodes           = le32(super);
+	e.inodes_per_group = le32(super + 40);
+	e.inode_size       = le32(super + 76) >= 1u ? le16(super + 88) : 128u;
+	e.descriptor_size  = e.wide && le16(super + 254) >= 32u ? le16(super + 254) : 32u;
+	per_group          = le32(super + 32);
+	if (e.inodes_per_group == 0u || per_group == 0u || e.inode_size < 128u || e.blocks == 0u ||
+	    base % DISK_UNIT != 0u || e.blocks > (w->bytes - base) / e.block)
+		return 0;
+	e.groups      = (e.blocks + per_group - 1u) / per_group;
+	e.descriptors = ((uint64_t)le32(super + 20) + 1u) * e.block;
+	if ((runs = malloc(EXT_MAX_RUNS * sizeof *runs)) == NULL)
+		return -1;
+	w->unit = DISK_UNIT;
+	*found = 1;
+	w->dirs = 0u;
+	if (volume[0] == '\0')
+		for (size_t i = 0u; i < 16u && super[120 + i] != 0u && i + 1u < cap; i++) {
+			char c = (char)super[120 + i];
+
+			volume[i]     = c >= ' ' && c <= '~' && strchr("\"\\()", c) == NULL ? c : '_';
+			volume[i + 1] = '\0';
+		}
+	status = ext_directory(w, &e, 2u, prefix, 0u, runs);
+	free(runs);
 	return status;
 }
 
@@ -655,7 +1034,8 @@ static int read_partitions(walk *w, char *volume, size_t cap)
 		snprintf(path, sizeof path, "%s/%s", w->root, prefix);
 		if (mkdir(path, 0755) != 0)
 			return -1;
-		if (read_fat(w, first[i] * 512u, prefix, &found, volume, cap) != 0)
+		if (read_fat(w, first[i] * 512u, prefix, &found, volume, cap) != 0 ||
+		    (!found && read_ext(w, first[i] * 512u, prefix, &found, volume, cap) != 0))
 			return -1;
 		if (!found)
 			rmdir(path);
@@ -1449,6 +1829,7 @@ static int import_into(walk *w, const char *dir, hull_media_report *report, char
 		int found = 0;
 
 		if (read_fat(w, 0u, "", &found, volume, sizeof volume) != 0 ||
+		    (!found && read_ext(w, 0u, "", &found, volume, sizeof volume) != 0) ||
 		    (!found && read_partitions(w, volume, sizeof volume) != 0))
 			return fail(detail, cap, "the disk's files cannot be written", strerror(errno));
 	}

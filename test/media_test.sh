@@ -217,6 +217,40 @@ else
 	printf 'media: FAT not measured: mtools is not installed\n'
 fi
 
+# ext2 at 1 KiB blocks, whose big file reaches double indirection, ext3,
+# and ext4 by extents: mke2fs's, not hull's. A name of a space and a +, a
+# link, which is no file, and a hole.
+mke2fs=$(command -v mke2fs || ls /usr/sbin/mke2fs /sbin/mke2fs 2>/dev/null | head -1)
+if [ -n "$mke2fs" ]; then
+	mkdir -p "$dir/tree/sub/deep"
+	head -c 3000000 /dev/urandom > "$dir/tree/big.bin"
+	head -c 5000 /dev/urandom > "$dir/tree/sub/deep/small"
+	printf 'hi\n' > "$dir/tree/sub/lib++ name"
+	: > "$dir/tree/empty"
+	ln -s big.bin "$dir/tree/link"
+	dd if=/dev/urandom of="$dir/tree/holed" bs=4096 count=1 seek=100 2>/dev/null
+	for fs in ext2:1024 ext3:4096 ext4:4096; do
+		type=${fs%:*}
+		"$mke2fs" -q -F -t "$type" -b "${fs#*:}" -L HULLFS -d "$dir/tree" "$dir/$type.img" 16M
+		media import "$dir/$type.img" "$dir/$type"
+		check "$type imported" "$got" 0 "$out"
+		diff -r -x link -x lost+found "$dir/tree" "$dir/$type/files" > "$dir/differs" 2>&1
+		check "$type's tree is the tree" "$?" 0 "$(cat "$dir/differs")"
+		grep -q '(volume "HULLFS")' "$dir/$type/media.conf"
+		check "$type's label is read" "$?" 0 "$(cat "$dir/$type/media.conf")"
+		media export "$dir/$type" "$dir/$type.again"
+		check "$type exports" "$got" 0 "$out"
+		cmp -s "$dir/$type.img" "$dir/$type.again"
+		check "$type is itself" "$?" 0 ''
+	done
+	cases=$((cases + 1))
+	patch=$(find "$dir/ext4/quirks" -type f -printf '%s\n' | awk '{ n += $1 } END { print n + 0 }')
+	[ "$patch" -lt 1000000 ] ||
+		{ failures=$((failures + 1)); printf 'FAIL: ext4 is mostly patch: %s\n' "$patch"; }
+else
+	printf 'media: ext not measured: mke2fs is not installed\n'
+fi
+
 printf 'media: %d cases, %d failed\n' "$cases" "$failures"
 rm -rf "$dir"
 [ "$failures" -eq 0 ]

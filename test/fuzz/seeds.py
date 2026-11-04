@@ -88,3 +88,24 @@ fat[root + 43] = 0x10
 fat[root + 58:root + 60] = (3).to_bytes(2, 'little')
 with open(os.path.join(disc, 'fat'), 'wb') as seed:
 	seed.write(fat)
+
+# An ext2 filesystem of 64 blocks, whole, where mke2fs is: its boot block
+# is free, and the 0xE2 there is media_fuzz.c's sign that it is whole.
+for tool in ('/usr/sbin/mke2fs', '/sbin/mke2fs'):
+	if os.path.exists(tool):
+		tree = os.path.join(disc, 'tree')
+		image = os.path.join(disc, 'ext')
+		os.makedirs(os.path.join(tree, 'd'), exist_ok=True)
+		with open(os.path.join(tree, 'd', 'f'), 'wb') as f:
+			f.write(b'x' * 3000)
+		subprocess.check_call([tool, '-q', '-F', '-t', 'ext2', '-b', '1024', '-N', '16', '-O',
+		                       '^resize_inode', '-d', tree, image, '64'])
+		# mke2fs leaves a file short of the filesystem's size, and a reader
+		# that holds the size to the image would refuse it.
+		with open(image, 'r+b') as f:
+			f.write(b'\xe2')
+			f.truncate(64 * 1024)
+		os.unlink(os.path.join(tree, 'd', 'f'))
+		os.rmdir(os.path.join(tree, 'd'))
+		os.rmdir(tree)
+		break

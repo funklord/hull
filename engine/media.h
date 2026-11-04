@@ -14,9 +14,11 @@
  *
  * A disk of FAT is the same, its unit the disk's sector, (unit N) in
  * media.conf, and a file whose clusters are apart a line for each run,
- * `SECTOR SIZE @OFFSET/TOTAL PATH`. A partitioned disk, by GPT or MBR, is
- * each FAT partition's tree under files/pN, N its place in the table; a
- * partition of anything else is the patch's.
+ * `SECTOR SIZE @OFFSET/TOTAL PATH`. So is an ext2, ext3 or ext4 filesystem,
+ * its regular files; a link's, a device's and every owner and mode being
+ * the patch's. A partitioned disk, by GPT or MBR, is each such partition's
+ * tree under files/pN, N its place in the table; a partition of anything
+ * else is the patch's.
  *
  * A raw dump, `IMAGE.cue` and the .bin files it names, carries more: the
  * disc above is its data track's 2048 bytes a sector, and
