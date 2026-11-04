@@ -234,7 +234,10 @@ static void ping(void)
 	fix("sysctl net.ipv4.ping_group_range='0 2147483647'");
 }
 
-static void device(const char *path, const char *what, const char *name)
+/* A device the user must open: ok, absent, or missing with the group to
+ * join. `instead`, where hull does without it, makes missing limited and
+ * says what it does then. */
+static void device(const char *path, const char *what, const char *name, const char *instead)
 {
 	struct stat   st;
 	char          text[512];
@@ -248,7 +251,10 @@ static void device(const char *path, const char *what, const char *name)
 		line("ok", what, path);
 		return;
 	}
-	line("missing", what, "the device is not this user's to open");
+	if (instead != NULL)
+		line("limited", what, instead);
+	else
+		line("missing", what, "the device is not this user's to open");
 	owner = getgrgid(st.st_gid);
 	snprintf(text, sizeof text, "usermod -aG %s %s", owner != NULL ? owner->gr_name : "GROUP", name);
 	fix(text);
@@ -363,9 +369,10 @@ int hull_doctor(const char *runtime_why)
 	cgroups();
 	ports();
 	ping();
-	device("/dev/kvm", "vm and emu machines (/dev/kvm)", name);
-	device("/dev/vhost-vsock", "a vm's agent (/dev/vhost-vsock)", name);
-	device("/dev/fuse", "FUSE, an image read or changed without a mount (/dev/fuse)", name);
+	device("/dev/kvm", "vm and emu machines (/dev/kvm)", name, NULL);
+	device("/dev/vhost-vsock", "a vm's agent over vsock (/dev/vhost-vsock)", name,
+	       "not this user's to open: a vm's agent is reached by a serial port instead");
+	device("/dev/fuse", "FUSE, an image read or changed without a mount (/dev/fuse)", name, NULL);
 	vm_kernel();
 	fetched_sshd();
 	usable = runtime(runtime_why) && usable;

@@ -62,6 +62,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -180,7 +181,9 @@ struct hull_machine {
 	int              keep;         /* (on_disconnect keep): qemu outlives the core */
 	int              adopted;      /* taken back: qemu is not this process's child */
 	int              pidfd;        /* qemu's, when adopted, else -1 */
-	uint32_t         cid;          /* its vsock context id */
+	uint32_t         cid;          /* its vsock context id; 0, the serial port's agent.sock */
+	int              transport;    /* (tuning (qemu (transport ...))): 0 auto, 1 vsock, 2 serial */
+	int              agent_listen; /* the serial port's socket, bound, while qemu is forked */
 	uint8_t          token[32];    /* what a host after this one resumes with */
 	char             persisted[4800];  /* what persist() last gave */
 	hull_wire        wire;
@@ -637,6 +640,14 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			m->kernel_hull = strcmp(text, "hull") == 0;
 			free(text);
 		}
+	}
+
+	/* (tuning (qemu (transport ...))): how the agent is reached. */
+	if (hull_access_find(doc, &machine, "tuning", &entry) &&
+	    hull_access_find(doc, &entry, "qemu", &item) &&
+	    (text = hull_access_value(doc, &item, "transport")) != NULL) {
+		m->transport = strcmp(text, "vsock") == 0 ? 1 : strcmp(text, "serial") == 0 ? 2 : 0;
+		free(text);
 	}
 
 	if (m->kernel_image && m->composefs != NULL)
@@ -1694,6 +1705,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        memory[32];
 	char        cpus[16];
 	char        vsock[64];
+	char        agent_chardev[4500];
 	char        netdev[64];
 	char        root[9000];
 	char        modules[9000];
@@ -1723,7 +1735,17 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	snprintf(console, sizeof console, "file,id=console,path=%s/console.log", path);
 	snprintf(memory, sizeof memory, "%lu", m->memory_mib);
 	snprintf(cpus, sizeof cpus, "%u", m->cpus);
-	snprintf(vsock, sizeof vsock, "vhost-vsock-pci,guest-cid=%u", cid);
+	/* The agent's channel: vsock, or where it cannot be had a virtio
+	 * serial port named hull.agent, behind a unix socket in the machine's
+	 * own directory, which only the user may reach (transport()). */
+	if (cid != 0u) {
+		snprintf(vsock, sizeof vsock, "vhost-vsock-pci,guest-cid=%u", cid);
+	} else {
+		/* Bound by the engine and handed over, so the directory's path
+		 * may be longer than a socket's address holds (agent_address). */
+		snprintf(agent_chardev, sizeof agent_chardev, "socket,id=agent,fd=%u,server=on,wait=off",
+		         SEGMENT_FD + m->segment_count);
+	}
 	if (m->bridge && m->bridge_root[0] != '\0')
 		snprintf(netdev, sizeof netdev, "tap,id=net,fd=%d", NETWORK_FD);
 	else if (m->bridge)
@@ -1966,8 +1988,15 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	}
 	argv[n++] = "-device";
 	argv[n++] = "virtio-rng-pci";
-	argv[n++] = "-device";
-	argv[n++] = vsock;
+	if (cid != 0u) {
+		argv[n++] = "-device";
+		argv[n++] = vsock;
+	} else {
+		argv[n++] = "-chardev";
+		argv[n++] = agent_chardev;
+		argv[n++] = "-device";
+		argv[n++] = "virtserialport,chardev=agent,name=hull.agent";
+	}
 	if (!m->no_network) {
 		argv[n++] = "-netdev";
 		argv[n++] = netdev;
@@ -2062,21 +2091,28 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		 * is moved above them all first, so that none is closed by
 		 * another's dup2; a dup carries no CLOEXEC. */
 		{
-			int moved_network = -1;
-			int moved[MAX_SEGMENTS];
+			int      moved_network = -1;
+			int      moved[MAX_SEGMENTS];
+			int      moved_agent = -1;
+			unsigned after = SEGMENT_FD + m->segment_count;
 
 			if (m->network >= 0 && (moved_network = fcntl(m->network, F_DUPFD, 64)) < 0)
 				_exit(126);
 			for (unsigned i = 0u; i < m->segment_count; i++)
 				if ((moved[i] = fcntl(m->segment_fd[i], F_DUPFD, 64)) < 0)
 					_exit(126);
+			if (cid == 0u && (moved_agent = fcntl(m->agent_listen, F_DUPFD, 64)) < 0)
+				_exit(126);
 			if (moved_network >= 0 ? dup2(moved_network, NETWORK_FD) < 0 :
 			                         close(NETWORK_FD) != 0 && errno != EBADF)
 				_exit(126);  /* (network none): no passt */
 			for (unsigned i = 0u; i < m->segment_count; i++)
 				if (dup2(moved[i], (int)(SEGMENT_FD + i)) < 0)
 					_exit(126);
-			syscall(SYS_close_range, SEGMENT_FD + m->segment_count, ~0u, 0u);
+			/* The agent's serial socket after the segments' ports. */
+			if (moved_agent >= 0 && dup2(moved_agent, (int)after++) < 0)
+				_exit(126);
+			syscall(SYS_close_range, after, ~0u, 0u);
 		}
 		if ((m->host_overlay || m->staged) &&
 		    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
@@ -2195,11 +2231,86 @@ static void last_line(const hull_machine *m, const char *file, char *out, size_t
 	free(data);
 }
 
+/* The agent's channel for a new machine: 1, vsock; 0, a virtio-serial
+ * port behind a unix socket, which needs nothing of the host's -- some
+ * hosts keep /dev/vhost-vsock to a group the user is not in. (transport
+ * auto), the default, takes vsock where it is open to the user. */
+static int transport(const hull_machine *m)
+{
+	if (m->transport == 2)
+		return 0;
+	return m->transport == 1 || access("/dev/vhost-vsock", R_OK | W_OK) == 0;
+}
+
+/* The serial port's socket, agent.sock in the machine's directory, as an
+ * address through /proc/self/fd, which a socket's address holds whatever
+ * the directory's length; `*dir` is the descriptor that names it, for the
+ * caller to close. 0, or -1. */
+static int agent_address(const hull_machine *m, struct sockaddr_un *address, int *dir)
+{
+	memset(address, 0, sizeof *address);
+	address->sun_family = AF_UNIX;
+	if ((*dir = open(m->dir, O_PATH | O_DIRECTORY | O_CLOEXEC)) < 0)
+		return -1;
+	snprintf(address->sun_path, sizeof address->sun_path, "/proc/self/fd/%d/agent.sock", *dir);
+	return 0;
+}
+
+/* The serial port's socket bound and listening, for qemu. -1 where not. */
+static int agent_socket(const hull_machine *m)
+{
+	struct sockaddr_un address;
+	int                dir;
+	int                fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+	if (fd < 0)
+		return -1;
+	if (agent_address(m, &address, &dir) != 0) {
+		close(fd);
+		return -1;
+	}
+	if (bind(fd, (struct sockaddr *)&address, sizeof address) != 0 || listen(fd, 1) != 0) {
+		close(dir);
+		close(fd);
+		return -1;
+	}
+	close(dir);
+	return fd;
+}
+
 /* Connect to the agent, while qemu lives, for BOOT_LIMIT seconds. */
 static int dial(hull_machine *m, uint32_t cid)
 {
 	time_t deadline = time(NULL) + BOOT_LIMIT;
 
+	/* The serial port's socket: qemu listens on it as soon as it runs,
+	 * and holds what is written until the agent opens the port, so the
+	 * hello sent at once is read when the guest is up. */
+	if (cid == 0u) {
+		struct sockaddr_un address;
+		int                dir;
+
+		if (agent_address(m, &address, &dir) != 0)
+			return -1;
+		while (time(NULL) < deadline && !qemu_gone(m)) {
+			int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+			if (fd < 0)
+				break;
+			if (connect(fd, (struct sockaddr *)&address, sizeof address) == 0) {
+				close(dir);
+				return fd;
+			}
+			close(fd);
+			{
+				struct timespec pause = { 0, 20000000L };
+
+				nanosleep(&pause, NULL);
+			}
+		}
+		close(dir);
+		return -1;
+	}
 	while (time(NULL) < deadline && !qemu_gone(m)) {
 		struct sockaddr_vm address;
 		struct timeval     patience = { 0, 200000 };
@@ -2723,7 +2834,7 @@ static void mark_adopted_dir(const char *dir, int on)
 static void remove_files(const char *dir)
 {
 	static const char *const files[] = { "initrd", "console.log", "qemu.log", "passt.log",
-	                                     "root.img",
+	                                     "root.img", "agent.sock",
 	                                     "passt.pid" /* written by a core before 2026-10-21 */ };
 	char path[4200];
 
@@ -2907,8 +3018,9 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		return fail(error, HULL_ERR_RUNTIME, "the qemu engine boots on x86_64 hosts only so far");
 	if (!m->emu && access("/dev/kvm", R_OK | W_OK) != 0)
 		return fail(error, HULL_ERR_RUNTIME, "/dev/kvm is not open to this user");
-	if (access("/dev/vhost-vsock", R_OK | W_OK) != 0)
-		return fail(error, HULL_ERR_RUNTIME, "/dev/vhost-vsock is not open to this user");
+	if (m->transport == 1 && access("/dev/vhost-vsock", R_OK | W_OK) != 0)
+		return fail(error, HULL_ERR_RUNTIME, "(transport vsock), and /dev/vhost-vsock is not "
+		            "open to this user: (transport auto) takes a serial port instead");
 
 	/* The kernel, and the release whose modules it wants. bundled is the
 	 * host's own, always modular here. A path kernel is the user's on disk,
@@ -3041,9 +3153,14 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	for (int attempt = 0; attempt < CID_TRIES && fd < 0; attempt++) {
 		uint32_t cid = 0u;
 
-		if (getrandom(&cid, sizeof cid, 0) != (ssize_t)sizeof cid)
-			cid = (uint32_t)getpid() ^ (uint32_t)time(NULL);
-		cid = 3u + cid % 0x7ffffff0u;
+		if (transport(m) == 0) {
+			if (attempt > 0)
+				break;   /* no context id to collide */
+		} else {
+			if (getrandom(&cid, sizeof cid, 0) != (ssize_t)sizeof cid)
+				cid = (uint32_t)getpid() ^ (uint32_t)time(NULL);
+			cid = 3u + cid % 0x7ffffff0u;
+		}
 		m->done = 0;
 		/* A passt each time: the last ended with its qemu. */
 		if ((reason = start_network(m)) != NULL) {
@@ -3056,7 +3173,18 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 			m->network = -1;
 			break;
 		}
+		if (cid == 0u && (m->agent_listen = agent_socket(m)) < 0) {
+			snprintf(m->detail, sizeof m->detail, "the agent's serial socket: %s", strerror(errno));
+			close(m->network);
+			m->network = -1;
+			close_segments(m);
+			break;
+		}
 		m->qemu = spawn(m, kernel, mbuf, load_modules, cid);
+		if (cid == 0u) {
+			close(m->agent_listen);
+			m->agent_listen = -1;
+		}
 		close(m->network);
 		m->network = -1;
 		close_segments(m);
@@ -3215,7 +3343,7 @@ static const char *read_state(hull_machine *m, hull_buf state)
 		if (sscanf(line, "pid %ld", &number) == 1 && number > 0) {
 			m->qemu = (pid_t)number;
 			seen |= 1;
-		} else if (sscanf(line, "cid %u", &a) == 1 && a >= 3u) {
+		} else if (sscanf(line, "cid %u", &a) == 1 && (a >= 3u || a == 0u)) {
 			m->cid = a;
 			seen |= 2;
 		} else if (sscanf(line, "passt %ld", &number) == 1) {
@@ -4288,6 +4416,12 @@ static const hull_cap_entry entries[] = {
 	  "its modules the host's for its release where it has them, else built in", NULL },
 	{ "vm.cpu_profile.host", HULL_SUP_NATIVE,  NULL, NULL },
 	{ "qemu.accel.auto",     HULL_SUP_NATIVE,  NULL, NULL },
+	/* The agent's channel: vsock where /dev/vhost-vsock is open to the
+	 * user, else a virtio-serial port behind a unix socket. */
+	{ "qemu.transport.auto",   HULL_SUP_NATIVE, NULL, NULL },
+	{ "qemu.transport.vsock",  HULL_SUP_NATIVE, "needs /dev/vhost-vsock open to the user", NULL },
+	{ "qemu.transport.serial", HULL_SUP_NATIVE, "a virtio-serial port, its socket in the "
+	  "machine's own directory", NULL },
 	{ "emu.cores_scale",     HULL_SUP_NATIVE,  NULL, NULL },
 
 	{ NULL,                 HULL_SUP_NATIVE,   NULL, NULL },

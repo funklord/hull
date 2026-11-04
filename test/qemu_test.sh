@@ -2328,6 +2328,63 @@ sleep 2
 left=$(pgrep -f "^qemu-system-x86_64 .*$XDG_RUNTIME_DIR/hull/qemu-")
 [ ! -e "$kept_file" ] && [ -z "$left" ] ||
 	fail "a taken-back vm's file or qemu is left" "$(ls "$XDG_RUNTIME_DIR/hull/machines") $left"
+# The same over (transport serial), the agent's channel a virtio-serial
+# port behind agent.sock in the machine's directory, as where vhost-vsock
+# is not open to the user: a kept vm outliving its core; a host on the
+# socket with a false token, whose exec sent after it must not reach the
+# next host's stream, a port having no boundary between hosts as a vsock
+# connection does; then the next core taking it back, an exec, what it
+# wrote meanwhile, and its exit.
+conf sadopt '(backend vm) (hostname "qsadopt") (on_disconnect keep) (tuning (qemu (transport serial)))' \
+	'(command "/probe" "say" "before" "sleep" "2" "say" "during" "sleep" "12" "exit" "5")'
+(cd / && exec timeout -k 2 90 "$hull" run -f "$root/sadopt.conf" > /dev/null 2>&1) &
+runner=$!
+await qsadopt
+kept_file=$XDG_RUNTIME_DIR/hull/machines/qsadopt
+kill -KILL "$(head -1 "$XDG_RUNTIME_DIR/hull/core.lock")" 2> /dev/null
+wait "$runner" 2>/dev/null
+sleep 4
+sock=$(grep -a '^dir ' "$kept_file" 2>/dev/null | cut -d' ' -f2-)/agent.sock
+cases=$((cases + 1))
+out=$(timeout 20 python3 -c '
+import socket, struct, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(3)
+s.connect(sys.argv[1])
+def say(m):
+	s.sendall(struct.pack(">I", len(m)) + m)
+say(b"(5:hello(2:ch1:0)(8:features)(5:proto1:1))")
+say(b"(6:resume(2:ch1:0)(5:token32:" + b"x" * 32 + b"))")
+say(b"(4:exec(4:argv6:/probe)(2:ch1:7)(3:tty5:false))")
+got = b""
+while True:
+	try:
+		piece = s.recv(4096)
+	except (socket.timeout, ConnectionResetError):
+		break
+	if not piece:
+		break
+	got += piece
+leaked = any(word in got for word in (b"started", b"data", b"exited"))
+print("believed" if leaked else "closed", repr(got[:200]))
+' "$sock" 2>&1)
+printf '%s\n' "$out" | grep -q '^closed ' || fail "a host without the token was believed over serial" "$out"
+cases=$((cases + 1))
+out=$(timeout 60 "$hull" ps 2>&1)
+printf '%s\n' "$out" | grep -q '^qsadopt .*running$' ||
+	fail "the next core did not take the kept serial vm back" "$out
+$(tail -5 "$XDG_RUNTIME_DIR/hull/core.log")"
+cases=$((cases + 1))
+out=$(timeout 30 "$hull" exec qsadopt /probe say "in it" 2>&1)
+[ "$out" = "in it" ] || fail "an exec in a taken-back serial vm said '$out'" ""
+cases=$((cases + 1))
+logs=$(timeout 30 "$hull" logs -f qsadopt 2>&1)
+printf '%s\n' "$logs" | grep -q '^during$' ||
+	fail "what a taken-back serial vm wrote meanwhile was lost" "$logs"
+cases=$((cases + 1))
+out=$(timeout 30 "$hull" attach qsadopt 2>&1)
+got=$?
+[ "$got" = 5 ] || fail "a taken-back serial vm's exit was $got, wanted 5" "$out"
 # A kept vm whose workload ends while no core holds it waits for the next
 # core, and its exit is that core's to report: 7 here, a second after its
 # core is killed.

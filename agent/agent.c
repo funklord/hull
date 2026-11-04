@@ -2338,10 +2338,50 @@ static void handle(const hull_sexpr_doc *body)
 
 /* --- PID 1 --------------------------------------------------------------- */
 
+/* The host's serial port, where the engine gives one in place of vsock: a
+ * virtio-serial port named hull.agent, its node, else empty. */
+static char host_port[300];
+/* A host dropped from the port and not yet gone from it: what it still
+ * writes is its, not the next host's, and a port carries no boundary
+ * between them as a new vsock connection does. */
+static int  port_dropped;
+
+static void find_host_port(void)
+{
+	DIR           *ports = opendir("/sys/class/virtio-ports");
+	struct dirent *port;
+
+	while (ports != NULL && host_port[0] == '\0' && (port = readdir(ports)) != NULL) {
+		char  path[300];
+		char  name[64] = "";
+		FILE *file;
+
+		if (port->d_name[0] == '.')
+			continue;
+		snprintf(path, sizeof path, "/sys/class/virtio-ports/%s/name", port->d_name);
+		if ((file = fopen(path, "r")) == NULL)
+			continue;
+		if (fgets(name, sizeof name, file) != NULL) {
+			name[strcspn(name, "\n")] = '\0';
+			if (strcmp(name, "hull.agent") == 0)
+				snprintf(host_port, sizeof host_port, "/dev/%s", port->d_name);
+		}
+		fclose(file);
+	}
+	if (ports != NULL)
+		closedir(ports);
+}
+
+/* What is listened on for the host: the vsock port, or the serial port,
+ * which is then the connection itself once the host is on it. */
 static int listen_host(void)
 {
 	struct sockaddr_vm address;
-	int                fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	int                fd;
+
+	if (host_port[0] != '\0')
+		return open(host_port, O_RDWR | O_CLOEXEC);
+	fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
 
 	memset(&address, 0, sizeof address);
 	address.svm_family = AF_VSOCK;
@@ -2355,6 +2395,43 @@ static int listen_host(void)
 		return -1;
 	}
 	return fd;
+}
+
+/* The host's connection, where `listener` says one is ready: accepted on
+ * vsock; on the serial port the port itself, the host being on it once it
+ * has written. */
+static int accept_host(int *listener, short revents)
+{
+	if (host_port[0] == '\0')
+		return accept4(*listener, NULL, NULL, SOCK_CLOEXEC);
+	/* After a drop: the old host's bytes read and thrown away until it
+	 * hangs up, then the port opened again, which discards what is left
+	 * unread, so the next host's stream starts at its first byte. */
+	if (port_dropped) {
+		if (revents & POLLHUP) {
+			close(*listener);
+			*listener = listen_host();
+			port_dropped = 0;
+		} else if (revents & POLLIN) {
+			char junk[512];
+
+			if (read(*listener, junk, sizeof junk) <= 0)
+				port_dropped = 0;
+		}
+		return -1;
+	}
+	/* POLLHUP is no host, and a port with none says POLLIN too, a read
+	 * not blocking where it would only return 0: a host is data on a port
+	 * that is not hung up. Taking the hung-up port, reading its end and
+	 * opening it again lost the hello of a host arriving meanwhile, so a
+	 * core taking the machine back was never answered, measured. */
+	if ((revents & POLLIN) == 0 || (revents & POLLHUP) != 0) {
+		struct timespec fifth = { 0, 200000000L };
+
+		nanosleep(&fifth, NULL);   /* not spun on: it says so until one comes */
+		return -1;
+	}
+	return *listener;
 }
 
 /* The workload has ended and said all it will: tell the host, end what is
@@ -2517,19 +2594,32 @@ int main(int argc, char **argv)
 	sigaddset(&mask, SIGCHLD);
 	sigprocmask(SIG_BLOCK, &mask, NULL);
 	children = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
+	find_host_port();
 	listener = listen_host();
 	if (listener < 0) {
-		say("vsock", strerror(errno));
+		say(host_port[0] != '\0' ? host_port : "vsock", strerror(errno));
 		power_off();
 	}
 	/* One controller (B.2): the first connection is the host's, and the
-	 * listener is closed so that no second can be made. */
+	 * listener is closed so that no second can be made. The serial port
+	 * is one connection by its nature, and is waited on until the host
+	 * has written to it. */
 	{
-		int fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+		int fd = -1;
 
-		close(listener);
+		while (fd < 0) {
+			struct pollfd ready = { listener, POLLIN, 0 };
+
+			if (poll(&ready, 1u, -1) < 0 && errno != EINTR)
+				power_off();
+			fd = accept_host(&listener, ready.revents);
+			if (fd < 0 && host_port[0] == '\0')
+				power_off();
+		}
+		if (fd != listener)
+			close(listener);
 		listener = -1;
-		if (fd < 0 || hull_wire_open(&host, fd, HULL_WIRE_FROM_HOST) != 0)
+		if (hull_wire_open(&host, fd, HULL_WIRE_FROM_HOST) != 0)
 			power_off();
 		connected = 1;
 	}
@@ -2552,6 +2642,7 @@ int main(int argc, char **argv)
 				hull_wire_close(&host);
 			drop_channels();
 			listener = listen_host();
+			port_dropped = host_port[0] != '\0';
 			if (listener < 0)
 				say("vsock", strerror(errno));
 		}
@@ -2643,14 +2734,15 @@ int main(int argc, char **argv)
 			settle(c);
 		}
 		if (!connected && listener >= 0 && fds[0].revents != 0) {
-			int fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+			int fd = accept_host(&listener, fds[0].revents);
 
 			if (fd >= 0 && hull_wire_open(&host, fd, HULL_WIRE_FROM_HOST) == 0) {
-				close(listener);
+				if (fd != listener)
+					close(listener);
 				listener = -1;
 				connected = 1;
 				believed  = 0;
-			} else if (fd >= 0) {
+			} else if (fd >= 0 && fd != listener) {
 				close(fd);
 			}
 		} else if (connected && fds[0].revents != 0) {
