@@ -60,6 +60,7 @@
 #include "kernel_fetch.h"
 #include "sshd_fetch.h"
 #include "vbox_fetch.h"
+#include "vbox_host.h"
 #include "import.h"
 #include "matrix.h"
 #include "names.h"
@@ -6191,6 +6192,8 @@ int main(int argc, char **argv)
 		}
 		return 0;
 	}
+	if (strcmp(command, "virtualbox") == 0 && argc == 9 && strcmp(argv[2], "host") == 0)
+		return hull_vbox_host(argv[3], argv[4], argv[5], argv[6], argv[7], argv[8]);
 	if (strcmp(command, "sshd") == 0 && argc == 3 && strcmp(argv[2], "fetch") == 0) {
 		char why[4400] = "";
 
@@ -6346,6 +6349,7 @@ int main(int argc, char **argv)
 	 * which run in the core: nothing here reports to a core. */
 	if (hull_registry_add(&registry, hull_engine_docker(NULL), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_qemu(NULL), &reason) != HULL_REGISTRY_OK ||
+	    hull_registry_add(&registry, hull_engine_virtualbox(NULL), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_chroot(NULL), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_dosbox(NULL), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_dosemu(NULL), &reason) != HULL_REGISTRY_OK ||

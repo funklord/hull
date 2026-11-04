@@ -46,6 +46,7 @@
 #include <grp.h>
 #include <stddef.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
@@ -84,6 +85,7 @@
 #include "kernel.h"
 #include "sshd.h"
 #include "tree.h"
+#include "vbox.h"
 
 #define MAX_VOLUMES  64u
 #define MAX_PORTS    64u
@@ -92,6 +94,7 @@
 #define MAX_PARALLEL 3u   /* isa-parallel's, parport0 to parport2 */
 #define AGENT_PORT   1u
 #define BOOT_LIMIT   60   /* seconds for the agent to answer, TCG included */
+#define HOSTED_LIMIT 300  /* and through VirtualBox, nested, in a vm of its own */
 #define CID_TRIES    4
 #define MAX_STREAMS  64u
 #define WINDOW       65536u  /* what the agent gives, and is given, each way */
@@ -184,6 +187,9 @@ struct hull_machine {
 	int              pidfd;        /* qemu's, when adopted, else -1 */
 	uint32_t         cid;          /* its vsock context id; 0, the serial port's agent.sock */
 	int              transport;    /* (tuning (qemu (transport ...))): 0 auto, 1 vsock, 2 serial, 3 uart */
+	int              hosted;       /* the virtualbox engine's: `qemu` is `hull virtualbox host` */
+	int              hosted_fd;    /* the wire to it, until the reader opens it */
+	int              ready;        /* the agent has started the workload */
 	int              agent_listen; /* the serial port's socket, bound, while qemu is forked */
 	uint8_t          token[32];    /* what a host after this one resumes with */
 	char             persisted[4800];  /* what persist() last gave */
@@ -255,6 +261,9 @@ struct hull_stream {
 static const hull_host_ops *host;
 
 static void *forward_ports(void *arg);
+static int handshake(hull_machine *m);
+static void kill_qemu(hull_machine *m);
+static void start_forwarder(hull_machine *m);
 
 static hull_status fail(hull_error *error, hull_status code, const char *detail)
 {
@@ -467,6 +476,9 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		return "the plan holds no machine";
 	text = hull_access_value(doc, &top, "class");
 	m->emu = text != NULL && strcmp(text, "emu") == 0;
+	free(text);
+	text = hull_access_value(doc, &top, "engine");
+	m->hosted = text != NULL && strcmp(text, "virtualbox") == 0;
 	free(text);
 	/* (arch arm64), which the planner gives only to emu (section 5.3). */
 	text = hull_access_value(doc, &machine, "arch");
@@ -2664,13 +2676,43 @@ static void export_tree(hull_machine *m)
 		close(fd);
 }
 
+/* A virtualbox machine's wire taken up, on the reader's thread. 1, or 0
+ * with the machine killed and the reason logged. */
+static int hosted_connect(hull_machine *m)
+{
+	time_t deadline = time(NULL) + HOSTED_LIMIT;
+	char   line[400] = "";
+	char   message[640];
+
+	if (uart_ready(m, m->hosted_fd, deadline) &&
+	    hull_wire_open(&m->wire, m->hosted_fd, HULL_WIRE_FROM_AGENT) == 0) {
+		m->hosted_fd = -1;
+		m->connected = 1;
+		if (handshake(m)) {
+			start_forwarder(m);
+			return 1;
+		}
+	}
+	if (m->hosted_fd >= 0)
+		close(m->hosted_fd);
+	m->hosted_fd = -1;
+	kill_qemu(m);
+	last_line(m, "qemu.log", line, sizeof line);
+	snprintf(message, sizeof message, "the machine's agent never answered: %s",
+	         m->detail[0] != '\0' ? m->detail : line[0] != '\0' ? line : "nothing was said");
+	host->log(m->core, 3, message);
+	return 0;
+}
+
 static void *read_agent(void *arg)
 {
 	hull_machine *m = arg;
 	pthread_t     deliverer;
-	int           delivering = pthread_create(&deliverer, NULL, deliver_workload, m) == 0;
+	int           delivering;
+	int           up = !m->hosted || hosted_connect(m);
 
-	for (;;) {
+	delivering = up && pthread_create(&deliverer, NULL, deliver_workload, m) == 0;
+	for (; up;) {
 		hull_sexpr_doc   body;
 		hull_sexpr_form  value;
 		hull_wire_status status = hull_wire_read(&m->wire, &body);
@@ -2787,7 +2829,7 @@ static void *read_agent(void *arg)
 		char line[400];
 		char message[512];
 
-		last_line(m, "console.log", line, sizeof line);
+		last_line(m, m->hosted ? "qemu.log" : "console.log", line, sizeof line);
 		snprintf(message, sizeof message, "machine died without its agent's word: %s",
 		         line[0] != '\0' ? line : "the console is empty");
 		host->log(m->core, 3, message);
@@ -2874,6 +2916,30 @@ static void mark_adopted_dir(const char *dir, int on)
 	pthread_mutex_unlock(&adopted_lock);
 }
 
+/* One entry of a hosted machine's work, for nftw, deepest first. */
+static int remove_entry(const char *path, const struct stat *file, int kind, struct FTW *where)
+{
+	(void)file;
+	(void)kind;
+	(void)where;
+	remove(path);
+	return 0;
+}
+
+/* The work of a virtualbox machine whose directory is `dir`, kept on disk
+ * rather than in the runtime directory, memory, as its disk images are
+ * the size of its tree: a directory `hull virtualbox host` made for this
+ * machine alone, named by the machine's own, so not a pattern. */
+static void remove_hosted(const char *dir)
+{
+	const char *name = strrchr(dir, '/');
+	char        work[4096];
+
+	if (name != NULL && name[1] != '\0' && strcmp(name + 1, "..") != 0 &&
+	    hull_vbox_work(name + 1, work, sizeof work) == 0 && access(work, F_OK) == 0)
+		nftw(work, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
+}
+
 static void remove_files(const char *dir)
 {
 	static const char *const files[] = { "initrd", "console.log", "qemu.log", "passt.log",
@@ -2882,6 +2948,8 @@ static void remove_files(const char *dir)
 	char path[4200];
 
 	static const char *const staging[] = { "merged", "lower", "kept", "mem" };
+
+	remove_hosted(dir);
 
 	for (unsigned i = 0u; i < sizeof files / sizeof files[0]; i++) {
 		snprintf(path, sizeof path, "%s/%s", dir, files[i]);
@@ -3042,6 +3110,158 @@ static void kill_qemu(hull_machine *m)
 	pthread_mutex_unlock(&m->lock);
 }
 
+/* The agent told hello, the spec and start, and its `started` heard. 1,
+ * or 0 with the reason in m->detail. */
+static int handshake(hull_machine *m)
+{
+	hull_msg msg = { 0 };
+
+	hull_msg_raw(&msg, "(5:hello(2:ch1:0)(8:features)(5:proto1:1))");
+	send_msg(m, &msg);
+	if (!expect(m, "hello"))
+		return 0;
+	hull_msg_raw(&msg, "(4:spec(2:ch1:0)");
+	hull_msg_bytes(&msg, m->spec, m->spec_length);
+	if (m->secrets.data != NULL)
+		hull_msg_bytes(&msg, m->secrets.data, m->secrets.length);
+	if (m->ssh.data != NULL)
+		hull_msg_bytes(&msg, m->ssh.data, m->ssh.length);
+	if (m->names != NULL)
+		hull_msg_bytes(&msg, m->names, m->names_length);
+	hull_msg_raw(&msg, ")");
+	forget_secrets(m);
+	forget_ssh(m);
+	pthread_mutex_lock(&m->send_lock);
+	if (m->connected && hull_wire_send(m->wire.fd, &msg) != 0)
+		m->connected = 0;
+	pthread_mutex_unlock(&m->send_lock);
+	if (msg.data != NULL)
+		explicit_bzero(msg.data, msg.cap);
+	hull_msg_free(&msg);
+	if (!expect(m, "ready"))
+		return 0;
+	if (getrandom(m->token, sizeof m->token, 0) != (ssize_t)sizeof m->token) {
+		snprintf(m->detail, sizeof m->detail, "no randomness for the token");
+		return 0;
+	}
+	hull_msg_raw(&msg, "(5:start(2:ch1:0)(5:token");
+	hull_msg_atom(&msg, m->token, sizeof m->token);
+	hull_msg_raw(&msg, "))");
+	send_msg(m, &msg);
+	if (!expect(m, "started"))
+		return 0;
+	m->ready = 1;
+	return 1;
+}
+
+/* Without a forwarder a port's connections wait in its backlog,
+ * unanswered; the machine runs. */
+static void start_forwarder(hull_machine *m)
+{
+	if (m->port_count > 0u && m->wake >= 0 &&
+	    pthread_create(&m->forwarder, NULL, forward_ports, m) == 0)
+		m->forwarding = 1;
+	else if (m->port_count > 0u)
+		host->log(m->core, 3, "the machine's ports cannot be forwarded");
+}
+
+/* A virtualbox machine (project.md section 12): VirtualBox refuses to run
+ * beside KVM and needs a kernel module, so it runs inside a qemu vm, and
+ * `hull virtualbox host` makes all that: this machine's tree as a disk,
+ * the outer vm on a core of its own, and VBoxHeadless in it. Its stdin and
+ * stdout are the agent's wire, relayed from the guest's UART. Most of a
+ * minute passes before that answers, and the core's loop must not wait
+ * for it, so the reader takes the wire up: the machine is running from
+ * here, and an exec before the agent is up is refused. */
+static hull_status hosted_start(hull_core *core, hull_machine *m, hull_error *error)
+{
+	struct utsname name;
+	char        agent[4200];
+	char        self[4200];
+	char        work[4096];
+	char        memory[32];
+	char        cpus[32];
+	const char *reason;
+	const char *machine;
+	int         pair[2];
+	char       *slash;
+
+	if (!agent_path(agent, sizeof agent, 0) || (slash = strrchr(agent, '/')) == NULL)
+		return fail(error, HULL_ERR_RUNTIME, "hull's agent cannot be found");
+	snprintf(self, sizeof self, "%.*s/hull", (int)(slash - agent), agent);
+	/* What can be said now rather than a minute into a start. */
+	if (access("/dev/kvm", R_OK | W_OK) != 0)
+		return fail(error, HULL_ERR_RUNTIME, "VirtualBox runs inside a vm here, and /dev/kvm is "
+		            "not open to this user");
+	if (uname(&name) != 0)
+		return fail(error, HULL_ERR_RUNTIME, "the host's kernel release cannot be read");
+	snprintf(work, sizeof work, "/lib/modules/%s/misc/vboxdrv.ko", name.release);
+	if (access(work, R_OK) != 0)
+		return fail(error, HULL_ERR_RUNTIME, "the outer vm loads the host's vboxdrv.ko, and "
+		            "there is none for this kernel: VirtualBox " HULL_VBOX_VERSION " installed "
+		            "on the host builds it");
+	if (hull_vbox_dir(work, sizeof work) != 0)
+		return fail(error, HULL_ERR_RUNTIME, "the user's cache directory cannot be found");
+	{
+		char headless[4300];
+
+		snprintf(headless, sizeof headless, "%s/%s", work, HULL_VBOX_HEADLESS);
+		if (access(headless, X_OK) != 0)
+			return fail(error, HULL_ERR_RUNTIME, "no VirtualBox has been fetched: `hull "
+			            "virtualbox fetch` downloads it, once");
+	}
+	if ((reason = make_dir(m)) != NULL || (reason = open_listeners(m)) != NULL) {
+		if (reason != m->detail)
+			snprintf(m->detail, sizeof m->detail, "%s", reason);
+		remove_dir(m);
+		return fail(error, HULL_ERR_RUNTIME, m->detail);
+	}
+	machine = strrchr(m->dir, '/') + 1;
+	if (hull_vbox_work(machine, work, sizeof work) != 0 ||
+	    socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) {
+		remove_dir(m);
+		return fail(error, HULL_ERR_RUNTIME, "the machine's work cannot be placed");
+	}
+	snprintf(memory, sizeof memory, "%lu", m->memory_mib);
+	snprintf(cpus, sizeof cpus, "%u", m->cpus);
+	if (m->port_count > 0u)
+		m->wake = eventfd(0u, EFD_CLOEXEC);
+	m->qemu = fork();
+	if (m->qemu == 0) {
+		char log[4300];
+		int  fd;
+
+		prctl(PR_SET_PDEATHSIG, SIGKILL);
+		snprintf(log, sizeof log, "%s/qemu.log", m->dir);
+		fd = open(log, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		dup2(pair[1], 0);
+		dup2(pair[1], 1);
+		if (fd >= 0)
+			dup2(fd, 2);
+		execl(self, "hull", "virtualbox", "host", work, m->root, agent, memory, cpus,
+		      m->no_network ? "none" : "nat", (char *)NULL);
+		_exit(127);
+	}
+	close(pair[1]);
+	if (m->qemu < 0) {
+		close(pair[0]);
+		remove_dir(m);
+		return fail(error, HULL_ERR_RUNTIME, "hull virtualbox host could not be started");
+	}
+	m->hosted_fd = pair[0];
+	if (pthread_create(&m->reader, NULL, read_agent, m) != 0) {
+		close(pair[0]);
+		kill_qemu(m);
+		waitpid(m->qemu, NULL, 0);
+		m->done = 1;
+		remove_dir(m);
+		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+	}
+	m->started = 1;
+	host->on_state(core, m, "running");
+	return HULL_OK;
+}
+
 static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *error)
 {
 	struct utsname name;
@@ -3053,10 +3273,11 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	char           rbuf[256];      /* a path kernel's release */
 	int            load_modules;   /* the host has this release's modules */
 	int            fd = -1;
-	hull_msg       msg = { 0 };
 
 	if (m->started || m->qemu > 0)
 		return fail(error, HULL_ERR_BUSY, "the machine has been started already");
+	if (m->hosted)
+		return hosted_start(core, m, error);
 	if (uname(&name) != 0 || strcmp(name.machine, "x86_64") != 0)
 		return fail(error, HULL_ERR_RUNTIME, "the qemu engine boots on x86_64 hosts only so far");
 	if (!m->emu && access("/dev/kvm", R_OK | W_OK) != 0)
@@ -3265,52 +3486,12 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	if (m->port_count > 0u)
 		m->wake = eventfd(0u, EFD_CLOEXEC);
 
-	hull_msg_raw(&msg, "(5:hello(2:ch1:0)(8:features)(5:proto1:1))");
-	send_msg(m, &msg);
-	if (expect(m, "hello")) {
-		hull_msg_raw(&msg, "(4:spec(2:ch1:0)");
-		hull_msg_bytes(&msg, m->spec, m->spec_length);
-		if (m->secrets.data != NULL)
-			hull_msg_bytes(&msg, m->secrets.data, m->secrets.length);
-		if (m->ssh.data != NULL)
-			hull_msg_bytes(&msg, m->ssh.data, m->ssh.length);
-		if (m->names != NULL)
-			hull_msg_bytes(&msg, m->names, m->names_length);
-		hull_msg_raw(&msg, ")");
-		forget_secrets(m);
-		forget_ssh(m);
-		pthread_mutex_lock(&m->send_lock);
-		if (m->connected && hull_wire_send(m->wire.fd, &msg) != 0)
-			m->connected = 0;
-		pthread_mutex_unlock(&m->send_lock);
-		if (msg.data != NULL)
-			explicit_bzero(msg.data, msg.cap);
-		hull_msg_free(&msg);
-		if (expect(m, "ready")) {
-			if (getrandom(m->token, sizeof m->token, 0) != (ssize_t)sizeof m->token) {
-				snprintf(m->detail, sizeof m->detail, "no randomness for the token");
-				goto refused;
-			}
-			hull_msg_raw(&msg, "(5:start(2:ch1:0)(5:token");
-			hull_msg_atom(&msg, m->token, sizeof m->token);
-			hull_msg_raw(&msg, "))");
-			send_msg(m, &msg);
-			if (expect(m, "started") &&
-			    pthread_create(&m->reader, NULL, read_agent, m) == 0) {
-				m->started = 1;
-				/* Without a forwarder a port's connections wait in
-				 * its backlog, unanswered; the machine runs. */
-				if (m->port_count > 0u && m->wake >= 0 &&
-				    pthread_create(&m->forwarder, NULL, forward_ports, m) == 0)
-					m->forwarding = 1;
-				else if (m->port_count > 0u)
-					host->log(core, 3, "the machine's ports cannot be forwarded");
-				host->on_state(core, m, "running");
-				return HULL_OK;
-			}
-		}
+	if (handshake(m) && pthread_create(&m->reader, NULL, read_agent, m) == 0) {
+		m->started = 1;
+		start_forwarder(m);
+		host->on_state(core, m, "running");
+		return HULL_OK;
 	}
-refused:
 	kill_qemu(m);
 	waitpid(m->qemu, NULL, 0);
 	m->done = 1;
@@ -3564,6 +3745,12 @@ static hull_status qemu_stop(hull_core *core, hull_machine *m, int timeout_ms, h
 	if (!m->started || wait_done(m, 0))
 		return HULL_OK;
 	host->on_state(core, m, "stopping");
+	/* Still booting, a virtualbox machine has no agent to tell. */
+	if (m->hosted && !m->ready) {
+		kill_qemu(m);
+		wait_done(m, 60000);
+		return HULL_OK;
+	}
 	hull_msg_raw(&msg, "(4:stop(2:ch1:0)(10:timeout_ms");
 	hull_msg_number(&msg, timeout_ms);
 	hull_msg_raw(&msg, "))");
@@ -3807,6 +3994,8 @@ static hull_status qemu_exec(hull_core *core, hull_machine *m, hull_buf spec, hu
 
 	if (!m->started || wait_done(m, 0))
 		return fail(error, HULL_ERR_GONE, "the machine is not running");
+	if (m->hosted && !m->ready)
+		return fail(error, HULL_ERR_BUSY, "the machine is still booting");
 	/* The command's words, or (tree true), each passed on as it is. */
 	if (hull_sexpr_open(&doc, spec.data, spec.len, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
 	    !hull_sexpr_first(&doc, &message) ||
@@ -4571,4 +4760,90 @@ const hull_engine *hull_engine_qemu(const hull_host_ops *host_ops)
 {
 	host = host_ops;
 	return &engine;
+}
+
+/* --- the virtualbox engine ------------------------------------------------ */
+
+/* Its machine is this file's in all but what runs it: the same agent, the
+ * same wire and the same streams, so these are qemu's operations, without
+ * what a UART and a machine inside another cannot do. Its column is its
+ * own, each thing it does not list refused (section 6). */
+static const hull_cap_entry vbox_entries[] = {
+	{ "source.dir.overlay", HULL_SUP_EMULATED,
+	  "the tree copied into the machine's disk as it starts; writes are the disk's and go "
+	  "with it", NULL },
+	{ "projection.block",   HULL_SUP_NATIVE,
+	  "`hull export`'s disk in its hosted form, VirtualBox's SATA disk", NULL },
+	{ "writeback.none",     HULL_SUP_NATIVE, NULL, NULL },
+	{ "command",            HULL_SUP_NATIVE, NULL, NULL },
+	{ "workdir",            HULL_SUP_NATIVE, NULL, NULL },
+	{ "env",                HULL_SUP_NATIVE, NULL, NULL },
+	{ "hostname",           HULL_SUP_NATIVE, NULL, NULL },
+	{ "secrets",            HULL_SUP_NATIVE,
+	  "placed by the agent on a tmpfs under one at the machine's /run, which it must "
+	  "have", NULL },
+	{ "cpus",               HULL_SUP_NATIVE, NULL, NULL },
+	{ "memory",             HULL_SUP_NATIVE,
+	  "a hard allocation, in an outer vm given 1.5 GiB more", NULL },
+	{ "ports",              HULL_SUP_EMULATED,
+	  "tcp and udp, forwarded over the UART from the machine's address, at its speed", NULL },
+	{ "network.nat",        HULL_SUP_NATIVE,
+	  "VirtualBox's NAT, out through the outer vm's passt", NULL },
+	{ "network.none",       HULL_SUP_NATIVE, "no NIC: lo alone in the guest", NULL },
+	{ "security.readonly_root", HULL_SUP_NATIVE, NULL, NULL },
+	{ "security.no_new_privs",  HULL_SUP_NATIVE, "set by the agent on the workload", NULL },
+	{ "on_disconnect.stop", HULL_SUP_NATIVE, NULL, NULL },
+	{ "on_disconnect.keep", HULL_SUP_REJECTED,
+	  "a UART never says its host has gone", NULL },
+	{ "vm.profile.full",    HULL_SUP_NATIVE,
+	  "VirtualBox's own PC, booted by its EFI through Limine, in tens of seconds", NULL },
+	{ "vm.profile.micro",   HULL_SUP_EMULATED,
+	  "a full PC, VirtualBox having no other, in tens of seconds", NULL },
+	{ "vm.kernel.bundled",  HULL_SUP_EMULATED,
+	  "the host's own kernel and modules, on the disk as `hull export` puts them", NULL },
+	{ "vm.cpu_profile.host", HULL_SUP_NATIVE, NULL, NULL },
+	{ "virtualbox.gui.false", HULL_SUP_NATIVE, "VBoxHeadless", NULL },
+	{ NULL,                 HULL_SUP_NATIVE, NULL, NULL },
+};
+
+static const char *const vbox_classes[] = { "vm", NULL };
+
+static const hull_capabilities vbox_caps = {
+	.struct_size    = sizeof (hull_capabilities),
+	.engine_name    = "virtualbox",
+	.engine_version = "0",
+	.classes        = vbox_classes,
+	.entries        = vbox_entries,
+	.migration      = HULL_MIG_PINNED,
+};
+
+static const hull_engine_ops vbox_ops = {
+	.struct_size  = sizeof (hull_engine_ops),
+	.create       = qemu_create,
+	.start        = qemu_start,
+	.stop         = qemu_stop,
+	.destroy      = qemu_destroy,
+	.exec         = qemu_exec,
+	.stream_write = qemu_stream_write,
+	.stream_eof   = qemu_stream_eof,
+	.stream_close = qemu_stream_close,
+	.resize       = qemu_resize,
+	.signal       = qemu_signal,
+	.stats        = qemu_stats,
+	.guest_stats  = qemu_guest_stats,
+	.dial         = qemu_dial,
+};
+
+static const hull_engine vbox_engine = {
+	.struct_size = sizeof (hull_engine),
+	.abi_major   = HULL_ABI_MAJOR,
+	.abi_minor   = HULL_ABI_MINOR,
+	.caps        = &vbox_caps,
+	.ops         = &vbox_ops,
+};
+
+const hull_engine *hull_engine_virtualbox(const hull_host_ops *host_ops)
+{
+	host = host_ops;
+	return &vbox_engine;
 }

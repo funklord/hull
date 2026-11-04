@@ -4516,6 +4516,7 @@ int hull_core_run(const char *host_arch)
 	hull_registry_init(&registry, host_arch);
 	if (hull_registry_add(&registry, hull_engine_docker(&host_ops), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_qemu(&host_ops), &reason) != HULL_REGISTRY_OK ||
+	    hull_registry_add(&registry, hull_engine_virtualbox(&host_ops), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_chroot(&host_ops), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_dosbox(&host_ops), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_dosemu(&host_ops), &reason) != HULL_REGISTRY_OK ||

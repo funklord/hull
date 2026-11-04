@@ -620,7 +620,7 @@ static int export_image(hull_store *store, const char *name, const char *image,
 		snprintf(boot, sizeof boot, "root %s\ninit %s\n", part_name, init);
 		snprintf(cmdline, sizeof cmdline, "console=tty0 console=ttyS0");
 	} else {
-		snprintf(cmdline, sizeof cmdline, "console=tty0 console=ttyS1 hull.host=%s hull.root=%s",
+		snprintf(cmdline, sizeof cmdline, "console=tty0 console=ttyS1 hull.passt=1 hull.host=%s hull.root=%s",
 		         host, part_name);
 	}
 	if (hull_qemu_boot_files(work, host == NULL ? boot : NULL, kernel, sizeof kernel, why,

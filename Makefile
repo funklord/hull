@@ -104,7 +104,7 @@ ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/tree.o $(BUILD_DIR)/engine/hostnet.o \
               $(BUILD_DIR)/engine/hostdev.o $(BUILD_DIR)/engine/rootmode.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o $(BUILD_DIR)/cli/runtime.o $(BUILD_DIR)/cli/doctor.o \
-              $(BUILD_DIR)/cli/import.o $(BUILD_DIR)/cli/export.o $(BUILD_DIR)/cli/kernel_fetch.o $(BUILD_DIR)/cli/vbox_fetch.o \
+              $(BUILD_DIR)/cli/import.o $(BUILD_DIR)/cli/export.o $(BUILD_DIR)/cli/kernel_fetch.o $(BUILD_DIR)/cli/vbox_fetch.o $(BUILD_DIR)/cli/vbox_host.o \
               $(BUILD_DIR)/cli/sshd_fetch.o
 # Section 3's optional store, which only the commands that name it use.
 STORE_OBJS  = $(BUILD_DIR)/store/store.o $(BUILD_DIR)/store/unpack.o $(BUILD_DIR)/store/pack.o
@@ -335,6 +335,7 @@ help:
 	@echo '  check     style, the situ contracts, then the tests'
 	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
 	@echo '  check-qemu    hull run on the qemu engine, as the user, with KVM'
+	@echo '  check-virtualbox  hull run on VirtualBox, inside a vm, as the user'
 	@echo '  check-root    root mode'"'"'s native grants, hull-root setuid, inside a vm'
 	@echo '  check-sanitize  the unit tests, store and pull under ASan and UBSan'
 	@echo '  check-fuzz    libFuzzer over the JSON and layer readers, FUZZ_TIME s each'
@@ -682,6 +683,9 @@ check-docker: $(HULL) $(PROBE) $(BUILD_DIR)/test/tree_tar $(ROOT_BIN)
 check-flip: $(HULL) $(AGENT_BIN) $(PROBE) $(BUILD_DIR)/test/tree_tar
 	BUILD_DIR='$(BUILD_DIR)' sh test/flip_test.sh '$(HULL)' '$(PROBE)' \
 		'$(BUILD_DIR)/test/tree_tar'
+
+check-virtualbox: $(HULL) $(AGENT_BIN) $(PROBE)
+	BUILD_DIR='$(BUILD_DIR)' sh test/virtualbox_test.sh '$(HULL)' '$(PROBE)'
 
 check-qemu: $(HULL) $(AGENT_BIN) $(PROBE) $(AGENT_ARM64) $(ARM64_PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/qemu_test.sh '$(HULL)' '$(PROBE)'

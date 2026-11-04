@@ -188,7 +188,8 @@ reason, and where one exists, the `--accept` token that takes it anyway).
 | `dosbox` | dos | full PC emulation | DOS | dosbox | written |
 | `dosemu` | dos | DOS on the host's CPU | FreeDOS (fdpp) | dosemu2 | written |
 | crun | ns | namespaces | the host's | user namespaces | designed |
-| virtualbox, vmware | vm | hardware virtualization | its own | the hypervisor | designed |
+| `virtualbox` | vm | hardware virtualization, inside a qemu vm | its own | VirtualBox's `vboxdrv`, `/dev/kvm`, `hull virtualbox fetch` | written |
+| vmware | vm | hardware virtualization | its own | the hypervisor | designed |
 | hyperv | vm | hardware virtualization | its own | Windows | reserved |
 | `hw` | hw | a real machine | its own | a board and its leases | designed |
 
@@ -415,6 +416,25 @@ machine on docker with the same machine on chroot or vm.
 - An exposed secret shows in `docker inspect`, as all container
   environment does.
 
+## virtualbox — VirtualBox's PC, as the user
+
+VirtualBox on a host needs root for its module and will not run beside
+KVM, so hull runs it inside a vm of its own. The same file flips onto it
+by one line:
+
+    hull virtualbox fetch        # once: the pinned package, into the cache
+    hull run --backend virtualbox
+
+| | |
+|---|---|
+| Root | the tree copied to a disk as it starts; writes go with the machine |
+| Agent | over the guest's UART, relayed out of the outer vm: no port on the host |
+| Ports | on the machine's address, as on qemu, at the UART's speed |
+| Network | VirtualBox's NAT, or `(network none)` |
+| Start | about a minute, nested; `hull exec` says *still booting* until then |
+| Host needs | VirtualBox of the pinned version installed, for `vboxdrv.ko`, and `/dev/kvm` |
+| Refused | `(mutable direct)`, volumes, `(on_disconnect keep)`, `hull pause` |
+
 ## dosbox and dosemu — a DOS PC, for software written for one
 
 The dos class has two engines, run as the user with no window, and the
@@ -470,9 +490,8 @@ from a directory and scripted like any other machine.
 - **A micro vm profile with its own kernel**: a minimal guest kernel
   bundled with hull, booting in a few hundred milliseconds and making a
   machine independent of the host's kernel version.
-- **virtualbox, vmware**: full-profile vm engines for hosts where those
-  hypervisors are what is there, through a block image built from the
-  tree.
+- **vmware**: a full-profile vm engine for hosts where that hypervisor is
+  what is there, through a block image built from the tree.
 - **hyperv**: the Windows-host slot, reserved so that Windows support
   arrives as an engine.
 - **hw**: real machines, a board on a lab bench reached through leases
@@ -568,6 +587,7 @@ make         # build/hull and its agent; fetches vendor/situ the first time
 fmake        # ./hull, ./hull-agent and ./libnss_hull.so, as fmake.toml describes
 make check   # the style gate, the situ contracts, then the tests
 make check-qemu    # the vm and emu engines, booting real guests
+make check-virtualbox  # a machine under VirtualBox, inside a vm
 make check-flip    # one project, unchanged, on chroot, vm, emu and docker
 make check-docker  # the docker adapter, against the daemon
 make hooks   # install the commit-msg hook

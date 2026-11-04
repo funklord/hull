@@ -59,6 +59,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/un.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2606,6 +2607,60 @@ static void boot_standalone(FILE *boot)
 		pause();
 }
 
+/* `hull-agent relay PATH`, in a virtualbox machine's outer vm: the unix
+ * socket VBoxHeadless serves the guest's UART on joined to stdin and
+ * stdout, which a `hull exec` carries to the core (project.md section
+ * 12). The socket comes once VirtualBox is up, so it is waited for; both
+ * ways end with either side. */
+static int relay(const char *path)
+{
+	struct sockaddr_un address;
+	struct pollfd      fds[2];
+	char               buffer[16384];
+	int                fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+	signal(SIGPIPE, SIG_IGN);
+	memset(&address, 0, sizeof address);
+	address.sun_family = AF_UNIX;
+	if (fd < 0 || strlen(path) >= sizeof address.sun_path)
+		return 1;
+	memcpy(address.sun_path, path, strlen(path));
+	for (int tries = 0; connect(fd, (struct sockaddr *)&address, sizeof address) != 0; tries++) {
+		struct timespec pause = { 0, 100000000L };
+
+		if (tries == 3000)
+			return 1;
+		nanosleep(&pause, NULL);
+	}
+	fds[0].fd     = 0;
+	fds[1].fd     = fd;
+	fds[0].events = fds[1].events = POLLIN;
+	for (;;) {
+		if (poll(fds, 2u, -1) < 0) {
+			if (errno == EINTR)
+				continue;
+			return 1;
+		}
+		for (unsigned i = 0u; i < 2u; i++) {
+			int     to = i == 0u ? fd : 1;
+			ssize_t got;
+
+			if (fds[i].revents == 0)
+				continue;
+			got = read(fds[i].fd, buffer, sizeof buffer);
+			if (got <= 0)
+				return 0;
+			for (ssize_t done = 0; done < got;) {
+				ssize_t put = write(to, buffer + done, (size_t)(got - done));
+
+				if (put <= 0)
+					return 0;
+				done += put;
+			}
+		}
+	}
+}
+
 int main(int argc, char **argv)
 {
 	sigset_t       mask;
@@ -2619,6 +2674,8 @@ int main(int argc, char **argv)
 		printf("hull agent\ncommit %s\n", HULL_COMMIT);
 		return 0;
 	}
+	if (argc == 3 && strcmp(argv[1], "relay") == 0)
+		return relay(argv[2]);
 	if (getpid() != 1) {
 		fprintf(stderr, "hull agent: runs as a machine's init, PID 1\n");
 		return 2;

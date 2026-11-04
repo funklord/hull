@@ -37,4 +37,15 @@ static inline int hull_vbox_dir(char *out, size_t cap)
 	return 0;
 }
 
+/* A machine's work, its disks and the outer vm's runtime directory, on
+ * disk under the cache as they are the size of its tree: into `out`. */
+static inline int hull_vbox_work(const char *machine, char *out, size_t cap)
+{
+	char dir[3900];
+
+	if (hull_vbox_dir(dir, sizeof dir) != 0)
+		return -1;
+	return snprintf(out, cap, "%s-run/%s", dir, machine) < (int)cap ? 0 : -1;
+}
+
 #endif /* HULL_ENGINE_VBOX_H */

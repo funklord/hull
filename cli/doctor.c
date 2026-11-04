@@ -30,6 +30,7 @@
 #include "doctor.h"
 #include "kernel.h"
 #include "sshd.h"
+#include "vbox.h"
 
 #define TMPFS_MAGIC 0x01021994
 #define RAMFS_MAGIC 0x858458f6
@@ -289,6 +290,34 @@ static void vm_kernel(void)
 	printf("  fix (as the user): hull kernel fetch\n");
 }
 
+/* The virtualbox engine's two needs: the package `hull virtualbox fetch`
+ * puts in the cache, and the host's vboxdrv.ko for this kernel, which the
+ * outer vm loads. Neither matters to a host that runs no such machine. */
+static void virtualbox(void)
+{
+	struct utsname name;
+	char           dir[4096];
+	char           path[4400];
+
+	if (hull_vbox_dir(dir, sizeof dir) != 0)
+		dir[0] = '\0';
+	snprintf(path, sizeof path, "%s/%s", dir, HULL_VBOX_HEADLESS);
+	if (dir[0] == '\0' || access(path, X_OK) != 0) {
+		line("absent", "VirtualBox for (backend virtualbox)", "not fetched");
+		printf("  fix (as the user): hull virtualbox fetch\n");
+		return;
+	}
+	if (uname(&name) != 0)
+		return;
+	snprintf(path, sizeof path, "/lib/modules/%s/misc/vboxdrv.ko", name.release);
+	if (access(path, R_OK) != 0) {
+		line("absent", "VirtualBox for (backend virtualbox)", "no vboxdrv.ko for this kernel");
+		fix("install VirtualBox " HULL_VBOX_VERSION " on the host, which builds it");
+		return;
+	}
+	line("ok", "VirtualBox for (backend virtualbox)", dir);
+}
+
 /* (ssh true)'s sshd for an image with none, which `hull sshd fetch` puts
  * in the cache (section 8.1 item 3). Absent rather than missing: only a
  * machine whose image has no sshd of its own needs it. */
@@ -375,6 +404,7 @@ int hull_doctor(const char *runtime_why)
 	device("/dev/fuse", "FUSE, an image read or changed without a mount (/dev/fuse)", name, NULL);
 	vm_kernel();
 	fetched_sshd();
+	virtualbox();
 	usable = runtime(runtime_why) && usable;
 	tool("passt", "a vm's network");
 	tool("qemu-system-x86_64", "vm and emu machines on x86_64");
