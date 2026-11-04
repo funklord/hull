@@ -59,6 +59,7 @@
 #include "hostnet.h"
 #include "kernel_fetch.h"
 #include "sshd_fetch.h"
+#include "vbox_fetch.h"
 #include "import.h"
 #include "matrix.h"
 #include "names.h"
@@ -124,6 +125,7 @@ static void usage(FILE *out)
 	      "       hull export --bootable DIR|REF IMAGE [--init PATH | --host TTY]\n"
 	      "       hull kernel fetch [--arch ARCH]\n"
 	      "       hull sshd fetch\n"
+	      "       hull virtualbox fetch\n"
 	      "       hull export --bootable -f FILE [NAME] IMAGE\n"
 	      "       hull build [-f FILE] [--check] REF\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
@@ -6176,6 +6178,15 @@ int main(int argc, char **argv)
 
 		if (hull_kernel_fetch_arch(argc == 5 ? argv[4] : "amd64", why, sizeof why) != 0) {
 			fprintf(stderr, "hull: kernel fetch: %s\n", why);
+			return 1;
+		}
+		return 0;
+	}
+	if (strcmp(command, "virtualbox") == 0 && argc == 3 && strcmp(argv[2], "fetch") == 0) {
+		char why[4400] = "";
+
+		if (hull_vbox_fetch(why, sizeof why) != 0) {
+			fprintf(stderr, "hull: virtualbox fetch: %s\n", why);
 			return 1;
 		}
 		return 0;

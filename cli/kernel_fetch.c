@@ -200,12 +200,19 @@ int hull_fetch_deb(const char *path, const char *sha256, const char *deb, const 
 	 * /boot: a test's, one that has nothing, to hold the snapshot to it. */
 	if (pool != NULL && strncmp(pool, "https://", 8u) == 0)
 		bases[0] = pool;
-	/* The pool first, the snapshot where the pool no longer has it. */
-	for (unsigned i = 0u; i < sizeof bases / sizeof bases[0] && got != 200; i++) {
+	/* The pool first, the snapshot where the pool no longer has it; a
+	 * whole https URL, a package from outside Debian, alone. */
+	unsigned tries = sizeof bases / sizeof bases[0];
+
+	if (strncmp(path, "https://", 8u) == 0) {
+		bases[0] = "";
+		tries = 1u;
+	}
+	for (unsigned i = 0u; i < tries && got != 200; i++) {
 		snprintf(url, sizeof url, "%s%s", bases[i], path);
 		if (get_following(url, &d, &got, why, cap) != 0)
 			goto done;
-		if (got != 200 && i == 0u)
+		if (got != 200 && i == 0u && tries > 1u)
 			fprintf(stderr, "hull: %s answered %d: taking it from Debian's snapshot\n", url, got);
 	}
 	if (got != 200) {
