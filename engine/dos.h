@@ -47,6 +47,8 @@ struct hull_machine {
 	char            *media_host[HULL_DOS_MAX_MEDIA];   /* a collection's files/, or an image */
 	char             media_drive[HULL_DOS_MAX_MEDIA];
 	int              media_image[HULL_DOS_MAX_MEDIA];
+	int              media_exact[HULL_DOS_MAX_MEDIA];       /* `hull media import`'s */
+	char            *media_collection[HULL_DOS_MAX_MEDIA];  /* its directory, then */
 	unsigned         media_count;
 	/* A collection with a media.conf, its disc projected (section 3.10):
 	 * its files/, label and audio tracks, the image made from them. */

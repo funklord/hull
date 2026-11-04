@@ -3975,6 +3975,22 @@ for dosengine in dosbox dosemu; do
 	from_root 0 '^on a disc' -f "$root/doscdtype.conf"
 	dosconf doscdquirk "(media (medium (type cdrom) (source \"dir:./doscdq\"))) (command \"TYPE\" \"$cd:\\\\README.TXT\")"
 	from_root 125 'the disc has quirks/, its copy protection' -f "$root/doscdquirk.conf"
+	# A disc imported (section 3.10): the original itself, its descriptors
+	# and directories from quirks/sectors, on what mounts an image.
+	rm -rf "$root/doscdimp"
+	"$hull" media import "$root/doscd.iso" "$root/doscdimp" > /dev/null
+	dosconf doscdimp "(media (medium (type cdrom) (source \"dir:./doscdimp\"))) (command \"TYPE\" \"$cd:\\\\README.TXT\")"
+	if [ "$dosengine" = dosbox ]; then
+		from_root 0 '^on a disc' -f "$root/doscdimp.conf"
+		# And a raw dump's, its audio track a track of the disc.
+		rm -rf "$root/doscdraw"
+		python3 -I "$(dirname "$0")/raw_disc.py" "$root/doscd.iso" "$root/doscd.bin" "$root/doscd.cue"
+		"$hull" media import "$root/doscd.cue" "$root/doscdraw" > /dev/null
+		dosconf doscdraw '(media (medium (type cdrom) (source "dir:./doscdraw"))) (command "AUDINFO")'
+		from_root 0 '^2' -f "$root/doscdraw.conf"
+	else
+		from_root 125 'whose layout dosemu2 cannot' -f "$root/doscdimp.conf"
+	fi
 	dosconf doscdaudio '(media (medium (type cdrom) (source "dir:./doscdx"))) (command "AUDINFO")'
 	dosconf doscdsub "(media (medium (type cdrom) (source \"dir:./doscdx\"))) (command \"TYPE\" \"$cd:\\\\DATA\\\\SUB.TXT\")"
 	if [ "$dosengine" = dosbox ]; then

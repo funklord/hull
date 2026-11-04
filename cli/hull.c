@@ -59,6 +59,7 @@
 #include "hostnet.h"
 #include "kernel_fetch.h"
 #include "sshd_fetch.h"
+#include "media.h"
 #include "vbox_fetch.h"
 #include "vbox_host.h"
 #include "import.h"
@@ -146,7 +147,8 @@ static void usage(FILE *out)
 	      "       hull manifest show REF | hull manifest compile [REF]\n"
 	      "       hull manifest composefs REF FILE\n"
 	      "       hull pull [--arch A] IMAGE [REF] | hull push REF IMAGE\n"
-	      "       hull import DOCKERFILE|COMPOSE-FILE\n"
+	      "       hull import DOCKERFILE|COMPOSE-FILE | hull import IMAGE DIR\n"
+	      "       hull media import IMAGE DIR | verify DIR | export DIR IMAGE\n"
 	      "       hull up [-f COMPOSE-FILE] [--backend B] [NAME]\n"
 	      "       hull core\n"
 	      "       hull engines | hull doctor\n"
@@ -4419,6 +4421,59 @@ static int tree_name(hull_store *store, const char *source, char *name, size_t c
 	return 0;
 }
 
+/* `hull media import IMAGE DIR` (section 3.10), and `hull import IMAGE
+ * DIR`, section 3.11's one algorithm: what it understood and what it did
+ * not, the patch being the measure of that. */
+static int media_import(const char *image, const char *dir)
+{
+	hull_media_report report;
+	char              why[4400] = "";
+
+	if (hull_media_import(image, dir, &report, why, sizeof why) != 0) {
+		fprintf(stderr, "hull: media import: %s\n", why);
+		return 1;
+	}
+	printf("%s: %llu file%s, %llu bytes, %llu of them patch\n", dir, report.files,
+	       report.files == 1u ? "" : "s", report.bytes, report.patch_bytes);
+	return 0;
+}
+
+/* `hull media verify DIR`: reassembled and held to the hash of what was
+ * imported; and `hull media export DIR IMAGE`, the same kept. */
+static int media_verify(const char *dir, const char *image)
+{
+	char why[4400] = "";
+	char temporary[4300];
+	int  fd;
+	int  status;
+
+	if (image != NULL) {
+		fd = open(image, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+	} else {
+		snprintf(temporary, sizeof temporary, "%s/.verify-XXXXXX", dir);
+		fd = mkostemp(temporary, O_CLOEXEC);
+		if (fd >= 0)
+			unlink(temporary);
+	}
+	if (fd < 0) {
+		fprintf(stderr, "hull: media: %s: %s\n", image != NULL ? image : dir, strerror(errno));
+		return 1;
+	}
+	/* A raw dump's own, where it was one; else the disc. */
+	status = hull_media_write_raw(dir, fd, why, sizeof why);
+	if (status == 1)
+		status = hull_media_write(dir, fd, why, sizeof why);
+	if (status != 0 || close(fd) != 0) {
+		close(fd);
+		if (image != NULL)
+			unlink(image);
+		fprintf(stderr, "hull: media: %s\n", why);
+		return 1;
+	}
+	printf("%s\n", image != NULL ? image : "the collection gives its disc, byte for byte");
+	return 0;
+}
+
 /* `hull export --bootable SRC IMAGE [--init PATH]` (section 3.13): the
  * tree SRC is as a disk image that boots by itself, PATH its PID 1,
  * /sbin/init unless said. */
@@ -6250,6 +6305,13 @@ int main(int argc, char **argv)
 	if (strcmp(command, "manifest") == 0 && (argc == 3 || argc == 4) &&
 	    strcmp(argv[2], "compile") == 0)
 		return compile_manifest(argc == 4 ? argv[3] : NULL);
+	if (strcmp(command, "media") == 0 && argc == 4 && strcmp(argv[2], "verify") == 0)
+		return media_verify(argv[3], NULL);
+	if (strcmp(command, "media") == 0 && argc == 5 && strcmp(argv[2], "export") == 0)
+		return media_verify(argv[3], argv[4]);
+	if ((strcmp(command, "media") == 0 && argc == 5 && strcmp(argv[2], "import") == 0) ||
+	    (strcmp(command, "import") == 0 && argc == 4))
+		return media_import(argv[argc - 2], argv[argc - 1]);
 	if (strcmp(command, "import") == 0 && argc == 3)
 		return hull_import(argv[2]);
 	if (strcmp(command, "proxy-ssh") == 0 && argc == 3)

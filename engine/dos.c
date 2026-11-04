@@ -38,6 +38,7 @@
 #include "access.h"
 #include "dos.h"
 #include "iso.h"
+#include "media.h"
 #include "usage.h"
 
 #define POLL_NS 100000000L
@@ -79,6 +80,7 @@ static void release(hull_machine *m)
 		free(m->volume_host[i]);
 	for (unsigned i = 0u; i < HULL_DOS_MAX_MEDIA; i++) {
 		free(m->media_host[i]);
+		free(m->media_collection[i]);
 		free(m->media_files[i]);
 		free(m->media_volume[i]);
 		for (unsigned t = 0u; t < HULL_DOS_MAX_TRACKS; t++)
@@ -146,6 +148,21 @@ static char *disc_value(const hull_sexpr_doc *doc, const hull_sexpr_form *record
 	return strdup(text);
 }
 
+/* Whether quirks/ holds sectors/ and nothing else. */
+static int quirks_are_sectors(const char *path)
+{
+	DIR           *quirks = opendir(path);
+	struct dirent *entry;
+	int            only = quirks != NULL;
+
+	while (only && (entry = readdir(quirks)) != NULL)
+		only = strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0 ||
+		       strcmp(entry->d_name, "sectors") == 0;
+	if (quirks != NULL)
+		closedir(quirks);
+	return only;
+}
+
 static const char *read_disc(hull_machine *m, unsigned i, const char *collection)
 {
 	static char     why[300];
@@ -160,8 +177,15 @@ static const char *read_disc(hull_machine *m, unsigned i, const char *collection
 	ssize_t         n;
 	const char     *wrong = NULL;
 
+	/* An imported collection's quirks/sectors are bytes of the disc, which
+	 * an image holds; its other quirks, sectors meant to fail and a
+	 * subchannel, nothing here replays. */
+	m->media_exact[i] = hull_media_exact(collection);
+	if (m->media_exact[i] && !m->engine->images)
+		return "the disc is a collection of `hull media import`'s, whose layout dosemu2 cannot "
+		       "keep, redirecting the disc's files alone: run it on DOSBox";
 	snprintf(path, sizeof path, "%s/quirks", collection);
-	if (stat(path, &st) == 0)
+	if (stat(path, &st) == 0 && !(m->media_exact[i] && quirks_are_sectors(path)))
 		return "the disc has quirks/, its copy protection, which neither DOSBox nor dosemu2 "
 		       "replays, reading no disc raw: a check of it would fail rather than be passed";
 	snprintf(path, sizeof path, "%s/media.conf", collection);
@@ -260,7 +284,9 @@ static const char *read_media(hull_machine *m, const hull_sexpr_doc *doc,
 			m->media_host[i] = real(dir ? files : path);
 			if (dir && path != NULL)
 				wrong = read_disc(m, i, path);
-			if (dir)
+			if (dir && m->media_exact[i])
+				m->media_collection[i] = path;
+			else if (dir)
 				free(path);
 			if (wrong != NULL) {
 				free(source);
@@ -636,9 +662,10 @@ static const char *project_media(hull_machine *m)
 			continue;
 		snprintf(image, sizeof image, "%s/disc%u.iso", m->dir, i + 1u);
 		snprintf(cue, sizeof cue, "%s/disc%u.cue", m->dir, i + 1u);
-		if ((fd = open(image, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0)
+		if ((fd = open(image, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0)
 			return "the disc's image cannot be made in the machine's directory";
-		if (hull_iso_write(m->media_host[i], m->media_volume[i], fd, detail, sizeof detail) != 0 ||
+		if ((m->media_exact[i] ? hull_media_write(m->media_collection[i], fd, detail, sizeof detail) :
+		     hull_iso_write(m->media_host[i], m->media_volume[i], fd, detail, sizeof detail)) != 0 ||
 		    close(fd) != 0) {
 			snprintf(why, sizeof why, "the disc's image cannot be made: %s", detail);
 			return why;

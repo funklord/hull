@@ -1,0 +1,1239 @@
+/*
+ * media.c -- a disc as plain files and back (media.h, project.md section
+ * 3.10). What is read here is somebody else's disc, so every offset in it
+ * is checked against the image, a name becomes a path only if it is a
+ * plain one, and what cannot be trusted is left for the diff to carry:
+ * nothing about the image can make the result inexact, only larger.
+ *
+ * ISO9660's records are read by hand rather than by engine/disc.situ's
+ * views, which hold the shape hull's own images have -- no extended
+ * attributes, no interleave -- where a foreign disc may differ and is
+ * still a disc.
+ */
+
+#define _GNU_SOURCE
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <ftw.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "media.h"
+#include "sha256.h"
+
+#define SECTOR      2048u
+#define MAX_DEPTH   32u
+#define MAX_FILES   200000u
+#define MAX_DIRS    50000u
+#define COPY_BYTES  (1u << 20)
+
+typedef struct placed {
+	uint64_t sector;
+	uint64_t size;
+	char    *path;     /* under files/ */
+} placed;
+
+typedef struct walk {
+	int      image;
+	uint64_t bytes;
+	char     root[4200];      /* DIR/files */
+	placed  *files;
+	size_t   count;
+	size_t   cap;
+	unsigned dirs;
+	uint64_t dir_extents[MAX_DIRS];
+	const char *extra;        /* more of media.conf, a raw dump's */
+} walk;
+
+static int fail(char *detail, size_t cap, const char *what, const char *why)
+{
+	snprintf(detail, cap, "%s%s%s", what, why != NULL ? ": " : "", why != NULL ? why : "");
+	return -1;
+}
+
+static uint32_t le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static int read_all(int fd, void *to, size_t n, uint64_t at)
+{
+	uint8_t *p = to;
+
+	while (n > 0u) {
+		ssize_t got = pread(fd, p, n, (off_t)at);
+
+		if (got <= 0)
+			return -1;
+		p += got;
+		at += (uint64_t)got;
+		n -= (size_t)got;
+	}
+	return 0;
+}
+
+static int write_all(int fd, const void *from, size_t n, uint64_t at)
+{
+	const uint8_t *p = from;
+
+	while (n > 0u) {
+		ssize_t put = pwrite(fd, p, n, (off_t)at);
+
+		if (put <= 0)
+			return -1;
+		p += put;
+		at += (uint64_t)put;
+		n -= (size_t)put;
+	}
+	return 0;
+}
+
+/* A path of plain names under files/, as a collection may hold it: nothing
+ * that leaves the directory, whoever wrote layout.conf. */
+static int plain_path(const char *path)
+{
+	const char *name = path;
+
+	if (path[0] == '\0' || path[0] == '/')
+		return 0;
+	for (;;) {
+		const char *end = strchr(name, '/');
+		size_t      n = end != NULL ? (size_t)(end - name) : strlen(name);
+
+		if (n == 0u || (n == 1u && name[0] == '.') ||
+		    (n == 2u && name[0] == '.' && name[1] == '.'))
+			return 0;
+		if (end == NULL)
+			return 1;
+		name = end + 1;
+	}
+}
+
+/* An identifier off the disc as a file's name: its `;1` and a bare trailing
+ * dot gone, into `out`. 0 where it is not a plain name, whose bytes the
+ * diff then carries. */
+static int disc_name(const uint8_t *id, size_t length, char *out, size_t cap)
+{
+	size_t n = 0u;
+
+	while (n < length && id[n] != ';')
+		n++;
+	if (n > 0u && id[n - 1u] == '.')
+		n--;
+	if (n == 0u || n >= cap)
+		return 0;
+	for (size_t i = 0u; i < n; i++) {
+		char c = (char)id[i];
+
+		if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+		      c == '_' || c == '-' || c == '.' || c == '~' || c == '$' || c == '!'))
+			return 0;
+		out[i] = c;
+	}
+	out[n] = '\0';
+	return strcmp(out, ".") != 0 && strcmp(out, "..") != 0;
+}
+
+/* The file at `sector` of `size` bytes copied out to `path`. */
+static int copy_out(walk *w, uint64_t sector, uint64_t size, const char *path)
+{
+	static uint8_t buffer[COPY_BYTES];
+	int            fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644);
+	uint64_t       done = 0u;
+
+	if (fd < 0)
+		return -1;
+	while (done < size) {
+		size_t n = size - done < sizeof buffer ? (size_t)(size - done) : sizeof buffer;
+
+		if (read_all(w->image, buffer, n, sector * SECTOR + done) != 0 ||
+		    write_all(fd, buffer, n, done) != 0) {
+			close(fd);
+			unlink(path);
+			return -1;
+		}
+		done += n;
+	}
+	return close(fd);
+}
+
+static int place(walk *w, uint64_t sector, uint64_t size, const char *relative)
+{
+	if (w->count == w->cap) {
+		size_t  cap = w->cap != 0u ? w->cap * 2u : 256u;
+		placed *grown = realloc(w->files, cap * sizeof *grown);
+
+		if (grown == NULL)
+			return -1;
+		w->files = grown;
+		w->cap   = cap;
+	}
+	if ((w->files[w->count].path = strdup(relative)) == NULL)
+		return -1;
+	w->files[w->count].sector = sector;
+	w->files[w->count].size   = size;
+	w->count++;
+	return 0;
+}
+
+/* The directory of `size` bytes at `sector`, `relative` its path under
+ * files/ ("" for the root). A record that does not make sense is passed
+ * over and left to the diff. -1 only where this host fails. */
+static int read_directory(walk *w, uint64_t sector, uint64_t size, const char *relative,
+                          unsigned depth)
+{
+	uint8_t *bytes;
+	int      status = 0;
+
+	if (depth > MAX_DEPTH || w->dirs == MAX_DIRS || size == 0u || size > (64u << 20) ||
+	    sector * SECTOR + size > w->bytes)
+		return 0;
+	/* A directory that names one above it would be walked for ever. */
+	for (unsigned i = 0u; i < w->dirs; i++)
+		if (w->dir_extents[i] == sector)
+			return 0;
+	w->dir_extents[w->dirs++] = sector;
+	if ((bytes = malloc((size_t)size)) == NULL)
+		return -1;
+	if (read_all(w->image, bytes, (size_t)size, sector * SECTOR) != 0) {
+		free(bytes);
+		return -1;
+	}
+	for (uint64_t at = 0u; at < size && status == 0;) {
+		const uint8_t *record = bytes + at;
+		size_t         length = record[0];
+		uint64_t       extent;
+		uint64_t       bytes_of;
+		size_t         id_length;
+		unsigned       flags;
+		char           name[256];
+		char           next[4096];
+		char           path[8400];
+
+		/* A record does not cross a sector: zero to the sector's end. */
+		if (length == 0u) {
+			at = (at / SECTOR + 1u) * SECTOR;
+			continue;
+		}
+		if (length < 34u || at + length > size)
+			break;
+		at += length;
+		id_length = record[32];
+		if (33u + id_length > length)
+			continue;
+		extent   = (uint64_t)le32(record + 2) + record[1];
+		bytes_of = le32(record + 10);
+		flags    = record[25];
+		if (id_length == 1u && record[33] <= 1u)
+			continue;   /* . and .. */
+		/* Interleaved or in several extents: not one run of bytes. */
+		if ((flags & 0x80u) != 0u || record[26] != 0u || record[27] != 0u)
+			continue;
+		if (!disc_name(record + 33, id_length, name, sizeof name) ||
+		    (size_t)snprintf(next, sizeof next, "%s%s%s", relative, relative[0] != '\0' ? "/" : "",
+		                     name) >= sizeof next)
+			continue;
+		snprintf(path, sizeof path, "%s/%s", w->root, next);
+		if ((flags & 0x02u) != 0u) {
+			if (mkdir(path, 0755) == 0)
+				status = read_directory(w, extent, bytes_of, next, depth + 1u);
+			continue;
+		}
+		if (w->count >= MAX_FILES || extent * SECTOR + bytes_of > w->bytes)
+			continue;
+		if (copy_out(w, extent, bytes_of, path) == 0)
+			status = place(w, extent, bytes_of, next);
+	}
+	free(bytes);
+	return status;
+}
+
+/* The primary volume descriptor's tree into w->files, its label into
+ * `volume`. An image with none has no files, and that is not a failure. */
+static int read_iso(walk *w, char *volume, size_t cap)
+{
+	uint8_t pvd[SECTOR];
+	size_t  n = 32u;
+
+	if (w->bytes < 17u * SECTOR || read_all(w->image, pvd, sizeof pvd, 16u * SECTOR) != 0 ||
+	    pvd[0] != 1u || memcmp(pvd + 1, "CD001", 5u) != 0)
+		return 0;
+	while (n > 0u && pvd[40u + n - 1u] == ' ')
+		n--;
+	for (size_t i = 0u; i < n && i + 1u < cap; i++) {
+		char c = (char)pvd[40u + i];
+
+		/* media.conf's own punctuation kept out of it: a label of
+		 * `(bytes ` read as that field, which the fuzzer found. What the
+		 * label was is in the patch. */
+		volume[i]     = c >= ' ' && c <= '~' && strchr("\"\\()", c) == NULL ? c : '_';
+		volume[i + 1] = '\0';
+	}
+	return read_directory(w, (uint64_t)le32(pvd + 156 + 2) + pvd[156 + 1], le32(pvd + 156 + 10),
+	                      "", 0u);
+}
+
+/* --- reassembly ----------------------------------------------------------- */
+
+/* media.conf's bytes and sha256, by the text this file wrote and any
+ * readable form as near it as a hand might: (bytes N), (sha256 "H"). */
+static int read_conf(const char *dir, uint64_t *bytes, char sha[65])
+{
+	char    path[4300];
+	static char text[65536];
+	int     fd;
+	ssize_t got;
+	const char *at;
+
+	snprintf(path, sizeof path, "%s/media.conf", dir);
+	if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0)
+		return -1;
+	got = read(fd, text, sizeof text - 1u);
+	close(fd);
+	if (got <= 0)
+		return -1;
+	text[got] = '\0';
+	if ((at = strstr(text, "(bytes ")) == NULL || sscanf(at, "(bytes %" SCNu64 ")", bytes) != 1)
+		return -1;
+	if ((at = strstr(text, "(sha256 \"")) == NULL || sscanf(at, "(sha256 \"%64[0-9a-f]\")", sha) != 1)
+		return -1;
+	return strlen(sha) == 64u ? 0 : -1;
+}
+
+/* layout.conf's files placed on `fd`, already `bytes` long and empty. */
+static int place_files(const char *dir, int fd, uint64_t bytes, char *detail, size_t cap)
+{
+	static uint8_t buffer[COPY_BYTES];
+	char           path[4300];
+	char           line[4400];
+	FILE          *layout;
+	int            status = 0;
+
+	snprintf(path, sizeof path, "%s/layout.conf", dir);
+	if ((layout = fopen(path, "re")) == NULL)
+		return fail(detail, cap, "the collection's layout.conf cannot be read", strerror(errno));
+	while (status == 0 && fgets(line, sizeof line, layout) != NULL) {
+		uint64_t sector;
+		uint64_t size;
+		int      used = 0;
+		size_t   n = strlen(line);
+		char     file[8800];
+		int      in;
+		uint64_t done = 0u;
+		struct stat st;
+
+		if (n > 0u && line[n - 1u] == '\n')
+			line[n - 1u] = '\0';
+		if (sscanf(line, "%" SCNu64 " %" SCNu64 " %n", &sector, &size, &used) != 2 || used == 0 ||
+		    !plain_path(line + used) || sector > bytes / SECTOR ||
+		    sector * SECTOR + size > bytes) {
+			status = fail(detail, cap, "a line of layout.conf is not a file on this disc", line);
+			break;
+		}
+		snprintf(file, sizeof file, "%s/files/%s", dir, line + used);
+		if ((in = open(file, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)) < 0) {
+			status = fail(detail, cap, file, strerror(errno));
+			break;
+		}
+		/* Longer would pass the hash, its tail never read, and an edit
+		 * nothing reassembles should not read as an intact disc. */
+		if (fstat(in, &st) != 0 || (uint64_t)st.st_size != size) {
+			status = fail(detail, cap, "a file is not the size the layout says", file);
+			close(in);
+			break;
+		}
+		while (done < size && status == 0) {
+			size_t n2 = size - done < sizeof buffer ? (size_t)(size - done) : sizeof buffer;
+
+			if (read_all(in, buffer, n2, done) != 0 ||
+			    write_all(fd, buffer, n2, sector * SECTOR + done) != 0)
+				status = fail(detail, cap, "a file is shorter than the layout says", file);
+			done += n2;
+		}
+		close(in);
+	}
+	fclose(layout);
+	return status;
+}
+
+/* quirks/sectors/ laid over what the files gave. */
+static int apply_quirks(const char *dir, int fd, uint64_t bytes, char *detail, size_t cap)
+{
+	static uint8_t buffer[COPY_BYTES];
+	char           path[4300];
+	DIR           *runs;
+	struct dirent *entry;
+	int            status = 0;
+
+	snprintf(path, sizeof path, "%s/quirks/sectors", dir);
+	if ((runs = opendir(path)) == NULL)
+		return errno == ENOENT ? 0 : fail(detail, cap, path, strerror(errno));
+	while (status == 0 && (entry = readdir(runs)) != NULL) {
+		uint64_t sector;
+		int      used = 0;
+		char     file[4700];
+		int      in;
+		uint64_t at;
+		ssize_t  got;
+
+		if (entry->d_name[0] == '.')
+			continue;
+		if (sscanf(entry->d_name, "0x%" SCNx64 ".raw%n", &sector, &used) != 1 ||
+		    entry->d_name[used] != '\0' || sector > bytes / SECTOR) {
+			status = fail(detail, cap, "a file in quirks/sectors is no run of this disc",
+			              entry->d_name);
+			break;
+		}
+		snprintf(file, sizeof file, "%s/%s", path, entry->d_name);
+		if ((in = open(file, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)) < 0) {
+			status = fail(detail, cap, file, strerror(errno));
+			break;
+		}
+		at = sector * SECTOR;
+		while (status == 0 && (got = read(in, buffer, sizeof buffer)) > 0) {
+			if (at + (uint64_t)got > bytes || write_all(fd, buffer, (size_t)got, at) != 0)
+				status = fail(detail, cap, "a run in quirks/sectors passes the disc's end",
+				              entry->d_name);
+			at += (uint64_t)got;
+		}
+		close(in);
+	}
+	closedir(runs);
+	return status;
+}
+
+static int hash_fd(int fd, uint64_t bytes, char out[65])
+{
+	static uint8_t buffer[COPY_BYTES];
+	hull_sha256    h;
+	uint8_t        digest[32];
+	uint64_t       done = 0u;
+
+	hull_sha256_init(&h);
+	while (done < bytes) {
+		size_t n = bytes - done < sizeof buffer ? (size_t)(bytes - done) : sizeof buffer;
+
+		if (read_all(fd, buffer, n, done) != 0)
+			return -1;
+		hull_sha256_update(&h, buffer, n);
+		done += n;
+	}
+	hull_sha256_final(&h, digest);
+	hull_sha256_hex(digest, out);
+	return 0;
+}
+
+/* --- a raw dump ------------------------------------------------------------ */
+
+/*
+ * A CD's data sector, Mode 1, is 2352 bytes around its 2048 (ECMA-130):
+ * twelve of sync, a header of its address, the data, an EDC over those,
+ * eight zeros, and the Reed-Solomon P and Q parity of annex A. All of it
+ * but the data follows from the data and the address, so none of it need
+ * be kept where it is what it should be.
+ */
+#define RAW_SECTOR 2352u
+#define RAW_DATA   16u
+#define MSF_LEAD   150u   /* sector 0 is 00:02:00 */
+
+#define MAX_TRACKS 99u
+
+typedef struct raw_track {
+	unsigned number;
+	uint64_t at;      /* in the dump, its INDEX 01 */
+	uint64_t bytes;
+	int      audio;
+} raw_track;
+
+typedef struct raw_disc {
+	uint64_t  bytes;
+	uint64_t  data_sectors;
+	char      sha[65];
+	raw_track tracks[MAX_TRACKS];
+	unsigned  count;
+} raw_disc;
+
+static uint32_t edc_table[256];
+static uint8_t  gf_forward[256];
+static uint8_t  gf_backward[256];
+
+static void tables(void)
+{
+	for (unsigned i = 0u; i < 256u; i++) {
+		uint32_t edc = i;
+		unsigned next = (i << 1) ^ ((i & 0x80u) != 0u ? 0x11Du : 0u);
+
+		for (unsigned bit = 0u; bit < 8u; bit++)
+			edc = (edc >> 1) ^ ((edc & 1u) != 0u ? 0xD8018001u : 0u);
+		edc_table[i]   = edc;
+		gf_forward[i]  = (uint8_t)next;
+		gf_backward[i ^ (next & 0xFFu)] = (uint8_t)i;
+	}
+}
+
+static void ecc_block(const uint8_t *from, unsigned major_count, unsigned minor_count,
+                      unsigned major_mult, unsigned minor_step, uint8_t *to)
+{
+	unsigned size = major_count * minor_count;
+
+	for (unsigned major = 0u; major < major_count; major++) {
+		unsigned index = (major >> 1) * major_mult + (major & 1u);
+		uint8_t  a = 0u;
+		uint8_t  b = 0u;
+
+		for (unsigned minor = 0u; minor < minor_count; minor++) {
+			uint8_t byte = from[index];
+
+			index += minor_step;
+			if (index >= size)
+				index -= size;
+			a = (uint8_t)(a ^ byte);
+			b = (uint8_t)(b ^ byte);
+			a = gf_forward[a];
+		}
+		a = gf_backward[gf_forward[a] ^ b];
+		to[major] = a;
+		to[major + major_count] = (uint8_t)(a ^ b);
+	}
+}
+
+/* The Mode 1 sector `sector` around its 2048 bytes of `data`. */
+static void make_sector(uint8_t *raw, const uint8_t *data, uint64_t sector)
+{
+	uint64_t address = sector + MSF_LEAD;
+	unsigned minute = (unsigned)(address / 4500u);
+	unsigned second = (unsigned)(address / 75u % 60u);
+	unsigned frame  = (unsigned)(address % 75u);
+	uint32_t edc = 0u;
+
+	memset(raw, 0, RAW_SECTOR);
+	memset(raw + 1, 0xFF, 10u);
+	raw[12] = (uint8_t)(minute / 10u << 4 | minute % 10u);
+	raw[13] = (uint8_t)(second / 10u << 4 | second % 10u);
+	raw[14] = (uint8_t)(frame / 10u << 4 | frame % 10u);
+	raw[15] = 1u;
+	memcpy(raw + RAW_DATA, data, SECTOR);
+	for (unsigned i = 0u; i < 2064u; i++)
+		edc = (edc >> 8) ^ edc_table[(edc ^ raw[i]) & 0xFFu];
+	raw[2064] = (uint8_t)edc;
+	raw[2065] = (uint8_t)(edc >> 8);
+	raw[2066] = (uint8_t)(edc >> 16);
+	raw[2067] = (uint8_t)(edc >> 24);
+	ecc_block(raw + 12, 86u, 24u, 2u, 86u, raw + 2076);
+	ecc_block(raw + 12, 52u, 43u, 86u, 88u, raw + 2248);
+}
+
+/* MM:SS:FF as bytes of a raw dump. */
+static int cue_time(const char *text, uint64_t *at)
+{
+	unsigned minute;
+	unsigned second;
+	unsigned frame;
+
+	if (sscanf(text, "%u:%u:%u", &minute, &second, &frame) != 3 || second > 59u || frame > 74u)
+		return -1;
+	*at = ((uint64_t)minute * 4500u + second * 75u + frame) * RAW_SECTOR;
+	return 0;
+}
+
+/* The cue sheet at `path`: its one BINARY file's name into `bin`, and the
+ * tracks. A sheet of another shape says why it is not read in `detail`. */
+static int read_cue(const char *path, char *bin, size_t bin_cap, raw_disc *disc, char *detail,
+                    size_t cap)
+{
+	char     line[1024];
+	FILE    *cue = fopen(path, "re");
+	unsigned files = 0u;
+
+	if (cue == NULL)
+		return fail(detail, cap, path, strerror(errno));
+	bin[0] = '\0';
+	while (fgets(line, sizeof line, cue) != NULL) {
+		char     mode[32];
+		char     when[32];
+		char     name[512];
+		unsigned number;
+		unsigned index;
+
+		if (sscanf(line, " FILE \"%511[^\"]\"", name) == 1) {
+			if (files++ != 0u || strchr(name, '/') != NULL) {
+				fclose(cue);
+				return fail(detail, cap, "a sheet of several files, or one in another "
+				            "directory, is not read yet", name);
+			}
+			snprintf(bin, bin_cap, "%s", name);
+		} else if (sscanf(line, " TRACK %u %31s", &number, mode) == 2) {
+			if (disc->count == MAX_TRACKS || (disc->count == 0u && strcmp(mode, "MODE1/2352") != 0) ||
+			    (disc->count != 0u && strcmp(mode, "AUDIO") != 0)) {
+				fclose(cue);
+				return fail(detail, cap, "only a Mode 1 data track and audio after it are read "
+				            "yet, and this track is", mode);
+			}
+			disc->tracks[disc->count].number = number;
+			disc->tracks[disc->count].audio = strcmp(mode, "AUDIO") == 0;
+			disc->count++;
+		} else if (sscanf(line, " INDEX %u %31s", &index, when) == 2 && index == 1u &&
+		           disc->count != 0u) {
+			if (cue_time(when, &disc->tracks[disc->count - 1u].at) != 0) {
+				fclose(cue);
+				return fail(detail, cap, "a time in the sheet cannot be read", when);
+			}
+		}
+	}
+	fclose(cue);
+	if (bin[0] == '\0' || disc->count == 0u)
+		return fail(detail, cap, "the sheet names no binary file or no track", NULL);
+	return 0;
+}
+
+/* Bytes of the dump to `out`, as a RIFF WAVE of CD audio. */
+static int write_wav(int dump, uint64_t at, uint64_t bytes, const char *path)
+{
+	static uint8_t buffer[COPY_BYTES];
+	uint8_t        head[44];
+	int            fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+	uint32_t       data = (uint32_t)bytes;
+	uint32_t       riff = data + 36u;
+	static const uint8_t format[] = { 16, 0, 0, 0, 1, 0, 2, 0, 0x44, 0xAC, 0, 0, 0x10, 0xB1, 2, 0,
+	                                  4, 0, 16, 0 };
+	uint64_t       done = 0u;
+
+	if (fd < 0)
+		return -1;
+	memcpy(head, "RIFF", 4u);
+	for (unsigned i = 0u; i < 4u; i++) {
+		head[4u + i]  = (uint8_t)(riff >> (8u * i));
+		head[40u + i] = (uint8_t)(data >> (8u * i));
+	}
+	memcpy(head + 8, "WAVEfmt ", 8u);
+	memcpy(head + 16, format, sizeof format);
+	memcpy(head + 36, "data", 4u);
+	if (write_all(fd, head, sizeof head, 0u) != 0) {
+		close(fd);
+		return -1;
+	}
+	while (done < bytes) {
+		size_t n = bytes - done < sizeof buffer ? (size_t)(bytes - done) : sizeof buffer;
+
+		if (read_all(dump, buffer, n, at + done) != 0 ||
+		    write_all(fd, buffer, n, sizeof head + done) != 0) {
+			close(fd);
+			return -1;
+		}
+		done += n;
+	}
+	return close(fd);
+}
+
+/* media.conf's raw dump, what hull_media_write_raw and verify read. 0, or
+ * 1 where the collection has none. */
+static int read_raw(const char *dir, raw_disc *disc)
+{
+	static char text[65536];
+	char        path[4300];
+	int         fd;
+	ssize_t     got;
+	const char *at;
+
+	snprintf(path, sizeof path, "%s/media.conf", dir);
+	if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0)
+		return -1;
+	got = read(fd, text, sizeof text - 1u);
+	close(fd);
+	if (got <= 0)
+		return -1;
+	text[got] = '\0';
+	memset(disc, 0, sizeof *disc);
+	if ((at = strstr(text, "(raw (bytes ")) == NULL)
+		return 1;
+	if (sscanf(at, "(raw (bytes %" SCNu64 ") (sha256 \"%64[0-9a-f]\") (sectors %" SCNu64 "))",
+	           &disc->bytes, disc->sha, &disc->data_sectors) != 3)
+		return -1;
+	for (at = strstr(text, "(track "); at != NULL; at = strstr(at + 1, "(track ")) {
+		raw_track *t = &disc->tracks[disc->count];
+		char       file[64];
+
+		if (disc->count == MAX_TRACKS ||
+		    sscanf(at, "(track (number %u) (audio \"%63[^\"]\") (at %" SCNu64 ") (bytes %" SCNu64 "))",
+		           &t->number, file, &t->at, &t->bytes) != 4)
+			return -1;
+		t->audio = 1;
+		disc->count++;
+	}
+	return 0;
+}
+
+/* The dump as data and audio alone give it, on `fd`, `disc->bytes` long
+ * and empty: every data sector made from the disc reassembled in `cooked`,
+ * and each track's samples from tracks/. */
+static int project_raw(const char *dir, const raw_disc *disc, int cooked, int fd, char *detail,
+                       size_t cap)
+{
+	static uint8_t buffer[COPY_BYTES];
+	uint8_t        data[SECTOR];
+	uint8_t        raw[RAW_SECTOR];
+
+	tables();
+	for (uint64_t s = 0u; s < disc->data_sectors; s++) {
+		if (read_all(cooked, data, SECTOR, s * SECTOR) != 0)
+			return fail(detail, cap, "the data track cannot be read back", NULL);
+		make_sector(raw, data, s);
+		if (write_all(fd, raw, RAW_SECTOR, s * RAW_SECTOR) != 0)
+			return fail(detail, cap, "the dump cannot be written", strerror(errno));
+	}
+	for (unsigned i = 0u; i < disc->count; i++) {
+		char     path[4400];
+		int      in;
+		uint64_t done = 0u;
+
+		if (!disc->tracks[i].audio)
+			continue;
+		snprintf(path, sizeof path, "%s/tracks/%02u.wav", dir, disc->tracks[i].number);
+		if ((in = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)) < 0)
+			return fail(detail, cap, path, strerror(errno));
+		while (done < disc->tracks[i].bytes) {
+			uint64_t left = disc->tracks[i].bytes - done;
+			size_t   n = left < sizeof buffer ? (size_t)left : sizeof buffer;
+
+			if (disc->tracks[i].at + done + n > disc->bytes ||
+			    read_all(in, buffer, n, 44u + done) != 0 ||
+			    write_all(fd, buffer, n, disc->tracks[i].at + done) != 0) {
+				close(in);
+				return fail(detail, cap, "an audio track is not the size media.conf says", path);
+			}
+			done += n;
+		}
+		close(in);
+	}
+	return 0;
+}
+
+/* quirks/raw/ over the projected dump. */
+static int apply_raw_quirks(const char *dir, int fd, uint64_t bytes, char *detail, size_t cap)
+{
+	static uint8_t buffer[COPY_BYTES];
+	char           path[4300];
+	DIR           *runs;
+	struct dirent *entry;
+	int            status = 0;
+
+	snprintf(path, sizeof path, "%s/quirks/raw", dir);
+	if ((runs = opendir(path)) == NULL)
+		return errno == ENOENT ? 0 : fail(detail, cap, path, strerror(errno));
+	while (status == 0 && (entry = readdir(runs)) != NULL) {
+		uint64_t sector;
+		int      used = 0;
+		char     file[4700];
+		int      in;
+		uint64_t at;
+		ssize_t  got;
+
+		if (entry->d_name[0] == '.')
+			continue;
+		if (sscanf(entry->d_name, "0x%" SCNx64 ".raw%n", &sector, &used) != 1 ||
+		    entry->d_name[used] != '\0' || sector > bytes / RAW_SECTOR) {
+			status = fail(detail, cap, "a file in quirks/raw is no run of this dump",
+			              entry->d_name);
+			break;
+		}
+		snprintf(file, sizeof file, "%s/%s", path, entry->d_name);
+		if ((in = open(file, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)) < 0) {
+			status = fail(detail, cap, file, strerror(errno));
+			break;
+		}
+		at = sector * RAW_SECTOR;
+		while (status == 0 && (got = read(in, buffer, sizeof buffer)) > 0) {
+			if (at + (uint64_t)got > bytes || write_all(fd, buffer, (size_t)got, at) != 0)
+				status = fail(detail, cap, "a run in quirks/raw passes the dump's end",
+				              entry->d_name);
+			at += (uint64_t)got;
+		}
+		close(in);
+	}
+	closedir(runs);
+	return status;
+}
+
+int hull_media_write_raw(const char *dir, int fd, char *detail, size_t cap)
+{
+	raw_disc *disc = malloc(sizeof *disc);
+	char      path[4300];
+	char      got[65];
+	int       cooked = -1;
+	int       kind;
+	int       status = -1;
+
+	if (disc == NULL)
+		return fail(detail, cap, "out of memory", NULL);
+	kind = read_raw(dir, disc);
+	if (kind != 0) {
+		free(disc);
+		return kind > 0 ? 1 : fail(detail, cap, "media.conf's (raw ...) cannot be read", NULL);
+	}
+	snprintf(path, sizeof path, "%s/.cooked-XXXXXX", dir);
+	if ((cooked = mkostemp(path, O_CLOEXEC)) < 0) {
+		fail(detail, cap, path, strerror(errno));
+		goto done;
+	}
+	unlink(path);
+	if (hull_media_write(dir, cooked, detail, cap) != 0)
+		goto done;
+	if (ftruncate(fd, (off_t)disc->bytes) != 0) {
+		fail(detail, cap, "the dump cannot be sized", strerror(errno));
+		goto done;
+	}
+	if (project_raw(dir, disc, cooked, fd, detail, cap) != 0 ||
+	    apply_raw_quirks(dir, fd, disc->bytes, detail, cap) != 0)
+		goto done;
+	if (hash_fd(fd, disc->bytes, got) != 0) {
+		fail(detail, cap, "the dump cannot be read back", strerror(errno));
+		goto done;
+	}
+	if (strcmp(got, disc->sha) != 0) {
+		snprintf(detail, cap, "the collection no longer gives its dump: sha256 %s, and %s was "
+		         "imported", got, disc->sha);
+		goto done;
+	}
+	status = 0;
+done:
+	if (cooked >= 0)
+		close(cooked);
+	free(disc);
+	return status;
+}
+
+int hull_media_exact(const char *dir)
+{
+	char path[4300];
+
+	snprintf(path, sizeof path, "%s/layout.conf", dir);
+	return access(path, R_OK) == 0;
+}
+
+int hull_media_write(const char *dir, int fd, char *detail, size_t cap)
+{
+	uint64_t bytes;
+	char     want[65];
+	char     got[65];
+
+	if (read_conf(dir, &bytes, want) != 0)
+		return fail(detail, cap, "the collection's media.conf gives no bytes and sha256", NULL);
+	if (ftruncate(fd, (off_t)bytes) != 0)
+		return fail(detail, cap, "the disc's image cannot be sized", strerror(errno));
+	if (place_files(dir, fd, bytes, detail, cap) != 0 ||
+	    apply_quirks(dir, fd, bytes, detail, cap) != 0)
+		return -1;
+	if (hash_fd(fd, bytes, got) != 0)
+		return fail(detail, cap, "the disc's image cannot be read back", strerror(errno));
+	if (strcmp(want, got) != 0) {
+		snprintf(detail, cap, "the collection no longer gives its disc: sha256 %s, and %s was "
+		         "imported", got, want);
+		return -1;
+	}
+	return 0;
+}
+
+/* --- import --------------------------------------------------------------- */
+
+static int remove_entry(const char *path, const struct stat *file, int kind, struct FTW *where)
+{
+	(void)file;
+	(void)kind;
+	(void)where;
+	remove(path);
+	return 0;
+}
+
+static int by_sector(const void *a, const void *b)
+{
+	const placed *x = a;
+	const placed *y = b;
+
+	return x->sector < y->sector ? -1 : x->sector > y->sector;
+}
+
+/* The bytes of the image that the placed files do not give, each run a
+ * file. `naive` is the image with the files alone. */
+static int write_quirks(const walk *w, int naive, const char *dir, hull_media_report *report,
+                        char *detail, size_t cap)
+{
+	static uint8_t ours[COPY_BYTES];
+	static uint8_t theirs[COPY_BYTES];
+	char           path[4400];
+	int            run = -1;
+	uint64_t       run_at = 0u;
+
+	for (uint64_t at = 0u; at < w->bytes;) {
+		size_t n = w->bytes - at < sizeof ours ? (size_t)(w->bytes - at) : sizeof ours;
+
+		if (read_all(w->image, theirs, n, at) != 0 || read_all(naive, ours, n, at) != 0)
+			return fail(detail, cap, "the image cannot be read", strerror(errno));
+		for (size_t i = 0u; i < n; i += SECTOR) {
+			size_t piece = n - i < SECTOR ? n - i : SECTOR;
+
+			if (memcmp(ours + i, theirs + i, piece) == 0) {
+				if (run >= 0) {
+					close(run);
+					run = -1;
+				}
+				continue;
+			}
+			if (run < 0) {
+				snprintf(path, sizeof path, "%s/quirks/sectors/0x%" PRIX64 ".raw", dir,
+				         (at + i) / SECTOR);
+				run_at = at + i;
+				if ((run = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0)
+					return fail(detail, cap, path, strerror(errno));
+			}
+			if (write_all(run, theirs + i, piece, at + i - run_at) != 0) {
+				close(run);
+				return fail(detail, cap, path, strerror(errno));
+			}
+			report->patch_bytes += piece;
+		}
+		at += n;
+	}
+	if (run >= 0)
+		close(run);
+	return 0;
+}
+
+static int import_into(walk *w, const char *dir, hull_media_report *report, char *detail,
+                       size_t cap)
+{
+	char        volume[33] = "";
+	char        path[4400];
+	char        sha[65];
+	FILE       *file;
+	int         naive = -1;
+	int         status = -1;
+
+	snprintf(path, sizeof path, "%s/quirks", dir);
+	if (mkdir(w->root, 0755) != 0 || mkdir(path, 0755) != 0)
+		return fail(detail, cap, "the collection's directories cannot be made", strerror(errno));
+	snprintf(path, sizeof path, "%s/quirks/sectors", dir);
+	if (mkdir(path, 0755) != 0)
+		return fail(detail, cap, "the collection's directories cannot be made", strerror(errno));
+	if (read_iso(w, volume, sizeof volume) != 0)
+		return fail(detail, cap, "the disc's files cannot be written", strerror(errno));
+	if (hash_fd(w->image, w->bytes, sha) != 0)
+		return fail(detail, cap, "the image cannot be read", strerror(errno));
+	if (w->count != 0u)
+		qsort(w->files, w->count, sizeof w->files[0], by_sector);
+
+	snprintf(path, sizeof path, "%s/media.conf", dir);
+	if ((file = fopen(path, "we")) == NULL)
+		return fail(detail, cap, path, strerror(errno));
+	fprintf(file, "(disc (volume \"%s\") (bytes %" PRIu64 ") (sha256 \"%s\")%s)\n", volume,
+	        w->bytes, sha, w->extra != NULL ? w->extra : "");
+	if (fclose(file) != 0)
+		return fail(detail, cap, path, strerror(errno));
+	snprintf(path, sizeof path, "%s/layout.conf", dir);
+	if ((file = fopen(path, "we")) == NULL)
+		return fail(detail, cap, path, strerror(errno));
+	for (size_t i = 0u; i < w->count; i++)
+		fprintf(file, "%" PRIu64 " %" PRIu64 " %s\n", w->files[i].sector, w->files[i].size,
+		        w->files[i].path);
+	if (fclose(file) != 0)
+		return fail(detail, cap, path, strerror(errno));
+
+	/* Project, diff, and reassemble: the last is the proof, by the same
+	 * function a machine's disc is made with. */
+	snprintf(path, sizeof path, "%s/.projected", dir);
+	if ((naive = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0)
+		return fail(detail, cap, path, strerror(errno));
+	unlink(path);
+	if (ftruncate(naive, (off_t)w->bytes) != 0 ||
+	    place_files(dir, naive, w->bytes, detail, cap) != 0 ||
+	    write_quirks(w, naive, dir, report, detail, cap) != 0)
+		goto done;
+	close(naive);
+	snprintf(path, sizeof path, "%s/.projected", dir);
+	if ((naive = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0) {
+		fail(detail, cap, path, strerror(errno));
+		goto done;
+	}
+	unlink(path);
+	if (hull_media_write(dir, naive, detail, cap) != 0)
+		goto done;
+	report->files = w->count;
+	report->bytes = w->bytes;
+	status = 0;
+done:
+	if (naive >= 0)
+		close(naive);
+	return status;
+}
+
+/* The raw dump's bytes that its projection does not give, each run a file
+ * of quirks/raw. As write_quirks, a raw sector at a time. */
+static int write_raw_quirks(int dump, int naive, uint64_t bytes, const char *dir,
+                            hull_media_report *report, char *detail, size_t cap)
+{
+	uint8_t  ours[RAW_SECTOR];
+	uint8_t  theirs[RAW_SECTOR];
+	char     path[4400];
+	int      run = -1;
+	uint64_t run_at = 0u;
+
+	for (uint64_t at = 0u; at < bytes; at += RAW_SECTOR) {
+		size_t n = bytes - at < RAW_SECTOR ? (size_t)(bytes - at) : RAW_SECTOR;
+
+		if (read_all(dump, theirs, n, at) != 0 || read_all(naive, ours, n, at) != 0)
+			return fail(detail, cap, "the dump cannot be read", strerror(errno));
+		if (memcmp(ours, theirs, n) == 0) {
+			if (run >= 0) {
+				close(run);
+				run = -1;
+			}
+			continue;
+		}
+		if (run < 0) {
+			snprintf(path, sizeof path, "%s/quirks/raw/0x%" PRIX64 ".raw", dir, at / RAW_SECTOR);
+			run_at = at;
+			if ((run = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0)
+				return fail(detail, cap, path, strerror(errno));
+		}
+		if (write_all(run, theirs, n, at - run_at) != 0) {
+			close(run);
+			return fail(detail, cap, path, strerror(errno));
+		}
+		report->patch_bytes += n;
+	}
+	if (run >= 0)
+		close(run);
+	return 0;
+}
+
+/* `hull media import X.cue`: the data track's 2048 bytes a sector taken out
+ * and imported as a disc, the audio to tracks/, and the dump's remainder
+ * found by regenerating it. */
+static int import_cue(const char *cue, const char *dir, hull_media_report *report, char *detail,
+                      size_t cap)
+{
+	static uint8_t raw[RAW_SECTOR];
+	raw_disc      *disc = calloc(1u, sizeof *disc);
+	char          *extra = malloc(MAX_TRACKS * 96u + 256u);
+	char           bin[512];
+	char           path[4400];
+	char           cooked_path[4400];
+	const char    *slash = strrchr(cue, '/');
+	struct stat    st;
+	int            dump = -1;
+	int            cooked = -1;
+	int            naive = -1;
+	int            status = -1;
+	size_t         used = 0u;
+	walk          *w = NULL;
+	uint64_t       patch_cooked;
+
+	if (disc == NULL || extra == NULL) {
+		fail(detail, cap, "out of memory", NULL);
+		goto done;
+	}
+	if (read_cue(cue, bin, sizeof bin, disc, detail, cap) != 0)
+		goto done;
+	snprintf(path, sizeof path, "%.*s%s", slash != NULL ? (int)(slash + 1 - cue) : 0, cue, bin);
+	if ((dump = open(path, O_RDONLY | O_CLOEXEC)) < 0 || fstat(dump, &st) != 0 ||
+	    !S_ISREG(st.st_mode)) {
+		fail(detail, cap, path, dump < 0 ? strerror(errno) : "not a file");
+		goto done;
+	}
+	disc->bytes = (uint64_t)st.st_size;
+	for (unsigned i = 0u; i < disc->count; i++) {
+		uint64_t end = i + 1u < disc->count ? disc->tracks[i + 1u].at : disc->bytes;
+
+		if (disc->tracks[i].at > end || end > disc->bytes) {
+			fail(detail, cap, "the sheet's tracks are not in order within the dump", NULL);
+			goto done;
+		}
+		disc->tracks[i].bytes = end - disc->tracks[i].at;
+	}
+	if (disc->tracks[0].at != 0u) {
+		fail(detail, cap, "the data track does not start the dump", NULL);
+		goto done;
+	}
+	disc->data_sectors = disc->tracks[0].bytes / RAW_SECTOR;
+	if (hash_fd(dump, disc->bytes, disc->sha) != 0) {
+		fail(detail, cap, "the dump cannot be read", strerror(errno));
+		goto done;
+	}
+	if (mkdir(dir, 0755) != 0) {
+		fail(detail, cap, dir, strerror(errno));
+		goto done;
+	}
+
+	/* The data track as a disc. */
+	snprintf(cooked_path, sizeof cooked_path, "%s/.cooked", dir);
+	if ((cooked = open(cooked_path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0) {
+		fail(detail, cap, cooked_path, strerror(errno));
+		goto done;
+	}
+	for (uint64_t s = 0u; s < disc->data_sectors; s++) {
+		if (read_all(dump, raw, RAW_SECTOR, s * RAW_SECTOR) != 0 ||
+		    write_all(cooked, raw + RAW_DATA, SECTOR, s * SECTOR) != 0) {
+			fail(detail, cap, "the data track cannot be read", strerror(errno));
+			goto done;
+		}
+	}
+	used = (size_t)snprintf(extra, 256u, " (raw (bytes %" PRIu64 ") (sha256 \"%s\") (sectors %" PRIu64
+	                        "))", disc->bytes, disc->sha, disc->data_sectors);
+	if (disc->count > 1u) {
+		used += (size_t)sprintf(extra + used, " (tracks");
+		for (unsigned i = 1u; i < disc->count; i++)
+			used += (size_t)sprintf(extra + used, " (track (number %u) (audio \"tracks/%02u.wav\") "
+			                        "(at %" PRIu64 ") (bytes %" PRIu64 "))", disc->tracks[i].number,
+			                        disc->tracks[i].number, disc->tracks[i].at,
+			                        disc->tracks[i].bytes);
+		sprintf(extra + used, ")");
+	}
+	if ((w = calloc(1u, sizeof *w)) == NULL) {
+		fail(detail, cap, "out of memory", NULL);
+		goto done;
+	}
+	w->image = cooked;
+	w->bytes = disc->data_sectors * SECTOR;
+	w->extra = extra;
+	snprintf(w->root, sizeof w->root, "%s/files", dir);
+	if (import_into(w, dir, report, detail, cap) != 0)
+		goto done;
+	patch_cooked = report->patch_bytes;
+
+	/* The audio. */
+	snprintf(path, sizeof path, "%s/tracks", dir);
+	if (disc->count > 1u && mkdir(path, 0755) != 0) {
+		fail(detail, cap, path, strerror(errno));
+		goto done;
+	}
+	for (unsigned i = 1u; i < disc->count; i++) {
+		snprintf(path, sizeof path, "%s/tracks/%02u.wav", dir, disc->tracks[i].number);
+		disc->tracks[i].audio = 1;
+		if (write_wav(dump, disc->tracks[i].at, disc->tracks[i].bytes, path) != 0) {
+			fail(detail, cap, path, strerror(errno));
+			goto done;
+		}
+	}
+	disc->tracks[0].audio = 0;
+
+	/* The sheet, as it came. */
+	snprintf(path, sizeof path, "%s/disc.cue", dir);
+	{
+		static uint8_t text[65536];
+		int            in = open(cue, O_RDONLY | O_CLOEXEC);
+		ssize_t        got = in >= 0 ? read(in, text, sizeof text) : -1;
+		int            out = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+
+		if (in >= 0)
+			close(in);
+		if (got < 0 || got == (ssize_t)sizeof text || out < 0 ||
+		    write_all(out, text, (size_t)got, 0u) != 0) {
+			if (out >= 0)
+				close(out);
+			fail(detail, cap, "the cue sheet cannot be kept", strerror(errno));
+			goto done;
+		}
+		close(out);
+	}
+
+	/* What regenerating the dump does not give. */
+	snprintf(path, sizeof path, "%s/quirks/raw", dir);
+	if (mkdir(path, 0755) != 0) {
+		fail(detail, cap, path, strerror(errno));
+		goto done;
+	}
+	snprintf(path, sizeof path, "%s/.naive", dir);
+	if ((naive = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0) {
+		fail(detail, cap, path, strerror(errno));
+		goto done;
+	}
+	unlink(path);
+	if (ftruncate(naive, (off_t)disc->bytes) != 0 ||
+	    project_raw(dir, disc, cooked, naive, detail, cap) != 0 ||
+	    write_raw_quirks(dump, naive, disc->bytes, dir, report, detail, cap) != 0)
+		goto done;
+	close(naive);
+	naive = -1;
+	/* Nothing left is a disc that is what its data says: a machine may
+	 * run it, nothing being lost by reading it as files. */
+	snprintf(path, sizeof path, "%s/quirks/raw", dir);
+	rmdir(path);
+	snprintf(path, sizeof path, "%s/.naive", dir);
+	if ((naive = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0) {
+		fail(detail, cap, path, strerror(errno));
+		goto done;
+	}
+	unlink(path);
+	if (hull_media_write_raw(dir, naive, detail, cap) != 0)
+		goto done;
+	report->bytes = disc->bytes;
+	(void)patch_cooked;
+	status = 0;
+done:
+	if (cooked >= 0) {
+		close(cooked);
+		unlink(cooked_path);
+	}
+	if (naive >= 0)
+		close(naive);
+	if (dump >= 0)
+		close(dump);
+	if (w != NULL) {
+		for (size_t i = 0u; i < w->count; i++)
+			free(w->files[i].path);
+		free(w->files);
+		free(w);
+	}
+	free(extra);
+	free(disc);
+	if (status != 0)
+		nftw(dir, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
+	return status;
+}
+
+int hull_media_import(const char *image, const char *dir, hull_media_report *report, char *detail,
+                      size_t cap)
+{
+	size_t      length = strlen(image);
+	walk       *w;
+	struct stat st;
+	int         status = -1;
+
+	memset(report, 0, sizeof *report);
+	if (length > 4u && strcasecmp(image + length - 4u, ".cue") == 0) {
+		if (access(dir, F_OK) == 0)
+			return fail(detail, cap, dir, strerror(EEXIST));
+		return import_cue(image, dir, report, detail, cap);
+	}
+	w = calloc(1u, sizeof *w);
+	if (w == NULL)
+		return fail(detail, cap, "out of memory", NULL);
+	if ((w->image = open(image, O_RDONLY | O_CLOEXEC)) < 0 || fstat(w->image, &st) != 0 ||
+	    !S_ISREG(st.st_mode)) {
+		fail(detail, cap, image, w->image < 0 ? strerror(errno) : "not a file");
+		goto done;
+	}
+	w->bytes = (uint64_t)st.st_size;
+	if (mkdir(dir, 0755) != 0) {
+		fail(detail, cap, dir, strerror(errno));
+		goto done;
+	}
+	snprintf(w->root, sizeof w->root, "%s/files", dir);
+	status = import_into(w, dir, report, detail, cap);
+	if (status != 0)
+		nftw(dir, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
+done:
+	if (w->image >= 0)
+		close(w->image);
+	for (size_t i = 0u; i < w->count; i++)
+		free(w->files[i].path);
+	free(w->files);
+	free(w);
+	return status;
+}

@@ -9,8 +9,8 @@
  * EXPOSE, USER, VOLUME and STOPSIGNAL become the runtime.
  *
  * Only a single stage is translated: a second FROM ends it with a comment,
- * since multi-stage COPY --from has no (build ...) shape. The foreign-image
- * import the CLI sketch names is not written.
+ * since multi-stage COPY --from has no (build ...) shape. A foreign image,
+ * `hull import IMAGE DIR`, is engine/media.c's.
  *
  * A compose file is translated the same way to a (machines ...) form, and
  * is also section 9's compose dialect: hull_import_compose() gives the

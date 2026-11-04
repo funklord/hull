@@ -6,6 +6,7 @@ pax and GNU form, gzip, and paths that try to leave the tree."""
 import gzip
 import io
 import os
+import subprocess
 import sys
 import tarfile
 
@@ -55,3 +56,13 @@ make("long", [("file", "d/" + "n" * 150, b"long")], gz=True)
 make("gnu", [("file", "g/" + "q" * 120, b"gnu")], fmt=tarfile.GNU_FORMAT)
 ESCAPE = [("symlink", "up", "../.."), ("file", "up/x", b"out"), ("file", "../y", b"out")]
 make("escape", ESCAPE)
+
+# A disc from sector 16 on, as media_fuzz.c takes one: iso.py's.
+disc = os.path.join(out, 'disc')
+os.makedirs(disc, exist_ok=True)
+image = os.path.join(disc, 'whole.iso')
+subprocess.check_call([sys.executable, '-I', os.path.join(os.path.dirname(__file__), '..', 'iso.py'),
+                       image, 'README.TXT', 'on a disc'])
+with open(image, 'rb') as whole, open(os.path.join(disc, 'seed'), 'wb') as seed:
+	seed.write(whole.read()[16 * 2048:])
+os.unlink(image)

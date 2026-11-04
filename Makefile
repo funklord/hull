@@ -97,6 +97,7 @@ PLAN_OBJS = $(BUILD_DIR)/plan/matrix.o $(BUILD_DIR)/plan/registry.o \
 ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/chroot.o $(BUILD_DIR)/engine/dos.o \
               $(BUILD_DIR)/engine/dosbox.o $(BUILD_DIR)/engine/dosemu.o $(BUILD_DIR)/engine/iso.o \
+              $(BUILD_DIR)/engine/media.o \
               $(GEN_DIR)/disc.o \
               $(BUILD_DIR)/engine/access.o \
               $(BUILD_DIR)/engine/usage.o $(BUILD_DIR)/engine/sha256.o $(BUILD_DIR)/engine/verity.o \
@@ -646,6 +647,7 @@ test: $(TEST_BINS) $(HULL) $(PROBE) $(ARM64_PROBE) $(NSS_LIB) $(ROOT_BIN) vector
 	BUILD_DIR='$(BUILD_DIR)' $(BUILD_DIR)/test/hostdev_test
 	BUILD_DIR='$(BUILD_DIR)' $(BUILD_DIR)/test/iso_test
 	BUILD_DIR='$(BUILD_DIR)' sh test/tree_test.sh '$(BUILD_DIR)/test/tree_tar'
+	BUILD_DIR='$(BUILD_DIR)' sh test/media_test.sh '$(HULL)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/cli_test.sh '$(HULL)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/nss_test.sh '$(HULL)' '$(NSS_LIB)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/root_test.sh '$(HULL)' '$(ROOT_BIN)'
@@ -743,13 +745,19 @@ $(FUZZ_DIR)/unpack_fuzz: test/fuzz/unpack_fuzz.c store/unpack.c $(wildcard store
 	@mkdir -p '$(@D)'
 	$(FUZZ_CC) $(FUZZ_FLAGS) $(CPPFLAGS) -o $@ $(filter %.c %.o,$^) -lz
 
-check-fuzz: $(FUZZ_DIR)/json_fuzz $(FUZZ_DIR)/unpack_fuzz
+$(FUZZ_DIR)/media_fuzz: test/fuzz/media_fuzz.c engine/media.c engine/media.h engine/sha256.c
+	@mkdir -p $(dir $@)
+	$(FUZZ_CC) $(FUZZ_FLAGS) -Iengine -o $@ $(filter %.c,$^)
+
+check-fuzz: $(FUZZ_DIR)/json_fuzz $(FUZZ_DIR)/unpack_fuzz $(FUZZ_DIR)/media_fuzz
 	$(PYTHON) test/fuzz/seeds.py '$(FUZZ_DIR)/corpus'
 	mkdir -p '$(FUZZ_DIR)/work' '$(FUZZ_DIR)/found'
 	cd '$(FUZZ_DIR)/found' && ../json_fuzz -max_total_time=$(FUZZ_TIME) -max_len=4096 \
 		../corpus/json
 	cd '$(FUZZ_DIR)/found' && FUZZ_DIR='$(abspath $(FUZZ_DIR))' ../unpack_fuzz \
 		-max_total_time=$(FUZZ_TIME) -max_len=8192 -timeout=10 ../corpus/tar
+	cd '$(FUZZ_DIR)/found' && FUZZ_DIR='$(abspath $(FUZZ_DIR))' ../media_fuzz \
+		-max_total_time=$(FUZZ_TIME) -max_len=16384 -timeout=10 ../corpus/disc
 
 # Root mode's native grants with hull-root really setuid root, inside a vm
 # whose guest root is the only root it needs (project.md section 7). Not
