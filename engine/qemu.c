@@ -124,6 +124,7 @@ struct hull_machine {
 	char            *composefs;    /* a composefs: source, its image; root is then the objects */
 	char            *verity_disk;  /* (security (verity true)): its objects as ext4, beside it */
 	const char      *boot;         /* a bootable export's /hull/boot, else NULL */
+	int              exported;     /* a bootable export's initramfs, standalone or hosted */
 	char            *layer_path[MAX_VOLUMES];  /* (layers ...): read-only, each above the last */
 	unsigned         layer_count;
 	char            *upper;        /* (upper PATH): the overlay's writes, kept */
@@ -1268,7 +1269,7 @@ static const char *write_initramfs(const hull_machine *m, const char *modules, i
 	 * are, its older IDE one, the SCSI disk layer both report through, and
 	 * NVMe. Without them the agent found no partition under VirtualBox,
 	 * measured. Each optional, a kernel that builds one in having none. */
-	if (m->boot != NULL && load_modules && extra_count + 4u <= MAX_MODULES) {
+	if (m->exported && load_modules && extra_count + 4u <= MAX_MODULES) {
 		extra[extra_count++] = "?ahci";
 		extra[extra_count++] = "?ata_piix";
 		extra[extra_count++] = "?sd_mod";
@@ -4558,6 +4559,7 @@ const char *hull_qemu_boot_files(const char *dir, const char *boot, char *kernel
 	snprintf(m.dir, sizeof m.dir, "%s", dir);
 	m.block_root = 1;
 	m.boot       = boot;
+	m.exported   = 1;
 	if ((reason = write_initramfs(&m, modules, 1)) != NULL) {
 		snprintf(detail, detail_cap, "%s", reason);
 		return detail;

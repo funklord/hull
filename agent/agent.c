@@ -673,6 +673,42 @@ static int share(const char *tag, const char *at, int readonly)
 	             "trans=virtio,version=9p2000.L,msize=262144");
 }
 
+/* The partition whose GPT name is `name`, its node into `node`, a
+ * bootable export's (section 3.13): looked for for five seconds, the disk
+ * maybe still probing, as mount_block waits for one. Empty where none. */
+static void partition_node(const char *name, char *node, size_t cap)
+{
+	struct timespec tenth = { 0, 100000000L };
+
+	node[0] = '\0';
+	for (int tries = 0; name[0] != '\0' && node[0] == '\0' && tries < 50; tries++) {
+		DIR           *block = opendir("/sys/class/block");
+		struct dirent *each;
+
+		while (block != NULL && node[0] == '\0' && (each = readdir(block)) != NULL) {
+			char  path[300];
+			char  field[128];
+			FILE *uevent;
+
+			if (each->d_name[0] == '.')
+				continue;
+			snprintf(path, sizeof path, "/sys/class/block/%s/uevent", each->d_name);
+			if ((uevent = fopen(path, "r")) == NULL)
+				continue;
+			while (fgets(field, sizeof field, uevent) != NULL) {
+				field[strcspn(field, "\n")] = '\0';
+				if (strncmp(field, "PARTNAME=", 9u) == 0 && strcmp(field + 9, name) == 0)
+					snprintf(node, cap, "/dev/%s", each->d_name);
+			}
+			fclose(uevent);
+		}
+		if (block != NULL)
+			closedir(block);
+		if (node[0] == '\0')
+			nanosleep(&tenth, NULL);
+	}
+}
+
 /* The virtio disk whose serial is `tag`, an image volume's, mounted at
  * `at` as the filesystem its superblock says, which the engine read on
  * the host to put its module here. Its disk may still be probing: looked
@@ -1328,7 +1364,20 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 				return reason;
 			layered = 1;
 		} else if (block_root) {
-			if (mount_block("root", "/machine", readonly_root) != 0) {
+			char        named[256];
+			char        node[300];
+			const char *type;
+
+			/* A hosted export's root, its partition named on the kernel's
+			 * command line; else the virtio disk the engine made of it. */
+			if (cmdline_value("hull.root", named, sizeof named)) {
+				partition_node(named, node, sizeof node);
+				if (node[0] == '\0' || hull_access_filesystem(node, &type) == NULL ||
+				    mount(node, "/machine", type, readonly_root ? MS_RDONLY : 0u, NULL) != 0) {
+					say("the root's partition", node[0] != '\0' ? strerror(errno) : named);
+					return "the machine's root partition could not be mounted";
+				}
+			} else if (mount_block("root", "/machine", readonly_root) != 0) {
 				say("the root's image", strerror(errno));
 				return "the machine's root image could not be mounted";
 			}
@@ -2500,7 +2549,6 @@ static void finish(void)
  */
 static void boot_standalone(FILE *boot)
 {
-	struct timespec tenth = { 0, 100000000L };
 	char            line[256];
 	char            root[256] = "";
 	char            init[256] = "/sbin/init";
@@ -2515,33 +2563,7 @@ static void boot_standalone(FILE *boot)
 			snprintf(init, sizeof init, "%s", line + 5);
 	}
 	fclose(boot);
-	/* The disk may still be probing, as mount_block waits for one. */
-	for (int tries = 0; root[0] != '\0' && node[0] == '\0' && tries < 50; tries++) {
-		DIR           *block = opendir("/sys/class/block");
-		struct dirent *each;
-
-		while (block != NULL && node[0] == '\0' && (each = readdir(block)) != NULL) {
-			char  path[300];
-			char  field[128];
-			FILE *uevent;
-
-			if (each->d_name[0] == '.')
-				continue;
-			snprintf(path, sizeof path, "/sys/class/block/%s/uevent", each->d_name);
-			if ((uevent = fopen(path, "r")) == NULL)
-				continue;
-			while (fgets(field, sizeof field, uevent) != NULL) {
-				field[strcspn(field, "\n")] = '\0';
-				if (strncmp(field, "PARTNAME=", 9u) == 0 && strcmp(field + 9, root) == 0)
-					snprintf(node, sizeof node, "/dev/%s", each->d_name);
-			}
-			fclose(uevent);
-		}
-		if (block != NULL)
-			closedir(block);
-		if (node[0] == '\0')
-			nanosleep(&tenth, NULL);
-	}
+	partition_node(root, node, sizeof node);
 	mkdir("/machine", 0755);
 	if (node[0] == '\0') {
 		say("boot: no partition is named", root);

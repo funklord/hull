@@ -121,7 +121,8 @@ static void usage(FILE *out)
 	      "       hull reserve POOL [--count N] [--wait D|--no-wait] | hull release ID\n"
 	      "       hull pool ls | hull lease ls\n"
 	      "       hull pack DIR|REF FILE | hull unpack FILE|- DIR\n"
-	      "       hull export --bootable DIR|REF IMAGE [--init PATH] | hull kernel fetch [--arch ARCH]\n"
+	      "       hull export --bootable DIR|REF IMAGE [--init PATH | --host TTY]\n"
+	      "       hull kernel fetch [--arch ARCH]\n"
 	      "       hull sshd fetch\n"
 	      "       hull export --bootable -f FILE [NAME] IMAGE\n"
 	      "       hull build [-f FILE] [--check] REF\n"
@@ -4418,7 +4419,10 @@ static int tree_name(hull_store *store, const char *source, char *name, size_t c
 /* `hull export --bootable SRC IMAGE [--init PATH]` (section 3.13): the
  * tree SRC is as a disk image that boots by itself, PATH its PID 1,
  * /sbin/init unless said. */
-static int export_bootable(const char *source, const char *image, const char *init)
+/* `host`: `--host TTY`, the hosted form (hull_export_hosted), whose agent
+ * waits on that UART for an engine's core rather than booting the tree. */
+static int export_bootable(const char *source, const char *image, const char *init,
+                           const char *host)
 {
 	hull_store store;
 	char       name[200];
@@ -4428,7 +4432,8 @@ static int export_bootable(const char *source, const char *image, const char *in
 	if ((status = open_store(&store, 1)) != 0)
 		return status;
 	if (tree_name(&store, source, name, sizeof name, why, sizeof why) != 0 ||
-	    hull_export_bootable(&store, name, image, init, why, sizeof why) != 0) {
+	    (host != NULL ? hull_export_hosted(&store, name, image, host, why, sizeof why) :
+	                    hull_export_bootable(&store, name, image, init, why, sizeof why)) != 0) {
 		hull_store_close(&store);
 		fprintf(stderr, "hull: export: %s\n", why);
 		return 1;
@@ -4500,10 +4505,10 @@ static int export_machine(const char *file, const char *name, const char *image)
 
 		snprintf(path, sizeof path, "%.*s%s", slash != NULL ? (int)(slash - file + 1) : 0,
 		         file, source + 4);
-		status = export_bootable(path, image, init != NULL ? init : "/sbin/init");
+		status = export_bootable(path, image, init != NULL ? init : "/sbin/init", NULL);
 	} else {
 		status = export_bootable(strncmp(source, "dir:", 4u) == 0 ? source + 4 : source, image,
-		                         init != NULL ? init : "/sbin/init");
+		                         init != NULL ? init : "/sbin/init", NULL);
 	}
 	free(source);
 	free(init);
@@ -6188,10 +6193,13 @@ int main(int argc, char **argv)
 	    strcmp(argv[2], "--bootable") == 0 && strcmp(argv[3], "-f") == 0)
 		return export_machine(argv[4], argc == 7 ? argv[5] : NULL, argv[argc - 1]);
 	if (strcmp(command, "export") == 0 && argc == 5 && strcmp(argv[2], "--bootable") == 0)
-		return export_bootable(argv[3], argv[4], "/sbin/init");
+		return export_bootable(argv[3], argv[4], "/sbin/init", NULL);
 	if (strcmp(command, "export") == 0 && argc == 7 && strcmp(argv[2], "--bootable") == 0 &&
 	    strcmp(argv[5], "--init") == 0)
-		return export_bootable(argv[3], argv[4], argv[6]);
+		return export_bootable(argv[3], argv[4], argv[6], NULL);
+	if (strcmp(command, "export") == 0 && argc == 7 && strcmp(argv[2], "--bootable") == 0 &&
+	    strcmp(argv[5], "--host") == 0)
+		return export_bootable(argv[3], argv[4], NULL, argv[6]);
 	if (strcmp(command, "pack") == 0 && argc == 4)
 		return pack(argv[2], argv[3]);
 	if (strcmp(command, "unpack") == 0 && argc == 4)

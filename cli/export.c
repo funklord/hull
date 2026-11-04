@@ -428,8 +428,8 @@ static void clean(const char *work)
  * time for what it makes, not the source's -- Limine built by `make
  * limine` carries the hour it was built, which made two builds two
  * images. */
-static int build_esp(const char *work, const char *loader, const char *kernel, char *why,
-                     size_t cap)
+static int build_esp(const char *work, const char *loader, const char *kernel,
+                     const char *cmdline, char *why, size_t cap)
 {
 	char                 mkfs[300], mmd[300], mcopy[300];
 	char                 esp[4300], initrd[4300], conf[4300], rc[4300];
@@ -461,7 +461,7 @@ static int build_esp(const char *work, const char *loader, const char *kernel, c
 	}
 	/* Closed whether the write went or not, so a failed one leaks nothing. */
 	written = fprintf(file, "timeout: 0\n\n/hull\n    protocol: linux\n    path: boot():/vmlinuz\n"
-	                  "    module_path: boot():/initrd\n    cmdline: console=tty0 console=ttyS0\n") >= 0;
+	                  "    module_path: boot():/initrd\n    cmdline: %s\n", cmdline) >= 0;
 	if ((fclose(file) != 0) | !written) {
 		snprintf(why, cap, "limine.conf could not be written");
 		return -1;
@@ -516,8 +516,10 @@ static int build_esp(const char *work, const char *loader, const char *kernel, c
 	return 0;
 }
 
-int hull_export_bootable(hull_store *store, const char *name, const char *image,
-                         const char *init, char *why, size_t cap)
+/* The image, standalone where `host` is NULL, its init `init`; hosted
+ * where it names the agent's UART. */
+static int export_image(hull_store *store, const char *name, const char *image,
+                        const char *init, const char *host, char *why, size_t cap)
 {
 	char                     work[4200];
 	char                     tar[4300], root[4300], esp[4300];
@@ -528,13 +530,20 @@ int hull_export_bootable(hull_store *store, const char *name, const char *image,
 	char                     arch[64] = "";
 	char                     part_name[40];
 	char                     boot[400];
+	char                     cmdline[200];
 	char                     uuid[40];
 	uint8_t                  digest[32];
 	unsigned long long       bytes, esp_bytes, root_bytes, total;
 	int                      fd;
 	int                      status = -1;
 
-	if (init[0] != '/' || strchr(init, '\n') != NULL || strlen(init) >= 256u) {
+	if (host != NULL && (strncmp(host, "tty", 3u) != 0 || strpbrk(host, "/ \n") != NULL ||
+	                     strlen(host) > 16u)) {
+		snprintf(why, cap, "the agent's port is not a tty's name");
+		return -1;
+	}
+	if (host == NULL &&
+	    (init[0] != '/' || strchr(init, '\n') != NULL || strlen(init) >= 256u)) {
 		snprintf(why, cap, "the image's init is not an absolute path");
 		return -1;
 	}
@@ -603,10 +612,21 @@ int hull_export_bootable(hull_store *store, const char *name, const char *image,
 	/* The kernel and initramfs, the agent told which partition is the
 	 * tree's by its name, and its init. */
 	snprintf(part_name, sizeof part_name, "hull-root-%.8s", hex);
-	snprintf(boot, sizeof boot, "root %s\ninit %s\n", part_name, init);
-	if (hull_qemu_boot_files(work, boot, kernel, sizeof kernel, why, cap) != NULL)
+	/* Standalone, the agent boots the tree's init by /hull/boot; hosted,
+	 * it waits for its host on the UART and mounts the partition named
+	 * when the host's spec says to, the console the first port's or, when
+	 * the first is the agent's, the second's. */
+	if (host == NULL) {
+		snprintf(boot, sizeof boot, "root %s\ninit %s\n", part_name, init);
+		snprintf(cmdline, sizeof cmdline, "console=tty0 console=ttyS0");
+	} else {
+		snprintf(cmdline, sizeof cmdline, "console=tty0 console=ttyS1 hull.host=%s hull.root=%s",
+		         host, part_name);
+	}
+	if (hull_qemu_boot_files(work, host == NULL ? boot : NULL, kernel, sizeof kernel, why,
+	                         cap) != NULL)
 		goto done;
-	if (build_esp(work, loader, kernel, why, cap) != 0)
+	if (build_esp(work, loader, kernel, cmdline, why, cap) != 0)
 		goto done;
 
 	/* The disk: 1 MiB for the table, the ESP, the root, and 1 MiB for
@@ -654,4 +674,16 @@ int hull_export_bootable(hull_store *store, const char *name, const char *image,
 done:
 	clean(work);
 	return status;
+}
+
+int hull_export_bootable(hull_store *store, const char *name, const char *image,
+                         const char *init, char *why, size_t cap)
+{
+	return export_image(store, name, image, init, NULL, why, cap);
+}
+
+int hull_export_hosted(hull_store *store, const char *name, const char *image,
+                       const char *host, char *why, size_t cap)
+{
+	return export_image(store, name, image, "", host, why, cap);
 }

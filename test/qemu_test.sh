@@ -2776,6 +2776,47 @@ else
 	out=$(tr -d '\r' < "$root/boot.serial" 2>&1 | grep -a -E 'booted|hull agent|Kernel panic')
 	name='export, booted from a SATA disk'
 	has 0 '^booted pid=1 root=ext4 writable=yes owned=0:0 probe=0:0$'
+	# The hosted form (--host ttyS0), the virtualbox engine's disk: no
+	# /hull/boot, so its agent waits for a host on the first UART, and says
+	# it is ready there once the line is raw -- after the firmware's own
+	# writes to the same port, which the engine reads past.
+	name='export, hosted, its agent ready on the UART'
+	out=$(cd "$root" && timeout 120 "$hull" export --bootable ./bootroot boot3.img --host ttyS0 2>&1)
+	got=$?
+	has 0 'boot3\.img$'
+	rm -f "$root/hosted.sock"
+	timeout 60 qemu-system-x86_64 -machine q35 -m 512 -enable-kvm -bios "$ovmf" \
+		-drive "file=$root/boot3.img,format=raw,if=none,id=sata" \
+		-device ide-hd,drive=sata,bus=ide.0 -display none -net none \
+		-chardev "socket,id=agent,path=$root/hosted.sock,server=on,wait=off" \
+		-serial chardev:agent -no-reboot >/dev/null 2>&1 &
+	hosted=$!
+	out=$(timeout 45 python3 -I -c '
+import socket, sys, time
+deadline = time.time() + 10
+while True:
+	try:
+		s = socket.socket(socket.AF_UNIX)
+		s.connect(sys.argv[1])
+		break
+	except OSError:
+		if time.time() > deadline:
+			raise
+		time.sleep(0.2)
+s.settimeout(40)
+got = b""
+while b"hull-agent ready\n" not in got:
+	piece = s.recv(256)
+	if not piece:
+		break
+	got += piece
+print("ready" if b"hull-agent ready\n" in got else "not ready: " + repr(got[-200:]))
+' "$root/hosted.sock" 2>&1)
+	got=$?
+	kill "$hosted" 2>/dev/null
+	wait "$hosted" 2>/dev/null
+	has 0 '^ready$'
+	rm -f "$root/boot3.img" "$root/hosted.sock"
 	# A stored tree's explicit owners, as its manifest has them: the
 	# view edited to give etc/owned to 101:102 and compiled back.
 	timeout 30 "$hull" commit "$root/bootroot" boot/tree:1 >/dev/null 2>&1
