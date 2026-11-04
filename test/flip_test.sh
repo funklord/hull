@@ -103,18 +103,23 @@ had_image=0
 # host takes the port at the machine's address; the machine's output in
 # $out, its status in $got, and what the client heard in $heard.
 flip() {
+	# VirtualBox boots nested, in most of a minute, and its port is a UART
+	# away: the rest are given what they always were.
+	limit=120
+	read_limit=5
+	[ "$1" = virtualbox ] && limit=300 && read_limit=30
 	rm -f "$deployed/data/out"
-	(cd / && exec timeout -k 2 120 "$hull" run -f "$deployed/hull.conf" --backend "$1" \
+	(cd / && exec timeout -k 2 "$limit" "$hull" run -f "$deployed/hull.conf" --backend "$1" \
 		> "$root/$1.out" 2>&1) &
 	runner=$!
 	# A connection the machine is not yet listening for reaches the
 	# client as a close, so it tries again until it is greeted.
-	heard=$(timeout 100 python3 -c '
+	heard=$(timeout "$((limit - 20))" python3 -c '
 import socket, sys, time
-end = time.time() + 90
+end = time.time() + int(sys.argv[3]) - 30
 while time.time() < end:
 	try:
-		c = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5)
+		c = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=int(sys.argv[4]))
 		line = c.makefile().readline()
 		if line:
 			c.sendall(b"from the host\n")
@@ -125,7 +130,7 @@ while time.time() < end:
 	except OSError:
 		pass
 	time.sleep(0.25)
-print("nobody greeted")' "$address" "$port" 2>&1)
+print("nobody greeted")' "$address" "$port" "$limit" "$read_limit" 2>&1)
 	wait "$runner"
 	got=$?
 	out=$(cat "$root/$1.out")
@@ -148,7 +153,14 @@ got=$?
 [ "$got" != 0 ] && [ "$got" != 7 ] && [ "$got" != 124 ] && [ ! -e "$deployed/data/out" ] ||
 	fail "docker was not absent: a run on it exited $got" "$(cat "$root/nodocker.out")"
 
+# VirtualBox where its pinned package is fetched and the host has its
+# module; it is 110 MB, and not fetched here.
+vbox_up=0
+vbox_at=${XDG_CACHE_HOME:-$HOME/.cache}/hull/virtualbox-$(sed -n 's/^#define HULL_VBOX_VERSION "\(.*\)"/\1/p' engine/vbox.h)
+[ -x "$vbox_at/usr/lib/virtualbox/VBoxHeadless" ] &&
+	[ -r "/lib/modules/$(uname -r)/misc/vboxdrv.ko" ] && vbox_up=1
 backends="chroot vm emu"
+[ "$vbox_up" = 1 ] && backends="$backends virtualbox"
 [ "$docker_up" = 1 ] && backends="$backends docker"
 for backend in $backends; do
 	# docker on the daemon this account reaches, from the test's own core.
@@ -187,6 +199,13 @@ cases=$((cases + 1))
 cases=$((cases + 1))
 [ "$(own "$out_emu")" = "$(own "$out_chroot")" ] ||
 	fail "the emu machine differs from chroot's" "$(own "$out_emu")"
+if [ "$vbox_up" = 1 ]; then
+	cases=$((cases + 1))
+	[ "$(own "$out_virtualbox")" = "$(own "$out_chroot")" ] ||
+		fail "VirtualBox's machine differs from chroot's" "$(own "$out_virtualbox")"
+else
+	printf 'flip: VirtualBox not fetched, or no vboxdrv.ko: virtualbox not run\n'
+fi
 if [ "$docker_up" = 1 ]; then
 	cases=$((cases + 1))
 	[ "$(own "$out_docker")" = "$(own "$out_chroot")" ] ||
