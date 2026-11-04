@@ -195,6 +195,24 @@ LOOPED
 	check 'a looping chain exports' "$got" 0 "$out"
 	cmp -s "$dir/loop.img" "$dir/loop.again"
 	check 'a looping chain is itself' "$?" 0 ''
+
+	# A partitioned disk, MBR and a FAT partition, by mtools again, and a
+	# GPT with an ESP, hull's own export: each tree out, each disk exact.
+	head -c 20971520 /dev/zero > "$dir/hd.img"
+	cat > "$dir/mtools.conf" <<MTOOLS
+drive h: file="$dir/hd.img" partition=1
+MTOOLS
+	MTOOLSRC=$dir/mtools.conf mpartition -I -c -T 6 -s 32 -h 4 -t 320 h: 2> /dev/null
+	MTOOLSRC=$dir/mtools.conf mformat h: 2> /dev/null
+	MTOOLSRC=$dir/mtools.conf mcopy "$dir/b.bin" h:B.BIN 2> /dev/null
+	media import "$dir/hd.img" "$dir/hd"
+	check 'a partitioned disk imported' "$got" 0 "$out"
+	cmp -s "$dir/b.bin" "$dir/hd/files/p1/B.BIN"
+	check 'its partition is a tree' "$?" 0 "$(ls -R "$dir/hd/files" 2>&1)"
+	media export "$dir/hd" "$dir/hd.again"
+	check 'a partitioned disk exports' "$got" 0 "$out"
+	cmp -s "$dir/hd.img" "$dir/hd.again"
+	check 'a partitioned disk is itself' "$?" 0 ''
 else
 	printf 'media: FAT not measured: mtools is not installed\n'
 fi

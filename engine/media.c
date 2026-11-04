@@ -304,7 +304,7 @@ static int read_iso(walk *w, char *volume, size_t cap)
 typedef struct fat {
 	uint64_t bytes_per_sector;
 	uint64_t sectors_per_cluster;
-	uint64_t first_data;      /* in sectors */
+	uint64_t first_data;      /* in sectors, from the disk's start */
 	uint64_t clusters;
 	unsigned bits;            /* 12, 16 or 32 */
 	uint8_t *table;
@@ -514,8 +514,10 @@ static int fat_directory(walk *w, const fat *f, const uint8_t *entries, size_t l
 	return status;
 }
 
-/* A FAT volume's tree into w->files. Nothing done where it is not one. */
-static int read_fat(walk *w, char *volume, size_t cap)
+/* A FAT volume's tree into w->files, the volume `base` bytes into the
+ * image and its files under `prefix` of files/. Sets *found where it was
+ * one; nothing is done where it is not. */
+static int read_fat(walk *w, uint64_t base, const char *prefix, int *found, char *volume, size_t cap)
 {
 	uint8_t  boot[512];
 	fat      f;
@@ -528,7 +530,7 @@ static int read_fat(walk *w, char *volume, size_t cap)
 	int      status = 0;
 
 	memset(&f, 0, sizeof f);
-	if (w->bytes < sizeof boot || read_all(w->image, boot, sizeof boot, 0u) != 0)
+	if (w->bytes < base + sizeof boot || read_all(w->image, boot, sizeof boot, base) != 0)
 		return 0;
 	f.bytes_per_sector    = le16(boot + 11);
 	f.sectors_per_cluster = boot[13];
@@ -541,40 +543,124 @@ static int read_fat(walk *w, char *volume, size_t cap)
 	     f.bytes_per_sector != 4096u) ||
 	    f.sectors_per_cluster == 0u || (f.sectors_per_cluster & (f.sectors_per_cluster - 1u)) != 0u ||
 	    reserved == 0u || fats == 0u || fats > 2u || boot[21] < 0xF0u || total == 0u ||
-	    table_sectors == 0u || total * f.bytes_per_sector > w->bytes)
+	    table_sectors == 0u || base % f.bytes_per_sector != 0u ||
+	    base + total * f.bytes_per_sector > w->bytes)
 		return 0;
 	root_sectors = (root_entries * 32u + f.bytes_per_sector - 1u) / f.bytes_per_sector;
 	f.first_data = reserved + fats * table_sectors + root_sectors;
 	if (f.first_data >= total)
 		return 0;
 	f.clusters = (total - f.first_data) / f.sectors_per_cluster;
+	f.first_data += base / f.bytes_per_sector;
 	f.bits = f.clusters < 4085u ? 12u : f.clusters < 65525u ? 16u : 32u;
 	if ((f.bits == 32u) != (root_entries == 0u) ||
 	    (f.table_bytes = (size_t)(table_sectors * f.bytes_per_sector)) > (256u << 20) ||
 	    (f.table = malloc(f.table_bytes)) == NULL ||
-	    read_all(w->image, f.table, f.table_bytes, reserved * f.bytes_per_sector) != 0) {
+	    read_all(w->image, f.table, f.table_bytes, base + reserved * f.bytes_per_sector) != 0) {
 		free(f.table);
 		return 0;
 	}
 	w->unit = (unsigned)f.bytes_per_sector;
+	*found = 1;
+	/* Each volume's clusters are its own. */
+	w->dirs = 0u;
 	if (f.bits == 32u) {
 		size_t   length = 0u;
 		uint8_t *root = fat_chain(w, &f, le32(boot + 44), &length);
 
 		if (root != NULL)
-			status = fat_directory(w, &f, root, length, "", 0u, volume, cap);
+			status = fat_directory(w, &f, root, length, prefix, 0u, volume, cap);
 		free(root);
 	} else {
 		size_t   length = (size_t)root_entries * 32u;
 		uint8_t *root = malloc(length);
 
-		if (root != NULL && read_all(w->image, root, length,
-		                             (reserved + fats * table_sectors) * f.bytes_per_sector) == 0)
-			status = fat_directory(w, &f, root, length, "", 0u, volume, cap);
+		if (root != NULL && read_all(w->image, root, length, base + (reserved + fats * table_sectors) *
+		                             f.bytes_per_sector) == 0)
+			status = fat_directory(w, &f, root, length, prefix, 0u, volume, cap);
 		free(root);
 	}
 	free(f.table);
 	return status;
+}
+
+/* --- partitions ------------------------------------------------------------ */
+
+#define MAX_PARTITIONS 128u
+
+/* The first sector of each partition a table in the image names, GPT's or
+ * failing that MBR's, into `first`, each checked against the image; how
+ * many. Their sectors are 512 bytes, as a table's are on these disks. */
+static unsigned read_table(walk *w, uint64_t first[MAX_PARTITIONS])
+{
+	uint8_t  sector[512];
+	unsigned count = 0u;
+
+	if (w->bytes < 1024u || read_all(w->image, sector, sizeof sector, 0u) != 0 ||
+	    sector[510] != 0x55u || sector[511] != 0xAAu)
+		return 0u;
+	if (sector[446 + 4] == 0xEEu) {
+		uint8_t  header[512];
+		uint64_t entries;
+		uint32_t number;
+		uint32_t size;
+
+		if (read_all(w->image, header, sizeof header, 512u) != 0 ||
+		    memcmp(header, "EFI PART", 8u) != 0)
+			return 0u;
+		entries = (uint64_t)le32(header + 72) | (uint64_t)le32(header + 76) << 32;
+		number = le32(header + 80);
+		size = le32(header + 84);
+		if (size < 128u || size > 4096u || number > 4096u ||
+		    entries > w->bytes / 512u || entries * 512u + (uint64_t)number * size > w->bytes)
+			return 0u;
+		for (uint32_t i = 0u; i < number && count < MAX_PARTITIONS; i++) {
+			uint8_t  entry[128];
+			uint64_t start;
+			static const uint8_t none[16];
+
+			if (read_all(w->image, entry, sizeof entry, entries * 512u + (uint64_t)i * size) != 0)
+				break;
+			if (memcmp(entry, none, sizeof none) == 0)
+				continue;
+			start = (uint64_t)le32(entry + 32) | (uint64_t)le32(entry + 36) << 32;
+			if (start != 0u && start < w->bytes / 512u)
+				first[count++] = start;
+		}
+		return count;
+	}
+	for (unsigned i = 0u; i < 4u; i++) {
+		const uint8_t *entry = sector + 446 + 16u * i;
+		uint64_t       start = le32(entry + 8);
+
+		if (entry[4] != 0u && start != 0u && start < w->bytes / 512u)
+			first[count++] = start;
+	}
+	return count;
+}
+
+/* Each FAT partition's tree, under pN of files/, N its place in the table.
+ * What is in a partition this cannot read is the diff's, like the table. */
+static int read_partitions(walk *w, char *volume, size_t cap)
+{
+	uint64_t first[MAX_PARTITIONS];
+	unsigned count = read_table(w, first);
+
+	for (unsigned i = 0u; i < count; i++) {
+		char prefix[16];
+		char path[4300];
+		int  found = 0;
+
+		snprintf(prefix, sizeof prefix, "p%u", i + 1u);
+		snprintf(path, sizeof path, "%s/%s", w->root, prefix);
+		if (mkdir(path, 0755) != 0)
+			return -1;
+		if (read_fat(w, first[i] * 512u, prefix, &found, volume, cap) != 0)
+			return -1;
+		if (!found)
+			rmdir(path);
+	}
+	return 0;
 }
 
 /* --- reassembly ----------------------------------------------------------- */
@@ -1359,8 +1445,13 @@ static int import_into(walk *w, const char *dir, hull_media_report *report, char
 	w->unit = SECTOR;
 	if (read_iso(w, volume, sizeof volume) != 0)
 		return fail(detail, cap, "the disc's files cannot be written", strerror(errno));
-	if (w->count == 0u && w->dirs == 0u && read_fat(w, volume, sizeof volume) != 0)
-		return fail(detail, cap, "the disk's files cannot be written", strerror(errno));
+	if (w->count == 0u && w->dirs == 0u) {
+		int found = 0;
+
+		if (read_fat(w, 0u, "", &found, volume, sizeof volume) != 0 ||
+		    (!found && read_partitions(w, volume, sizeof volume) != 0))
+			return fail(detail, cap, "the disk's files cannot be written", strerror(errno));
+	}
 	if (hash_fd(w->image, w->bytes, sha) != 0)
 		return fail(detail, cap, "the image cannot be read", strerror(errno));
 	if (w->count != 0u)
