@@ -1287,6 +1287,12 @@ static const char *write_initramfs(const hull_machine *m, const char *modules, i
 		extra[extra_count++] = "?sd_mod";
 		extra[extra_count++] = "?nvme";
 	}
+	/* A hosted export's volumes, VirtualBox's shared folders: mainline's
+	 * driver for its VMMDev device, and its filesystem. */
+	if (m->exported && m->boot == NULL && load_modules && extra_count + 2u <= MAX_MODULES) {
+		extra[extra_count++] = "?vboxguest";
+		extra[extra_count++] = "?vboxsf";
+	}
 	/* An image volume's drive, and the filesystem each is. ext4, xfs,
 	 * btrfs and erofs check their metadata with the crypto API's crc32c,
 	 * a soft dependency: without it ext4's mount fails ENOENT. */
@@ -3183,6 +3189,8 @@ static hull_status hosted_start(hull_core *core, hull_machine *m, hull_error *er
 	char        cpus[32];
 	const char *reason;
 	const char *machine;
+	const char *argv[11u + 2u * MAX_VOLUMES];
+	unsigned    argc = 0u;
 	int         pair[2];
 	char       *slash;
 
@@ -3226,6 +3234,22 @@ static hull_status hosted_start(hull_core *core, hull_machine *m, hull_error *er
 	snprintf(cpus, sizeof cpus, "%u", m->cpus);
 	if (m->port_count > 0u)
 		m->wake = eventfd(0u, EFD_CLOEXEC);
+	/* What it is told, each volume a path and its mode after the rest. */
+	argv[argc++] = "hull";
+	argv[argc++] = "virtualbox";
+	argv[argc++] = "host";
+	argv[argc++] = work;
+	argv[argc++] = m->root;
+	argv[argc++] = agent;
+	argv[argc++] = memory;
+	argv[argc++] = cpus;
+	argv[argc++] = m->no_network ? "none" : "nat";
+	argv[argc++] = m->ssh.data != NULL ? "ssh" : "none";
+	for (unsigned i = 0u; i < m->volume_count; i++) {
+		argv[argc++] = m->volume_host[i];
+		argv[argc++] = m->volume_readonly[i] ? "ro" : "rw";
+	}
+	argv[argc] = NULL;
 	m->qemu = fork();
 	if (m->qemu == 0) {
 		char log[4300];
@@ -3238,8 +3262,7 @@ static hull_status hosted_start(hull_core *core, hull_machine *m, hull_error *er
 		dup2(pair[1], 1);
 		if (fd >= 0)
 			dup2(fd, 2);
-		execl(self, "hull", "virtualbox", "host", work, m->root, agent, memory, cpus,
-		      m->no_network ? "none" : "nat", (char *)NULL);
+		execv(self, (char *const *)argv);
 		_exit(127);
 	}
 	close(pair[1]);
@@ -4782,6 +4805,9 @@ static const hull_cap_entry vbox_entries[] = {
 	{ "secrets",            HULL_SUP_NATIVE,
 	  "placed by the agent on a tmpfs under one at the machine's /run, which it must "
 	  "have", NULL },
+	{ "volumes",            HULL_SUP_EMULATED,
+	  "VirtualBox's shared folders, mainline's vboxsf in the guest, over the outer vm's 9p: "
+	  "two hops, and owned by root in the machine", NULL },
 	{ "cpus",               HULL_SUP_NATIVE, NULL, NULL },
 	{ "memory",             HULL_SUP_NATIVE,
 	  "a hard allocation, in an outer vm given 1.5 GiB more", NULL },
@@ -4790,6 +4816,9 @@ static const hull_cap_entry vbox_entries[] = {
 	{ "network.nat",        HULL_SUP_NATIVE,
 	  "VirtualBox's NAT, out through the outer vm's passt", NULL },
 	{ "network.none",       HULL_SUP_NATIVE, "no NIC: lo alone in the guest", NULL },
+	{ "ssh",                HULL_SUP_NATIVE,
+	  "the agent supervises the image's own sshd on the guest's port 22, or the dropbear "
+	  "`hull sshd fetch` keeps, on a disk of its own, reached over the UART", NULL },
 	{ "security.readonly_root", HULL_SUP_NATIVE, NULL, NULL },
 	{ "security.no_new_privs",  HULL_SUP_NATIVE, "set by the agent on the workload", NULL },
 	{ "on_disconnect.stop", HULL_SUP_NATIVE, NULL, NULL },

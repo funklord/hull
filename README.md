@@ -433,7 +433,9 @@ by one line:
 | Network | VirtualBox's NAT, or `(network none)` |
 | Start | about a minute, nested; `hull exec` says *still booting* until then |
 | Host needs | VirtualBox of the pinned version installed, for `vboxdrv.ko`, and `/dev/kvm` |
-| Refused | `(mutable direct)`, volumes, `(on_disconnect keep)`, `hull pause` |
+| SSH | `hull ssh`, the machine's host key, as on every engine |
+| Volumes | VirtualBox's shared folders, by the kernel's own `vboxsf`: no Guest Additions in the image |
+| Refused | `(mutable direct)`, layered and block volumes, `(on_disconnect keep)`, `hull pause` |
 
 ## dosbox and dosemu — a DOS PC, for software written for one
 

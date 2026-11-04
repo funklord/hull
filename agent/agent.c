@@ -715,6 +715,28 @@ static void partition_node(const char *name, char *node, size_t cap)
  * the host to put its module here. Its disk may still be probing: looked
  * for for two seconds. 0, or -1 with errno: ENODEV where there is no such
  * disk, EMEDIUMTYPE where it holds no filesystem hull knows. */
+/* A hosted machine's fetched sshd, a whole disk of ext4 beside the one the
+ * root is a partition of, there being no share for it (cli/vbox_host.c):
+ * whichever disk holds a filesystem at its start. A SATA disk may still be
+ * probing. 0, or -1. */
+static int hosted_sshd(void)
+{
+	static const char *const nodes[] = { "/dev/sdb", "/dev/sda" };
+	struct timespec          tenth = { 0, 100000000L };
+
+	for (int tries = 0; tries < 50; tries++) {
+		for (unsigned i = 0u; i < 2u; i++) {
+			const char *type;
+
+			if (hull_access_filesystem(nodes[i], &type) != NULL &&
+			    mount(nodes[i], "/machine/run/hull/sshd", type, MS_RDONLY, NULL) == 0)
+				return 0;
+		}
+		nanosleep(&tenth, NULL);
+	}
+	return -1;
+}
+
 static int mount_block(const char *tag, const char *at, int readonly)
 {
 	struct timespec tenth = { 0, 100000000L };
@@ -1264,6 +1286,8 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	const char     *reason;
 	unsigned        n = 0u;
 	unsigned        volumes = 0u;
+	char            root_name[256];
+	int             hosted = cmdline_value("hull.root", root_name, sizeof root_name);
 	int             readonly_root = 0;
 	int             verity = 0;
 	int             layered;
@@ -1427,7 +1451,9 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 			/* A guest path that is not there is made, where the root
 			 * can be written. */
 			make_path(at);
-			if (block ? mount_block(tag, at, readonly) != 0 : share(tag, at, readonly) != 0) {
+			if (block ? mount_block(tag, at, readonly) != 0 :
+			    hosted ? mount(tag, at, "vboxsf", readonly ? MS_RDONLY : 0u, NULL) != 0 :
+			    share(tag, at, readonly) != 0) {
 				static char reason_[4400];
 
 				snprintf(reason_, sizeof reason_, "%s could not be mounted at %s: %s",
@@ -1484,6 +1510,8 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 		return reason;
 	ssh_enabled = hull_access_true(doc, machine, "ssh");
 	if (ssh_enabled) {
+		char named_root[256];
+
 		if (ssh == NULL)
 			return "(ssh true) asked for, but no ssh material was delivered";
 		if ((reason = place_ssh(doc, ssh)) != NULL)
@@ -1491,7 +1519,8 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 		/* The fetched sshd, where the engine shared it: used only where
 		 * the image has none (below). */
 		if (mkdir("/machine/run/hull/sshd", 0755) == 0 &&
-		    share("sshd", "/machine/run/hull/sshd", 1) != 0)
+		    (cmdline_value("hull.root", named_root, sizeof named_root) ?
+		     hosted_sshd() : share("sshd", "/machine/run/hull/sshd", 1)) != 0)
 			rmdir("/machine/run/hull/sshd");
 	}
 	/* The kernel's filesystems inside, where the machine has a place for

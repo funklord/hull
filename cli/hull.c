@@ -6192,8 +6192,10 @@ int main(int argc, char **argv)
 		}
 		return 0;
 	}
-	if (strcmp(command, "virtualbox") == 0 && argc == 9 && strcmp(argv[2], "host") == 0)
-		return hull_vbox_host(argv[3], argv[4], argv[5], argv[6], argv[7], argv[8]);
+	if (strcmp(command, "virtualbox") == 0 && argc >= 10 && argc % 2 == 0 &&
+	    strcmp(argv[2], "host") == 0)
+		return hull_vbox_host(argv[3], argv[4], argv[5], argv[6], argv[7], argv[8], argv[9],
+		                      argv + 10, (unsigned)(argc - 10) / 2u);
 	if (strcmp(command, "sshd") == 0 && argc == 3 && strcmp(argv[2], "fetch") == 0) {
 		char why[4400] = "";
 

@@ -69,12 +69,12 @@ out=$("$hull" plan -f "$root/keep/hull.conf" 2>&1)
 [ $? -ne 0 ] && printf '%s\n' "$out" | grep -q 'on_disconnect.keep: rejected: a UART' ||
 	fail 'a kept machine was not refused at plan' "$out"
 
-conf vol '(backend virtualbox) (volumes (volume (host "/tmp") (guest "/t")))' \
+conf vol '(backend virtualbox) (volumes (volume (layers "dir:/tmp") (guest "/t")))' \
 	'(command "/probe" "say" "x")'
 cases=$((cases + 1))
 out=$("$hull" plan -f "$root/vol/hull.conf" 2>&1)
-[ $? -ne 0 ] && printf '%s\n' "$out" | grep -q 'volumes: rejected' ||
-	fail 'a volume was not refused at plan' "$out"
+[ $? -ne 0 ] && printf '%s\n' "$out" | grep -q 'volumes.layers: rejected' ||
+	fail 'a layered volume was not refused at plan' "$out"
 
 # Nothing fetched: refused at once, naming the command.
 conf bare '(backend virtualbox) (network none) (command "/probe" "say" "x")'
@@ -109,19 +109,29 @@ while True:
 	c.sendall(b"from the host\n")
 	c.close()' "$listen" "$port" &
 server=$!
+mkdir -p "$root/data" "$root/seen"
+printf 'from the host\n' > "$root/seen/in"
 conf flip '(hostname "flip") (workdir "/srv") (env (WHO "flip")) (memory "256M")' \
+	"(volumes (volume (host \"$root/data\") (guest \"/data\"))" \
+	"(volume (host \"$root/seen\") (guest \"/seen\") (mode ro)))" \
 	"(command \"/probe\" \"env\" \"WHO\" \"cwd\" \"host\" \"read\" \"/etc/flip\"" \
-	'"write" "/srv/flipped" "read" "/srv/flipped"' \
+	'"write" "/srv/flipped" "read" "/srv/flipped" "write" "/data/out" "read" "/seen/in"' \
+	'"write" "/seen/nope"' \
 	"\"dial\" \"$listen\" \"$port\" \"exit\" \"7\")"
 lines() {
 	grep -v '^hull: \|: emulated: \|^\S*hull.conf' "$1" | sed "s/$listen:$port/HOST/"
 }
 for backend in vm virtualbox; do
 	cases=$((cases + 1))
+	rm -f "$root/data/out"
 	(cd / && timeout -k 2 200 "$hull" run -f "$root/flip/hull.conf" --backend "$backend" \
 		> "$root/$backend.out" 2>&1)
 	got=$?
 	[ "$got" = 7 ] || fail "$backend: the file exited $got" "$(cat "$root/$backend.out")"
+	cases=$((cases + 1))
+	[ -e "$root/data/out" ] && [ -O "$root/data/out" ] && [ ! -e "$root/seen/nope" ] ||
+		fail "$backend: a volume's write did not land as the user's, or a read-only one took it" \
+			"$(ls -la "$root/data" "$root/seen" 2>&1)"
 done
 kill "$server" 2>/dev/null
 wait "$server" 2>/dev/null
@@ -154,7 +164,7 @@ import socket, sys, time
 end = time.time() + 190
 while time.time() < end:
 	try:
-		c = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5)
+		c = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=30)
 		line = c.makefile().readline()
 		if line:
 			c.sendall(b"from the host\n")
@@ -208,6 +218,82 @@ while [ "$tries" -lt 20 ] && [ -n "$(left)" ]; do
 done
 out=$(left)
 [ -z "$out" ] || fail 'a killed run left something' "$out"
+
+# --- ssh ---------------------------------------------------------------------
+
+# Goal 7: the same login into the same machine on vm and on virtualbox,
+# under one known_hosts with strict checking, so a key that moved with
+# the backend would be refused. A project of busybox and its libraries, a
+# passwd and no sshd: the dropbear `hull sshd fetch` keeps serves it, on a
+# disk of its own here. A core of its own on a tmpfs, the key being
+# private, with a HOME and data home of the test's.
+busybox=$(command -v busybox 2>/dev/null)
+sshrt=$(mktemp -d /dev/shm/hull-vboxssh.XXXXXX 2>/dev/null)
+cache=${XDG_CACHE_HOME:-$HOME/.cache}
+if [ -z "$busybox" ] || [ -z "$sshrt" ] || ! ls -d "$cache"/hull/dropbear-* > /dev/null 2>&1; then
+	printf 'virtualbox: ssh not run: busybox %s, tmpfs %s, or no `hull sshd fetch`\n' \
+		"${busybox:-absent}" "${sshrt:-absent}"
+	[ -z "$sshrt" ] || rmdir "$sshrt"
+else
+	chmod 700 "$sshrt"
+	ssh_env="XDG_RUNTIME_DIR=$sshrt HOME=$root/sshhome XDG_DATA_HOME=$root/sshdata XDG_CACHE_HOME=$cache"
+	rm -rf -- "${root:?}/sshproject" "${root:?}/sshhome" "${root:?}/sshdata"
+	mkdir -p "$root/sshhome/.ssh" "$root/sshdata"
+	chmod 700 "$root/sshhome/.ssh"
+	ssh-keygen -q -t ed25519 -N '' -C hull-vbox -f "$root/sshhome/.ssh/id_ed25519" < /dev/null
+	r=$root/sshproject/rootfs
+	mkdir -p "$r/bin" "$r/etc" "$r/run" "$r/tmp" "$r/proc" "$r/dev" "$r/sys" "$r/root"
+	cp "$busybox" "$r/bin/busybox"
+	for a in sh id hostname sleep cat; do
+		ln -s busybox "$r/bin/$a"
+	done
+	for lib in $(ldd "$busybox" | sed -n 's/.*=> \(\/[^ ]*\) .*/\1/p; s/^[[:space:]]*\(\/[^ ]*\) .*/\1/p'); do
+		mkdir -p "$r$(dirname "$lib")"
+		cp -L "$lib" "$r$lib"
+	done
+	printf 'root:x:0:0:root:/root:/bin/sh\n' > "$r/etc/passwd"
+	chgrp -R "$(id -g)" "$root/sshproject"
+	chmod -R g-s,go-w "$root/sshproject"
+	printf '%s\n' '(machine (source "dir:./rootfs") (mutable overlay) (hostname "vboxssh") (ssh true)' \
+		'  (memory "256M") (command "/bin/sh" "-c" "echo ready; exec sleep 300"))' \
+		> "$root/sshproject/hull.conf"
+	{
+		printf 'Host vboxssh.hull\n'
+		printf '  ProxyCommand env XDG_RUNTIME_DIR=%s %s proxy-ssh %%h\n' "$sshrt" "$hull"
+		printf '  User root\n  IdentityFile %s\n  IdentitiesOnly yes\n' "$root/sshhome/.ssh/id_ed25519"
+		printf '  StrictHostKeyChecking yes\n  UserKnownHostsFile %s\n' "$root/vboxssh.known"
+	} > "$root/vboxssh.ssh"
+	rm -f "$root/vboxssh.known"
+	for backend in vm virtualbox; do
+		rm -f "$root/vboxssh-$backend.out"
+		(cd / && exec env $ssh_env timeout -k 2 300 "$hull" run -f "$root/sshproject/hull.conf" \
+			--backend "$backend" > "$root/vboxssh-$backend.out" 2>&1) &
+		runner=$!
+		tries=0
+		until grep -q '^ready$' "$root/vboxssh-$backend.out" 2>/dev/null || [ "$tries" -ge 360 ]; do
+			tries=$((tries + 1))
+			sleep 0.5
+		done
+		[ -f "$root/vboxssh.known" ] ||
+			printf 'vboxssh.hull %s\n' "$(cut -d' ' -f1,2 "$root/sshdata/hull/machines/vboxssh/host_key.pub" 2>&1)" \
+				> "$root/vboxssh.known"
+		tries=0
+		until timeout 20 ssh -F "$root/vboxssh.ssh" vboxssh.hull true < /dev/null 2>/dev/null ||
+		      [ "$tries" -ge 40 ]; do
+			tries=$((tries + 1))
+			sleep 0.5
+		done
+		said=$(timeout 20 ssh -F "$root/vboxssh.ssh" vboxssh.hull 'echo "$(id -u) on $(hostname)"' \
+			< /dev/null 2>&1)
+		env $ssh_env timeout 60 "$hull" stop vboxssh > /dev/null 2>&1
+		wait "$runner"
+		cases=$((cases + 1))
+		[ "$said" = '0 on vboxssh' ] ||
+			fail "$backend: ssh with the machine's key pinned did not log in" \
+				"$said; $(cat "$root/vboxssh-$backend.out")"
+	done
+	rm -rf -- "${sshrt:?}" "${root:?}/sshhome/.ssh"
+fi
 
 printf 'virtualbox: %d cases, %d failures\n' "$cases" "$failures"
 [ "$failures" -eq 0 ]
