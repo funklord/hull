@@ -12,7 +12,11 @@
  *                               descriptors, the directories, a boot area,
  *                               a file no name could be given
  *
- * A raw dump, `IMAGE.cue` and the one .bin it names, carries more: the
+ * A disk of FAT is the same, its unit the disk's sector, (unit N) in
+ * media.conf, and a file whose clusters are apart a line for each run,
+ * `SECTOR SIZE @OFFSET/TOTAL PATH`.
+ *
+ * A raw dump, `IMAGE.cue` and the .bin files it names, carries more: the
  * disc above is its data track's 2048 bytes a sector, and
  *
  *     DIR/disc.cue              the cue sheet, as it came
@@ -25,7 +29,9 @@
  *                               gaps between tracks that are not silence
  *
  * media.conf then says (raw (bytes N) (sha256 H) (sectors D)), D the data
- * track's sectors, and each track (at BYTE) (bytes N) in the dump.
+ * track's sectors, each track (at BYTE) (bytes N) in the dump, and for a
+ * sheet of several files (parts (part NAME BYTES) ...), the dump being
+ * them end to end.
  *
  * The projection is the files placed at their sectors over nothing; the
  * quirks are what differs from the original, found by diffing, so nobody
@@ -61,6 +67,11 @@ int hull_media_import(const char *image, const char *dir, hull_media_report *rep
  * to media.conf's. 0, or -1 with why in `detail`; 1 where the collection
  * was imported from no raw dump. */
 int hull_media_write_raw(const char *dir, int fd, char *detail, size_t cap);
+
+/* What `hull media export` writes: the image, or the raw dump, at `out`, a
+ * file; or where the dump was several, `out` a new directory of them and
+ * the sheet. 0, or -1 with why in `detail`. */
+int hull_media_export(const char *dir, const char *out, char *detail, size_t cap);
 
 /* Whether `dir` is a collection this file made: has it a layout.conf. */
 int hull_media_exact(const char *dir);

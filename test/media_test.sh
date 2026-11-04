@@ -144,6 +144,61 @@ check 'a protected dump exports' "$got" 0 "$out"
 cmp -s "$dir/prot.bin" "$dir/prot.again"
 check 'a protected dump is itself' "$?" 0 ''
 
+# A sheet of several files, a track each: back as the files they were.
+python3 -I "$here/raw_disc.py" "$dir/disc.iso" "$dir/set.bin" "$dir/set.cue" split
+media import "$dir/set.cue" "$dir/set"
+check 'a set imported' "$got" 0 "$out"
+[ ! -e "$dir/set/quirks/raw" ] && [ -f "$dir/set/tracks/02.wav" ]
+check 'its sectors regenerated and its track a file' "$?" 0 "$(ls -R "$dir/set" 2>&1)"
+media export "$dir/set" "$dir/set.out"
+check 'a set exports' "$got" 0 "$out"
+cmp -s "$dir/set.bin" "$dir/set.out/set.bin" && cmp -s "$dir/set.bin.2" "$dir/set.out/set.bin.2" &&
+	cmp -s "$dir/set.cue" "$dir/set.out/disc.cue"
+check 'each file of a set is itself' "$?" 0 "$(ls -la "$dir/set.out" 2>&1)"
+
+# A floppy of FAT, mtools' rather than hull's, a file fragmented by a
+# delete: its bytes back in a file, and the image exact.
+if command -v mformat > /dev/null 2>&1; then
+	mformat -C -f 1440 -v HULLDISK -i "$dir/fd.img" ::
+	head -c 200000 /dev/urandom > "$dir/a.bin"
+	head -c 100000 /dev/urandom > "$dir/b.bin"
+	head -c 500000 /dev/urandom > "$dir/c.bin"
+	mcopy -i "$dir/fd.img" "$dir/a.bin" ::A.BIN
+	mcopy -i "$dir/fd.img" "$dir/b.bin" ::B.BIN
+	mmd -i "$dir/fd.img" ::GAME
+	mdel -i "$dir/fd.img" ::A.BIN
+	mcopy -i "$dir/fd.img" "$dir/c.bin" ::GAME/C.BIN
+	media import "$dir/fd.img" "$dir/fd"
+	check 'a floppy imported' "$got" 0 "$out"
+	cmp -s "$dir/c.bin" "$dir/fd/files/GAME/C.BIN"
+	check 'a fragmented file is its bytes' "$?" 0 "$(cat "$dir/fd/layout.conf" 2>&1)"
+	grep -q '@0/500000 GAME/C.BIN$' "$dir/fd/layout.conf"
+	check 'it is fragmented, so that means something' "$?" 0 "$(cat "$dir/fd/layout.conf" 2>&1)"
+	grep -q '(volume "HULLDISK")' "$dir/fd/media.conf"
+	check 'its label is read' "$?" 0 "$(cat "$dir/fd/media.conf" 2>&1)"
+	media export "$dir/fd" "$dir/fd.again"
+	check 'a floppy exports' "$got" 0 "$out"
+	cmp -s "$dir/fd.img" "$dir/fd.again"
+	check 'a floppy is itself' "$?" 0 ''
+	# A chain that loops is no file, and exact all the same.
+	python3 -I - "$dir/fd.img" "$dir/loop.img" <<'LOOPED'
+import sys
+b = bytearray(open(sys.argv[1], 'rb').read())
+# FAT12, sector 1: cluster 2's entry made to name cluster 2.
+b[512 + 3] = 2
+b[512 + 4] = (b[512 + 4] & 0xF0)
+open(sys.argv[2], 'wb').write(b)
+LOOPED
+	media import "$dir/loop.img" "$dir/loop"
+	check 'a looping chain imported' "$got" 0 "$out"
+	media export "$dir/loop" "$dir/loop.again"
+	check 'a looping chain exports' "$got" 0 "$out"
+	cmp -s "$dir/loop.img" "$dir/loop.again"
+	check 'a looping chain is itself' "$?" 0 ''
+else
+	printf 'media: FAT not measured: mtools is not installed\n'
+fi
+
 printf 'media: %d cases, %d failed\n' "$cases" "$failures"
 rm -rf "$dir"
 [ "$failures" -eq 0 ]

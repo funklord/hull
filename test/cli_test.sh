@@ -305,10 +305,10 @@ expect 0 '^ok +user namespaces$' "$hull" doctor
 # has been fetched, the fix is the user's own command (Appendix F).
 expect 0 '^ok +a vm.s kernel, the host.s: /' "$hull" doctor
 expect 0 '^  fix \(as the user\): hull kernel fetch$' \
-	env HULL_BOOT_DIR=/nonexistent XDG_CACHE_HOME="$dir/nocache" "$hull" doctor
+	env HULL_BOOT_DIR=/nonexistent XDG_CACHE_HOME="$(pwd)/$dir/nocache" "$hull" doctor
 # The sshd for an image with none: its fix where nothing is fetched.
 expect 0 '^  fix \(as the user\): hull sshd fetch$' \
-	env XDG_CACHE_HOME="$dir/nocache" "$hull" doctor
+	env XDG_CACHE_HOME="$(pwd)/$dir/nocache" "$hull" doctor
 # A tool is found on PATH, and said where.
 mkdir -p "$dir/tools"
 printf '#!/bin/sh\n' > "$dir/tools/squashfuse"

@@ -66,3 +66,25 @@ subprocess.check_call([sys.executable, '-I', os.path.join(os.path.dirname(__file
 with open(image, 'rb') as whole, open(os.path.join(disc, 'seed'), 'wb') as seed:
 	seed.write(whole.read()[16 * 2048:])
 os.unlink(image)
+
+# A FAT12 disk of 32 sectors, whole: a file in two runs, and a directory.
+fat = bytearray(32 * 512)
+fat[0:3] = b'\xeb\x3c\x90'
+fat[11:13] = (512).to_bytes(2, 'little')
+fat[13] = 1
+fat[14:16] = (1).to_bytes(2, 'little')
+fat[16] = 1
+fat[17:19] = (16).to_bytes(2, 'little')
+fat[19:21] = (32).to_bytes(2, 'little')
+fat[21] = 0xF0
+fat[22:24] = (1).to_bytes(2, 'little')
+fat[512:512 + 9] = bytes([0xF0, 0xFF, 0xFF, 0x04, 0xF0, 0xFF, 0xFF, 0x0F, 0x00])
+root = 1024
+fat[root:root + 11] = b'FILE    BIN'
+fat[root + 26:root + 28] = (2).to_bytes(2, 'little')
+fat[root + 28:root + 32] = (700).to_bytes(4, 'little')
+fat[root + 32:root + 43] = b'DIR        '
+fat[root + 43] = 0x10
+fat[root + 58:root + 60] = (3).to_bytes(2, 'little')
+with open(os.path.join(disc, 'fat'), 'wb') as seed:
+	seed.write(fat)

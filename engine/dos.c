@@ -262,18 +262,21 @@ static const char *read_media(hull_machine *m, const hull_sexpr_doc *doc,
 		char    *source = hull_access_value(doc, &item, "source");
 		unsigned i = m->media_count;
 		int      cdrom = type != NULL && strcmp(type, "cdrom") == 0;
+		int      floppy = type != NULL && strcmp(type, "floppy") == 0;
 		int      image = source != NULL && strncmp(source, "image:", 6u) == 0;
 		int      dir = source != NULL && strncmp(source, "dir:", 4u) == 0;
-		char     drive = 'D';
+		char     drive = floppy ? 'A' : 'D';
 		struct stat st;
 
 		free(type);
-		if (i == HULL_DOS_MAX_MEDIA || !cdrom || !(dir || (image && m->engine->images))) {
+		if (i == HULL_DOS_MAX_MEDIA || !(cdrom || (floppy && m->engine->images)) ||
+		    !(dir || (image && m->engine->images))) {
 			free(source);
 			return i == HULL_DOS_MAX_MEDIA ? "there are too many media" :
-			       "a dos machine's medium is a cdrom, from a dir: collection or, where the "
-			       "engine mounts one, an image:";
+			       "a dos machine's medium is a cdrom, or a floppy where the engine mounts "
+			       "images, from a dir: collection or, where it does, an image:";
 		}
+		m->media_floppy[i] = floppy;
 		{
 			char       *path = hull_access_path(doc, source + (image ? 6 : 4));
 			char       *files = NULL;
@@ -284,6 +287,10 @@ static const char *read_media(hull_machine *m, const hull_sexpr_doc *doc,
 			m->media_host[i] = real(dir ? files : path);
 			if (dir && path != NULL)
 				wrong = read_disc(m, i, path);
+			/* A floppy has only the image it was: nothing here makes a
+			 * disk's filesystem from a tree. */
+			if (wrong == NULL && dir && floppy && !m->media_exact[i])
+				wrong = "a floppy's collection is one `hull media import` made of a disk";
 			if (dir && m->media_exact[i])
 				m->media_collection[i] = path;
 			else if (dir)
@@ -299,8 +306,8 @@ static const char *read_media(hull_machine *m, const hull_sexpr_doc *doc,
 		m->media_count++;
 		while (drive <= 'Z' && !drive_free(m, drive))
 			drive++;
-		if (drive > 'Z')
-			return "no drive is left for a medium";
+		if (drive > (floppy ? 'B' : 'Z'))
+			return floppy ? "no floppy drive is left for a medium" : "no drive is left for a medium";
 		m->media_drive[i] = drive;
 		if (m->media_host[i] == NULL || !usable(m, m->media_host[i]) ||
 		    stat(m->media_host[i], &st) != 0 ||
@@ -660,7 +667,8 @@ static const char *project_media(hull_machine *m)
 
 		if (m->media_volume[i] == NULL || !m->engine->images)
 			continue;
-		snprintf(image, sizeof image, "%s/disc%u.iso", m->dir, i + 1u);
+		snprintf(image, sizeof image, "%s/disc%u.%s", m->dir, i + 1u,
+		         m->media_floppy[i] ? "img" : "iso");
 		snprintf(cue, sizeof cue, "%s/disc%u.cue", m->dir, i + 1u);
 		if ((fd = open(image, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0)
 			return "the disc's image cannot be made in the machine's directory";
@@ -669,6 +677,14 @@ static const char *project_media(hull_machine *m)
 		    close(fd) != 0) {
 			snprintf(why, sizeof why, "the disc's image cannot be made: %s", detail);
 			return why;
+		}
+		/* A floppy is mounted as the image it is. */
+		if (m->media_floppy[i]) {
+			m->media_files[i] = m->media_host[i];
+			if ((m->media_host[i] = strdup(image)) == NULL)
+				return "out of memory";
+			m->media_image[i] = 1;
+			continue;
 		}
 		if ((sheet = fopen(cue, "we")) == NULL)
 			return "the disc's cue sheet cannot be written";

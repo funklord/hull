@@ -1,7 +1,8 @@
 /*
  * media_fuzz.c -- libFuzzer over engine/media.c, which reads somebody
  * else's disc. Each input is a disc from sector 16 on, the sixteen before
- * being empty, imported into a collection of its own under $FUZZ_DIR/media-work,
+ * being empty, or one opening 0xEB a FAT disk whole, imported into a
+ * collection of its own under $FUZZ_DIR/media-work,
  * and the run stopped where the import fails, which reassembling it exactly
  * inside it would show, or where anything was made beside the collection.
  * `make check-fuzz` runs it.
@@ -57,7 +58,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 	snprintf(collection, sizeof collection, "%s/out", base);
 	if ((fd = open(image, O_WRONLY | O_CREAT | O_TRUNC, 0600)) < 0)
 		abort();
-	for (unsigned i = 0u; i < 16u; i++)
+	for (unsigned i = 0u; (size == 0u || data[0] != 0xEBu) && i < 16u; i++)
 		if (write(fd, nothing, sizeof nothing) != (ssize_t)sizeof nothing)
 			abort();
 	if (size != 0u && write(fd, data, size) != (ssize_t)size)

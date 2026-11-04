@@ -48,6 +48,7 @@ struct hull_machine {
 	char             media_drive[HULL_DOS_MAX_MEDIA];
 	int              media_image[HULL_DOS_MAX_MEDIA];
 	int              media_exact[HULL_DOS_MAX_MEDIA];       /* `hull media import`'s */
+	int              media_floppy[HULL_DOS_MAX_MEDIA];      /* an A: or B:, not a CD-ROM */
 	char            *media_collection[HULL_DOS_MAX_MEDIA];  /* its directory, then */
 	unsigned         media_count;
 	/* A collection with a media.conf, its disc projected (section 3.10):

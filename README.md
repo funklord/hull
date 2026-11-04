@@ -552,10 +552,11 @@ hull manifest show app/2             # a tree as readable text, an entry a line
 hull gc
 ```
 
-A disc image becomes plain files the same way, and comes back byte for
-byte: `hull media import game.iso cd/` writes the disc's tree to `cd/files`,
-and everything a tree cannot hold to `cd/quirks`, found by diffing rather
-than written by hand. `hull media verify cd/` checks it against the
+A disc becomes plain files the same way, and comes back byte for byte:
+`hull media import game.iso cd/` writes the disc's tree to `cd/files`, and
+everything a tree cannot hold to `cd/quirks`, found by diffing rather than
+written by hand. A raw `.cue` and its `.bin` files work too, audio tracks
+becoming WAVE files, and so does a floppy of FAT. `hull media verify cd/` checks it against the
 original's hash; `hull media export cd/ game.iso` reassembles it; and DOSBox
 runs the collection as it is, as `(media (medium (type cdrom) (source
 "dir:./cd")))`. An image hull does not understand is still kept exactly, as

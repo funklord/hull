@@ -90,7 +90,8 @@ static int write_files(const hull_machine *m)
 	for (unsigned i = 0u; i < m->volume_count; i++)
 		ADD("mount %c \"%s\"\n", m->volume_drive[i], m->volume_host[i]);
 	for (unsigned i = 0u; i < m->media_count; i++)
-		ADD(m->media_image[i] ? "imgmount %c \"%s\" -t iso\n" : "mount %c \"%s\" -t cdrom\n",
+		ADD(m->media_floppy[i] ? "imgmount %c \"%s\" -t floppy\n" :
+		    m->media_image[i] ? "imgmount %c \"%s\" -t iso\n" : "mount %c \"%s\" -t cdrom\n",
 		    m->media_drive[i], m->media_host[i]);
 	ADD("h:\\hull.bat\n");
 	snprintf(path, sizeof path, "%s/dosbox.conf", m->dir);
@@ -186,12 +187,12 @@ static const hull_cap_entry entries[] = {
 	  "a drive each, its guest path the letter: /d is D:, and /h is hull's", NULL },
 	{ "media",              HULL_SUP_NATIVE,
 	  "a CD-ROM drive each, by DOSBox's own MSCDEX, at the first drive from D: no volume "
-	  "holds", NULL },
+	  "holds; a floppy at A: or B:", NULL },
 	{ "media.dir",          HULL_SUP_EMULATED,
 	  "the collection's files/ as the disc's tree, mounted as a CD-ROM; with a media.conf, "
 	  "projected: files/ an ISO image hull makes, its audio tracks by a cue sheet; one with "
 	  "quirks/ refused, DOSBox reading no disc raw", NULL },
-	{ "media.image",        HULL_SUP_NATIVE,   "an ISO image, by imgmount", NULL },
+	{ "media.image",        HULL_SUP_NATIVE,   "an ISO or floppy image, by imgmount", NULL },
 	{ "media.tar",          HULL_SUP_REJECTED, "not yet: a tar: collection", NULL },
 	{ "media.pack",         HULL_SUP_REJECTED, "not yet: a pack: collection", NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   "a DOS machine here has no network", NULL },
@@ -211,7 +212,7 @@ static const hull_cap_entry entries[] = {
 };
 
 static const char *const classes[] = { "dos", NULL };
-static const char *const media[]   = { "cdrom", NULL };
+static const char *const media[]   = { "cdrom", "floppy", NULL };
 
 static const hull_capabilities caps = {
 	.struct_size    = sizeof (hull_capabilities),

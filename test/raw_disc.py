@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """raw_disc.py -- a CD dump, for test/media_test.sh.
 
-    raw_disc.py ISO BIN CUE [bad-edc SECTOR]
+    raw_disc.py ISO BIN CUE [bad-edc SECTOR | split]
 
 BIN is ISO's sectors as raw Mode 1, 2352 bytes each, then one audio track
-of a second of noise, and CUE its sheet. The sector's sync, header, EDC and
+of a second of noise, and CUE its sheet; or with `split` the track is a file
+of its own, BIN.2, as a Redump set has them. The sector's sync, header, EDC and
 parity are made here from ECMA-130 as it states them: the EDC by dividing
 by its polynomial, a bit at a time, and each parity pair by solving annex
 A's two check equations over GF(2^8) for it, where hull computes them by
@@ -103,6 +104,7 @@ def make(data, number):
 
 def main():
 	iso, out, cue = sys.argv[1:4]
+	split = len(sys.argv) > 4 and sys.argv[4] == 'split'
 	bad = int(sys.argv[5]) if len(sys.argv) > 5 else -1
 	cooked = open(iso, 'rb').read()
 	count = len(cooked) // 2048
@@ -112,14 +114,24 @@ def main():
 			if number == bad:
 				sector[2064] ^= 0xFF
 			bin_file.write(sector)
-		rng = random.Random(7)
-		bin_file.write(bytes(rng.randrange(256) for _ in range(RAW * 75)))
+	rng = random.Random(7)
+	audio = bytes(rng.randrange(256) for _ in range(RAW * 75))
+	if split:
+		with open(out + '.2', 'wb') as track:
+			track.write(audio)
+	else:
+		with open(out, 'ab') as bin_file:
+			bin_file.write(audio)
 	seconds, frames = divmod(count, 75)
 	with open(cue, 'w') as sheet:
 		sheet.write('FILE "%s" BINARY\n' % os.path.basename(out))
 		sheet.write('  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n')
-		sheet.write('  TRACK 02 AUDIO\n    INDEX 01 %02d:%02d:%02d\n'
-		            % (seconds // 60, seconds % 60, frames))
+		if split:
+			sheet.write('FILE "%s.2" BINARY\n  TRACK 02 AUDIO\n    INDEX 01 00:00:00\n'
+			            % os.path.basename(out))
+		else:
+			sheet.write('  TRACK 02 AUDIO\n    INDEX 01 %02d:%02d:%02d\n'
+			            % (seconds // 60, seconds % 60, frames))
 
 
 main()
