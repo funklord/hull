@@ -283,6 +283,20 @@ else
 	printf 'pc: no Xvfb, the window not tried\n'
 fi
 
+# --- its screen by VNC, at its address, with no X -----------------------------
+
+conf '(source "media:disk") (display vnc)' \
+	'(media (medium (type disk) (source "image:./spin.img")))'
+timeout 30 "$hull" run -f "$root/hull.conf" > "$root/vnc.out" 2>&1 &
+pid=$!
+sleep 2
+address=$("$hull" ps | awk '$5 == "running" { print $2 }')
+out=$(timeout 5 nc -w 2 "$address" 5900 < /dev/null | head -c 12)
+says 'the screen answers at the machine'"'"'s address' "$out" 'RFB 003'
+id=$("$hull" ps | awk '$5 == "running" { print $1 }')
+timeout 30 "$hull" stop "$id" > /dev/null 2>&1
+wait "$pid"
+
 # --- a real system, its port at the machine's address ------------------------
 
 busybox=$(command -v busybox)
@@ -334,6 +348,48 @@ INIT
 	status 'a linux powers off' "$?" 0 "$(tail -5 "$root/linux.out")"
 	says 'it booted' "$(cat "$root/linux.out")" 'a linux on a pc'
 	says 'a client at its address reached it' "$(cat "$root/linux.out")" 'from the host'
+
+	# Two of them on a wire of hull's: a legacy machine is a host of the
+	# networks hull simulates. Each sets its own address, as it must.
+	cat > "$tree/init.sh" <<'INIT'
+#!/bin/busybox sh
+/bin/busybox mount -t proc proc /proc
+/bin/busybox --install -s /bin
+insmod /e1000.ko
+ip link set eth0 up
+ip addr add 10.77.0.1/24 dev eth0
+nc -l -p 7001
+echo served on the wire
+poweroff -f
+INIT
+	out=$(timeout 120 "$hull" export --bootable "$tree" "$root/one.img" --init /init.sh 2>&1)
+	status 'a first end of a wire' "$?" 0 "$out"
+	cat > "$tree/init.sh" <<'INIT'
+#!/bin/busybox sh
+/bin/busybox mount -t proc proc /proc
+/bin/busybox --install -s /bin
+insmod /e1000.ko
+ip link set eth0 up
+ip addr add 10.77.0.2/24 dev eth0
+n=0
+until ping -c 1 -W 1 10.77.0.1 > /dev/null 2>&1 || [ "$n" = 30 ]; do n=$((n + 1)); done
+sleep 2
+echo over the wire | nc -w 2 10.77.0.1 7001
+poweroff -f
+INIT
+	out=$(timeout 120 "$hull" export --bootable "$tree" "$root/two.img" --init /init.sh 2>&1)
+	status 'a second' "$?" 0 "$out"
+	for end in one two; do
+		cat <<CONF
+  ($end (backend pc) (source "image:./$end.img") (memory "512M") (segments "pcwire")
+    (tuning (pc (nic e1000) (firmware uefi))))
+CONF
+	done > "$root/ends"
+	{ printf '(machines\n'; cat "$root/ends"; printf ')\n'; } > "$root/wire.conf"
+	out=$(timeout 150 "$hull" run -f "$root/wire.conf" 2>&1)
+	got=$?
+	status 'two machines on a wire end' "$got" 0 "$(printf '%s\n' "$out" | tail -5)"
+	says 'one heard the other' "$out" 'over the wire'
 else
 	printf 'pc: no busybox or e1000 module, the linux not tried\n'
 fi

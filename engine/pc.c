@@ -27,6 +27,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,7 +44,8 @@
 #include "usage.h"
 
 #define PC_MAX_MEDIA 6u    /* four on IDE, two floppy drives */
-#define PC_MAX_ARGS  48u
+#define PC_MAX_ARGS  64u
+#define PC_MAX_SEGMENTS 4u
 #define PC_MAX_PORTS 32u
 
 typedef struct medium {
@@ -73,8 +75,12 @@ struct hull_machine {
 	unsigned        port_guest[PC_MAX_PORTS];
 	int             port_udp[PC_MAX_PORTS];
 	unsigned        port_count;
+	char           *segment[PC_MAX_SEGMENTS];  /* Appendix D's wires, by name */
+	int             segment_fd[PC_MAX_SEGMENTS];
+	unsigned        segment_count;
 	char           *display;        /* the run's X display, or NULL */
 	char           *xauthority;
+	int             vnc;            /* (display vnc): the screen at the machine's address */
 	char            cache[4096];    /* where qemu's snapshots and made images are */
 	pid_t           pid;
 	int             out;            /* the first serial port */
@@ -105,6 +111,11 @@ static void release(hull_machine *m)
 		free(m->media[i].path);
 		if (m->media[i].fd >= 0)
 			close(m->media[i].fd);
+	}
+	for (unsigned i = 0u; i < m->segment_count; i++) {
+		free(m->segment[i]);
+		if (m->segment_fd[i] >= 0)
+			close(m->segment_fd[i]);
 	}
 	free(m->memory);
 	free(m->cpus);
@@ -312,6 +323,18 @@ static const char *read_network(hull_machine *m, const hull_sexpr_doc *doc,
 	if (address != NULL && strlen(address) < sizeof m->address)
 		strcpy(m->address, address);
 	free(address);
+	if (hull_access_find(doc, machine, "segments", &entry)) {
+		hull_sexpr_child(doc, &entry, &item);
+		while (hull_sexpr_next(doc, &item, &item)) {
+			if (m->segment_count == PC_MAX_SEGMENTS)
+				return "there are too many segments";
+			m->segment_fd[m->segment_count] = -1;
+			if ((m->segment[m->segment_count++] = hull_access_segment_name(doc, &item)) == NULL)
+				return "a segment's name is not text";
+		}
+		if (m->address[0] == '\0')
+			return "the plan gives its segments no address to draw a MAC from";
+	}
 	if (!hull_access_find(doc, machine, "ports", &entry))
 		return NULL;
 	if (!m->network)
@@ -379,6 +402,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 		}
 		m->xauthority = hull_access_value(doc, &screen, "xauthority");
 	}
+	m->vnc = display != NULL && strcmp(display, "vnc") == 0;
 	free(display);
 	/* An image: source is the first disk, before any (media ...). */
 	if (source[0] == 'i') {
@@ -409,6 +433,8 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 				return wrong;
 		}
 	}
+	if (m->vnc && m->address[0] == '\0')
+		return "the plan gives (display vnc) no address";
 	if ((wrong = read_media(m, doc, machine)) != NULL)
 		return wrong;
 	for (unsigned i = 0u; i < m->media_count; i++)
@@ -443,6 +469,7 @@ static void exec_qemu(const hull_machine *m)
 	char    *argv[PC_MAX_ARGS];
 	char     machine[128];
 	char     smp[64];
+	char     vnc[48];
 	unsigned n = 0u;
 	unsigned ide = 0u;
 	unsigned floppy = 0u;
@@ -463,8 +490,10 @@ static void exec_qemu(const hull_machine *m)
 	argv[n++] = "stdio";
 	argv[n++] = "-vga";
 	argv[n++] = m->vga != NULL ? m->vga : "std";
+	/* VNC's display 0 is port 5900, at the machine's own address. */
+	snprintf(vnc, sizeof vnc, "vnc=%s:0", m->address);
 	argv[n++] = "-display";
-	argv[n++] = m->display != NULL ? "sdl" : "none";
+	argv[n++] = m->vnc ? vnc : m->display != NULL ? "sdl" : "none";
 	argv[n++] = "-boot";
 	argv[n++] = boot;
 	if (m->firmware != NULL) {
@@ -498,6 +527,25 @@ static void exec_qemu(const hull_machine *m)
 			                       m->port_guest[i]);
 		argv[n++] = "-nic";
 		argv[n++] = nic;
+	}
+	/* A card on each wire, the machine's own to address. */
+	for (unsigned i = 0u; i < m->segment_count; i++) {
+		unsigned char mac[6];
+		char         *netdev = malloc(64u);
+		char         *device = malloc(96u);
+		int           fd = fcntl(m->segment_fd[i], F_DUPFD, 3);
+
+		if (netdev == NULL || device == NULL || fd < 0)
+			return;
+		hull_access_segment_mac(m->address, m->segment[i], i, mac);
+		snprintf(netdev, 64u, "stream,id=s%u,addr.type=fd,addr.str=%d", i, fd);
+		snprintf(device, 96u, "%s,netdev=s%u,mac=%02x:%02x:%02x:%02x:%02x:%02x",
+		         m->nic == NULL ? "ne2k_pci" : strcmp(m->nic, "virtio") == 0 ? "virtio-net-pci" :
+		         m->nic, i, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+		argv[n++] = "-netdev";
+		argv[n++] = netdev;
+		argv[n++] = "-device";
+		argv[n++] = device;
 	}
 	for (unsigned i = 0u; i < m->media_count; i++) {
 		const medium *d = &m->media[i];
@@ -632,6 +680,17 @@ static hull_status pc_start(hull_core *core, hull_machine *m, hull_error *error)
 	pid_t parent = getpid();
 
 	(void)core;
+	/* A port on each wire, from the core's switch. */
+	for (unsigned i = 0u; i < m->segment_count; i++) {
+		static char detail[256];
+
+		if (host->struct_size < offsetof(hull_host_ops, segment) + sizeof host->segment ||
+		    host->segment == NULL)
+			return fail(error, HULL_ERR_RUNTIME, "the core has no switch for a segment");
+		m->segment_fd[i] = host->segment(m->core, m->segment[i], detail, sizeof detail);
+		if (m->segment_fd[i] < 0)
+			return fail(error, HULL_ERR_RUNTIME, detail);
+	}
 	if (pipe2(out, O_CLOEXEC) != 0)
 		return fail(error, HULL_ERR_RUNTIME, "a pipe for the machine could not be made");
 	if (pipe2(err, O_CLOEXEC) != 0) {
@@ -663,6 +722,10 @@ static hull_status pc_start(hull_core *core, hull_machine *m, hull_error *error)
 	}
 	close(out[1]);
 	close(err[1]);
+	for (unsigned i = 0u; i < m->segment_count; i++) {
+		close(m->segment_fd[i]);
+		m->segment_fd[i] = -1;
+	}
 	m->out = out[0];
 	m->err = err[0];
 	if (pthread_create(&m->reader, NULL, read_machine, m) != 0) {
@@ -807,11 +870,19 @@ static const hull_cap_entry entries[] = {
 	{ "network.nat",        HULL_SUP_NATIVE,
 	  "qemu's own user network, a card of (tuning (pc (nic ...))), ne2k_pci by default, DHCP "
 	  "at 10.0.2.2; none unless asked for", NULL },
+	{ "segments",           HULL_SUP_NATIVE,
+	  "a card on each, of (tuning (pc (nic ...))), beside any (network nat), its address the "
+	  "guest's own to set, nothing of hull's running there to give it one", NULL },
+	{ "impair",             HULL_SUP_NATIVE,   "in the core's switch", NULL },
+	{ "tamper",             HULL_SUP_NATIVE,   "in the core's switch", NULL },
 	{ "ports",              HULL_SUP_NATIVE,
 	  "qemu's forwards from the machine's address, with (network nat), to whatever the guest's "
 	  "own stack answers", NULL },
 	{ "display.window",     HULL_SUP_NATIVE,
 	  "qemu's SDL window on the X display the run was given; no sound", NULL },
+	{ "display.vnc",        HULL_SUP_NATIVE,
+	  "the screen, keyboard and mouse by VNC at the machine's address, port 5900, with no "
+	  "password: any local user can connect, as to its ports", NULL },
 	{ "memory",             HULL_SUP_NATIVE,   NULL, NULL },
 	{ "cpus",               HULL_SUP_NATIVE,   NULL, NULL },
 	{ "pc.firmware.bios", HULL_SUP_NATIVE, "qemu's SeaBIOS", NULL },

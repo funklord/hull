@@ -463,7 +463,7 @@ and installing from a disc then booting the disk is one changed line.
 | Media | an `image:` file (raw, qcow2, vmdk, vhd, vhdx, vdi), or a `dir:` collection of `hull media import`, reassembled and its hash checked |
 | Writes | thrown away with the machine by default; `(mutable direct)` writes the image |
 | Output | its first serial port is `hull run`'s output; powering off is exit 0 |
-| Screen | `(display window)`, an SDL window on your X display; no sound yet |
+| Screen | `(display window)`, an SDL window on your X display, or `(display vnc)`, port 5900 at its address; no sound yet |
 | Network | none unless `(network nat)`; ports on the machine's own address |
 | Tuning | `(tuning (pc (machine pc\|q35\|isapc) (firmware bios\|uefi) (vga …) (nic …) (accel …)))` |
 
