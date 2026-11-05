@@ -18,9 +18,9 @@ case $dir in
 *) printf 'remote: refusing to clear %s\n' "$dir"; exit 1 ;;
 esac
 rm -rf "$dir"
-mkdir -p "$dir/near" "$dir/far" "$dir/bin" "$dir/site/tree/proc" "$dir/site/tree/dev" \
+mkdir -p "$dir/near" "$dir/bin" "$dir/site/tree/proc" "$dir/site/tree/dev" \
 	"$dir/site/tree/sys" "$dir/here"
-chmod 700 "$dir/near" "$dir/far"
+chmod 700 "$dir/near"
 root=$(cd "$dir" && pwd)
 sshd=/usr/sbin/sshd
 real_ssh=$(command -v ssh)
@@ -56,6 +56,10 @@ expect() {
 	fi
 }
 
+# The far core keeps host keys in memory only, so its runtime is a tmpfs.
+far=$(mktemp -d /dev/shm/hull-remote.XXXXXX)
+mkdir -p "$root/farhome/.ssh"
+ssh-keygen -q -t ed25519 -N '' -f "$root/farhome/.ssh/id_ed25519"
 port=$((20000 + $$ % 20000))
 ssh-keygen -q -t ed25519 -N '' -f "$root/hostkey"
 ssh-keygen -q -t ed25519 -N '' -f "$root/userkey"
@@ -68,12 +72,13 @@ AuthorizedKeysFile $root/authorized
 PidFile $root/sshd.pid
 StrictModes no
 UsePAM no
-SetEnv XDG_RUNTIME_DIR=$root/far HULL_CORE_IDLE=1
+SetEnv XDG_RUNTIME_DIR=$far HULL_CORE_IDLE=1 HOME=$root/farhome XDG_DATA_HOME=$root/fardata XDG_CACHE_HOME=$root/farcache
 CONF
 "$sshd" -D -e -f "$root/sshd_config" > "$root/sshd.log" 2>&1 &
 server=$!
 stop_server() {
 	kill "$server" 2> /dev/null
+	rm -rf "$far"
 }
 trap stop_server EXIT
 trap 'stop_server; exit 1' INT TERM
@@ -109,7 +114,7 @@ expect 2 'Connection refused' "$hull" -H ssh://127.0.0.1:1 ps
 
 expect 0 '^ID' "$hull" -H "$url" ps
 cases=$((cases + 1))
-[ -S "$root/far/hull/core.sock" ] || fail 'a core was started at the far end' "$(ls -la "$root/far")"
+[ -S "$far/hull/core.sock" ] || fail 'a core was started at the far end' "$(ls -la "$far")"
 cases=$((cases + 1))
 [ ! -e "$root/near/hull/core.sock" ] || fail 'and none here' "$(ls -la "$root/near/hull")"
 
@@ -153,6 +158,33 @@ out=$("$hull" ps 2>&1)
 if printf '%s\n' "$out" | grep -q running; then
 	fail 'a killed frontend took its far machine with it' "$out"
 fi
+unset HULL_HOST
+
+# A pc machine's door, from here: the far host's OpenSSH answering through
+# `hull -H ... proxy-ssh`, with nothing of the door on this side.
+printf '\353\376' > "$root/site/spin.img"
+truncate -s 1M "$root/site/spin.img"
+printf '\125\252' | dd of="$root/site/spin.img" bs=1 seek=510 conv=notrunc status=none
+printf '(machine (backend pc) (source "media:disk") (ssh true) (media (medium (type disk) (source "image:./spin.img"))))\n' \
+	> "$root/here/door.conf"
+HULL_HOST=$url$root/site
+export HULL_HOST
+timeout 30 "$hull" run -f "$root/here/door.conf" > "$root/door.out" 2>&1 &
+run=$!
+n=0
+until "$hull" ps 2> /dev/null | grep -q running || [ "$n" -ge 50 ]; do
+	sleep 0.2
+	n=$((n + 1))
+done
+id=$("$hull" ps | awk '$NF == "running" { print $1 }')
+out=$( { sleep 3; } | timeout 10 "$hull" proxy-ssh "$id" 2>&1 | head -c 40)
+cases=$((cases + 1))
+case $out in
+SSH-2.0-OpenSSH*) ;;
+*) fail 'the far host'"'"'s OpenSSH answers at the door' "$out$(tail -3 "$root/door.out")" ;;
+esac
+timeout 20 "$hull" stop --timeout 1 "$id" > /dev/null 2>&1
+wait "$run"
 unset HULL_HOST
 
 # What works on this host's store does not pretend otherwise.
