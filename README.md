@@ -558,7 +558,8 @@ everything a tree cannot hold to `cd/quirks`, found by diffing rather than
 written by hand. A raw `.cue` and its `.bin` files work too, audio tracks
 becoming WAVE files, and so does a disk: a floppy or volume of FAT, ext2,
 ext3 or ext4, or a partitioned disk of them, its files read out and the
-rest kept as the patch. `hull media verify cd/` checks it against the
+rest kept as the patch. A virtual machine's qcow2, VMDK, VDI, VHD or VHDX
+disk is taken as the raw disk it holds, and comes back as that raw disk. `hull media verify cd/` checks it against the
 original's hash; `hull media export cd/ game.iso` reassembles it; and DOSBox
 runs the collection as it is, as `(media (medium (type cdrom) (source
 "dir:./cd")))`. An image hull does not understand is still kept exactly, as

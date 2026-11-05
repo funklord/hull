@@ -4421,6 +4421,31 @@ static int tree_name(hull_store *store, const char *source, char *name, size_t c
 	return 0;
 }
 
+/* The container format of a virtual machine's disk, by its magic, as
+ * qemu-img names it; NULL for anything else. */
+static const char *container_format(const char *image)
+{
+	unsigned char head[80] = { 0 };
+	int           fd = open(image, O_RDONLY | O_CLOEXEC);
+	ssize_t       got = fd >= 0 ? read(fd, head, sizeof head) : -1;
+
+	if (fd >= 0)
+		close(fd);
+	if (got < 8)
+		return NULL;
+	if (memcmp(head, "QFI\xfb", 4u) == 0)
+		return "qcow2";
+	if (memcmp(head, "KDMV", 4u) == 0)
+		return "vmdk";
+	if (memcmp(head, "vhdxfile", 8u) == 0)
+		return "vhdx";
+	if (memcmp(head, "conectix", 8u) == 0)
+		return "vpc";
+	if (got >= 68 && memcmp(head + 64, "\x7f\x10\xda\xbe", 4u) == 0)
+		return "vdi";
+	return NULL;
+}
+
 /* `hull media import IMAGE DIR` (section 3.10), and `hull import IMAGE
  * DIR`, section 3.11's one algorithm: what it understood and what it did
  * not, the patch being the measure of that. */
@@ -4428,11 +4453,40 @@ static int media_import(const char *image, const char *dir)
 {
 	hull_media_report report;
 	char              why[4400] = "";
+	char              raw[4400] = "";
+	const char       *format = container_format(image);
+	int               status;
 
-	if (hull_media_import(image, dir, &report, why, sizeof why) != 0) {
+	/* A virtual machine's disk is its raw disk in a container qemu-img
+	 * reads: that is what is taken apart, and what export gives back, the
+	 * container's own bytes being no part of the disk (section 3.13). */
+	if (format != NULL) {
+		pid_t pid;
+		int   child = 1;
+
+		snprintf(raw, sizeof raw, "%s.raw", dir);
+		if ((pid = fork()) == 0) {
+			execlp("qemu-img", "qemu-img", "convert", "-f", format, "-O", "raw", image, raw,
+			       (char *)NULL);
+			_exit(127);
+		}
+		if (pid < 0 || waitpid(pid, &child, 0) < 0 || !WIFEXITED(child) ||
+		    WEXITSTATUS(child) != 0) {
+			unlink(raw);
+			fprintf(stderr, "hull: media import: qemu-img could not read %s as %s\n", image, format);
+			return 1;
+		}
+		image = raw;
+	}
+	status = hull_media_import(image, dir, &report, why, sizeof why);
+	if (raw[0] != '\0')
+		unlink(raw);
+	if (status != 0) {
 		fprintf(stderr, "hull: media import: %s\n", why);
 		return 1;
 	}
+	if (format != NULL)
+		printf("%s: a %s disk, taken as its raw disk\n", dir, format);
 	printf("%s: %llu file%s, %llu bytes, %llu of them patch\n", dir, report.files,
 	       report.files == 1u ? "" : "s", report.bytes, report.patch_bytes);
 	return 0;

@@ -218,6 +218,21 @@ else
 	printf 'media: FAT not measured: mtools is not installed\n'
 fi
 
+# A virtual machine's disk in a container: its raw disk, taken apart.
+if command -v qemu-img > /dev/null 2>&1 && [ -f "$dir/hd.img" ]; then
+	for format in qcow2 vmdk vdi vpc vhdx; do
+		qemu-img convert -f raw -O "$format" "$dir/hd.img" "$dir/vm.$format" 2> /dev/null
+		media import "$dir/vm.$format" "$dir/vm-$format"
+		check "a $format disk imported" "$got" 0 "$out"
+		cmp -s "$dir/b.bin" "$dir/vm-$format/files/p1/B.BIN"
+		check "a $format disk's file is a file" "$?" 0 "$(ls -R "$dir/vm-$format/files" 2>&1)"
+		media verify "$dir/vm-$format"
+		check "a $format disk verifies" "$got" 0 "$out"
+		[ ! -e "$dir/vm-$format.raw" ]
+		check "a $format disk's raw form is gone" "$?" 0 ''
+	done
+fi
+
 # ext2 at 1 KiB blocks, whose big file reaches double indirection, ext3,
 # and ext4 by extents: mke2fs's, not hull's. A name of a space and a +, a
 # link, which is no file, and a hole.
