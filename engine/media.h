@@ -4,7 +4,10 @@
  * reassembly a machine's disc and `hull media verify` both are.
  *
  *     DIR/files/...             the disc's tree, plain files
- *     DIR/media.conf            (disc (volume V) (bytes N) (sha256 H))
+ *     DIR/media.conf            (disc (volume V) (bytes N) (sha256 H)), and
+ *                               (sparse true) where H is over the non-zero
+ *                               blocks of an image mostly holes, and no
+ *                               plain sha256
  *     DIR/layout.conf           a line each, `SECTOR SIZE PATH`: where on
  *                               the disc each file's bytes sit
  *     DIR/quirks/sectors/0xS.raw  every run of bytes from sector S that

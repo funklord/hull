@@ -61,6 +61,7 @@
 #include "kernel_fetch.h"
 #include "sshd_fetch.h"
 #include "media.h"
+#include "vagrant.h"
 #include "vbox_fetch.h"
 #include "vbox_host.h"
 #include "import.h"
@@ -150,6 +151,7 @@ static void usage(FILE *out)
 	      "       hull pull [--arch A] IMAGE [REF] | hull push REF IMAGE\n"
 	      "       hull import DOCKERFILE|COMPOSE-FILE | hull import IMAGE DIR\n"
 	      "       hull media import IMAGE DIR | verify DIR | export DIR IMAGE\n"
+	      "       hull vagrant box add NAME FILE\n"
 	      "       hull up [-f COMPOSE-FILE] [--backend B] [NAME]\n"
 	      "       hull core\n"
 	      "       hull engines | hull doctor\n"
@@ -316,9 +318,10 @@ static uint8_t *spec_text(const char *path, size_t *length)
 	char      *text;
 	size_t     n;
 
-	if (!hull_import_is_compose(path))
+	if (!hull_import_is_compose(path) && !hull_vagrant_is_file(path))
 		return read_file(path, length);
-	text = hull_import_compose(path, said ? NULL : stderr);
+	text = hull_vagrant_is_file(path) ? hull_vagrant_form(path, said ? NULL : stderr) :
+	       hull_import_compose(path, said ? NULL : stderr);
 	said = 1;
 	if (text == NULL)
 		return NULL;
@@ -339,7 +342,7 @@ static uint8_t *spec_text(const char *path, size_t *length)
 static const char *compose_file(void)
 {
 	static const char *const names[] = {
-		"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"
+		"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml", "Vagrantfile"
 	};
 
 	for (size_t i = 0u; i < sizeof names / sizeof names[0]; i++)
@@ -4217,6 +4220,45 @@ static int compose_builds(const options *o, const hull_registry *registry)
 	return status != 0;
 }
 
+/* A Vagrantfile's shell provisioners, each machine's a build on its box,
+ * as compose_builds() builds a service: so a second `hull up` costs a look
+ * where Vagrant would run them once and keep the machine. 0, or 1. */
+static int vagrant_builds(const options *o, const hull_registry *registry)
+{
+	const hull_vagrant_build *list;
+	unsigned                  count;
+	char                     *text = hull_vagrant_form(o->file, NULL);
+	int                       status = 0;
+
+	if (text == NULL)
+		return 1;
+	free(text);
+	count = hull_vagrant_builds(&list);
+	for (unsigned i = 0u; i < count && status == 0; i++) {
+		options sub = *o;
+		char    path[64];
+		int     out = dup(1);
+		int     fd = memfd_create("hull-vagrant", MFD_CLOEXEC);
+		size_t  length = list[i].form != NULL ? strlen(list[i].form) : 0u;
+
+		if (fd < 0 || out < 0 || length == 0u || write(fd, list[i].form, length) != (ssize_t)length) {
+			perror("hull: up");
+			return 1;
+		}
+		fprintf(stderr, "hull: up: provisioning %s\n", list[i].ref);
+		snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
+		sub.file = path;
+		fflush(stdout);
+		dup2(2, 1);
+		status = build_file(&sub, registry, list[i].ref, 0);
+		fflush(stdout);
+		dup2(out, 1);
+		close(out);
+		close(fd);
+	}
+	return status != 0;
+}
+
 /* --- the other commands -------------------------------------------------- */
 
 /* Whether a core answers, without starting one; or would, holding the
@@ -4705,6 +4747,118 @@ static int media_import(const char *image, const char *dir)
 	printf("%s: %llu file%s, %llu bytes, %llu of them patch\n", dir, report.files,
 	       report.files == 1u ? "" : "s", report.bytes, report.patch_bytes);
 	return 0;
+}
+
+/* A child's status, stdout on stderr: this process's own is the caller's. */
+static int run_child(const char *const *argv)
+{
+	int   status = 1;
+	pid_t pid = fork();
+
+	if (pid == 0) {
+		dup2(2, 1);
+		execvp(argv[0], (char *const *)argv);
+		_exit(127);
+	}
+	if (pid < 0 || waitpid(pid, &status, 0) < 0)
+		return 1;
+	return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
+/* `hull vagrant box add NAME FILE`: a box is a tar around a virtual disk.
+ * The disk taken apart, the partition with a /sbin/init is the machine's
+ * root, committed as vagrant/NAME, which a Vagrantfile's box names. Its
+ * files are the user's, and its owners and devices stay in the patch that
+ * is dropped here, so what the image's own users own is root's. */
+static int vagrant_box_add(const char *name, const char *file)
+{
+	char           self[4096];
+	char           work[4200];
+	char           disk[4500] = "";
+	char           collection[4300];
+	char           root[4500] = "";
+	char           ref[300];
+	hull_store     store;
+	DIR           *dir;
+	struct dirent *entry;
+	ssize_t        n = readlink("/proc/self/exe", self, sizeof self - 1u);
+	int            status = 1;
+
+	if (n <= 0 || strpbrk(name, " \t\"") != NULL || open_store(&store, 1) != 0) {
+		fprintf(stderr, "hull: vagrant: a box's name is one word\n");
+		return 1;
+	}
+	self[n] = '\0';
+	snprintf(work, sizeof work, "%s/tmp/box-XXXXXX", store.root);
+	hull_store_close(&store);
+	if (mkdtemp(work) == NULL) {
+		perror(work);
+		return 1;
+	}
+	{
+		const char *const argv[] = { "tar", "-xf", file, "-C", work, "--no-same-owner", NULL };
+
+		if (run_child(argv) != 0) {
+			fprintf(stderr, "hull: vagrant: %s is not a box's tar\n", file);
+			goto done;
+		}
+	}
+	if ((dir = opendir(work)) == NULL)
+		goto done;
+	while ((entry = readdir(dir)) != NULL) {
+		const char *dot = strrchr(entry->d_name, '.');
+
+		if (dot != NULL && (strcmp(dot, ".vmdk") == 0 || strcmp(dot, ".img") == 0 ||
+		                    strcmp(dot, ".qcow2") == 0 || strcmp(dot, ".vdi") == 0 ||
+		                    strcmp(dot, ".vhd") == 0 || strcmp(dot, ".vhdx") == 0)) {
+			snprintf(disk, sizeof disk, "%s/%s", work, entry->d_name);
+			break;
+		}
+	}
+	closedir(dir);
+	if (disk[0] == '\0') {
+		fprintf(stderr, "hull: vagrant: %s holds no disk\n", file);
+		goto done;
+	}
+	snprintf(collection, sizeof collection, "%s/collection", work);
+	{
+		const char *const argv[] = { self, "media", "import", disk, collection, NULL };
+
+		if (run_child(argv) != 0)
+			goto done;
+	}
+	/* The disk's own tree, or the partition that is an operating system. */
+	snprintf(root, sizeof root, "%s/files", collection);
+	{
+		char probe[4600];
+
+		snprintf(probe, sizeof probe, "%s/sbin/init", root);
+		if (access(probe, F_OK) != 0 && faccessat(AT_FDCWD, probe, F_OK, AT_SYMLINK_NOFOLLOW) != 0) {
+			char found[4500] = "";
+
+			for (unsigned i = 1u; i <= 16u && found[0] == '\0'; i++) {
+				snprintf(probe, sizeof probe, "%s/files/p%u/sbin/init", collection, i);
+				if (faccessat(AT_FDCWD, probe, F_OK, AT_SYMLINK_NOFOLLOW) == 0)
+					snprintf(found, sizeof found, "%s/files/p%u", collection, i);
+			}
+			if (found[0] == '\0') {
+				fprintf(stderr, "hull: vagrant: no partition of %s has a /sbin/init\n", file);
+				goto done;
+			}
+			snprintf(root, sizeof root, "%s", found);
+		}
+	}
+	snprintf(ref, sizeof ref, "vagrant/%s", name);
+	{
+		const char *const argv[] = { self, "commit", root, ref, NULL };
+
+		status = run_child(argv);
+	}
+	if (status == 0)
+		printf("%s\n", ref);
+done:
+	hull_store_remove_tree(AT_FDCWD, work);
+	return status != 0;
 }
 
 /* `hull media verify DIR`: reassembled and held to the hash of what was
@@ -6512,6 +6666,9 @@ int main(int argc, char **argv)
 		}
 		return 0;
 	}
+	if (strcmp(command, "vagrant") == 0 && argc == 6 && strcmp(argv[2], "box") == 0 &&
+	    strcmp(argv[3], "add") == 0)
+		return vagrant_box_add(argv[4], argv[5]);
 	if (strcmp(command, "virtualbox") == 0 && argc == 3 && strcmp(argv[2], "fetch") == 0) {
 		char why[4400] = "";
 
@@ -6760,8 +6917,8 @@ int main(int argc, char **argv)
 		return strcmp(command, "run") == 0 ? 125 : 2;
 	}
 	if (o.file == NULL && (o.file = compose_file()) == NULL) {
-		fprintf(stderr, "hull: up: no compose.yaml, compose.yml, docker-compose.yaml or "
-		        "docker-compose.yml here; -f names one\n");
+		fprintf(stderr, "hull: up: no compose.yaml, compose.yml, docker-compose.yaml, "
+		        "docker-compose.yml or Vagrantfile here; -f names one\n");
 		return 125;
 	}
 	o.base = base_of(o.file);
@@ -6772,6 +6929,8 @@ int main(int argc, char **argv)
 	if (strcmp(command, "run") == 0) {
 		o.stream = stderr;
 		if (hull_import_is_compose(o.file) && compose_builds(&o, &registry) != 0)
+			return 125;
+		if (hull_vagrant_is_file(o.file) && vagrant_builds(&o, &registry) != 0)
 			return 125;
 		return run(&o, &registry, name);
 	}

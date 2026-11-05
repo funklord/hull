@@ -54,6 +54,7 @@ typedef struct walk {
 	uint64_t dir_extents[MAX_DIRS];
 	const char *extra;        /* more of media.conf, a raw dump's */
 	unsigned unit;            /* the bytes a sector of the layout is */
+	int      sparse;          /* its digest is hash_sparse's */
 } walk;
 
 static int fail(char *detail, size_t cap, const char *what, const char *why)
@@ -850,8 +851,8 @@ static int ext_file(walk *w, const ext *e, const uint8_t inode[128], ext_run *ru
 		unlink(path);
 		return 0;
 	}
-	(void)!fchmod(fd, (mode_t)(le16(inode) & 0777u) | 0600u);
 	if (size == 0u) {
+		(void)!fchmod(fd, (mode_t)(le16(inode) & 07777u) | 0600u);
 		close(fd);
 		return place(w, 0u, 0u, relative);
 	}
@@ -883,6 +884,8 @@ static int ext_file(walk *w, const ext *e, const uint8_t inode[128], ext_run *ru
 			done += n;
 		}
 	}
+	/* Last, as a write clears a setuid bit. */
+	(void)!fchmod(fd, (mode_t)(le16(inode) & 07777u) | 0600u);
 	return close(fd);
 }
 
@@ -1080,7 +1083,7 @@ static int read_partitions(walk *w, char *volume, size_t cap)
 
 /* media.conf's bytes and sha256, by the text this file wrote and any
  * readable form as near it as a hand might: (bytes N), (sha256 "H"). */
-static int read_conf(const char *dir, uint64_t *bytes, char sha[65], unsigned *unit)
+static int read_conf(const char *dir, uint64_t *bytes, char sha[65], unsigned *unit, int *sparse)
 {
 	char    path[4300];
 	static char text[65536];
@@ -1100,6 +1103,7 @@ static int read_conf(const char *dir, uint64_t *bytes, char sha[65], unsigned *u
 		return -1;
 	if ((at = strstr(text, "(sha256 \"")) == NULL || sscanf(at, "(sha256 \"%64[0-9a-f]\")", sha) != 1)
 		return -1;
+	*sparse = strstr(text, "(sparse true)") != NULL;
 	*unit = SECTOR;
 	if ((at = strstr(text, "(unit ")) != NULL &&
 	    (sscanf(at, "(unit %u)", unit) != 1 || *unit == 0u || *unit > SECTOR * 2u))
@@ -1242,6 +1246,66 @@ static int hash_fd(int fd, uint64_t bytes, char out[65])
 		hull_sha256_update(&h, buffer, n);
 		done += n;
 	}
+	hull_sha256_final(&h, digest);
+	hull_sha256_hex(digest, out);
+	return 0;
+}
+
+/*
+ * A virtual machine's disk is mostly holes: 128 GiB holding 100 MB is
+ * usual, and a SHA-256 of it reads every zero. So a sparse image's digest
+ * is over what it holds: each non-zero block of SPARSE_BLOCK bytes with its
+ * offset, then the size. That is the same whether the zeros are holes or
+ * were written, so reassembly gives the same digest however it lays them
+ * out, and it is no plain sha256, which media.conf's (sparse true) says.
+ */
+#define SPARSE_BLOCK 4096u
+
+static void le64_of(uint64_t value, uint8_t out[8])
+{
+	for (unsigned i = 0u; i < 8u; i++)
+		out[i] = (uint8_t)(value >> (8u * i));
+}
+
+/* The next offset from `at` where `fd` may hold data, or `bytes` if none.
+ * A filesystem without SEEK_DATA says everything is data, which is right. */
+static uint64_t next_data(int fd, uint64_t at, uint64_t bytes)
+{
+	off_t found = lseek(fd, (off_t)at, SEEK_DATA);
+
+	return found < 0 ? (errno == ENXIO ? bytes : at) : (uint64_t)found;
+}
+
+static int hash_sparse(int fd, uint64_t bytes, char out[65])
+{
+	static uint8_t       buffer[COPY_BYTES];
+	static const uint8_t zero[SPARSE_BLOCK];
+	hull_sha256          h;
+	uint8_t              digest[32];
+	uint8_t              offset[8];
+	uint64_t             at = 0u;
+
+	hull_sha256_init(&h);
+	while ((at = next_data(fd, at, bytes)) < bytes) {
+		size_t n;
+
+		at -= at % SPARSE_BLOCK;
+		n = bytes - at < sizeof buffer ? (size_t)(bytes - at) : sizeof buffer;
+		if (read_all(fd, buffer, n, at) != 0)
+			return -1;
+		for (size_t i = 0u; i < n; i += SPARSE_BLOCK) {
+			size_t piece = n - i < SPARSE_BLOCK ? n - i : SPARSE_BLOCK;
+
+			if (memcmp(buffer + i, zero, piece) != 0) {
+				le64_of(at + i, offset);
+				hull_sha256_update(&h, offset, sizeof offset);
+				hull_sha256_update(&h, buffer + i, piece);
+			}
+		}
+		at += n;
+	}
+	le64_of(bytes, offset);
+	hull_sha256_update(&h, offset, sizeof offset);
 	hull_sha256_final(&h, digest);
 	hull_sha256_hex(digest, out);
 	return 0;
@@ -1657,17 +1721,18 @@ int hull_media_write(const char *dir, int fd, char *detail, size_t cap)
 {
 	uint64_t bytes;
 	unsigned unit;
+	int      sparse;
 	char     want[65];
 	char     got[65];
 
-	if (read_conf(dir, &bytes, want, &unit) != 0)
+	if (read_conf(dir, &bytes, want, &unit, &sparse) != 0)
 		return fail(detail, cap, "the collection's media.conf gives no bytes and sha256", NULL);
 	if (ftruncate(fd, (off_t)bytes) != 0)
 		return fail(detail, cap, "the disc's image cannot be sized", strerror(errno));
 	if (place_files(dir, fd, bytes, unit, detail, cap) != 0 ||
 	    apply_quirks(dir, fd, bytes, unit, detail, cap) != 0)
 		return -1;
-	if (hash_fd(fd, bytes, got) != 0)
+	if ((sparse ? hash_sparse(fd, bytes, got) : hash_fd(fd, bytes, got)) != 0)
 		return fail(detail, cap, "the disc's image cannot be read back", strerror(errno));
 	if (strcmp(want, got) != 0) {
 		snprintf(detail, cap, "the collection no longer gives its disc: sha256 %s, and %s was "
@@ -1805,8 +1870,23 @@ static int write_quirks(const walk *w, int naive, const char *dir, hull_media_re
 	uint64_t       run_at = 0u;
 
 	for (uint64_t at = 0u; at < w->bytes;) {
-		size_t n = w->bytes - at < sizeof ours ? (size_t)(w->bytes - at) : sizeof ours;
+		size_t   n;
+		uint64_t next = next_data(w->image, at, w->bytes);
+		uint64_t other = next_data(naive, at, w->bytes);
 
+		/* Where both are holes, they agree. */
+		if (other < next)
+			next = other;
+		if (next > at) {
+			if (run >= 0) {
+				close(run);
+				run = -1;
+			}
+			if (next >= w->bytes)
+				break;
+			at = next - next % w->unit;
+		}
+		n = w->bytes - at < sizeof ours ? (size_t)(w->bytes - at) : sizeof ours;
 		if (read_all(w->image, theirs, n, at) != 0 || read_all(naive, ours, n, at) != 0)
 			return fail(detail, cap, "the image cannot be read", strerror(errno));
 		for (size_t i = 0u; i < n; i += w->unit) {
@@ -1866,7 +1946,7 @@ static int import_into(walk *w, const char *dir, hull_media_report *report, char
 		    (!found && read_partitions(w, volume, sizeof volume) != 0))
 			return fail(detail, cap, "the disk's files cannot be written", strerror(errno));
 	}
-	if (hash_fd(w->image, w->bytes, sha) != 0)
+	if ((w->sparse ? hash_sparse(w->image, w->bytes, sha) : hash_fd(w->image, w->bytes, sha)) != 0)
 		return fail(detail, cap, "the image cannot be read", strerror(errno));
 	if (w->count != 0u)
 		qsort(w->files, w->count, sizeof w->files[0], by_sector);
@@ -1874,8 +1954,9 @@ static int import_into(walk *w, const char *dir, hull_media_report *report, char
 	snprintf(path, sizeof path, "%s/media.conf", dir);
 	if ((file = fopen(path, "we")) == NULL)
 		return fail(detail, cap, path, strerror(errno));
-	fprintf(file, "(disc (volume \"%s\") (bytes %" PRIu64 ") (sha256 \"%s\") (unit %u)%s)\n",
-	        volume, w->bytes, sha, w->unit, w->extra != NULL ? w->extra : "");
+	fprintf(file, "(disc (volume \"%s\") (bytes %" PRIu64 ") (sha256 \"%s\") (unit %u)%s%s)\n",
+	        volume, w->bytes, sha, w->unit, w->sparse ? " (sparse true)" : "",
+	        w->extra != NULL ? w->extra : "");
 	if (fclose(file) != 0)
 		return fail(detail, cap, path, strerror(errno));
 	snprintf(path, sizeof path, "%s/layout.conf", dir);
@@ -2219,6 +2300,8 @@ int hull_media_import(const char *image, const char *dir, hull_media_report *rep
 		goto done;
 	}
 	w->bytes = (uint64_t)st.st_size;
+	/* Mostly holes. */
+	w->sparse = (uint64_t)st.st_blocks * 512u < w->bytes / 2u;
 	if (mkdir(dir, 0755) != 0) {
 		fail(detail, cap, dir, strerror(errno));
 		goto done;

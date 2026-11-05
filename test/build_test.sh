@@ -399,6 +399,79 @@ expect 0 'step copy-1: cached' sh -c 'cd "$1/cp" && exec "$2" up 2>&1' sh "$root
 expect 0 'build key not translated: args' "$hull" plan -f "$root/cp/compose.yaml"
 expect 0 'source "compose/cp/web"' "$hull" import "$root/cp/compose.yaml"
 
+# A Vagrantfile and a box: the box a tar around a VMDK, as vagrantcloud's
+# are, of mke2fs's and qemu-img's making; the file's declarations read, its
+# Ruby refused, and a shell provisioner built on the box by `hull up`.
+mke2fs=$(command -v mke2fs || ls /usr/sbin/mke2fs /sbin/mke2fs 2>/dev/null | head -1)
+if [ -n "$mke2fs" ] && command -v qemu-img > /dev/null 2>&1; then
+	mkdir -p "$root/vg/rootfs/sbin" "$root/vg/rootfs/bin" "$root/vg/rootfs/etc" "$root/vg/rootfs/tmp" \
+		"$root/vg/box"
+	cp "$probe" "$root/vg/rootfs/sbin/init"
+	cp "$probe" "$root/vg/rootfs/bin/sh"
+	printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/vg/rootfs/etc/passwd"
+	"$mke2fs" -q -F -t ext4 -d "$root/vg/rootfs" "$root/vg/disk.raw" 16M
+	qemu-img convert -f raw -O vmdk "$root/vg/disk.raw" "$root/vg/box/box-disk001.vmdk"
+	printf '{"provider":"virtualbox"}\n' > "$root/vg/box/metadata.json"
+	tar -C "$root/vg/box" -cf "$root/vg/test.box" box-disk001.vmdk metadata.json
+	expect 0 '^vagrant/test/box$' "$hull" vagrant box add test/box "$root/vg/test.box"
+	expect 0 '^vagrant/test/box' "$hull" images
+	expect 1 'is not a box' "$hull" vagrant box add test/none "$root/vg/disk.raw.none"
+	mkdir -p "$root/vg/project"
+	cat > "$root/vg/project/Vagrantfile" <<'VAGRANTFILE'
+# -*- mode: ruby -*-
+VAGRANTFILE_API_VERSION = "2"
+$setup = <<-SCRIPT
+say provisioned
+SCRIPT
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+  config.vm.box = "test/box"
+  config.vm.box_check_update = false
+  config.vm.hostname = "vagrantbox"
+  config.vm.network "forwarded_port", guest: 80, host: 8088
+  config.vm.network :forwarded_port, guest: 53, host: 5353, protocol: "udp"
+  config.vm.network "private_network", ip: "192.168.33.10"
+  config.vm.synced_folder "./data", "/data"
+  config.vm.provider "virtualbox" do |vb|
+    vb.memory = "1024"
+    vb.cpus = 2
+    vb.customize ["modifyvm", :id, "--ioapic", "on"]
+  end
+  config.vm.provision "shell", inline: $setup
+end
+VAGRANTFILE
+	mkdir -p "$root/vg/project/data"
+	expect 1 '' "$hull" plan -f "$root/vg/project/Vagrantfile" --backend chroot
+	said=$("$hull" plan --resolved -f "$root/vg/project/Vagrantfile" --backend vm 2>&1)
+	check 'a Vagrantfile is read' sh -c 'printf "%s\n" "$1" | grep -q "private_network" &&
+		printf "%s\n" "$1" | grep -q "customize"' sh "$said"
+	vagrant_up=$(cd "$root/vg/project" && timeout 60 "$hull" up --backend chroot 2>&1)
+	check 'a provisioner is built on the box' sh -c 'printf "%s\n" "$1" | grep -q "step provision"' \
+		sh "$vagrant_up"
+	expect 0 '^vagrant/project/default' "$hull" images
+	# Ruby is refused, by line, rather than guessed at.
+	for ruby in '3.times do |i|' 'if ENV["X"]' 'config.vm.box = "a#{1}"' 'require "yaml"'; do
+		printf 'Vagrant.configure("2") do |config|\n  %s\nend\n' "$ruby" > "$root/vg/Vagrantfile"
+		expect 2 'Vagrantfile:2:' "$hull" plan -f "$root/vg/Vagrantfile"
+	done
+	# Several machines, each with what config. says and its own.
+	cat > "$root/vg/Vagrantfile" <<'VAGRANTFILE'
+Vagrant.configure("2") do |config|
+  config.vm.box = "test/box"
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+  config.vm.define "web" do |web|
+    web.vm.hostname = "web"
+  end
+  config.vm.define :db do |db|
+    db.vm.hostname = "db"
+  end
+end
+VAGRANTFILE
+	expect 0 'web on qemu' "$hull" plan -f "$root/vg/Vagrantfile" --backend vm
+	expect 0 'db on qemu' "$hull" plan -f "$root/vg/Vagrantfile" --backend vm
+else
+	echo 'build: a Vagrantfile not measured: no mke2fs or qemu-img'
+fi
+
 kill "$listener" 2> /dev/null
 wait "$listener" 2> /dev/null
 trap - EXIT

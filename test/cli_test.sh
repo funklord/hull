@@ -264,7 +264,7 @@ gbc '\(after db\)'
 gbc '\(ready \(command "pg_isready" "-U" "app"\) \(interval "5s"\) \(timeout "50s"\)\)'
 gbc '\(ready \(command "/bin/sh" "-c" "redis-cli ping"\) \(interval "30s"\) \(timeout "180s"\)\)'
 gbc '; depends_on db: service_completed_successfully not translated, its start waited for instead'
-gbc '; build not translated'
+gbc '; built by hull up from its Dockerfile, as: compose/'
 gbc '\(web \(source .*\(segments \(cli-default \(subnet "10\.1[6-9][0-9]\.[0-9]+\.0/24"\)\)\)'
 gbc '\(db \(source .*\(segments \(cli-backend \(subnet "10\.1[6-9][0-9]\.[0-9]+\.0/24"\)\)\)'
 gbc '\(work-er \(source "busybox:1\.36"\) \(segments \(cli-backend \(subnet [^)]*\)\) \(cli-front '
@@ -1668,8 +1668,11 @@ done
 cases=$((cases + 1))
 printf '%s\n' "$out" | grep -q 'depends_on\|healthcheck' && fail "hull up said it did not translate depends_on" "$out"
 expect 0 'compose\.yaml: db on chroot \(ns\): ok' "$hull" plan -f "$root/compose.yaml" --backend chroot
-printf 'services:\n  lost:\n    build: ./lost\n' > "$root/noimage.yaml"
+printf 'services:\n  lost:\n    command: ["true"]\n' > "$root/noimage.yaml"
 expect 125 'noimage\.yaml: lost: no image to run it from' "$hull" up -f "$root/noimage.yaml"
+# A build: with no Dockerfile says which it looked for.
+printf 'services:\n  lost:\n    build: ./lost\n' > "$root/nodockerfile.yaml"
+expect 125 'lost/Dockerfile: cannot open' "$hull" up -f "$root/nodockerfile.yaml"
 expect 125 'no compose\.yaml' sh -c 'cd "$1" && exec "$2" up' up "$root/rootfs" "$hull_abs"
 # A foreign arch on chroot, rootless: the probe built for arm64, run
 # translated by the host's qemu-user through binfmt_misc in the machine's
