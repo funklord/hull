@@ -349,6 +349,38 @@ INIT
 	says 'it booted' "$(cat "$root/linux.out")" 'a linux on a pc'
 	says 'a client at its address reached it' "$(cat "$root/linux.out")" 'from the host'
 
+	# The serial bridge: a shell on COM1, driven from the host through
+	# `hull exec ... console`, with nothing of hull's in the guest.
+	cat > "$tree/init.sh" <<'INIT'
+#!/bin/busybox sh
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t devtmpfs none /dev
+/bin/busybox --install -s /bin
+echo console-ready
+exec sh < /dev/ttyS0 > /dev/ttyS0 2>&1
+INIT
+	out=$(timeout 120 "$hull" export --bootable "$tree" "$root/shell.img" --init /init.sh 2>&1)
+	status 'a system with a shell on its serial port' "$?" 0 "$out"
+	conf '(source "image:./shell.img") (memory "512M") (tuning (pc (firmware uefi)))'
+	timeout 90 "$hull" run -f "$root/hull.conf" > "$root/shell.out" 2>&1 &
+	pid=$!
+	n=0
+	while [ "$n" -lt 60 ] && ! grep -qa console-ready "$root/shell.out"; do
+		sleep 1
+		n=$((n + 1))
+	done
+	id=$("$hull" ps | awk '$5 == "running" { print $1 }')
+	out=$(timeout 10 "$hull" exec "$id" -- ls 2>&1)
+	status 'a command is refused' "$?" 125 "$out"
+	says 'and the console named' "$out" 'console'
+	# Its input ending ends nothing; the machine's end ends it.
+	out=$( { sleep 1; printf 'echo marker-$((40 + 2))\n'; sleep 2; printf 'poweroff -f\n'; sleep 20; } |
+		timeout 40 "$hull" exec "$id" -- console 2>&1)
+	status 'a console ends with its machine' "$?" 0 "$out"
+	says 'what was typed ran in the guest' "$out" 'marker-42'
+	wait "$pid"
+	status 'and that was the guest powering off' "$?" 0 "$(tail -3 "$root/shell.out")"
+
 	# Two of them on a wire of hull's: a legacy machine is a host of the
 	# networks hull simulates. Each sets its own address, as it must.
 	cat > "$tree/init.sh" <<'INIT'

@@ -15,6 +15,14 @@
  * hash media.c holds to the collection's, its writes going with the fd,
  * so a killed core leaves nothing to sweep.
  *
+ * `hull exec -t ID -- console` is the serial bridge: a stream joined to
+ * COM1, input written to the port and what the port says copied to it,
+ * so a system with a console there can be driven with nothing of hull's
+ * in the guest. It is a terminal and no more: no exit status of what is
+ * typed, no sftp, no forwarding. One at a time. What the port says goes
+ * through a pipe of the console's, dropped when full, for a slow client
+ * must not hold the machine's own output, or its guest, back.
+ *
  * The guest powering off is the machine's end, status 0, and a stop
  * pulls the plug by SIGTERM, there being no agent to ask and no telling
  * whether a 1990s system answers ACPI.
@@ -32,6 +40,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -54,6 +63,14 @@ typedef struct medium {
 	int   fd;            /* a collection reassembled, or -1 */
 	char  format[8];     /* qemu's word for an image's container */
 } medium;
+
+struct hull_stream {
+	hull_machine *machine;
+	hull_core    *core;
+	int           from;     /* the console's end of its pipe */
+	int           to;       /* the reader's, or -1 once the console has ended */
+	pthread_t     thread;
+};
 
 struct hull_machine {
 	hull_core      *core;
@@ -85,6 +102,8 @@ struct hull_machine {
 	pid_t           pid;
 	int             out;            /* the first serial port */
 	int             err;            /* qemu's stderr */
+	int             input;          /* COM1's input: qemu's stdin, a socket */
+	hull_stream    *console;        /* the one joined to COM1, or NULL */
 	pthread_t       reader;
 	int             reading;
 	pthread_mutex_t lock;
@@ -131,6 +150,8 @@ static void release(hull_machine *m)
 		close(m->out);
 	if (m->err >= 0)
 		close(m->err);
+	if (m->input >= 0)
+		close(m->input);
 	pthread_mutex_destroy(&m->lock);
 	pthread_cond_destroy(&m->done_cond);
 	free(m);
@@ -599,6 +620,27 @@ static void exec_qemu(const hull_machine *m)
 	execvp(argv[0], argv);
 }
 
+/* What COM1 said, to the console where one is joined. */
+static void to_console(hull_machine *m, const uint8_t *data, size_t n)
+{
+	pthread_mutex_lock(&m->lock);
+	if (m->console != NULL && m->console->to >= 0 && write(m->console->to, data, n) < 0) {
+		/* Full: a console's reader behind, and what it missed is gone. */
+	}
+	pthread_mutex_unlock(&m->lock);
+}
+
+/* The console ended, its thread reading to the pipe's end. */
+static void end_console(hull_machine *m)
+{
+	pthread_mutex_lock(&m->lock);
+	if (m->console != NULL && m->console->to >= 0) {
+		close(m->console->to);
+		m->console->to = -1;
+	}
+	pthread_mutex_unlock(&m->lock);
+}
+
 /* The two pipes handed on until both end, then the end said. */
 static void *read_machine(void *arg)
 {
@@ -622,6 +664,8 @@ static void *read_machine(void *arg)
 			n = read(fds[i].fd, buffer, sizeof buffer);
 			if (n > 0) {
 				host->on_data(m->core, NULL, (int)i + 1, buffer, (size_t)n);
+				if (i == 0u)
+					to_console(m, buffer, (size_t)n);
 			} else if (n == 0 || errno != EINTR) {
 				fds[i].fd = -1;
 				open_fds--;
@@ -634,6 +678,7 @@ static void *read_machine(void *arg)
 	m->done = 1;
 	pthread_cond_broadcast(&m->done_cond);
 	pthread_mutex_unlock(&m->lock);
+	end_console(m);
 	if (WIFSIGNALED(status))
 		host->on_exit(m->core, m, NULL, -1, WTERMSIG(status));
 	else
@@ -659,6 +704,7 @@ static hull_status pc_create(hull_core *core, hull_buf plan, hull_machine **out,
 	m->pid  = -1;
 	m->out  = -1;
 	m->err  = -1;
+	m->input = -1;
 	pthread_mutex_init(&m->lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
 	if ((reason = read_plan(m, &doc, &machine)) == NULL && m->cache[0] == '\0' && !m->direct)
@@ -677,6 +723,7 @@ static hull_status pc_start(hull_core *core, hull_machine *m, hull_error *error)
 {
 	int   out[2];
 	int   err[2];
+	int   in[2];
 	pid_t parent = getpid();
 
 	(void)core;
@@ -691,15 +738,24 @@ static hull_status pc_start(hull_core *core, hull_machine *m, hull_error *error)
 		if (m->segment_fd[i] < 0)
 			return fail(error, HULL_ERR_RUNTIME, detail);
 	}
-	if (pipe2(out, O_CLOEXEC) != 0)
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, in) != 0)
+		return fail(error, HULL_ERR_RUNTIME, "a socket for the machine could not be made");
+	if (pipe2(out, O_CLOEXEC) != 0) {
+		close(in[0]);
+		close(in[1]);
 		return fail(error, HULL_ERR_RUNTIME, "a pipe for the machine could not be made");
+	}
 	if (pipe2(err, O_CLOEXEC) != 0) {
+		close(in[0]);
+		close(in[1]);
 		close(out[0]);
 		close(out[1]);
 		return fail(error, HULL_ERR_RUNTIME, "a pipe for the machine could not be made");
 	}
 	m->pid = fork();
 	if (m->pid < 0) {
+		close(in[0]);
+		close(in[1]);
 		close(out[0]);
 		close(out[1]);
 		close(err[0]);
@@ -707,9 +763,7 @@ static hull_status pc_start(hull_core *core, hull_machine *m, hull_error *error)
 		return fail(error, HULL_ERR_RUNTIME, "qemu could not be started");
 	}
 	if (m->pid == 0) {
-		int null = open("/dev/null", O_RDONLY);
-
-		if (null < 0 || dup2(null, 0) < 0 || dup2(out[1], 1) < 0 || dup2(err[1], 2) < 0 ||
+		if (dup2(in[1], 0) < 0 || dup2(out[1], 1) < 0 || dup2(err[1], 2) < 0 ||
 		    setsid() < 0 || prctl(PR_SET_PDEATHSIG, SIGKILL, 0L, 0L, 0L) != 0 ||
 		    getppid() != parent || prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) != 0)
 			_exit(126);
@@ -720,8 +774,10 @@ static hull_status pc_start(hull_core *core, hull_machine *m, hull_error *error)
 		dprintf(2, "qemu-system-x86_64, which a pc machine needs: %s\n", strerror(errno));
 		_exit(127);
 	}
+	close(in[1]);
 	close(out[1]);
 	close(err[1]);
+	m->input = in[0];
 	for (unsigned i = 0u; i < m->segment_count; i++) {
 		close(m->segment_fd[i]);
 		m->segment_fd[i] = -1;
@@ -801,12 +857,132 @@ static hull_status pc_signal(hull_core *core, hull_machine *m, hull_stream *stre
                              hull_error *error)
 {
 	(void)core;
-	if (stream != NULL)
-		return fail(error, HULL_ERR_UNSUPPORTED, "a pc machine has no commands but its own");
+	(void)error;
+	/* A signal to the console detaches it; the machine goes on. */
+	if (stream != NULL) {
+		end_console(m);
+		return HULL_OK;
+	}
 	pthread_mutex_lock(&m->lock);
 	if (!m->done && m->pid > 0)
 		kill(m->pid, signum);
 	pthread_mutex_unlock(&m->lock);
+	return HULL_OK;
+}
+
+/* The console's thread: the pipe, to its end, then the stream's end. */
+static void *deliver_console(void *arg)
+{
+	hull_stream *st = arg;
+	uint8_t      buffer[4096];
+	ssize_t      n;
+
+	while ((n = read(st->from, buffer, sizeof buffer)) > 0 || (n < 0 && errno == EINTR))
+		if (n > 0)
+			host->on_data(st->core, st, 1, buffer, (size_t)n);
+	host->on_exit(st->core, st->machine, st, 0, 0);
+	return NULL;
+}
+
+static hull_status pc_exec(hull_core *core, hull_machine *m, hull_buf spec, hull_stream **out,
+                           hull_error *error)
+{
+	hull_sexpr_doc  doc;
+	hull_sexpr_form message;
+	hull_sexpr_form argv;
+	hull_sexpr_form word;
+	hull_stream    *st;
+	char           *first = NULL;
+	int             ends[2];
+	int             asked;
+
+	if (hull_sexpr_open(&doc, spec.data, spec.len, HULL_SEXPR_CANONICAL, NULL) == HULL_SEXPR_OK &&
+	    hull_sexpr_first(&doc, &message) && hull_access_find(&doc, &message, "argv", &argv)) {
+		hull_sexpr_child(&doc, &argv, &word);
+		if (hull_sexpr_next(&doc, &word, &word))
+			first = hull_access_text(&doc, &word);
+	}
+	asked = first != NULL && strcmp(first, "console") == 0;
+	free(first);
+	if (!asked)
+		return fail(error, HULL_ERR_UNSUPPORTED, "nothing of hull's runs in a pc machine to run a "
+		            "command: `console` is its serial port, the one thing there is");
+	if ((st = calloc(1u, sizeof *st)) == NULL)
+		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+	if (pipe2(ends, O_CLOEXEC) != 0 || fcntl(ends[1], F_SETFL, O_NONBLOCK) != 0) {
+		free(st);
+		return fail(error, HULL_ERR_RUNTIME, "a pipe for the console could not be made");
+	}
+	st->machine = m;
+	st->core    = core;
+	st->from    = ends[0];
+	st->to      = ends[1];
+	pthread_mutex_lock(&m->lock);
+	if (m->done || m->console != NULL) {
+		int gone = m->done;
+
+		pthread_mutex_unlock(&m->lock);
+		close(ends[0]);
+		close(ends[1]);
+		free(st);
+		return gone ? fail(error, HULL_ERR_GONE, "the machine is not running") :
+		       fail(error, HULL_ERR_BUSY, "the serial port has a console joined to it already");
+	}
+	m->console = st;
+	pthread_mutex_unlock(&m->lock);
+	if (pthread_create(&st->thread, NULL, deliver_console, st) != 0) {
+		end_console(m);
+		pthread_mutex_lock(&m->lock);
+		m->console = NULL;
+		pthread_mutex_unlock(&m->lock);
+		close(ends[0]);
+		free(st);
+		return fail(error, HULL_ERR_INTERNAL, "the console's thread could not start");
+	}
+	*out = st;
+	return HULL_OK;
+}
+
+/* Input for COM1: it goes to qemu's stdin, which the port reads. */
+static hull_status pc_stream_write(hull_core *core, hull_stream *st, const uint8_t *data,
+                                   size_t length, hull_error *error)
+{
+	(void)core;
+	while (length > 0u) {
+		ssize_t n = send(st->machine->input, data, length, MSG_NOSIGNAL);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			return fail(error, HULL_ERR_GONE, "the machine is not running");
+		data += n;
+		length -= (size_t)n;
+	}
+	return HULL_OK;
+}
+
+/* A client's input ending ends nothing: what it typed may still answer. */
+static hull_status pc_stream_eof(hull_core *core, hull_stream *st, hull_error *error)
+{
+	(void)core;
+	(void)st;
+	(void)error;
+	return HULL_OK;
+}
+
+static hull_status pc_stream_close(hull_core *core, hull_stream *st, hull_error *error)
+{
+	hull_machine *m = st->machine;
+
+	(void)core;
+	(void)error;
+	end_console(m);
+	pthread_join(st->thread, NULL);
+	pthread_mutex_lock(&m->lock);
+	m->console = NULL;
+	pthread_mutex_unlock(&m->lock);
+	close(st->from);
+	free(st);
 	return HULL_OK;
 }
 
@@ -935,6 +1111,10 @@ static const hull_engine_ops ops = {
 	.stop        = pc_stop,
 	.destroy     = pc_destroy,
 	.signal      = pc_signal,
+	.exec         = pc_exec,
+	.stream_write = pc_stream_write,
+	.stream_eof   = pc_stream_eof,
+	.stream_close = pc_stream_close,
 	.stats       = pc_stats,
 	.pause       = pc_pause,
 };

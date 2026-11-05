@@ -442,7 +442,7 @@ by one line:
 
 The pc class boots what a PC's firmware can: an old Windows, OS/2, a
 Linux of its day, from a disk, a CD-ROM or a floppy. No agent runs in
-it, so no `hull exec` or `hull ssh`: `source` says which drive boots,
+it, so no `hull ssh`, and `hull exec` only its serial console: `source` says which drive boots,
 and installing from a disc then booting the disk is one changed line.
 
 ```scheme
@@ -463,6 +463,7 @@ and installing from a disc then booting the disk is one changed line.
 | Media | an `image:` file (raw, qcow2, vmdk, vhd, vhdx, vdi), or a `dir:` collection of `hull media import`, reassembled and its hash checked |
 | Writes | thrown away with the machine by default; `(mutable direct)` writes the image |
 | Output | its first serial port is `hull run`'s output; powering off is exit 0 |
+| Console | `hull exec -t ID -- console` joins your terminal to that port, nothing installed in the guest |
 | Screen | `(display window)`, an SDL window on your X display, or `(display vnc)`, port 5900 at its address; no sound yet |
 | Network | none unless `(network nat)`; ports on the machine's own address |
 | Tuning | `(tuning (pc (machine pc\|q35\|isapc) (firmware bios\|uefi) (vga …) (nic …) (accel …)))` |
