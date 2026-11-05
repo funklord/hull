@@ -319,7 +319,7 @@ static void write_machine(writer *w, const char *projection)
 	put_default(w, "writeback", "(writeback none)", machine->offset);
 	put_default(w, "ssh", "(ssh false)", machine->offset);
 	put_default(w, "on_disconnect", "(on_disconnect stop)", machine->offset);
-	if (!ref_source(w, &source))
+	if (!ref_source(w, &source) && strcmp(w->choice->class_name, "pc") != 0)
 		put_default(w, "workdir", "(workdir \"/\")", machine->offset);
 	if (w->name != NULL && !has(w, machine, "hostname")) {
 		put(w, " (hostname \"", machine->offset);

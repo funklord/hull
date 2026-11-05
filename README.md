@@ -187,6 +187,7 @@ reason, and where one exists, the `--accept` token that takes it anyway).
 | `docker` | ns | namespaces | the host's | a Docker daemon | written, optional |
 | `dosbox` | dos | full PC emulation | DOS | dosbox | written |
 | `dosemu` | dos | DOS on the host's CPU | FreeDOS (fdpp) | dosemu2 | written |
+| `qemu-pc` | pc | a whole PC, by KVM or emulated | the guest's own | qemu | written |
 | crun | ns | namespaces | the host's | user namespaces | designed |
 | `virtualbox` | vm | hardware virtualization, inside a qemu vm | its own | VirtualBox's `vboxdrv`, `/dev/kvm`, `hull virtualbox fetch` | written |
 | vmware | vm | hardware virtualization | its own | the hypervisor | designed |
@@ -436,6 +437,38 @@ by one line:
 | SSH | `hull ssh`, the machine's host key, as on every engine |
 | Volumes | VirtualBox's shared folders, by the kernel's own `vboxsf`: no Guest Additions in the image |
 | Refused | `(mutable direct)`, layered and block volumes, `(on_disconnect keep)`, `hull pause` |
+
+## qemu-pc — a whole PC, its system its own
+
+The pc class boots what a PC's firmware can: an old Windows, OS/2, a
+Linux of its day, from a disk, a CD-ROM or a floppy. No agent runs in
+it, so no `hull exec` or `hull ssh`: `source` says which drive boots,
+and installing from a disc then booting the disk is one changed line.
+
+```scheme
+(machine
+  (backend pc)
+  (source "media:cdrom")          ; then "media:disk"
+  (mutable direct)
+  (memory "64M")
+  (display window)
+  (media
+    (medium (type disk) (source "image:./c.img"))
+    (medium (type cdrom) (source "dir:./setup-disc"))))
+```
+
+| | |
+|---|---|
+| Boots | `media:cdrom`, `media:disk`, `media:floppy`, or `image:./old.vmdk` attached as it came |
+| Media | an `image:` file (raw, qcow2, vmdk, vhd, vhdx, vdi), or a `dir:` collection of `hull media import`, reassembled and its hash checked |
+| Writes | thrown away with the machine by default; `(mutable direct)` writes the image |
+| Output | its first serial port is `hull run`'s output; powering off is exit 0 |
+| Screen | `(display window)`, an SDL window on your X display; no sound yet |
+| Network | none unless `(network nat)`; ports on the machine's own address |
+| Tuning | `(tuning (pc (machine pc\|q35\|isapc) (firmware bios\|uefi) (vga …) (nic …) (accel …)))` |
+
+**When you want it:** a system that is not Linux and not DOS, or an old
+VM's disk, run from a plain file with no VM manager around it.
 
 ## dosbox and dosemu — a DOS PC, for software written for one
 

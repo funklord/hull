@@ -98,7 +98,8 @@ PLAN_OBJS = $(BUILD_DIR)/plan/matrix.o $(BUILD_DIR)/plan/registry.o \
 # lives; `hull --version` prints it.
 ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/chroot.o $(BUILD_DIR)/engine/dos.o \
-              $(BUILD_DIR)/engine/dosbox.o $(BUILD_DIR)/engine/dosemu.o $(BUILD_DIR)/engine/iso.o \
+              $(BUILD_DIR)/engine/dosbox.o $(BUILD_DIR)/engine/dosemu.o $(BUILD_DIR)/engine/pc.o \
+              $(BUILD_DIR)/engine/iso.o \
               $(BUILD_DIR)/engine/media.o \
               $(GEN_DIR)/disc.o \
               $(BUILD_DIR)/engine/access.o \
@@ -317,7 +318,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all kernel limine nss root install-root check check-docker check-qemu check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all kernel limine nss root install-root check check-docker check-pc check-qemu check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -338,6 +339,7 @@ help:
 	@echo '  check     style, the situ contracts, then the tests'
 	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
 	@echo '  check-qemu    hull run on the qemu engine, as the user, with KVM'
+	@echo '  check-pc      a whole PC booting its own media, as the user'
 	@echo '  check-virtualbox  hull run on VirtualBox, inside a vm, as the user'
 	@echo '  check-root    root mode'"'"'s native grants, hull-root setuid, inside a vm'
 	@echo '  check-sanitize  the unit tests, store and pull under ASan and UBSan'
@@ -690,6 +692,9 @@ check-flip: $(HULL) $(AGENT_BIN) $(PROBE) $(BUILD_DIR)/test/tree_tar
 
 check-virtualbox: $(HULL) $(AGENT_BIN) $(PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/virtualbox_test.sh '$(HULL)' '$(PROBE)'
+
+check-pc: $(HULL) $(AGENT_BIN)
+	BUILD_DIR='$(BUILD_DIR)' sh test/pc_test.sh '$(HULL)'
 
 check-qemu: $(HULL) $(AGENT_BIN) $(PROBE) $(AGENT_ARM64) $(ARM64_PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/qemu_test.sh '$(HULL)' '$(PROBE)'

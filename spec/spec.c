@@ -524,6 +524,23 @@ static const key qemu_keys[] = {
 };
 static const schema qemu = TABLE(qemu_keys);
 
+static const char *const pc_machine_values[] = { "pc", "q35", "isapc", NULL };
+static const char *const pc_vga_values[]     = { "std", "cirrus", "vmware", "none", NULL };
+
+static const char *const pc_nic_values[]     = { "ne2k_pci", "ne2k_isa", "pcnet", "rtl8139",
+                                                 "e1000", "virtio", NULL };
+
+static const char *const pc_firmware_values[] = { "bios", "uefi", NULL };
+
+static const key pc_keys[] = {
+	{ .name = "firmware", .type = CHOICE, .choices = pc_firmware_values },
+	{ .name = "nic",     .type = CHOICE, .choices = pc_nic_values },
+	{ .name = "machine", .type = CHOICE, .choices = pc_machine_values },
+	{ .name = "vga",     .type = CHOICE, .choices = pc_vga_values },
+	{ .name = "accel",   .type = CHOICE, .choices = accel_values },
+};
+static const schema pc = TABLE(pc_keys);
+
 static const key virtualbox_keys[] = {
 	{ .name = "gui", .type = BOOLEAN },
 };
@@ -535,6 +552,7 @@ static const key tuning_keys[] = {
 	{ .name = "ns",         .type = RECORD, .record = &ns },
 	{ .name = "qemu",       .type = RECORD, .record = &qemu },
 	{ .name = "virtualbox", .type = RECORD, .record = &virtualbox },
+	{ .name = "pc",         .type = RECORD, .record = &pc },
 	{ .name = "docker",     .type = RESERVED },
 	{ .name = "vmware",     .type = RESERVED },
 	{ .name = "hyperv",     .type = RESERVED },

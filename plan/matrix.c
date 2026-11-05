@@ -208,7 +208,8 @@ static void resolve_record(resolver *r, const char *prefix, const hull_sexpr_for
 static void resolve_source(resolver *r, const hull_sexpr_form *machine,
                            const hull_sexpr_form *entry)
 {
-	static const char *const schemes[] = { "dir", "tar", "pack", "image", "composefs", NULL };
+	static const char *const schemes[] = { "dir", "tar", "pack", "image", "composefs", "media",
+	                                     NULL };
 	hull_sexpr_form          head;
 	hull_sexpr_form          value;
 	hull_sexpr_form          mutable_entry;
