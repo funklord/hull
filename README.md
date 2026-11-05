@@ -565,6 +565,14 @@ job can run it first.
 - **A service.** `hull systemd` writes a user unit that runs a machine
   under the user's own systemd.
 
+## Another host
+
+`hull -H ssh://user@host/srv/app run` runs the file here on a core
+there, over ssh and your ssh keys: hull needs only to be installed at the
+far end, whose core it starts. `/srv/app` is what the file's relative
+paths mean there, the directory you `rsync`ed. `HULL_HOST` says the same
+for a whole shell, and `ps`, `exec`, `logs` and `stop` go with it.
+
 # Images, when you want them
 
 The store is optional, and a machine never needs it: `dir:` is a source

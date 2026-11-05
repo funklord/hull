@@ -65,6 +65,7 @@
 #include "vbox_fetch.h"
 #include "vbox_host.h"
 #include "import.h"
+#include "dial.h"
 #include "matrix.h"
 #include "names.h"
 #include "plan.h"
@@ -118,7 +119,8 @@ static int refused_status(const char *reason)
 
 static void usage(FILE *out)
 {
-	fputs("usage: hull plan [-f FILE] [--backend B] [--accept TOKEN]... [--explain]"
+	fputs("usage: hull [-H ssh://[USER@]HOST[:PORT][/DIR]] COMMAND ...\n"
+	      "       hull plan [-f FILE] [--backend B] [--accept TOKEN]... [--explain]"
 	      " [--resolved] [--root-hash]\n"
 	      "       hull check [-f FILE] --backend B[,B...] [--accept TOKEN]...\n"
 	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [--wait D|--no-wait]\n"
@@ -1304,7 +1306,19 @@ static int runtime_path(char *out, size_t cap, const char *leaf)
 	return (size_t)snprintf(out, cap, "%s/hull/%s", runtime, leaf) < cap;
 }
 
+/* `-H` or HULL_HOST: the core this frontend speaks to is that host's. */
+static hull_dial_target remote;
+static int         remote_given;
+
+static int dial_local(void);
+
+/* The local core, or with -H the far one through ssh. */
 static int dial_core(void)
+{
+	return remote_given ? hull_dial_host(&remote) : dial_local();
+}
+
+static int dial_local(void)
 {
 	struct sockaddr_un address;
 	char               path[sizeof address.sun_path];
@@ -1410,8 +1424,8 @@ again:
 	memset(&hello, 0, sizeof hello);
 	fd = dial_core();
 
-	start = start || kept_machines();
-	if (fd < 0 && start && getenv("XDG_RUNTIME_DIR") != NULL) {
+	start = start || (!remote_given && kept_machines());
+	if (fd < 0 && start && !remote_given && getenv("XDG_RUNTIME_DIR") != NULL) {
 		start_core();
 		for (int tries = 0; fd < 0 && tries < 100; tries++) {
 			struct timespec pause = { 0, 50000000L };
@@ -1448,7 +1462,7 @@ again:
 		/* A core from before 2026-10-31 refuses the build's entries, as
 		 * its description has none: said hello to again as it was, and
 		 * warned of below. */
-		if (!plain) {
+		if (!plain && !remote_given) {
 			hull_msg_free(&hello);
 			hull_wire_close(wire);
 			plain = 1;
@@ -6681,6 +6695,45 @@ static int add_backends(options *o, char *list)
 	return 1;
 }
 
+/* `hull dial`: the far end of `-H`, stdin and stdout joined to this
+ * user's core, one started as for any frontend. */
+static int dial(void)
+{
+	int fd = dial_local();
+
+	if (fd < 0 && getenv("XDG_RUNTIME_DIR") != NULL) {
+		start_core();
+		for (int tries = 0; fd < 0 && tries < 100; tries++) {
+			struct timespec pause = { 0, 50000000L };
+
+			nanosleep(&pause, NULL);
+			fd = dial_local();
+		}
+	}
+	if (fd < 0) {
+		fprintf(stderr, "hull: dial: no core here, and none started\n");
+		return 125;
+	}
+	return hull_dial_pump(fd);
+}
+
+/* Whether `command` is a core's to answer, so that -H can mean anything:
+ * the store and the rest are this host's, and doing them here under a
+ * flag naming another would say what is not so. */
+static int remote_command(const char *command)
+{
+	static const char *const commands[] = {
+		"run", "up", "plan", "check", "ps", "stop", "kill", "logs", "attach", "exec", "stats",
+		"pause", "unpause", "segment", "ssh", "proxy-ssh", "lease", "pool", "reserve", "release",
+		NULL
+	};
+
+	for (const char *const *c = commands; *c != NULL; c++)
+		if (strcmp(*c, command) == 0)
+			return 1;
+	return 0;
+}
+
 /* `hull import [--build-arg NAME=VALUE]... [--target STAGE] DOCKERFILE`. */
 static int import_flags(int argc, char **argv)
 {
@@ -6740,6 +6793,32 @@ int main(int argc, char **argv)
 	}
 	o.file   = "hull.conf";
 	o.stream = stdout;
+	/* -H URL leads the command, and HULL_HOST says the same, so that a
+	 * ProxyCommand this hull writes reaches the same core. */
+	{
+		const char *url = getenv("HULL_HOST");
+		char        why[300];
+
+		if (argc >= 3 && strcmp(argv[1], "-H") == 0) {
+			url = argv[2];
+			argv[2] = argv[0];
+			argv += 2;
+			argc -= 2;
+		}
+		if (url != NULL && url[0] != '\0') {
+			if (hull_dial_parse(url, &remote, why, sizeof why) != 0) {
+				fprintf(stderr, "hull: %s\n", why);
+				return 2;
+			}
+			remote_given = 1;
+			setenv("HULL_HOST", url, 1);
+			if (argc >= 2 && argv[1][0] != '-' && !remote_command(argv[1])) {
+				fprintf(stderr, "hull: %s works on this host, whatever -H says: run it there\n",
+				        argv[1]);
+				return 2;
+			}
+		}
+	}
 	if (argc < 2) {
 		usage(stderr);
 		return 2;
@@ -6757,6 +6836,8 @@ int main(int argc, char **argv)
 	if (strcmp(command, "doctor") == 0 && argc == 2)
 		return hull_doctor(runtime_why);
 	hull_registry_init(&registry, host_arch());
+	if (strcmp(command, "dial") == 0 && argc == 2)
+		return dial();
 	if (strcmp(command, "core") == 0 && argc == 2)
 		return hull_core_run(host_arch());
 	if (strcmp(command, "ps") == 0 && argc == 2)
@@ -7049,7 +7130,9 @@ int main(int argc, char **argv)
 		        "docker-compose.yml or Vagrantfile here; -f names one\n");
 		return 125;
 	}
-	o.base = base_of(o.file);
+	/* A file read here, its relative paths meaning the far directory's:
+	 * the same directory rsync'd there, section 4.10. */
+	o.base = remote_given && remote.dir[0] != '\0' ? strdup(remote.dir) : base_of(o.file);
 	if (o.base == NULL) {
 		fprintf(stderr, "%s: %s\n", o.file, strerror(errno));
 		return strcmp(command, "run") == 0 ? 125 : 2;

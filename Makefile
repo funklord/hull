@@ -108,7 +108,7 @@ ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/tree.o $(BUILD_DIR)/engine/hostnet.o \
               $(BUILD_DIR)/engine/hostdev.o $(BUILD_DIR)/engine/rootmode.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o $(BUILD_DIR)/cli/runtime.o $(BUILD_DIR)/cli/doctor.o \
-              $(BUILD_DIR)/cli/import.o $(BUILD_DIR)/cli/export.o $(BUILD_DIR)/cli/kernel_fetch.o $(BUILD_DIR)/cli/vbox_fetch.o $(BUILD_DIR)/cli/vbox_host.o $(BUILD_DIR)/cli/vagrant.o \
+              $(BUILD_DIR)/cli/import.o $(BUILD_DIR)/cli/export.o $(BUILD_DIR)/cli/kernel_fetch.o $(BUILD_DIR)/cli/vbox_fetch.o $(BUILD_DIR)/cli/vbox_host.o $(BUILD_DIR)/cli/vagrant.o $(BUILD_DIR)/cli/dial.o \
               $(BUILD_DIR)/cli/sshd_fetch.o
 # Section 3's optional store, which only the commands that name it use.
 STORE_OBJS  = $(BUILD_DIR)/store/store.o $(BUILD_DIR)/store/unpack.o $(BUILD_DIR)/store/pack.o
@@ -318,7 +318,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all kernel limine nss root install-root check check-docker check-pc check-qemu check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all kernel limine nss root install-root check check-docker check-pc check-remote check-qemu check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -340,6 +340,7 @@ help:
 	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
 	@echo '  check-qemu    hull run on the qemu engine, as the user, with KVM'
 	@echo '  check-pc      a whole PC booting its own media, as the user'
+	@echo '  check-remote  hull -H over a private sshd on 127.0.0.1'
 	@echo '  check-virtualbox  hull run on VirtualBox, inside a vm, as the user'
 	@echo '  check-root    root mode'"'"'s native grants, hull-root setuid, inside a vm'
 	@echo '  check-sanitize  the unit tests, store and pull under ASan and UBSan'
@@ -692,6 +693,9 @@ check-flip: $(HULL) $(AGENT_BIN) $(PROBE) $(BUILD_DIR)/test/tree_tar
 
 check-virtualbox: $(HULL) $(AGENT_BIN) $(PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/virtualbox_test.sh '$(HULL)' '$(PROBE)'
+
+check-remote: $(HULL) $(AGENT_BIN) $(PROBE)
+	BUILD_DIR='$(BUILD_DIR)' sh test/remote_test.sh '$(HULL)' '$(PROBE)'
 
 check-pc: $(HULL) $(AGENT_BIN)
 	BUILD_DIR='$(BUILD_DIR)' sh test/pc_test.sh '$(HULL)'
