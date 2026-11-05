@@ -3437,13 +3437,16 @@ sleep 1
 cat "$2/brserve.out"
 echo "== sshd"
 mkdir -p "$2/brrun/shm" && mount -t tmpfs none "$2/brrun/shm" && chmod 700 "$2/brrun/shm"
-(XDG_RUNTIME_DIR="$2/brrun/shm" timeout 30 "$1" run -f "$2/brsshd.conf" > /dev/null 2>&1 &)
+(XDG_RUNTIME_DIR="$2/brrun/shm" timeout 60 "$1" run -f "$2/brsshd.conf" > "$2/brsshd.out" 2>&1 &)
 tries=0
-until XDG_RUNTIME_DIR="$2/brrun/shm" "$1" ps 2>/dev/null | grep -q "^bsshd .*running" || [ "$tries" -ge 40 ]; do
+until XDG_RUNTIME_DIR="$2/brrun/shm" "$1" ps 2>/dev/null | grep -q "^bsshd .*running" || [ "$tries" -ge 200 ]; do
 	tries=$((tries + 1))
 	sleep 0.25
 done
 XDG_RUNTIME_DIR="$2/brrun/shm" timeout 10 "$1" proxy-ssh bsshd < /dev/null 2>&1 | head -1
+# After 2 of 5 runs read `no such machine` here with this hidden: a start
+# that failed and a wait that ran out looked the same.
+echo "== sshd waited $tries"; grep -v -e ": emulated: " -e ": accepted: " "$2/brsshd.out" | tail -3
 XDG_RUNTIME_DIR="$2/brrun/shm" timeout 10 "$1" kill -s KILL bsshd > /dev/null 2>&1
 echo "== named"; timeout 30 "$1" run -f "$2/brnamed.conf" 2>&1
 echo "== none"; timeout 30 "$1" run -f "$2/brnone.conf" 2>&1
