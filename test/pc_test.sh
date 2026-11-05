@@ -166,6 +166,18 @@ run
 status 'a collection is not written' "$got" 125 "$out"
 says 'and said' "$out" 'collection'
 
+# One file a collection can travel as, tar: or pack:, as a machine's source.
+tar -cf "$root/c.tar" -C "$root/c" .
+conf '(source "media:disk") (media (medium (type disk) (source "tar:./c.tar")))'
+run
+status 'a collection as a tar boots' "$got" 0 "$out"
+says 'as the disk it was' "$out" 'word: fresh'
+"$hull" pack "$root/c" "$root/c.hull" > /dev/null 2>&1
+conf '(source "media:disk") (media (medium (type disk) (source "pack:./c.hull")))'
+run
+status 'a collection as a pack boots' "$got" 0 "$out"
+says 'as the disk it was' "$out" 'word: fresh'
+
 first=$(find "$root/c/quirks" -type f | head -1)
 cp "$first" "$root/quirk.saved"
 printf 'x' | dd of="$first" bs=1 seek=1 conv=notrunc status=none

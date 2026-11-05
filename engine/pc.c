@@ -1307,8 +1307,10 @@ static const hull_cap_entry entries[] = {
 	  "reading a disc by its 2048-byte sectors", NULL },
 	{ "media.image",        HULL_SUP_NATIVE,
 	  "raw, qcow2, vmdk, vhd, vhdx or vdi, by its first bytes", NULL },
-	{ "media.tar",          HULL_SUP_REJECTED, "not yet: a tar: collection", NULL },
-	{ "media.pack",         HULL_SUP_REJECTED, "not yet: a pack: collection", NULL },
+	{ "media.tar",          HULL_SUP_EMULATED,
+	  "committed to the store as a tar: source is, its checkout taken as a dir: collection", NULL },
+	{ "media.pack",         HULL_SUP_EMULATED,
+	  "read into the store as a pack: source is, its checkout taken as a dir: collection", NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   "a PC with no network card", NULL },
 	{ "network.nat",        HULL_SUP_NATIVE,
 	  "qemu's own user network, a card of (tuning (pc (nic ...))), ne2k_pci by default, DHCP "

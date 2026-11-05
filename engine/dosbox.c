@@ -193,8 +193,10 @@ static const hull_cap_entry entries[] = {
 	  "projected: files/ an ISO image hull makes, its audio tracks by a cue sheet; one with "
 	  "quirks/ refused, DOSBox reading no disc raw", NULL },
 	{ "media.image",        HULL_SUP_NATIVE,   "an ISO or floppy image, by imgmount", NULL },
-	{ "media.tar",          HULL_SUP_REJECTED, "not yet: a tar: collection", NULL },
-	{ "media.pack",         HULL_SUP_REJECTED, "not yet: a pack: collection", NULL },
+	{ "media.tar",          HULL_SUP_EMULATED,
+	  "committed to the store as a tar: source is, its checkout taken as a dir: collection", NULL },
+	{ "media.pack",         HULL_SUP_EMULATED,
+	  "read into the store as a pack: source is, its checkout taken as a dir: collection", NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   "a DOS machine here has no network", NULL },
 	{ "display.window",     HULL_SUP_NATIVE,
 	  "DOSBox's own window on the X display the run was given, DISPLAY where hull ran; "

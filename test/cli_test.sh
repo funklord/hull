@@ -4109,6 +4109,10 @@ for dosengine in dosbox dosemu; do
 	dosconf doscdimp "(media (medium (type cdrom) (source \"dir:./doscdimp\"))) (command \"TYPE\" \"$cd:\\\\README.TXT\")"
 	if [ "$dosengine" = dosbox ]; then
 		from_root 0 '^on a disc' -f "$root/doscdimp.conf"
+		# The same collection as one file.
+		tar -cf "$root/doscdimp.tar" -C "$root/doscdimp" .
+		dosconf doscdtar "(media (medium (type cdrom) (source \"tar:./doscdimp.tar\"))) (command \"TYPE\" \"$cd:\\\\README.TXT\")"
+		from_root 0 '^on a disc' -f "$root/doscdtar.conf"
 		# And a raw dump's, its audio track a track of the disc.
 		rm -rf "$root/doscdraw"
 		python3 -I "$(dirname "$0")/raw_disc.py" "$root/doscd.iso" "$root/doscd.bin" "$root/doscd.cue"

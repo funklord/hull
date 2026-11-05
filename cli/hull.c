@@ -897,6 +897,71 @@ static int verity_disk(hull_store *store, const char *name, const char *image, c
 	return 0;
 }
 
+/* A medium's tar: or pack: collection (J.4), one file a disc can travel
+ * as: committed to the store as a machine's would be, and given to the
+ * engine as the dir: of its checkout, so every engine that takes a
+ * collection takes these. 0, or -1 having said why. */
+static int media_sources(const char *file, const hull_spec *spec, const hull_sexpr_form *machine,
+                         int create, rewrite *rewrites, unsigned *count)
+{
+	hull_sexpr_form media;
+	hull_sexpr_form item;
+	int             more;
+
+	if (!hull_spec_find(spec, machine, "media", &media))
+		return 0;
+	hull_sexpr_child(&spec->doc, &media, &item);
+	for (more = hull_sexpr_next(&spec->doc, &item, &item); more;
+	     more = hull_sexpr_next(&spec->doc, &item, &item)) {
+		hull_sexpr_form entry;
+		hull_sexpr_form head;
+		hull_sexpr_form value;
+		hull_store      store;
+		text_buf        text = { 0 };
+		char            given[300];
+		char            ref[300];
+		char            path[4400];
+		char            why[4400] = "";
+		uint64_t        skipped = 0u;
+		int             failed;
+
+		if (!hull_spec_find(spec, &item, "source", &entry) ||
+		    !hull_sexpr_child(&spec->doc, &entry, &head) ||
+		    !hull_sexpr_next(&spec->doc, &head, &value) || value.content_length >= sizeof given)
+			continue;
+		memcpy(given, spec->doc.data + value.content, value.content_length);
+		given[value.content_length] = '\0';
+		if (strncmp(given, "tar:", 4u) == 0) {
+			if (tar_ref(file, spec, machine, given + 4, ref, sizeof ref) != 0)
+				return -1;
+		} else if (strncmp(given, "pack:", 5u) == 0) {
+			if (pack_ref(file, given + 5, ref, sizeof ref) != 0)
+				return -1;
+		} else {
+			continue;
+		}
+		if (hull_store_open(&store, 0, why, sizeof why) != 0) {
+			fprintf(stderr, "%s: %s: the store: %s\n", file, given, why);
+			return -1;
+		}
+		failed = hull_store_checkout(&store, ref, create, path, sizeof path, &skipped, why,
+		                             sizeof why);
+		hull_store_close(&store);
+		if (failed != 0 || strpbrk(path, "\"\\\n") != NULL) {
+			fprintf(stderr, "%s: %s: %s\n", file, given,
+			        why[0] != '\0' ? why : "its checkout cannot be named in a source");
+			return -1;
+		}
+		add_text(&text, "dir:");
+		add_text(&text, path);
+		if (add_rewrite(rewrites, count, value.content, value.content_length, &text) != 0) {
+			fprintf(stderr, "%s: too many sources to name\n", file);
+			return -1;
+		}
+	}
+	return 0;
+}
+
 static int store_sources(const char *file, uint8_t *data, size_t *length, int create,
                          const char *const *backends, unsigned backend_count)
 {
@@ -940,6 +1005,10 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 		int                      cfs;
 		int                      schemed = 0;
 
+		if (media_sources(file, &spec, &machines[i], create, rewrites, &count) != 0) {
+			result = -1;
+			break;
+		}
 		if (!hull_spec_find(&spec, &machines[i], "source", &entry) ||
 		    !hull_sexpr_child(&spec.doc, &entry, &head) ||
 		    !hull_sexpr_next(&spec.doc, &head, &value) || value.content_length >= sizeof name)
