@@ -40,6 +40,7 @@
 #include <string.h>
 #include <strings.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
@@ -3182,6 +3183,183 @@ static int copy_tree(hull_store *store, int root, const step_input *in, const ch
 	return result;
 }
 
+/* Whether `(key true)` is in `record`. */
+static int record_true(const hull_spec *spec, const hull_sexpr_form *record, const char *key)
+{
+	char text[8];
+
+	return record_text(spec, record, key, text, sizeof text) && strcmp(text, "true") == 0;
+}
+
+/* A tar's contents at `to`, a new or empty directory of the tree, by the
+ * layer reader: what the user cannot make, a device or an owner, is said
+ * and left out, and `..` and links out of the tree refused, which a host
+ * tar would not hold to. Into one that holds files is refused: merging
+ * would write through whatever links the tree already has. */
+static int unpack_tar(int root, const char *from, const char *to, char *why, size_t cap)
+{
+	char         target[4300];
+	char         copy[4096];
+	const char  *leaf = "";
+	uint64_t     skipped = 0u;
+	hull_unpack *u;
+	int          dir = -1;
+	int          fd = open(from, O_RDONLY | O_CLOEXEC);
+	int          result = -1;
+
+	if (fd < 0) {
+		snprintf(why, cap, "%s: %s", from, strerror(errno));
+		return -1;
+	}
+	if (strcmp(to, "/") == 0) {
+		snprintf(target, sizeof target, "/proc/self/fd/%d", root);
+	} else {
+		if ((dir = in_tree(root, to, copy, sizeof copy, &leaf, 1)) < 0) {
+			snprintf(why, cap, "%s: not a path the tree can hold", to);
+			close(fd);
+			return -1;
+		}
+		if (mkdirat(dir, leaf, 0755) != 0 && errno != EEXIST) {
+			snprintf(why, cap, "%s: %s", to, strerror(errno));
+			goto done;
+		}
+		snprintf(target, sizeof target, "/proc/self/fd/%d/%s", dir, leaf);
+	}
+	{
+		DIR           *there = opendir(target);
+		struct dirent *entry;
+		int            empty = there != NULL;
+
+		while (there != NULL && (entry = readdir(there)) != NULL)
+			if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0)
+				empty = 0;
+		if (there != NULL)
+			closedir(there);
+		if (!empty) {
+			snprintf(why, cap, "%s: a tar is unpacked into a new or empty directory, and this "
+			         "holds files", to);
+			goto done;
+		}
+	}
+	if ((u = hull_unpack_begin(target, why, cap)) == NULL)
+		goto done;
+	result = hull_unpack_layer(u, fd, &skipped, why, cap);
+	if (hull_unpack_end(u, result == 0 ? why : (char[64]){ 0 }, result == 0 ? cap : 64u) != 0)
+		result = -1;
+done:
+	if (dir >= 0)
+		close(dir);
+	close(fd);
+	return result;
+}
+
+/* Whether `name` matches `pattern`, Go's filepath.Match as .dockerignore
+ * reads it: `*` and `?` within a component, `**` across them. */
+static int ignore_match(const char *pattern, const char *name)
+{
+	for (;;) {
+		if (pattern[0] == '*' && pattern[1] == '*') {
+			pattern += 2;
+			if (*pattern == '/')
+				pattern++;
+			for (;; name++) {
+				if (ignore_match(pattern, name))
+					return 1;
+				if (*name == '\0')
+					return 0;
+			}
+		}
+		if (*pattern == '*') {
+			for (pattern++;; name++) {
+				if (ignore_match(pattern, name))
+					return 1;
+				if (*name == '\0' || *name == '/')
+					return 0;
+			}
+		}
+		if (*pattern == '\0')
+			return *name == '\0' || *name == '/';  /* a directory's contents go with it */
+		if (*name == '\0' || (*pattern != '?' && *pattern != *name) ||
+		    (*pattern == '?' && *name == '/'))
+			return 0;
+		pattern++;
+		name++;
+	}
+}
+
+/* Whether the patterns leave out `path`, relative to the context: the last
+ * to match says, `!` keeping what an earlier one left out. */
+static int ignored(char *const *patterns, unsigned count, const char *path)
+{
+	int out = 0;
+
+	for (unsigned i = 0u; i < count; i++) {
+		const char *p = patterns[i];
+		int         keep = *p == '!';
+
+		p += keep;
+		while (*p == '/' || (p[0] == '.' && p[1] == '/'))
+			p += *p == '/' ? 1 : 2;
+		char   clean[1024];
+		size_t n = strlen(p);
+
+		while (n > 1u && p[n - 1u] == '/')
+			n--;
+		snprintf(clean, sizeof clean, "%.*s", (int)n, p);
+		if (ignore_match(clean, path))
+			out = !keep;
+	}
+	return out;
+}
+
+static char *const *exclude_patterns;
+static unsigned     exclude_count;
+static const char  *exclude_prefix;     /* the copy's source, relative to the context */
+static size_t       exclude_skip;       /* the tree walk's length before the path */
+
+/* One entry of a tree just copied, deepest first, gone if it is ignored; a
+ * directory a `!` kept something in stays. */
+static int exclude_entry(const char *path, const struct stat *st, int kind, struct FTW *at)
+{
+	char relative[4300];
+
+	(void)st;
+	(void)at;
+	if (strlen(path) <= exclude_skip)
+		return 0;
+	snprintf(relative, sizeof relative, "%s%s", exclude_prefix, path + exclude_skip + 1u);
+	if (ignored(exclude_patterns, exclude_count, relative)) {
+		if (kind == FTW_DP)
+			rmdir(path);
+		else
+			unlink(path);
+	}
+	return 0;
+}
+
+/* (exclude ...) on the tree just copied to `to`. */
+static void exclude_from(int root, const char *from, const char *to, char *const *patterns,
+                         unsigned count)
+{
+	char        target[4400];
+	char        prefix[4200] = "";
+	size_t      n = strlen(from);
+
+	while (from[0] == '.' && from[1] == '/')
+		from += 2;
+	if (strcmp(from, ".") != 0 && n > 0u)
+		snprintf(prefix, sizeof prefix, "%s/", from);
+	snprintf(target, sizeof target, "/proc/self/fd/%d%s", root, to);
+	n = strlen(target);
+	while (n > 1u && target[n - 1u] == '/')
+		target[--n] = '\0';
+	exclude_patterns = patterns;
+	exclude_count    = count;
+	exclude_prefix   = prefix;
+	exclude_skip     = n;
+	nftw(target, exclude_entry, 16, FTW_DEPTH | FTW_PHYS);
+}
+
 /* "7d" and its kind as seconds, or 0. */
 static long long seconds_of(const char *text)
 {
@@ -3951,6 +4129,10 @@ next_pass:
 					char to[4096];
 
 					record_text(&spec, &item, "to", to, sizeof to);
+					if (record_true(&spec, &item, "unpack")) {
+						ok = unpack_tar(root, inputs[first].path, to, why, sizeof why) == 0;
+						continue;
+					}
 					/* A file to a path ending in a slash goes into it. */
 					if (inputs[first].manifest[0] == '\0' && to[strlen(to) - 1u] == '/') {
 						const char *leaf = strrchr(inputs[first].path, '/');
@@ -3961,6 +4143,34 @@ next_pass:
 					ok = inputs[first].manifest[0] != '\0' ?
 					     copy_tree(&store, root, &inputs[first], to, why, sizeof why) == 0 :
 					     copy_file(root, inputs[first].path, to, why, sizeof why) == 0;
+					if (ok && inputs[first].manifest[0] != '\0') {
+						char           *patterns[512];
+						unsigned        patterns_count = 0u;
+						hull_sexpr_form list;
+						char            from[4096];
+
+						if (hull_spec_find(&spec, &item, "exclude", &list) &&
+						    record_text(&spec, &item, "from", from, sizeof from)) {
+							hull_sexpr_form word;
+
+							hull_sexpr_child(&spec.doc, &list, &word);
+							while (hull_sexpr_next(&spec.doc, &word, &word) && patterns_count < 512u) {
+								char   text[1024];
+								size_t got;
+
+								/* A file's string, escapes and all, no canonical atom. */
+								if (hull_sexpr_value(&spec.doc, &word, (uint8_t *)text,
+								                     sizeof text - 1u, &got) != HULL_SEXPR_OK)
+									continue;
+								text[got] = '\0';
+								if ((patterns[patterns_count] = strdup(text)) != NULL)
+									patterns_count++;
+							}
+							exclude_from(root, from, to, patterns, patterns_count);
+							for (unsigned p = 0u; p < patterns_count; p++)
+								free(patterns[p]);
+						}
+					}
 				}
 			}
 			/* The run line, in a chroot machine on the tree, or the

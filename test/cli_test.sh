@@ -154,7 +154,7 @@ gb '\(copy \(path \(from "\./app"\) \(to "/srv/app"\)\)\)'
 gb '\(entrypoint "/srv/app"\)'
 gb '\(cmd "/bin/sh" "-c" "echo hi"\)'
 gb '; not translated: LABEL'
-gb '; ADD treated as COPY'
+gb '\(unpack true\)'
 gb '; not translated: HEALTHCHECK'
 printf 'RUN true\n' > "$dir/nofrom.in"
 expect 2 'has no FROM' "$hull" import "$dir/nofrom.in"

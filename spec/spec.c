@@ -789,6 +789,8 @@ static const key path_keys[] = {
 	{ .name = "from",  .type = STRING, .required = 1, .value = nonempty },
 	{ .name = "to",    .type = STRING, .required = 1, .value = absolute },
 	{ .name = "stage", .type = STRING, .value = nonempty },
+	{ .name = "unpack", .type = BOOLEAN },
+	{ .name = "exclude", .type = STRINGS, .value = nonempty },
 };
 static const schema path = TABLE(path_keys);
 

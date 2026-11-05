@@ -396,6 +396,51 @@ expect 1 'not a tar' "$hull" load "$root/ld/short"
 gzip -c "$root/ld/layout.tar" > "$root/ld/layout.tar.gz"
 expect 1 'uncompressing' "$hull" load "$root/ld/layout.tar.gz"
 
+# ADD unpacks a local tar, as a base image opens, and .dockerignore keeps
+# what a COPY of the context leaves out, `!` bringing a file back.
+mkdir -p "$root/ad/ctx/logs" "$root/ad/ctx/.git" "$root/ad/ctx/deep/er" "$root/ad/base/etc"
+printf 'in the base\n' > "$root/ad/base/etc/from-tar"
+printf 'in the app\n' > "$root/ad/base/app"
+tar -cf "$root/ad/ctx/rootfs.tar" -C "$root/ad/base" etc
+tar -czf "$root/ad/ctx/app.tar.gz" -C "$root/ad/base" app
+: > "$root/ad/ctx/.git/config"
+: > "$root/ad/ctx/logs/one"
+: > "$root/ad/ctx/deep/er/secret"
+: > "$root/ad/ctx/a.log"
+: > "$root/ad/ctx/keep.log"
+: > "$root/ad/ctx/deep/stays"
+cat > "$root/ad/ctx/.dockerignore" <<'IGNORE'
+# what no image wants
+.git
+logs/
+*.log
+!keep.log
+**/secret
+*.tar
+*.tar.gz
+IGNORE
+cat > "$root/ad/ctx/Dockerfile" <<'DOCKERFILE'
+FROM scratch
+ADD rootfs.tar /
+ADD app.tar.gz /opt/app
+COPY . /src
+DOCKERFILE
+timeout 10 "$hull" import "$root/ad/ctx/Dockerfile" > "$root/ad/ctx/hull.conf"
+expect 0 '^added/1 sha256:' "$hull" build -f "$root/ad/ctx/hull.conf" added/1
+expect 0 '' "$hull" materialize added/1 "$root/ad/tree"
+check 'ADD unpacked a tar at /' grep -q 'in the base' "$root/ad/tree/etc/from-tar"
+check 'and a gzipped one at a path' grep -q 'in the app' "$root/ad/tree/opt/app/app"
+check 'the context came' [ -f "$root/ad/tree/src/deep/stays" ]
+check 'the ignored did not' [ "$(cd "$root/ad/tree/src" && ls -A | LC_ALL=C sort | tr '\n' ' ')" = '.dockerignore Dockerfile deep hull.conf keep.log ' ]
+check 'nor a deep match' [ ! -e "$root/ad/tree/src/deep/er/secret" ]
+cp -a "$root/b/base" "$root/ad/full"
+mkdir "$root/ad/full/held"
+: > "$root/ad/full/held/already"
+printf 'FROM dir:./full\nADD rootfs.tar /held\n' > "$root/ad/over"
+cp "$root/ad/ctx/rootfs.tar" "$root/ad/rootfs.tar"
+timeout 10 "$hull" import "$root/ad/over" > "$root/ad/over.conf"
+expect 1 'a tar is unpacked into a new or empty directory' "$hull" build -f "$root/ad/over.conf" added/2
+
 # A compose build's args and target reach the Dockerfile, and a service
 # of a profile not asked for is left out, as `docker compose up` does.
 mkdir -p "$root/ca/sub"

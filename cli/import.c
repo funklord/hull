@@ -488,6 +488,46 @@ static void stage_runtime(const build *b, sb *rt, const sb *after)
 	sb_add(rt, after->data != NULL ? after->data : "", after->len);
 }
 
+/* The .dockerignore beside the Dockerfile, its patterns as quoted atoms,
+ * which every COPY from the context takes as its (exclude ...). */
+static sb ignore_list;
+
+static void read_dockerignore(const char *dockerfile)
+{
+	const char *slash = strrchr(dockerfile, '/');
+	char        path[4400];
+	char        line[1024];
+	FILE       *file;
+
+	ignore_list.len = 0u;
+	snprintf(path, sizeof path, "%.*s%s.dockerignore", slash != NULL ? (int)(slash - dockerfile) : 0,
+	         dockerfile, slash != NULL ? "/" : "");
+	if ((file = fopen(path, "r")) == NULL)
+		return;
+	while (fgets(line, sizeof line, file) != NULL) {
+		char *text = trim(line);
+
+		text[strcspn(text, "\r\n")] = '\0';
+		text = trim(text);
+		if (*text == '\0' || *text == '#')
+			continue;
+		sb_str(&ignore_list, " ");
+		sb_quoted(&ignore_list, text);
+	}
+	fclose(file);
+}
+
+/* Whether `name` is a tar this reads, by its name: hull_unpack_layer()
+ * takes plain and gzip. */
+static int packed(const char *name)
+{
+	size_t n = strlen(name);
+
+	return (n > 4u && strcmp(name + n - 4u, ".tar") == 0) ||
+	       (n > 7u && strcmp(name + n - 7u, ".tar.gz") == 0) ||
+	       (n > 4u && strcmp(name + n - 4u, ".tgz") == 0);
+}
+
 static void do_copy(build *b, const char *instr, char *arg)
 {
 	char  name[32];
@@ -516,8 +556,10 @@ static void do_copy(build *b, const char *instr, char *arg)
 		note(&b->steps, instr, "needs a source and a destination");
 		return;
 	}
-	if (strcmp(instr, "ADD") == 0)
-		note(&b->steps, "ADD treated as COPY", "its url fetch and tar extraction are not done");
+	/* ADD's url Docker fetches, and nothing here does. */
+	for (int i = 0; i < n - 1; i++)
+		if (strcmp(instr, "ADD") == 0 && strstr(words[i], "://") != NULL)
+			note(&b->steps, "ADD of a url not fetched, and left a COPY", words[i]);
 	dst = words[n - 1];
 	snprintf(name, sizeof name, "copy-%u", ++b->step_no);
 	sb_str(&b->steps, "\n    (step (name \"");
@@ -538,7 +580,17 @@ static void do_copy(build *b, const char *instr, char *arg)
 			sb_str(&b->steps, ") (stage ");
 			sb_quoted(&b->steps, stage);
 		}
-		sb_str(&b->steps, "))");
+		sb_str(&b->steps, ")");
+		/* ADD unpacks a local tar, as a base image's first line does. */
+		if (strcmp(instr, "ADD") == 0 && stage == NULL && strstr(words[i], "://") == NULL &&
+		    packed(words[i]))
+			sb_str(&b->steps, " (unpack true)");
+		else if (stage == NULL && ignore_list.len > 0u) {
+			sb_str(&b->steps, " (exclude");
+			sb_add(&b->steps, ignore_list.data, ignore_list.len);
+			sb_str(&b->steps, ")");
+		}
+		sb_str(&b->steps, ")");
 	}
 	sb_str(&b->steps, ")");
 	if (b->workdir[0] != '\0') {
@@ -2376,6 +2428,7 @@ int hull_import(const char *path)
 		}
 		status = import_compose(file, project);
 	} else {
+		read_dockerignore(path);
 		status = import_dockerfile(file);
 	}
 	fclose(file);
