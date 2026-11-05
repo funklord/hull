@@ -119,8 +119,7 @@ static int refused_status(const char *reason)
 
 static void usage(FILE *out)
 {
-	fputs("usage: hull [-H ssh://[USER@]HOST[:PORT][/DIR]] COMMAND ...\n"
-	      "       hull plan [-f FILE] [--backend B] [--accept TOKEN]... [--explain]"
+	fputs("usage: hull plan [-f FILE] [--backend B] [--accept TOKEN]... [--explain]"
 	      " [--resolved] [--root-hash]\n"
 	      "       hull check [-f FILE] --backend B[,B...] [--accept TOKEN]...\n"
 	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [--wait D|--no-wait]\n"
@@ -158,6 +157,7 @@ static void usage(FILE *out)
 	      "       hull up [-f COMPOSE-FILE] [--backend B] [--profile P]... [NAME]\n"
 	      "       hull core\n"
 	      "       hull engines | hull doctor\n"
+	      "       hull -H ssh://[USER@]HOST[:PORT][/DIR] COMMAND ...\n"
 	      "       hull --version\n", out);
 }
 
