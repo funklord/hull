@@ -425,6 +425,8 @@ static int import_dockerfile(FILE *file)
 	size_t at = 0u;
 	int    status = 0;
 
+	/* Static for its size, and `hull up` imports one Dockerfile after another. */
+	memset(&b, 0, sizeof b);
 	while (fgets(line, sizeof line, file) != NULL) {
 		char  *p = line;
 		size_t n;
@@ -575,6 +577,16 @@ static int import_dockerfile(FILE *file)
 
 /* --- compose ------------------------------------------------------------- */
 
+static hull_compose_build builds[MAX_COMPOSE_BUILDS];
+static unsigned           build_count;
+static char               build_project[64];
+
+unsigned hull_compose_builds(const hull_compose_build **list)
+{
+	*list = builds;
+	return build_count;
+}
+
 /* A docker-compose.yml to a (machines ...) file (section 9, J.7). Only a
  * common block subset of YAML is read; what it cannot map onto hull's model
  * it says in a `;` comment. depends_on is (after ...), and a healthcheck
@@ -613,6 +625,8 @@ typedef struct svc {
 	char test[16][256];    /* the test's words, CMD's or the line */
 	int  test_count;
 	int  in_test;          /* a block list of the test's words follows */
+	char build_context[512];   /* from build:, relative to the file */
+	char build_dockerfile[256];
 	long interval_ms;      /* compose's own, or -1 for its default */
 	long timeout_ms;
 	long retries;
@@ -963,6 +977,23 @@ static void svc_flush(svc *s, sb *out)
 {
 	if (!s->open)
 		return;
+	/* build: the service's image is what `hull up` makes of its Dockerfile,
+	 * under a ref of the project's, even where an image: names it too. */
+	if (s->build_context[0] != '\0' || s->build_dockerfile[0] != '\0') {
+		if (build_count == MAX_COMPOSE_BUILDS) {
+			svc_note(s, "build not translated", "too many services build");
+		} else {
+			hull_compose_build *b = &builds[build_count++];
+
+			snprintf(b->ref, sizeof b->ref, "compose/%s/%s", build_project, s->name);
+			snprintf(b->context, sizeof b->context, "%s",
+			         s->build_context[0] != '\0' ? s->build_context : ".");
+			snprintf(b->dockerfile, sizeof b->dockerfile, "%s",
+			         s->build_dockerfile[0] != '\0' ? s->build_dockerfile : "Dockerfile");
+			snprintf(s->source, sizeof s->source, "%s", b->ref);
+			svc_note(s, "built by hull up from its Dockerfile, as", b->ref);
+		}
+	}
 	if (s->source[0] == '\0' && warnings != NULL) {
 		fprintf(warnings, "%s: %s: no image to run it from\n", warned_path, s->name);
 		unrunnable = 1;
@@ -1264,7 +1295,9 @@ static char *compose_text(FILE *file, const char *project)
 
 	file_net_count = 0;
 	declared_count = 0;
+	build_count = 0u;
 	as_label(name, sizeof name, project);
+	snprintf(build_project, sizeof build_project, "%s", name);
 
 	while (fgets(line, sizeof line, file) != NULL) {
 		const char *c;
@@ -1291,6 +1324,7 @@ static char *compose_text(FILE *file, const char *project)
 				network_indent = -1;
 			} else if (colon != NULL && strncmp(content, "name:", 5u) == 0) {
 				as_label(name, sizeof name, scalar(colon + 1));
+				snprintf(build_project, sizeof build_project, "%s", name);
 			} else if (colon != NULL) {
 				*colon = '\0';
 				if (strcmp(content, "version") != 0) {
@@ -1455,6 +1489,19 @@ static char *compose_text(FILE *file, const char *project)
 					         trim(content));
 					svc_note(&s, why, NULL);
 				}
+			} else if (strcmp(field, "build") == 0) {
+				/* build: as a block: its context, its Dockerfile, and
+				 * the rest said; args and target change what is built. */
+				char *at = strchr(content, ':');
+
+				if (at != NULL)
+					*at = '\0';
+				if (at != NULL && strcmp(trim(content), "context") == 0)
+					snprintf(s.build_context, sizeof s.build_context, "%s", scalar(at + 1));
+				else if (at != NULL && strcmp(trim(content), "dockerfile") == 0)
+					snprintf(s.build_dockerfile, sizeof s.build_dockerfile, "%s", scalar(at + 1));
+				else
+					svc_note(&s, "build key not translated", trim(content));
 			} else if (strcmp(field, "healthcheck") == 0) {
 				char *at = strchr(content, ':');
 				char *value_text;
@@ -1554,7 +1601,7 @@ static char *compose_text(FILE *file, const char *project)
 			if (n < 0)
 				svc_note(&s, key, "value not translated");
 		} else if (strcmp(key, "build") == 0)
-			svc_note(&s, "build not translated", "hull import the Dockerfile, then name the ref");
+			snprintf(s.build_context, sizeof s.build_context, "%s", scalar(value));
 		else if (strcmp(key, "networks") == 0) {
 			char *items[MAX_NETS];
 			int   n = flow_list(value, items, MAX_NETS);

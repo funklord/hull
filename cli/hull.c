@@ -4165,6 +4165,58 @@ done:
 	return result;
 }
 
+/* A compose file's build: services, each its Dockerfile imported as
+ * `hull import` prints it and built with its context as the file's
+ * directory, under the ref the service runs from. Cached as any build is,
+ * so a second `hull up` costs a look. Its output is stderr's: stdout is the
+ * machines'. 0, or 1. */
+static int compose_builds(const options *o, const hull_registry *registry)
+{
+	const hull_compose_build *list;
+	unsigned                  count;
+	char                     *text = hull_import_compose(o->file, NULL);
+	int                       status = 0;
+
+	if (text == NULL)
+		return 1;
+	free(text);
+	count = hull_compose_builds(&list);
+	for (unsigned i = 0u; i < count && status == 0; i++) {
+		options sub = *o;
+		char    context[8200];
+		char    dockerfile[8600];
+		char    path[64];
+		int     out = dup(1);
+		int     fd = memfd_create("hull-compose", MFD_CLOEXEC);
+
+		snprintf(context, sizeof context, "%s%s%s", list[i].context[0] == '/' ? "" : o->base,
+		         list[i].context[0] == '/' ? "" : "/", list[i].context);
+		snprintf(dockerfile, sizeof dockerfile, "%s/%s", context, list[i].dockerfile);
+		if (fd < 0 || out < 0) {
+			perror("hull: up");
+			return 1;
+		}
+		fprintf(stderr, "hull: up: building %s from %s\n", list[i].ref, dockerfile);
+		fflush(stdout);
+		dup2(fd, 1);
+		status = hull_import(dockerfile);
+		fflush(stdout);
+		dup2(2, 1);
+		if (status == 0) {
+			snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
+			sub.file = path;
+			sub.base = realpath(context, NULL);
+			status = sub.base == NULL ? 1 : build_file(&sub, registry, list[i].ref, 0);
+			free(sub.base);
+		}
+		fflush(stdout);
+		dup2(out, 1);
+		close(out);
+		close(fd);
+	}
+	return status != 0;
+}
+
 /* --- the other commands -------------------------------------------------- */
 
 /* Whether a core answers, without starting one; or would, holding the
@@ -6719,6 +6771,8 @@ int main(int argc, char **argv)
 	}
 	if (strcmp(command, "run") == 0) {
 		o.stream = stderr;
+		if (hull_import_is_compose(o.file) && compose_builds(&o, &registry) != 0)
+			return 125;
 		return run(&o, &registry, name);
 	}
 	if (strcmp(command, "systemd") == 0)

@@ -565,7 +565,8 @@ runs the collection as it is, as `(media (medium (type cdrom) (source
 "dir:./cd")))`. An image hull does not understand is still kept exactly, as
 one blob.
 
-`hull import Dockerfile` prints the same image as a `(build …)` form, and
+`hull import Dockerfile` prints the same image as a `(build …)` form, every
+stage of a multi-stage file included, and
 `hull import docker-compose.yml` a `(machines …)` file, each saying what
 it could not translate. `hull up` runs a compose file in place, with no
 conversion step: it reads `compose.yaml` or `docker-compose.yml` from the

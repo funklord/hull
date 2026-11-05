@@ -371,6 +371,34 @@ printf '(build (base "scratch") (stages (stage (name "a") (base "scratch"))) (st
 	> "$root/ms/up.conf"
 expect 1 'a stage.s path holds \.\.' "$hull" build -f "$root/ms/up.conf" staged/5
 
+# A compose file whose services build: `hull up` imports each Dockerfile,
+# builds it and runs the service from the result, as `docker compose up`
+# does; a block form with its own Dockerfile too, and a second up cached.
+mkdir -p "$root/cp/site/sub"
+cp -a "$root/b/base" "$root/cp/site/base"
+cp "$probe" "$root/cp/site/base/probe"
+printf 'FROM dir:./base\nCOPY sub/greeting /greeting\n' > "$root/cp/site/Dockerfile"
+printf 'FROM dir:./base\nCOPY sub/greeting /other\n' > "$root/cp/site/Other.dockerfile"
+printf 'from the build\n' > "$root/cp/site/sub/greeting"
+cat > "$root/cp/compose.yaml" <<'COMPOSE'
+services:
+  web:
+    build: ./site
+    command: ["/probe", "read", "/greeting"]
+  api:
+    build:
+      context: site
+      dockerfile: Other.dockerfile
+      args:
+        A: b
+    command: ["/probe", "read", "/other"]
+COMPOSE
+expect 0 'web +\| read=from the build' sh -c 'cd "$1/cp" && exec "$2" up 2>&1' sh "$root" "$hull"
+expect 0 'api +\| read=from the build' sh -c 'cd "$1/cp" && exec "$2" up 2>&1' sh "$root" "$hull"
+expect 0 'step copy-1: cached' sh -c 'cd "$1/cp" && exec "$2" up 2>&1' sh "$root" "$hull"
+expect 0 'build key not translated: args' "$hull" plan -f "$root/cp/compose.yaml"
+expect 0 'source "compose/cp/web"' "$hull" import "$root/cp/compose.yaml"
+
 kill "$listener" 2> /dev/null
 wait "$listener" 2> /dev/null
 trap - EXIT
