@@ -3,7 +3,9 @@
 # builds the reader, runs the checks and installs the git hook.
 
 PYTHON    ?= python3
-CFLAGS    ?= -Os -g
+# Each function and datum a section of its own, and the linker keeping only
+# what is reached: -Os works a function at a time and cannot see the rest.
+CFLAGS    ?= -Os -g -ffunction-sections -fdata-sections -Wl,--gc-sections
 WARNINGS   = -std=c11 -Wall -Wextra -Wconversion -Wsign-conversion
 DEPFLAGS   = -MMD -MP
 BUILD_DIR ?= build
