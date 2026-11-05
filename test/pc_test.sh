@@ -215,6 +215,14 @@ run
 status 'under emulation, on a q35' "$got" 0 "$out"
 says 'it boots the same' "$out" 'word: fresh'
 
+# The cards a system of each age looks for, each there as it boots.
+for card in sb16 adlib gus es1370 ac97 hda; do
+	conf "(source \"media:disk\") (tuning (pc (sound $card)))" \
+		'(media (medium (type disk) (source "image:./raw.img")))'
+	run
+	status "with a sound card, $card" "$got" 0 "$out"
+done
+
 # --- a stop, a killed run, and nothing left ----------------------------------
 
 printf '\353\376' > "$root/spin.bin"

@@ -11,9 +11,10 @@
  * a pipe the reader hands on, so nothing of the machine is on disk but
  * what its media are. A disk or floppy under (mutable overlay) is qemu's
  * snapshot, thrown away with it; under (mutable direct) the image is
- * written. A dir: collection is reassembled into an unnamed file, whose
- * hash media.c holds to the collection's, its writes going with the fd,
- * so a killed core leaves nothing to sweep.
+ * written. A dir: collection is reassembled, on the machine's own thread
+ * and not the core's loop, into an unnamed file, whose hash media.c holds
+ * to the collection's, its writes going with the fd, so a killed core
+ * leaves nothing to sweep.
  *
  * `hull exec -t ID -- console` is the serial bridge: a stream joined to
  * COM1, input written to the port and what the port says copied to it,
@@ -53,7 +54,7 @@
 #include "usage.h"
 
 #define PC_MAX_MEDIA 6u    /* four on IDE, two floppy drives */
-#define PC_MAX_ARGS  64u
+#define PC_MAX_ARGS  72u
 #define PC_MAX_SEGMENTS 4u
 #define PC_MAX_PORTS 32u
 
@@ -61,6 +62,8 @@ typedef struct medium {
 	int   type;          /* 'c' cdrom, 'd' disk, 'f' floppy */
 	char *path;          /* an image: path, or NULL */
 	int   fd;            /* a collection reassembled, or -1 */
+	char *collection;    /* its directory, until then */
+	int   exact;         /* `hull media import`'s, or a tree alone */
 	char  format[8];     /* qemu's word for an image's container */
 } medium;
 
@@ -83,6 +86,7 @@ struct hull_machine {
 	char           *machine_type;
 	char           *vga;
 	char           *accel;
+	char           *sound;          /* (tuning (pc (sound ...))), or NULL */
 	char           *firmware;       /* OVMF's path, for (firmware uefi), or NULL for SeaBIOS */
 	char           *nic;            /* (tuning (pc (nic ...))), or NULL for ne2k_pci */
 	char           *name;
@@ -110,6 +114,8 @@ struct hull_machine {
 	pthread_cond_t  done_cond;
 	int             done;
 	int             paused;
+	int             stopping;       /* asked to stop before qemu was started */
+	char            why[800];       /* the thread's own word for its failure */
 };
 
 static const hull_host_ops *host;
@@ -128,6 +134,7 @@ static void release(hull_machine *m)
 {
 	for (unsigned i = 0u; i < m->media_count; i++) {
 		free(m->media[i].path);
+		free(m->media[i].collection);
 		if (m->media[i].fd >= 0)
 			close(m->media[i].fd);
 	}
@@ -141,6 +148,7 @@ static void release(hull_machine *m)
 	free(m->machine_type);
 	free(m->vga);
 	free(m->accel);
+	free(m->sound);
 	free(m->firmware);
 	free(m->nic);
 	free(m->name);
@@ -206,17 +214,15 @@ static void read_format(medium *d)
 	close(fd);
 }
 
-/* A collection reassembled into an unnamed file of the cache's: NULL, or
- * why not. A cdrom's may be a tree alone, an ISO then made of it. */
-static const char *make_image(hull_machine *m, medium *d, const char *collection)
+/* A collection's medium checked, to be made as the machine starts: NULL,
+ * or why not. A cdrom's may be a tree alone, an ISO then made of it. */
+static const char *add_collection(hull_machine *m, medium *d, const char *collection)
 {
-	static char why[700];
-	char        detail[512];
 	char        files[4200];
 	struct stat st;
-	int         exact = hull_media_exact(collection);
 
-	if (!exact && d->type != 'c')
+	d->exact = hull_media_exact(collection);
+	if (!d->exact && d->type != 'c')
 		return "a floppy's or disk's collection is one `hull media import` made of its image";
 	snprintf(files, sizeof files, "%s/files", collection);
 	if (stat(files, &st) != 0 || !S_ISDIR(st.st_mode))
@@ -227,15 +233,32 @@ static const char *make_image(hull_machine *m, medium *d, const char *collection
 		if (wrong != NULL)
 			return wrong;
 	}
-	if ((d->fd = open(m->cache, O_TMPFILE | O_RDWR | O_CLOEXEC, 0600)) < 0)
-		return "an image cannot be made in the cache directory";
-	if ((exact ? hull_media_write(collection, d->fd, detail, sizeof detail) :
-	     hull_iso_write(files, "", d->fd, detail, sizeof detail)) != 0) {
-		snprintf(why, sizeof why, "a medium's image cannot be made: %s", detail);
-		return why;
-	}
+	if ((d->collection = strdup(collection)) == NULL)
+		return "out of memory";
 	strcpy(d->format, "raw");
 	return NULL;
+}
+
+/* A collection reassembled into an unnamed file of the cache's, on the
+ * machine's own thread, as a disk's gigabytes would hold every other
+ * machine of the core up on its loop: 0, or -1 with m->why. */
+static int make_image(hull_machine *m, medium *d)
+{
+	char detail[512];
+	char files[4200];
+
+	snprintf(files, sizeof files, "%s/files", d->collection);
+	if ((d->fd = open(m->cache, O_TMPFILE | O_RDWR | O_CLOEXEC, 0600)) < 0) {
+		snprintf(m->why, sizeof m->why, "an image cannot be made in the cache directory: %s\n",
+		         strerror(errno));
+		return -1;
+	}
+	if ((d->exact ? hull_media_write(d->collection, d->fd, detail, sizeof detail) :
+	     hull_iso_write(files, "", d->fd, detail, sizeof detail)) != 0) {
+		snprintf(m->why, sizeof m->why, "a medium's image cannot be made: %s\n", detail);
+		return -1;
+	}
+	return 0;
 }
 
 /* A medium of `type` from the image file `path`, next in the list: NULL,
@@ -293,7 +316,7 @@ static const char *read_media(hull_machine *m, const hull_sexpr_doc *doc,
 			d->type = kind;
 			d->fd   = -1;
 			m->media_count++;
-			wrong = make_image(m, d, path);
+			wrong = add_collection(m, d, path);
 		}
 		free(type);
 		free(source);
@@ -450,6 +473,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 			m->vga          = hull_access_value(doc, &pc, "vga");
 			m->accel        = hull_access_value(doc, &pc, "accel");
 			m->nic          = hull_access_value(doc, &pc, "nic");
+			m->sound        = hull_access_value(doc, &pc, "sound");
 			if ((wrong = read_firmware(m, doc, &pc)) != NULL)
 				return wrong;
 		}
@@ -517,6 +541,24 @@ static void exec_qemu(const hull_machine *m)
 	argv[n++] = m->vnc ? vnc : m->display != NULL ? "sdl" : "none";
 	argv[n++] = "-boot";
 	argv[n++] = boot;
+	/* A card, heard where there is a window, SDL's audio beside its
+	 * video, and playing to nothing where there is not: a system still
+	 * finds the card it was installed with. */
+	if (m->sound != NULL && strcmp(m->sound, "none") != 0) {
+		static char card[48];
+
+		argv[n++] = "-audiodev";
+		argv[n++] = m->display != NULL ? "sdl,id=sound" : "none,id=sound";
+		if (strcmp(m->sound, "hda") == 0) {
+			argv[n++] = "-device";
+			argv[n++] = "intel-hda";
+			snprintf(card, sizeof card, "hda-output,audiodev=sound");
+		} else {
+			snprintf(card, sizeof card, "%s,audiodev=sound", m->sound);
+		}
+		argv[n++] = "-device";
+		argv[n++] = card;
+	}
 	if (m->firmware != NULL) {
 		argv[n++] = "-bios";
 		argv[n++] = m->firmware;
@@ -641,10 +683,21 @@ static void end_console(hull_machine *m)
 	pthread_mutex_unlock(&m->lock);
 }
 
-/* The two pipes handed on until both end, then the end said. */
-static void *read_machine(void *arg)
+/* The machine's end said. */
+static void finish(hull_machine *m, int code, int signum)
 {
-	hull_machine *m = arg;
+	pthread_mutex_lock(&m->lock);
+	m->done = 1;
+	pthread_cond_broadcast(&m->done_cond);
+	pthread_mutex_unlock(&m->lock);
+	end_console(m);
+	host->on_exit(m->core, m, NULL, code, signum);
+	host->on_state(m->core, m, "stopped");
+}
+
+/* The two pipes handed on until both end, then the end said. */
+static void read_machine(hull_machine *m)
+{
 	struct pollfd fds[2] = { { m->out, POLLIN, 0 }, { m->err, POLLIN, 0 } };
 	uint8_t       buffer[65536];
 	int           status = 0;
@@ -674,16 +727,85 @@ static void *read_machine(void *arg)
 	}
 	while (waitpid(m->pid, &status, 0) < 0 && errno == EINTR)
 		;
+	finish(m, WIFSIGNALED(status) ? -1 : WEXITSTATUS(status),
+	       WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+}
+
+/* qemu started, its stdio this machine's: 0, or -1 with m->why. Forked
+ * from the thread that lives as long as it, PR_SET_PDEATHSIG going by the
+ * thread and not the process. */
+static int launch(hull_machine *m)
+{
+	int   out[2];
+	int   err[2];
+	int   in[2];
+	pid_t parent = getpid();
+	pid_t child;
+
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, in) != 0) {
+		snprintf(m->why, sizeof m->why, "a socket for the machine could not be made\n");
+		return -1;
+	}
+	if (pipe2(out, O_CLOEXEC) != 0 || pipe2(err, O_CLOEXEC) != 0) {
+		snprintf(m->why, sizeof m->why, "a pipe for the machine could not be made\n");
+		return -1;
+	}
+	child = fork();
+	if (child < 0) {
+		snprintf(m->why, sizeof m->why, "qemu could not be started\n");
+		return -1;
+	}
+	if (child == 0) {
+		if (dup2(in[1], 0) < 0 || dup2(out[1], 1) < 0 || dup2(err[1], 2) < 0 ||
+		    setsid() < 0 || prctl(PR_SET_PDEATHSIG, SIGKILL, 0L, 0L, 0L) != 0 ||
+		    getppid() != parent || prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) != 0)
+			_exit(126);
+		/* Nothing of the core's goes on; exec_qemu gives each made image
+		 * a descriptor of its own that does. */
+		close_range(3u, ~0u, CLOSE_RANGE_CLOEXEC);
+		exec_qemu(m);
+		dprintf(2, "qemu-system-x86_64, which a pc machine needs: %s\n", strerror(errno));
+		_exit(127);
+	}
+	close(in[1]);
+	close(out[1]);
+	close(err[1]);
+	for (unsigned i = 0u; i < m->segment_count; i++) {
+		close(m->segment_fd[i]);
+		m->segment_fd[i] = -1;
+	}
 	pthread_mutex_lock(&m->lock);
-	m->done = 1;
-	pthread_cond_broadcast(&m->done_cond);
+	m->pid   = child;
+	m->input = in[0];
+	m->out   = out[0];
+	m->err   = err[0];
 	pthread_mutex_unlock(&m->lock);
-	end_console(m);
-	if (WIFSIGNALED(status))
-		host->on_exit(m->core, m, NULL, -1, WTERMSIG(status));
-	else
-		host->on_exit(m->core, m, NULL, WEXITSTATUS(status), 0);
-	host->on_state(m->core, m, "stopped");
+	return 0;
+}
+
+/* The machine's thread: its images, qemu, and what it says to its end. */
+static void *run_machine(void *arg)
+{
+	hull_machine *m = arg;
+	int           failed = 0;
+	int           stopped;
+
+	for (unsigned i = 0u; i < m->media_count && !failed; i++)
+		if (m->media[i].collection != NULL)
+			failed = make_image(m, &m->media[i]) != 0;
+	pthread_mutex_lock(&m->lock);
+	stopped = m->stopping;
+	pthread_mutex_unlock(&m->lock);
+	if (stopped) {
+		finish(m, -1, SIGTERM);
+		return NULL;
+	}
+	if (failed || launch(m) != 0) {
+		host->on_data(m->core, NULL, 2, (const uint8_t *)m->why, strlen(m->why));
+		finish(m, 125, 0);
+		return NULL;
+	}
+	read_machine(m);
 	return NULL;
 }
 
@@ -721,11 +843,6 @@ static hull_status pc_create(hull_core *core, hull_buf plan, hull_machine **out,
 
 static hull_status pc_start(hull_core *core, hull_machine *m, hull_error *error)
 {
-	int   out[2];
-	int   err[2];
-	int   in[2];
-	pid_t parent = getpid();
-
 	(void)core;
 	/* A port on each wire, from the core's switch. */
 	for (unsigned i = 0u; i < m->segment_count; i++) {
@@ -738,57 +855,8 @@ static hull_status pc_start(hull_core *core, hull_machine *m, hull_error *error)
 		if (m->segment_fd[i] < 0)
 			return fail(error, HULL_ERR_RUNTIME, detail);
 	}
-	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, in) != 0)
-		return fail(error, HULL_ERR_RUNTIME, "a socket for the machine could not be made");
-	if (pipe2(out, O_CLOEXEC) != 0) {
-		close(in[0]);
-		close(in[1]);
-		return fail(error, HULL_ERR_RUNTIME, "a pipe for the machine could not be made");
-	}
-	if (pipe2(err, O_CLOEXEC) != 0) {
-		close(in[0]);
-		close(in[1]);
-		close(out[0]);
-		close(out[1]);
-		return fail(error, HULL_ERR_RUNTIME, "a pipe for the machine could not be made");
-	}
-	m->pid = fork();
-	if (m->pid < 0) {
-		close(in[0]);
-		close(in[1]);
-		close(out[0]);
-		close(out[1]);
-		close(err[0]);
-		close(err[1]);
-		return fail(error, HULL_ERR_RUNTIME, "qemu could not be started");
-	}
-	if (m->pid == 0) {
-		if (dup2(in[1], 0) < 0 || dup2(out[1], 1) < 0 || dup2(err[1], 2) < 0 ||
-		    setsid() < 0 || prctl(PR_SET_PDEATHSIG, SIGKILL, 0L, 0L, 0L) != 0 ||
-		    getppid() != parent || prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) != 0)
-			_exit(126);
-		/* Nothing of the core's goes on; exec_qemu gives each made image
-		 * a descriptor of its own that does. */
-		close_range(3u, ~0u, CLOSE_RANGE_CLOEXEC);
-		exec_qemu(m);
-		dprintf(2, "qemu-system-x86_64, which a pc machine needs: %s\n", strerror(errno));
-		_exit(127);
-	}
-	close(in[1]);
-	close(out[1]);
-	close(err[1]);
-	m->input = in[0];
-	for (unsigned i = 0u; i < m->segment_count; i++) {
-		close(m->segment_fd[i]);
-		m->segment_fd[i] = -1;
-	}
-	m->out = out[0];
-	m->err = err[0];
-	if (pthread_create(&m->reader, NULL, read_machine, m) != 0) {
-		kill(m->pid, SIGKILL);
-		waitpid(m->pid, NULL, 0);
-		return fail(error, HULL_ERR_INTERNAL, "the reader thread could not start");
-	}
+	if (pthread_create(&m->reader, NULL, run_machine, m) != 0)
+		return fail(error, HULL_ERR_INTERNAL, "the machine's thread could not start");
 	m->reading = 1;
 	host->on_state(m->core, m, "running");
 	return HULL_OK;
@@ -822,6 +890,7 @@ static hull_status pc_stop(hull_core *core, hull_machine *m, int timeout_ms, hul
 	(void)core;
 	(void)error;
 	pthread_mutex_lock(&m->lock);
+	m->stopping = 1;
 	if (!m->done && m->pid > 0) {
 		if (m->paused)
 			kill(m->pid, SIGCONT);
@@ -845,9 +914,6 @@ static hull_status pc_destroy(hull_core *core, hull_machine *m, hull_error *erro
 	if (m->reading) {
 		pc_stop(core, m, 0, error);
 		pthread_join(m->reader, NULL);
-	} else if (m->pid > 0) {
-		kill(m->pid, SIGKILL);
-		waitpid(m->pid, NULL, 0);
 	}
 	release(m);
 	return HULL_OK;
@@ -918,15 +984,17 @@ static hull_status pc_exec(hull_core *core, hull_machine *m, hull_buf spec, hull
 	st->from    = ends[0];
 	st->to      = ends[1];
 	pthread_mutex_lock(&m->lock);
-	if (m->done || m->console != NULL) {
+	if (m->done || m->console != NULL || m->input < 0) {
 		int gone = m->done;
+		int early = m->input < 0;
 
 		pthread_mutex_unlock(&m->lock);
 		close(ends[0]);
 		close(ends[1]);
 		free(st);
 		return gone ? fail(error, HULL_ERR_GONE, "the machine is not running") :
-		       fail(error, HULL_ERR_BUSY, "the serial port has a console joined to it already");
+		       fail(error, HULL_ERR_BUSY, early ? "the machine's media are still being made" :
+		            "the serial port has a console joined to it already");
 	}
 	m->console = st;
 	pthread_mutex_unlock(&m->lock);
@@ -1055,12 +1123,19 @@ static const hull_cap_entry entries[] = {
 	  "qemu's forwards from the machine's address, with (network nat), to whatever the guest's "
 	  "own stack answers", NULL },
 	{ "display.window",     HULL_SUP_NATIVE,
-	  "qemu's SDL window on the X display the run was given; no sound", NULL },
+	  "qemu's SDL window on the X display the run was given", NULL },
 	{ "display.vnc",        HULL_SUP_NATIVE,
 	  "the screen, keyboard and mouse by VNC at the machine's address, port 5900, with no "
 	  "password: any local user can connect, as to its ports", NULL },
 	{ "memory",             HULL_SUP_NATIVE,   NULL, NULL },
 	{ "cpus",               HULL_SUP_NATIVE,   NULL, NULL },
+	{ "pc.sound.none",  HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.sound.sb16",  HULL_SUP_NATIVE, "a Sound Blaster 16", NULL },
+	{ "pc.sound.adlib", HULL_SUP_NATIVE, "an AdLib's OPL2", NULL },
+	{ "pc.sound.gus",   HULL_SUP_NATIVE, "a Gravis Ultrasound", NULL },
+	{ "pc.sound.es1370", HULL_SUP_NATIVE, "an AudioPCI", NULL },
+	{ "pc.sound.ac97",  HULL_SUP_NATIVE, "AC'97", NULL },
+	{ "pc.sound.hda",   HULL_SUP_NATIVE, "Intel HD Audio", NULL },
 	{ "pc.firmware.bios", HULL_SUP_NATIVE, "qemu's SeaBIOS", NULL },
 	{ "pc.firmware.uefi", HULL_SUP_NATIVE, "OVMF, with no variable store", NULL },
 	{ "pc.machine.pc", HULL_SUP_NATIVE, NULL, NULL },

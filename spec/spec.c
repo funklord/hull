@@ -532,7 +532,11 @@ static const char *const pc_nic_values[]     = { "ne2k_pci", "ne2k_isa", "pcnet"
 
 static const char *const pc_firmware_values[] = { "bios", "uefi", NULL };
 
+static const char *const pc_sound_values[] = { "none", "sb16", "adlib", "gus", "es1370", "ac97",
+                                               "hda", NULL };
+
 static const key pc_keys[] = {
+	{ .name = "sound",    .type = CHOICE, .choices = pc_sound_values },
 	{ .name = "firmware", .type = CHOICE, .choices = pc_firmware_values },
 	{ .name = "nic",     .type = CHOICE, .choices = pc_nic_values },
 	{ .name = "machine", .type = CHOICE, .choices = pc_machine_values },

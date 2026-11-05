@@ -464,7 +464,8 @@ and installing from a disc then booting the disk is one changed line.
 | Writes | thrown away with the machine by default; `(mutable direct)` writes the image |
 | Output | its first serial port is `hull run`'s output; powering off is exit 0 |
 | Console | `hull exec -t ID -- console` joins your terminal to that port, nothing installed in the guest |
-| Screen | `(display window)`, an SDL window on your X display, or `(display vnc)`, port 5900 at its address; no sound yet |
+| Screen | `(display window)`, an SDL window on your X display, or `(display vnc)`, port 5900 at its address |
+| Sound | `(tuning (pc (sound sb16)))`, or `adlib`, `gus`, `es1370`, `ac97`, `hda`; heard with a window |
 | Network | none unless `(network nat)`; ports on the machine's own address |
 | Tuning | `(tuning (pc (machine pc\|q35\|isapc) (firmware bios\|uefi) (vga …) (nic …) (accel …)))` |
 
