@@ -8,6 +8,19 @@
  * the file cannot be read or holds no FROM. */
 int hull_import(const char *path);
 
+/* A build's ARG given from outside. */
+#define HULL_MAX_BUILD_ARGS 16u
+
+typedef struct hull_build_arg {
+	char name[128];
+	char value[512];
+} hull_build_arg;
+
+/* hull_import(), `args` given to its ARGs, and with a `target` the image
+ * the stage of that name, what follows it left out. */
+int hull_import_build(const char *path, const hull_build_arg *args, unsigned count,
+                      const char *target);
+
 /* Whether a spec reader takes `path` as a compose file: named .yml or
  * .yaml, as every compose file a directory's `hull up` finds is. */
 int hull_import_is_compose(const char *path);
@@ -28,6 +41,9 @@ typedef struct hull_compose_build {
 	char ref[256];
 	char context[512];
 	char dockerfile[256];
+	char target[128];
+	hull_build_arg args[HULL_MAX_BUILD_ARGS];
+	unsigned arg_count;
 } hull_compose_build;
 
 unsigned hull_compose_builds(const hull_compose_build **list);

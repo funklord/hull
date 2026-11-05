@@ -149,10 +149,11 @@ static void usage(FILE *out)
 	      "       hull manifest show REF | hull manifest compile [REF]\n"
 	      "       hull manifest composefs REF FILE\n"
 	      "       hull pull [--arch A] IMAGE [REF] | hull push REF IMAGE\n"
-	      "       hull import DOCKERFILE|COMPOSE-FILE | hull import IMAGE DIR\n"
+	      "       hull import [--build-arg N=V]... [--target STAGE] DOCKERFILE\n"
+	      "       hull import COMPOSE-FILE | hull import IMAGE DIR\n"
 	      "       hull media import IMAGE DIR | verify DIR | export DIR IMAGE\n"
 	      "       hull vagrant box add NAME FILE\n"
-	      "       hull up [-f COMPOSE-FILE] [--backend B] [NAME]\n"
+	      "       hull up [-f COMPOSE-FILE] [--backend B] [--profile P]... [NAME]\n"
 	      "       hull core\n"
 	      "       hull engines | hull doctor\n"
 	      "       hull --version\n", out);
@@ -4202,7 +4203,8 @@ static int compose_builds(const options *o, const hull_registry *registry)
 		fprintf(stderr, "hull: up: building %s from %s\n", list[i].ref, dockerfile);
 		fflush(stdout);
 		dup2(fd, 1);
-		status = hull_import(dockerfile);
+		status = hull_import_build(dockerfile, list[i].args, list[i].arg_count,
+		                           list[i].target[0] != '\0' ? list[i].target : NULL);
 		fflush(stdout);
 		dup2(2, 1);
 		if (status == 0) {
@@ -6596,6 +6598,36 @@ static int add_backends(options *o, char *list)
 	return 1;
 }
 
+/* `hull import [--build-arg NAME=VALUE]... [--target STAGE] DOCKERFILE`. */
+static int import_flags(int argc, char **argv)
+{
+	static hull_build_arg args[HULL_MAX_BUILD_ARGS];
+	unsigned              count = 0u;
+	const char           *target = NULL;
+	int                   i;
+
+	for (i = 2; i + 1 < argc; i += 2) {
+		char *eq = strchr(argv[i + 1], '=');
+
+		if (strcmp(argv[i], "--target") == 0) {
+			target = argv[i + 1];
+		} else if (strcmp(argv[i], "--build-arg") == 0 && eq != NULL &&
+		           count < HULL_MAX_BUILD_ARGS) {
+			snprintf(args[count].name, sizeof args[count].name, "%.*s",
+			         (int)(eq - argv[i + 1]), argv[i + 1]);
+			snprintf(args[count].value, sizeof args[count].value, "%s", eq + 1);
+			count++;
+		} else {
+			break;
+		}
+	}
+	if (i != argc - 1) {
+		usage(stderr);
+		return 2;
+	}
+	return hull_import_build(argv[i], args, count, target);
+}
+
 int main(int argc, char **argv)
 {
 	hull_registry registry;
@@ -6743,6 +6775,8 @@ int main(int argc, char **argv)
 	if ((strcmp(command, "media") == 0 && argc == 5 && strcmp(argv[2], "import") == 0) ||
 	    (strcmp(command, "import") == 0 && argc == 4))
 		return media_import(argv[argc - 2], argv[argc - 1]);
+	if (strcmp(command, "import") == 0 && argc >= 5 && strncmp(argv[2], "--", 2u) == 0)
+		return import_flags(argc, argv);
 	if (strcmp(command, "import") == 0 && argc == 3)
 		return hull_import(argv[2]);
 	if (strcmp(command, "proxy-ssh") == 0 && argc == 3)
@@ -6884,6 +6918,14 @@ int main(int argc, char **argv)
 				return 2;
 			}
 			o.tokens[o.token_count++] = argv[++i];
+		} else if (strcmp(arg, "--profile") == 0 && i + 1 < argc && strcmp(argv[1], "up") == 0) {
+			/* Compose's own variable, which the dialect reads. */
+			const char *had = getenv("COMPOSE_PROFILES");
+			char        list[512];
+
+			snprintf(list, sizeof list, "%s%s%s", had != NULL ? had : "",
+			         had != NULL ? "," : "", argv[++i]);
+			setenv("COMPOSE_PROFILES", list, 1);
 		} else if (strcmp(arg, "--explain") == 0 && strcmp(command, "plan") == 0) {
 			o.explain = 1;
 		} else if (strcmp(arg, "--resolved") == 0 && strcmp(command, "plan") == 0) {

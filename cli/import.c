@@ -139,6 +139,20 @@ static int exec_form(char *s, char **args, int max)
 }
 
 #define MAX_STAGES 32u
+#define MAX_ARGS   64u
+
+/* An ARG: its name, and its value, or NULL where it has none. */
+typedef struct build_arg {
+	char name[128];
+	char value[1024];
+	int  given;
+} build_arg;
+
+/* What a build was given from outside, `--build-arg` or compose's args:
+ * and target:, for the next import_dockerfile(). */
+static const hull_build_arg *given_args;
+static unsigned              given_count;
+static const char           *given_target;
 
 typedef struct build {
 	sb       steps;        /* each (step ...) as it is met */
@@ -151,7 +165,135 @@ typedef struct build {
 	char     stage[MAX_STAGES][128];  /* each stage's name so far, or its number */
 	char     stage_number[MAX_STAGES][16];
 	unsigned stage_count;
+	build_arg global[MAX_ARGS];   /* before the first FROM: FROM's alone */
+	unsigned  global_count;
+	build_arg arg[MAX_ARGS];      /* this stage's */
+	unsigned  arg_count;
 } build;
+
+/* The value the build was given for `name`, or NULL. */
+static const char *given_arg(const char *name)
+{
+	for (unsigned i = 0u; i < given_count; i++)
+		if (strcmp(given_args[i].name, name) == 0)
+			return given_args[i].value;
+	return NULL;
+}
+
+/* `name` among `list`, or NULL. */
+static const build_arg *arg_called(const build_arg *list, unsigned count, const char *name,
+                                   size_t length)
+{
+	for (unsigned i = 0u; i < count; i++)
+		if (strlen(list[i].name) == length && memcmp(list[i].name, name, length) == 0)
+			return &list[i];
+	return NULL;
+}
+
+/* `text` with each $NAME, ${NAME}, ${NAME:-word} and ${NAME-word} of a
+ * declared ARG put in, into `out`. Any other $ stays: a name may be the
+ * base image's, and a Dockerfile's reader cannot see that. */
+static void expand_args(const build_arg *list, unsigned count, const char *text, char *out,
+                        size_t cap)
+{
+	size_t at = 0u;
+
+	while (*text != '\0' && at + 1u < cap) {
+		const char      *name = text + 1;
+		const char      *end;
+		const char      *word = NULL;
+		const char      *close = NULL;
+		const build_arg *arg;
+		int              braced;
+		int              empty_too = 0;
+
+		if (*text != '$') {
+			out[at++] = *text++;
+			continue;
+		}
+		braced = *name == '{';
+		name += braced;
+		end = name;
+		while (isalnum((unsigned char)*end) || *end == '_')
+			end++;
+		if (braced) {
+			if (end[0] == ':' && end[1] == '-') {
+				word = end + 2;
+				empty_too = 1;
+			} else if (end[0] == '-') {
+				word = end + 1;
+			} else if (end[0] != '}') {
+				out[at++] = *text++;
+				continue;
+			}
+			close = strchr(end, '}');
+		}
+		arg = end > name ? arg_called(list, count, name, (size_t)(end - name)) : NULL;
+		if (arg == NULL || (braced && close == NULL)) {
+			out[at++] = *text++;
+			continue;
+		}
+		if (arg->given && !(empty_too && arg->value[0] == '\0'))
+			at += (size_t)snprintf(out + at, cap - at, "%s", arg->value);
+		else if (word != NULL)
+			at += (size_t)snprintf(out + at, cap - at, "%.*s", (int)(close - word), word);
+		if (at >= cap)
+			at = cap - 1u;
+		text = braced ? close + 1 : end;
+	}
+	out[at] = '\0';
+}
+
+static void note(sb *steps, const char *why, const char *text);
+
+/* An ARG's `NAME[=value]` words, into `list`: the value the build was
+ * given, the one written, or for a stage's bare name the global of that
+ * name, as Docker scopes them. */
+static void declare_args(build *b, build_arg *list, unsigned *count, char *text, int global)
+{
+	char *save;
+
+	for (char *w = strtok_r(text, " \t", &save); w != NULL; w = strtok_r(NULL, " \t", &save)) {
+		char            *eq = strchr(w, '=');
+		const char      *from_outside;
+		const build_arg *outer;
+		build_arg       *arg;
+
+		if (eq != NULL)
+			*eq = '\0';
+		/* Declared again, the later one stands. */
+		arg = (build_arg *)arg_called(list, *count, w, strlen(w));
+		if (arg == NULL && *count == MAX_ARGS) {
+			note(&b->steps, "ARG past the most kept not translated", w);
+			continue;
+		}
+		if (arg == NULL)
+			arg = &list[(*count)++];
+		memset(arg, 0, sizeof *arg);
+		snprintf(arg->name, sizeof arg->name, "%s", w);
+		from_outside = given_arg(arg->name);
+		outer = global ? NULL : arg_called(b->global, b->global_count, w, strlen(w));
+		if (from_outside != NULL) {
+			snprintf(arg->value, sizeof arg->value, "%s", from_outside);
+			arg->given = 1;
+		} else if (eq != NULL) {
+			char  *value = eq + 1;
+			size_t n = strlen(value);
+
+			if (n >= 2u && (value[0] == '"' || value[0] == '\'') && value[n - 1u] == value[0]) {
+				value[n - 1u] = '\0';
+				value++;
+			}
+			expand_args(list, *count, value, arg->value, sizeof arg->value);
+			arg->given = 1;
+		} else if (outer != NULL && outer->given) {
+			snprintf(arg->value, sizeof arg->value, "%s", outer->value);
+			arg->given = 1;
+		} else if (!global) {
+			note(&b->steps, "ARG given no value, and unset in what follows", w);
+		}
+	}
+}
 
 /* The stage `word` names, by its name or its number, or NULL. */
 static const char *stage_called(const build *b, const char *word)
@@ -167,8 +309,26 @@ static const char *stage_called(const build *b, const char *word)
  * and WORKDIR reach every later instruction. */
 static void step_context(build *b, sb *out)
 {
-	if (b->env_count > 0u) {
+	unsigned args = 0u;
+
+	/* An ARG is a RUN's environment and no part of the image's. */
+	for (unsigned i = 0u; i < b->arg_count; i++)
+		args += (unsigned)b->arg[i].given;
+	if (b->env_count > 0u || args > 0u) {
 		sb_str(out, " (env");
+		for (unsigned i = 0u; i < b->arg_count; i++) {
+			int shadowed = !b->arg[i].given;
+
+			for (unsigned e = 0u; e < b->env_count; e++)
+				shadowed |= strcmp(b->env_name[e], b->arg[i].name) == 0;
+			if (shadowed)
+				continue;
+			sb_str(out, " (");
+			sb_str(out, b->arg[i].name);
+			sb_str(out, " ");
+			sb_quoted(out, b->arg[i].value);
+			sb_str(out, ")");
+		}
 		for (unsigned i = 0u; i < b->env_count; i++) {
 			sb_str(out, " (");
 			sb_str(out, b->env_name[i]);
@@ -422,6 +582,7 @@ static int import_dockerfile(FILE *file)
 	char  *base = NULL;
 	char   line[LINE_CAP];
 	char   logical[LINE_CAP];
+	static char expanded[LINE_CAP];
 	size_t at = 0u;
 	int    status = 0;
 
@@ -456,6 +617,27 @@ static int import_dockerfile(FILE *file)
 				instr[k++] = (char)toupper((unsigned char)*sp);
 			instr[k] = '\0';
 			s = trim(sp);
+			/* Asked for a stage, what follows it is no part of the image. */
+			if (strcmp(instr, "FROM") == 0 && given_target != NULL && b.stage_count > 0u &&
+			    strcasecmp(b.stage[b.stage_count - 1u], given_target) == 0)
+				break;
+			if (strcmp(instr, "ARG") == 0) {
+				if (b.had_from)
+					declare_args(&b, b.arg, &b.arg_count, s, 0);
+				else
+					declare_args(&b, b.global, &b.global_count, s, 1);
+				continue;
+			}
+			/* A RUN has its ARGs as its environment, and CMD and ENTRYPOINT
+			 * are not expanded by Docker: everything else has them put in. */
+			if (strcmp(instr, "FROM") == 0) {
+				expand_args(b.global, b.global_count, s, expanded, sizeof expanded);
+				s = expanded;
+			} else if (strcmp(instr, "RUN") != 0 && strcmp(instr, "CMD") != 0 &&
+			           strcmp(instr, "ENTRYPOINT") != 0) {
+				expand_args(b.arg, b.arg_count, s, expanded, sizeof expanded);
+				s = expanded;
+			}
 			if (strcmp(instr, "FROM") == 0) {
 				char       *as;
 				char       *word = s;
@@ -487,6 +669,7 @@ static int import_dockerfile(FILE *file)
 					free(base);
 				}
 				b.had_from = 1;
+				b.arg_count = 0u;
 				while (strncmp(word, "--", 2u) == 0) {   /* --platform and the like */
 					char *end = strpbrk(word, " \t");
 
@@ -547,6 +730,15 @@ static int import_dockerfile(FILE *file)
 		free(b.steps.data);
 		free(rt.data);
 		free(after.data);
+		return 2;
+	}
+	if (given_target != NULL && strcasecmp(b.stage[b.stage_count - 1u], given_target) != 0) {
+		fprintf(stderr, "hull: import: the Dockerfile has no stage %s\n", given_target);
+		free(base);
+		free(b.steps.data);
+		free(rt.data);
+		free(after.data);
+		free(stages.data);
 		return 2;
 	}
 	stage_runtime(&b, &rt, &after);
@@ -627,6 +819,12 @@ typedef struct svc {
 	int  in_test;          /* a block list of the test's words follows */
 	char build_context[512];   /* from build:, relative to the file */
 	char build_dockerfile[256];
+	char build_target[128];
+	hull_build_arg build_arg[HULL_MAX_BUILD_ARGS];
+	unsigned build_arg_count;
+	int  args_indent;      /* where build's args: key is, or -1 */
+	char profile[8][64];   /* from profiles: */
+	int  profile_count;
 	long interval_ms;      /* compose's own, or -1 for its default */
 	long timeout_ms;
 	long retries;
@@ -901,6 +1099,7 @@ static void svc_reset(svc *s)
 	free(s->notes.data);
 	memset(s, 0, sizeof *s);
 	s->dep_indent  = -1;
+	s->args_indent = -1;
 	s->interval_ms = -1;
 	s->timeout_ms  = -1;
 	s->retries     = -1;
@@ -946,6 +1145,43 @@ static void svc_after(svc *s, const char *name)
 	sb_str(&s->after, label);
 }
 
+/* Whether COMPOSE_PROFILES, comma-separated, names one of the service's. */
+static int profile_active(const svc *s)
+{
+	const char *active = getenv("COMPOSE_PROFILES");
+	char        list[512];
+	char       *save;
+
+	if (active == NULL)
+		return 0;
+	snprintf(list, sizeof list, "%s", active);
+	for (char *w = strtok_r(list, ",", &save); w != NULL; w = strtok_r(NULL, ",", &save))
+		for (int i = 0; i < s->profile_count; i++)
+			if (strcmp(s->profile[i], trim(w)) == 0 || strcmp(trim(w), "*") == 0)
+				return 1;
+	return 0;
+}
+
+/* `NAME=value` or `NAME: value`, a build's arg. */
+static void svc_build_arg(svc *s, char *text, char separator)
+{
+	char *at = strchr(text, separator);
+
+	if (at == NULL) {
+		svc_note(s, "build arg with no value not translated", text);
+		return;
+	}
+	if (s->build_arg_count == HULL_MAX_BUILD_ARGS) {
+		svc_note(s, "build arg past the most kept not translated", text);
+		return;
+	}
+	*at = '\0';
+	snprintf(s->build_arg[s->build_arg_count].name, sizeof s->build_arg[0].name, "%s", trim(text));
+	snprintf(s->build_arg[s->build_arg_count].value, sizeof s->build_arg[0].value, "%s",
+	         scalar(at + 1));
+	s->build_arg_count++;
+}
+
 /* A healthcheck's test: a flow list, a block list's first word, or a line. */
 static void svc_test_word(svc *s, const char *word)
 {
@@ -977,6 +1213,18 @@ static void svc_flush(svc *s, sb *out)
 {
 	if (!s->open)
 		return;
+	/* As compose: a service with profiles runs only where one is asked
+	 * for, by COMPOSE_PROFILES, which `hull up --profile` adds to. */
+	if (s->profile_count > 0 && !profile_active(s)) {
+		if (warnings != NULL)
+			fprintf(warnings, "%s: %s: left out: none of its profiles is active\n", warned_path,
+			        s->name);
+		sb_str(out, "\n  ; ");
+		sb_str(out, s->name);
+		sb_str(out, " left out: none of its profiles is active");
+		svc_reset(s);
+		return;
+	}
 	/* build: the service's image is what `hull up` makes of its Dockerfile,
 	 * under a ref of the project's, even where an image: names it too. */
 	if (s->build_context[0] != '\0' || s->build_dockerfile[0] != '\0') {
@@ -990,6 +1238,9 @@ static void svc_flush(svc *s, sb *out)
 			         s->build_context[0] != '\0' ? s->build_context : ".");
 			snprintf(b->dockerfile, sizeof b->dockerfile, "%s",
 			         s->build_dockerfile[0] != '\0' ? s->build_dockerfile : "Dockerfile");
+			snprintf(b->target, sizeof b->target, "%s", s->build_target);
+			memcpy(b->args, s->build_arg, sizeof b->args);
+			b->arg_count = s->build_arg_count;
 			snprintf(s->source, sizeof s->source, "%s", b->ref);
 			svc_note(s, "built by hull up from its Dockerfile, as", b->ref);
 		}
@@ -1405,6 +1656,7 @@ static char *compose_text(FILE *file, const char *project)
 			s.open = 1;
 			s.net_indent  = -1;
 			s.dep_indent  = -1;
+			s.args_indent = -1;
 			s.interval_ms = -1;
 			s.timeout_ms  = -1;
 			s.retries     = -1;
@@ -1434,6 +1686,10 @@ static char *compose_text(FILE *file, const char *project)
 				svc_after(&s, scalar(item));
 			else if (strcmp(field, "healthcheck") == 0 && s.in_test)
 				svc_test_word(&s, scalar(item));
+			else if (strcmp(field, "build") == 0 && s.args_indent >= 0)
+				svc_build_arg(&s, item, '=');
+			else if (strcmp(field, "profiles") == 0 && s.profile_count < 8)
+				snprintf(s.profile[s.profile_count++], sizeof s.profile[0], "%s", scalar(item));
 			continue;
 		}
 		if (field_indent < 0)
@@ -1494,9 +1750,18 @@ static char *compose_text(FILE *file, const char *project)
 				 * the rest said; args and target change what is built. */
 				char *at = strchr(content, ':');
 
+				if (s.args_indent >= 0 && ind > s.args_indent) {
+					svc_build_arg(&s, content, ':');
+					continue;
+				}
+				s.args_indent = -1;
 				if (at != NULL)
 					*at = '\0';
-				if (at != NULL && strcmp(trim(content), "context") == 0)
+				if (at != NULL && strcmp(trim(content), "args") == 0 && *trim(at + 1) == '\0')
+					s.args_indent = ind;
+				else if (at != NULL && strcmp(trim(content), "target") == 0)
+					snprintf(s.build_target, sizeof s.build_target, "%s", scalar(at + 1));
+				else if (at != NULL && strcmp(trim(content), "context") == 0)
 					snprintf(s.build_context, sizeof s.build_context, "%s", scalar(at + 1));
 				else if (at != NULL && strcmp(trim(content), "dockerfile") == 0)
 					snprintf(s.build_dockerfile, sizeof s.build_dockerfile, "%s", scalar(at + 1));
@@ -1600,6 +1865,12 @@ static char *compose_text(FILE *file, const char *project)
 			}
 			if (n < 0)
 				svc_note(&s, key, "value not translated");
+		} else if (strcmp(key, "profiles") == 0) {
+			char *items[8];
+			int   n = flow_list(value, items, 8);
+
+			for (int i = 0; i < n; i++)
+				snprintf(s.profile[s.profile_count++], sizeof s.profile[0], "%s", items[i]);
 		} else if (strcmp(key, "build") == 0)
 			snprintf(s.build_context, sizeof s.build_context, "%s", scalar(value));
 		else if (strcmp(key, "networks") == 0) {
@@ -1711,6 +1982,21 @@ char *hull_import_compose(const char *path, FILE *notes)
 
 /* Dockerfile or compose, told apart by the file's name: a compose file ends
  * .yml or .yaml or is named for compose, anything else is a Dockerfile. */
+int hull_import_build(const char *path, const hull_build_arg *args, unsigned count,
+                      const char *target)
+{
+	int status;
+
+	given_args   = args;
+	given_count  = count;
+	given_target = target;
+	status       = hull_import(path);
+	given_args   = NULL;
+	given_count  = 0u;
+	given_target = NULL;
+	return status;
+}
+
 int hull_import(const char *path)
 {
 	const char *base = strrchr(path, '/');

@@ -158,6 +158,39 @@ gb '; ADD treated as COPY'
 gb '; not translated: HEALTHCHECK'
 printf 'RUN true\n' > "$dir/nofrom.in"
 expect 2 'has no FROM' "$hull" import "$dir/nofrom.in"
+# ARG: FROM takes the globals, a stage's own reach its later lines, a RUN
+# has them as its environment and no image keeps them; --build-arg wins
+# over a default, and --target ends the image at that stage.
+cat > "$dir/args.in" <<'DOCKERFILE'
+ARG TAG=3.20
+ARG REGISTRY
+FROM ${REGISTRY:-docker.io}/alpine:${TAG} AS build
+ARG TAG
+ARG VERSION=1.2
+ARG UNSET
+ENV APP=$VERSION
+RUN echo $VERSION
+WORKDIR /opt/app-${VERSION}
+COPY app-$VERSION.tar $PATH_OF_THE_BASE
+FROM scratch AS out
+COPY --from=build /v /v
+DOCKERFILE
+expect 0 '\(base "docker.io/alpine:3.20"\)' "$hull" import "$dir/args.in"
+expect 0 '\(run "echo \$VERSION"\) \(env \(TAG "3.20"\) \(VERSION "1.2"\) \(APP "1.2"\)\)' \
+	"$hull" import "$dir/args.in"
+expect 0 '\(workdir "/opt/app-1.2"\)' "$hull" import "$dir/args.in"
+expect 0 '\(from "app-1.2.tar"\) \(to "/opt/app-1.2/\$PATH_OF_THE_BASE"\)' "$hull" import "$dir/args.in"
+expect 0 '; ARG given no value, and unset in what follows: UNSET' "$hull" import "$dir/args.in"
+expect 0 '\(env \(APP "9"\)\)' "$hull" import --build-arg VERSION=9 "$dir/args.in"
+expect 0 '\(base "mirror/alpine:1"\)' "$hull" import --build-arg REGISTRY=mirror \
+	--build-arg TAG=1 --target build "$dir/args.in"
+expect 2 'has no stage nope' "$hull" import --target nope "$dir/args.in"
+cases=$((cases + 1))
+"$hull" import "$dir/args.in" | sed -n '/(runtime/,/(steps/p' | grep -q VERSION &&
+	fail 'an ARG is no part of the image' "$("$hull" import "$dir/args.in")"
+cases=$((cases + 1))
+"$hull" import --target build "$dir/args.in" | grep -q '"/v"' &&
+	fail 'a stage after --target is left out' "$("$hull" import --target build "$dir/args.in")"
 # hull import of a compose file (by its .yml name) to a (machines ...) form.
 # Section 4.8 plans a file's machines at once with no ordering, so
 # depends_on is (after ...); each network is an addressed segment

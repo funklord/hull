@@ -371,6 +371,40 @@ printf '(build (base "scratch") (stages (stage (name "a") (base "scratch"))) (st
 	> "$root/ms/up.conf"
 expect 1 'a stage.s path holds \.\.' "$hull" build -f "$root/ms/up.conf" staged/5
 
+# A compose build's args and target reach the Dockerfile, and a service
+# of a profile not asked for is left out, as `docker compose up` does.
+mkdir -p "$root/ca/sub"
+cp -a "$root/b/base" "$root/ca/base"
+cp "$probe" "$root/ca/base/probe"
+printf 'from the arg\n' > "$root/ca/sub/chosen"
+cat > "$root/ca/Dockerfile" <<'DOCKERFILE'
+ARG BASE=none
+FROM dir:./${BASE} AS first
+ARG FILE=wrong
+COPY sub/$FILE /greeting
+FROM scratch AS after
+COPY --from=first /greeting /nothing-runs-here
+DOCKERFILE
+cat > "$root/ca/compose.yaml" <<'COMPOSE'
+services:
+  web:
+    build:
+      context: .
+      target: first
+      args:
+        BASE: base
+        FILE: chosen
+    command: ["/probe", "read", "/greeting"]
+  debug:
+    image: nothing/of/this/name
+    profiles: [debug]
+COMPOSE
+limit=120 expect 0 'from the arg' "$hull" up -f "$root/ca/compose.yaml" --backend chroot
+limit=120 expect 0 'debug: left out: none of its profiles' \
+	"$hull" up -f "$root/ca/compose.yaml" --backend chroot
+limit=60 expect 125 'nothing/of/this/name|debug' "$hull" up -f "$root/ca/compose.yaml" \
+	--backend chroot --profile debug
+
 # A compose file whose services build: `hull up` imports each Dockerfile,
 # builds it and runs the service from the result, as `docker compose up`
 # does; a block form with its own Dockerfile too, and a second up cached.
