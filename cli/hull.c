@@ -148,7 +148,7 @@ static void usage(FILE *out)
 	      "       hull diff REF REF | hull tag REF NEW | hull tag -d REF\n"
 	      "       hull manifest show REF | hull manifest compile [REF]\n"
 	      "       hull manifest composefs REF FILE\n"
-	      "       hull pull [--arch A] IMAGE [REF] | hull push REF IMAGE\n"
+	      "       hull pull [--arch A] IMAGE [REF] | hull push REF IMAGE | hull load FILE [REF]\n"
 	      "       hull import [--build-arg N=V]... [--target STAGE] DOCKERFILE\n"
 	      "       hull import COMPOSE-FILE | hull import IMAGE DIR\n"
 	      "       hull media import IMAGE DIR | verify DIR | export DIR IMAGE\n"
@@ -4708,14 +4708,70 @@ static const char *container_format(const char *image)
 /* `hull media import IMAGE DIR` (section 3.10), and `hull import IMAGE
  * DIR`, section 3.11's one algorithm: what it understood and what it did
  * not, the patch being the measure of that. */
+/* An appliance, `.ova`: a tar of an .ovf and its disks. The disk taken
+ * apart, the first where there are several, which is said. */
+static int media_import(const char *image, const char *dir);
+static int run_child(const char *const *argv);
+
+static int ova_import(const char *image, const char *dir)
+{
+	char           work[4300];
+	char           disk[4600] = "";
+	DIR           *list;
+	struct dirent *entry;
+	unsigned       disks = 0u;
+	int            status = 1;
+
+	snprintf(work, sizeof work, "%s.ova-XXXXXX", dir);
+	if (mkdtemp(work) == NULL) {
+		perror(work);
+		return 1;
+	}
+	{
+		const char *const argv[] = { "tar", "-xf", image, "-C", work, "--no-same-owner", NULL };
+
+		if (run_child(argv) != 0) {
+			fprintf(stderr, "hull: media import: %s is not an appliance's tar\n", image);
+			goto done;
+		}
+	}
+	if ((list = opendir(work)) == NULL)
+		goto done;
+	while ((entry = readdir(list)) != NULL) {
+		const char *dot = strrchr(entry->d_name, '.');
+
+		if (dot == NULL || strcmp(dot, ".vmdk") != 0)
+			continue;
+		disks++;
+		/* The disks of one appliance are numbered, so the least name. */
+		if (disk[0] == '\0' || strcmp(strrchr(disk, '/') + 1, entry->d_name) > 0)
+			snprintf(disk, sizeof disk, "%s/%s", work, entry->d_name);
+	}
+	closedir(list);
+	if (disk[0] == '\0') {
+		fprintf(stderr, "hull: media import: %s holds no disk\n", image);
+		goto done;
+	}
+	if (disks > 1u)
+		fprintf(stderr, "hull: media import: %s holds %u disks, and only %s is taken\n", image,
+		        disks, strrchr(disk, '/') + 1);
+	status = media_import(disk, dir);
+done:
+	hull_store_remove_tree(AT_FDCWD, work);
+	return status;
+}
+
 static int media_import(const char *image, const char *dir)
 {
 	hull_media_report report;
 	char              why[4400] = "";
 	char              raw[4400] = "";
 	const char       *format = container_format(image);
+	size_t            length = strlen(image);
 	int               status;
 
+	if (length > 4u && strcmp(image + length - 4u, ".ova") == 0)
+		return ova_import(image, dir);
 	/* A virtual machine's disk is its raw disk in a container qemu-img
 	 * reads: that is what is taken apart, and what export gives back, the
 	 * container's own bytes being no part of the disk (section 3.13). */
@@ -5159,6 +5215,33 @@ static int pull(const char *name, const char *ref, const char *arch)
 	        (unsigned long long)made.entries, (unsigned long long)made.objects,
 	        (unsigned long long)made.new_objects, (unsigned long long)made.total_size,
 	        made.skipped != 0u ? "; some were left out, as said" : "");
+	return 0;
+}
+
+/* `hull load FILE [REF]`: an image saved to a file, with no registry. */
+static int load(const char *path, const char *ref)
+{
+	hull_store  store;
+	hull_commit made;
+	char        why[4400] = "";
+	char        name[512];
+	const char *arch = host_arch();
+	int         status;
+
+	if (arch == NULL) {
+		fprintf(stderr, "hull: load: the host's arch could not be read\n");
+		return 1;
+	}
+	if ((status = open_store(&store, 1)) != 0)
+		return status;
+	status = hull_load(&store, path, ref, arch, HULL_BUILDER, &made, name, sizeof name, why,
+	                   sizeof why);
+	hull_store_close(&store);
+	if (status != 0) {
+		fprintf(stderr, "hull: load: %s\n", why);
+		return 1;
+	}
+	printf("%s sha256:%s\n", name, made.manifest);
 	return 0;
 }
 
@@ -6759,6 +6842,8 @@ int main(int argc, char **argv)
 	if (strcmp(command, "pull") == 0 && argc >= 5 && strcmp(argv[2], "--arch") == 0 &&
 	    argc <= 6)
 		return pull(argv[4], argc == 6 ? argv[5] : argv[4], argv[3]);
+	if (strcmp(command, "load") == 0 && (argc == 3 || argc == 4))
+		return load(argv[2], argc == 4 ? argv[3] : NULL);
 	if (strcmp(command, "pull") == 0 && (argc == 3 || argc == 4))
 		return pull(argv[2], argc == 4 ? argv[3] : argv[2], NULL);
 	if (strcmp(command, "manifest") == 0 && argc == 4 && strcmp(argv[2], "show") == 0)

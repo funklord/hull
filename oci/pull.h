@@ -27,6 +27,18 @@ extern "C" {
 int hull_pull(hull_store *store, const char *image, const char *ref, const char *arch,
               const char *builder, hull_commit *out, char *why, size_t cap);
 
+/*
+ * `path`, the tar of `docker save` or of an OCI layout (`skopeo copy ...
+ * oci-archive:`), its image as hull_pull() commits one: an index narrowed
+ * to linux on `arch`, each blob held to the digest naming it, the tree
+ * committed as `ref`, or with none the archive's tag, or load/ and the
+ * config's digest, the name used into `ref_out`. No network. 0, or -1
+ * with `why`.
+ */
+int hull_load(hull_store *store, const char *path, const char *ref, const char *arch,
+              const char *builder, hull_commit *out, char *ref_out, size_t ref_cap, char *why,
+              size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

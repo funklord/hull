@@ -564,3 +564,394 @@ done:
 	free(provenance.data);
 	return result;
 }
+
+/* --- an archive on disk -------------------------------------------------- */
+
+/* A member of the archive: where its bytes are. */
+typedef struct member {
+	char     name[256];
+	uint64_t offset;
+	uint64_t size;
+} member;
+
+typedef struct archive {
+	int     fd;
+	member *members;
+	size_t  count;
+} archive;
+
+/* The octal number of a tar header's field. */
+static uint64_t tar_number(const char *field, size_t n)
+{
+	uint64_t value = 0u;
+
+	for (size_t i = 0u; i < n && field[i] >= '0' && field[i] <= '7'; i++)
+		value = value * 8u + (uint64_t)(field[i] - '0');
+	return value;
+}
+
+/* Every regular member of the tar at `fd`, into `a`. The names an image
+ * archive holds are short, so ustar's two fields are enough; a longer one
+ * is no name a manifest could use. 0, or -1. */
+static int read_members(archive *a, char *why, size_t cap)
+{
+	uint8_t  header[512];
+	uint64_t at = 0u;
+	size_t   room = 0u;
+
+	for (;;) {
+		char     name[256];
+		uint64_t size;
+		size_t   n;
+
+		ssize_t got = pread(a->fd, header, sizeof header, (off_t)at);
+
+		if (got == 0 || (got == (ssize_t)sizeof header && header[0] == '\0'))
+			return 0;
+		if (got != (ssize_t)sizeof header || memcmp(header + 257, "ustar", 5u) != 0)
+			return say(why, cap, "the archive", "it is not a tar; a compressed one wants "
+			           "uncompressing first");
+		size = tar_number((const char *)header + 124, 12u);
+		name[0] = '\0';
+		if (header[345] != '\0')
+			snprintf(name, sizeof name, "%.155s/", (const char *)header + 345);
+		n = strlen(name);
+		snprintf(name + n, sizeof name - n, "%.100s", (const char *)header);
+		if (header[156] == '0' || header[156] == '\0') {
+			const char *plain = strncmp(name, "./", 2u) == 0 ? name + 2 : name;
+
+			if (a->count == room) {
+				member *grown;
+
+				room = room != 0u ? room * 2u : 64u;
+				if ((grown = realloc(a->members, room * sizeof *grown)) == NULL)
+					return say(why, cap, "out of memory", NULL);
+				a->members = grown;
+			}
+			snprintf(a->members[a->count].name, sizeof a->members[0].name, "%s", plain);
+			a->members[a->count].offset = at + 512u;
+			a->members[a->count].size   = size;
+			a->count++;
+		}
+		at += 512u + (size + 511u) / 512u * 512u;
+	}
+}
+
+static const member *member_called(const archive *a, const char *name)
+{
+	for (size_t i = 0u; i < a->count; i++)
+		if (strcmp(a->members[i].name, name) == 0)
+			return &a->members[i];
+	return NULL;
+}
+
+/* `m`'s bytes into `out`, a document of at most MAX_DOCUMENT - 1, ended by
+ * a NUL. Its length, or -1. */
+static long member_text(const archive *a, const member *m, char *out)
+{
+	if (m->size >= MAX_DOCUMENT ||
+	    pread(a->fd, out, (size_t)m->size, (off_t)m->offset) != (ssize_t)m->size)
+		return -1;
+	out[m->size] = '\0';
+	return (long)m->size;
+}
+
+/* Whether the member `name` is a blob by its digest, blobs/sha256/HEX. */
+static const char *blob_digest(const char *name)
+{
+	return strncmp(name, "blobs/sha256/", 13u) == 0 && strlen(name) == 13u + 64u ? name + 13 : NULL;
+}
+
+/* `m` copied to `to`, over what it held, its digest held to its name where
+ * its name is one. 0, or -1. */
+static int member_to(const archive *a, const member *m, int to, char *why, size_t cap)
+{
+	static uint8_t buffer[1u << 16];
+	hull_sha256    hash;
+	uint64_t       done = 0u;
+	uint8_t        raw[32];
+	char           hex[65];
+	const char    *named = blob_digest(m->name);
+
+	hull_sha256_init(&hash);
+	if (ftruncate(to, 0) != 0 || lseek(to, 0, SEEK_SET) != 0)
+		return say(why, cap, m->name, strerror(errno));
+	while (done < m->size) {
+		size_t  want = m->size - done < sizeof buffer ? (size_t)(m->size - done) : sizeof buffer;
+		ssize_t n = pread(a->fd, buffer, want, (off_t)(m->offset + done));
+
+		if (n <= 0)
+			return say(why, cap, m->name, "the archive ends inside it");
+		if (write(to, buffer, (size_t)n) != n)
+			return say(why, cap, m->name, strerror(errno));
+		hull_sha256_update(&hash, buffer, (size_t)n);
+		done += (uint64_t)n;
+	}
+	hull_sha256_final(&hash, raw);
+	hull_sha256_hex(raw, hex);
+	if (named != NULL && strcmp(named, hex) != 0)
+		return say(why, cap, m->name, "it is not the digest that names it");
+	return 0;
+}
+
+/* A blob of an OCI layout, `sha256:HEX`, as a member's name in `out`. */
+static int blob_name(const char *digest, char *out, size_t cap)
+{
+	if (!hull_remote_is_digest(digest))
+		return -1;
+	snprintf(out, cap, "blobs/sha256/%s", digest + 7);
+	return 0;
+}
+
+/* The members of the image in `a`: its config's name, its layers' names
+ * and a tag, by docker save's manifest.json or, with none, an OCI layout's
+ * index.json, an index within narrowed to linux on `arch`. */
+#define MAX_LAYERS 256u
+
+typedef struct contents {
+	char config[256];
+	char layer[MAX_LAYERS][256];
+	unsigned layers;
+	char tag[256];
+} contents;
+
+static int read_contents(const archive *a, const char *arch, contents *c, char *text, char *why,
+                         size_t cap)
+{
+	const member   *m = member_called(a, "manifest.json");
+	hull_json       doc;
+	hull_json_value root;
+	hull_json_value list;
+	hull_json_value item;
+	const char     *bad;
+	long            n;
+
+	if (m != NULL) {
+		hull_json_value image;
+
+		if ((n = member_text(a, m, text)) < 0 ||
+		    hull_json_open(&doc, text, (size_t)n, &root, &bad) != 0 ||
+		    !hull_json_element(&doc, &root, 1, &image) ||
+		    hull_json_member_string(&doc, &image, "Config", c->config, sizeof c->config) <= 0 ||
+		    !hull_json_member(&doc, &image, "Layers", &list))
+			return say(why, cap, "manifest.json", "it names no image");
+		if (hull_json_member(&doc, &image, "RepoTags", &item)) {
+			hull_json_value tag;
+
+			if (hull_json_element(&doc, &item, 1, &tag))
+				hull_json_string(&doc, &tag, c->tag, sizeof c->tag);
+		}
+		for (int more = hull_json_element(&doc, &list, 1, &item); more;
+		     more = hull_json_element(&doc, &list, 0, &item)) {
+			if (c->layers == MAX_LAYERS)
+				return say(why, cap, "manifest.json", "it names too many layers");
+			if (hull_json_string(&doc, &item, c->layer[c->layers], sizeof c->layer[0]) <= 0)
+				return say(why, cap, "manifest.json", "a layer is not a name");
+			c->layers++;
+		}
+		return 0;
+	}
+	if ((m = member_called(a, "index.json")) == NULL)
+		return say(why, cap, "the archive", "it holds neither manifest.json nor index.json: no "
+		           "image of docker save or an OCI layout");
+	/* An index, perhaps of an index, down to a manifest. */
+	for (int depth = 0; depth < 3; depth++) {
+		char        digest[80] = "";
+		char        name[256];
+		char        media[256] = "";
+		hull_json_value config;
+
+		if ((n = member_text(a, m, text)) < 0 ||
+		    hull_json_open(&doc, text, (size_t)n, &root, &bad) != 0)
+			return say(why, cap, m->name, "it is no JSON this reads");
+		hull_json_member_string(&doc, &root, "mediaType", media, sizeof media);
+		if (hull_json_member(&doc, &root, "config", &config)) {
+			if (hull_json_member_string(&doc, &config, "digest", digest, sizeof digest) <= 0 ||
+			    blob_name(digest, c->config, sizeof c->config) != 0 ||
+			    !hull_json_member(&doc, &root, "layers", &list))
+				return say(why, cap, m->name, "it names no config, or no layers");
+			for (int more = hull_json_element(&doc, &list, 1, &item); more;
+			     more = hull_json_element(&doc, &list, 0, &item)) {
+				if (c->layers == MAX_LAYERS)
+					return say(why, cap, m->name, "it names too many layers");
+				if (hull_json_member_string(&doc, &item, "digest", digest, sizeof digest) <= 0 ||
+				    blob_name(digest, c->layer[c->layers], sizeof c->layer[0]) != 0)
+					return say(why, cap, m->name, "a layer has no digest");
+				c->layers++;
+			}
+			return 0;
+		}
+		if (!hull_json_member(&doc, &root, "manifests", &list) ||
+		    !hull_json_element(&doc, &list, 1, &item))
+			return say(why, cap, m->name, "it lists no manifests");
+		/* One manifest is taken as it is, its platform often unsaid;
+		 * several are chosen among. */
+		if (hull_json_element(&doc, &list, 0, &config)) {
+			if (choose(&doc, &root, arch, digest, why, cap) != 0)
+				return -1;
+		} else if (hull_json_member_string(&doc, &item, "digest", digest, sizeof digest) <= 0) {
+			return say(why, cap, m->name, "its manifest has no digest");
+		}
+		if (blob_name(digest, name, sizeof name) != 0 || (m = member_called(a, name)) == NULL)
+			return say(why, cap, digest, "the archive does not hold it");
+	}
+	return say(why, cap, "index.json", "its indexes go too deep");
+}
+
+int hull_load(hull_store *store, const char *path, const char *ref, const char *arch,
+              const char *builder, hull_commit *out, char *ref_out, size_t ref_cap, char *why,
+              size_t cap)
+{
+	canon             runtime = { 0 };
+	canon             digests = { 0 };
+	canon             provenance = { 0 };
+	hull_commit_extra extra;
+	hull_owner       *owners = NULL;
+	size_t            owner_count = 0u;
+	archive           a = { .fd = -1 };
+	contents         *c = calloc(1u, sizeof *c);
+	char             *text = malloc(MAX_DOCUMENT);
+	hull_unpack      *u = NULL;
+	const member     *m;
+	hull_json         doc;
+	hull_json_value   root;
+	const char       *bad;
+	char              scratch[4400] = "";
+	char              tree[4500];
+	char              file[4500];
+	char              image_arch[64] = "";
+	uint64_t          skipped = 0u;
+	int               layer_fd = -1;
+	int               result = -1;
+	long              n;
+
+	if (c == NULL || text == NULL) {
+		say(why, cap, "out of memory", NULL);
+		goto done;
+	}
+	if ((a.fd = open(path, O_RDONLY | O_CLOEXEC)) < 0) {
+		say(why, cap, path, strerror(errno));
+		goto done;
+	}
+	if (read_members(&a, why, cap) != 0 || read_contents(&a, arch, c, text, why, cap) != 0)
+		goto done;
+	if ((m = member_called(&a, c->config)) == NULL || (n = member_text(&a, m, text)) < 0 ||
+	    hull_json_open(&doc, text, (size_t)n, &root, &bad) != 0 ||
+	    hull_json_member_string(&doc, &root, "architecture", image_arch, sizeof image_arch) <= 0) {
+		say(why, cap, c->config, "the image's config is not there, or names no architecture");
+		goto done;
+	}
+	if (runtime_of(&doc, &root, &runtime) != 0) {
+		say(why, cap, "the config", "its defaults could not be read");
+		goto done;
+	}
+	/* Its digest, the image's name when it has no tag. */
+	{
+		hull_sha256 hash;
+		uint8_t     raw[32];
+		char        hex[65];
+		char        digest[80];
+
+		hull_sha256_init(&hash);
+		hull_sha256_update(&hash, text, (size_t)n);
+		hull_sha256_final(&hash, raw);
+		hull_sha256_hex(raw, hex);
+		if (blob_digest(c->config) != NULL && strcmp(blob_digest(c->config), hex) != 0) {
+			say(why, cap, c->config, "it is not the digest that names it");
+			goto done;
+		}
+		snprintf(digest, sizeof digest, "sha256:%s", hex);
+		put_text_atom(&digests, digest);
+		if (ref != NULL)
+			snprintf(ref_out, ref_cap, "%s", ref);
+		else if (c->tag[0] != '\0')
+			snprintf(ref_out, ref_cap, "%s", c->tag);
+		else
+			snprintf(ref_out, ref_cap, "load/%.32s", hex);
+	}
+	flock(store->lock, LOCK_SH);
+	snprintf(scratch, sizeof scratch, "%s/tmp/load-XXXXXX", store->root);
+	if (mkdtemp(scratch) == NULL) {
+		say(why, cap, scratch, strerror(errno));
+		scratch[0] = '\0';
+		goto done;
+	}
+	snprintf(tree, sizeof tree, "%s/tree", scratch);
+	snprintf(file, sizeof file, "%s/layer", scratch);
+	if (mkdir(tree, 0700) != 0 ||
+	    (layer_fd = open(file, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)) < 0) {
+		say(why, cap, scratch, strerror(errno));
+		goto done;
+	}
+	if ((u = hull_unpack_begin(tree, why, cap)) == NULL)
+		goto done;
+	for (unsigned i = 0u; i < c->layers; i++) {
+		char digest[80];
+
+		if ((m = member_called(&a, c->layer[i])) == NULL) {
+			say(why, cap, c->layer[i], "the archive does not hold this layer");
+			goto done;
+		}
+		fprintf(stderr, "hull: load: layer %u of %u, %llu bytes\n", i + 1u, c->layers,
+		        (unsigned long long)m->size);
+		if (member_to(&a, m, layer_fd, why, cap) != 0 ||
+		    hull_unpack_layer(u, layer_fd, &skipped, why, cap) != 0)
+			goto done;
+		if (blob_digest(m->name) != NULL) {
+			snprintf(digest, sizeof digest, "sha256:%s", blob_digest(m->name));
+			put_text_atom(&digests, digest);
+		}
+	}
+	hull_unpack_owners(u, &owners, &owner_count);
+	{
+		hull_unpack *ended = u;
+
+		u = NULL;
+		if (hull_unpack_end(ended, why, cap) != 0)
+			goto done;
+	}
+	put_raw(&provenance, "(10:provenance(7:builder");
+	put_text_atom(&provenance, builder);
+	put_raw(&provenance, ")(3:oci(7:digests");
+	put_bytes(&provenance, digests.data, digests.length);
+	put_raw(&provenance, ")(8:registry");
+	{
+		const char *base = strrchr(path, '/');
+		char        from[512];
+
+		snprintf(from, sizeof from, "file/%s", base != NULL ? base + 1 : path);
+		put_text_atom(&provenance, from);
+	}
+	put_raw(&provenance, ")))");
+	if (digests.failed || provenance.failed || runtime.failed) {
+		say(why, cap, "out of memory", NULL);
+		goto done;
+	}
+	extra = (hull_commit_extra){ provenance.data, provenance.length, runtime.data, runtime.length,
+	                             owners, owner_count };
+	if (hull_store_commit(store, tree, image_arch, ref_out, &extra, out, why, cap) != 0)
+		goto done;
+	out->skipped += skipped;
+	result = 0;
+done:
+	hull_owners_free(owners, owner_count);
+	{
+		char ignored[64];
+
+		hull_unpack_end(u, ignored, sizeof ignored);
+	}
+	if (layer_fd >= 0)
+		close(layer_fd);
+	if (a.fd >= 0)
+		close(a.fd);
+	if (scratch[0] != '\0')
+		hull_store_remove_tree(AT_FDCWD, scratch);
+	flock(store->lock, LOCK_UN);
+	free(a.members);
+	free(c);
+	free(text);
+	free(runtime.data);
+	free(digests.data);
+	free(provenance.data);
+	return result;
+}

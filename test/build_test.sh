@@ -371,6 +371,31 @@ printf '(build (base "scratch") (stages (stage (name "a") (base "scratch"))) (st
 	> "$root/ms/up.conf"
 expect 1 'a stage.s path holds \.\.' "$hull" build -f "$root/ms/up.conf" staged/5
 
+# hull load: docker save's tar and an OCI layout's, with no registry, the
+# image's defaults kept, each blob held to its digest.
+mkdir -p "$root/ld"
+printf 'from the archive\n' > "$root/ld/content"
+python3 -I "$(dirname "$0")/oci_archive.py" docker "$root/ld/saved.tar" "$root/ld/content"
+python3 -I "$(dirname "$0")/oci_archive.py" oci "$root/ld/layout.tar" "$root/ld/content"
+expect 0 '^test/saved:1 sha256:' "$hull" load "$root/ld/saved.tar"
+expect 0 '^loaded/oci sha256:' "$hull" load "$root/ld/layout.tar" loaded/oci
+expect 0 '' "$hull" materialize test/saved:1 "$root/ld/tree"
+check 'an archive.s layer is the tree' grep -q 'from the archive' "$root/ld/tree/greeting"
+expect 0 '' "$hull" materialize loaded/oci "$root/ld/tree2"
+check 'and an OCI layout.s, of the host.s platform' grep -q 'from the archive' "$root/ld/tree2/greeting"
+expect 0 'SAVED' "$hull" manifest show loaded/oci
+python3 -I -c '
+import sys
+data = bytearray(open(sys.argv[1], "rb").read())
+at = data.find(b"from the archive")
+data[at] ^= 1
+open(sys.argv[1], "wb").write(data)' "$root/ld/saved.tar"
+expect 1 'not the digest that names it' "$hull" load "$root/ld/saved.tar" tampered/1
+printf 'nothing' > "$root/ld/short"
+expect 1 'not a tar' "$hull" load "$root/ld/short"
+gzip -c "$root/ld/layout.tar" > "$root/ld/layout.tar.gz"
+expect 1 'uncompressing' "$hull" load "$root/ld/layout.tar.gz"
+
 # A compose build's args and target reach the Dockerfile, and a service
 # of a profile not asked for is left out, as `docker compose up` does.
 mkdir -p "$root/ca/sub"

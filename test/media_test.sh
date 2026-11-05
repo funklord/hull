@@ -231,6 +231,19 @@ if command -v qemu-img > /dev/null 2>&1 && [ -f "$dir/hd.img" ]; then
 		[ ! -e "$dir/vm-$format.raw" ]
 		check "a $format disk's raw form is gone" "$?" 0 ''
 	done
+	# An appliance: a tar of an .ovf and its disks, the first taken.
+	mkdir "$dir/ova"
+	printf '<Envelope/>\n' > "$dir/ova/app.ovf"
+	cp "$dir/vm.vmdk" "$dir/ova/app-disk1.vmdk"
+	cp "$dir/vm.vmdk" "$dir/ova/app-disk2.vmdk"
+	tar -cf "$dir/app.ova" -C "$dir/ova" app.ovf app-disk1.vmdk app-disk2.vmdk
+	media import "$dir/app.ova" "$dir/app"
+	check 'an appliance imported' "$got" 0 "$out"
+	printf '%s\n' "$out" | grep -q 'app-disk1.vmdk'
+	check 'its other disk said' "$?" 0 "$out"
+	cmp -s "$dir/b.bin" "$dir/app/files/p1/B.BIN"
+	check "an appliance's file is a file" "$?" 0 "$(ls -R "$dir/app/files" 2>&1)"
+	check 'nothing of it left beside the collection' "$(ls -d "$dir"/app.ova-* 2>/dev/null | wc -l)" 0 ''
 fi
 
 # ext2 at 1 KiB blocks, whose big file reaches double indirection, ext3,
