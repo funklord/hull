@@ -52,3 +52,16 @@ outputs = ["gen/frontend.c", "gen/frontend.h"]
 command = "mkdir -p gen && vendor/situ/bin/situc build --target c --prefix hull_protocol --out gen agent/protocol.situ"
 inputs = ["agent/protocol.situ", "sexpr/canonical.situ"]
 outputs = ["gen/protocol.c", "gen/protocol.h"]
+
+# The frames hull at a segment's .1 reads and writes, the edit layer and
+# the derived checksum codec, as the Makefile's FRAME_GEN.
+[generate.frame]
+command = "mkdir -p gen && vendor/situ/bin/situc build --target c --layer edit --prefix hull_frame --out gen core/frame.situ && vendor/situ/bin/situc gen-derived --target c --prefix hull_frame --out gen core/frame.situ"
+inputs = ["core/frame.situ"]
+outputs = ["gen/frame.c", "gen/frame.h", "gen/frame_edit.h", "gen/frame_build.h", "gen/frame_derived.c"]
+
+# An ISO9660 image's structures, as the Makefile's DISC_GEN.
+[generate.disc]
+command = "mkdir -p gen && vendor/situ/bin/situc build --target c --layer edit --prefix hull_disc --out gen engine/disc.situ"
+inputs = ["engine/disc.situ"]
+outputs = ["gen/disc.c", "gen/disc.h", "gen/disc_edit.h", "gen/disc_build.h"]
