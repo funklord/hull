@@ -3529,6 +3529,22 @@ while time.time() < deadline:
 sleep 1
 cat "$2/brserve.out"
 echo "== sshd"
+# The relay of another core, held for the whole case: this one is a second
+# core on hull0, and a core keeps those sockets for life, so its start met
+# EADDRINUSE whenever the first had not yet gone idle.
+timeout 50 python3 -c "
+import socket, time
+held = []
+for kind in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
+    s = socket.socket(socket.AF_INET, kind)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    s.bind((\"172.31.0.1\", 53))
+    held.append(s)
+time.sleep(45)
+" &
+holder=$!
+sleep 1
 mkdir -p "$2/brrun/shm" && mount -t tmpfs none "$2/brrun/shm" && chmod 700 "$2/brrun/shm"
 (XDG_RUNTIME_DIR="$2/brrun/shm" timeout 60 "$1" run -f "$2/brsshd.conf" > "$2/brsshd.out" 2>&1 &)
 tries=0
@@ -3541,6 +3557,7 @@ XDG_RUNTIME_DIR="$2/brrun/shm" timeout 10 "$1" proxy-ssh bsshd < /dev/null 2>&1 
 # that failed and a wait that ran out looked the same.
 echo "== sshd waited $tries"; grep -v -e ": emulated: " -e ": accepted: " "$2/brsshd.out" | tail -3
 XDG_RUNTIME_DIR="$2/brrun/shm" timeout 10 "$1" kill -s KILL bsshd > /dev/null 2>&1
+kill "$holder" 2> /dev/null
 echo "== named"; timeout 30 "$1" run -f "$2/brnamed.conf" 2>&1
 echo "== none"; timeout 30 "$1" run -f "$2/brnone.conf" 2>&1
 echo "== ports"; timeout 30 "$1" run -f "$2/brports.conf" 2>&1

@@ -426,9 +426,11 @@ int hull_hostnet_relay_sockets(int *udp, int *tcp)
 	inet_pton(AF_INET, BRIDGE_GATEWAY, &at.sin_addr);
 	if ((*udp = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)) < 0 ||
 	    setsockopt(*udp, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0 ||
+	    setsockopt(*udp, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) != 0 ||
 	    bind(*udp, (struct sockaddr *)&at, sizeof at) != 0 ||
 	    (*tcp = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0 ||
 	    setsockopt(*tcp, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0 ||
+	    setsockopt(*tcp, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) != 0 ||
 	    bind(*tcp, (struct sockaddr *)&at, sizeof at) != 0 || listen(*tcp, 16) != 0) {
 		int saved = errno;
 
