@@ -3464,10 +3464,15 @@ while time.time() < deadline:
     try:
         s = socket.create_connection((sys.argv[1], 18096), 2)
         s.sendall(b\"hello\\n\")
-        print(\"bridged port:\", s.recv(100).decode().strip())
-        break
+        reply = s.recv(100).decode().strip()
+        # The forwarder takes a connection before the machine listens,
+        # and closes it empty: not an answer, so go round again.
+        if reply:
+            print(\"bridged port:\", reply)
+            break
     except OSError:
-        time.sleep(0.2)
+        pass
+    time.sleep(0.2)
 " "$3"
 sleep 1
 cat "$2/brserve.out"
