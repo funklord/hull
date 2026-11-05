@@ -8,9 +8,10 @@
  * steps' per-step env and workdir and the build's runtime; CMD, ENTRYPOINT,
  * EXPOSE, USER, VOLUME and STOPSIGNAL become the runtime.
  *
- * Only a single stage is translated: a second FROM ends it with a comment,
- * since multi-stage COPY --from has no (build ...) shape. A foreign image,
- * `hull import IMAGE DIR`, is engine/media.c's.
+ * Each stage before the last is a (stage ...) of the form, the last the
+ * build itself: a FROM naming a stage is its `stage:NAME` base, and COPY
+ * --from a copy from its tree. A foreign image, `hull import IMAGE DIR`, is
+ * engine/media.c's.
  *
  * A compose file is translated the same way to a (machines ...) form, and
  * is also section 9's compose dialect: hull_import_compose() gives the
@@ -26,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "import.h"
 
@@ -136,6 +138,8 @@ static int exec_form(char *s, char **args, int max)
 	}
 }
 
+#define MAX_STAGES 32u
+
 typedef struct build {
 	sb       steps;        /* each (step ...) as it is met */
 	char     env_name[MAX_ENV][256];
@@ -143,9 +147,20 @@ typedef struct build {
 	unsigned env_count;
 	char     workdir[4096];   /* "" until a WORKDIR, then absolute */
 	int      had_from;
-	int      done;            /* a second FROM ended the stage */
 	unsigned step_no;
+	char     stage[MAX_STAGES][128];  /* each stage's name so far, or its number */
+	char     stage_number[MAX_STAGES][16];
+	unsigned stage_count;
 } build;
+
+/* The stage `word` names, by its name or its number, or NULL. */
+static const char *stage_called(const build *b, const char *word)
+{
+	for (unsigned i = 0u; i < b->stage_count; i++)
+		if (strcasecmp(b->stage[i], word) == 0 || strcmp(b->stage_number[i], word) == 0)
+			return b->stage[i];
+	return NULL;
+}
 
 /* ENV accumulated so far, as the entries of an (env ...) record, and the
  * current (workdir ...) -- a RUN step gets both, since a Dockerfile's ENV
@@ -288,6 +303,29 @@ static void do_run(build *b, char *arg)
 /* A COPY or ADD: a step whose copies are its sources to the destination,
  * each made absolute against the workdir. ADD's url and tar-extract, and a
  * --from or --chown flag, are noted rather than done. */
+/* A stage's final ENV and WORKDIR, which are its image's too, and what its
+ * CMD and the rest gathered in `after`, into `rt`. */
+static void stage_runtime(const build *b, sb *rt, const sb *after)
+{
+	if (b->env_count > 0u) {
+		sb_str(rt, "\n    (env");
+		for (unsigned i = 0u; i < b->env_count; i++) {
+			sb_str(rt, " (");
+			sb_str(rt, b->env_name[i]);
+			sb_str(rt, " ");
+			sb_quoted(rt, b->env_value[i]);
+			sb_str(rt, ")");
+		}
+		sb_str(rt, ")");
+	}
+	if (b->workdir[0] != '\0') {
+		sb_str(rt, "\n    (workdir ");
+		sb_quoted(rt, b->workdir);
+		sb_str(rt, ")");
+	}
+	sb_add(rt, after->data != NULL ? after->data : "", after->len);
+}
+
 static void do_copy(build *b, const char *instr, char *arg)
 {
 	char  name[32];
@@ -295,9 +333,17 @@ static void do_copy(build *b, const char *instr, char *arg)
 	int   n = 0;
 	char *save;
 	char *dst;
+	const char *stage = NULL;
 
 	for (char *w = strtok_r(trim(arg), " \t", &save); w != NULL && n < 64;
 	     w = strtok_r(NULL, " \t", &save)) {
+		if (strncmp(w, "--from=", 7u) == 0) {
+			if ((stage = stage_called(b, w + 7)) == NULL) {
+				note(&b->steps, "COPY --from an image not translated", w + 7);
+				return;
+			}
+			continue;
+		}
 		if (w[0] == '-' && w[1] == '-') {
 			note(&b->steps, "copy flag not translated", w);
 			continue;
@@ -326,6 +372,10 @@ static void do_copy(build *b, const char *instr, char *arg)
 		sb_quoted(&b->steps, words[i]);
 		sb_str(&b->steps, ") (to ");
 		sb_quoted(&b->steps, to);
+		if (stage != NULL) {
+			sb_str(&b->steps, ") (stage ");
+			sb_quoted(&b->steps, stage);
+		}
 		sb_str(&b->steps, "))");
 	}
 	sb_str(&b->steps, ")");
@@ -365,8 +415,9 @@ static void do_env(build *b, char *arg)
 
 static int import_dockerfile(FILE *file)
 {
-	build  b = { { NULL, 0u, 0u, 0 }, { { 0 } }, { { 0 } }, 0u, "", 0, 0, 0u };
+	static build b;
 	sb     rt = { NULL, 0u, 0u, 0 };
+	sb     stages = { NULL, 0u, 0u, 0 };
 	sb     after = { NULL, 0u, 0u, 0 };   /* CMD/ENTRYPOINT/etc. order kept */
 	char  *base = NULL;
 	char   line[LINE_CAP];
@@ -403,21 +454,60 @@ static int import_dockerfile(FILE *file)
 				instr[k++] = (char)toupper((unsigned char)*sp);
 			instr[k] = '\0';
 			s = trim(sp);
-			if (b.done && strcmp(instr, "FROM") != 0) {
-				continue;   /* past the first stage */
-			}
 			if (strcmp(instr, "FROM") == 0) {
-				char *as;
+				char       *as;
+				char       *word = s;
+				const char *earlier;
+				char        named[160];
 
+				/* The stage before this one is whole. */
 				if (b.had_from) {
-					note(&b.steps, "multi-stage not translated", "only the first FROM's stage");
-					b.done = 1;
-					continue;
+					stage_runtime(&b, &rt, &after);
+					sb_str(&stages, "\n  (stage (name ");
+					sb_quoted(&stages, b.stage[b.stage_count - 1u]);
+					sb_str(&stages, ") (base ");
+					sb_quoted(&stages, base);
+					sb_str(&stages, ")");
+					if (rt.len > 0u) {
+						sb_str(&stages, "\n    (runtime");
+						sb_add(&stages, rt.data, rt.len);
+						sb_str(&stages, ")");
+					}
+					if (b.steps.len > 0u) {
+						sb_str(&stages, "\n    (steps");
+						sb_add(&stages, b.steps.data, b.steps.len);
+						sb_str(&stages, "\n    )");
+					}
+					sb_str(&stages, ")");
+					rt.len = after.len = b.steps.len = 0u;
+					b.env_count = 0u;
+					b.workdir[0] = '\0';
+					free(base);
 				}
 				b.had_from = 1;
-				if ((as = strstr(s, " AS ")) != NULL || (as = strstr(s, " as ")) != NULL)
+				while (strncmp(word, "--", 2u) == 0) {   /* --platform and the like */
+					char *end = strpbrk(word, " \t");
+
+					if (end != NULL)
+						*end = '\0';
+					note(&b.steps, "FROM flag not translated", word);
+					word = end != NULL ? trim(end + 1) : word + strlen(word);
+				}
+				if ((as = strstr(word, " AS ")) != NULL || (as = strstr(word, " as ")) != NULL)
 					*as = '\0';
-				base = strdup(trim(s));
+				word = trim(word);
+				earlier = stage_called(&b, word);
+				snprintf(named, sizeof named, "stage:%s", earlier != NULL ? earlier : "");
+				base = strdup(earlier != NULL ? named : word);
+				if (b.stage_count == MAX_STAGES) {
+					fprintf(stderr, "hull: import: more than %u stages\n", MAX_STAGES);
+					free(base);
+					return 2;
+				}
+				snprintf(b.stage_number[b.stage_count], sizeof b.stage_number[0], "%u", b.stage_count);
+				snprintf(b.stage[b.stage_count], sizeof b.stage[0], "%s",
+				         as != NULL ? trim(as + 4) : b.stage_number[b.stage_count]);
+				b.stage_count++;
 			} else if (!b.had_from) {
 				note(&b.steps, "instruction before FROM not translated", instr);
 			} else if (strcmp(instr, "RUN") == 0) {
@@ -457,25 +547,8 @@ static int import_dockerfile(FILE *file)
 		free(after.data);
 		return 2;
 	}
-	/* The final ENV and WORKDIR are the image's too. */
-	if (b.env_count > 0u) {
-		sb_str(&rt, "\n    (env");
-		for (unsigned i = 0u; i < b.env_count; i++) {
-			sb_str(&rt, " (");
-			sb_str(&rt, b.env_name[i]);
-			sb_str(&rt, " ");
-			sb_quoted(&rt, b.env_value[i]);
-			sb_str(&rt, ")");
-		}
-		sb_str(&rt, ")");
-	}
-	if (b.workdir[0] != '\0') {
-		sb_str(&rt, "\n    (workdir ");
-		sb_quoted(&rt, b.workdir);
-		sb_str(&rt, ")");
-	}
-	sb_add(&rt, after.data ? after.data : "", after.len);
-	if (b.steps.bad || rt.bad || after.bad) {
+	stage_runtime(&b, &rt, &after);
+	if (b.steps.bad || rt.bad || after.bad || stages.bad) {
 		fprintf(stderr, "hull: import: out of memory\n");
 		status = 2;
 	} else {
@@ -484,6 +557,8 @@ static int import_dockerfile(FILE *file)
 		printf("\"%s\")", base);
 		if (rt.len > 0u)
 			printf("\n  (runtime%s)", rt.data);
+		if (stages.len > 0u)
+			printf("\n  (stages%s\n  )", stages.data);
 		/* The steps' closing paren is on its own line: the last entry may be
 		 * a `;` comment, which would swallow a paren on the same line. */
 		if (b.steps.len > 0u)
@@ -494,6 +569,7 @@ static int import_dockerfile(FILE *file)
 	free(b.steps.data);
 	free(rt.data);
 	free(after.data);
+	free(stages.data);
 	return status;
 }
 

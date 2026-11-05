@@ -764,8 +764,9 @@ const char *hull_spec_machine_key(unsigned index)
 
 /* J.6: (path (from "./src") (to "/app")), what a step copies in. */
 static const key path_keys[] = {
-	{ .name = "from", .type = STRING, .required = 1, .value = nonempty },
-	{ .name = "to",   .type = STRING, .required = 1, .value = absolute },
+	{ .name = "from",  .type = STRING, .required = 1, .value = nonempty },
+	{ .name = "to",    .type = STRING, .required = 1, .value = absolute },
+	{ .name = "stage", .type = STRING, .value = nonempty },
 };
 static const schema path = TABLE(path_keys);
 
@@ -804,10 +805,21 @@ static const key runtime_keys[] = {
 };
 static const schema runtime = TABLE(runtime_keys);
 
+/* J.6: a build before the build, whose tree a step copies from or a later
+ * base is, as a Dockerfile's earlier stages are. */
+static const key stage_keys[] = {
+	{ .name = "name",    .type = STRING, .required = 1, .value = nonempty },
+	{ .name = "base",    .type = STRING, .required = 1, .value = nonempty },
+	{ .name = "steps",   .type = ENTRIES, .record = &step, .entry = "step" },
+	{ .name = "runtime", .type = RECORD, .record = &runtime },
+};
+static const schema stage = TABLE(stage_keys);
+
 static const key build_keys[] = {
 	{ .name = "base",    .type = STRING, .required = 1, .value = nonempty },
 	{ .name = "steps",   .type = ENTRIES, .record = &step, .entry = "step" },
 	{ .name = "runtime", .type = RECORD, .record = &runtime },
+	{ .name = "stages",  .type = ENTRIES, .record = &stage, .entry = "stage" },
 };
 static const schema build = TABLE(build_keys);
 

@@ -42,6 +42,7 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
@@ -3431,6 +3432,115 @@ static int build_runtime(const hull_spec *spec, const hull_sexpr_form *own, cons
  */
 #define MAX_BUILD_STEPS 256u
 
+static int build_file(options *o, const hull_registry *registry, const char *ref, int check);
+
+/* The stages of the build in hand (J.6): each built first, as a build of
+ * its own, its tree tagged under this prefix, and a stage a step copies
+ * from materialized once, in the store's tmp. */
+#define MAX_STAGE_TREES 16u
+static char     stage_prefix[64];
+static char     stage_name[MAX_STAGE_TREES][256];
+static char     stage_dir[MAX_STAGE_TREES][4400];
+static unsigned stage_count;
+
+/* The tree of stage `name`, its root into `root`. 0, or -1 with `why`. */
+static int stage_tree(hull_store *store, const char *name, char *root, size_t cap, char *why,
+                      size_t why_cap)
+{
+	char     ref[400];
+	uint64_t skipped = 0u;
+
+	for (unsigned i = 0u; i < stage_count; i++)
+		if (strcmp(stage_name[i], name) == 0) {
+			snprintf(root, cap, "%s/root", stage_dir[i]);
+			return 0;
+		}
+	if (stage_count == MAX_STAGE_TREES || stage_prefix[0] == '\0' || strlen(name) >= 256u) {
+		snprintf(why, why_cap, "stage %.200s: there is no such stage, or too many are copied from",
+		         name);
+		return -1;
+	}
+	snprintf(ref, sizeof ref, "%s%s", stage_prefix, name);
+	snprintf(stage_dir[stage_count], sizeof stage_dir[0], "%s/tmp/stage-XXXXXX", store->root);
+	if (mkdtemp(stage_dir[stage_count]) == NULL) {
+		snprintf(why, why_cap, "%.4000s: %s", stage_dir[stage_count], strerror(errno));
+		return -1;
+	}
+	snprintf(root, cap, "%s/root", stage_dir[stage_count]);
+	snprintf(stage_name[stage_count], sizeof stage_name[0], "%s", name);
+	stage_count++;
+	return hull_store_materialize(store, ref, root, &skipped, why, why_cap);
+}
+
+static void stage_trees_gone(void)
+{
+	for (unsigned i = 0u; i < stage_count; i++)
+		hull_store_remove_tree(AT_FDCWD, stage_dir[i]);
+	stage_count = 0u;
+}
+
+/* Each of the file's stages built, in order, as `(build ...)`s of their
+ * own, by a descriptor holding each form's text: their steps cached as any
+ * build's are. 0, or 1 where one failed. */
+static int build_stages(options *o, const hull_registry *registry, hull_spec *spec,
+                        const uint8_t *data, size_t length)
+{
+	hull_sexpr_form stages;
+	hull_sexpr_form stage;
+	hull_sha256     h;
+	uint8_t         digest[32];
+	char            hex[65];
+	int             more;
+
+	if (!hull_spec_find(spec, &spec->build, "stages", &stages))
+		return 0;
+	hull_sha256_init(&h);
+	hull_sha256_update(&h, data, length);
+	hull_sha256_final(&h, digest);
+	hex_of_bytes(digest, 16u, hex);
+	snprintf(stage_prefix, sizeof stage_prefix, "build/stage/%.32s/", hex);
+	hull_sexpr_child(&spec->doc, &stages, &stage);
+	for (more = hull_sexpr_next(&spec->doc, &stage, &stage); more;
+	     more = hull_sexpr_next(&spec->doc, &stage, &stage)) {
+		static const char *const keys[] = { "base", "steps", "runtime" };
+		char                     name[256] = "";
+		char                     ref[400];
+		char                     path[64];
+		options                  sub = *o;
+		int                      fd = memfd_create("hull-stage", MFD_CLOEXEC);
+		int                      status;
+
+		record_text(spec, &stage, "name", name, sizeof name);
+		snprintf(ref, sizeof ref, "%s%s", stage_prefix, name);
+		if (fd < 0 || write(fd, "(build ", 7u) != 7) {
+			fprintf(stderr, "hull: build: stage %s: %s\n", name, strerror(errno));
+			return 1;
+		}
+		for (unsigned i = 0u; i < 3u; i++) {
+			hull_sexpr_form found;
+
+			if (hull_spec_find(spec, &stage, keys[i], &found) &&
+			    (write(fd, spec->doc.data + found.offset, found.extent) != (ssize_t)found.extent ||
+			     write(fd, "\n", 1u) != 1)) {
+				close(fd);
+				return 1;
+			}
+		}
+		if (write(fd, ")\n", 2u) != 2) {
+			close(fd);
+			return 1;
+		}
+		snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
+		sub.file = path;
+		fprintf(stderr, "hull: build: stage %s\n", name);
+		status = build_file(&sub, registry, ref, 0);
+		close(fd);
+		if (status != 0)
+			return status;
+	}
+	return 0;
+}
+
 static int build_file(options *o, const hull_registry *registry, const char *ref, int check)
 {
 	static char     first_pass[MAX_BUILD_STEPS][65];
@@ -3453,6 +3563,7 @@ static int build_file(options *o, const hull_registry *registry, const char *ref
 	int             held = -1;
 	int             result = 1;
 	int             more;
+	int             status_of_empty;
 
 	data = read_file(o->file, &length);
 	if (data == NULL)
@@ -3465,6 +3576,11 @@ static int build_file(options *o, const hull_registry *registry, const char *ref
 	}
 	if (!spec.has_build) {
 		fprintf(stderr, "%s: there is no (build ...) to build\n", o->file);
+		free(data);
+		return 1;
+	}
+	/* Before the store is held: a stage holds it for itself. */
+	if (build_stages(o, registry, &spec, data, length) != 0) {
 		free(data);
 		return 1;
 	}
@@ -3489,6 +3605,31 @@ static int build_file(options *o, const hull_registry *registry, const char *ref
 			goto done;
 		}
 		snprintf(parent, sizeof parent, "%s", in.manifest);
+	} else if (strcmp(base, "scratch") == 0) {
+		/* Nothing: an empty directory's tree, as a Dockerfile's scratch. */
+		step_input in;
+		char       empty[4400];
+
+		snprintf(empty, sizeof empty, "%s/tmp/scratch-XXXXXX", store.root);
+		if (mkdtemp(empty) == NULL) {
+			snprintf(why, sizeof why, "%.4000s: %s", empty, strerror(errno));
+			goto done;
+		}
+		chmod(empty, 0755);
+		status_of_empty = input_of(&store, empty, &in, why, sizeof why);
+		rmdir(empty);
+		if (status_of_empty != 0)
+			goto done;
+		snprintf(parent, sizeof parent, "%s", in.manifest);
+	} else if (strncmp(base, "stage:", 6u) == 0) {
+		char named[400];
+
+		snprintf(named, sizeof named, "%s%.300s", stage_prefix, base + 6);
+		if (stage_prefix[0] == '\0' ||
+		    hull_store_resolve(&store, named, parent, why, sizeof why) != 0) {
+			snprintf(why, sizeof why, "%.300s: there is no such stage before this one", base);
+			goto done;
+		}
 	} else if (hull_store_resolve(&store, base, parent, why, sizeof why) != 0) {
 		hull_commit made;
 
@@ -3604,6 +3745,7 @@ next_pass:
 			for (go = hull_sexpr_next(&spec.doc, &item, &item); go;
 			     go = hull_sexpr_next(&spec.doc, &item, &item)) {
 				char from[4096];
+				char stage[256];
 				char absolute[8200];
 
 				if (input_count == MAX_STEP_INPUTS ||
@@ -3611,8 +3753,21 @@ next_pass:
 					snprintf(why, sizeof why, "step %s: too many copies", name);
 					goto done;
 				}
-				snprintf(absolute, sizeof absolute, "%s%s%s", from[0] == '/' ? "" : o->base,
-				         from[0] == '/' ? "" : "/", from);
+				/* From a stage's tree, which `from` must not leave. */
+				if (record_text(&spec, &item, "stage", stage, sizeof stage)) {
+					char tree[4500];
+
+					if (strstr(from, "..") != NULL) {
+						snprintf(why, sizeof why, "step %s: a stage's path holds ..", name);
+						goto done;
+					}
+					if (stage_tree(&store, stage, tree, sizeof tree, why, sizeof why) != 0)
+						goto done;
+					snprintf(absolute, sizeof absolute, "%s/%.3600s", tree, from);
+				} else {
+					snprintf(absolute, sizeof absolute, "%s%s%s", from[0] == '/' ? "" : o->base,
+					         from[0] == '/' ? "" : "/", from);
+				}
 				if (input_of(&store, absolute, &inputs[input_count++], why, sizeof why) != 0)
 					goto done;
 			}
@@ -3709,6 +3864,13 @@ next_pass:
 					char to[4096];
 
 					record_text(&spec, &item, "to", to, sizeof to);
+					/* A file to a path ending in a slash goes into it. */
+					if (inputs[first].manifest[0] == '\0' && to[strlen(to) - 1u] == '/') {
+						const char *leaf = strrchr(inputs[first].path, '/');
+
+						if (leaf != NULL && strlen(to) + strlen(leaf) < sizeof to)
+							strcat(to, leaf + 1);
+					}
 					ok = inputs[first].manifest[0] != '\0' ?
 					     copy_tree(&store, root, &inputs[first], to, why, sizeof why) == 0 :
 					     copy_file(root, inputs[first].path, to, why, sizeof why) == 0;
@@ -3996,6 +4158,7 @@ next_pass:
 done:
 	if (result != 0)
 		fprintf(stderr, "hull: build: %s\n", why[0] != '\0' ? why : "it could not be built");
+	stage_trees_gone();
 	hull_store_release(held);
 	hull_store_close(&store);
 	free(data);

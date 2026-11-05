@@ -334,6 +334,43 @@ fi
 cases=$((cases + 1))
 [ -z "$(ls -A "$store/tmp")" ] || fail "a build left its scratch in tmp/" "$(ls "$store/tmp")"
 
+# A multi-stage Dockerfile: hull import keeps every stage, a later one's
+# FROM and COPY --from reach an earlier one's tree, by name and by number,
+# the last is a scratch image holding only what it copied, and all of it
+# is cached as any build is.
+mkdir -p "$root/ms/src"
+cp -a "$root/b/base" "$root/ms/base"
+printf 'hello\n' > "$root/ms/src/app.txt"
+cat > "$root/ms/Dockerfile" <<'DOCKERFILE'
+FROM --platform=linux/amd64 dir:./base AS build
+ENV STAGE=one
+WORKDIR /w
+COPY src /w/src
+FROM build AS tested
+COPY src/app.txt /tested
+FROM scratch
+COPY --from=tested /w/src/app.txt /app/
+COPY --from=0 /w/src /all
+CMD ["/app/app.txt"]
+DOCKERFILE
+timeout 10 "$hull" import "$root/ms/Dockerfile" > "$root/ms/hull.conf"
+expect 0 '^staged/1 sha256:[0-9a-f]{64}$' "$hull" build -f "$root/ms/hull.conf" staged/1
+expect 0 '' "$hull" materialize staged/1 "$root/ms/tree"
+check 'a scratch image holds what it copied and nothing else' \
+	[ "$(cd "$root/ms/tree" && find . -type f | sort | tr '\n' ' ')" = './all/app.txt ./app/app.txt ' ]
+check 'a file copied to a path with a slash is in it' grep -q hello "$root/ms/tree/app/app.txt"
+expect 0 'step copy-3: cached' "$hull" build -f "$root/ms/hull.conf" staged/2
+printf 'changed\n' > "$root/ms/src/app.txt"
+expect 0 '^staged/3 sha256:' "$hull" build -f "$root/ms/hull.conf" staged/3
+expect 0 '' "$hull" materialize staged/3 "$root/ms/tree3"
+check 'a stage changing reaches what copied from it' grep -q changed "$root/ms/tree3/app/app.txt"
+printf '(build (base "scratch") (steps (step (name "s") (copy (path (from "/x") (to "/y") (stage "none"))))))\n' \
+	> "$root/ms/none.conf"
+expect 1 'stage none: there is no such stage' "$hull" build -f "$root/ms/none.conf" staged/4
+printf '(build (base "scratch") (stages (stage (name "a") (base "scratch"))) (steps (step (name "s") (copy (path (from "/../../x") (to "/y") (stage "a"))))))\n' \
+	> "$root/ms/up.conf"
+expect 1 'a stage.s path holds \.\.' "$hull" build -f "$root/ms/up.conf" staged/5
+
 kill "$listener" 2> /dev/null
 wait "$listener" 2> /dev/null
 trap - EXIT
