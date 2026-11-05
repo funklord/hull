@@ -455,7 +455,7 @@ COMPOSE
 expect 0 'web +\| read=from the build' sh -c 'cd "$1/cp" && exec "$2" up 2>&1' sh "$root" "$hull"
 expect 0 'api +\| read=from the build' sh -c 'cd "$1/cp" && exec "$2" up 2>&1' sh "$root" "$hull"
 expect 0 'step copy-1: cached' sh -c 'cd "$1/cp" && exec "$2" up 2>&1' sh "$root" "$hull"
-expect 0 'build key not translated: args' "$hull" plan -f "$root/cp/compose.yaml"
+expect 0 'built by hull up from its Dockerfile' "$hull" plan -f "$root/cp/compose.yaml"
 expect 0 'source "compose/cp/web"' "$hull" import "$root/cp/compose.yaml"
 
 # A Vagrantfile and a box: the box a tar around a VMDK, as vagrantcloud's

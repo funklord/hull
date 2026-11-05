@@ -786,6 +786,7 @@ static int read_contents(const archive *a, const char *arch, contents *c, char *
 			return say(why, cap, m->name, "it lists no manifests");
 		/* One manifest is taken as it is, its platform often unsaid;
 		 * several are chosen among. */
+		config = item;
 		if (hull_json_element(&doc, &list, 0, &config)) {
 			if (choose(&doc, &root, arch, digest, why, cap) != 0)
 				return -1;
