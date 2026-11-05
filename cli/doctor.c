@@ -318,6 +318,22 @@ static void virtualbox(void)
 	line("ok", "VirtualBox for (backend virtualbox)", dir);
 }
 
+/* The door of a pc machine, (ssh true) there being the host's own OpenSSH
+ * (section 8.1). Absent rather than missing: only such a machine wants it. */
+static void host_sshd(void)
+{
+	static const char *const places[] = { "/usr/sbin/sshd", "/usr/local/sbin/sshd", "/sbin/sshd",
+	                                      NULL };
+
+	for (const char *const *place = places; *place != NULL; place++)
+		if (access(*place, X_OK) == 0) {
+			line("ok", "the host's sshd, the door of a pc machine", *place);
+			return;
+		}
+	line("absent", "the host's sshd, the door of a pc machine", "(ssh true) on one is refused");
+	fix("install the host's openssh-server");
+}
+
 /* (ssh true)'s sshd for an image with none, which `hull sshd fetch` puts
  * in the cache (section 8.1 item 3). Absent rather than missing: only a
  * machine whose image has no sshd of its own needs it. */
@@ -404,6 +420,7 @@ int hull_doctor(const char *runtime_why)
 	device("/dev/fuse", "FUSE, an image read or changed without a mount (/dev/fuse)", name, NULL);
 	vm_kernel();
 	fetched_sshd();
+	host_sshd();
 	virtualbox();
 	usable = runtime(runtime_why) && usable;
 	tool("passt", "a vm's network");

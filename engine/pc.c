@@ -24,6 +24,14 @@
  * through a pipe of the console's, dropped when full, for a slow client
  * must not hold the machine's own output, or its guest, back.
  *
+ * Port 22 is the door (section 8.1): `ssh pc.hull`, by way of `hull
+ * proxy-ssh`, reaches the guest's own sshd where a port forwards to one,
+ * and under (ssh true) otherwise the host's OpenSSH, `sshd -i` for each
+ * connection with the machine's host key and the user's keys, its one
+ * command the console above. Hull writes no ssh server: where a host has
+ * no natural sshd the door is refused, saying so, the holder's rule being
+ * that a connector is made only for a host that could not have one.
+ *
  * The guest powering off is the machine's end, status 0, and a stop
  * pulls the plug by SIGTERM, there being no agent to ask and no telling
  * whether a 1990s system answers ACPI.
@@ -31,8 +39,10 @@
 
 #define _GNU_SOURCE
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -72,6 +82,8 @@ struct hull_stream {
 	hull_core    *core;
 	int           from;     /* the console's end of its pipe */
 	int           to;       /* the reader's, or -1 once the console has ended */
+	int           socket;   /* a dial's connection, or -1 for the console */
+	pid_t         child;    /* a door's sshd, or 0 */
 	pthread_t     thread;
 };
 
@@ -108,6 +120,8 @@ struct hull_machine {
 	int             err;            /* qemu's stderr */
 	int             input;          /* COM1's input: qemu's stdin, a socket */
 	hull_stream    *console;        /* the one joined to COM1, or NULL */
+	char           *ssh_dir;        /* (ssh true): the core's material, door.conf beside it */
+	char            sshd[64];       /* and the host's sshd */
 	pthread_t       reader;
 	int             reading;
 	pthread_mutex_t lock;
@@ -143,6 +157,7 @@ static void release(hull_machine *m)
 		if (m->segment_fd[i] >= 0)
 			close(m->segment_fd[i]);
 	}
+	free(m->ssh_dir);
 	free(m->memory);
 	free(m->cpus);
 	free(m->machine_type);
@@ -408,6 +423,66 @@ static const char *read_network(hull_machine *m, const hull_sexpr_doc *doc,
 	return NULL;
 }
 
+/* (ssh true): the host's OpenSSH found and door.conf written beside the
+ * core's material: NULL, or why not. */
+static const char *read_door(hull_machine *m, const hull_sexpr_doc *doc)
+{
+	static const char *const places[] = { "/usr/sbin/sshd", "/usr/local/sbin/sshd", "/sbin/sshd",
+	                                      NULL };
+	hull_sexpr_form top;
+	const char     *runtime = getenv("XDG_RUNTIME_DIR");
+	const char     *id;
+	char            self[4096];
+	char            path[4400];
+	ssize_t         n = readlink("/proc/self/exe", self, sizeof self - 1u);
+	FILE           *conf;
+	int             fd;
+
+	if (!hull_sexpr_first(doc, &top) ||
+	    (m->ssh_dir = hull_access_value(doc, &top, "ssh_dir")) == NULL)
+		return NULL;
+	for (const char *const *place = places; *place != NULL && m->sshd[0] == '\0'; place++)
+		if (access(*place, X_OK) == 0)
+			snprintf(m->sshd, sizeof m->sshd, "%s", *place);
+	if (m->sshd[0] == '\0')
+		return "(ssh true) on a pc machine is the host's OpenSSH in front of its serial port, and "
+		       "this host has no sshd: its openssh-server package gives one";
+	if (n <= 0 || runtime == NULL || strpbrk(runtime, "\"\\\n") != NULL)
+		return "(ssh true): the door's command cannot be written";
+	self[n] = '\0';
+	if (strpbrk(self, "\"\\\n") != NULL)
+		return "(ssh true): hull's path cannot go in the door's command";
+	id = strrchr(m->ssh_dir, '/');
+	id = id != NULL ? id + 1 : m->ssh_dir;
+	snprintf(path, sizeof path, "%s/door.conf", m->ssh_dir);
+	if ((fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0400)) < 0 ||
+	    (conf = fdopen(fd, "w")) == NULL) {
+		if (fd >= 0)
+			close(fd);
+		return "(ssh true): the door's configuration cannot be written";
+	}
+	/* The one command, with nothing else the host's sshd could give:
+	 * this is a door to a serial port, not a login to the host. */
+	fprintf(conf, "HostKey %s/host_key\n"
+	        "AuthorizedKeysFile %s/authorized_keys\n"
+	        "PidFile none\n"
+	        "UsePAM no\n"
+	        "StrictModes no\n"
+	        "PubkeyAuthentication yes\n"
+	        "PasswordAuthentication no\n"
+	        "KbdInteractiveAuthentication no\n"
+	        "AllowTcpForwarding no\n"
+	        "AllowStreamLocalForwarding no\n"
+	        "AllowAgentForwarding no\n"
+	        "X11Forwarding no\n"
+	        "PermitTunnel no\n"
+	        "PermitUserRC no\n"
+	        "PermitUserEnvironment no\n"
+	        "ForceCommand exec env XDG_RUNTIME_DIR=\"%s\" \"%s\" exec -t %s -- console\n",
+	        m->ssh_dir, m->ssh_dir, runtime, self, id);
+	return fclose(conf) == 0 ? NULL : "(ssh true): the door's configuration cannot be written";
+}
+
 /* What the plan asks, read into `m`: NULL, or why it cannot be run. */
 static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
                              const hull_sexpr_form *machine)
@@ -460,7 +535,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 		}
 	}
 	free(source);
-	if ((wrong = read_network(m, doc, machine)) != NULL)
+	if ((wrong = read_network(m, doc, machine)) != NULL || (wrong = read_door(m, doc)) != NULL)
 		return wrong;
 	m->memory = hull_access_value(doc, machine, "memory");
 	m->cpus   = hull_access_value(doc, machine, "cpus");
@@ -924,9 +999,12 @@ static hull_status pc_signal(hull_core *core, hull_machine *m, hull_stream *stre
 {
 	(void)core;
 	(void)error;
-	/* A signal to the console detaches it; the machine goes on. */
+	/* A signal to a stream ends it; the machine goes on. */
 	if (stream != NULL) {
-		end_console(m);
+		if (stream->socket >= 0)
+			shutdown(stream->socket, SHUT_RDWR);
+		else
+			end_console(m);
 		return HULL_OK;
 	}
 	pthread_mutex_lock(&m->lock);
@@ -983,6 +1061,7 @@ static hull_status pc_exec(hull_core *core, hull_machine *m, hull_buf spec, hull
 	st->core    = core;
 	st->from    = ends[0];
 	st->to      = ends[1];
+	st->socket  = -1;
 	pthread_mutex_lock(&m->lock);
 	if (m->done || m->console != NULL || m->input < 0) {
 		int gone = m->done;
@@ -1011,13 +1090,121 @@ static hull_status pc_exec(hull_core *core, hull_machine *m, hull_buf spec, hull
 	return HULL_OK;
 }
 
+/* A dial's connection, to its end, then the stream's. */
+static void *deliver_socket(void *arg)
+{
+	hull_stream *st = arg;
+	uint8_t      buffer[16384];
+	ssize_t      n;
+
+	while ((n = read(st->socket, buffer, sizeof buffer)) > 0 || (n < 0 && errno == EINTR))
+		if (n > 0)
+			host->on_data(st->core, st, 1, buffer, (size_t)n);
+	host->on_exit(st->core, st->machine, st, 0, 0);
+	return NULL;
+}
+
+/* A connection to the forward of guest port `port`: a descriptor, or -1. */
+static int dial_forward(const hull_machine *m, unsigned port)
+{
+	for (unsigned i = 0u; i < m->port_count; i++) {
+		struct sockaddr_in at;
+		int                fd;
+
+		if (m->port_guest[i] != port || m->port_udp[i])
+			continue;
+		memset(&at, 0, sizeof at);
+		at.sin_family = AF_INET;
+		at.sin_port   = htons((uint16_t)m->port_host[i]);
+		if (inet_pton(AF_INET, m->address, &at.sin_addr) != 1 ||
+		    (fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0)
+			return -1;
+		if (connect(fd, (struct sockaddr *)&at, sizeof at) == 0)
+			return fd;
+		close(fd);
+	}
+	return -1;
+}
+
+/* The host's sshd on one end of a new socket, `sshd -i`, as inetd would
+ * run it: the other end, or -1. The user's own, so it logs in the user
+ * alone, and its configuration is the door's. */
+static int open_door(const hull_machine *m, pid_t *child)
+{
+	int  pair[2];
+	char conf[4400];
+
+	snprintf(conf, sizeof conf, "%s/door.conf", m->ssh_dir);
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0)
+		return -1;
+	*child = fork();
+	if (*child < 0) {
+		close(pair[0]);
+		close(pair[1]);
+		return -1;
+	}
+	if (*child == 0) {
+		int null = open("/dev/null", O_WRONLY);
+
+		if (null < 0 || dup2(pair[1], 0) < 0 || dup2(pair[1], 1) < 0 || dup2(null, 2) < 0 ||
+		    setsid() < 0)
+			_exit(126);
+		close_range(3u, ~0u, 0);
+		execl(m->sshd, m->sshd, "-i", "-f", conf, (char *)NULL);
+		_exit(127);
+	}
+	close(pair[1]);
+	return pair[0];
+}
+
+/* One of the machine's ports, as a stream: a forward of qemu's where it
+ * has one, the guest's own server being the natural one to reach, and
+ * port 22 otherwise the door where the machine has one. */
+static hull_status pc_dial(hull_core *core, hull_machine *m, uint16_t port, hull_stream **out,
+                           hull_error *error)
+{
+	hull_stream *st;
+	pid_t        child = 0;
+	int          fd = dial_forward(m, port);
+
+	if (fd < 0 && port == 22u && m->ssh_dir != NULL)
+		fd = open_door(m, &child);
+	if (fd < 0)
+		return fail(error, HULL_ERR_GONE, port == 22u ?
+		            "this machine has no door: (ssh true), or a port forwarded to its own sshd" :
+		            "nothing is forwarded to that port of the machine");
+	if ((st = calloc(1u, sizeof *st)) == NULL) {
+		close(fd);
+		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+	}
+	st->machine = m;
+	st->core    = core;
+	st->socket  = fd;
+	st->child   = child;
+	st->from    = -1;
+	st->to      = -1;
+	if (pthread_create(&st->thread, NULL, deliver_socket, st) != 0) {
+		close(fd);
+		if (child > 0) {
+			kill(child, SIGKILL);
+			waitpid(child, NULL, 0);
+		}
+		free(st);
+		return fail(error, HULL_ERR_INTERNAL, "the connection's thread could not start");
+	}
+	*out = st;
+	return HULL_OK;
+}
+
 /* Input for COM1: it goes to qemu's stdin, which the port reads. */
 static hull_status pc_stream_write(hull_core *core, hull_stream *st, const uint8_t *data,
                                    size_t length, hull_error *error)
 {
+	int to = st->socket >= 0 ? st->socket : st->machine->input;
+
 	(void)core;
 	while (length > 0u) {
-		ssize_t n = send(st->machine->input, data, length, MSG_NOSIGNAL);
+		ssize_t n = send(to, data, length, MSG_NOSIGNAL);
 
 		if (n < 0 && errno == EINTR)
 			continue;
@@ -1033,8 +1220,9 @@ static hull_status pc_stream_write(hull_core *core, hull_stream *st, const uint8
 static hull_status pc_stream_eof(hull_core *core, hull_stream *st, hull_error *error)
 {
 	(void)core;
-	(void)st;
 	(void)error;
+	if (st->socket >= 0)
+		shutdown(st->socket, SHUT_WR);
 	return HULL_OK;
 }
 
@@ -1044,6 +1232,17 @@ static hull_status pc_stream_close(hull_core *core, hull_stream *st, hull_error 
 
 	(void)core;
 	(void)error;
+	if (st->socket >= 0) {
+		shutdown(st->socket, SHUT_RDWR);
+		pthread_join(st->thread, NULL);
+		close(st->socket);
+		if (st->child > 0) {
+			kill(st->child, SIGTERM);
+			waitpid(st->child, NULL, 0);
+		}
+		free(st);
+		return HULL_OK;
+	}
 	end_console(m);
 	pthread_join(st->thread, NULL);
 	pthread_mutex_lock(&m->lock);
@@ -1114,6 +1313,12 @@ static const hull_cap_entry entries[] = {
 	{ "network.nat",        HULL_SUP_NATIVE,
 	  "qemu's own user network, a card of (tuning (pc (nic ...))), ne2k_pci by default, DHCP "
 	  "at 10.0.2.2; none unless asked for", NULL },
+	{ "ssh",                HULL_SUP_EMULATED,
+	  "the host's OpenSSH in front of the machine's first serial port: a terminal on whatever "
+	  "console the system has there, the machine's name and host key the same; no sftp, no "
+	  "forwarding, no exit status of what is typed, one at a time, and the user logs in as "
+	  "the host's user. A port forwarded to the guest's own sshd goes first, whole. Refused "
+	  "where the host has no sshd", NULL },
 	{ "segments",           HULL_SUP_NATIVE,
 	  "a card on each, of (tuning (pc (nic ...))), beside any (network nat), its address the "
 	  "guest's own to set, nothing of hull's running there to give it one", NULL },
@@ -1190,6 +1395,7 @@ static const hull_engine_ops ops = {
 	.stream_write = pc_stream_write,
 	.stream_eof   = pc_stream_eof,
 	.stream_close = pc_stream_close,
+	.dial         = pc_dial,
 	.stats       = pc_stats,
 	.pause       = pc_pause,
 };

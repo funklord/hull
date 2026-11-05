@@ -331,6 +331,8 @@ ip link set eth0 up
 ip addr add 10.0.2.15/24 dev eth0
 echo listening
 nc -l -p 7000
+echo guest-listening-on-22
+nc -l -p 22
 echo served
 poweroff -f
 INIT
@@ -340,7 +342,8 @@ INIT
 	# UEFI, which a bootable export always boots by: its BIOS stage is
 	# there only where Limine was built.
 	conf '(source "image:./linux.img") (memory "512M") (network nat)' \
-		'(ports (port (host 7000) (guest 7000))) (tuning (pc (nic e1000) (firmware uefi)))'
+		'(ports (port (host 7000) (guest 7000)) (port (host 7022) (guest 22)))' \
+		'(tuning (pc (nic e1000) (firmware uefi)))'
 	timeout 90 "$hull" run -f "$root/hull.conf" > "$root/linux.out" 2>&1 &
 	pid=$!
 	sleep 2
@@ -352,10 +355,20 @@ INIT
 	done
 	sleep 1
 	printf 'from the host\n' | timeout 10 nc -w 3 "$address" 7000
+	n=0
+	while [ "$n" -lt 20 ] && ! grep -qa guest-listening-on-22 "$root/linux.out"; do
+		sleep 1
+		n=$((n + 1))
+	done
+	sleep 1
+	# Port 22 forwarded is the guest's own server, which goes before any door.
+	id=$("$hull" ps | awk '$5 == "running" { print $1 }')
+	{ printf 'through proxy-ssh\n'; sleep 2; } | timeout 10 "$hull" proxy-ssh "$id" > /dev/null 2>&1
 	wait "$pid"
 	status 'a linux powers off' "$?" 0 "$(tail -5 "$root/linux.out")"
 	says 'it booted' "$(cat "$root/linux.out")" 'a linux on a pc'
 	says 'a client at its address reached it' "$(cat "$root/linux.out")" 'from the host'
+	says 'proxy-ssh reached the guest'"'"'s own port 22' "$(cat "$root/linux.out")" 'through proxy-ssh'
 
 	# The serial bridge: a shell on COM1, driven from the host through
 	# `hull exec ... console`, with nothing of hull's in the guest.
@@ -365,7 +378,7 @@ INIT
 /bin/busybox mount -t devtmpfs none /dev
 /bin/busybox --install -s /bin
 echo console-ready
-exec sh < /dev/ttyS0 > /dev/ttyS0 2>&1
+while :; do sh < /dev/ttyS0 > /dev/ttyS0 2>&1; done
 INIT
 	out=$(timeout 120 "$hull" export --bootable "$tree" "$root/shell.img" --init /init.sh 2>&1)
 	status 'a system with a shell on its serial port' "$?" 0 "$out"
@@ -388,6 +401,85 @@ INIT
 	says 'what was typed ran in the guest' "$out" 'marker-42'
 	wait "$pid"
 	status 'and that was the guest powering off' "$?" 0 "$(tail -3 "$root/shell.out")"
+
+	# The door: real ssh, through `hull proxy-ssh`, to the host's OpenSSH
+	# in front of that serial port, the machine's host key pinned strictly.
+	if [ -x /usr/sbin/sshd ] && command -v ssh > /dev/null; then
+		mkdir -p "$root/home/.ssh"
+		chmod 700 "$root/home" "$root/home/.ssh"
+		ssh-keygen -q -t ed25519 -N '' -f "$root/home/.ssh/id_ed25519"
+		conf '(source "image:./shell.img") (memory "512M") (ssh true) (tuning (pc (firmware uefi)))'
+		# The core keeps a host key in memory only, so a tmpfs of the user's.
+		XDG_RUNTIME_DIR=$(mktemp -d /dev/shm/hull-pc.XXXXXX)
+		door_run=$XDG_RUNTIME_DIR
+		HOME=$root/home timeout 90 "$hull" run -f "$root/hull.conf" > "$root/door.out" 2>&1 &
+		pid=$!
+		n=0
+		while [ "$n" -lt 60 ] && ! grep -qa console-ready "$root/door.out"; do
+			sleep 1
+			n=$((n + 1))
+		done
+		id=$("$hull" ps | awk '$5 == "running" { print $1 }')
+		pub=$(find "$XDG_DATA_HOME/hull/machines/$id" -name host_key.pub)
+		printf '%s.hull %s\n' "$id" "$(cut -d' ' -f1,2 "$pub")" > "$root/known"
+		cat > "$root/door" <<WRAP
+#!/bin/sh
+exec "$(command -v ssh)" -F /dev/null -i "$root/home/.ssh/id_ed25519" -o IdentitiesOnly=yes \
+	-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$root/known" \
+	-o ProxyCommand="$hull proxy-ssh %h" "\$@"
+WRAP
+		chmod +x "$root/door"
+		me=$(id -un)
+		# It is a door to a serial port and no login to the host: a command
+		# or sftp asked for runs nothing here, and no port is forwarded.
+		timeout 20 "$root/door" -T "$me@$id.hull" touch "$root/pwned" > /dev/null 2>&1
+		cases=$((cases + 1))
+		[ ! -e "$root/pwned" ] || fail 'a command does not run on the host' ''
+		out=$(timeout 20 "$root/door" -T -s "$me@$id.hull" sftp < /dev/null 2>&1 | head -c 200)
+		cases=$((cases + 1))
+		case $out in
+		*SSH*|*sftp*version*) fail 'sftp is not served' "$out" ;;
+		esac
+		# A listener of the test's own, so the case cannot pass for want of one.
+		canary=$((30000 + $$ % 15000))
+		timeout 15 python3 -I -c '
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(1)
+c, _ = s.accept()
+c.sendall(b"canary\n")' "$canary" &
+		listener=$!
+		sleep 1
+		timeout 8 "$root/door" -T -N -L "127.0.0.1:$((canary + 1)):127.0.0.1:$canary" "$me@$id.hull" \
+			> /dev/null 2>&1 < /dev/null &
+		sleep 4
+		out=$(timeout 3 nc -w 2 127.0.0.1 $((canary + 1)) < /dev/null 2>&1)
+		cases=$((cases + 1))
+		case $out in
+		*canary*) fail 'nothing is forwarded through the door' "$out" ;;
+		esac
+		kill "$listener" 2> /dev/null
+		wait "$listener" 2> /dev/null
+		sleep 4
+		# hull ssh, as anyone would: the user logged in, by this ssh.
+		mkdir -p "$root/doorbin"
+		ln -s "$root/door" "$root/doorbin/ssh"
+		out=$( { sleep 4; printf 'echo viahull-$((1 + 1))\n'; sleep 3; } |
+			PATH=$root/doorbin:$PATH timeout 10 script -qec "$hull ssh $id" /dev/null 2>&1)
+		says 'hull ssh comes through it too' "$out" 'viahull-2'
+		out=$( { sleep 3; printf 'echo door-$((40 + 3))\n'; sleep 2; printf 'poweroff -f\n'; sleep 15; } |
+			timeout 40 "$root/door" -tt "$me@$id.hull" 2>&1)
+		says 'ssh through the door ran what was typed' "$out" 'door-43'
+		wait "$pid"
+		status 'and powered the guest off' "$?" 0 "$(tail -3 "$root/door.out")"
+		XDG_RUNTIME_DIR=$root/run
+		sleep 2
+		rm -rf "$door_run"
+	else
+		printf 'pc: no sshd on this host, the door not tried\n'
+	fi
 
 	# Two of them on a wire of hull's: a legacy machine is a host of the
 	# networks hull simulates. Each sets its own address, as it must.

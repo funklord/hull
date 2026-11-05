@@ -4279,6 +4279,9 @@ static int vagrant_builds(const options *o, const hull_registry *registry)
 
 /* Whether a core answers, without starting one; or would, holding the
  * machines a core that went kept for it. */
+/* The engine of the machine list_machines() was last asked for. */
+static char listed_engine[64];
+
 /* `hull ps`; or with `want`, nothing printed, and that machine's arch
  * into `arch`, "" where it says none, the host's: 0 where it is listed. */
 static int list_machines(const char *want, char *arch, size_t cap)
@@ -4334,6 +4337,7 @@ static int list_machines(const char *want, char *arch, size_t cap)
 			if (strcmp(values[0], want) != 0)
 				continue;
 			snprintf(arch, cap, "%s", values[6]);
+			snprintf(listed_engine, sizeof listed_engine, "%s", values[2]);
 			hull_wire_close(&wire);
 			return 0;
 		}
@@ -5873,7 +5877,13 @@ static int ssh_client(const char *id, const char *pub)
 		snprintf(hosts, sizeof hosts, "UserKnownHostsFile=%s", known);
 	}
 	snprintf(proxy, sizeof proxy, "ProxyCommand=\"%s\" proxy-ssh %%h", self);
-	snprintf(target, sizeof target, "root@%s.hull", id);
+	/* The door on a pc machine is the host's sshd, run as the user, which
+	 * logs in the user alone; a guest's own sshd is the guest's root. */
+	{
+		struct passwd *who = strcmp(listed_engine, "qemu-pc") == 0 ? getpwuid(getuid()) : NULL;
+
+		snprintf(target, sizeof target, "%s@%s.hull", who != NULL ? who->pw_name : "root", id);
+	}
 	argv[ai++] = "ssh";
 	argv[ai++] = "-o";
 	argv[ai++] = proxy;
@@ -5950,9 +5960,20 @@ static int ssh_into(const char *id)
 	 * client. The key alone is not enough: it outlives the run that made
 	 * it, and a later run of the machine without (ssh true) has no sshd,
 	 * where `hull ssh` met a refused port 22 rather than its shell. */
+	{
+		char arch[64];
+
+		list_machines(id, arch, sizeof arch);
+	}
 	if (machine_sshd_open(id)) {
 		if ((rc = ssh_client(id, machine_host_pub(id, pub, sizeof pub) ? pub : NULL)) >= 0)
 			return rc;
+	}
+	/* A pc machine runs nothing of hull's: its serial port is the shell. */
+	if (strcmp(listed_engine, "qemu-pc") == 0) {
+		char *console[] = { "console" };
+
+		return exec_in(id, console, 1, 1, 0u);
 	}
 	if (term == NULL || term[0] == '\0')
 		return exec_in(id, login, 2, 1, 0u);
