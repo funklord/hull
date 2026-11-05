@@ -5836,8 +5836,13 @@ static int exec_in(const char *id, char **argv, int argc, int tty, unsigned port
 					restore_terminal();
 					ended = 1;
 				}
-				fprintf(stderr, started && terminal_raw ? "hull: %s\r\n" : "hull: %s\n",
-				        reason);
+				/* A connection the far side closed first is no error of
+				 * ssh's: its last bytes crossing that close is how a login
+				 * ends, and a ProxyCommand's stderr is the user's screen. */
+				if (port == 0u || !started ||
+				    strcmp(reason, "the command's input has closed") != 0)
+					fprintf(stderr, started && terminal_raw ? "hull: %s\r\n" : "hull: %s\n",
+					        reason);
 			} else if (hull_msg_is(&body, "started")) {
 				started = 1;
 			}
