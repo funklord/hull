@@ -191,6 +191,58 @@ cases=$((cases + 1))
 cases=$((cases + 1))
 "$hull" import --target build "$dir/args.in" | grep -q '"/v"' &&
 	fail 'a stage after --target is left out' "$("$hull" import --target build "$dir/args.in")"
+# Compose's variables: the environment over .env, the forms it has, $$ a
+# dollar; env_file, environment winning; and a block unread is said.
+mkdir -p "$dir/vars"
+printf 'TAG=9\nexport MODE="fast"\n# a comment\nDEEP=down\n' > "$dir/vars/.env"
+printf 'FROMFILE=1\nMODE=lost\n' > "$dir/vars/site.env"
+cat > "$dir/vars/compose.yaml" <<'COMPOSE'
+services:
+  web:
+    image: alpine:${TAG:-3.20}
+    env_file: site.env
+    environment:
+      - MODE=${MODE}
+      - SPEND=$$5
+      - PLUS=${TAG:+set}
+      - NESTED=${GONE:-${DEEP}}
+    ports:
+      - "${PORT:-8080}:80"
+    mem_limit: 256m
+    cpus: 2
+    labels:
+      a: b
+COMPOSE
+expect 0 '\(source "alpine:9"\)' "$hull" import "$dir/vars/compose.yaml"
+expect 0 '\(host 9090\)' env PORT=9090 "$hull" import "$dir/vars/compose.yaml"
+expect 0 '\(host 8080\)' "$hull" import "$dir/vars/compose.yaml"
+expect 0 '\(source "alpine:1"\)' env TAG=1 "$hull" import "$dir/vars/compose.yaml"
+expect 0 '\(MODE "fast"\)' "$hull" import "$dir/vars/compose.yaml"
+expect 0 '\(SPEND "\$5"\)' "$hull" import "$dir/vars/compose.yaml"
+expect 0 '\(PLUS "set"\)' "$hull" import "$dir/vars/compose.yaml"
+expect 0 '\(NESTED "down"\)' "$hull" import "$dir/vars/compose.yaml"
+expect 0 '\(FROMFILE "1"\)' "$hull" import "$dir/vars/compose.yaml"
+expect 0 '\(memory "256M"\) \(cpus 2\)' "$hull" import "$dir/vars/compose.yaml"
+expect 0 '; key not translated: labels' "$hull" import "$dir/vars/compose.yaml"
+cases=$((cases + 1))
+"$hull" import "$dir/vars/compose.yaml" | grep -q 'lost' &&
+	fail 'environment wins over env_file' "$("$hull" import "$dir/vars/compose.yaml")"
+printf 'services:\n  web:\n    image: ${NEEDED:?say so}\n' > "$dir/vars/need.yaml"
+expect 2 'required variable NEEDED: say so' "$hull" plan -f "$dir/vars/need.yaml"
+printf 'services:\n  web:\n    image: alpine\n    command: echo $UNSETHERE\n' > "$dir/vars/unset.yaml"
+expect 1 'the variable UNSETHERE is not set' "$hull" plan -f "$dir/vars/unset.yaml"
+# A named volume is a directory that outlives the machine, made as the
+# dialect reads the file and only printed by hull import.
+rm -rf "$dir/vdata"
+printf 'services:\n  db:\n    image: alpine\n    volumes:\n      - data:/var/lib/db\nvolumes:\n  data:\n' \
+	> "$dir/vars/named.yaml"
+expect 0 'compose/vars/data"\) \(guest "/var/lib/db"\)' env XDG_DATA_HOME="$dir/vdata" \
+	"$hull" import "$dir/vars/named.yaml"
+cases=$((cases + 1))
+[ ! -e "$dir/vdata" ] || fail 'hull import makes nothing' "$(ls -R "$dir/vdata")"
+expect 1 'named volume kept' env XDG_DATA_HOME="$dir/vdata" "$hull" plan -f "$dir/vars/named.yaml" --backend chroot
+cases=$((cases + 1))
+[ -d "$dir/vdata/hull/compose/vars/data" ] || fail 'the dialect makes it' ''
 # hull import of a compose file (by its .yml name) to a (machines ...) form.
 # Section 4.8 plans a file's machines at once with no ordering, so
 # depends_on is (after ...); each network is an addressed segment

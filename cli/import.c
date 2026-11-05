@@ -22,6 +22,8 @@
 #define _GNU_SOURCE
 
 #include <ctype.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -820,6 +822,9 @@ typedef struct svc {
 	char build_context[512];   /* from build:, relative to the file */
 	char build_dockerfile[256];
 	char build_target[128];
+	sb   file_env;         /* env_file:'s `NAME=value` lines, environment: winning */
+	char memory[32];       /* from mem_limit: */
+	char cpus[16];         /* from cpus:, a whole number */
 	hull_build_arg build_arg[HULL_MAX_BUILD_ARGS];
 	unsigned build_arg_count;
 	int  args_indent;      /* where build's args: key is, or -1 */
@@ -1059,11 +1064,39 @@ static void compose_port(svc *s, char *spec)
 
 /* "host:guest[:ro]" -> a (volume ...). A named volume, no leading /, is
  * noted: hull has no named volumes. */
+/* $XDG_DATA_HOME/hull/compose/PROJECT/NAME into `out`, made where the
+ * dialect reads the file, `hull import` only printing one: 1, or 0. */
+static int named_volume(const char *name, char *out, size_t cap)
+{
+	const char *data = getenv("XDG_DATA_HOME");
+	const char *home = getenv("HOME");
+	char        base[4000];
+	char        step[4400];
+
+	if (strchr(name, '/') != NULL)
+		return 0;
+	if (data != NULL && data[0] != '\0')
+		snprintf(base, sizeof base, "%s", data);
+	else if (home != NULL && home[0] != '\0')
+		snprintf(base, sizeof base, "%s/.local/share", home);
+	else
+		return 0;
+	snprintf(out, cap, "%s/hull/compose/%s/%s", base, build_project, name);
+	if (warnings == NULL)
+		return 1;
+	for (char *slash = strchr(out + 1, '/'); slash != NULL; slash = strchr(slash + 1, '/')) {
+		snprintf(step, sizeof step, "%.*s", (int)(slash - out), out);
+		mkdir(step, 0700);
+	}
+	return mkdir(out, 0700) == 0 || errno == EEXIST;
+}
+
 static void compose_volume(svc *s, char *spec)
 {
 	char *p = scalar(spec);
 	char *c1 = strchr(p, ':');
 	char *c2;
+	char  kept[4400];
 	int   ro;
 
 	if (c1 == NULL) {
@@ -1071,9 +1104,16 @@ static void compose_volume(svc *s, char *spec)
 		return;
 	}
 	*c1 = '\0';
-	if (p[0] != '/' && p[0] != '.') {
-		svc_note(s, "named volume not translated", p);
-		return;
+	/* A named volume outlives the machine, so it is a directory of the
+	 * user's, the project's and its name's, made as the dialect reads the
+	 * file: a database's data survives a `hull up` as under compose. */
+	if (p[0] != '/' && p[0] != '.' && p[0] != '~') {
+		if (!named_volume(p, kept, sizeof kept)) {
+			svc_note(s, "named volume not translated", p);
+			return;
+		}
+		svc_note(s, "named volume kept, starting empty, not from the image, at", kept);
+		p = kept;
 	}
 	c2 = strchr(c1 + 1, ':');
 	ro = c2 != NULL && strstr(c2, "ro") != NULL;
@@ -1097,6 +1137,7 @@ static void svc_reset(svc *s)
 	free(s->ports.data);
 	free(s->volumes.data);
 	free(s->notes.data);
+	free(s->file_env.data);
 	memset(s, 0, sizeof *s);
 	s->dep_indent  = -1;
 	s->args_indent = -1;
@@ -1225,6 +1266,20 @@ static void svc_flush(svc *s, sb *out)
 		svc_reset(s);
 		return;
 	}
+	/* An env_file's names, but those environment: gave, which win. */
+	if (s->file_env.len > 0u) {
+		char *save;
+
+		for (char *w = strtok_r(s->file_env.data, "\n", &save); w != NULL;
+		     w = strtok_r(NULL, "\n", &save)) {
+			char   wanted[200];
+			size_t n = strcspn(w, "=");
+
+			snprintf(wanted, sizeof wanted, "(%.*s ", (int)n, w);
+			if (s->env.data == NULL || strstr(s->env.data, wanted) == NULL)
+				compose_env(s, w, 0);
+		}
+	}
 	/* build: the service's image is what `hull up` makes of its Dockerfile,
 	 * under a ref of the project's, even where an image: names it too. */
 	if (s->build_context[0] != '\0' || s->build_dockerfile[0] != '\0') {
@@ -1331,6 +1386,16 @@ static void svc_flush(svc *s, sb *out)
 	if (s->hostname[0] != '\0') {
 		sb_str(out, " (hostname ");
 		sb_quoted(out, s->hostname);
+		sb_str(out, ")");
+	}
+	if (s->memory[0] != '\0') {
+		sb_str(out, " (memory ");
+		sb_quoted(out, s->memory);
+		sb_str(out, ")");
+	}
+	if (s->cpus[0] != '\0') {
+		sb_str(out, " (cpus ");
+		sb_str(out, s->cpus);
 		sb_str(out, ")");
 	}
 	if (s->restart[0] != '\0') {
@@ -1525,6 +1590,246 @@ static void project_of(const char *path, char *out, size_t cap)
 
 /* The compose file `file` as a (machines ...) form, allocated, or NULL
  * having said why; its networks' segments named for `project`. */
+/* --- variables ----------------------------------------------------------- */
+
+#define MAX_DOTENV 128u
+
+static char     compose_dir[4096];   /* the file's, for .env and env_file */
+static char     dotenv_name[MAX_DOTENV][64];
+static char     dotenv_value[MAX_DOTENV][512];
+static unsigned dotenv_count;
+
+/* A `NAME=value` line of an env file, in place: 1 with `*name` and `*value`
+ * set, a leading `export` and the value's quotes gone, or 0 for a blank,
+ * a comment or no `=`. */
+static int env_line(char *line, char **name, char **value)
+{
+	char  *text = trim(line);
+	char  *eq;
+	size_t n;
+
+	text[strcspn(text, "\r\n")] = '\0';
+	if (*text == '#' || (eq = strchr(text, '=')) == NULL)
+		return 0;
+	if (strncmp(text, "export ", 7u) == 0)
+		text = trim(text + 7);
+	*eq = '\0';
+	*name = trim(text);
+	*value = trim(eq + 1);
+	n = strlen(*value);
+	if (n >= 2u && ((*value)[0] == '"' || (*value)[0] == '\'') && (*value)[n - 1u] == (*value)[0]) {
+		(*value)[n - 1u] = '\0';
+		(*value)++;
+	}
+	return (*name)[0] != '\0';
+}
+
+/* The .env beside the compose file, as compose reads one. */
+static void read_dotenv(void)
+{
+	char  path[4200];
+	char  line[1024];
+	FILE *file;
+
+	dotenv_count = 0u;
+	snprintf(path, sizeof path, "%s/.env", compose_dir);
+	if ((file = fopen(path, "r")) == NULL)
+		return;
+	while (fgets(line, sizeof line, file) != NULL && dotenv_count < MAX_DOTENV) {
+		char *name;
+		char *value;
+
+		if (env_line(line, &name, &value)) {
+			snprintf(dotenv_name[dotenv_count], sizeof dotenv_name[0], "%s", name);
+			snprintf(dotenv_value[dotenv_count], sizeof dotenv_value[0], "%s", value);
+			dotenv_count++;
+		}
+	}
+	fclose(file);
+}
+
+/* A variable's value: the environment's, then .env's, or NULL. */
+static const char *compose_variable(const char *name)
+{
+	const char *value = getenv(name);
+
+	if (value != NULL)
+		return value;
+	for (unsigned i = 0u; i < dotenv_count; i++)
+		if (strcmp(dotenv_name[i], name) == 0)
+			return dotenv_value[i];
+	return NULL;
+}
+
+/* `line` with compose's interpolation done, written to `out`: $NAME,
+ * ${NAME}, the :- - :? ? :+ + forms, and $$ for a dollar. Unset is empty,
+ * and said, as compose says it. */
+static void interpolate(const char *line, FILE *out)
+{
+	while (*line != '\0') {
+		const char *end;
+		const char *word = NULL;
+		const char *close = NULL;
+		const char *value;
+		char        name[64];
+		char        op = '\0';
+		int         colon = 0;
+		int         braced;
+		size_t      n;
+
+		if (*line != '$') {
+			fputc(*line++, out);
+			continue;
+		}
+		if (line[1] == '$') {
+			fputc('$', out);
+			line += 2;
+			continue;
+		}
+		braced = line[1] == '{';
+		end = line + 1 + braced;
+		n = 0u;
+		while ((isalnum((unsigned char)end[n]) || end[n] == '_') && n + 1u < sizeof name) {
+			name[n] = end[n];
+			n++;
+		}
+		name[n] = '\0';
+		end += n;
+		if (n == 0u || isdigit((unsigned char)name[0])) {
+			fputc(*line++, out);
+			continue;
+		}
+		if (braced) {
+			int depth = 1;
+
+			colon = *end == ':';
+			if (strchr("-?+", end[colon]) != NULL && end[colon] != '\0') {
+				op = end[colon];
+				word = end + colon + 1;
+			} else if (*end != '}') {
+				fputc(*line++, out);
+				continue;
+			}
+			for (close = end; *close != '\0'; close++) {
+				if (close[0] == '$' && close[1] == '{')
+					depth++;
+				else if (*close == '}' && --depth == 0)
+					break;
+			}
+			if (*close != '}') {
+				fputc(*line++, out);
+				continue;
+			}
+		}
+		value = compose_variable(name);
+		{
+			int set = value != NULL && (!colon || value[0] != '\0');
+
+			if (op == '-' && !set) {
+				char inner[1024];
+
+				snprintf(inner, sizeof inner, "%.*s", (int)(close - word), word);
+				interpolate(inner, out);
+			} else if (op == '+') {
+				if (set)
+					fprintf(out, "%.*s", (int)(close - word), word);
+			} else if (op == '?' && !set) {
+				if (warnings != NULL)
+					fprintf(warnings, "%s: required variable %s: %.*s\n", warned_path, name,
+					        (int)(close - word), word);
+				unrunnable = 1;
+			} else if (value != NULL) {
+				fputs(value, out);
+			} else if (warnings != NULL) {
+				fprintf(warnings, "%s: the variable %s is not set, and is empty\n", warned_path,
+				        name);
+			}
+		}
+		line = braced ? close + 1 : end;
+	}
+}
+
+/* `file`, read to its end, as the file compose would parse: a new stream
+ * the caller closes, or `file` itself if memory ran out. */
+static FILE *interpolated(FILE *file)
+{
+	char   line[LINE_CAP];
+	char  *text = NULL;
+	size_t length = 0u;
+	FILE  *out = open_memstream(&text, &length);
+	FILE  *in;
+
+	if (out == NULL)
+		return file;
+	read_dotenv();
+	while (fgets(line, sizeof line, file) != NULL) {
+		if (*trim(line) == '#')
+			continue;
+		interpolate(line, out);
+	}
+	fclose(out);
+	if (length == 0u || (in = fmemopen(text, length, "r")) == NULL) {
+		free(text);
+		return tmpfile();
+	}
+	return in;   /* the text goes with the process: a few KiB, a run's only */
+}
+
+/* `path`'s directory, for what the file names beside it. */
+static void set_compose_dir(const char *path)
+{
+	const char *slash = strrchr(path, '/');
+
+	if (slash == NULL)
+		snprintf(compose_dir, sizeof compose_dir, ".");
+	else
+		snprintf(compose_dir, sizeof compose_dir, "%.*s", (int)(slash - path), path);
+}
+
+/* An env_file:, relative to the compose file, into the service's env. */
+static void compose_env_file(svc *s, const char *path)
+{
+	char  full[4600];
+	char  line[1024];
+	FILE *file;
+
+	snprintf(full, sizeof full, "%s%s%s", path[0] == '/' ? "" : compose_dir,
+	         path[0] == '/' ? "" : "/", path);
+	if ((file = fopen(full, "r")) == NULL) {
+		svc_note(s, "env_file not read", path);
+		return;
+	}
+	while (fgets(line, sizeof line, file) != NULL) {
+		char *name;
+		char *value;
+		char  entry[800];
+
+		if (env_line(line, &name, &value)) {
+			snprintf(entry, sizeof entry, "%s=%s\n", name, value);
+			sb_str(&s->file_env, entry);
+		}
+	}
+	fclose(file);
+}
+
+/* mem_limit, `256m` or bytes, as a spec's size, `256M`. */
+static void compose_memory(svc *s, const char *text)
+{
+	char         *end;
+	unsigned long n = strtoul(text, &end, 10);
+	char          unit = (char)toupper((unsigned char)*end);
+
+	if (end == text || (*end != '\0' && strchr("KMG", unit) == NULL && unit != 'B')) {
+		svc_note(s, "mem_limit not translated", text);
+		return;
+	}
+	if (*end == '\0' || unit == 'B')
+		snprintf(s->memory, sizeof s->memory, "%luM", n / (1024u * 1024u) != 0u ?
+		         n / (1024u * 1024u) : 1u);
+	else
+		snprintf(s->memory, sizeof s->memory, "%lu%c", n, unit);
+}
+
 static char *compose_text(FILE *file, const char *project)
 {
 	svc    s = { 0 };
@@ -1578,7 +1883,9 @@ static char *compose_text(FILE *file, const char *project)
 				snprintf(build_project, sizeof build_project, "%s", name);
 			} else if (colon != NULL) {
 				*colon = '\0';
-				if (strcmp(content, "version") != 0) {
+				/* A top-level volumes: declares the names a service's
+				 * volumes then keep. */
+				if (strcmp(content, "version") != 0 && strcmp(content, "volumes") != 0) {
 					sb_str(&top_notes, "\n; top-level key not translated: ");
 					sb_str(&top_notes, content);
 					if (warnings != NULL)
@@ -1688,6 +1995,8 @@ static char *compose_text(FILE *file, const char *project)
 				svc_test_word(&s, scalar(item));
 			else if (strcmp(field, "build") == 0 && s.args_indent >= 0)
 				svc_build_arg(&s, item, '=');
+			else if (strcmp(field, "env_file") == 0)
+				compose_env_file(&s, scalar(item));
 			else if (strcmp(field, "profiles") == 0 && s.profile_count < 8)
 				snprintf(s.profile[s.profile_count++], sizeof s.profile[0], "%s", scalar(item));
 			continue;
@@ -1818,8 +2127,21 @@ static char *compose_text(FILE *file, const char *project)
 		key = trim(content);
 		value = trim(colon + 1);
 		snprintf(field, sizeof field, "%s", key);
-		if (value[0] == '\0')
-			continue;             /* a block list or map follows */
+		if (value[0] == '\0') {
+			/* A block list or map follows, which only these are read
+			 * under: another goes unread, and is said. */
+			static const char *const blocks[] = {
+				"environment", "ports", "volumes", "command", "entrypoint", "networks",
+				"depends_on", "healthcheck", "build", "profiles", "env_file", NULL
+			};
+			int known = 0;
+
+			for (const char *const *b = blocks; *b != NULL; b++)
+				known |= strcmp(*b, key) == 0;
+			if (!known)
+				svc_note(&s, "key not translated", key);
+			continue;
+		}
 		field[0] = '\0';          /* a scalar or flow value, handled now */
 		if (strcmp(key, "image") == 0)
 			snprintf(s.source, sizeof s.source, "%s", scalar(value));
@@ -1891,7 +2213,25 @@ static char *compose_text(FILE *file, const char *project)
 				svc_note(&s, "depends_on not translated", scalar(value));
 		} else if (strcmp(key, "healthcheck") == 0)
 			svc_note(&s, "healthcheck not translated", "a flow map; write it as a block");
-		else if (strcmp(key, "user") == 0)
+		else if (strcmp(key, "env_file") == 0) {
+			char *items[16];
+			int   n = flow_list(value, items, 16);
+
+			if (n < 0)
+				compose_env_file(&s, scalar(value));
+			for (int i = 0; i < n; i++)
+				compose_env_file(&s, items[i]);
+		} else if (strcmp(key, "mem_limit") == 0) {
+			compose_memory(&s, scalar(value));
+		} else if (strcmp(key, "cpus") == 0) {
+			char *text = scalar(value);
+
+			if (text[0] != '\0' && strspn(text, "0123456789") == strlen(text) &&
+			    strtol(text, NULL, 10) > 0)
+				snprintf(s.cpus, sizeof s.cpus, "%s", text);
+			else
+				svc_note(&s, "cpus of a fraction not translated", text);
+		} else if (strcmp(key, "user") == 0)
 			svc_note(&s, "user not translated", scalar(value));
 		else if (strcmp(key, "network_mode") == 0) {
 			/* bridge is docker's own network, which hull's nat names on
@@ -1967,6 +2307,15 @@ char *hull_import_compose(const char *path, FILE *notes)
 	warnings = notes;
 	warned_path = path;
 	unrunnable = 0;
+	set_compose_dir(path);
+	{
+		FILE *read = interpolated(file);
+
+		if (read != file) {
+			fclose(file);
+			file = read;
+		}
+	}
 	text = compose_text(file, project);
 	fclose(file);
 	warnings = NULL;
@@ -2016,7 +2365,15 @@ int hull_import(const char *path)
 	if (compose) {
 		char project[256];
 
+		FILE *read;
+
 		project_of(path, project, sizeof project);
+		set_compose_dir(path);
+		read = interpolated(file);
+		if (read != file) {
+			fclose(file);
+			file = read;
+		}
 		status = import_compose(file, project);
 	} else {
 		status = import_dockerfile(file);
