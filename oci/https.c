@@ -273,6 +273,7 @@ static int open_conn(conn *c, const url *u, char *why, size_t cap)
 	SSL_CTX        *ctx = context();
 	struct in6_addr address;
 	int             spoke_tls = 0;
+	int             connected;
 	int             literal = inet_pton(AF_INET, u->host, &address) == 1 ||
 	                          inet_pton(AF_INET6, u->host, &address) == 1;
 
@@ -296,7 +297,12 @@ static int open_conn(conn *c, const url *u, char *why, size_t cap)
 		return say(why, cap, u->host, "its name could not be set to be verified");
 	SSL_set_msg_callback(c->ssl, heard_tls);
 	SSL_set_msg_callback_arg(c->ssl, &spoke_tls);
-	if (SSL_connect(c->ssl) != 1 || SSL_get_verify_result(c->ssl) != X509_V_OK) {
+	connected = SSL_connect(c->ssl) == 1;
+	/* spoke_tls is this function's, and TLS 1.3 sends its session tickets
+	 * after the handshake: left set, each is a write to a dead stack frame. */
+	SSL_set_msg_callback(c->ssl, NULL);
+	SSL_set_msg_callback_arg(c->ssl, NULL);
+	if (!connected || SSL_get_verify_result(c->ssl) != X509_V_OK) {
 		if (plain_allowed && !spoke_tls && peer_is_loopback(c->fd)) {
 			ERR_clear_error();
 			SSL_free(c->ssl);
