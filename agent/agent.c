@@ -677,9 +677,16 @@ static void network(void)
 		say("resolv.conf", strerror(errno));
 }
 
-/* Mount the 9p share `tag` at `at`. */
+/* Mount the share `tag` at `at`: 9p, or under (share virtiofs) virtiofs for
+ * the root and the volumes. The engine's own, its modules and the like, are
+ * small and stay 9p. */
 static int share(const char *tag, const char *at, int readonly)
 {
+	char how[16];
+
+	if ((strcmp(tag, "root") == 0 || (tag[0] == 'v' && isdigit((unsigned char)tag[1]))) &&
+	    cmdline_value("hull.share", how, sizeof how) && strcmp(how, "virtiofs") == 0)
+		return mount(tag, at, "virtiofs", readonly ? MS_RDONLY : 0u, NULL);
 	return mount(tag, at, "9p", readonly ? MS_RDONLY : 0u,
 	             "trans=virtio,version=9p2000.L,msize=262144");
 }

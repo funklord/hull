@@ -89,6 +89,8 @@
 #include "vbox.h"
 
 #define MAX_VOLUMES  64u
+
+static char *virtiofsd_path(void);
 #define MAX_PORTS    64u
 #define MAX_MODULES  64u
 #define MAX_SERIAL   4u   /* isa-serial's indices, ttyS0 to ttyS3 */
@@ -188,6 +190,7 @@ struct hull_machine {
 	int              pidfd;        /* qemu's, when adopted, else -1 */
 	uint32_t         cid;          /* its vsock context id; 0, the serial port's agent.sock */
 	int              transport;    /* (tuning (qemu (transport ...))): 0 auto, 1 vsock, 2 serial, 3 uart */
+	char            *virtiofsd;    /* (tuning (qemu (share virtiofs))): the daemon, or NULL for 9p */
 	int              hosted;       /* the virtualbox engine's: `qemu` is `hull virtualbox host` */
 	int              hosted_fd;    /* the wire to it, until the reader opens it */
 	int              ready;        /* the agent has started the workload */
@@ -426,6 +429,7 @@ static void release(hull_machine *m)
 	free(m->upper);
 	free(m->upper_work);
 	free(m->owners);
+	free(m->virtiofsd);
 	free(m->export);
 	free(m->kernel_path);
 	free(m->spec);
@@ -647,6 +651,19 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		m->transport = strcmp(text, "vsock") == 0 ? 1 : strcmp(text, "serial") == 0 ? 2 :
 		               strcmp(text, "uart") == 0 ? 3 : 0;
 		free(text);
+	}
+	/* (tuning (qemu (share ...))): how a tree reaches the guest. auto is 9p
+	 * until the holder says otherwise (section 4.11): the key's absence is
+	 * following that, and only virtiofs here is a choice of it. */
+	if (hull_access_find(doc, &machine, "tuning", &entry) &&
+	    hull_access_find(doc, &entry, "qemu", &item) &&
+	    (text = hull_access_value(doc, &item, "share")) != NULL) {
+		int wanted = strcmp(text, "virtiofs") == 0;
+
+		free(text);
+		if (wanted && (m->virtiofsd = virtiofsd_path()) == NULL)
+			return "(share virtiofs) needs virtiofsd, which is not installed: "
+			       "its package, or HULL_VIRTIOFSD naming the program";
 	}
 
 	if (m->kernel_image && m->composefs != NULL)
@@ -971,7 +988,7 @@ static const char *find_modules(const char *modules, const char *const *extra,
                                 unsigned extra_count, module_list *list)
 {
 	static const char *const base[] = { "9p", "9pnet_virtio", "vmw_vsock_virtio_transport",
-	                                    "virtio_net", "overlay", "?virtio-rng" };
+	                                    "virtio_net", "overlay", "?virtio-rng", "?virtiofs" };
 	const char *wanted[sizeof base / sizeof base[0] + MAX_MODULES];
 	unsigned    wanted_count = 0u;
 	char        path[512];
@@ -1629,6 +1646,92 @@ static void segment_mac(const hull_machine *m, unsigned i, char *out, size_t cap
  * user's own group and not setgid, overlayfs refusing one of a group the
  * namespace does not map. The step that failed, or NULL.
  */
+/* The daemon (tuning (qemu (share virtiofs))) needs: HULL_VIRTIOFSD, or where
+ * the distributions put it. Allocated, or NULL. */
+static char *virtiofsd_path(void)
+{
+	static const char *const places[] = { "/usr/libexec/virtiofsd", "/usr/lib/qemu/virtiofsd",
+	                                      "/usr/bin/virtiofsd" };
+	const char *chosen = getenv("HULL_VIRTIOFSD");
+
+	if (chosen != NULL && chosen[0] != '\0')
+		return access(chosen, X_OK) == 0 ? strdup(chosen) : NULL;
+	for (unsigned i = 0u; i < sizeof places / sizeof places[0]; i++)
+		if (access(places[i], X_OK) == 0)
+			return strdup(places[i]);
+	return NULL;
+}
+
+/* One daemon for `dir`, as tag `tag`, its socket in the cwd: run in qemu's own
+ * namespaces, so it sees what 9p would, the user as root and the overlay
+ * mounted there. It goes when qemu's connection does, and with qemu if qemu
+ * never connects. No sandbox of its own, this namespace being one and a
+ * machine being no security boundary (section 1). Mount points stay
+ * unannounced, one tree as 9p shows it: announced, the guest's overlay
+ * refuses each, EREMOTE, a root of the host's tree losing all under /home.
+ * A guest's ids all come to the user, so that a chown is taken and keeps
+ * nothing, as 9p's is: refused, EINVAL, dpkg and tar would fail in the guest. */
+static int virtiofs_daemon(const hull_machine *m, const char *tag, const char *dir, int readonly)
+{
+	char  socket_path[64];
+	char  socket_option[96];
+	char  dir_option[4400];
+	pid_t pid;
+
+	snprintf(socket_path, sizeof socket_path, "vfs-%s.sock", tag);
+	snprintf(socket_option, sizeof socket_option, "--socket-path=%s", socket_path);
+	snprintf(dir_option, sizeof dir_option, "--shared-dir=%s", dir);
+	pid = fork();
+	if (pid < 0)
+		return 0;
+	if (pid == 0) {
+		prctl(PR_SET_PDEATHSIG, SIGTERM);
+		syscall(SYS_close_range, 3u, ~0u, 0u);
+		execl(m->virtiofsd, "virtiofsd", socket_option, dir_option, "--sandbox=none", "--cache=auto",
+		      "--log-level=error", "--no-announce-submounts", "--translate-uid=squash-guest:0:0:4294967295",
+		      "--translate-gid=squash-guest:0:0:4294967295", readonly ? "--readonly" : (char *)NULL, (char *)NULL);
+		_exit(127);
+	}
+	for (int tries = 0; tries < 500; tries++) {
+		struct stat     is;
+		struct timespec wait = { 0, 10000000L };
+
+		if (stat(socket_path, &is) == 0)
+			return 1;
+		nanosleep(&wait, NULL);
+	}
+	fprintf(stderr, "qemu-system-x86_64: virtiofsd for %s did not start\n", tag);
+	return 0;
+}
+
+/* A daemon for the root and each volume that is a tree, before qemu dials
+ * them. In the machine's directory, so that a socket's name stays short. */
+static int virtiofs_daemons(const hull_machine *m)
+{
+	char at[4300];
+
+	if (chdir(m->dir) != 0)
+		return 0;
+	if (!m->block_root) {
+		snprintf(at, sizeof at, "%s/merged", m->dir);
+		if (!virtiofs_daemon(m, "root", m->host_overlay ? at : m->root,
+		                     m->readonly_root || (m->overlay && m->upper == NULL && m->export == NULL)))
+			return 0;
+	}
+	for (unsigned i = 0u; i < m->volume_count; i++) {
+		char tag[16];
+
+		if (m->volume_block[i] != NULL)
+			continue;
+		snprintf(tag, sizeof tag, "v%u", i);
+		snprintf(at, sizeof at, "%s/v%u/merged", m->dir, i);
+		if (!virtiofs_daemon(m, tag, m->volume_stack[i].count > 0u ? at : m->volume_host[i],
+		                     m->volume_readonly[i]))
+			return 0;
+	}
+	return 1;
+}
+
 static const char *stage_overlay(const hull_machine *m)
 {
 	char   options[8800u + 16u * MAX_VOLUMES];
@@ -1732,7 +1835,8 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        path[8500];
 	char        device_chardev[HULL_MAX_DEVICES][600];
 	char        device_device[HULL_MAX_DEVICES][96];
-	const char *argv[76 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS + 4u * HULL_MAX_DEVICES + 2u];
+	char        shared_memory[96];
+	const char *argv[80 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS + 4u * HULL_MAX_DEVICES + 2u];
 	unsigned    serial = 0u;
 	unsigned    parallel = 0u;
 	int         usb = 0;
@@ -1795,6 +1899,16 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	argv[n++] = m->emu ? "max" : "host";
 	argv[n++] = "-m";
 	argv[n++] = memory;
+	if (m->virtiofsd != NULL) {
+		/* The daemon reads and writes the guest's buffers itself, so its
+		 * memory has to be shareable. */
+		snprintf(shared_memory, sizeof shared_memory, "memory-backend-memfd,id=mem,size=%luM,share=on",
+		         m->memory_mib);
+		argv[n++] = "-object";
+		argv[n++] = shared_memory;
+		argv[n++] = "-machine";
+		argv[n++] = "memory-backend=mem";
+	}
 	argv[n++] = "-smp";
 	argv[n++] = cpus;
 	argv[n++] = "-kernel";
@@ -1832,6 +1946,11 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	} else {
 		snprintf(m->append, sizeof m->append, "%s", m->no_network ?
 		         "console=hvc0 quiet panic=-1" : "console=hvc0 quiet panic=-1 hull.passt=1");
+	}
+	if (m->virtiofsd != NULL) {
+		size_t at = strlen(m->append);
+
+		snprintf(m->append + at, sizeof m->append - at, " hull.share=virtiofs");
 	}
 	/* (transport uart): the agent told its port, a UART having no name;
 	 * the first ISA serial port, the console being hvc0. */
@@ -1905,6 +2024,11 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		argv[n++] = root;
 		argv[n++] = "-device";
 		argv[n++] = "virtio-blk-pci,drive=rootdisk,serial=root";
+	} else if (m->virtiofsd != NULL) {
+		argv[n++] = "-chardev";
+		argv[n++] = "socket,id=vfsroot,path=vfs-root.sock";
+		argv[n++] = "-device";
+		argv[n++] = "vhost-user-fs-pci,chardev=vfsroot,tag=root";
 	} else {
 		argv[n++] = "-fsdev";
 		argv[n++] = root;
@@ -1922,6 +2046,15 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 			         i, m->volume_readonly[i] ? ",readonly=on" : "");
 			snprintf(device[i], sizeof device[i], "virtio-blk-pci,drive=v%u,serial=v%u", i, i);
 			argv[n++] = "-drive";
+			argv[n++] = fsdev[i];
+			argv[n++] = "-device";
+			argv[n++] = device[i];
+			continue;
+		}
+		if (m->virtiofsd != NULL) {
+			snprintf(fsdev[i], sizeof fsdev[i], "socket,id=vfsv%u,path=vfs-v%u.sock", i, i);
+			snprintf(device[i], sizeof device[i], "vhost-user-fs-pci,chardev=vfsv%u,tag=v%u", i, i);
+			argv[n++] = "-chardev";
 			argv[n++] = fsdev[i];
 			argv[n++] = "-device";
 			argv[n++] = device[i];
@@ -2179,6 +2312,8 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 				_exit(126);
 			}
 		}
+		if (m->virtiofsd != NULL && !virtiofs_daemons(m))
+			_exit(126);
 		execvp(argv[0], (char *const *)argv);
 		fprintf(stderr, "qemu-system-x86_64: %s\n", strerror(errno));
 		_exit(127);
@@ -4667,6 +4802,10 @@ static const hull_cap_entry entries[] = {
 	{ "qemu.accel.auto",     HULL_SUP_NATIVE,  NULL, NULL },
 	/* The agent's channel: vsock where /dev/vhost-vsock is open to the
 	 * user, else a virtio-serial port behind a unix socket. */
+	{ "qemu.share",            HULL_SUP_NATIVE, NULL, NULL },
+	{ "qemu.share.auto",       HULL_SUP_NATIVE, "9p, until the holder says otherwise", NULL },
+	{ "qemu.share.9p",         HULL_SUP_NATIVE, NULL, NULL },
+	{ "qemu.share.virtiofs",   HULL_SUP_NATIVE, "needs virtiofsd installed", NULL },
 	{ "qemu.transport.auto",   HULL_SUP_NATIVE, NULL, NULL },
 	{ "qemu.transport.vsock",  HULL_SUP_NATIVE, "needs /dev/vhost-vsock open to the user", NULL },
 	{ "qemu.transport.serial", HULL_SUP_NATIVE, "a virtio-serial port, its socket in the "
