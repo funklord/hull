@@ -3431,6 +3431,24 @@ printf '(machine (source "pack:./rootfs.hull") (backend chroot) (command "/probe
 from_root 0 '^from a pack$' -f "$root/frompack.conf"
 expect 0 '^pack/[0-9a-f]{32} ' "$hull" images
 rm -f "$root/rootfs.hull"
+# policy.conf (section 4.5): the engine a class means on this host, the
+# spec's class unchanged; and a file that cannot be meant stops the command
+# rather than leaving the machine on an engine nobody chose.
+mkdir -p "$root/home/.config/hull"
+printf '(machine (source "dir:./rootfs") (backend vm) (command "/probe"))\n' > "$root/polvm.conf"
+expect 0 'machine on qemu \(vm\)|^qemu' "$hull" plan --explain -f "$root/polvm.conf"
+printf '(policy (default (vm virtualbox)))\n' > "$root/home/.config/hull/policy.conf"
+expect 1 'machine on virtualbox \(vm\)' "$hull" plan --explain -f "$root/polvm.conf"
+refute 'machine on qemu' "$hull" plan --explain -f "$root/polvm.conf"
+printf '(policy (default (vm docker)))\n' > "$root/home/.config/hull/policy.conf"
+expect 2 'docker is no engine of class vm' "$hull" plan -f "$root/polvm.conf"
+printf '(policy (default (vm nosuch)))\n' > "$root/home/.config/hull/policy.conf"
+expect 2 'nosuch is no engine of class vm' "$hull" plan -f "$root/polvm.conf"
+printf '(policy (sign (registry "x")))\n' > "$root/home/.config/hull/policy.conf"
+expect 2 'a policy holds \(default \(CLASS ENGINE\) ...\)' "$hull" plan -f "$root/polvm.conf"
+printf '(pools)\n' > "$root/home/.config/hull/policy.conf"
+expect 2 'not a \(policy ...\)' "$hull" plan -f "$root/polvm.conf"
+rm -f "$root/home/.config/hull/policy.conf"
 # Pools (section 4.12): a pool of one slot, held by a machine that sleeps.
 # A run that does not wait is refused at once, 75; one that waits a second
 # says it waits, then is refused, 75; one that waits for ever says so and

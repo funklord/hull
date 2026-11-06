@@ -5091,6 +5091,84 @@ static int list_of(int pools, int json)
 	return 0;
 }
 
+/* ~/.config/hull/policy.conf (section 4.5), `(policy (default (CLASS
+ * ENGINE) ...))`: the engine a class means on this host, so that a host
+ * with no KVM can have (backend vm) be VirtualBox. The class stays the
+ * spec's; which engine serves it is the host's. No file is no policy. A
+ * file that cannot be meant stops the command, as a machine run on the
+ * wrong engine is worse than one not run. 0, or -1 said on stderr. */
+static int apply_policy(hull_registry *registry)
+{
+	const char     *config = getenv("XDG_CONFIG_HOME");
+	const char     *home   = getenv("HOME");
+	char            path[4200];
+	uint8_t         text[16384];
+	size_t          length;
+	hull_sexpr_doc  doc;
+	hull_sexpr_form top;
+	hull_sexpr_form head;
+	hull_sexpr_form item;
+	FILE           *file;
+
+	if (config != NULL && config[0] == '/')
+		snprintf(path, sizeof path, "%s/hull/policy.conf", config);
+	else if (home != NULL)
+		snprintf(path, sizeof path, "%s/.config/hull/policy.conf", home);
+	else
+		return 0;
+	if ((file = fopen(path, "re")) == NULL)
+		return 0;
+	length = fread(text, 1u, sizeof text, file);
+	fclose(file);
+	if (hull_sexpr_open(&doc, text, length, HULL_SEXPR_READABLE, NULL) != HULL_SEXPR_OK ||
+	    !hull_sexpr_first(&doc, &top) || top.kind != HULL_SEXPR_LIST ||
+	    !hull_sexpr_child(&doc, &top, &head) || !hull_sexpr_is(&doc, &head, "policy")) {
+		fprintf(stderr, "hull: %s: not a (policy ...)\n", path);
+		return -1;
+	}
+	item = head;
+	while (hull_sexpr_next(&doc, &item, &item)) {
+		hull_sexpr_form key;
+		hull_sexpr_form entry;
+
+		if (item.kind != HULL_SEXPR_LIST || !hull_sexpr_child(&doc, &item, &key) ||
+		    !hull_sexpr_is(&doc, &key, "default")) {
+			fprintf(stderr, "hull: %s: a policy holds (default (CLASS ENGINE) ...)\n", path);
+			return -1;
+		}
+		entry = key;
+		while (hull_sexpr_next(&doc, &entry, &entry)) {
+			hull_sexpr_form class_form;
+			hull_sexpr_form engine_form;
+			char            class_name[32] = "";
+			char            engine_name[32] = "";
+			size_t          n = 0u;
+
+			if (entry.kind != HULL_SEXPR_LIST || !hull_sexpr_child(&doc, &entry, &class_form) ||
+			    !hull_sexpr_next(&doc, &class_form, &engine_form) ||
+			    hull_sexpr_value(&doc, &class_form, (uint8_t *)class_name,
+			                     sizeof class_name - 1u, &n) != HULL_SEXPR_OK) {
+				fprintf(stderr, "hull: %s: a default is (CLASS ENGINE)\n", path);
+				return -1;
+			}
+			class_name[n] = '\0';
+			n = 0u;
+			if (hull_sexpr_value(&doc, &engine_form, (uint8_t *)engine_name,
+			                     sizeof engine_name - 1u, &n) != HULL_SEXPR_OK) {
+				fprintf(stderr, "hull: %s: a default is (CLASS ENGINE)\n", path);
+				return -1;
+			}
+			engine_name[n] = '\0';
+			if (hull_registry_set_default(registry, class_name, engine_name) != HULL_REGISTRY_OK) {
+				fprintf(stderr, "hull: %s: %s is no engine of class %s\n", path, engine_name,
+				        class_name);
+				return -1;
+			}
+		}
+	}
+	return 0;
+}
+
 /* `hull pool ls POOL`: each entry in the order it fills, one line a
  * record, its columns fixed, a header first; "-" for no holder. */
 static int pool_members(const char *pool, int json)
@@ -7722,6 +7800,8 @@ int main(int argc, char **argv)
 		fprintf(stderr, "hull: a built-in engine is refused: %s\n", reason);
 		return 2;
 	}
+	if (apply_policy(&registry) != 0)
+		return 2;
 
 	if (strcmp(command, "engines") == 0 && argc == 2) {
 		list_engines(&registry);

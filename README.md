@@ -599,6 +599,15 @@ pool's `(capacity N)` and its slots, a hw machine on its boards.
   machine in a pool of only boards, or a hw machine in a pool with none.
 - A request waiting for one named entry holds up nothing else in the pool.
 
+## policy.conf — which engine a class means here
+
+`(backend vm)` says what a machine is. Which engine serves it is the host's, in
+`~/.config/hull/policy.conf`, so a host with no KVM needs no spec edited:
+
+```scheme
+(policy (default (vm virtualbox)))
+```
+
 ## Designed, not written
 
 - **crun**, ns: crun under user namespaces, with idmapped mounts for

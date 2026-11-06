@@ -1884,6 +1884,14 @@ CHECK
 			printf '%s\n' "$out" | grep -q '^status=0$' ||
 			fail "a stored tree with (verity true) on (kernel $kernel) did not read as committed" "$out"
 	done
+	# And on emu: the same engine and agent, under TCG.
+	sed 's/(backend vm)/(backend emu)/; s/(tuning (vm (kernel KERNEL)))//' "$root/cfsverity.in" > "$root/cfsverity.conf"
+	out=$(cd / && XDG_DATA_HOME="$root/cfs/store" timeout 240 "$hull" run -f "$root/cfsverity.conf" 2>&1)
+	cases=$((cases + 1))
+	printf '%s\n' "$out" | grep -q '^overlay / overlay .*verity=require' &&
+		printf '%s\n' "$out" | grep -q '^VERITYMARK guarded$' &&
+		printf '%s\n' "$out" | grep -q '^status=0$' ||
+		fail "a stored tree with (verity true) on emu did not read as committed" "$out"
 	disk=$(ls "$root/cfs/store/hull/store/mounts/"*.objects.ext4 2>/dev/null)
 	cases=$((cases + 1))
 	if [ -z "$disk" ] || ! python3 -I -c '
