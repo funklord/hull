@@ -462,6 +462,7 @@ and installing from a disc then booting the disk is one changed line.
 | Boots | `media:cdrom`, `media:disk`, `media:floppy`, or `image:./old.vmdk` attached as it came |
 | Media | an `image:` file (raw, qcow2, vmdk, vhd, vhdx, vdi), or a `dir:` collection of `hull media import`, reassembled and its hash checked |
 | Writes | thrown away with the machine by default; `(mutable direct)` writes the image |
+| Disk sets | `hull media change ID floppy next.img` swaps a floppy or CD while it runs; no image takes it out |
 | Output | its first serial port is `hull run`'s output; powering off is exit 0 |
 | Console | `hull exec -t ID -- console` joins your terminal to that port, nothing installed in the guest |
 | SSH | `(ssh true)`: `ssh name.hull` reaches that console through the host's own OpenSSH, its host key as on any backend; a terminal only. A port forwarded to the guest's own sshd goes first, whole |

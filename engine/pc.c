@@ -32,6 +32,10 @@
  * no natural sshd the door is refused, saying so, the holder's rule being
  * that a connector is made only for a host that could not have one.
  *
+ * `hull media change` swaps a floppy or CD under a running machine by
+ * qemu's QMP, on a socket qemu inherits: a set of disks is how much of
+ * what this class runs was shipped.
+ *
  * The guest powering off is the machine's end, status 0, and a stop
  * pulls the plug by SIGTERM, there being no agent to ask and no telling
  * whether a 1990s system answers ACPI.
@@ -64,7 +68,7 @@
 #include "usage.h"
 
 #define PC_MAX_MEDIA 6u    /* four on IDE, two floppy drives */
-#define PC_MAX_ARGS  72u
+#define PC_MAX_ARGS  80u
 #define PC_MAX_SEGMENTS 4u
 #define PC_MAX_PORTS 32u
 
@@ -119,6 +123,10 @@ struct hull_machine {
 	int             out;            /* the first serial port */
 	int             err;            /* qemu's stderr */
 	int             input;          /* COM1's input: qemu's stdin, a socket */
+	int             monitor;        /* qemu's QMP, a socket, or -1 before it starts */
+	int             monitor_peer;   /* its other end, for qemu to take */
+	int             monitor_ready;  /* the greeting read and capabilities said */
+	pthread_mutex_t monitor_lock;
 	hull_stream    *console;        /* the one joined to COM1, or NULL */
 	char           *ssh_dir;        /* (ssh true): the core's material, door.conf beside it */
 	char            sshd[64];       /* and the host's sshd */
@@ -175,6 +183,9 @@ static void release(hull_machine *m)
 		close(m->err);
 	if (m->input >= 0)
 		close(m->input);
+	if (m->monitor >= 0)
+		close(m->monitor);
+	pthread_mutex_destroy(&m->monitor_lock);
 	pthread_mutex_destroy(&m->lock);
 	pthread_cond_destroy(&m->done_cond);
 	free(m);
@@ -590,9 +601,12 @@ static void exec_qemu(const hull_machine *m)
 	char     machine[128];
 	char     smp[64];
 	char     vnc[48];
+	char     monitor[48];
+	int      monitor_fd;
 	unsigned n = 0u;
 	unsigned ide = 0u;
 	unsigned floppy = 0u;
+	unsigned cdrom = 0u;
 	char     boot[16];
 	const char *accel = m->accel != NULL ? m->accel : "auto";
 
@@ -608,6 +622,15 @@ static void exec_qemu(const hull_machine *m)
 	argv[n++] = machine;
 	argv[n++] = "-serial";
 	argv[n++] = "stdio";
+	/* The monitor, for changing a medium: a descriptor, so no path to
+	 * clean up and nothing a second client could reach. */
+	if ((monitor_fd = fcntl(m->monitor_peer, F_DUPFD, 3)) < 0)
+		return;
+	snprintf(monitor, sizeof monitor, "socket,id=monitor,fd=%d", monitor_fd);
+	argv[n++] = "-chardev";
+	argv[n++] = monitor;
+	argv[n++] = "-mon";
+	argv[n++] = "chardev=monitor,mode=control";
 	argv[n++] = "-vga";
 	argv[n++] = m->vga != NULL ? m->vga : "std";
 	/* VNC's display 0 is port 5900, at the machine's own address. */
@@ -712,11 +735,20 @@ static void exec_qemu(const hull_machine *m)
 			return;
 		{
 			size_t length = strlen(drive);
-			char  *indexed = malloc(length + 16u);
+			char  *indexed = malloc(length + 40u);
 
 			if (indexed == NULL)
 				return;
-			sprintf(indexed, "%s,index=%u", drive, d->type == 'f' ? floppy++ : ide++);
+			/* What change_medium() calls it, for a removable one. */
+			if (d->type == 'f')
+				sprintf(indexed, "%s,index=%u,id=floppy%u", drive, floppy, floppy);
+			else if (d->type == 'c')
+				sprintf(indexed, "%s,index=%u,id=cdrom%u", drive, ide, cdrom);
+			else
+				sprintf(indexed, "%s,index=%u", drive, ide);
+			floppy += d->type == 'f';
+			cdrom += d->type == 'c';
+			ide += d->type != 'f';
 			argv[n++] = "-drive";
 			argv[n++] = indexed;
 		}
@@ -814,6 +846,7 @@ static int launch(hull_machine *m)
 	int   out[2];
 	int   err[2];
 	int   in[2];
+	int   monitor[2];
 	pid_t parent = getpid();
 	pid_t child;
 
@@ -821,10 +854,15 @@ static int launch(hull_machine *m)
 		snprintf(m->why, sizeof m->why, "a socket for the machine could not be made\n");
 		return -1;
 	}
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, monitor) != 0) {
+		snprintf(m->why, sizeof m->why, "a socket for the machine could not be made\n");
+		return -1;
+	}
 	if (pipe2(out, O_CLOEXEC) != 0 || pipe2(err, O_CLOEXEC) != 0) {
 		snprintf(m->why, sizeof m->why, "a pipe for the machine could not be made\n");
 		return -1;
 	}
+	m->monitor_peer = monitor[1];
 	child = fork();
 	if (child < 0) {
 		snprintf(m->why, sizeof m->why, "qemu could not be started\n");
@@ -845,6 +883,7 @@ static int launch(hull_machine *m)
 	close(in[1]);
 	close(out[1]);
 	close(err[1]);
+	close(monitor[1]);
 	for (unsigned i = 0u; i < m->segment_count; i++) {
 		close(m->segment_fd[i]);
 		m->segment_fd[i] = -1;
@@ -852,6 +891,7 @@ static int launch(hull_machine *m)
 	pthread_mutex_lock(&m->lock);
 	m->pid   = child;
 	m->input = in[0];
+	m->monitor = monitor[0];
 	m->out   = out[0];
 	m->err   = err[0];
 	pthread_mutex_unlock(&m->lock);
@@ -902,7 +942,9 @@ static hull_status pc_create(hull_core *core, hull_buf plan, hull_machine **out,
 	m->out  = -1;
 	m->err  = -1;
 	m->input = -1;
+	m->monitor = -1;
 	pthread_mutex_init(&m->lock, NULL);
+	pthread_mutex_init(&m->monitor_lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
 	if ((reason = read_plan(m, &doc, &machine)) == NULL && m->cache[0] == '\0' && !m->direct)
 		reason = make_cache(m);
@@ -1014,6 +1056,149 @@ static hull_status pc_signal(hull_core *core, hull_machine *m, hull_stream *stre
 	return HULL_OK;
 }
 
+/* One line of QMP's answer read into `why`: 1 for a return, 0 for an error
+ * whose words are in `why`, -1 for no answer within the time. Events and the
+ * greeting pass by, an answer being the only line opening with these. */
+static int monitor_answer(hull_machine *m, char *why, size_t cap)
+{
+	char   line[2048];
+	size_t have = 0u;
+	long   left = 5000;
+
+	while (left > 0) {
+		struct pollfd   p = { .fd = m->monitor, .events = POLLIN };
+		struct timespec before;
+		struct timespec after;
+		char           *end;
+		ssize_t         n;
+		int             ready;
+
+		clock_gettime(CLOCK_MONOTONIC, &before);
+		ready = poll(&p, 1u, (int)left);
+		clock_gettime(CLOCK_MONOTONIC, &after);
+		left -= (after.tv_sec - before.tv_sec) * 1000L + (after.tv_nsec - before.tv_nsec) / 1000000L;
+		if (ready < 0 && errno == EINTR)
+			continue;
+		if (ready <= 0)
+			break;
+		n = read(m->monitor, line + have, sizeof line - 1u - have);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;
+		have += (size_t)n;
+		line[have] = '\0';
+		while ((end = strchr(line, '\n')) != NULL) {
+			const char *desc;
+
+			*end = '\0';
+			if (strncmp(line, "{\"return\"", 9u) == 0)
+				return 1;
+			if (strncmp(line, "{\"error\"", 8u) == 0) {
+				desc = strstr(line, "\"desc\": \"");
+				snprintf(why, cap, "%.*s", desc != NULL ? (int)strcspn(desc + 9, "\"") : 0,
+				         desc != NULL ? desc + 9 : "");
+				return 0;
+			}
+			have -= (size_t)(end + 1 - line);
+			memmove(line, end + 1, have + 1u);
+		}
+		if (have == sizeof line - 1u)
+			have = 0u;   /* a line longer than any answer: an event's */
+	}
+	snprintf(why, cap, "qemu's monitor did not answer");
+	return -1;
+}
+
+/* A command said to QMP: NULL, or why it failed. */
+static const char *monitor_say(hull_machine *m, const char *command, char *why, size_t cap)
+{
+	static const char capabilities[] = "{\"execute\":\"qmp_capabilities\"}\n";
+
+	if (!m->monitor_ready) {
+		if (send(m->monitor, capabilities, sizeof capabilities - 1u, MSG_NOSIGNAL) < 0 ||
+		    monitor_answer(m, why, cap) != 1)
+			return "qemu's monitor did not answer";
+		m->monitor_ready = 1;
+	}
+	if (send(m->monitor, command, strlen(command), MSG_NOSIGNAL) < 0)
+		return "the machine is not running";
+	return monitor_answer(m, why, cap) == 1 ? NULL : why;
+}
+
+/* The medium of a removable drive changed, or with no `path` taken out: the
+ * swap a floppy set or a second CD asks for. `drive` is its type, then its
+ * number from the second on, `floppy`, `floppy2`, `cdrom`. Lasts as long as
+ * the machine: what boots next is what the file says. Under (mutable overlay)
+ * a floppy goes in write-protected, qemu's snapshot being taken only as it
+ * starts, so what overlay promises, the file unchanged, holds. */
+static hull_status change_medium(hull_machine *m, const char *drive, const char *path,
+                                 hull_error *error)
+{
+	char        command[8192];
+	char        escaped[4200];
+	char        why[512] = "";
+	char        id[16];
+	const char *wrong;
+	int         cdrom = strncmp(drive, "cdrom", 5u) == 0;
+	const char *rest = drive + (cdrom ? 5 : 6);
+	unsigned    wanted = 1u;
+	unsigned    seen = 0u;
+	size_t      at = 0u;
+	medium      probe = { .path = (char *)path };
+
+	if (!cdrom && strncmp(drive, "floppy", 6u) != 0)
+		return fail(error, HULL_ERR_RUNTIME, "a drive whose medium changes is a floppy or a cdrom");
+	if (*rest != '\0' && (rest[0] < '2' || rest[0] > '9' || rest[1] != '\0'))
+		return fail(error, HULL_ERR_RUNTIME, "a drive is `floppy` or `cdrom`, then 2 and on for "
+		            "the next of that type");
+	if (*rest != '\0')
+		wanted = (unsigned)(rest[0] - '0');
+	for (unsigned i = 0u; i < m->media_count; i++)
+		seen += m->media[i].type == (cdrom ? 'c' : 'f');
+	if (wanted > seen)
+		return fail(error, HULL_ERR_RUNTIME, "this machine has no such drive: a medium of that "
+		            "type in (media ...) is what gives it one");
+	snprintf(id, sizeof id, "%s%u", cdrom ? "cdrom" : "floppy", wanted - 1u);
+	if (path == NULL) {
+		snprintf(command, sizeof command, "{\"execute\":\"eject\",\"arguments\":"
+		         "{\"device\":\"%s\",\"force\":true}}\n", id);
+	} else {
+		if (path[0] != '/')
+			return fail(error, HULL_ERR_RUNTIME, "a medium's path is absolute by here");
+		for (const char *c = path; *c != '\0'; c++) {
+			if (at + 3u > sizeof escaped)
+				return fail(error, HULL_ERR_RUNTIME, "the medium's path is too long");
+			if ((unsigned char)*c < 0x20u)
+				return fail(error, HULL_ERR_RUNTIME, "the medium's path holds a control character");
+			if (*c == '"' || *c == '\\')
+				escaped[at++] = '\\';
+			escaped[at++] = *c;
+		}
+		escaped[at] = '\0';
+		read_format(&probe);
+		snprintf(command, sizeof command, "{\"execute\":\"blockdev-change-medium\",\"arguments\":"
+		         "{\"device\":\"%s\",\"filename\":\"%s\",\"format\":\"%s\","
+		         "\"read-only-mode\":\"%s\",\"force\":true}}\n", id, escaped, probe.format,
+		         cdrom || !m->direct ? "read-only" : "read-write");
+	}
+	pthread_mutex_lock(&m->lock);
+	if (m->done || m->monitor < 0 || m->paused) {
+		int gone = m->done;
+		int paused = m->paused;
+
+		pthread_mutex_unlock(&m->lock);
+		return gone ? fail(error, HULL_ERR_GONE, "the machine is not running") :
+		       fail(error, HULL_ERR_BUSY, paused ? "the machine is paused" :
+		            "the machine's media are still being made");
+	}
+	pthread_mutex_unlock(&m->lock);
+	pthread_mutex_lock(&m->monitor_lock);
+	wrong = monitor_say(m, command, why, sizeof why);
+	pthread_mutex_unlock(&m->monitor_lock);
+	return wrong != NULL ? fail(error, HULL_ERR_RUNTIME, wrong) : HULL_OK;
+}
+
 /* The console's thread: the pipe, to its end, then the stream's end. */
 static void *deliver_console(void *arg)
 {
@@ -1028,6 +1213,37 @@ static void *deliver_console(void *arg)
 	return NULL;
 }
 
+static void *deliver_socket(void *arg);
+
+/* A stream with nothing to say: a socket whose far end has gone, so it ends
+ * at once, status 0, by a dial's own path. */
+static hull_status finished_stream(hull_core *core, hull_machine *m, hull_stream **out,
+                                   hull_error *error)
+{
+	hull_stream *st = calloc(1u, sizeof *st);
+	int          ends[2];
+
+	if (st == NULL)
+		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, ends) != 0) {
+		free(st);
+		return fail(error, HULL_ERR_RUNTIME, "a socket for the answer could not be made");
+	}
+	close(ends[1]);
+	st->machine = m;
+	st->core    = core;
+	st->from    = -1;
+	st->to      = -1;
+	st->socket  = ends[0];
+	if (pthread_create(&st->thread, NULL, deliver_socket, st) != 0) {
+		close(ends[0]);
+		free(st);
+		return fail(error, HULL_ERR_INTERNAL, "the answer's thread could not start");
+	}
+	*out = st;
+	return HULL_OK;
+}
+
 static hull_status pc_exec(hull_core *core, hull_machine *m, hull_buf spec, hull_stream **out,
                            hull_error *error)
 {
@@ -1036,18 +1252,28 @@ static hull_status pc_exec(hull_core *core, hull_machine *m, hull_buf spec, hull
 	hull_sexpr_form argv;
 	hull_sexpr_form word;
 	hull_stream    *st;
-	char           *first = NULL;
+	char           *words[3] = { NULL, NULL, NULL };
+	unsigned        count = 0u;
 	int             ends[2];
 	int             asked;
 
 	if (hull_sexpr_open(&doc, spec.data, spec.len, HULL_SEXPR_CANONICAL, NULL) == HULL_SEXPR_OK &&
 	    hull_sexpr_first(&doc, &message) && hull_access_find(&doc, &message, "argv", &argv)) {
 		hull_sexpr_child(&doc, &argv, &word);
-		if (hull_sexpr_next(&doc, &word, &word))
-			first = hull_access_text(&doc, &word);
+		while (count < 3u && hull_sexpr_next(&doc, &word, &word))
+			words[count++] = hull_access_text(&doc, &word);
 	}
-	asked = first != NULL && strcmp(first, "console") == 0;
-	free(first);
+	/* `hull media change`, which asks and is done. */
+	if (words[0] != NULL && strcmp(words[0], "change") == 0 && words[1] != NULL) {
+		hull_status changed = change_medium(m, words[1], words[2], error);
+
+		for (unsigned i = 0u; i < count; i++)
+			free(words[i]);
+		return changed == HULL_OK ? finished_stream(core, m, out, error) : changed;
+	}
+	asked = words[0] != NULL && strcmp(words[0], "console") == 0;
+	for (unsigned i = 0u; i < count; i++)
+		free(words[i]);
 	if (!asked)
 		return fail(error, HULL_ERR_UNSUPPORTED, "nothing of hull's runs in a pc machine to run a "
 		            "command: `console` is its serial port, the one thing there is");

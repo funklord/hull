@@ -154,6 +154,7 @@ static void usage(FILE *out)
 	      "       hull import [--build-arg N=V]... [--target STAGE] DOCKERFILE\n"
 	      "       hull import COMPOSE-FILE | hull import IMAGE DIR\n"
 	      "       hull media import IMAGE DIR | verify DIR | export DIR IMAGE\n"
+	      "       hull media change ID DRIVE [IMAGE]\n"
 	      "       hull vagrant box add NAME FILE\n"
 	      "       hull up [-f COMPOSE-FILE] [--backend B] [--profile P]... [NAME]\n"
 	      "       hull core\n"
@@ -5216,6 +5217,41 @@ done:
 	return status != 0;
 }
 
+/* `hull media change ID DRIVE [IMAGE]`: a running pc machine's floppy or CD
+ * swapped, or with no image taken out, for a set of disks. It goes by exec,
+ * the engine's own word as `console` is, so it is asked of a pc machine alone:
+ * anything else would run it as a program. A collection is not taken, being
+ * reassembled as a machine starts: `hull media export` makes it an image. */
+static int media_change(const char *id, const char *drive, const char *image)
+{
+	char        arch[32];
+	char        path[PATH_MAX];
+	struct stat st;
+	char       *words[3] = { "change", (char *)drive, path };
+
+	if (list_machines(id, arch, sizeof arch) != 0) {
+		fprintf(stderr, "hull: media change: no machine %s\n", id);
+		return 125;
+	}
+	if (strcmp(listed_engine, "qemu-pc") != 0) {
+		fprintf(stderr, "hull: media change: %s is on %s; a pc machine's drives are what change\n",
+		        id, listed_engine);
+		return 125;
+	}
+	if (image == NULL)
+		return exec_in(id, words, 2, 0, 0u);
+	if (realpath(image, path) == NULL || stat(path, &st) != 0) {
+		fprintf(stderr, "hull: media change: %s: %s\n", image, strerror(errno));
+		return 125;
+	}
+	if (!S_ISREG(st.st_mode)) {
+		fprintf(stderr, "hull: media change: %s is not an image file; `hull media export` makes "
+		        "one of a collection\n", image);
+		return 125;
+	}
+	return exec_in(id, words, 3, 0, 0u);
+}
+
 /* `hull media verify DIR`: reassembled and held to the hash of what was
  * imported. */
 static int media_verify(const char *dir)
@@ -7241,6 +7277,8 @@ int main(int argc, char **argv)
 		return compile_manifest(argc == 4 ? argv[3] : NULL);
 	if (strcmp(command, "media") == 0 && argc == 4 && strcmp(argv[2], "verify") == 0)
 		return media_verify(argv[3]);
+	if (strcmp(command, "media") == 0 && (argc == 5 || argc == 6) && strcmp(argv[2], "change") == 0)
+		return media_change(argv[3], argv[4], argc == 6 ? argv[5] : NULL);
 	if (strcmp(command, "media") == 0 && argc == 5 && strcmp(argv[2], "export") == 0)
 		return media_export(argv[3], argv[4]);
 	if ((strcmp(command, "media") == 0 && argc == 5 && strcmp(argv[2], "import") == 0) ||

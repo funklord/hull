@@ -303,6 +303,39 @@ else
 	printf 'pc: no Xvfb, the window not tried\n'
 fi
 
+# --- a medium changed under a running machine --------------------------------
+
+# A sector that spins, so the machine is there to be asked.
+truncate -s 1440K "$root/swap.img"
+dd if="$root/spin.bin" of="$root/swap.img" conv=notrunc status=none
+printf '\125\252' | dd of="$root/swap.img" bs=1 seek=510 conv=notrunc status=none
+conf '(source "media:floppy") (media (medium (type floppy) (source "image:./swap.img")))'
+timeout 40 "$hull" run -f "$root/hull.conf" > "$root/swap.out" 2>&1 &
+pid=$!
+sleep 2
+id=$("$hull" ps | awk '$5 == "running" { print $1 }')
+out=$(timeout 10 "$hull" media change "$id" cdrom "$root/swap.img" 2>&1)
+status 'a drive the machine lacks is refused' "$?" 125 "$out"
+says 'and said to be lacking' "$out" 'no such drive'
+out=$(timeout 10 "$hull" media change "$id" disk "$root/swap.img" 2>&1)
+status 'a fixed disk is refused' "$?" 125 "$out"
+says 'being no removable drive' "$out" 'floppy or a cdrom'
+out=$(timeout 10 "$hull" media change "$id" floppy2 "$root/swap.img" 2>&1)
+status 'a second drive not there is refused' "$?" 125 "$out"
+out=$(timeout 10 "$hull" media change "$id" floppy "$root/gone.img" 2>&1)
+status 'an image not there is refused' "$?" 125 "$out"
+out=$(timeout 10 "$hull" media change "$id" floppy "$root" 2>&1)
+status 'a directory is refused' "$?" 125 "$out"
+says 'and export named' "$out" 'hull media export'
+out=$(timeout 10 "$hull" media change "$id" floppy "$root/floppy.img" 2>&1)
+status 'a floppy changes' "$?" 0 "$out"
+out=$(timeout 10 "$hull" media change "$id" floppy 2>&1)
+status 'and comes out' "$?" 0 "$out"
+out=$(timeout 10 "$hull" media change nobody floppy 2>&1)
+status 'a machine not there is refused' "$?" 125 "$out"
+timeout 30 "$hull" stop "$id" > /dev/null 2>&1
+wait "$pid"
+
 # --- its screen by VNC, at its address, with no X -----------------------------
 
 conf '(source "media:disk") (display vnc)' \
