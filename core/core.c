@@ -1787,6 +1787,8 @@ static void keep_machine(slot *s)
 	hull_msg_text(&m, s->lease);
 	hull_msg_raw(&m, ")(6:member");
 	hull_msg_text(&m, s->member);
+	hull_msg_raw(&m, ")(10:broker_end");
+	hull_msg_number(&m, s->broker_end);
 	hull_msg_raw(&m, ")(12:broker_lease");
 	hull_msg_text(&m, s->broker_lease);
 	hull_msg_raw(&m, ")(4:cpus");
@@ -1904,6 +1906,9 @@ static int adopt_one(const char *id)
 			hull_msg_string(&doc, &held, s->member, sizeof s->member);
 		if (hull_msg_find(&doc, "broker_lease", &held))
 			hull_msg_string(&doc, &held, s->broker_lease, sizeof s->broker_lease);
+		/* Monotonic, which a core after this one on this boot reads alike. */
+		if (hull_msg_find(&doc, "broker_end", &held) && hull_msg_long(&doc, &held, &number))
+			s->broker_end = number;
 		if (hull_msg_find(&doc, "memory", &held) && hull_msg_long(&doc, &held, &number))
 			s->memory_mib = (unsigned)number;
 		if (hull_msg_find(&doc, "cpus", &held) && hull_msg_long(&doc, &held, &number))

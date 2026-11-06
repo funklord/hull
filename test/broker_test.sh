@@ -233,6 +233,29 @@ ending=$(run_as alice timeout 30 "$hull" reserve many --for 3s < /dev/null)
 conf ends '(backend chroot) (pool "many") (hostname "ends") (command "/probe" "say" "ready" "sleep" "25")'
 as alice 79 'its broker.s lease ended: its time ran out' run --lease "$ending" -f "$root/project/ends.conf"
 
+# And to one a core that died kept: its end is in what the next core reads.
+ending=$(run_as alice timeout 30 "$hull" reserve many --for 10s < /dev/null)
+conf keptend '(backend chroot) (pool "many") (hostname "keptend") (on_disconnect keep)' \
+	'(command "/probe" "say" "ready" "sleep" "60")'
+: > "$root/keptend.out"
+(run_as alice timeout -k 2 80 "$hull" run --lease "$ending" -f "$root/project/keptend.conf" > "$root/keptend.out" 2>&1 < /dev/null) &
+keptend=$!
+wait_ready "$root/keptend.out"
+kill -KILL "$(head -1 "$root/alice/run/hull/core.lock")" 2> /dev/null
+wait "$keptend" 2> /dev/null
+as alice 0 '^keptend .*running$' ps
+n=0
+until ! run_as alice timeout 20 "$hull" ps < /dev/null | grep -q '^keptend .*running$' || [ "$n" -ge 30 ]; do
+	n=$((n + 1))
+	sleep 1
+done
+not_running=$(run_as alice timeout 20 "$hull" ps < /dev/null | grep -c '^keptend .*running$')
+cases=$((cases + 1))
+[ "$not_running" = 0 ] || {
+	fail 'a kept machine ran past its broker lease' "$(run_as alice timeout 20 "$hull" ps 2>&1 < /dev/null)"
+	run_as alice timeout 10 "$hull" stop --timeout 1 keptend > /dev/null 2>&1
+}
+
 # --- a budget is the broker's, across users -----------------------------------
 
 conf nobudget '(backend chroot) (pool "budget") (hostname "nb") (command "/probe" "say" "no")'
