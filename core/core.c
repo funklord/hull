@@ -42,6 +42,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/random.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
@@ -76,7 +77,11 @@
 #define HULL_COMMIT "unknown"
 #endif
 
-#define MAX_CLIENTS      32u
+/* More than any line can fill: each request waiting in line is a client, and
+ * the word that frees what they wait for has to be able to get in. At 32,
+ * under MAX_WAITING's 64, a full line turned a holder's release away at the
+ * door, so nothing could ever come back. */
+#define MAX_CLIENTS      256u
 #define MAX_MACHINES     512u   /* the user's, every file's together */
 #define MAX_ATTACHED     16u
 #define MAX_STOPS        16u
@@ -99,6 +104,8 @@ typedef struct client {
 	char       holder[64];  /* a broker's: who it speaks for, the peer's account or its --as */
 	int        owner;       /* a broker's: the peer is the account it runs as */
 	int        spoke;       /* a broker's: it has said something, so is past identifying */
+	int        closing;     /* a broker's: gone once what it was told has been written */
+	long long  since;       /* a broker's: when it connected */
 
 	/* Framed messages not yet written; the socket does not block, and
 	 * poll() says when it takes more. */
@@ -2367,6 +2374,7 @@ static int root_of(const hull_sexpr_doc *doc, char *hash, size_t hash_cap, char 
 /* A run waiting for a slot of its pool, first come first served: its
  * request whole, its frontend's, and how long it waits. */
 #define MAX_WAITING 64u
+_Static_assert(MAX_WAITING * 2u <= MAX_CLIENTS, "a line must leave room for what ends it");
 #define NOTICE_MS   60000LL
 
 /* What a run or a lease asks of a pool: `count` entries, the `named` of
@@ -2403,6 +2411,8 @@ static int broker_mode;   /* this is `hull broker`: no machines, its leases for 
 #define BROKER_GRACE_S 120
 /* A grant nobody has said they heard goes back after this long. */
 #define BROKER_HOLD_MS 30000LL
+/* A connection that has said nothing by now is not a client. */
+#define BROKER_SILENT_MS 15000LL
 
 /* An entry of a pool by name, held by a lease. */
 typedef struct held_member {
@@ -2446,6 +2456,7 @@ static long long monotonic_ms(void);
 static void      handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body);
 static void      handle_lease_ask(client *c, uint32_t ch, const hull_sexpr_doc *body);
 static int       over_quota(const char *holder);
+static int       over_connections(client *c, uint32_t ch);
 
 /* Who holds the entry `name`: a lease, `*leased` set, or a machine, or
  * NULL for nobody. An entry is one thing by its name, so a board listed in
@@ -4777,6 +4788,27 @@ static int over_quota(const char *holder)
 	return leased >= MAX_LEASES / 4u || waits >= MAX_WAITING / 4u;
 }
 
+/* Whether `c` is one more connection than its holder may have: a quarter of
+ * the table, as of leases, so that one holder, or one stolen key, cannot take
+ * every way in. The broker's own account is who clears up, so is not held to
+ * it. Told, and gone. */
+static int over_connections(client *c, uint32_t ch)
+{
+	unsigned held = 0u;
+
+	if (c->owner)
+		return 0;
+	for (unsigned i = 0u; i < MAX_CLIENTS; i++)
+		held += clients[i].used && !clients[i].closing && clients[i].spoke &&
+		        strcmp(clients[i].holder, c->holder) == 0;
+	if (held <= MAX_CLIENTS / 4u)
+		return 0;
+	fprintf(stderr, "hull broker: %s has as many connections as one holder may\n", c->holder);
+	send_error(c, ch, "this holder has as many connections as one may");
+	c->closing = 1;
+	return 1;
+}
+
 /* Whether `c` may act on `l`: its holder, or the account the broker runs
  * as, who is who clears what a holder cannot come back for. */
 static int may_touch(const client *c, const lease *l)
@@ -4960,6 +4992,9 @@ static void end_leases_due(void)
 {
 	long long now = (long long)time(NULL);
 
+	for (unsigned i = 0u; broker_mode && i < MAX_CLIENTS; i++)
+		if (clients[i].used && !clients[i].spoke && monotonic_ms() - clients[i].since >= BROKER_SILENT_MS)
+			clients[i].dead = 1;
 	for (unsigned i = 0u; i < MAX_LEASES; i++) {
 		const lease *l = &leases[i];
 		int          claimed = l->unnamed_claimed > 0u;
@@ -5168,6 +5203,8 @@ static void name_peer(client *c, int fd)
 
 	c->holder[0] = '\0';
 	c->spoke     = 0;
+	c->closing   = 0;
+	c->since     = monotonic_ms();
 	c->owner     = 0;
 	if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &length) != 0) {
 		c->dead = 1;
@@ -5178,6 +5215,25 @@ static void name_peer(client *c, int fd)
 		snprintf(c->holder, sizeof c->holder, "%s", found->pw_name);
 	else
 		snprintf(c->holder, sizeof c->holder, "uid-%lu", (unsigned long)peer.uid);
+}
+
+/* How long the listener is left when no descriptor is to be had. */
+#define ACCEPT_PAUSE_MS 200LL
+static long long accept_after;
+
+/* 512 machines and 256 clients do not fit a session's usual soft limit of
+ * 1024, so a core takes what the hard limit allows, to a bound: what it
+ * starts inherits this, and some programs walk every descriptor up to it. */
+#define CORE_NOFILE 16384u
+static void raise_nofile(void)
+{
+	struct rlimit limit;
+
+	if (getrlimit(RLIMIT_NOFILE, &limit) != 0 || limit.rlim_cur >= CORE_NOFILE)
+		return;
+	limit.rlim_cur = limit.rlim_max == RLIM_INFINITY || limit.rlim_max > CORE_NOFILE ?
+	                 CORE_NOFILE : limit.rlim_max;
+	setrlimit(RLIMIT_NOFILE, &limit);
 }
 
 /* Set by a signal, or by a hello this core goes for: the loop's last. */
@@ -5199,6 +5255,8 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		send_error(c, 0u, "a message carries its channel");
 		return;
 	}
+	if (c->closing)
+		return;
 	/* A broker answers for pools alone, to more than its own user. */
 	if (broker_mode) {
 		static const char *const allowed[] = { "hello", "lease", "free", "leases", "pools",
@@ -5225,9 +5283,14 @@ static void handle(client *c, const hull_sexpr_doc *body)
 			snprintf(c->holder, sizeof c->holder, "%s", name);
 			c->owner = 0;
 			c->spoke = 1;
+			over_connections(c, (uint32_t)ch);
 			return;
 		}
-		c->spoke = 1;
+		if (!c->spoke) {
+			c->spoke = 1;
+			if (over_connections(c, (uint32_t)ch))
+				return;
+		}
 	}
 	if (hull_msg_is(body, "hello")) {
 		hull_msg m = { 0 };
@@ -5376,7 +5439,7 @@ static void flush_all(void)
 		if (clients[i].used)
 			flush(&clients[i]);
 	for (unsigned i = 0u; i < MAX_CLIENTS; i++)
-		if (clients[i].used && clients[i].dead) {
+		if (clients[i].used && (clients[i].dead || clients[i].closing)) {
 			unheld_back(&clients[i]);
 			disconnect(&clients[i]);
 		}
@@ -5669,6 +5732,7 @@ static int core_loop(const char *host_arch, const char *broker_dir)
 		fprintf(stderr, "hull core: %s: %s\n", path, strerror(errno));
 		return 1;
 	}
+	raise_nofile();
 	if (pipe2(wake, O_CLOEXEC | O_NONBLOCK) != 0)
 		return 1;
 	/* A broker's socket is its group's, as the directory it was given is:
@@ -5801,6 +5865,12 @@ static int core_loop(const char *host_arch, const char *broker_dir)
 		}
 		if (timeout < 0 || timeout > (int)PLACE_CHECK_MS)
 			timeout = (int)PLACE_CHECK_MS;
+		fds[0].events = POLLIN;
+		if (monotonic_ms() < accept_after) {
+			fds[0].events = 0;
+			if (timeout > (int)ACCEPT_PAUSE_MS)
+				timeout = (int)ACCEPT_PAUSE_MS;
+		}
 		if (poll(fds, n, timeout) < 0) {
 			if (errno == EINTR)
 				continue;
@@ -5818,6 +5888,10 @@ static int core_loop(const char *host_arch, const char *broker_dir)
 			 * stalls nothing: what it is sent waits in its queue. */
 			int fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
 
+			/* Out of descriptors the listener stays readable, and the loop
+			 * would spin on it: measured, a whole CPU. */
+			if (fd < 0 && (errno == EMFILE || errno == ENFILE))
+				accept_after = monotonic_ms() + ACCEPT_PAUSE_MS;
 			for (unsigned i = 0u; fd >= 0 && i < MAX_CLIENTS; i++) {
 				if (!clients[i].used) {
 					if (hull_wire_open(&clients[i].wire, fd, HULL_WIRE_FROM_CLIENT) == 0) {

@@ -459,7 +459,9 @@ grep -q 'no such lease is held' "$root/unheld.out" || fail 'one connection held 
 free_gpu 40
 # Silent on a wire that stays up, as one cut and not yet known to be is.
 cases=$((cases + 1))
-python3 -I "$root/unheld.py" "$broker" silent 45 > "$root/unheld.out" 2>&1 &
+# It outlives the hold by far: what ends it here must be the hold's own time,
+# and not its connection closing.
+python3 -I "$root/unheld.py" "$broker" silent 300 > "$root/unheld.out" 2>&1 &
 silent=$!
 sleep 1
 as bob 75 'gpu is held' reserve bench --member gpu --no-wait
@@ -486,6 +488,135 @@ broker_up
 as bob 0 '^gpu +slot +by-name +free +-$' pool ls bench
 kill "$silent" 2> /dev/null
 wait "$silent" 2> /dev/null
+
+# A full line leaves a way in: what frees an entry has to be able to say so,
+# and one holder has a share of the connections, as of the leases.
+cat > "$root/line.py" <<'PY'
+import os, socket, struct, sys, time
+def connect():
+	s = socket.socket(socket.AF_UNIX)
+	d = os.open(sys.argv[1], os.O_PATH)
+	s.connect("/proc/self/fd/%d/core.sock" % d)
+	os.close(d)
+	s.settimeout(10)
+	return s
+def send(s, m):
+	s.sendall(struct.pack(">I", len(m)) + m)
+def reply(s):
+	h = s.recv(4)
+	if len(h) < 4:
+		return b""
+	n = struct.unpack(">I", h)[0]
+	data = b""
+	while len(data) < n:
+		data += s.recv(n - len(data))
+	return data
+def who(name):
+	s = connect()
+	send(s, b"(8:identify(2:ch1:1)(2:as%d:%s))" % (len(name), name))
+	send(s, b"(5:hello(2:ch1:0)(5:proto1:1))")
+	return s, reply(s)
+ask = (b"(5:lease(2:ch1:1)(5:count1:1)(4:cpus1:0)(3:for1:0)(4:kind0:)(7:members3:gpu)"
+       b"(6:memory1:0)(3:run1:0)(4:pool5:bench)(4:wait3:600))")
+s, _ = who(b"first")
+send(s, ask)
+w = reply(s).split(b"(2:id14:")[1][:14]
+send(s, b"(4:hold(2:ch1:1)(2:id14:" + w + b"))")
+reply(s)
+s.close()
+line = []
+for i in range(64):
+	c, _ = who(b"job%d" % (i % 4))
+	send(c, ask)
+	line.append(c)
+	time.sleep(0.01)
+time.sleep(0.5)
+s, _ = who(b"first")
+send(s, b"(4:free(2:ch1:1)(2:id14:" + w + b"))")
+print("release:", reply(s)[:7])
+told = reply(line[0])
+while told.startswith(b"(4:data"):
+	told = reply(line[0])
+print("next:", told[:7])
+for c in line:
+	c.close()
+held = []
+for i in range(80):
+	c, r = who(b"greedy")
+	if b"hello" not in r:
+		print("refused at", i, r[:90])
+		break
+	held.append(c)
+s, r = who(b"other")
+print("other:", r[:7], "held", len(held))
+quiet = connect()
+quiet.settimeout(25)
+at = time.time()
+print("silent closed:", quiet.recv(10) == b"", round(time.time() - at))
+PY
+cases=$((cases + 1))
+timeout 60 python3 -I "$root/line.py" "$broker" > "$root/line.out" 2>&1
+grep -q "release: b'.*(4:done" "$root/line.out" && grep -q "next: b'.*(5:lea" "$root/line.out" ||
+	fail 'a full line kept out what ends it' "$(cat "$root/line.out")"
+cases=$((cases + 1))
+grep -q 'refused at 64 .*as many connections' "$root/line.out" && grep -q "other: b'.*(5:hel.* held 64" "$root/line.out" ||
+	fail 'one holder took more than its share of the connections' "$(cat "$root/line.out")"
+cases=$((cases + 1))
+grep -Eq 'silent closed: True 1[3-7]$' "$root/line.out" || fail 'a silent connection stayed' "$(cat "$root/line.out")"
+run_as admin timeout 20 "$hull" lease ls < /dev/null 2> /dev/null | awk '/^lease-/ { print $1 }' > "$root/line.left"
+while read -r id; do
+	run_as admin timeout 20 "$hull" release "$id" > /dev/null 2>&1 < /dev/null
+done < "$root/line.left"
+
+# Out of descriptors, a broker waits; it does not spin. And a core takes what
+# its hard limit gives it, where a session's soft limit would be too few.
+mkdir -p "$root/fds"
+chmod 750 "$root/fds"
+printf '(pools (many (capacity 8)))\n' > "$root/fds/pools.conf"
+chmod 640 "$root/fds/pools.conf"
+python3 -I - "$hull" "$root/fds" <<'PY' > "$root/fds.out" 2>&1
+import os, socket, subprocess, sys, time
+hull, d = sys.argv[1], sys.argv[2]
+env = dict(os.environ, XDG_RUNTIME_DIR=d, HOME=d)
+def start(limit):
+	b = subprocess.Popen(["sh", "-c", limit + '; exec "$0" broker "$1"', hull, d], env=env,
+	                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+	for _ in range(100):
+		if os.path.exists(d + "/core.sock"):
+			break
+		time.sleep(0.1)
+	return b
+def stop(b):
+	b.terminate()
+	b.wait(10)
+b = start("ulimit -n 20")
+held = []
+for i in range(25):
+	s = socket.socket(socket.AF_UNIX)
+	a = os.open(d, os.O_PATH)
+	s.connect("/proc/self/fd/%d/core.sock" % a)
+	os.close(a)
+	held.append(s)
+	time.sleep(0.02)
+ticks = lambda: sum(int(x) for x in open("/proc/%d/stat" % b.pid).read().rsplit(")", 1)[1].split()[11:13])
+at = ticks()
+time.sleep(3)
+print("ticks", ticks() - at)
+stop(b)
+for s in held:
+	s.close()
+b = start("ulimit -Sn 30")
+for line in open("/proc/%d/limits" % b.pid):
+	if line.startswith("Max open files"):
+		print("soft", line.split()[3])
+stop(b)
+PY
+cases=$((cases + 1))
+ticks=$(sed -n 's/^ticks //p' "$root/fds.out")
+[ -n "$ticks" ] && [ "$ticks" -lt 60 ] || fail 'a broker with no descriptors left spun' "$(cat "$root/fds.out")"
+cases=$((cases + 1))
+soft=$(sed -n 's/^soft //p' "$root/fds.out")
+[ -n "$soft" ] && [ "$soft" -gt 30 ] || fail 'a core kept a soft limit too low for its tables' "$(cat "$root/fds.out")"
 
 # A broker that lies: what it answers goes into a file and a plan here, so a
 # name that is no name is refused, and the machine does not run.
@@ -561,7 +692,7 @@ user() { # UID GROUPS COMMAND...
 	mkdir -p "$a/$u/run"
 	chown -R "$u:$u" "$a/$u"
 	chmod 700 "$a/$u/run"
-	setpriv --reuid "$u" --regid "$u" --groups "$g" env -i PATH="$PATH" HOME="$a/$u" \
+	setpriv --reuid "$u" --regid "$u" --groups "$g" env -i PATH="$PATH" HOME="$a/$u" ASAN_OPTIONS="${ASAN_OPTIONS:-}" \
 		XDG_RUNTIME_DIR="$a/$u/run" XDG_CONFIG_HOME="$a/$u/config" XDG_DATA_HOME="$a/$u/data" \
 		HULL_CORE_IDLE=1 DOCKER_HOST="unix://$a/none.sock" timeout 20 "$@"
 }
