@@ -3365,6 +3365,18 @@ static const char *impairment_of(const hull_sexpr_doc *body, const hull_sexpr_fo
 
 			if (!probability(body, &value, to))
 				return "a probability is from 0 to 1";
+		} else if (strcmp(name, "correlation") == 0) {
+			if (!probability(body, &value, &m->correlation) || m->correlation >= 1.0)
+				return "a correlation is from 0 to below 1";
+		} else if (strcmp(name, "distribution") == 0) {
+			if (hull_sexpr_is(body, &value, "normal"))
+				m->distribution = HULL_DELAY_NORMAL;
+			else if (hull_sexpr_is(body, &value, "pareto"))
+				m->distribution = HULL_DELAY_PARETO;
+			else if (hull_sexpr_is(body, &value, "uniform"))
+				m->distribution = HULL_DELAY_UNIFORM;
+			else
+				return "a distribution is uniform, normal or pareto";
 		} else if (strcmp(name, "gemodel") == 0) {
 			/* (gemodel (bad_loss 1-h)? (good_loss 1-k)? (p p) (r r)?),
 			 * with netem's defaults: r is 1-p, 1-h is 1, 1-k is 0. */

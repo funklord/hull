@@ -266,6 +266,9 @@ static void test_records(void)
 	 * (Appendix D). */
 	OK(M("(segments \"wire\") (impair (wire (out (loss 0.03) (delay 40) (jitter 10) (seed 7)) "
 	     "(in (gemodel (p 0.01) (r 0.3)) (rate 1000000) (limit 64) (down false))))"));
+	OK(M("(impair (wire (out (delay 80) (jitter 20) (distribution pareto) (correlation 0.5))))"));
+	NO(M("(impair (wire (out (distribution lumpy))))"), VALUE, "lumpy",
+	   "machine.impair.wire.out.distribution");
 	NO(M("(impair (wire (out (wobble 1))))"), UNKNOWN, "wobble", "machine.impair.wire.out.wobble");
 	NO(M("(impair (wire (out (gemodel (r 0.3)))))"), MISSING, "(gemodel ",
 	   "machine.impair.wire.out.gemodel.p");

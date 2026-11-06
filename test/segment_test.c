@@ -831,8 +831,82 @@ static uint64_t pattern(const char *key, uint64_t seed, double loss, unsigned n)
 	return got;
 }
 
+/* What each distribution and correlation is said to be, over enough draws
+ * that a figure can be held to a bound; a seed fixes them. */
+static void deviates(void)
+{
+	enum { DRAWS = 200000 };
+	static const char *const names[] = { "uniform", "normal", "pareto" };
+
+	for (int d = HULL_DELAY_UNIFORM; d <= HULL_DELAY_PARETO; d++) {
+		for (int tied = 0; tied < 2; tied++) {
+			double   rho = tied ? 0.75 : 0.0;
+			uint64_t random = 7u;
+			double   last = 0.0, previous = 0.0;
+			double   sum = 0.0, squares = 0.0, products = 0.0, most = 0.0;
+			unsigned within = 0u;
+			char     what[96];
+
+			for (int i = 0; i < DRAWS; i++) {
+				double z = hull_impair_deviate(&random, d, rho, &last);
+
+				sum += z;
+				squares += z * z;
+				products += z * previous;
+				previous = z;
+				most = z > most ? z : most;
+				within += z > -1.0 && z < 1.0;
+			}
+			double mean = sum / DRAWS;
+			double variance = squares / DRAWS - mean * mean;
+			double lag = (products / DRAWS - mean * mean) / variance;
+
+			snprintf(what, sizeof what, "%s at %.2f: mean near 0", names[d], rho);
+			check(what, mean > -0.05 && mean < 0.05);
+			snprintf(what, sizeof what, "%s at %.2f: successive draws tied as asked", names[d], rho);
+			check(what, lag > rho - 0.03 && lag < rho + 0.03);
+			if (d == HULL_DELAY_UNIFORM) {
+				snprintf(what, sizeof what, "%s at %.2f: within the jitter", names[d], rho);
+				check(what, within == DRAWS);
+			} else {
+				snprintf(what, sizeof what, "%s at %.2f: a deviation of 1", names[d], rho);
+				check(what, variance > 0.9 && variance < 1.1);
+			}
+			if (d == HULL_DELAY_NORMAL && !tied) {
+				check("normal: two thirds within a deviation",
+				      (double)within / DRAWS > 0.66 && (double)within / DRAWS < 0.70);
+				check("normal: a tail, and a short one", most > 3.0 && most < 6.0);
+			}
+			if (d == HULL_DELAY_PARETO && !tied)
+				check("pareto: a tail far past normal's", most > 8.0);
+		}
+	}
+	/* The same rate of loss, in longer runs. */
+	for (int tied = 0; tied < 2; tied++) {
+		uint64_t random = 7u;
+		int      last = 0;
+		unsigned lost = 0u, runs = 0u;
+		int      before = 0;
+
+		for (int i = 0; i < DRAWS; i++) {
+			int now = hull_impair_lost(&random, 0.1, tied ? 0.9 : 0.0, &last);
+
+			lost += (unsigned)now;
+			runs += now && !before;
+			before = now;
+		}
+		check("loss: at its rate, tied or not", lost > DRAWS / 11 && lost < DRAWS / 9);
+		if (!tied)
+			check("loss untied: runs short", (double)lost / runs < 1.3);
+		else
+			check("loss tied: runs as long as the chain says, 1 / 0.09",
+			      (double)lost / runs > 9.0 && (double)lost / runs < 13.0);
+	}
+}
+
 int main(void)
 {
+	deviates();
 	int a = port("wire");
 	int b = port("wire");
 	int c = port("wire");

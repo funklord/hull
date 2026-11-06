@@ -2075,6 +2075,9 @@ until "$hull" segment "$cut" > "$root/counts.out" 2>&1 &&
 	sleep 0.25
 done
 [ "$tries" -lt 60 ] || fail "a cut link's frames were not counted lost" "$(cat "$root/counts.out")"
+expect 0 '' "$hull" segment "$cut" impair shouter out delay=5 jitter=1 distribution=pareto correlation=0.5
+expect 1 'a correlation is from 0 to below 1' "$hull" segment "$cut" impair shouter out correlation=1
+expect 1 'a distribution is uniform, normal or pareto' "$hull" segment "$cut" impair shouter out distribution=lumpy
 expect 0 '' "$hull" segment "$cut" impair shouter out
 wait "$cutrun"
 cases=$((cases + 1))

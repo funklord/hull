@@ -6600,9 +6600,9 @@ static int fault_words(int argc, char **argv, hull_msg *m)
 
 static int impairment_words(int argc, char **argv, hull_msg *m)
 {
-	static const char *const keys[] = { "corrupt", "delay", "down", "duplicate", "gemodel",
-	                                    "jitter", "limit", "loss", "mtu", "rate", "reorder",
-	                                    "seed" };
+	static const char *const keys[] = { "correlation", "corrupt", "delay", "distribution", "down",
+	                                    "duplicate", "gemodel", "jitter", "limit", "loss", "mtu",
+	                                    "rate", "reorder", "seed" };
 	const char *given[sizeof keys / sizeof keys[0]] = { NULL };
 
 	for (int i = 0; i < argc; i++) {
@@ -6615,8 +6615,8 @@ static int impairment_words(int argc, char **argv, hull_msg *m)
 				break;
 		if (k == sizeof keys / sizeof keys[0] || (equals == NULL) != (strcmp(keys[k], "down") == 0)) {
 			fprintf(stderr, "hull: segment: %s is not an impairment: down, or one of loss, "
-			        "gemodel, delay, jitter, reorder, duplicate, corrupt, rate, limit, mtu "
-			        "and seed with =VALUE\n", argv[i]);
+			        "gemodel, delay, jitter, distribution, correlation, reorder, duplicate, "
+			        "corrupt, rate, limit, mtu and seed with =VALUE\n", argv[i]);
 			return 2;
 		}
 		given[k] = equals != NULL ? equals + 1 : "true";

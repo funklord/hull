@@ -74,6 +74,8 @@ typedef struct way {
 	int                tampering;  /* a tamper is set */
 	uint64_t           random;     /* the draws' state */
 	int                bursting;   /* the Gilbert-Elliott model in its bad state */
+	int                last_loss;  /* correlation's memory of the last frame's */
+	double             last_delay;
 	uint64_t           link_free;  /* when the rate's link is next free, ns */
 	held              *queue;
 	unsigned           queued;
@@ -309,6 +311,71 @@ static int happens(way *w, double p)
 	return (double)(draw(w) >> 11) * (1.0 / 9007199254740992.0) < p;
 }
 
+/* A draw from 0 to 1, by the way's generator. */
+static double unit(uint64_t *random)
+{
+	return (double)(splitmix(random) >> 11) * (1.0 / 9007199254740992.0);
+}
+
+/* By Newton's method, this file wanting no libm for two roots. */
+static double root_of(double x, int cube)
+{
+	double y = x > 1.0 ? x : 1.0;
+
+	if (x <= 0.0)
+		return 0.0;
+	for (int i = 0; i < 200; i++) {
+		double next = cube ? (2.0 * y + x / (y * y)) / 3.0 : (y + x / y) / 2.0;
+
+		if (next == y)
+			break;
+		y = next;
+	}
+	return y;
+}
+
+double hull_impair_deviate(uint64_t *random, int distribution, double correlation, double *last)
+{
+	double value;
+
+	if (distribution == HULL_DELAY_UNIFORM) {
+		value = 2.0 * unit(random) - 1.0;
+		/* netem's mix, which keeps it within the jitter. */
+		*last = value * (1.0 - correlation) + *last * correlation;
+		return *last;
+	}
+	if (distribution == HULL_DELAY_NORMAL) {
+		/* Twelve draws' sum: a deviation of 1, out to 6. */
+		value = -6.0;
+		for (int i = 0; i < 12; i++)
+			value += unit(random);
+	} else {
+		/* netem's table is Pareto of shape 3: mean 1.5, deviation sqrt(3)/2.
+		 * A tail capped, or a frame could wait for ever. */
+		double u = unit(random);
+
+		value = u > 0.0 ? 1.0 / root_of(u, 1) : 100.0;
+		value = (value - 1.5) / 0.8660254037844386;
+		if (value > 100.0)
+			value = 100.0;
+	}
+	/* An AR(1), which keeps the deviation at 1 whatever the correlation. */
+	*last = *last * correlation + value * root_of(1.0 - correlation * correlation, 0);
+	return *last;
+}
+
+int hull_impair_lost(uint64_t *random, double loss, double correlation, int *last)
+{
+	/* A chain of two states, not netem's mix of draws: that narrows them
+	 * toward a half, so at 0.9 a loss of 0.1 all but stopped, measured. This
+	 * holds the rate at `loss` and ties each frame to the last by exactly
+	 * `correlation`. */
+	double chance = *last ? loss + correlation * (1.0 - loss) : loss * (1.0 - correlation);
+
+	*last = unit(random) < chance;
+	return *last;
+}
+
 /* `impairment` for `w` of `machine`'s, its draws seeded afresh. */
 static void impair_way(way *w, const char *machine, int direction,
                        const hull_impairment *impairment)
@@ -322,6 +389,8 @@ static void impair_way(way *w, const char *machine, int direction,
 		seed = (seed ^ (uint8_t)*c) * 0x100000001b3u;
 	w->random    = impairment->seed ^ seed ^ (uint64_t)direction << 63;
 	w->bursting  = 0;
+	w->last_loss = 0;
+	w->last_delay = 0.0;
 	w->link_free = 0u;
 }
 
@@ -650,7 +719,9 @@ static void cross(segment *s, unsigned at, int direction, const uint8_t *framed,
 			w->count.lost++;
 			return;
 		}
-	} else if (happens(w, m->loss)) {
+	} else if (m->correlation > 0.0 ?
+	           m->loss > 0.0 && hull_impair_lost(&w->random, m->loss, m->correlation, &w->last_loss) :
+	           happens(w, m->loss)) {
 		w->count.lost++;
 		return;
 	}
@@ -675,8 +746,11 @@ static void cross(segment *s, unsigned at, int direction, const uint8_t *framed,
 			int64_t spread = (int64_t)m->jitter_ms * 1000000;
 			int64_t off    = (int64_t)m->delay_ms * 1000000;
 
-			if (spread != 0)
+			if (spread != 0 && m->distribution == HULL_DELAY_UNIFORM && m->correlation <= 0.0)
 				off += (int64_t)(draw(w) % (uint64_t)(2 * spread + 1)) - spread;
+			else if (spread != 0)
+				off += (int64_t)(hull_impair_deviate(&w->random, m->distribution, m->correlation,
+				                                     &w->last_delay) * (double)spread);
 			due += off > 0 ? (uint64_t)off : 0u;
 		}
 		if (m->rate != 0u) {

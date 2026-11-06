@@ -29,14 +29,18 @@ extern "C" {
  * loses with `bad_loss` (netem's 1-h) in the bad state and `good_loss`
  * (1-k) in the good; it is sent twice with `duplicate`, and a bit of its
  * payload flipped with `corrupt`; it is held back `delay_ms`, give or
- * take up to `jitter_ms`, drawn evenly, unless with `reorder` it is not
- * held and so overtakes those that are; at `rate` bits a second it waits
+ * take up to `jitter_ms`, drawn evenly, or by `distribution` with
+ * `jitter_ms` its standard deviation, unless with `reorder` it is not
+ * held and so overtakes those that are; `correlation` ties each frame's
+ * loss and delay to the last's; at `rate` bits a second it waits
  * for the link; and a direction holds at most `limit` frames, netem's
  * 1000 where it is 0, dropping one more. Probabilities are from 0 to 1;
  * all zero is a wire. The draws come from `seed`, mixed with the machine
  * and the direction, so the same frames in the same order meet the same
  * fate.
  */
+enum { HULL_DELAY_UNIFORM, HULL_DELAY_NORMAL, HULL_DELAY_PARETO };
+
 typedef struct hull_impairment {
 	int      down;
 	unsigned mtu;
@@ -50,11 +54,22 @@ typedef struct hull_impairment {
 	double   corrupt;
 	unsigned delay_ms;
 	unsigned jitter_ms;
+	int      distribution;   /* a HULL_DELAY_ */
+	double   correlation;
 	double   reorder;
 	uint64_t rate;
 	unsigned limit;
 	uint64_t seed;
 } hull_impairment;
+
+/* The next deviation of a delay, in `jitter`s: within 1 either way where
+ * uniform, a mean of 0 and a deviation of 1 where normal or pareto. Tied to
+ * `*last` by `correlation`, which it updates; drawn from `*random`. */
+double hull_impair_deviate(uint64_t *random, int distribution, double correlation, double *last);
+
+/* Whether a frame is lost at `loss`, tied to whether the last was, `*last`,
+ * by `correlation`: losses bunch, at the same rate. */
+int hull_impair_lost(uint64_t *random, double loss, double correlation, int *last);
 
 /*
  * A targeted fault on one direction of a link, for testing a protocol

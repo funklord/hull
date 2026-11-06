@@ -406,6 +406,7 @@ static const char *const restart_values[]    = { "no", "on-failure", "always", N
 static const char *const disconnect_values[] = { "stop", "keep", NULL };
 static const char *const network_values[]    = { "bridge", "host", "nat", "none", NULL };
 static const char *const display_values[]    = { "window", "vnc", NULL };
+static const char *const distribution_values[] = { "uniform", "normal", "pareto", NULL };
 static const char *const proto_values[]      = { "tcp", "udp", NULL };
 static const char *const mode_values[]       = { "rw", "ro", NULL };
 static const char *const expose_values[]     = { "env", NULL };
@@ -588,6 +589,8 @@ static const key link_way_keys[] = {
 	{ .name = "rate",      .type = COUNT },
 	{ .name = "limit",     .type = COUNT },
 	{ .name = "seed",      .type = COUNT },
+	{ .name = "correlation", .type = NUMBER },
+	{ .name = "distribution", .type = CHOICE, .choices = distribution_values },
 };
 static const schema link_way = TABLE(link_way_keys);
 
