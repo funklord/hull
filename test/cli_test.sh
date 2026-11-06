@@ -3701,6 +3701,26 @@ sleep 3
 refute "$gone" "$hull" lease ls
 cases=$((cases + 1))
 [ ! -e "$XDG_RUNTIME_DIR/hull/leases/$gone" ] || fail "a lease past its end kept its file" ""
+# --json: the same records as an array, read back by a JSON parser.
+jsoned=$(timeout 20 "$hull" reserve tmix --member gpu --for 1h)
+cases=$((cases + 1))
+python3 -I -c '
+import json, sys
+pools, members, leases = (json.loads(sys.argv[i]) for i in (1, 2, 3))
+tmix = [p for p in pools if p["pool"] == "tmix"][0]
+assert tmix == {"pool": "tmix", "capacity": 3, "held": 1, "waiting": 0}, tmix
+assert [m["member"] for m in members] == ["plain", "gpu"], members
+assert members[0] == {"member": "plain", "kind": "slot", "priority": 5, "state": "free", "holder": None}, members
+assert members[1]["priority"] == -1 and members[1]["state"] == "leased" and members[1]["holder"] == sys.argv[4], members
+mine = [l for l in leases if l["id"] == sys.argv[4]][0]
+assert mine["count"] == 1 and mine["machines"] == 0 and mine["ends"].endswith("Z"), mine
+kept = json.loads(sys.argv[5])
+assert kept[-1]["priority"] == "by-name", kept
+' "$("$hull" pool ls --json)" "$("$hull" pool ls tmix --json)" "$("$hull" lease ls --json)" "$jsoned" \
+	"$("$hull" pool ls tkept --json)" 2>&1 || fail "--json is not the same records" ""
+expect 0 '' "$hull" release "$jsoned"
+expect 2 'usage' "$hull" lease ls tmix
+expect 0 '^\[\]$' "$hull" lease ls --json
 # A machine the pool has nothing for is refused, not left to wait or to
 # take a slot from what the pool is for; nor is a file that cannot be meant.
 conf pnoboard '(pool "tboards") (hostname "pnoboard") (command "/probe" "say" "ran")'

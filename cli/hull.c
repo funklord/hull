@@ -128,7 +128,7 @@ static void usage(FILE *out)
 	      "                [--lease ID] [NAME]\n"
 	      "       hull reserve POOL [--count N] [--member NAME]... [--kind board|slot]\n"
 	      "                    [--for D] [--wait D|--no-wait] | hull release ID\n"
-	      "       hull pool ls [POOL] | hull lease ls\n"
+	      "       hull pool ls [POOL] [--json] | hull lease ls [--json]\n"
 	      "       hull pack DIR|REF FILE | hull unpack FILE|- DIR\n"
 	      "       hull export --bootable DIR|REF IMAGE [--init PATH | --host TTY]\n"
 	      "       hull kernel fetch [--arch ARCH]\n"
@@ -4981,12 +4981,52 @@ static int release(const char *id)
 	return status;
 }
 
+/* One record of `--json`, the columns' own names as its keys: "-" or
+ * nothing as null, and a number as a number in the columns `numeric` has a
+ * bit for, a board called 7 staying a name. Names are the file's, so they
+ * are escaped. `*count` says whether a comma comes first. */
+static void json_record(const char *const *keys, const char *const *values, unsigned n,
+                        unsigned numeric, unsigned *count)
+{
+	printf("%s{", (*count)++ > 0u ? "," : "");
+	for (unsigned k = 0u; k < n; k++) {
+		const char *v = values[k];
+		char       *end = NULL;
+
+		printf("%s\"%s\":", k > 0u ? "," : "", keys[k]);
+		if (v[0] == '\0' || strcmp(v, "-") == 0) {
+			printf("null");
+			continue;
+		}
+		(void)strtoll(v, &end, 10);
+		if (*end == '\0' && (numeric >> k & 1u) != 0u) {
+			printf("%s", v);
+			continue;
+		}
+		putchar('"');
+		for (; *v != '\0'; v++) {
+			if (*v == '"' || *v == '\\')
+				printf("\\%c", *v);
+			else if ((unsigned char)*v < 0x20u)
+				printf("\\u%04x", (unsigned)(unsigned char)*v);
+			else
+				putchar(*v);
+		}
+		putchar('"');
+	}
+	putchar('}');
+}
+
 /* `hull lease ls` and `hull pool ls`: one line a record, its columns
- * fixed, a header first, as `hull ps` prints. */
-static int list_of(int pools)
+ * fixed, a header first, as `hull ps` prints; or with `json` the same
+ * records as one array, for a script (section 4.12). */
+static int list_of(int pools, int json)
 {
 	static const char *const lease_keys[] = { "id", "pool", "count", "machines", "ends" };
 	static const char *const pool_keys[]  = { "name", "capacity", "held", "waiting", "" };
+	static const char *const lease_names[] = { "id", "pool", "count", "machines", "ends" };
+	static const char *const pool_names[]  = { "pool", "capacity", "held", "waiting" };
+	unsigned                 records = 0u;
 	const char *const       *keys = pools ? pool_keys : lease_keys;
 	hull_wire                wire;
 	hull_sexpr_doc           body;
@@ -4998,7 +5038,9 @@ static int list_of(int pools)
 	hull_msg_raw(&m, pools ? "(5:pools" : "(6:leases");
 	hull_msg_channel(&m, 1u);
 	hull_msg_raw(&m, ")");
-	if (pools)
+	if (json)
+		printf("[");
+	else if (pools)
 		printf("%-24s %-9s %-6s %s\n", "POOL", "CAPACITY", "HELD", "WAITING");
 	else
 		printf("%-24s %-24s %-6s %-9s %s\n", "ID", "POOL", "COUNT", "MACHINES", "ENDS");
@@ -5029,24 +5071,33 @@ static int list_of(int pools)
 					hull_msg_string(&body, &v, values[k], sizeof values[k]);
 			}
 		}
-		if (pools)
+		at = (time_t)strtoll(values[4], NULL, 10);
+		if (!pools && at != 0 && gmtime_r(&at, &utc) != NULL)
+			strftime(ends, sizeof ends, "%Y-%m-%dT%H:%M:%SZ", &utc);
+		if (json) {
+			const char *const row[] = { values[0], values[1], values[2], values[3], ends };
+
+			json_record(pools ? pool_names : lease_names, row, pools ? 4u : 5u,
+			            pools ? 0xeu : 0xcu, &records);
+		} else if (pools) {
 			printf("%-24s %-9s %-6s %s\n", values[0], values[1], values[2], values[3]);
-		else {
-			at = (time_t)strtoll(values[4], NULL, 10);
-			if (at != 0 && gmtime_r(&at, &utc) != NULL)
-				strftime(ends, sizeof ends, "%Y-%m-%dT%H:%M:%SZ", &utc);
+		} else {
 			printf("%-24s %-24s %-6s %-9s %s\n", values[0], values[1], values[2], values[3], ends);
 		}
 	}
+	if (json)
+		printf("]\n");
 	hull_wire_close(&wire);
 	return 0;
 }
 
 /* `hull pool ls POOL`: each entry in the order it fills, one line a
  * record, its columns fixed, a header first; "-" for no holder. */
-static int pool_members(const char *pool)
+static int pool_members(const char *pool, int json)
 {
 	static const char *const keys[] = { "name", "kind", "priority", "state", "holder" };
+	static const char *const names[] = { "member", "kind", "priority", "state", "holder" };
+	unsigned                 records = 0u;
 	hull_wire                wire;
 	hull_sexpr_doc           body;
 	hull_sexpr_form          message;
@@ -5061,7 +5112,10 @@ static int pool_members(const char *pool)
 	hull_msg_raw(&m, "))");
 	if (ask_core(&wire, &m, &body, &status, 1) != 0)
 		return status;
-	printf("%-24s %-6s %-9s %-8s %s\n", "MEMBER", "KIND", "PRIORITY", "STATE", "HOLDER");
+	if (json)
+		printf("[");
+	else
+		printf("%-24s %-6s %-9s %-8s %s\n", "MEMBER", "KIND", "PRIORITY", "STATE", "HOLDER");
 	hull_sexpr_first(&body, &message);
 	hull_sexpr_child(&body, &message, &item);
 	while (hull_sexpr_next(&body, &item, &item)) {
@@ -5080,9 +5134,17 @@ static int pool_members(const char *pool)
 			    hull_sexpr_child(&body, &value, &name) && hull_sexpr_next(&body, &name, &v))
 				hull_msg_string(&body, &v, values[k], sizeof values[k]);
 		}
-		printf("%-24s %-6s %-9s %-8s %s\n", values[0], values[1], values[2], values[3],
-		       values[4][0] != '\0' ? values[4] : "-");
+		if (json) {
+			const char *const row[] = { values[0], values[1], values[2], values[3], values[4] };
+
+			json_record(names, row, 5u, 0x4u, &records);
+		} else {
+			printf("%-24s %-6s %-9s %-8s %s\n", values[0], values[1], values[2], values[3],
+			       values[4][0] != '\0' ? values[4] : "-");
+		}
 	}
+	if (json)
+		printf("]\n");
 	hull_wire_close(&wire);
 	return 0;
 }
@@ -7489,12 +7551,22 @@ int main(int argc, char **argv)
 		return reserve(argc, argv);
 	if (strcmp(command, "release") == 0 && argc == 3)
 		return release(argv[2]);
-	if (strcmp(command, "lease") == 0 && argc == 3 && strcmp(argv[2], "ls") == 0)
-		return list_of(0);
-	if (strcmp(command, "pool") == 0 && argc == 3 && strcmp(argv[2], "ls") == 0)
-		return list_of(1);
-	if (strcmp(command, "pool") == 0 && argc == 4 && strcmp(argv[2], "ls") == 0)
-		return pool_members(argv[3]);
+	if ((strcmp(command, "pool") == 0 || strcmp(command, "lease") == 0) && argc >= 3 &&
+	    strcmp(argv[2], "ls") == 0) {
+		int         pools = strcmp(command, "pool") == 0;
+		int         json = 0;
+		const char *name = NULL;
+
+		for (int i = 3; i < argc; i++) {
+			if (strcmp(argv[i], "--json") == 0)
+				json = 1;
+			else if (pools && argv[i][0] != '-' && name == NULL)
+				name = argv[i];
+			else
+				return usage(stderr), 2;
+		}
+		return name != NULL ? pool_members(name, json) : list_of(pools, json);
+	}
 	if (strcmp(command, "images") == 0 && argc == 2)
 		return images();
 	if (strcmp(command, "diff") == 0 && argc == 4)
