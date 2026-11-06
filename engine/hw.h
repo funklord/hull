@@ -13,6 +13,7 @@ typedef struct hull_board {
 	char     power[512];     /* a command, given on, off or cycle */
 	char     console[512];   /* a command whose output is the machine's log */
 	char     health[512];    /* a command that is 0 for a board fit to lease */
+	char     deploy[512];    /* a command in place of tar over ssh, given SOURCE and TREE */
 	char     root[512];      /* where a tree lands on it */
 	unsigned port;
 	unsigned wait;           /* seconds its sshd has to answer after power on */

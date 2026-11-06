@@ -49,6 +49,7 @@
 #define MAX_ENV        64u
 #define MAX_ARGS       64u
 #define MAX_BUSY       64u
+#define DEPLOY_SECONDS 1800
 #define MAX_PORTS      32u
 #define SCRIPT_MAX     32768u
 #define WAIT_SECONDS   60     /* a board's sshd, from its power on, unless it says */
@@ -317,6 +318,7 @@ int hull_hw_boards(const char *pool, hull_board *boards, unsigned cap)
 			field(&doc, &item, "power", b->power, sizeof b->power);
 			field(&doc, &item, "console", b->console, sizeof b->console);
 			field(&doc, &item, "health", b->health, sizeof b->health);
+			field(&doc, &item, "deploy", b->deploy, sizeof b->deploy);
 			field(&doc, &item, "root", b->root, sizeof b->root);
 			field(&doc, &item, "port", port, sizeof port);
 			b->port = port[0] != '\0' ? (unsigned)strtoul(port, NULL, 10) : 22u;
@@ -547,6 +549,23 @@ static int hook(hull_machine *m, const char *command, const char *word)
 	return run_quietly(m, argv, HOOK_SECONDS);
 }
 
+/* A board's (deploy "CMD"), on this host with the board off, given the
+ * source and where its tree has to be once its sshd answers: an image
+ * flashed, a netboot served. A slow thing, so given longer than a hook. */
+static int deploy_hook(hull_machine *m)
+{
+	char        line[6000];
+	const char *argv[4] = { "sh", "-c", line, NULL };
+	size_t      at = 0u;
+
+	if (add(line, sizeof line, &at, m->board.deploy) != 0 ||
+	    add(line, sizeof line, &at, " ") != 0 ||
+	    quote(line, sizeof line, &at, m->source) != 0 || add(line, sizeof line, &at, " ") != 0 ||
+	    quote(line, sizeof line, &at, m->tree) != 0)
+		return -1;
+	return run_quietly(m, argv, DEPLOY_SECONDS);
+}
+
 static void say(hull_machine *m, const char *format, const char *a, const char *b)
 {
 	char line[1200];
@@ -580,6 +599,16 @@ static int deploy(hull_machine *m)
 	size_t      remote_at = 0u;
 	const char *argv[4] = { "sh", "-c", line, NULL };
 
+	/* Its own hook laid the tree before the power came on: only looked for. */
+	if (m->board.deploy[0] != '\0') {
+		char   look[800];
+		size_t length = 0u;
+
+		if (add(look, sizeof look, &length, "test -d ") != 0 ||
+		    quote(look, sizeof look, &length, m->tree) != 0)
+			return -1;
+		return board_ssh(m, look, 15) == 0 ? 0 : -1;
+	}
 	if (add(remote, sizeof remote, &remote_at, "rm -rf ") != 0 ||
 	    quote(remote, sizeof remote, &remote_at, m->tree) != 0 ||
 	    add(remote, sizeof remote, &remote_at, " && mkdir -p ") != 0 ||
@@ -862,7 +891,11 @@ static void *run_machine(void *arg)
 	char          clean[1600];
 	size_t        at = 0u;
 
-	if (bring_up(m)) {
+	/* Tried twice, a flash that fails being as a deploy that does. */
+	if (m->board.deploy[0] != '\0' && deploy_hook(m) != 0 && deploy_hook(m) != 0) {
+		say(m, "hull: board %s: marked broken: its deploy hook failed%s\n", m->board.name, "");
+		mark_broken(m->board.name, "its deploy hook failed");
+	} else if (bring_up(m)) {
 		if (hook(m, m->board.health, NULL) != 0) {
 			say(m, "hull: board %s: marked broken: its health check failed%s\n", m->board.name, "");
 			mark_broken(m->board.name, "its health check failed");

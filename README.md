@@ -582,6 +582,7 @@ pool's `(capacity N)` and its slots, a hw machine on its boards.
 | `(capacity N)` | N unnamed places for software machines, at priority 0 |
 | `(board "NAME" ...)` | a computer reached by ssh, a vm included |
 | `(slot "NAME")` | a named place for a software machine: one at a time on what the name stands for |
+| `(deploy "CMD")` | on a board: runs on this host with the board off, given the source and where its tree must be, in place of `tar` over ssh: an image flashed, a netboot served |
 | `(priority N)` | on a board or slot: the higher fills first, 0 by default; below 0 keeps an entry clear until the rest is held |
 | `(by_name true)` | on a board or slot: given only to a lease that names it, however full the pool is |
 

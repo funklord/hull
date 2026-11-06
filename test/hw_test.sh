@@ -143,6 +143,15 @@ cat > "$XDG_CONFIG_HOME/hull/pools.conf" <<CONF
     (board "high" (priority 3) (address "127.0.0.1") (port $((port + 5))) (root "$root/on-b")
            (power "$root/power high $((port + 5))"))))
   (soft (capacity 1))
+  (flashed (members
+    (board "img" (address "127.0.0.1") (port $((port + 7))) (root "$root/on-a")
+           (deploy "$root/flash") (power "$root/power img $((port + 7))"))))
+  (badflash (members
+    (board "bf" (address "127.0.0.1") (port $((port + 8))) (root "$root/on-a") (deploy "false")
+           (power "$root/power bf $((port + 8))"))))
+  (noflash (members
+    (board "nf" (address "127.0.0.1") (port $((port + 9))) (root "$root/on-a") (deploy "true")
+           (power "$root/power nf $((port + 9))"))))
   (lab (members
     (board "kept" (by_name true) (address "127.0.0.1") (port $((port + 6))) (root "$root/on-a")
            (power "$root/power kept $((port + 6))")))))
@@ -352,6 +361,34 @@ conf stray '(backend chroot) (pool "bench") (command "/probe" "say" "stray")'
 expect 125 'pool bench has nothing for a ns machine' "$hull" run -f "$root/project/stray.conf"
 conf noboard '(backend hw) (pool "soft") (command "/probe" "say" "no")'
 expect 125 'pool soft has no boards for a hw machine' "$hull" run -f "$root/project/noboard.conf"
+
+# --- a deploy of the board's own: an image flashed, a netboot served ----------
+
+cat > "$root/flash" <<'FLASH'
+#!/bin/sh
+base=$(dirname "$0")
+printf 'img flash\n' >> "$base/power.log"
+printf '%s\n' "$1 $2" > "$base/flash.args"
+cp -a "$1" "$2"
+FLASH
+chmod +x "$root/flash"
+conf flashed '(backend hw) (pool "flashed") (workdir "/srv") (command "/probe" "say" "flashed" "read" "/srv/file")'
+: > "$root/power.log"
+expect 0 '^flashed$' "$hull" run -f "$root/project/flashed.conf"
+cases=$((cases + 1))
+[ "$(cat "$root/power.log")" = "img flash
+img on
+img off" ] || fail 'a deploy hook did not run with the board off, before its power' "$(cat "$root/power.log")"
+cases=$((cases + 1))
+grep -q "/tree $root/on-a/" "$root/flash.args" ||
+	fail 'a deploy hook was not given the source and the tree' "$(cat "$root/flash.args")"
+check 'and its tree went with the run' test -z "$(ls -A "$root/on-a")"
+conf badflash '(backend hw) (pool "badflash") (command "/probe" "say" "never")'
+expect 125 'marked broken: its deploy hook failed' "$hull" run -f "$root/project/badflash.conf"
+expect 0 '' "$hull" board fix bf
+conf noflash '(backend hw) (pool "noflash") (command "/probe" "say" "never")'
+expect 125 'marked broken: the tree could not be deployed' "$hull" run -f "$root/project/noflash.conf"
+expect 0 '' "$hull" board fix nf
 
 # --- recovery: cycled, then marked, and out of its pool -----------------------
 
