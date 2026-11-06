@@ -561,6 +561,38 @@ to the board, and another board of the pool is another key.
 **When you want it:** a test that has to meet real hardware, or a run on a
 machine you already have, with the same file you use on a vm.
 
+### What a pool holds
+
+A pool can hold every kind at once, and never chooses one: the machine's
+`(backend ...)` stays the one line that does. A software machine draws on the
+pool's `(capacity N)` and its slots, a hw machine on its boards.
+
+```scheme
+(pools
+  (bench (capacity 4)
+    (members
+      (board "rpi4-a" (priority 5) (address "192.168.7.21"))
+      (board "rpi4-b" (address "192.168.7.22"))
+      (board "fpga"   (priority -10) (address "192.168.7.30"))
+      (slot  "gpu"    (priority -10)))))
+```
+
+| Entry | What it is |
+|---|---|
+| `(capacity N)` | N unnamed places for software machines, at priority 0 |
+| `(board "NAME" ...)` | a computer reached by ssh, a vm included |
+| `(slot "NAME")` | a named place for a software machine: one at a time on what the name stands for |
+| `(priority N)` | on a board or slot: the higher fills first, 0 by default; below 0 keeps an entry clear until the rest is held |
+
+- `hull reserve bench --member fpga` holds that entry, and `hull run --lease ID`
+  runs on it. `--count N` adds whatever fills first, and `--kind board` keeps
+  that to boards.
+- `hull pool ls bench` lists the entries in the order they fill, with who
+  holds each.
+- A machine the pool has nothing for is refused at once, status 125: a chroot
+  machine in a pool of only boards, or a hw machine in a pool with none.
+- A request waiting for one named entry holds up nothing else in the pool.
+
 ## Designed, not written
 
 - **crun**, ns: crun under user namespaces, with idmapped mounts for

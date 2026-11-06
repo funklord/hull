@@ -141,6 +141,7 @@ struct slot {
 	char               arch[16];       /* the plan's (arch ...), or "" for the host's */
 	char               pool[64];       /* the plan's (pool ...), or "" for none (4.12) */
 	char               lease[24];      /* the lease it runs under, or "" */
+	char               member[64];     /* the pool's entry it holds, or "" for an unnamed slot */
 	hull_core          core;
 	hull_machine      *handle;
 	char               state[16];
@@ -1182,6 +1183,49 @@ static uint8_t *with_address(const hull_buf *plan, const char *address, size_t *
 	return out;
 }
 
+/*
+ * The plan with `(member NAME)` added, the board the core chose: an entry
+ * of the plan's in its sorted place, which is after the keys below it and
+ * before the first above.
+ */
+static uint8_t *with_member(const hull_buf *plan, const char *member, size_t *length)
+{
+	hull_sexpr_doc  doc;
+	hull_sexpr_form top;
+	hull_sexpr_form item;
+	char            entry[96];
+	size_t          at = plan->len - 1u;
+	int             written = snprintf(entry, sizeof entry, "(6:member%zu:%s)", strlen(member),
+	                                   member);
+	uint8_t        *out;
+
+	if (written < 0 || (size_t)written >= sizeof entry || plan->len == 0u ||
+	    hull_sexpr_open(&doc, plan->data, plan->len, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
+	    !hull_sexpr_first(&doc, &top) || !hull_sexpr_child(&doc, &top, &item))
+		return NULL;
+	while (hull_sexpr_next(&doc, &item, &item)) {
+		hull_sexpr_form key;
+		size_t          n;
+		int             order;
+
+		if (item.kind != HULL_SEXPR_LIST || !hull_sexpr_child(&doc, &item, &key))
+			continue;
+		n = key.content_length < 6u ? key.content_length : 6u;
+		order = memcmp(doc.data + key.content, "member", n);
+		if (order > 0 || (order == 0 && key.content_length > 6u)) {
+			at = item.offset;
+			break;
+		}
+	}
+	*length = plan->len + (size_t)written;
+	if ((out = malloc(*length)) == NULL)
+		return NULL;
+	memcpy(out, plan->data, at);
+	memcpy(out + at, entry, (size_t)written);
+	memcpy(out + at + (size_t)written, plan->data + at, plan->len - at);
+	return out;
+}
+
 /* --- secrets ------------------------------------------------------------- */
 
 /*
@@ -1602,7 +1646,8 @@ static void forget_ssh(slot *s)
  * engine can take one back: what a core that comes after this one needs,
  * should this one go without stopping it, killed or crashed.
  *
- *     (4:kept (7:machine ID) (6:engine NAME) (5:class CLASS) (5:state S))
+ *     (4:kept (7:machine ID) (6:engine NAME) (5:class CLASS) (5:lease L)
+ *             (6:member M) (4:pool P) (5:state S))
  *
  * canonical, S the engine's persist(). It is written whole, by a rename,
  * once the machine has started, and removed once it has exited. A core
@@ -1640,6 +1685,13 @@ static void keep_machine(slot *s)
 	hull_msg_text(&m, s->engine->caps->engine_name);
 	hull_msg_raw(&m, ")(5:class");
 	hull_msg_text(&m, s->class_name);
+	/* What it holds of a pool, which the next core has to go on counting. */
+	hull_msg_raw(&m, ")(5:lease");
+	hull_msg_text(&m, s->lease);
+	hull_msg_raw(&m, ")(6:member");
+	hull_msg_text(&m, s->member);
+	hull_msg_raw(&m, ")(4:pool");
+	hull_msg_text(&m, s->pool);
 	hull_msg_raw(&m, ")(5:state");
 	hull_msg_atom(&m, state.data, state.len);
 	hull_msg_raw(&m, "))");
@@ -1737,6 +1789,16 @@ static int adopt_one(const char *id)
 	address_of(id, s->address);
 	snprintf(s->class_name, sizeof s->class_name, "%s", class_name);
 	snprintf(s->state, sizeof s->state, "adopting");
+	{
+		hull_sexpr_form held;
+
+		if (hull_msg_find(&doc, "pool", &held))
+			hull_msg_string(&doc, &held, s->pool, sizeof s->pool);
+		if (hull_msg_find(&doc, "lease", &held))
+			hull_msg_string(&doc, &held, s->lease, sizeof s->lease);
+		if (hull_msg_find(&doc, "member", &held))
+			hull_msg_string(&doc, &held, s->member, sizeof s->member);
+	}
 	status = engine->ops->adopt(&s->core, state, &s->handle, &error);
 	if (status == HULL_OK) {
 		char dir[4300];
@@ -1750,6 +1812,7 @@ static int adopt_one(const char *id)
 	s->used = 0;
 	s->kept = 0;
 	s->handle = NULL;
+	s->pool[0] = s->lease[0] = s->member[0] = '\0';
 	if (status == HULL_ERR_GONE || status == HULL_ERR_UNSUPPORTED) {
 		fprintf(stderr, "hull core: machine %s is forgotten: %s\n", id, why);
 		unlink(path);
@@ -2190,6 +2253,17 @@ static int root_of(const hull_sexpr_doc *doc, char *hash, size_t hash_cap, char 
 #define MAX_WAITING 64u
 #define NOTICE_MS   60000LL
 
+/* What a run or a lease asks of a pool: `count` entries, the `named` of
+ * them by name and the rest whichever fills first, of the kind asked. */
+enum { WANT_ANY, WANT_SOFTWARE, WANT_BOARD };
+
+typedef struct want {
+	int      kind;
+	unsigned count;
+	unsigned named;
+	char     names[HULL_POOL_MEMBERS][64];
+} want;
+
 typedef struct waiting {
 	int       used;
 	unsigned  client;
@@ -2201,12 +2275,19 @@ typedef struct waiting {
 	long long since;
 	long long until;      /* when it gives up, or 0 for never */
 	long long noticed;    /* when it last said it waits */
-	unsigned  needed;     /* slots it takes: 1 for a run, a lease's count */
+	want      asked;
 } waiting;
 
+/* An entry of a pool by name, held by a lease. */
+typedef struct held_member {
+	char name[64];
+	int  board;
+} held_member;
+
 /* A lease (section 4.12): `count` slots of `pool`, held until released,
- * each a machine run with `--lease ID` while it runs. Kept as a file each
- * under hull/leases/, so that a core that comes after agrees. */
+ * each a machine run with `--lease ID` while it runs: the `held_count`
+ * entries named, and the rest of its count unnamed slots. Kept as a file
+ * each under hull/leases/, so that a core that comes after agrees. */
 #define MAX_LEASES 64u
 
 typedef struct lease {
@@ -2214,90 +2295,270 @@ typedef struct lease {
 	char     id[24];
 	char     pool[64];
 	unsigned count;
+	unsigned    held_count;
+	held_member held[HULL_POOL_MEMBERS];
 } lease;
 
 static lease leases[MAX_LEASES];
 static char  lease_dir[4200];
 
 static waiting   waiters[MAX_WAITING];
-static int       admitting;   /* handle_run called by admit_waiting: its turn has come */
+static long long admitting;   /* when what admit_waiting calls began to wait, or 0 */
 static long long monotonic_ms(void);
 static void      handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body);
 static void      handle_lease_ask(client *c, uint32_t ch, const hull_sexpr_doc *body);
 
-/* A pool's capacity, from the user's pools.conf, `(pools (NAME (capacity
- * N)) ...)`: N, 0 where the file names the pool with no capacity, or -1
- * where it does not name it, or there is no file. Read at each run, so
- * what the file says is what a run meets, with no state of the core's. */
-static long long pool_capacity(const char *pool)
+/* Who holds the entry `name`: a lease, `*leased` set, or a machine, or
+ * NULL for nobody. An entry is one thing by its name, so a board listed in
+ * two pools is held in both. */
+static const char *holder_of(const char *name, int *leased)
 {
-	const char     *config = getenv("XDG_CONFIG_HOME");
-	const char     *home   = getenv("HOME");
-	char            path[4200];
-	uint8_t        *text;
-	size_t          length = 0u;
-	hull_sexpr_doc  doc;
-	hull_sexpr_form top;
-	hull_sexpr_form entry;
-	long long       capacity = -1;
-	FILE           *file;
-
-	if (config != NULL && config[0] == '/')
-		snprintf(path, sizeof path, "%s/hull/pools.conf", config);
-	else if (home != NULL)
-		snprintf(path, sizeof path, "%s/.config/hull/pools.conf", home);
-	else
-		return -1;
-	if ((file = fopen(path, "re")) == NULL)
-		return -1;
-	text = malloc(65536u);
-	if (text != NULL)
-		length = fread(text, 1u, 65536u, file);
-	fclose(file);
-	if (text != NULL &&
-	    hull_sexpr_open(&doc, text, length, HULL_SEXPR_READABLE, NULL) == HULL_SEXPR_OK &&
-	    hull_sexpr_first(&doc, &top) && hull_access_find(&doc, &top, pool, &entry)) {
-		hull_sexpr_form found;
-		hull_sexpr_form head;
-		hull_sexpr_form value;
-		uint8_t         n[24];
-		size_t          n_length = 0u;
-
-		/* The file is written by hand, its numbers bare: read as the
-		 * spec's values are, not as a canonical plan's atoms. */
-		capacity = 0;
-		/* A pool of boards holds as many as are not broken. */
-		if (hull_access_find(&doc, &entry, "members", &found)) {
-			static hull_board boards[64];
-			int               count = hull_hw_boards(pool, boards, 64u);
-
-			for (int i = 0; i < count; i++)
-				capacity += !hull_hw_broken(boards[i].name);
-		}
-		if (hull_access_find(&doc, &entry, "capacity", &found) &&
-		    hull_sexpr_child(&doc, &found, &head) && hull_sexpr_next(&doc, &head, &value) &&
-		    hull_sexpr_value(&doc, &value, n, sizeof n - 1u, &n_length) == HULL_SEXPR_OK) {
-			n[n_length] = '\0';
-			capacity = strtoll((const char *)n, NULL, 10);
-		}
-	}
-	free(text);
-	return capacity;
+	*leased = 1;
+	for (unsigned i = 0u; i < MAX_LEASES; i++)
+		for (unsigned k = 0u; leases[i].used && k < leases[i].held_count; k++)
+			if (strcmp(leases[i].held[k].name, name) == 0)
+				return leases[i].id;
+	*leased = 0;
+	for (unsigned i = 0u; i < MAX_MACHINES; i++)
+		if (machines[i].used && !machines[i].exited && strcmp(machines[i].member, name) == 0)
+			return machines[i].id;
+	return NULL;
 }
 
-/* The slots of `pool` held now: each machine run in it with no lease,
- * and each lease's count, whose machines run in its slots. */
-static unsigned in_pool(const char *pool)
+static int is_held(const char *name)
+{
+	int leased;
+
+	return holder_of(name, &leased) != NULL;
+}
+
+/* The unnamed slots of `pool` held now: each machine run in it on no
+ * entry and under no lease, and what of each lease's count is unnamed. */
+static unsigned unnamed_held(const char *pool)
 {
 	unsigned n = 0u;
 
 	for (unsigned i = 0u; i < MAX_MACHINES; i++)
 		n += machines[i].used && !machines[i].exited && machines[i].lease[0] == '\0' &&
-		     strcmp(machines[i].pool, pool) == 0;
+		     machines[i].member[0] == '\0' && strcmp(machines[i].pool, pool) == 0;
 	for (unsigned i = 0u; i < MAX_LEASES; i++)
 		if (leases[i].used && strcmp(leases[i].pool, pool) == 0)
-			n += leases[i].count;
+			n += leases[i].count - leases[i].held_count;
 	return n;
+}
+
+/* A pool with neither a capacity nor members is the limit of nothing. */
+static int is_unlimited(const hull_pool *p)
+{
+	return p->capacity == 0 && p->count == 0u;
+}
+
+static int member_fits(const hull_member *m, int kind)
+{
+	return kind == WANT_ANY || m->board == (kind == WANT_BOARD);
+}
+
+/* What of `kind` the pool has now, not counting a board broken, and how
+ * much of that is held. */
+static void tally(const char *pool, const hull_pool *p, int kind, unsigned *used, unsigned *total)
+{
+	*used = *total = 0u;
+	if (kind != WANT_BOARD) {
+		*total = (unsigned)p->capacity;
+		*used  = unnamed_held(pool);
+	}
+	for (unsigned i = 0u; i < p->count; i++)
+		if (member_fits(&p->members[i], kind) && !p->members[i].broken) {
+			(*total)++;
+			*used += is_held(p->members[i].name) ? 1u : 0u;
+		}
+}
+
+static const hull_member *member_of(const hull_pool *p, const char *name)
+{
+	for (unsigned i = 0u; i < p->count; i++)
+		if (strcmp(p->members[i].name, name) == 0)
+			return &p->members[i];
+	return NULL;
+}
+
+/* Whether `w` can never be had of the pool, whatever is released: said
+ * in `why`, so that nothing waits for what will not come. A machine the
+ * pool has nothing for is one of these: its spec chooses what it is, and
+ * the pool only what it draws on (section 4.12). A want all by name of
+ * one kind becomes that kind, so that it stands in that kind's line. */
+static int refused(const char *pool, const hull_pool *p, want *w, const char *class_name,
+                   char *why, size_t cap)
+{
+	unsigned used;
+	unsigned total;
+	unsigned boards = 0u;
+	unsigned slots = 0u;
+
+	if (p->wrong[0] != '\0') {
+		snprintf(why, cap, "pool %s in pools.conf: %s", pool, p->wrong);
+		return 1;
+	}
+	for (unsigned i = 0u; i < w->named; i++) {
+		const hull_member *m = member_of(p, w->names[i]);
+
+		if (m == NULL) {
+			snprintf(why, cap, "pool %s has no member %s", pool, w->names[i]);
+			return 1;
+		}
+		if (m->broken) {
+			snprintf(why, cap, "member %s of pool %s is broken: `hull board ls %s`", m->name,
+			         pool, pool);
+			return 1;
+		}
+		if (!member_fits(m, w->kind)) {
+			snprintf(why, cap, "member %s of pool %s is a %s", m->name, pool,
+			         m->board ? "board" : "slot");
+			return 1;
+		}
+		for (unsigned k = 0u; k < i; k++)
+			if (strcmp(w->names[k], w->names[i]) == 0) {
+				snprintf(why, cap, "member %s is named twice", m->name);
+				return 1;
+			}
+		boards += m->board ? 1u : 0u;
+		slots  += m->board ? 0u : 1u;
+	}
+	if (w->kind == WANT_ANY && w->named == w->count && w->named > 0u && (boards == 0u || slots == 0u))
+		w->kind = boards > 0u ? WANT_BOARD : WANT_SOFTWARE;
+	if (is_unlimited(p)) {
+		if (w->kind != WANT_BOARD)
+			return 0;
+		snprintf(why, cap, "pool %s has no boards for a hw machine: (members (board ...)) in "
+		         "pools.conf", pool);
+		return 1;
+	}
+	boards = 0u;
+	for (unsigned i = 0u; i < p->count; i++)
+		boards += p->members[i].board ? 1u : 0u;
+	tally(pool, p, w->kind, &used, &total);
+	if (total == 0u && w->kind == WANT_SOFTWARE) {
+		snprintf(why, cap, "pool %s has nothing for a %s machine, only boards: a (capacity N) or "
+		         "a (slot ...) of its members in pools.conf", pool,
+		         class_name != NULL ? class_name : "software");
+		return 1;
+	}
+	if (total == 0u && boards == 0u) {
+		snprintf(why, cap, "pool %s has no boards for a hw machine: (members (board ...)) in "
+		         "pools.conf", pool);
+		return 1;
+	}
+	if (total == 0u) {
+		snprintf(why, cap, "every board of pool %s is broken: `hull board ls %s`", pool, pool);
+		return 1;
+	}
+	if (w->count > total) {
+		snprintf(why, cap, "pool %s has %u slots, and the lease asks %u", pool, total, w->count);
+		return 1;
+	}
+	return 0;
+}
+
+/* Whether a request that came later has to stand behind `first`. Strictly
+ * so for what it could take from it; but a request by name wants only
+ * that entry, so what asks for another goes past it, and a special entry
+ * that is long held does not stop its pool. */
+static int competes(const want *first, const want *later)
+{
+	for (unsigned i = 0u; i < first->named; i++)
+		for (unsigned k = 0u; k < later->named; k++)
+			if (strcmp(first->names[i], later->names[k]) == 0)
+				return 1;
+	return first->count > first->named &&
+	       (first->kind == WANT_ANY || later->kind == WANT_ANY || first->kind == later->kind);
+}
+
+/* How many of `pool`'s requests older than `since` stand before `w`. */
+static unsigned ahead_of(const char *pool, const want *w, long long since)
+{
+	unsigned n = 0u;
+
+	for (unsigned i = 0u; i < MAX_WAITING; i++)
+		n += waiters[i].used && strcmp(waiters[i].pool, pool) == 0 && waiters[i].since < since &&
+		     competes(&waiters[i].asked, w);
+	return n;
+}
+
+/* Whether a request older than `since` waits for `name` by name. */
+static int named_ahead(const char *pool, const char *name, long long since)
+{
+	for (unsigned i = 0u; i < MAX_WAITING; i++)
+		for (unsigned k = 0u; waiters[i].used && k < waiters[i].asked.named; k++)
+			if (waiters[i].since < since && strcmp(waiters[i].pool, pool) == 0 &&
+			    strcmp(waiters[i].asked.names[k], name) == 0)
+				return 1;
+	return 0;
+}
+
+/* What `w` takes of the pool now, in `out`: those it names, then the rest
+ * in the order the pool fills, the higher priorities first, the unnamed
+ * capacity at 0 before a member of 0, so that a member given a lower
+ * priority is what is left last. 1, or 0 where the pool cannot. */
+static int pick(const char *pool, const hull_pool *p, const want *w, long long since,
+                held_member *out, unsigned *out_count)
+{
+	unsigned needed = w->count - w->named;
+	unsigned unnamed = 0u;
+	unsigned taken = 0u;
+	int      unnamed_done = w->kind == WANT_BOARD;
+
+	if (w->kind != WANT_BOARD) {
+		unsigned held = unnamed_held(pool);
+
+		unnamed = is_unlimited(p) ? needed :
+		          held < (unsigned)p->capacity ? (unsigned)p->capacity - held : 0u;
+	}
+	for (unsigned i = 0u; i < w->named; i++) {
+		const hull_member *m = member_of(p, w->names[i]);
+
+		if (m == NULL || m->broken || is_held(m->name))
+			return 0;
+		snprintf(out[taken].name, sizeof out[taken].name, "%s", m->name);
+		out[taken++].board = m->board;
+	}
+	for (unsigned i = 0u; needed > 0u && i <= p->count; i++) {
+		const hull_member *m = i < p->count ? &p->members[i] : NULL;
+		int                by_name = 0;
+
+		if (!unnamed_done && (m == NULL || m->priority <= 0)) {
+			unsigned some = unnamed < needed ? unnamed : needed;
+
+			needed -= some;
+			unnamed_done = 1;
+		}
+		if (m == NULL || needed == 0u)
+			break;
+		for (unsigned k = 0u; k < w->named; k++)
+			by_name |= strcmp(w->names[k], m->name) == 0;
+		if (by_name || !member_fits(m, w->kind) || m->broken || is_held(m->name) ||
+		    named_ahead(pool, m->name, since))
+			continue;
+		snprintf(out[taken].name, sizeof out[taken].name, "%s", m->name);
+		out[taken++].board = m->board;
+		needed--;
+	}
+	*out_count = taken;
+	return needed == 0u;
+}
+
+/* What stops `w`, for a person: the entry it names, or the pool's count. */
+static void in_use(const char *pool, const hull_pool *p, const want *w, char *text, size_t cap)
+{
+	unsigned used;
+	unsigned total;
+
+	for (unsigned i = 0u; i < w->named; i++)
+		if (is_held(w->names[i])) {
+			snprintf(text, cap, "%s is held", w->names[i]);
+			return;
+		}
+	tally(pool, p, w->kind, &used, &total);
+	snprintf(text, cap, "%u of %u in use", used, total);
 }
 
 static lease *find_lease(const char *id)
@@ -2318,6 +2579,33 @@ static unsigned under_lease(const char *id)
 	return n;
 }
 
+/* The entry of `l` a machine takes, in `member`, "" for an unnamed slot:
+ * 1, or 0 where it holds none of that kind no machine of it is on. */
+static int lease_entry(const lease *l, int board, char *member, size_t cap)
+{
+	unsigned unnamed = 0u;
+
+	for (unsigned k = 0u; k < l->held_count; k++) {
+		int taken = l->held[k].board != board;
+
+		for (unsigned i = 0u; i < MAX_MACHINES && !taken; i++)
+			taken = machines[i].used && !machines[i].exited &&
+			        strcmp(machines[i].lease, l->id) == 0 &&
+			        strcmp(machines[i].member, l->held[k].name) == 0;
+		if (!taken) {
+			snprintf(member, cap, "%s", l->held[k].name);
+			return 1;
+		}
+	}
+	if (board)
+		return 0;
+	for (unsigned i = 0u; i < MAX_MACHINES; i++)
+		unnamed += machines[i].used && !machines[i].exited &&
+		           strcmp(machines[i].lease, l->id) == 0 && machines[i].member[0] == '\0';
+	member[0] = '\0';
+	return unnamed < l->count - l->held_count;
+}
+
 /* A lease's file, written whole and then put in its place. 0, or -1. */
 static int save_lease(const lease *l)
 {
@@ -2333,6 +2621,9 @@ static int save_lease(const lease *l)
 	if ((file = fopen(made, "we")) == NULL)
 		return -1;
 	ok = fprintf(file, "pool %s\ncount %u\n", l->pool, l->count) > 0;
+	for (unsigned i = 0u; ok && i < l->held_count; i++)
+		ok = fprintf(file, "member %s %s\n", l->held[i].board ? "board" : "slot",
+		             l->held[i].name) > 0;
 	ok = fclose(file) == 0 && ok;
 	if (!ok || rename(made, path) != 0) {
 		unlink(made);
@@ -2350,19 +2641,23 @@ static void load_leases(void)
 
 	while (dir != NULL && n < MAX_LEASES && (entry = readdir(dir)) != NULL) {
 		char   path[4500];
+		char   kind[8];
 		FILE  *file;
 		lease  l = { 0 };
-		size_t n = strlen(entry->d_name);
+		size_t length = strlen(entry->d_name);
 
 		if (strncmp(entry->d_name, "lease-", 6u) != 0 || strchr(entry->d_name, '.') != NULL ||
-		    n >= sizeof l.id)
+		    length >= sizeof l.id)
 			continue;
 		snprintf(path, sizeof path, "%s/%s", lease_dir, entry->d_name);
 		if ((file = fopen(path, "re")) == NULL)
 			continue;
 		if (fscanf(file, "pool %63s count %u", l.pool, &l.count) == 2 && l.count > 0u) {
 			l.used = 1;
-			memcpy(l.id, entry->d_name, n + 1u);
+			memcpy(l.id, entry->d_name, length + 1u);
+			while (l.held_count < HULL_POOL_MEMBERS &&
+			       fscanf(file, " member %7s %63s", kind, l.held[l.held_count].name) == 2)
+				l.held[l.held_count++].board = strcmp(kind, "board") == 0;
 			leases[n++] = l;
 		}
 		fclose(file);
@@ -2382,26 +2677,27 @@ static unsigned waiting_in(const char *pool)
 	return n;
 }
 
-/* A waiting run's place in its pool's line, from 1. */
+/* A waiting run's place in its pool's line, from 1: behind what it could
+ * take from, and past what it could not. */
 static unsigned place_of(const waiting *w)
 {
-	unsigned place = 1u;
-
-	for (unsigned i = 0u; i < MAX_WAITING; i++)
-		place += waiters[i].used && &waiters[i] != w && strcmp(waiters[i].pool, w->pool) == 0 &&
-		         waiters[i].since < w->since;
-	return place;
+	return 1u + ahead_of(w->pool, &w->asked, w->since);
 }
 
 /* What a wait says on the run's stderr, where a log shows it: the pool,
  * its slots, the run's place, and how long it has waited. */
-static void say_waiting(waiting *w, long long capacity)
+static void say_waiting(waiting *w)
 {
-	char line[256];
-	int  n = snprintf(line, sizeof line, "hull: waiting for a slot of pool %s: %u of %lld in use, "
-	                  "place %u in line, waited %llds\n", w->pool, in_pool(w->pool), capacity,
-	                  place_of(w), (monotonic_ms() - w->since) / 1000);
+	static hull_pool p;
+	char             busy[100] = "";
+	char             line[300];
+	int              n;
 
+	if (hull_pool_read(w->pool, &p) == 0)
+		in_use(w->pool, &p, &w->asked, busy, sizeof busy);
+	n = snprintf(line, sizeof line, "hull: waiting for a slot of pool %s: %s, place %u in line, "
+	             "waited %llds\n", w->pool, busy, place_of(w),
+	             (monotonic_ms() - w->since) / 1000);
 	if (n > 0)
 		send_data(&clients[w->client], w->ch, 2, (const uint8_t *)line, (size_t)n);
 	w->noticed = monotonic_ms();
@@ -2410,7 +2706,7 @@ static void say_waiting(waiting *w, long long capacity)
 /* A request in its pool's line, `needed` slots, given up after `wait`
  * seconds, or -1 for never: said at once, as each minute after. */
 static void wait_in_line(client *c, uint32_t ch, const hull_sexpr_doc *body, const char *pool,
-                         unsigned needed, long long wait, long long capacity)
+                         const want *asked, long long wait)
 {
 	waiting *w = NULL;
 
@@ -2429,15 +2725,16 @@ static void wait_in_line(client *c, uint32_t ch, const hull_sexpr_doc *body, con
 	w->ch         = ch;
 	w->since      = monotonic_ms();
 	w->until      = wait > 0 ? w->since + wait * 1000 : 0;
-	w->needed     = needed;
+	w->asked      = *asked;
 	snprintf(w->pool, sizeof w->pool, "%s", pool);
-	say_waiting(w, capacity);
+	say_waiting(w);
 }
 
-/* Each pool's first waiting run: run where its pool has a slot, given up
- * where its wait has ended, and said again each minute; and any whose
- * frontend has gone let go of. Again while anything moved, since a run
- * that went may be followed by the next in its line. */
+/* Each request with nothing before it: run where its pool has what it
+ * asks, or where that can no longer come, which its handler then refuses;
+ * given up where its wait has ended, and said again each minute; and any
+ * whose frontend has gone let go of. Again while anything moved, since a
+ * run that went may be followed by the next in its line. */
 static void admit_waiting(void)
 {
 	int moved = 1;
@@ -2465,25 +2762,29 @@ static void admit_waiting(void)
 				free(w->body);
 				*w = (waiting){ 0 };
 			} else if (now - w->noticed >= NOTICE_MS) {
-				say_waiting(w, pool_capacity(w->pool));
+				say_waiting(w);
 			}
 		}
 		/* The first in each line, where its pool has a slot now. */
 		for (unsigned i = 0u; i < MAX_WAITING && !moved; i++) {
-			waiting  *w = &waiters[i];
-			long long capacity;
+			static hull_pool p;
+			static held_member picked[HULL_POOL_MEMBERS];
+			waiting          *w = &waiters[i];
+			unsigned          count = 0u;
+			char              why[300];
 
 			if (!w->used || place_of(w) != 1u)
 				continue;
-			capacity = pool_capacity(w->pool);
-			if (capacity <= 0 || in_pool(w->pool) + w->needed <= (unsigned)capacity) {
+			if (hull_pool_read(w->pool, &p) != 0 ||
+			    refused(w->pool, &p, &w->asked, NULL, why, sizeof why) ||
+			    pick(w->pool, &p, &w->asked, w->since, picked, &count)) {
 				waiting        taken = *w;
 				hull_sexpr_doc doc;
 
 				*w = (waiting){ 0 };
 				if (hull_sexpr_open(&doc, taken.body, taken.length, HULL_SEXPR_CANONICAL,
 				                    NULL) == HULL_SEXPR_OK) {
-					admitting = 1;
+					admitting = taken.since;
 					if (hull_msg_is(&doc, "lease"))
 						handle_lease_ask(&clients[taken.client], taken.ch, &doc);
 					else
@@ -2512,6 +2813,7 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	char              *class_name;
 	char              *given;
 	char              *dir_given;
+	char              *member_given;
 	char              *on_disconnect;
 	unsigned           generation;
 	slot              *s;
@@ -2523,6 +2825,8 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	char               granted_root[72];
 	char               pool_name[64];
 	char               lease_id[24];
+	char               member[64] = "";
+	int                on_board;
 
 	if (!hull_msg_find(body, "machine", &value) || !hull_msg_string(body, &value, id, sizeof id) ||
 	    !is_label(id)) {
@@ -2549,6 +2853,15 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	 * recorded only once its turn comes. */
 	pool_name[0] = '\0';
 	lease_id[0]  = '\0';
+	{
+		hull_sexpr_form top;
+		char           *name;
+
+		hull_sexpr_first(&plan_doc, &top);
+		name = hull_access_value(&plan_doc, &top, "engine");
+		on_board = name != NULL && strcmp(name, "board") == 0;
+		free(name);
+	}
 	/* Under a lease, `hull run --lease ID`, the plan's (under ID): a slot
 	 * of the lease's, its pool's already held, so it neither waits nor
 	 * takes another. */
@@ -2569,6 +2882,9 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 				         l->id, l->pool, pool);
 			else if (under_lease(l->id) >= l->count)
 				snprintf(why, sizeof why, "lease %s's %u slots are in use", l->id, l->count);
+			else if (!lease_entry(l, on_board, member, sizeof member))
+				snprintf(why, sizeof why, "lease %s holds no %s free", l->id,
+				         on_board ? "board" : "slot for a software machine");
 			free(pool);
 			free(id_given);
 			if (why[0] != '\0') {
@@ -2583,21 +2899,39 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		char *pool = hull_access_value(&plan_doc, &machine, "pool");
 
 		if (pool != NULL) {
-			long long capacity = pool_capacity(pool);
+			static hull_pool   p;
+			static held_member picked[HULL_POOL_MEMBERS];
+			want               asked = { .kind = on_board ? WANT_BOARD : WANT_SOFTWARE,
+			                             .count = 1u };
+			long long          since = admitting != 0 ? admitting : monotonic_ms() + 1;
+			unsigned           count = 0u;
+			char               why[300];
 
 			snprintf(pool_name, sizeof pool_name, "%s", pool);
 			free(pool);
-			if (capacity < 0) {
-				char why[300];
-
+			if (hull_pool_read(pool_name, &p) != 0) {
 				snprintf(why, sizeof why, "pool %s is not one the user's pools.conf names: "
 				         "(pools (%s (capacity N))) in ~/.config/hull/pools.conf",
 				         pool_name, pool_name);
 				send_error(c, ch, why);
 				return;
 			}
-			if (capacity > 0 && (in_pool(pool_name) >= (unsigned)capacity ||
-			                     (!admitting && waiting_in(pool_name) > 0))) {
+			{
+				hull_sexpr_form top;
+				char           *class_given;
+				int             no;
+
+				hull_sexpr_first(&plan_doc, &top);
+				class_given = hull_access_value(&plan_doc, &top, "class");
+				no = refused(pool_name, &p, &asked, class_given, why, sizeof why);
+				free(class_given);
+				if (no) {
+					send_error(c, ch, why);
+					return;
+				}
+			}
+			if (ahead_of(pool_name, &asked, since) > 0u ||
+			    !pick(pool_name, &p, &asked, since, picked, &count)) {
 				hull_sexpr_form top;
 				char           *text;
 				long long       wait = -1;
@@ -2607,16 +2941,19 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 					wait = strtoll(text, NULL, 10);
 				free(text);
 				if (wait == 0) {
-					char why[300];
+					char busy[100];
 
-					snprintf(why, sizeof why, "no slot of pool %s: %u of %lld in use, and the "
-					         "run does not wait", pool_name, in_pool(pool_name), capacity);
+					in_use(pool_name, &p, &asked, busy, sizeof busy);
+					snprintf(why, sizeof why, "no slot of pool %s: %s, and the run does not "
+					         "wait", pool_name, busy);
 					send_error(c, ch, why);
 					return;
 				}
-				wait_in_line(c, ch, body, pool_name, 1u, wait, capacity);
+				wait_in_line(c, ch, body, pool_name, &asked, wait);
 				return;
 			}
+			if (count > 0u)
+				snprintf(member, sizeof member, "%s", picked[0].name);
 		}
 	}
 	/* Root mode's machine: hull-root grants it, the host's owner having
@@ -2667,12 +3004,15 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		class_name  = hull_access_value(&plan_doc, &top, "class");
 		given       = hull_access_value(&plan_doc, &top, "address");
 		dir_given   = hull_access_value(&plan_doc, &top, "secrets");
+		member_given = hull_access_value(&plan_doc, &top, "member");
 	}
-	if (given != NULL || dir_given != NULL) {
+	if (given != NULL || dir_given != NULL || member_given != NULL) {
 		send_error(c, ch, given != NULL ? "a plan's address is the core's to give" :
-		                                  "a plan's secrets' directory is the core's to give");
+		                  dir_given != NULL ? "a plan's secrets' directory is the core's to give" :
+		                                      "a plan's member is the core's to give");
 		free(given);
 		free(dir_given);
+		free(member_given);
 		free(engine_name);
 		free(class_name);
 		return;
@@ -2738,6 +3078,7 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	snprintf(s->state, sizeof s->state, "creating");
 	snprintf(s->pool, sizeof s->pool, "%s", pool_name);
 	snprintf(s->lease, sizeof s->lease, "%s", lease_id);
+	snprintf(s->member, sizeof s->member, "%s", member);
 	free(class_name);
 	/* Its arch, for what is committed of it while it runs; the host's is
 	 * said by saying none. */
@@ -2772,6 +3113,19 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	}
 	plan.data = addressed;
 	plan.len  = addressed_length;
+	if (on_board) {
+		uint8_t *with = with_member(&plan, member, &addressed_length);
+
+		free(addressed);
+		if (with == NULL) {
+			send_error(c, ch, "the plan is not a plan");
+			s->used = 0;
+			return;
+		}
+		addressed = with;
+		plan.data = addressed;
+		plan.len  = addressed_length;
+	}
 	if (hull_access_find(&plan_doc, &machine, "secrets", &secrets)) {
 		char        dir[4300];
 		const char *why = write_secrets(id, &plan_doc, &secrets, body, dir, sizeof dir);
@@ -3944,48 +4298,76 @@ static void handle_gc(client *c, uint32_t ch)
 	pthread_detach(thread);
 }
 
-/* `(lease (ch n) (count N) (pool P) (wait S)?)`: N slots of P held as a
- * lease, answered with its id, or waited for in P's line as a run waits
- * (section 4.12). A lease has no end but its release. */
+/* `(lease (ch n) (count N) (kind K) (members NAMES) (pool P) (wait S)?)`:
+ * N slots of P held as a lease, those NAMES lists, comma between them, and
+ * the rest what fills first, of kind K, any, board or slot; answered with
+ * its id, or waited for in P's line as a run waits (section 4.12). A lease
+ * has no end but its release. */
 static void handle_lease_ask(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
-	hull_sexpr_form value;
-	char            pool[64];
-	long long       count = 0;
-	long long       wait = -1;
-	long long       capacity;
-	char            why[300];
-	lease          *l = NULL;
+	static hull_pool   p;
+	static held_member picked[HULL_POOL_MEMBERS];
+	static want        asked;
+	hull_sexpr_form    value;
+	char               pool[64];
+	char               kind[8];
+	char               names[HULL_POOL_MEMBERS * 64u];
+	long long          count = 0;
+	long long          wait = -1;
+	long long          since = admitting != 0 ? admitting : monotonic_ms() + 1;
+	unsigned           picked_count = 0u;
+	char               why[300];
+	lease             *l = NULL;
 
 	if (!hull_msg_find(body, "pool", &value) || !hull_msg_string(body, &value, pool, sizeof pool) ||
 	    !is_label(pool) || !hull_msg_find(body, "count", &value) ||
-	    !hull_msg_long(body, &value, &count) || count < 1 || count > 65535) {
+	    !hull_msg_long(body, &value, &count) || count < 1 || count > 65535 ||
+	    !hull_msg_find(body, "kind", &value) || !hull_msg_string(body, &value, kind, sizeof kind) ||
+	    !hull_msg_find(body, "members", &value) ||
+	    !hull_msg_string(body, &value, names, sizeof names)) {
 		send_error(c, ch, "a lease is of a pool, by its name, and of 1 slot or more");
+		return;
+	}
+	memset(&asked, 0, sizeof asked);
+	asked.count = (unsigned)count;
+	asked.kind  = strcmp(kind, "board") == 0 ? WANT_BOARD :
+	              strcmp(kind, "slot") == 0  ? WANT_SOFTWARE : WANT_ANY;
+	for (char *name = strtok(names, ","); name != NULL; name = strtok(NULL, ",")) {
+		if (asked.named == HULL_POOL_MEMBERS || strlen(name) >= sizeof asked.names[0]) {
+			send_error(c, ch, "a lease names too many members, or one too long");
+			return;
+		}
+		snprintf(asked.names[asked.named++], sizeof asked.names[0], "%s", name);
+	}
+	if (asked.named > asked.count) {
+		snprintf(why, sizeof why, "a lease of %u names %u members", asked.count, asked.named);
+		send_error(c, ch, why);
 		return;
 	}
 	if (hull_msg_find(body, "wait", &value))
 		hull_msg_long(body, &value, &wait);
-	if ((capacity = pool_capacity(pool)) < 0) {
+	if (hull_pool_read(pool, &p) != 0) {
 		snprintf(why, sizeof why, "pool %s is not one the user's pools.conf names: "
 		         "(pools (%s (capacity N))) in ~/.config/hull/pools.conf", pool, pool);
 		send_error(c, ch, why);
 		return;
 	}
-	if (capacity > 0 && count > capacity) {
-		snprintf(why, sizeof why, "pool %s has %lld slots, and the lease asks %lld", pool,
-		         capacity, count);
+	if (refused(pool, &p, &asked, NULL, why, sizeof why)) {
 		send_error(c, ch, why);
 		return;
 	}
-	if (capacity > 0 && (in_pool(pool) + (unsigned)count > (unsigned)capacity ||
-	                     (!admitting && waiting_in(pool) > 0))) {
+	if (ahead_of(pool, &asked, since) > 0u ||
+	    !pick(pool, &p, &asked, since, picked, &picked_count)) {
 		if (wait == 0) {
-			snprintf(why, sizeof why, "no slot of pool %s: %u of %lld in use, and the lease "
-			         "does not wait", pool, in_pool(pool), capacity);
+			char busy[100];
+
+			in_use(pool, &p, &asked, busy, sizeof busy);
+			snprintf(why, sizeof why, "no slot of pool %s: %s, and the lease does not wait",
+			         pool, busy);
 			send_error(c, ch, why);
 			return;
 		}
-		wait_in_line(c, ch, body, pool, (unsigned)count, wait, capacity);
+		wait_in_line(c, ch, body, pool, &asked, wait);
 		return;
 	}
 	for (unsigned i = 0u; i < MAX_LEASES && l == NULL; i++)
@@ -4001,7 +4383,8 @@ static void handle_lease_ask(client *c, uint32_t ch, const hull_sexpr_doc *body)
 
 		if (getrandom(&random_id, sizeof random_id, 0) != (ssize_t)sizeof random_id)
 			random_id = (uint32_t)getpid() ^ (uint32_t)monotonic_ms();
-		*l = (lease){ .used = 1, .count = (unsigned)count };
+		*l = (lease){ .used = 1, .count = (unsigned)count, .held_count = picked_count };
+		memcpy(l->held, picked, picked_count * sizeof picked[0]);
 		snprintf(l->id, sizeof l->id, "lease-%08x", random_id);
 		snprintf(l->pool, sizeof l->pool, "%s", pool);
 		if (save_lease(l) != 0) {
@@ -4111,10 +4494,16 @@ static void handle_pools(client *c, uint32_t ch)
 			        HULL_SEXPR_OK)
 				continue;
 			pool[pool_length] = '\0';
+			static hull_pool p;
+			unsigned         used = 0u;
+			unsigned         total = 0u;
+
+			if (hull_pool_read((const char *)pool, &p) == 0)
+				tally((const char *)pool, &p, WANT_ANY, &used, &total);
 			hull_msg_raw(&m, "(4:pool(8:capacity");
-			hull_msg_number(&m, pool_capacity((const char *)pool));
+			hull_msg_number(&m, total);
 			hull_msg_raw(&m, ")(4:held");
-			hull_msg_number(&m, in_pool((const char *)pool));
+			hull_msg_number(&m, used);
 			hull_msg_raw(&m, ")(4:name");
 			hull_msg_text(&m, (const char *)pool);
 			hull_msg_raw(&m, ")(7:waiting");
@@ -4123,6 +4512,49 @@ static void handle_pools(client *c, uint32_t ch)
 		}
 	}
 	free(text);
+	hull_msg_raw(&m, ")");
+	send_to(c, &m);
+}
+
+/* `(members (ch n) (pool P))`: each entry of P in the order it fills,
+ * `(member (holder H) (kind K) (name N) (priority R) (state S))`, S free,
+ * running, leased or broken, H who holds it or "". */
+static void handle_members(client *c, uint32_t ch, const hull_sexpr_doc *body)
+{
+	static hull_pool p;
+	hull_sexpr_form  value;
+	char             pool[64];
+	char             why[300];
+	hull_msg         m = { 0 };
+
+	if (!hull_msg_find(body, "pool", &value) || !hull_msg_string(body, &value, pool, sizeof pool) ||
+	    hull_pool_read(pool, &p) != 0) {
+		snprintf(why, sizeof why, "no pool of that name in the user's pools.conf");
+		send_error(c, ch, why);
+		return;
+	}
+	hull_msg_raw(&m, "(7:members");
+	hull_msg_channel(&m, ch);
+	for (unsigned i = 0u; i < p.count; i++) {
+		const hull_member *entry = &p.members[i];
+		int                leased = 0;
+		const char        *holder = holder_of(entry->name, &leased);
+		char               priority[16];
+
+		snprintf(priority, sizeof priority, "%d", entry->priority);
+		hull_msg_raw(&m, "(6:member(6:holder");
+		hull_msg_text(&m, holder != NULL ? holder : "");
+		hull_msg_raw(&m, ")(4:kind");
+		hull_msg_text(&m, entry->board ? "board" : "slot");
+		hull_msg_raw(&m, ")(4:name");
+		hull_msg_text(&m, entry->name);
+		hull_msg_raw(&m, ")(8:priority");
+		hull_msg_text(&m, priority);
+		hull_msg_raw(&m, ")(5:state");
+		hull_msg_text(&m, entry->broken ? "broken" : holder == NULL ? "free" :
+		                  leased ? "leased" : "running");
+		hull_msg_raw(&m, "))");
+	}
 	hull_msg_raw(&m, ")");
 	send_to(c, &m);
 }
@@ -4228,6 +4660,8 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		handle_free(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "leases")) {
 		handle_leases(c, (uint32_t)ch);
+	} else if (hull_msg_is(body, "members")) {
+		handle_members(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "pools")) {
 		handle_pools(c, (uint32_t)ch);
 	} else {

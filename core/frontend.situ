@@ -42,6 +42,7 @@ const FREE     = ('4' << 24) | (':' << 16) | ('f' << 8) | 'r';
 const LEASES   = ('6' << 24) | (':' << 16) | ('l' << 8) | 'e';
 const POOLS    = ('5' << 24) | (':' << 16) | ('p' << 8) | 'o';  // PORTS's, the other way
 const SLOTS    = ('5' << 24) | (':' << 16) | ('s' << 8) | 'l';
+const MEMBERS  = ('7' << 24) | (':' << 16) | ('m' << 8) | 'e';  // both ways
 const STARTED  = ('7' << 24) | (':' << 16) | ('s' << 8) | 't';
 const DATA     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'a';
 const EXITED   = ('6' << 24) | (':' << 16) | ('e' << 8) | 'x';
@@ -83,6 +84,7 @@ struct client_message {
 		case FREE:    free_lease    free;
 		case LEASES:  leases_ask    leases;
 		case POOLS:   pools_ask     pools;
+		case MEMBERS: members_ask   members;
 		case DATA:    client_data   data;
 		case EOF:     eof           eof;
 		case CREDIT:  credit        credit;
@@ -180,13 +182,19 @@ struct stop {
 	preamble u8[2] = "))";
 }
 
-// A lease of `count` slots of a pool (section 4.12), waited for as a run
-// waits, `(wait N)` seconds, 0 not at all; answered `lease`, its id.
+// A lease of `count` slots of a pool (section 4.12), those `members` lists
+// by name, a comma between them, the rest what fills first of `kind`: any,
+// board or slot. Waited for as a run waits, `(wait N)` seconds, 0 not at
+// all; answered `lease`, its id.
 struct lease_ask {
 	preamble u8[7] = "5:lease";
 	channel  ch;
 	preamble u8[8] = "(5:count";
 	atom  count;
+	preamble u8[8] = ")(4:kind";
+	atom  kind;
+	preamble u8[11] = ")(7:members";
+	atom  names;
 	preamble u8[8] = ")(4:pool";
 	atom  pool;
 	u8  close_pool  [must_eq = ')'];
@@ -225,6 +233,15 @@ struct pools_ask {
 	preamble u8[7] = "5:pools";
 	channel  ch;
 	u8  close  [must_eq = ')'];
+}
+
+// A pool's entries, in the order they fill, answered `members`.
+struct members_ask {
+	preamble u8[9] = "7:members";
+	channel  ch;
+	preamble u8[7] = "(4:pool";
+	atom  pool;
+	preamble u8[2] = "))";
 }
 
 // The machines the core holds, answered `machines`.
@@ -462,6 +479,7 @@ struct core_message {
 		case LEASE:     leased      lease;
 		case LEASES:    leases      leases;
 		case SLOTS:     slots       slots;
+		case MEMBERS:   members     members;
 		case ERROR:     failure     error;
 		default:        unknown     unknown;
 	}
@@ -625,6 +643,13 @@ struct leases {
 // `pools`' answer: each pool, its capacity and its slots, framed.
 struct slots {
 	preamble u8[7] = "5:slots";
+	channel  ch;
+	form     items[]  until ")";
+}
+
+// `members`' answer: each entry, its kind, priority, state and holder, framed.
+struct members {
+	preamble u8[9] = "7:members";
 	channel  ch;
 	form     items[]  until ")";
 }

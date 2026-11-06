@@ -69,6 +69,7 @@ struct hull_machine {
 	hull_board      board;
 	int             on_board;     /* `board` is taken, for hw_login */
 	char           *pool;
+	char            member[64];   /* the plan's (member ...): the board the core chose */
 	char           *source;       /* the tree here */
 	char           *workdir;
 	char           *argv[MAX_ARGS];
@@ -137,9 +138,108 @@ static void field(const hull_sexpr_doc *doc, const hull_sexpr_form *record, cons
 		out[length] = '\0';
 }
 
+/* pools.conf whole, to be freed, or NULL where there is none. */
+static uint8_t *config_text(size_t *length)
+{
+	char     path[4200];
+	uint8_t *text;
+	FILE    *file;
+
+	if (config_path(path, sizeof path) == NULL || (file = fopen(path, "re")) == NULL)
+		return NULL;
+	if ((text = malloc(65536u)) != NULL)
+		*length = fread(text, 1u, 65536u, file);
+	fclose(file);
+	return text;
+}
+
+/* One member read into `pool`, or what is wrong with it said. A name goes
+ * into a lease's file and a wire's list, so it is one word. */
+static void add_member(hull_pool *pool, const hull_sexpr_doc *doc, const hull_sexpr_form *item)
+{
+	hull_sexpr_form head;
+	hull_sexpr_form name;
+	hull_member     m = { 0 };
+	char            address[128];
+	char            priority[24];
+	char           *end;
+	size_t          n = 0u;
+	unsigned        at;
+
+	if (item->kind != HULL_SEXPR_LIST || !hull_sexpr_child(doc, item, &head))
+		return;
+	m.board = hull_sexpr_is(doc, &head, "board");
+	if ((!m.board && !hull_sexpr_is(doc, &head, "slot")) || !hull_sexpr_next(doc, &head, &name) ||
+	    hull_sexpr_value(doc, &name, (uint8_t *)m.name, sizeof m.name - 1u, &n) != HULL_SEXPR_OK)
+		return;
+	m.name[n] = '\0';
+	if (n == 0u || strpbrk(m.name, " \t\r\n,") != NULL) {
+		snprintf(pool->wrong, sizeof pool->wrong, "a member's name is one word: \"%.63s\"", m.name);
+		return;
+	}
+	field(doc, item, "priority", priority, sizeof priority);
+	m.priority = (int)strtol(priority, &end, 10);
+	if (*end != '\0') {
+		snprintf(pool->wrong, sizeof pool->wrong, "member %s: (priority %s) is not a number",
+		         m.name, priority);
+		return;
+	}
+	if (m.board) {
+		field(doc, item, "address", address, sizeof address);
+		if (address[0] == '\0') {
+			snprintf(pool->wrong, sizeof pool->wrong, "board %s has no (address ...)", m.name);
+			return;
+		}
+		m.broken = hull_hw_broken(m.name);
+	}
+	if (pool->count == HULL_POOL_MEMBERS) {
+		snprintf(pool->wrong, sizeof pool->wrong, "a pool holds %u members at most",
+		         HULL_POOL_MEMBERS);
+		return;
+	}
+	/* The higher first, and those of one priority as the file has them. */
+	for (at = pool->count; at > 0u && pool->members[at - 1u].priority < m.priority; at--)
+		pool->members[at] = pool->members[at - 1u];
+	pool->members[at] = m;
+	pool->count++;
+}
+
+int hull_pool_read(const char *name, hull_pool *pool)
+{
+	size_t          length = 0u;
+	uint8_t        *text = config_text(&length);
+	hull_sexpr_doc  doc;
+	hull_sexpr_form top;
+	hull_sexpr_form entry;
+	hull_sexpr_form members;
+	hull_sexpr_form item;
+	int             named = -1;
+
+	memset(pool, 0, sizeof *pool);
+	if (text != NULL &&
+	    hull_sexpr_open(&doc, text, length, HULL_SEXPR_READABLE, NULL) == HULL_SEXPR_OK &&
+	    hull_sexpr_first(&doc, &top) && hull_access_find(&doc, &top, name, &entry)) {
+		char  capacity[24];
+		char *end;
+
+		named = 0;
+		/* The file is written by hand, its numbers bare: read as the
+		 * spec's values are, not as a canonical plan's atoms. */
+		field(&doc, &entry, "capacity", capacity, sizeof capacity);
+		pool->capacity = strtoll(capacity, &end, 10);
+		if (*end != '\0' || pool->capacity < 0)
+			snprintf(pool->wrong, sizeof pool->wrong, "(capacity %s) is not a count", capacity);
+		if (hull_access_find(&doc, &entry, "members", &members) &&
+		    hull_sexpr_child(&doc, &members, &item))
+			while (hull_sexpr_next(&doc, &item, &item))
+				add_member(pool, &doc, &item);
+	}
+	free(text);
+	return named;
+}
+
 int hull_hw_boards(const char *pool, hull_board *boards, unsigned cap)
 {
-	char            path[4200];
 	uint8_t        *text;
 	size_t          length = 0u;
 	hull_sexpr_doc  doc;
@@ -147,17 +247,10 @@ int hull_hw_boards(const char *pool, hull_board *boards, unsigned cap)
 	hull_sexpr_form entry;
 	hull_sexpr_form members;
 	hull_sexpr_form item;
-	FILE           *file;
 	int             count = -1;
 
-	if (config_path(path, sizeof path) == NULL || (file = fopen(path, "re")) == NULL)
+	if ((text = config_text(&length)) == NULL)
 		return -1;
-	if ((text = malloc(65536u)) == NULL) {
-		fclose(file);
-		return -1;
-	}
-	length = fread(text, 1u, 65536u, file);
-	fclose(file);
 	if (hull_sexpr_open(&doc, text, length, HULL_SEXPR_READABLE, NULL) == HULL_SEXPR_OK &&
 	    hull_sexpr_first(&doc, &top) && hull_access_find(&doc, &top, pool, &entry) &&
 	    hull_access_find(&doc, &entry, "members", &members) &&
@@ -248,8 +341,10 @@ static void mark_broken(const char *name, const char *why)
 	}
 }
 
-/* A board of the pool neither held nor broken, taken: 0, or -1. */
-static int take_board(const char *pool, hull_board *board)
+/* The board `name` of the pool, which the core chose, taken: 0, or -1
+ * where it has gone from the file, is broken, or is held all the same: by
+ * a machine of another pool it is also a member of, say. */
+static int take_board(const char *pool, const char *name, hull_board *board)
 {
 	hull_board boards[MAX_BUSY];
 	int        count = hull_hw_boards(pool, boards, MAX_BUSY);
@@ -257,12 +352,15 @@ static int take_board(const char *pool, hull_board *board)
 
 	pthread_mutex_lock(&busy_lock);
 	for (int i = 0; i < count && taken < 0; i++) {
-		int held = hull_hw_broken(boards[i].name);
+		int held;
 
+		if (strcmp(boards[i].name, name) != 0)
+			continue;
+		held = hull_hw_broken(boards[i].name);
 		for (unsigned k = 0u; k < MAX_BUSY && !held; k++)
 			held = strcmp(busy[k], boards[i].name) == 0;
 		if (held)
-			continue;
+			break;
 		for (unsigned k = 0u; k < MAX_BUSY; k++)
 			if (busy[k][0] == '\0') {
 				memcpy(busy[k], boards[i].name, sizeof busy[k]);
@@ -270,6 +368,7 @@ static int take_board(const char *pool, hull_board *board)
 				taken = i;
 				break;
 			}
+		break;
 	}
 	pthread_mutex_unlock(&busy_lock);
 	return taken < 0 ? -1 : 0;
@@ -790,11 +889,18 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	free(source);
 	m->pool    = hull_access_value(doc, &machine, "pool");
 	m->workdir = hull_access_value(doc, &machine, "workdir");
+	if (hull_sexpr_first(doc, &entry)) {
+		name = hull_access_value(doc, &entry, "member");
+		snprintf(m->member, sizeof m->member, "%s", name != NULL ? name : "");
+		free(name);
+	}
 	name       = hull_access_value(doc, &machine, "hostname");
 	snprintf(m->id, sizeof m->id, "%s", name != NULL ? name : "machine");
 	free(name);
 	if (m->pool == NULL)
 		return "a board comes from a pool: (pool \"NAME\"), its members in pools.conf";
+	if (m->member[0] == '\0')
+		return "the core names no board for the machine";
 	if (m->source == NULL || m->workdir == NULL)
 		return "the plan is missing its source or workdir";
 	if (!hull_access_find(doc, &machine, "command", &entry))
@@ -901,9 +1007,9 @@ static hull_status hw_create(hull_core *core, hull_buf plan, hull_machine **out,
 		release(m);
 		return fail(error, HULL_ERR_UNSUPPORTED, why);
 	}
-	if (take_board(m->pool, &m->board) != 0) {
-		snprintf(why, sizeof why, "pool %s has no board free and not broken: `hull board ls`",
-		         m->pool);
+	if (take_board(m->pool, m->member, &m->board) != 0) {
+		snprintf(why, sizeof why, "board %.63s of pool %.63s is broken or held: `hull pool ls %.63s`",
+		         m->member, m->pool, m->pool);
 		release(m);
 		return fail(error, HULL_ERR_RUNTIME, why);
 	}

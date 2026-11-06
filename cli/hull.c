@@ -126,8 +126,9 @@ static void usage(FILE *out)
 	      "       hull check [-f FILE] --backend B[,B...] [--accept TOKEN]...\n"
 	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [--wait D|--no-wait]\n"
 	      "                [--lease ID] [NAME]\n"
-	      "       hull reserve POOL [--count N] [--wait D|--no-wait] | hull release ID\n"
-	      "       hull pool ls | hull lease ls\n"
+	      "       hull reserve POOL [--count N] [--member NAME]... [--kind board|slot]\n"
+	      "                    [--wait D|--no-wait] | hull release ID\n"
+	      "       hull pool ls [POOL] | hull lease ls\n"
 	      "       hull pack DIR|REF FILE | hull unpack FILE|- DIR\n"
 	      "       hull export --bootable DIR|REF IMAGE [--init PATH | --host TTY]\n"
 	      "       hull kernel fetch [--arch ARCH]\n"
@@ -4871,8 +4872,10 @@ static int ask_core(hull_wire *wire, hull_msg *m, hull_sexpr_doc *body, int *sta
 	}
 }
 
-/* `hull reserve POOL [--count N] [--wait D|--no-wait]`: a lease's id,
- * alone on stdout, so that `lease=$(hull reserve ci)` takes it. */
+/* `hull reserve POOL [--count N] [--member NAME]... [--kind board|slot]
+ * [--wait D|--no-wait]`: a lease's id, alone on stdout, so that
+ * `lease=$(hull reserve ci)` takes it. Its count is what it names, or 1,
+ * unless it says; what is not named is what fills first. */
 static int reserve(int argc, char **argv)
 {
 	hull_wire       wire;
@@ -4880,15 +4883,33 @@ static int reserve(int argc, char **argv)
 	hull_sexpr_form value;
 	hull_msg        m = { 0 };
 	const char     *pool = NULL;
-	long long       count = 1;
+	long long       count = 0;
 	long long       wait = -1;
 	int             status = 0;
 	char            id[64] = "";
+	char            names[4096] = "";
+	size_t          names_at = 0u;
+	unsigned        named = 0u;
+	const char     *kind = "any";
+	int             bad = 0;
 
 	for (int i = 2; i < argc; i++) {
 		if (strcmp(argv[i], "--count") == 0 && i + 1 < argc)
-			count = strtoll(argv[++i], NULL, 10);
-		else if (strcmp(argv[i], "--wait") == 0 && i + 1 < argc)
+			bad |= (count = strtoll(argv[++i], NULL, 10)) < 1;
+		else if (strcmp(argv[i], "--member") == 0 && i + 1 < argc) {
+			int n = snprintf(names + names_at, sizeof names - names_at, "%s%s",
+			                 named > 0u ? "," : "", argv[++i]);
+
+			/* The list has a comma for a separator, so none in a name. */
+			bad |= n < 0 || (size_t)n >= sizeof names - names_at || argv[i][0] == '\0' ||
+			       strchr(argv[i], ',') != NULL;
+			if (!bad)
+				names_at += (size_t)n;
+			named++;
+		} else if (strcmp(argv[i], "--kind") == 0 && i + 1 < argc) {
+			kind = argv[++i];
+			bad |= strcmp(kind, "board") != 0 && strcmp(kind, "slot") != 0;
+		} else if (strcmp(argv[i], "--wait") == 0 && i + 1 < argc)
 			wait = seconds_of(argv[++i]) > 0 ? seconds_of(argv[i]) : -2;
 		else if (strcmp(argv[i], "--no-wait") == 0)
 			wait = 0;
@@ -4897,7 +4918,9 @@ static int reserve(int argc, char **argv)
 		else
 			pool = NULL, i = argc;
 	}
-	if (pool == NULL || count < 1 || wait == -2) {
+	if (count == 0)
+		count = named > 0u ? named : 1;
+	if (pool == NULL || bad || wait == -2) {
 		usage(stderr);
 		return 2;
 	}
@@ -4905,6 +4928,10 @@ static int reserve(int argc, char **argv)
 	hull_msg_channel(&m, 1u);
 	hull_msg_raw(&m, "(5:count");
 	hull_msg_number(&m, count);
+	hull_msg_raw(&m, ")(4:kind");
+	hull_msg_text(&m, kind);
+	hull_msg_raw(&m, ")(7:members");
+	hull_msg_text(&m, names);
 	hull_msg_raw(&m, ")(4:pool");
 	hull_msg_text(&m, pool);
 	hull_msg_raw(&m, ")");
@@ -4998,6 +5025,51 @@ static int list_of(int pools)
 			printf("%-24s %-9s %-6s %s\n", values[0], values[1], values[2], values[3]);
 		else
 			printf("%-24s %-24s %-6s %s\n", values[0], values[1], values[2], values[3]);
+	}
+	hull_wire_close(&wire);
+	return 0;
+}
+
+/* `hull pool ls POOL`: each entry in the order it fills, one line a
+ * record, its columns fixed, a header first; "-" for no holder. */
+static int pool_members(const char *pool)
+{
+	static const char *const keys[] = { "name", "kind", "priority", "state", "holder" };
+	hull_wire                wire;
+	hull_sexpr_doc           body;
+	hull_sexpr_form          message;
+	hull_sexpr_form          item;
+	hull_msg                 m = { 0 };
+	int                      status = 0;
+
+	hull_msg_raw(&m, "(7:members");
+	hull_msg_channel(&m, 1u);
+	hull_msg_raw(&m, "(4:pool");
+	hull_msg_text(&m, pool);
+	hull_msg_raw(&m, "))");
+	if (ask_core(&wire, &m, &body, &status, 1) != 0)
+		return status;
+	printf("%-24s %-6s %-9s %-8s %s\n", "MEMBER", "KIND", "PRIORITY", "STATE", "HOLDER");
+	hull_sexpr_first(&body, &message);
+	hull_sexpr_child(&body, &message, &item);
+	while (hull_sexpr_next(&body, &item, &item)) {
+		char            values[5][64] = { "", "", "", "", "" };
+		hull_sexpr_form head;
+
+		if (item.kind != HULL_SEXPR_LIST || !hull_sexpr_child(&body, &item, &head) ||
+		    !hull_sexpr_is(&body, &head, "member"))
+			continue;
+		for (unsigned k = 0u; k < 5u; k++) {
+			hull_sexpr_form value;
+			hull_sexpr_form name;
+			hull_sexpr_form v;
+
+			if (hull_access_find(&body, &item, keys[k], &value) &&
+			    hull_sexpr_child(&body, &value, &name) && hull_sexpr_next(&body, &name, &v))
+				hull_msg_string(&body, &v, values[k], sizeof values[k]);
+		}
+		printf("%-24s %-6s %-9s %-8s %s\n", values[0], values[1], values[2], values[3],
+		       values[4][0] != '\0' ? values[4] : "-");
 	}
 	hull_wire_close(&wire);
 	return 0;
@@ -7409,6 +7481,8 @@ int main(int argc, char **argv)
 		return list_of(0);
 	if (strcmp(command, "pool") == 0 && argc == 3 && strcmp(argv[2], "ls") == 0)
 		return list_of(1);
+	if (strcmp(command, "pool") == 0 && argc == 4 && strcmp(argv[2], "ls") == 0)
+		return pool_members(argv[3]);
 	if (strcmp(command, "images") == 0 && argc == 2)
 		return images();
 	if (strcmp(command, "diff") == 0 && argc == 4)

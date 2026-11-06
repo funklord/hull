@@ -136,7 +136,13 @@ cat > "$XDG_CONFIG_HOME/hull/pools.conf" <<CONF
            (power "$root/power s $((port + 2))") (health "false"))))
   (dark (members
     (board "d" (address "127.0.0.1") (port $((port + 3))) (root "$root/on-a") (wait 3)
-           (power "$root/power d $((port + 3))")))))
+           (power "$root/power d $((port + 3))"))))
+  (steer (capacity 1) (members
+    (board "low" (priority -1) (address "127.0.0.1") (port $((port + 4))) (root "$root/on-a")
+           (power "$root/power low $((port + 4))"))
+    (board "high" (priority 3) (address "127.0.0.1") (port $((port + 5))) (root "$root/on-b")
+           (power "$root/power high $((port + 5))"))))
+  (soft (capacity 1)))
 CONF
 : > "$root/d.dead"
 
@@ -293,13 +299,56 @@ cases=$((cases + 1))
 timeout 20 "$hull" stop --timeout 1 door > /dev/null 2>&1
 wait "$pid"
 
+# --- what a pool holds: a machine's spec chooses, the pool only supplies -------
+
+conf fill '(backend hw) (pool "steer") (command "/probe" "say" "ran")'
+conf soft '(backend chroot) (pool "steer") (command "/probe" "say" "soft")'
+powered() { # WORD...: what went on since the log was emptied, in order
+	awk '$2 == "on" { print $1 }' "$root/power.log" | tr '\n' ' '
+}
+: > "$root/power.log"
+expect 0 '^ran$' "$hull" run -f "$root/project/fill.conf"
+cases=$((cases + 1))
+[ "$(powered)" = 'high ' ] || fail 'the board of the highest priority did not fill first' "$(cat "$root/power.log")"
+# Named, the lease holds that board, and a run under it lands there.
+lease=$(timeout 20 "$hull" reserve steer --member low)
+expect 0 "^low +board +-1 +leased +$lease\$" "$hull" pool ls steer
+: > "$root/power.log"
+expect 0 '^ran$' "$hull" run --lease "$lease" -f "$root/project/fill.conf"
+cases=$((cases + 1))
+[ "$(powered)" = 'low ' ] || fail 'a run under a lease by name was not on that board' "$(cat "$root/power.log")"
+expect 125 "lease $lease holds no slot for a software machine" "$hull" run --lease "$lease" -f "$root/project/soft.conf"
+# With every board held the hw run is told 75, and a software machine still
+# has the pool's capacity: neither is counted against the other.
+any=$(timeout 20 "$hull" reserve steer --kind board)
+expect 0 "^high +board +3 +leased +$any\$" "$hull" pool ls steer
+expect 75 'no slot of pool steer: 2 of 2 in use' "$hull" run --no-wait -f "$root/project/fill.conf"
+expect 0 '^soft$' "$hull" run --no-wait -f "$root/project/soft.conf"
+expect 0 '' "$hull" release "$lease"
+expect 0 '' "$hull" release "$any"
+# A lease of a slot holds no board, so a hw run under it is told.
+lease=$(timeout 20 "$hull" reserve steer --kind slot)
+expect 125 "lease $lease holds no board free" "$hull" run --lease "$lease" -f "$root/project/fill.conf"
+expect 0 '^high +board +3 +free +-$' "$hull" pool ls steer
+expect 0 '^ran$' "$hull" run --no-wait -f "$root/project/fill.conf"
+expect 0 '' "$hull" release "$lease"
+# What the pool has nothing for is refused: a chroot machine in a pool of
+# boards would hold a board it does not use, a hw machine in a pool of
+# software slots would have nowhere to go.
+conf stray '(backend chroot) (pool "bench") (command "/probe" "say" "stray")'
+expect 125 'pool bench has nothing for a ns machine' "$hull" run -f "$root/project/stray.conf"
+conf noboard '(backend hw) (pool "soft") (command "/probe" "say" "no")'
+expect 125 'pool soft has no boards for a hw machine' "$hull" run -f "$root/project/noboard.conf"
+
 # --- recovery: cycled, then marked, and out of its pool -----------------------
 
 conf sick '(backend hw) (pool "sick") (command "/probe" "say" "never")'
 expect 125 'marked broken: its health check failed' "$hull" run -f "$root/project/sick.conf"
 expect 0 '^s +127.0.0.1 +broken' "$hull" board ls sick
 # Every board broken is no wait's to end: said at once, naming what fixes it.
-expect 125 'no board free and not broken' "$hull" run --no-wait -f "$root/project/sick.conf"
+expect 125 'every board of pool sick is broken' "$hull" run --no-wait -f "$root/project/sick.conf"
+expect 125 'member s of pool sick is broken' "$hull" reserve sick --member s
+expect 0 '^s +board +0 +broken +-$' "$hull" pool ls sick
 expect 0 '' "$hull" board fix s
 expect 0 '^s +127.0.0.1 +up' "$hull" board ls sick
 : > "$root/power.log"

@@ -3440,6 +3440,7 @@ printf '(pools (tpool (capacity 1)))\n' > "$root/home/.config/hull/pools.conf"
 conf pholder '(pool "tpool") (hostname "pholder") (command "/probe" "say" "ready" "sleep" "4")'
 conf pnext '(pool "tpool") (hostname "pnext") (command "/probe" "say" "ran")'
 conf pnowhere '(pool "nosuchpool") (hostname "pnowhere") (command "/probe" "say" "ran")'
+conf pnext2 '(pool "tcap") (hostname "pnext2") (command "/probe" "say" "ran")'
 expect 0 'pool: native: hull.s own' "$hull" plan --explain -f "$root/pnext.conf"
 rm -f "$root/pholder.out"
 (cd / && exec timeout -k 2 30 "$hull_abs" run -f "$root/pholder.conf" > "$root/pholder.out" 2>&1) &
@@ -3493,6 +3494,149 @@ cases=$((cases + 1))
 expect 0 '' "$hull" release "$lease"
 expect 0 '^tpool +2 +0 +0$' "$hull" pool ls
 expect 125 'no such lease is held' "$hull" release "$lease"
+# What a pool holds: named slots, each with a priority, beside its unnamed
+# capacity, which sits at 0. `pool ls POOL` is the order they fill; a lease
+# with no name takes that order, so what has the lowest is left to the last.
+cat > "$root/home/.config/hull/pools.conf" <<'CONF'
+(pools
+  (tmix (capacity 1)
+        (members (slot "gpu" (priority -1)) (slot "plain" (priority 5))))
+  (tcap (capacity 1))
+  (tboards (members (board "nb" (address "127.0.0.1"))))
+  (tbad (members (slot "x" (priority soon)))))
+CONF
+expect 0 '^plain +slot +5 +free +-$' "$hull" pool ls tmix
+expect 0 '^gpu +slot +-1 +free +-$' "$hull" pool ls tmix
+cases=$((cases + 1))
+[ "$(timeout 20 "$hull" pool ls tmix | awk 'NR > 1 { print $1 }' | tr '\n' ' ')" = "plain gpu " ] ||
+	fail "pool ls POOL is not the order the pool fills" "$("$hull" pool ls tmix 2>&1)"
+expect 0 '^tmix +3 +0 +0$' "$hull" pool ls
+first=$(timeout 20 "$hull" reserve tmix)
+expect 0 "^plain +slot +5 +leased +$first\$" "$hull" pool ls tmix
+second=$(timeout 20 "$hull" reserve tmix)
+expect 0 '^gpu +slot +-1 +free +-$' "$hull" pool ls tmix
+expect 0 '^tmix +3 +2 +0$' "$hull" pool ls
+third=$(timeout 20 "$hull" reserve tmix)
+expect 0 "^gpu +slot +-1 +leased +$third\$" "$hull" pool ls tmix
+expect 75 'no slot of pool tmix: 3 of 3 in use, and the lease does not wait' \
+	"$hull" reserve tmix --no-wait
+expect 0 '' "$hull" release "$second"
+expect 0 '' "$hull" release "$third"
+expect 0 '' "$hull" release "$first"
+# A lease by name: that entry and no other, a run of the pool going past it;
+# held, refused 75, saying what holds it up; what cannot be, refused 125.
+named=$(timeout 20 "$hull" reserve tmix --member gpu)
+expect 0 "^gpu +slot +-1 +leased +$named\$" "$hull" pool ls tmix
+expect 0 '^plain +slot +5 +free +-$' "$hull" pool ls tmix
+expect 75 'no slot of pool tmix: gpu is held, and the lease does not wait' \
+	"$hull" reserve tmix --member gpu --no-wait
+expect 125 'pool tmix has no member nosuch' "$hull" reserve tmix --member nosuch
+expect 125 'member plain is named twice' "$hull" reserve tmix --member plain --member plain
+expect 125 'a lease of 1 names 2 members' "$hull" reserve tmix --member plain --member gpu --count 1
+expect 125 'pool tmix has no boards for a hw machine' "$hull" reserve tmix --kind board
+expect 125 'member plain of pool tmix is a slot' "$hull" reserve tmix --kind board --member plain
+expect 125 'pool tboards has nothing for a software machine' "$hull" reserve tboards --kind slot
+expect 2 'usage' "$hull" reserve tmix --kind vm
+conf pgpu '(pool "tmix") (hostname "pgpu") (command "/probe" "say" "ready" "sleep" "3")'
+rm -f "$root/pgpu.out"
+(cd / && exec timeout -k 2 30 "$hull_abs" run --lease "$named" -f "$root/pgpu.conf" > "$root/pgpu.out" 2>&1) &
+pgpu=$!
+tries=0
+until grep -q '^ready$' "$root/pgpu.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+expect 0 "^$named +tmix +1 +1\$" "$hull" lease ls
+wait "$pgpu" 2>/dev/null
+# A run with no lease takes what fills first, and goes past gpu's holder.
+conf pfill '(pool "tmix") (hostname "pfill") (command "/probe" "say" "ready" "sleep" "3")'
+rm -f "$root/pfill.out"
+(cd / && exec timeout -k 2 30 "$hull_abs" run -f "$root/pfill.conf" > "$root/pfill.out" 2>&1) &
+pfill=$!
+tries=0
+until grep -q '^ready$' "$root/pfill.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+expect 0 '^plain +slot +5 +running +pfill$' "$hull" pool ls tmix
+wait "$pfill" 2>/dev/null
+expect 0 '^plain +slot +5 +free +-$' "$hull" pool ls tmix
+# What waits for a held entry by name stops nothing else of its pool, and
+# gets it when it comes free, ahead of what asks for anything.
+(cd / && exec timeout -k 2 30 "$hull_abs" reserve tmix --member gpu > "$root/pwait.out" 2> "$root/pwait.err") &
+pwait=$!
+tries=0
+until grep -q 'waiting for a slot of pool tmix: gpu is held, place 1 in line' "$root/pwait.err" 2>/dev/null ||
+	[ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+expect 0 '^tmix +3 +1 +1$' "$hull" pool ls
+past=$(timeout 20 "$hull" reserve tmix --no-wait)
+expect 0 "^plain +slot +5 +leased +$past\$" "$hull" pool ls tmix
+more=$(timeout 20 "$hull" reserve tmix --no-wait)
+expect 75 'no slot of pool tmix: 3 of 3 in use' "$hull" reserve tmix --no-wait
+expect 0 '' "$hull" release "$named"
+wait "$pwait"
+cases=$((cases + 1))
+waited=$(cat "$root/pwait.out")
+printf '%s\n' "$waited" | grep -Eqx 'lease-[0-9a-f]{8}' ||
+	fail "a lease waiting for an entry by name did not get it" "$waited $(cat "$root/pwait.err")"
+expect 0 "^gpu +slot +-1 +leased +$waited\$" "$hull" pool ls tmix
+# An entry a waiting request names is not there for one that came later,
+# though it is free: gpu here, waited for along with plain, which is held.
+expect 0 '' "$hull" release "$waited"
+(cd / && exec timeout -k 2 30 "$hull_abs" reserve tmix --member gpu --member plain > "$root/pwait.out" 2> "$root/pwait.err") &
+pwait=$!
+tries=0
+until grep -q 'waiting for a slot of pool tmix: plain is held, place 1 in line' "$root/pwait.err" 2>/dev/null ||
+	[ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+expect 0 '^gpu +slot +-1 +free +-$' "$hull" pool ls tmix
+expect 75 'no slot of pool tmix: 2 of 3 in use' "$hull" reserve tmix --no-wait
+expect 0 '' "$hull" release "$past"
+wait "$pwait"
+waited=$(cat "$root/pwait.out")
+expect 0 "^gpu +slot +-1 +leased +$waited\$" "$hull" pool ls tmix
+expect 0 "^plain +slot +5 +leased +$waited\$" "$hull" pool ls tmix
+# A named count holds the name and then what fills first; every lease and
+# what it holds is read back by the next core, and a kept machine goes on
+# counting against its pool there.
+expect 0 '' "$hull" release "$more"
+expect 0 '' "$hull" release "$waited"
+both=$(timeout 20 "$hull" reserve tmix --member gpu --count 2)
+expect 0 "^gpu +slot +-1 +leased +$both\$" "$hull" pool ls tmix
+expect 0 "^plain +slot +5 +leased +$both\$" "$hull" pool ls tmix
+other=$(timeout 20 "$hull" reserve tmix)
+conf pkept '(pool "tcap") (hostname "pkept") (on_disconnect keep) (command "/probe" "say" "ready" "sleep" "30")'
+rm -f "$root/pkept.out"
+(cd / && exec timeout -k 2 30 "$hull_abs" run -f "$root/pkept.conf" > "$root/pkept.out" 2>&1) &
+pkept=$!
+tries=0
+until grep -q '^ready$' "$root/pkept.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+kill -KILL "$(head -1 "$XDG_RUNTIME_DIR/hull/core.lock")" 2> /dev/null
+wait "$pkept" 2>/dev/null
+expect 0 "^$both +tmix +2 +0\$" "$hull" lease ls
+expect 0 "^$other +tmix +1 +0\$" "$hull" lease ls
+expect 0 "^gpu +slot +-1 +leased +$both\$" "$hull" pool ls tmix
+expect 0 '^tmix +3 +3 +0$' "$hull" pool ls
+expect 0 '^tcap +1 +1 +0$' "$hull" pool ls
+expect 75 'no slot of pool tcap: 1 of 1 in use' "$hull" run --no-wait -f "$root/pnext2.conf"
+expect 0 '' "$hull" stop --timeout 1 pkept
+expect 0 '' "$hull" release "$both"
+expect 0 '' "$hull" release "$other"
+# A machine the pool has nothing for is refused, not left to wait or to
+# take a slot from what the pool is for; nor is a file that cannot be meant.
+conf pnoboard '(pool "tboards") (hostname "pnoboard") (command "/probe" "say" "ran")'
+expect 125 'pool tboards has nothing for a ns machine' "$hull" run -f "$root/pnoboard.conf"
+expect 0 '^tboards +1 +0 +0$' "$hull" pool ls
+conf pbad '(pool "tbad") (hostname "pbad") (command "/probe" "say" "ran")'
+expect 125 'member x: \(priority soon\) is not a number' "$hull" run -f "$root/pbad.conf"
 rm -f "$root/home/.config/hull/pools.conf"
 # cpus and memory: a systemd scope the init is moved into before its
 # workload, asked of the manager by busctl. Faked here, with a core of its
