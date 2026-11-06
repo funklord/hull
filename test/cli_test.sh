@@ -3497,6 +3497,22 @@ expect 125 'no such lease is held' "$hull" release "$lease"
 # What a pool holds: named slots, each with a priority, beside its unnamed
 # capacity, which sits at 0. `pool ls POOL` is the order they fill; a lease
 # with no name takes that order, so what has the lowest is left to the last.
+# The default pool: a machine naming none is in it where the file names it.
+printf '(pools (default (capacity 1)))\n' > "$root/home/.config/hull/pools.conf"
+conf pdefault '(hostname "pdefault") (command "/probe" "say" "ready" "sleep" "3")'
+conf pdefault2 '(hostname "pdefault2") (command "/probe" "say" "ran")'
+rm -f "$root/pdefault.out"
+(cd / && exec timeout -k 2 30 "$hull_abs" run -f "$root/pdefault.conf" > "$root/pdefault.out" 2>&1) &
+pdefault=$!
+tries=0
+until grep -q '^ready$' "$root/pdefault.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+expect 0 '^default +1 +1 +0$' "$hull" pool ls
+expect 75 'no slot of pool default: 1 of 1 in use' "$hull" run --no-wait -f "$root/pdefault2.conf"
+wait "$pdefault" 2>/dev/null
+expect 0 '^ran$' "$hull" run --no-wait -f "$root/pdefault2.conf"
 cat > "$root/home/.config/hull/pools.conf" <<'CONF'
 (pools
   (tmix (capacity 1)

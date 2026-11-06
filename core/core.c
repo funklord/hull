@@ -2914,6 +2914,15 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	if (lease_id[0] == '\0') {
 		char *pool = hull_access_value(&plan_doc, &machine, "pool");
 
+		/* A machine naming no pool is in the user's default, a pool like
+		 * any where the file names `default`, and the limit of nothing
+		 * where it does not, so what ran before waits for nothing. */
+		if (pool == NULL && !on_board) {
+			static hull_pool p;
+
+			if (hull_pool_read("default", &p) == 0)
+				pool = strdup("default");
+		}
 		if (pool != NULL) {
 			static hull_pool   p;
 			static held_member picked[HULL_POOL_MEMBERS];
