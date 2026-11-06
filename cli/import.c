@@ -580,9 +580,9 @@ static void landed_at(char *list, size_t cap, const char *from, const char *to)
 	if (strchr(to, '\'') != NULL || strchr(from, '\'') != NULL)
 		return;
 	if (contents || to[strlen(to) - 1u] != '/')
-		snprintf(list + at, cap - at, " '%s'", to);
+		snprintf(list + at, cap - at, " '%.4000s'", to);
 	else
-		snprintf(list + at, cap - at, " '%s%s'", to, leaf != NULL ? leaf + 1 : from);
+		snprintf(list + at, cap - at, " '%.4000s%.3000s'", to, leaf != NULL ? leaf + 1 : from);
 }
 
 /* A step of a line after a copy, as root whatever USER says, as docker's
@@ -970,6 +970,7 @@ typedef struct svc {
 	char memory[32];       /* from mem_limit: */
 	char cpus[16];         /* from cpus:, a whole number */
 	char user[128];        /* from user: */
+	char shm_size[32];     /* from shm_size: */
 	char arch[16];         /* from platform: */
 	sb   devices;          /* from devices:, each path quoted */
 	sb   secrets;          /* from secrets:, each a whole entry */
@@ -1659,6 +1660,11 @@ static void svc_flush(svc *s, sb *out)
 	if (s->tmpfs.data != NULL) {
 		sb_str(out, " (tmpfs");
 		sb_str(out, s->tmpfs.data);
+		sb_str(out, ")");
+	}
+	if (s->shm_size[0] != '\0') {
+		sb_str(out, " (shm_size ");
+		sb_quoted(out, s->shm_size);
 		sb_str(out, ")");
 	}
 	if (s->stop_signal[0] != '\0') {
@@ -2657,6 +2663,14 @@ static char *compose_text(FILE *file, const char *project)
 			compose_cpus(&s, scalar(value));
 		} else if (strcmp(key, "user") == 0) {
 			snprintf(s.user, sizeof s.user, "%s", scalar(value));
+		} else if (strcmp(key, "shm_size") == 0) {
+			char saved[sizeof s.memory];
+
+			/* memory's own reading of a size, kept apart from it. */
+			snprintf(saved, sizeof saved, "%s", s.memory);
+			compose_memory(&s, scalar(value));
+			snprintf(s.shm_size, sizeof s.shm_size, "%s", s.memory);
+			snprintf(s.memory, sizeof s.memory, "%s", saved);
 		} else if (strcmp(key, "stop_signal") == 0) {
 			snprintf(s.stop_signal, sizeof s.stop_signal, "%s", scalar(value));
 		} else if (strcmp(key, "stop_grace_period") == 0) {

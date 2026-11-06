@@ -116,6 +116,8 @@ conf names '(command "sh" "-c" "grep db.internal /etc/hosts; grep -c 9.9.9.9 /et
 expect 0 '^10.0.0.5' run -f "$root/names.conf"
 expect 0 '^1234$' run -f "$root/names.conf"
 expect 0 '^2048$' run -f "$root/names.conf"
+conf shm '(command "df" "-k" "/dev/shm") (shm_size "16M")'
+expect 0 '16384' run -f "$root/shm.conf"
 conf asroot '(command "true") (user "root")'
 expect 125 'a container.s root is the host.s' run -f "$root/asroot.conf"
 cases=$((cases + 1))

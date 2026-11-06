@@ -1301,6 +1301,14 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 		add_text(&body, "]");
 	}
 	add_host_settings(&body, doc, machine);
+	if ((value = hull_access_value(doc, machine, "shm_size")) != NULL) {
+		char              *unit;
+		unsigned long long bytes = strtoull(value, &unit, 10);
+
+		bytes <<= *unit == 'K' ? 10 : *unit == 'M' ? 20 : *unit == 'G' ? 30 : 0;
+		addf(&body, ",\"ShmSize\":%llu", bytes);
+		free(value);
+	}
 	if (hull_access_find(doc, machine, "tmpfs", &entry)) {
 		hull_sexpr_form path;
 		int             more;
@@ -4219,6 +4227,7 @@ static const hull_cap_entry entries[] = {
 	{ "user",               HULL_SUP_NATIVE,   NULL, NULL },
 	{ "stop_signal",        HULL_SUP_NATIVE,   NULL, NULL },
 	{ "stop_grace",         HULL_SUP_NATIVE,   NULL, NULL },
+	{ "shm_size",           HULL_SUP_NATIVE,   NULL, NULL },
 	{ "hosts",              HULL_SUP_NATIVE,   NULL, NULL },
 	{ "dns",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "sysctls",            HULL_SUP_NATIVE,   NULL, NULL },

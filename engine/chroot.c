@@ -121,6 +121,7 @@ struct hull_machine {
 	char            *root;       /* the dir source, without "dir:" */
 	char            *workdir;
 	char            *user;     /* (user ...), or NULL for the machine's root */
+	char             shm_options[64];  /* /dev/shm's mount options */
 	char            *limit[MAX_LIMITS];   /* (ulimits ...) */
 	unsigned         limit_count;
 	char            *sysctl[MAX_LIMITS];  /* (sysctls ...) */
@@ -378,6 +379,13 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	m->hostname = hull_access_value(doc, &machine, "hostname");
 	m->init = hull_access_value(doc, &machine, "init");
 	m->user = hull_access_value(doc, &machine, "user");
+	{
+		char *size = hull_access_value(doc, &machine, "shm_size");
+
+		snprintf(m->shm_options, sizeof m->shm_options, "mode=1777%s%s",
+		         size != NULL ? ",size=" : "", size != NULL ? size : "");
+		free(size);
+	}
 	if (m->root == NULL || m->workdir == NULL)
 		return "the plan is missing its source or workdir";
 	if (m->user != NULL && m->init != NULL)
@@ -1196,7 +1204,7 @@ static void make_dev(const hull_machine *m, int report)
 	if (mount("devpts", "dev/pts", "devpts", MS_NOSUID | MS_NOEXEC,
 	          "newinstance,ptmxmode=0666,mode=0620") != 0)
 		errno = 0;
-	if (mount("tmpfs", "dev/shm", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777") != 0)
+	if (mount("tmpfs", "dev/shm", "tmpfs", MS_NOSUID | MS_NODEV, m->shm_options) != 0)
 		child_fail(report, "mounting /dev/shm");
 	bind_devices(m, report);
 }
@@ -4374,6 +4382,7 @@ static const hull_cap_entry entries[] = {
 	{ "user",                   HULL_SUP_NATIVE,   NULL, NULL },
 	{ "stop_signal",            HULL_SUP_NATIVE,   NULL, NULL },
 	{ "stop_grace",             HULL_SUP_NATIVE,   NULL, NULL },
+	{ "shm_size",               HULL_SUP_NATIVE,   NULL, NULL },
 	{ "hosts",                  HULL_SUP_NATIVE,   NULL, NULL },
 	{ "dns",                    HULL_SUP_NATIVE,   NULL, NULL },
 	{ "sysctls",                HULL_SUP_EMULATED, "a user namespace holds net.* alone, in a network namespace of the machine's own", NULL },

@@ -84,6 +84,12 @@ CONF
 	says "$backend: stopped by its own signal" "$(cat "$root/nginx.$backend")" 'signal 3 (SIGQUIT)'
 	says "$backend: and ended 0" "$(tail -1 "$root/nginx.$backend")" 'ended 0'
 
+	# (shm_size ...), by what the machine's own df says.
+	printf '(machine (backend %s) (source "postgres:16-alpine") (user "root") (shm_size "16M") (command "/bin/df" "-k" "/dev/shm"))\n' \
+		"$backend" > "$root/nginx/shm.conf"
+	out=$(cd "$root/nginx" && timeout 60 "$hull" run -f shm.conf 2>&1)
+	says "$backend: /dev/shm is the size asked" "$out" '16384'
+
 	# A compose project: rootless postgres dropping to its own user, redis
 	# from the host, and one finding the other by its service name.
 	cat > "$root/app/compose.yaml" <<'COMPOSE'
@@ -175,6 +181,65 @@ if timeout 200 "$hull" pull alpine:3.20 alpine:3.20 > /dev/null 2>&1; then
 	says '--chown gave what was copied' "$out" ' 100 '
 	cases=$((cases + 1))
 	printf '%s\n' "$out" | grep -q '^private$' && fail 'the file .dockerignore names stayed out' "$out"
+fi
+
+# --- a real registry: goal 4 against what is not ours ---------------------------
+
+# registry:2 as a machine of hull's, over TLS as hull's pull and push require,
+# a CA the test makes; an image hull built pushed to it, pulled back, and where
+# a daemon answers, pulled and run by docker, which owes hull nothing.
+if timeout 120 "$hull" pull registry:2 registry:2 > /dev/null 2>&1 && command -v openssl > /dev/null; then
+	mkdir -p "$root/reg/certs" "$root/img"
+	printf '(machine (backend chroot) (source "registry:2") (hostname "reg") (ports (port (host 5000) (guest 5000)))
+  (volumes (volume (host "./certs") (guest "/certs") (mode ro)))
+  (env (REGISTRY_HTTP_TLS_CERTIFICATE "/certs/server.crt") (REGISTRY_HTTP_TLS_KEY "/certs/server.key")))\n' \
+		> "$root/reg/hull.conf"
+	# The certificate names the address, which a first start tells: one that
+	# waits, the registry exiting at once for want of the certificate.
+	printf '(machine (backend chroot) (source "registry:2") (hostname "reg") (command "/bin/sleep" "60"))\n' \
+		> "$root/reg/first.conf"
+	(cd "$root/reg" && timeout 70 "$hull" run -f first.conf > /dev/null 2>&1) &
+	pid=$!
+	at=$(address reg)
+	timeout 20 "$hull" stop --timeout 1 reg > /dev/null 2>&1
+	wait "$pid"
+	sleep 2
+	openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj '/CN=hull test ca' \
+		-keyout "$root/ca.key" -out "$root/ca.crt" 2> /dev/null
+	openssl req -newkey rsa:2048 -nodes -subj "/CN=$at" -keyout "$root/reg/certs/server.key" \
+		-out "$root/server.csr" 2> /dev/null
+	printf 'subjectAltName=IP:%s\n' "$at" > "$root/san"
+	openssl x509 -req -in "$root/server.csr" -CA "$root/ca.crt" -CAkey "$root/ca.key" \
+		-CAcreateserial -days 2 -extfile "$root/san" -out "$root/reg/certs/server.crt" 2> /dev/null
+	(cd "$root/reg" && timeout 90 "$hull" run -f hull.conf > "$root/reg.out" 2>&1) &
+	pid=$!
+	address reg > /dev/null
+	n=0
+	while [ "$n" -lt 30 ] && ! curl -s -m 2 --cacert "$root/ca.crt" -o /dev/null "https://$at:5000/v2/"; do
+		sleep 1
+		n=$((n + 1))
+	done
+	cat > "$root/img/hull.conf" <<'CONF'
+(build (base "alpine:3.20") (steps (step (name "mark") (run "echo built-by-hull > /mark")))
+  (runtime (cmd "cat" "/mark") (env (FROM_HULL "yes")) (user "nobody")))
+CONF
+	out=$(timeout 90 "$hull" build -f "$root/img/hull.conf" pushed 2>&1)
+	out=$(SSL_CERT_FILE=$root/ca.crt timeout 60 "$hull" push pushed "$at:5000/test/pushed:1" 2>&1)
+	says 'hull pushes to a real registry' "$out" 'sha256:'
+	says 'which lists it' "$(curl -s -m 4 --cacert "$root/ca.crt" "https://$at:5000/v2/_catalog")" 'test/pushed'
+	out=$(SSL_CERT_FILE=$root/ca.crt timeout 60 "$hull" pull "$at:5000/test/pushed:1" back 2>&1)
+	says 'and pulls it back' "$out" 'sha256:'
+	says 'its runtime whole' "$("$hull" manifest show back 2>&1)" '(FROM_HULL yes)'
+	if timeout 10 docker version > /dev/null 2>&1; then
+		timeout 60 docker pull "$at:5000/test/pushed:1" > /dev/null 2>&1
+		says 'docker runs what hull built' "$(timeout 30 docker run --rm "$at:5000/test/pushed:1" 2>&1)" 'built-by-hull'
+		says 'as its USER' "$(timeout 20 docker inspect --format '{{.Config.User}}' "$at:5000/test/pushed:1" 2>&1)" 'nobody'
+		docker rmi "$at:5000/test/pushed:1" > /dev/null 2>&1
+	else
+		printf 'images: no docker daemon, its pull not tried\n'
+	fi
+	timeout 20 "$hull" stop reg > /dev/null 2>&1
+	wait "$pid"
 fi
 
 printf 'images: %s cases, %s failed\n' "$cases" "$failures"

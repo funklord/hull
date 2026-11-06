@@ -123,6 +123,7 @@ static char  *workdir;
 static char  *user_;        /* (user ...), or NULL for the machine's root */
 static int    stop_signal_ = SIGTERM;   /* what a stop sends first */
 #define MAX_LIMITS 32u
+static char   shm_size[32];             /* (shm_size ...), tmpfs's words, or "" */
 static char  *limits_[MAX_LIMITS];      /* (ulimits ...) */
 static unsigned limit_count;
 static char  *sysctls_[MAX_LIMITS];     /* (sysctls ...) */
@@ -1351,6 +1352,12 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 		if (stop_signal_ == 0)
 			return "(stop_signal ...) names no signal";
 	}
+	{
+		char *size = hull_access_value(doc, machine, "shm_size");
+
+		snprintf(shm_size, sizeof shm_size, "%s", size != NULL ? size : "");
+		free(size);
+	}
 	user_ = hull_access_value(doc, machine, "user");
 	if (user_ != NULL && init_ != NULL)
 		return "(user ...) is whom a command runs as; an (init ...) starts its own";
@@ -1643,9 +1650,15 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 			if (symlink(links[i][1], links[i][0]) != 0 && errno != EEXIST && errno != ENOENT)
 				say("dev", strerror(errno));
 		mkdir("/machine/dev/shm", 01777);
-		if (mount("tmpfs", "/machine/dev/shm", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777") != 0 &&
-		    errno != ENOENT)
-			say("/dev/shm", strerror(errno));
+		{
+			char options[64];
+
+			snprintf(options, sizeof options, "mode=1777%s%s", shm_size[0] != '\0' ? ",size=" : "",
+			         shm_size);
+			if (mount("tmpfs", "/machine/dev/shm", "tmpfs", MS_NOSUID | MS_NODEV, options) != 0 &&
+			    errno != ENOENT)
+				say("/dev/shm", strerror(errno));
+		}
 	}
 	if (chdir("/machine") != 0 || mount(".", "/", NULL, MS_MOVE, NULL) != 0 ||
 	    chroot(".") != 0 || chdir("/") != 0)

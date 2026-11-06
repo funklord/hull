@@ -270,6 +270,9 @@ services:
     stop_grace_period: 1m30s
 COMPOSE
 expect 0 '\(stop_signal "SIGQUIT"\) \(stop_grace "90s"\)' "$hull" import "$dir/vars/stop.yaml"
+printf 'services:\n  db:\n    image: postgres\n    shm_size: 256m\n    mem_limit: 1g\n' > "$dir/vars/shm.yaml"
+expect 0 '\(shm_size "256M"\)' "$hull" import "$dir/vars/shm.yaml"
+expect 0 '\(memory "1G"\)' "$hull" import "$dir/vars/shm.yaml"
 cat > "$dir/vars/more.yaml" <<'COMPOSE'
 services:
   web:

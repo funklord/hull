@@ -780,6 +780,7 @@ static const key machine_keys[] = {
 	{ .name = "dns",           .type = STRINGS, .value = nonempty },
 	{ .name = "sysctls",       .type = STRINGS, .value = nonempty },
 	{ .name = "ulimits",       .type = STRINGS, .value = nonempty },
+	{ .name = "shm_size",      .type = STRING, .value = size },
 };
 static hull_spec_status machine_across(walk *w, const hull_sexpr_form *record,
                                        const hull_sexpr_form *found, uint64_t present);
