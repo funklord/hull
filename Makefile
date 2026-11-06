@@ -319,7 +319,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-images check-legacy check-remote check-qemu check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-images check-legacy check-remote check-qemu check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -710,6 +710,10 @@ check-hw: $(HULL) $(AGENT_BIN) $(PROBE)
 
 check-broker: $(HULL) $(AGENT_BIN) $(PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/broker_test.sh '$(HULL)' '$(PROBE)'
+
+# The broker across a real wire: three vms on a segment, delay, loss and cuts.
+check-broker-wire: $(HULL) $(AGENT_BIN) $(PROBE)
+	BUILD_DIR='$(BUILD_DIR)' sh test/broker_wire_test.sh '$(HULL)' '$(PROBE)'
 
 check-images: $(HULL) $(AGENT_BIN)
 	BUILD_DIR='$(BUILD_DIR)' sh test/images_test.sh '$(HULL)'

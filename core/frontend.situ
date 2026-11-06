@@ -45,6 +45,7 @@ const SLOTS    = ('5' << 24) | (':' << 16) | ('s' << 8) | 'l';
 const MEMBERS  = ('7' << 24) | (':' << 16) | ('m' << 8) | 'e';  // both ways
 const CLAIM    = ('5' << 24) | (':' << 16) | ('c' << 8) | 'l';  // both ways
 const SETTLE   = ('6' << 24) | (':' << 16) | ('s' << 8) | 'e';
+const HOLD     = ('4' << 24) | (':' << 16) | ('h' << 8) | 'o';
 const IDENTIFY = ('8' << 24) | (':' << 16) | ('i' << 8) | 'd';
 const BROKEN   = ('6' << 24) | (':' << 16) | ('b' << 8) | 'r';
 const STARTED  = ('7' << 24) | (':' << 16) | ('s' << 8) | 't';
@@ -90,6 +91,7 @@ struct client_message {
 		case POOLS:   pools_ask     pools;
 		case MEMBERS: members_ask   members;
 		case CLAIM:   claim_ask     claim;
+		case HOLD:    hold          hold;
 		case SETTLE:  settle        settle;
 		case IDENTIFY: identify     identify;
 		case BROKEN:  broken        broken;
@@ -262,6 +264,16 @@ struct claim_ask {
 	atom  id;
 	preamble u8[8] = ")(4:kind";
 	atom  kind;
+	preamble u8[2] = "))";
+}
+
+// A broker's `lease` heard, which nothing is done on until it is answered
+// `done`; a grant not held goes back.
+struct hold {
+	preamble u8[6] = "4:hold";
+	channel  ch;
+	preamble u8[5] = "(2:id";
+	atom  id;
 	preamble u8[2] = "))";
 }
 

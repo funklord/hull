@@ -179,6 +179,9 @@ client_message claim_ask 28 35 3A 63 6C 61 69 6D 28 32 3A 63 68 31 3A 37 29 28 3
 # claimed: (5:claim(2:ch1:7)(4:left2:60)(6:member1:a))
 core_message claimed 28 35 3A 63 6C 61 69 6D 28 32 3A 63 68 31 3A 37 29 28 34 3A 6C 65 66 74 32 3A 36 30 29 28 36 3A 6D 65 6D 62 65 72 31 3A 61 29 29
 
+# hold: (4:hold(2:ch1:7)(2:id14:lease-3f7792d0))
+client_message hold 28 34 3A 68 6F 6C 64 28 32 3A 63 68 31 3A 37 29 28 32 3A 69 64 31 34 3A 6C 65 61 73 65 2D 33 66 37 37 39 32 64 30 29 29
+
 # settle: (6:settle(2:ch1:7)(2:id14:lease-3f7792d0)(6:member1:a))
 client_message settle 28 36 3A 73 65 74 74 6C 65 28 32 3A 63 68 31 3A 37 29 28 32 3A 69 64 31 34 3A 6C 65 61 73 65 2D 33 66 37 37 39 32 64 30 29 28 36 3A 6D 65 6D 62 65 72 31 3A 61 29 29
 

@@ -4979,6 +4979,21 @@ static int ask_broker(const char *url, hull_wire *wire, hull_msg *m, hull_sexpr_
 	return ask_on(wire, m, body, status, "broker");
 }
 
+/* A broker's `lease` heard, on the wire it came by: nothing is acted on
+ * before this is answered, a grant not held going back (section 4.12). */
+static int broker_hold(hull_wire *wire, const char *id, int *status)
+{
+	hull_sexpr_doc body;
+	hull_msg       m = { 0 };
+
+	hull_msg_raw(&m, "(4:hold");
+	hull_msg_channel(&m, 1u);
+	hull_msg_raw(&m, "(2:id");
+	hull_msg_text(&m, id);
+	hull_msg_raw(&m, "))");
+	return ask_on(wire, &m, &body, status, "broker");
+}
+
 /* `hull reserve POOL [--count N] [--member NAME]... [--kind board|slot]
  * [--for D] [--wait D|--no-wait]`: a lease's id, alone on stdout, so that
  * `lease=$(hull reserve ci)` takes it. Its count is what it names, or 1,
@@ -5065,6 +5080,10 @@ static int reserve(int argc, char **argv)
 		hull_wire_close(&wire);
 		fprintf(stderr, "hull: the core's answer to a lease is not one\n");
 		return 2;
+	}
+	if (given.broker[0] != '\0' && broker_hold(&wire, id, &status) != 0) {
+		hull_wire_close(&wire);
+		return status;
 	}
 	hull_wire_close(&wire);
 	printf("%s\n", id);
@@ -5297,16 +5316,21 @@ static int add_broker(hull_plan *plan, const char *pool, const hull_pool *given,
 		hull_msg_string(&body, &value, member, sizeof member);
 	if (hull_msg_find(&body, "id", &value))
 		hull_msg_string(&body, &value, id, sizeof id);
-	hull_wire_close(&wire);
 	if (o->lease != NULL)
 		snprintf(id, sizeof id, "%s", o->lease);
 	/* A network's answer is held to what a name can be: these go into a
 	 * file here and a plan. */
 	if (strspn(id, BROKER_WORD) != strlen(id) || strspn(member, BROKER_WORD) != strlen(member) ||
 	    strncmp(id, "lease-", 6u) != 0) {
+		hull_wire_close(&wire);
 		fprintf(stderr, "hull: the broker at %s answered what no lease is\n", given->broker);
 		return 125;
 	}
+	if (o->lease == NULL && broker_hold(&wire, id, &status) != 0) {
+		hull_wire_close(&wire);
+		return status;
+	}
+	hull_wire_close(&wire);
 	/* What a board is, is this file's: nothing a broker says is run. */
 	if (board) {
 		static hull_board boards[64];

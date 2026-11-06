@@ -396,6 +396,97 @@ env XDG_DATA_HOME="$broker" timeout 20 "$hull" board fix b1 ||
 	fail 'a mark at the broker could not be taken off' ''
 as bob 0 '^b1 +board +5 +free +-$' pool ls bench
 
+# A grant nobody hears goes back: told, and gone or silent, a peer holds nothing.
+# What is held stays, gone or not, and a lease is not another's to hold.
+cat > "$root/unheld.py" <<'PY'
+import os, socket, struct, sys, time
+def connect():
+	s = socket.socket(socket.AF_UNIX)
+	d = os.open(sys.argv[1], os.O_PATH)
+	s.connect("/proc/self/fd/%d/core.sock" % d)
+	s.settimeout(10)
+	return s
+def send(s, m):
+	s.sendall(struct.pack(">I", len(m)) + m)
+def reply(s):
+	n = struct.unpack(">I", s.recv(4))[0]
+	data = b""
+	while len(data) < n:
+		data += s.recv(n - len(data))
+	return data
+def ask(s):
+	send(s, b"(5:hello(2:ch1:0)(5:proto1:1))")
+	reply(s)
+	send(s, b"(5:lease(2:ch1:1)(5:count1:1)(4:cpus1:0)(3:for1:0)(4:kind0:)(7:members3:gpu)"
+	        b"(6:memory1:0)(3:run1:0)(4:pool5:bench))")
+	return reply(s)
+def word(answer):
+	return answer.split(b"(2:id14:")[1][:14]
+held = lambda s, w: (send(s, b"(4:hold(2:ch1:1)(2:id14:" + w + b"))"), reply(s))[1]
+mode = sys.argv[2]
+s = connect()
+w = word(ask(s))
+print(w.decode())
+if mode == "gone":
+	s.close()
+elif mode == "other":
+	t = connect()
+	send(t, b"(5:hello(2:ch1:0)(5:proto1:1))")
+	reply(t)
+	print(held(t, w))
+	s.close()
+elif mode == "silent":
+	sys.stdout.flush()
+	time.sleep(float(sys.argv[3]))
+elif mode == "held":
+	print(held(s, w))
+	s.close()
+PY
+free_gpu() {
+	n=0
+	until run_as alice timeout 20 "$hull" pool ls bench < /dev/null | grep -q '^gpu .*free' || [ "$n" -ge "$1" ]; do
+		n=$((n + 1))
+		sleep 0.25
+	done
+}
+cases=$((cases + 1))
+python3 -I "$root/unheld.py" "$broker" gone > "$root/unheld.out" 2>&1
+free_gpu 40
+[ "$n" -lt 40 ] || fail 'a grant to one gone was kept' "$(cat "$root/unheld.out" "$root/broker.log" | tail -5)"
+cases=$((cases + 1))
+python3 -I "$root/unheld.py" "$broker" other > "$root/unheld.out" 2>&1
+grep -q 'no such lease is held' "$root/unheld.out" || fail 'one connection held what another was told' "$(cat "$root/unheld.out")"
+free_gpu 40
+# Silent on a wire that stays up, as one cut and not yet known to be is.
+cases=$((cases + 1))
+python3 -I "$root/unheld.py" "$broker" silent 45 > "$root/unheld.out" 2>&1 &
+silent=$!
+sleep 1
+as bob 75 'gpu is held' reserve bench --member gpu --no-wait
+free_gpu 170
+[ "$n" -lt 170 ] || fail 'a grant nobody held did not go back' "$(tail -5 "$root/broker.log")"
+kill "$silent" 2> /dev/null
+wait "$silent" 2> /dev/null
+cases=$((cases + 1))
+python3 -I "$root/unheld.py" "$broker" held > "$root/unheld.out" 2>&1
+heldid=$(head -1 "$root/unheld.out")
+as bob 0 "^gpu +slot +by-name +leased +$heldid\$" pool ls bench
+kill -KILL "$broker_pid"
+wait "$broker_pid" 2> /dev/null
+broker_up
+as bob 0 "^gpu +slot +by-name +leased +$heldid\$" pool ls bench
+run_as admin timeout 20 "$hull" release "$heldid" > /dev/null 2>&1 < /dev/null
+# Not held, a broker that dies has given nothing: it was on no disk.
+python3 -I "$root/unheld.py" "$broker" silent 5 > "$root/unheld.out" 2>&1 &
+silent=$!
+sleep 1
+kill -KILL "$broker_pid"
+wait "$broker_pid" 2> /dev/null
+broker_up
+as bob 0 '^gpu +slot +by-name +free +-$' pool ls bench
+kill "$silent" 2> /dev/null
+wait "$silent" 2> /dev/null
+
 # A broker that lies: what it answers goes into a file and a plan here, so a
 # name that is no name is refused, and the machine does not run.
 mkdir -p "$root/evil"

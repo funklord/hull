@@ -632,6 +632,9 @@ Specs and commands stay as they were: `(pool "bench")`, `hull reserve`,
 - **A lost connection frees nothing.** A board is never given to two. The client
   retries until the broker hears the machine is over, and a client gone for good
   shows in `hull lease ls` for the broker's account to release.
+- **A grant is heard before it counts.** A client answers a grant before it acts
+  on it, and one nobody answers goes back, so a request waiting in line on a link
+  that died cannot hold a board for good.
 - **No clocks are compared.** A lease's end reaches a client as seconds left, and
   a machine under it stops with status 79.
 - **Only a lease's holder can end it,** and one holder can take only a quarter of

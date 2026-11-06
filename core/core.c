@@ -2401,6 +2401,8 @@ static int broker_mode;   /* this is `hull broker`: no machines, its leases for 
 
 /* What a broker gives a machine past its lease's end to stop in. */
 #define BROKER_GRACE_S 120
+/* A grant nobody has said they heard goes back after this long. */
+#define BROKER_HOLD_MS 30000LL
 
 /* An entry of a pool by name, held by a lease. */
 typedef struct held_member {
@@ -2428,6 +2430,11 @@ typedef struct lease {
 	int         run;            /* a broker's: made for one run */
 	uint8_t     claimed[HULL_POOL_MEMBERS];  /* a broker's: the held in use by a run */
 	unsigned    unnamed_claimed;
+	/* A broker's grant not yet held (section 4.12): when it goes back, and
+	 * who was told. 0 is held. On no disk, so that a broker that dies gives
+	 * back what nobody has acted on. */
+	long long   unheld_until;
+	const void *told;
 } lease;
 
 static lease leases[MAX_LEASES];
@@ -4730,7 +4737,11 @@ static void handle_lease_ask(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		}
 		snprintf(l->id, sizeof l->id, "lease-%08x", random_id);
 		snprintf(l->pool, sizeof l->pool, "%s", pool);
-		if (save_lease(l) != 0) {
+		if (broker_mode) {
+			l->unheld_until = monotonic_ms() + BROKER_HOLD_MS;
+			l->told         = c;
+		}
+		if (!broker_mode && save_lease(l) != 0) {
 			*l = (lease){ 0 };
 			send_error(c, ch, "the lease could not be kept in hull/leases");
 			return;
@@ -4771,6 +4782,45 @@ static int over_quota(const char *holder)
 static int may_touch(const client *c, const lease *l)
 {
 	return strcmp(c->holder, l->holder) == 0 || c->owner;
+}
+
+static void end_lease(lease *l, const char *why);
+
+/* `(hold (ch n) (id ID))`: the answer to a broker's `lease` heard. Only from
+ * here does a lost link free nothing, and a client acts on nothing before
+ * its `done`: a grant goes down a wire that may have nobody at the end of
+ * it, as a request in line for hours has every chance of, and an entry
+ * given to that would stay held by one who never heard of it. So the rule
+ * is not bent. An unheld grant is one nobody can be using. */
+static void handle_hold(client *c, uint32_t ch, const hull_sexpr_doc *body)
+{
+	hull_sexpr_form value;
+	char            id[24];
+	lease          *l;
+
+	if (!hull_msg_find(body, "id", &value) || !hull_msg_string(body, &value, id, sizeof id) ||
+	    (l = find_lease(id)) == NULL || l->told != c) {
+		send_error(c, ch, "no such lease is held");
+		return;
+	}
+	if (save_lease(l) != 0) {
+		end_lease(l, "it could not be kept");
+		send_error(c, ch, "the lease could not be kept in hull/leases");
+		return;
+	}
+	l->unheld_until = 0;
+	l->told         = NULL;
+	send_simple(c, "(4:done", ch);
+}
+
+/* What `c` was told and has not held, now that it has gone. */
+static void unheld_back(const client *c)
+{
+	for (unsigned i = 0u; i < MAX_LEASES; i++)
+		if (leases[i].used && leases[i].told == c) {
+			fprintf(stderr, "hull broker: %s never held %s\n", leases[i].holder, leases[i].id);
+			end_lease(&leases[i], "its holder never heard of it");
+		}
 }
 
 /* `(claim (ch n) (id ID) (kind K))`: an entry of a broker's lease for a
@@ -4913,6 +4963,12 @@ static void end_leases_due(void)
 	for (unsigned i = 0u; i < MAX_LEASES; i++) {
 		const lease *l = &leases[i];
 		int          claimed = l->unnamed_claimed > 0u;
+
+		if (l->used && l->unheld_until != 0 && monotonic_ms() >= l->unheld_until) {
+			fprintf(stderr, "hull broker: %s never held %s\n", l->holder, l->id);
+			end_lease(&leases[i], "its holder never heard of it");
+			continue;
+		}
 
 		for (unsigned k = 0u; k < l->held_count; k++)
 			claimed |= l->claimed[k];
@@ -5146,8 +5202,8 @@ static void handle(client *c, const hull_sexpr_doc *body)
 	/* A broker answers for pools alone, to more than its own user. */
 	if (broker_mode) {
 		static const char *const allowed[] = { "hello", "lease", "free", "leases", "pools",
-		                                       "members", "claim", "settle", "identify",
-		                                       "broken" };
+		                                       "members", "claim", "hold", "settle",
+		                                       "identify", "broken" };
 		int                      fine = 0;
 
 		for (unsigned i = 0u; i < sizeof allowed / sizeof allowed[0]; i++)
@@ -5259,6 +5315,8 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		handle_members(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "claim")) {
 		handle_claim(c, (uint32_t)ch, body);
+	} else if (hull_msg_is(body, "hold")) {
+		handle_hold(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "settle")) {
 		handle_settle(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "broken")) {
@@ -5318,8 +5376,10 @@ static void flush_all(void)
 		if (clients[i].used)
 			flush(&clients[i]);
 	for (unsigned i = 0u; i < MAX_CLIENTS; i++)
-		if (clients[i].used && clients[i].dead)
+		if (clients[i].used && clients[i].dead) {
+			unheld_back(&clients[i]);
 			disconnect(&clients[i]);
+		}
 }
 
 
