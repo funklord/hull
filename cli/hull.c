@@ -2313,6 +2313,8 @@ static void member_write(member *m, int width, int stream, const uint8_t *data, 
 }
 
 static long long seconds_of(const char *text);
+static int parent_owners(hull_store *store, const char *parent, hull_owner **out, size_t *count,
+                         char *why, size_t why_cap);
 
 static long long monotonic_ms(void)
 {
@@ -4170,6 +4172,10 @@ next_pass:
 						if (leaf != NULL && strlen(to) + strlen(leaf) < sizeof to)
 							strcat(to, leaf + 1);
 					}
+					/* A tree's contents land at `to`, a slash saying nothing more. */
+					if (inputs[first].manifest[0] != '\0' && strlen(to) > 1u &&
+					    to[strlen(to) - 1u] == '/')
+						to[strlen(to) - 1u] = '\0';
 					ok = inputs[first].manifest[0] != '\0' ?
 					     copy_tree(&store, root, &inputs[first], to, why, sizeof why) == 0 :
 					     copy_file(root, inputs[first].path, to, why, sizeof why) == 0;
@@ -4408,9 +4414,18 @@ next_pass:
 					if (tar >= 0)
 						close(tar);
 				} else {
+					/* A step of copies gives no owner, and takes none away: the
+					 * tree on disk is the user's, and its parent's owners go on. */
+					hull_owner *owners = NULL;
+					size_t      owner_count = 0u;
+
 					ok = !provenance.failed &&
-					     hull_store_commit(&store, root_path, build_arch, cache, &extra, &made,
-					                       why, sizeof why) == 0;
+					     parent_owners(&store, parent, &owners, &owner_count, why, sizeof why) == 0;
+					extra.owners = owners;
+					extra.owner_count = owner_count;
+					ok = ok && hull_store_commit(&store, root_path, build_arch, cache, &extra, &made,
+					                             why, sizeof why) == 0;
+					hull_owners_free(owners, owner_count);
 				}
 				if (ok) {
 					snprintf(parent, sizeof parent, "%s", made.manifest);
@@ -5265,6 +5280,57 @@ static int board_list(const char *pool)
 	for (int i = 0; i < count; i++)
 		printf("%-24s %-15s %s\n", boards[i].name, boards[i].address,
 		       hull_hw_broken(boards[i].name) ? "broken" : "up");
+	return 0;
+}
+
+/* The owners the manifest `parent` gives, as a commit takes them: 0, or -1. */
+static int parent_owners(hull_store *store, const char *parent, hull_owner **out, size_t *count,
+                         char *why, size_t why_cap)
+{
+	char     name[80];
+	uint64_t listed = 0u;
+	int      fd = memfd_create("hull-owners", MFD_CLOEXEC);
+	char    *text = NULL;
+	off_t    length;
+	size_t   at = 0u;
+
+	*out = NULL;
+	*count = 0u;
+	snprintf(name, sizeof name, "sha256:%s", parent);
+	if (fd < 0 || hull_store_owners(store, name, fd, &listed, why, why_cap) != 0) {
+		if (fd >= 0)
+			close(fd);
+		return -1;
+	}
+	length = lseek(fd, 0, SEEK_END);
+	if (listed == 0u || length <= 0) {
+		close(fd);
+		return 0;
+	}
+	if ((text = malloc((size_t)length)) == NULL ||
+	    pread(fd, text, (size_t)length, 0) != length ||
+	    (*out = calloc((size_t)listed, sizeof **out)) == NULL) {
+		free(text);
+		close(fd);
+		snprintf(why, why_cap, "the parent's owners could not be read");
+		return -1;
+	}
+	close(fd);
+	/* uid, gid and path, each ended by a NUL, in the manifest's own order. */
+	while (at < (size_t)length && *count < listed) {
+		hull_owner *o = &(*out)[*count];
+
+		o->uid = strtoull(text + at, NULL, 10);
+		at += strlen(text + at) + 1u;
+		o->gid = strtoull(text + at, NULL, 10);
+		at += strlen(text + at) + 1u;
+		o->path = strdup(text + at);
+		at += strlen(text + at) + 1u;
+		if (o->path == NULL)
+			break;
+		(*count)++;
+	}
+	free(text);
 	return 0;
 }
 

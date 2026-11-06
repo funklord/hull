@@ -459,7 +459,9 @@ static void do_run(build *b, char *arg)
 	sb_str(&b->steps, name);
 	sb_str(&b->steps, "\") (run ");
 	sb_quoted(&b->steps, trim(arg));
-	sb_str(&b->steps, ")");
+	/* Docker gives every RUN the network; a file written for it counts on
+	 * that, `apt-get install` first of all. */
+	sb_str(&b->steps, ") (network true)");
 	if (b->user[0] != '\0') {
 		sb_str(&b->steps, " (user ");
 		sb_quoted(&b->steps, b->user);
@@ -535,6 +537,70 @@ static int packed(const char *name)
 	       (n > 4u && strcmp(name + n - 4u, ".tgz") == 0);
 }
 
+/* Where `dst` is, by the workdir: `.` and `./x` as a shell would read them, a
+ * destination that is a directory keeping its slash, which puts a file in it. */
+static void copy_target(const build *b, const char *dst, int several, char *to, size_t cap)
+{
+	const char *base = b->workdir[0] != '\0' ? b->workdir : "/";
+	char        joined[16384];
+	size_t      at = 0u;
+	int         dir = several || strcmp(dst, ".") == 0 || dst[strlen(dst) - 1u] == '/' ||
+	                  (strlen(dst) >= 2u && strcmp(dst + strlen(dst) - 2u, "/.") == 0);
+
+	if (dst[0] == '/')
+		snprintf(joined, sizeof joined, "%s", dst);
+	else
+		snprintf(joined, sizeof joined, "%s/%s", base, dst);
+	for (const char *c = joined; *c != '\0' && at + 2u < cap;) {
+		if (c[0] == '/' && c[1] == '/') {
+			c++;
+		} else if (c[0] == '/' && c[1] == '.' && (c[2] == '/' || c[2] == '\0')) {
+			c += 2;
+		} else {
+			to[at++] = *c++;
+		}
+	}
+	if (at == 0u || (dir && to[at - 1u] != '/'))
+		to[at++] = '/';
+	if (!dir && at > 1u && to[at - 1u] == '/')
+		at--;
+	to[at] = '\0';
+}
+
+/* What a chown or chmod after a copy names: `from`'s landing, added to `list`,
+ * each single-quoted for the shell. A directory's contents land in `to`
+ * itself; a file sent to a directory, under its own name. */
+static void landed_at(char *list, size_t cap, const char *from, const char *to)
+{
+	size_t      at = strlen(list);
+	size_t      length = strlen(from);
+	const char *leaf = strrchr(from, '/');
+	int         contents = strcmp(from, ".") == 0 || (length > 0u && from[length - 1u] == '/');
+
+	if (strchr(to, '\'') != NULL || strchr(from, '\'') != NULL)
+		return;
+	if (contents || to[strlen(to) - 1u] != '/')
+		snprintf(list + at, cap - at, " '%s'", to);
+	else
+		snprintf(list + at, cap - at, " '%s%s'", to, leaf != NULL ? leaf + 1 : from);
+}
+
+/* A step of a line after a copy, as root whatever USER says, as docker's
+ * --chown and --chmod are. */
+static void after_copy(build *b, const char *tool, const char *value, const char *list)
+{
+	char name[32];
+	char line[8400];
+
+	snprintf(name, sizeof name, "%s-%u", tool, ++b->step_no);
+	snprintf(line, sizeof line, "%s -R '%s'%s", tool, value, list);
+	sb_str(&b->steps, "\n    (step (name \"");
+	sb_str(&b->steps, name);
+	sb_str(&b->steps, "\") (run ");
+	sb_quoted(&b->steps, line);
+	sb_str(&b->steps, "))");
+}
+
 static void do_copy(build *b, const char *instr, char *arg)
 {
 	char  name[32];
@@ -543,6 +609,9 @@ static void do_copy(build *b, const char *instr, char *arg)
 	char *save;
 	char *dst;
 	const char *stage = NULL;
+	const char *chown_to = NULL;
+	const char *chmod_to = NULL;
+	char        landed[8192] = "";
 
 	for (char *w = strtok_r(trim(arg), " \t", &save); w != NULL && n < 64;
 	     w = strtok_r(NULL, " \t", &save)) {
@@ -553,6 +622,17 @@ static void do_copy(build *b, const char *instr, char *arg)
 			}
 			continue;
 		}
+		if (strncmp(w, "--chown=", 8u) == 0) {
+			chown_to = w + 8;
+			continue;
+		}
+		if (strncmp(w, "--chmod=", 8u) == 0) {
+			chmod_to = w + 8;
+			continue;
+		}
+		/* How docker stores a layer, which says nothing of what is in it. */
+		if (strcmp(w, "--link") == 0)
+			continue;
 		if (w[0] == '-' && w[1] == '-') {
 			note(&b->steps, "copy flag not translated", w);
 			continue;
@@ -575,10 +655,8 @@ static void do_copy(build *b, const char *instr, char *arg)
 	for (int i = 0; i < n - 1; i++) {
 		char to[8192];
 
-		if (dst[0] == '/' || b->workdir[0] == '\0')
-			snprintf(to, sizeof to, "%s", dst);
-		else
-			snprintf(to, sizeof to, "%s/%s", b->workdir, dst);
+		copy_target(b, dst, n > 2, to, sizeof to);
+		landed_at(landed, sizeof landed, words[i], to);
 		sb_str(&b->steps, " (path (from ");
 		sb_quoted(&b->steps, words[i]);
 		sb_str(&b->steps, ") (to ");
@@ -606,6 +684,10 @@ static void do_copy(build *b, const char *instr, char *arg)
 		sb_str(&b->steps, ")");
 	}
 	sb_str(&b->steps, ")");
+	if (chown_to != NULL && landed[0] != '\0')
+		after_copy(b, "chown", chown_to, landed);
+	if (chmod_to != NULL && landed[0] != '\0')
+		after_copy(b, "chmod", chmod_to, landed);
 }
 
 static void do_env(build *b, char *arg)

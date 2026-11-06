@@ -316,6 +316,11 @@ static int entry(writer *w, int dir, const char *name, size_t base, unsigned dep
 		if (S_ISDIR(st.st_mode)) {
 			w->path[base + length]      = '/';
 			w->path[base + length + 1u] = '\0';
+			/* Its owner is what is mounted's, the kernel's for /proc, which
+			 * reads as nobody from a user namespace: the point itself is
+			 * root's, as an image has it. */
+			st.st_uid = 0u;
+			st.st_gid = 0u;
 			status = header(w, -1, NULL, w->path, '5', &st, 0u, NULL);
 		}
 		w->path[base] = '\0';

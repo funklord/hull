@@ -203,6 +203,17 @@ cases=$((cases + 1))
 printf '%s\n' "$out" | grep -q '^hull: build: pass 2 of 2$' &&
 	! printf '%s\n' "$out" | grep -q ': cached, sha256:' ||
 	fail "--check did not run every step twice, uncached" "$out"
+# What an earlier step gave a user stays that user's through a step of copies,
+# which gives no owner and takes none away: `RUN adduser`, then `COPY`.
+printf 'copied\n' > "$root/b/later"
+cat > "$root/b/keep.conf" <<'EOF'
+(build (base "dir:./base") (steps
+  (step (name "give") (run "probe write /kept chown /kept 4321"))
+  (step (name "copy") (copy (path (from "later") (to "/later"))))))
+EOF
+expect 0 '' "$hull" build -f "$root/b/keep.conf" app/keep
+expect 0 '\(uid 4321\)\) \(path "kept"\)' "$hull" manifest show app/keep
+
 # A step's (user ...) is whom its run line runs as, as a Dockerfile's USER is.
 cat > "$root/b/asuser.conf" <<'EOF'
 (build (base "dir:./base") (steps (step (name "as") (run "probe uid") (user "4321"))))

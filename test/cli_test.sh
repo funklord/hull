@@ -150,10 +150,32 @@ FROM debian:13-slim
 RUN echo next-stage
 DF
 "$hull" import "$dir/Dockerfile.user" > "$dir/user.build" 2>&1
-expect 0 '\(run "echo as-app"\) \(user "app:app"\)' cat "$dir/user.build"
-expect 0 '\(run "echo as-root"\)\)' cat "$dir/user.build"
-expect 0 '\(run "echo root-again"\)\)' cat "$dir/user.build"
-expect 0 '\(run "echo next-stage"\)\)' cat "$dir/user.build"
+cat > "$dir/Dockerfile.copy" <<'DF'
+FROM debian:13-slim
+RUN apt-get install -y curl
+WORKDIR /srv
+COPY src/ .
+COPY one.txt two.txt ./
+COPY --link three.txt sub/
+COPY --chown=app:app four.txt /opt/
+COPY --chmod=755 run.sh run.sh
+COPY --chown=1000 . /all
+DF
+"$hull" import "$dir/Dockerfile.copy" > "$dir/copy.build" 2>&1
+expect 0 '\(run "apt-get install -y curl"\) \(network true\)' cat "$dir/copy.build"
+expect 0 '\(from "src/"\) \(to "/srv/"\)' cat "$dir/copy.build"
+expect 0 '\(from "one.txt"\) \(to "/srv/"\)' cat "$dir/copy.build"
+expect 0 '\(from "three.txt"\) \(to "/srv/sub/"\)' cat "$dir/copy.build"
+expect 0 '\(run "chown -R .app:app. ./opt/four.txt."\)' cat "$dir/copy.build"
+expect 0 '\(from "run.sh"\) \(to "/srv/run.sh"\)' cat "$dir/copy.build"
+expect 0 '\(run "chmod -R .755. ./srv/run.sh."\)' cat "$dir/copy.build"
+expect 0 '\(run "chown -R .1000. ./all."\)' cat "$dir/copy.build"
+cases=$((cases + 1))
+grep -q 'copy flag not translated' "$dir/copy.build" && fail 'a copy flag with a home is said to have none' "$(cat "$dir/copy.build")"
+expect 0 '\(run "echo as-app"\) \(network true\) \(user "app:app"\)' cat "$dir/user.build"
+expect 0 '\(run "echo as-root"\) \(network true\)\)' cat "$dir/user.build"
+expect 0 '\(run "echo root-again"\) \(network true\)\)' cat "$dir/user.build"
+expect 0 '\(run "echo next-stage"\) \(network true\)\)' cat "$dir/user.build"
 "$hull" import "$dir/Dockerfile.in" > "$dir/imported.build" 2>&1
 expect 0 'no machine to plan, only a build' "$hull" plan -f "$dir/imported.build"
 gb() {
@@ -192,7 +214,7 @@ FROM scratch AS out
 COPY --from=build /v /v
 DOCKERFILE
 expect 0 '\(base "docker.io/alpine:3.20"\)' "$hull" import "$dir/args.in"
-expect 0 '\(run "echo \$VERSION"\) \(env \(TAG "3.20"\) \(VERSION "1.2"\) \(APP "1.2"\)\)' \
+expect 0 '\(run "echo \$VERSION"\) \(network true\) \(env \(TAG "3.20"\) \(VERSION "1.2"\) \(APP "1.2"\)\)' \
 	"$hull" import "$dir/args.in"
 expect 0 '\(workdir "/opt/app-1.2"\)' "$hull" import "$dir/args.in"
 expect 0 '\(from "app-1.2.tar"\) \(to "/opt/app-1.2/\$PATH_OF_THE_BASE"\)' "$hull" import "$dir/args.in"

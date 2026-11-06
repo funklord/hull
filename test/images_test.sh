@@ -122,6 +122,61 @@ COMPOSE
 	sleep 3
 done
 
+# --- a real Dockerfile, imported, built and run --------------------------------
+
+# Two stages, a compiler from apk, a user made and owning what is copied after
+# it, a RUN as that user, and the build's own context filtered.
+mkdir -p "$root/df/src" "$root/df/.git"
+cat > "$root/df/src/hello.c" <<'C'
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(void)
+{
+	printf("hello %s from uid %d\n", getenv("GREETING"), (int)getuid());
+	return 0;
+}
+C
+printf 'private\n' > "$root/df/notes.txt"
+printf 'notes.txt\n.git\n' > "$root/df/.dockerignore"
+cat > "$root/df/Dockerfile" <<'DF'
+ARG ALPINE=3.20
+FROM alpine:${ALPINE} AS build
+RUN apk add --no-cache gcc musl-dev
+WORKDIR /src
+COPY src/ .
+RUN gcc -static -Os -o /hello hello.c
+
+FROM alpine:${ALPINE}
+ARG WHO=world
+ENV GREETING=${WHO}
+RUN addgroup -S app && adduser -S -G app -h /home/app app
+COPY --from=build /hello /usr/local/bin/hello
+COPY --chown=app:app src/hello.c /home/app/copied.c
+WORKDIR /home/app
+USER app
+RUN id -un > /home/app/whoami
+ENTRYPOINT ["/usr/local/bin/hello"]
+DF
+if timeout 200 "$hull" pull alpine:3.20 alpine:3.20 > /dev/null 2>&1; then
+	(cd "$root/df" && "$hull" import Dockerfile > hull.conf 2> /dev/null &&
+	 timeout 300 "$hull" build -f hull.conf dfapp > "$root/df.out" 2>&1)
+	cases=$((cases + 1))
+	[ "$?" = 0 ] || fail 'a real Dockerfile builds' "$(tail -5 "$root/df.out")"
+	printf '(machine (backend chroot) (source "dfapp"))\n' > "$root/df/run.conf"
+	out=$(cd "$root/df" && timeout 30 "$hull" run -f run.conf 2>&1)
+	says 'its entrypoint runs as its USER, its ENV set' "$out" 'hello world from uid 100'
+	cases=$((cases + 1))
+	printf '%s\n' "$out" | grep -q 'owners:' && fail 'every owner in it is given' "$out"
+	printf '(machine (backend chroot) (source "dfapp") (command "/bin/sh" "-c" "cat whoami; ls -ln copied.c; ls /; cat notes.txt"))\n' \
+		> "$root/df/look.conf"
+	out=$(cd "$root/df" && timeout 30 "$hull" run -f look.conf 2>&1)
+	says 'a RUN after USER ran as it, in a home a COPY passed over' "$out" 'app'
+	says '--chown gave what was copied' "$out" ' 100 '
+	cases=$((cases + 1))
+	printf '%s\n' "$out" | grep -q '^private$' && fail 'the file .dockerignore names stayed out' "$out"
+fi
+
 printf 'images: %s cases, %s failed\n' "$cases" "$failures"
 [ "$failures" = 0 ] && rm -rf "$dir"
 [ "$failures" = 0 ]
