@@ -600,6 +600,43 @@ pool's `(capacity N)` and its slots, a hw machine on its boards.
   machine in a pool of only boards, or a hw machine in a pool with none.
 - A request waiting for one named entry holds up nothing else in the pool.
 
+### A pool shared between people or hosts
+
+Each user's core sees only that user's machines, so a shared bench needs one
+owner for who holds what: `hull broker`. It runs as an ordinary user with no
+root, and starts no machines.
+
+```sh
+hull broker /srv/hull-broker      # pools.conf beside it; the directory's group may ask
+```
+
+```scheme
+; on each client: the same pool, its boards described here
+(pools
+  (bench (broker "ssh://pool@bench-host/srv/hull-broker")
+    (members (board "rpi4-a" (address "192.168.7.21") (power "pdu-switch 7/1")))))
+```
+
+```
+# authorized_keys of the broker's account: a key is a holder, with no shell
+command="hull broker-dial --dir /srv/hull-broker --as alice",restrict ssh-ed25519 AAAA...
+```
+
+Specs and commands stay as they were: `(pool "bench")`, `hull reserve`,
+`hull pool ls`. What makes it safe across a network:
+
+- **Hull opens no port.** Everything goes over ssh, so keys, encryption and the
+  host's identity are OpenSSH's. Nothing prompts, and a dead link ends.
+- **A broker cannot run anything on a client.** It only says who holds what;
+  how to reach a board stays in each client's own file.
+- **A lost connection frees nothing.** A board is never given to two. The client
+  retries until the broker hears the machine is over, and a client gone for good
+  shows in `hull lease ls` for the broker's account to release.
+- **No clocks are compared.** A lease's end reaches a client as seconds left, and
+  a machine under it stops with status 79.
+- **Only a lease's holder can end it,** and one holder can take only a quarter of
+  what a broker keeps.
+
 ## policy.conf — which engine a class means here
 
 `(backend vm)` says what a machine is. Which engine serves it is the host's, in

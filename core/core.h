@@ -14,6 +14,9 @@ extern "C" {
  * when another core already holds the lock, or 1 if it could not start. */
 int hull_core_run(const char *host_arch);
 
+/* `hull broker DIR`: pools for those who can reach it (section 4.12). */
+int hull_broker_run(const char *dir);
+
 #ifdef __cplusplus
 }
 #endif

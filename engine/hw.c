@@ -111,12 +111,21 @@ static hull_status fail(hull_error *error, hull_status code, const char *detail)
 
 /* --- boards -------------------------------------------------------------- */
 
-static const char *config_path(char *path, size_t cap)
+static char config_given[4200];
+
+void hull_pool_config(const char *path)
+{
+	snprintf(config_given, sizeof config_given, "%s", path);
+}
+
+const char *hull_pool_path(char *path, size_t cap)
 {
 	const char *config = getenv("XDG_CONFIG_HOME");
 	const char *home   = getenv("HOME");
 
-	if (config != NULL && config[0] == '/')
+	if (config_given[0] != '\0')
+		snprintf(path, cap, "%s", config_given);
+	else if (config != NULL && config[0] == '/')
 		snprintf(path, cap, "%s/hull/pools.conf", config);
 	else if (home != NULL)
 		snprintf(path, cap, "%s/.config/hull/pools.conf", home);
@@ -147,7 +156,7 @@ static uint8_t *config_text(size_t *length)
 	uint8_t *text;
 	FILE    *file;
 
-	if (config_path(path, sizeof path) == NULL || (file = fopen(path, "re")) == NULL)
+	if (hull_pool_path(path, sizeof path) == NULL || (file = fopen(path, "re")) == NULL)
 		return NULL;
 	if ((text = malloc(65536u)) != NULL)
 		*length = fread(text, 1u, 65536u, file);
@@ -265,6 +274,7 @@ int hull_pool_read(const char *name, hull_pool *pool)
 		pool->capacity = strtoll(capacity, &end, 10);
 		if (*end != '\0' || pool->capacity < 0)
 			snprintf(pool->wrong, sizeof pool->wrong, "(capacity %s) is not a count", capacity);
+		field(&doc, &entry, "broker", pool->broker, sizeof pool->broker);
 		field(&doc, &entry, "memory", capacity, sizeof capacity);
 		if (capacity[0] != '\0' && (pool->memory_mib = hull_size_mib(capacity)) == 0u)
 			snprintf(pool->wrong, sizeof pool->wrong, "(memory %s) is not a size", capacity);
@@ -279,6 +289,34 @@ int hull_pool_read(const char *name, hull_pool *pool)
 	}
 	free(text);
 	return named;
+}
+
+unsigned hull_pool_brokers(char (*urls)[1100], unsigned cap)
+{
+	size_t          length = 0u;
+	uint8_t        *text = config_text(&length);
+	hull_sexpr_doc  doc;
+	hull_sexpr_form top;
+	hull_sexpr_form item;
+	unsigned        count = 0u;
+
+	if (text != NULL &&
+	    hull_sexpr_open(&doc, text, length, HULL_SEXPR_READABLE, NULL) == HULL_SEXPR_OK &&
+	    hull_sexpr_first(&doc, &top) && hull_sexpr_child(&doc, &top, &item))
+		while (hull_sexpr_next(&doc, &item, &item) && count < cap) {
+			char     url[1100];
+			unsigned seen = 0u;
+
+			if (item.kind != HULL_SEXPR_LIST)
+				continue;
+			field(&doc, &item, "broker", url, sizeof url);
+			while (seen < count && strcmp(urls[seen], url) != 0)
+				seen++;
+			if (url[0] != '\0' && seen == count)
+				memcpy(urls[count++], url, sizeof url);
+		}
+	free(text);
+	return count;
 }
 
 int hull_hw_boards(const char *pool, hull_board *boards, unsigned cap)
@@ -351,6 +389,8 @@ static int mark_path(const char *name, char *path, size_t cap)
 	return 0;
 }
 
+static void mark_broken(const char *name, const char *why);
+
 int hull_hw_broken(const char *name)
 {
 	char path[4200];
@@ -363,6 +403,11 @@ int hull_hw_fix(const char *name)
 	char path[4200];
 
 	return mark_path(name, path, sizeof path) == 0 && unlink(path) == 0 ? 0 : -1;
+}
+
+void hull_hw_mark(const char *name, const char *why)
+{
+	mark_broken(name, why);
 }
 
 static void mark_broken(const char *name, const char *why)

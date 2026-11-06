@@ -3491,7 +3491,7 @@ cases=$((cases + 1))
 lease=$(timeout 20 "$hull" reserve tpool 2>&1)
 printf '%s\n' "$lease" | grep -Eqx 'lease-[0-9a-f]{8}' ||
 	fail "hull reserve did not print a lease's id alone" "$lease"
-expect 0 "^$lease +tpool +1 +0 +-\$" "$hull" lease ls
+expect 0 "^$lease +tpool +1 +0 +- +-\$" "$hull" lease ls
 expect 0 '^tpool +2 +1 +0$' "$hull" pool ls
 conf plow '(pool "tpool") (hostname "plow") (command "/probe" "say" "ready" "sleep" "3")'
 rm -f "$root/plow.out"
@@ -3502,7 +3502,7 @@ until grep -q '^ready$' "$root/plow.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
 	tries=$((tries + 1))
 	sleep 0.25
 done
-expect 0 "^$lease +tpool +1 +1 +-\$" "$hull" lease ls
+expect 0 "^$lease +tpool +1 +1 +- +-\$" "$hull" lease ls
 expect 125 "lease $lease.s 1 slots are in use" "$hull" run --lease "$lease" -f "$root/pnext.conf"
 wait "$plow" 2>/dev/null
 expect 125 'pool tpool has 2 slots, and the lease asks 3' "$hull" reserve tpool --count 3
@@ -3586,7 +3586,7 @@ until grep -q '^ready$' "$root/pgpu.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
 	tries=$((tries + 1))
 	sleep 0.25
 done
-expect 0 "^$named +tmix +1 +1 +-\$" "$hull" lease ls
+expect 0 "^$named +tmix +1 +1 +- +-\$" "$hull" lease ls
 wait "$pgpu" 2>/dev/null
 # A run with no lease takes what fills first, and goes past gpu's holder.
 conf pfill '(pool "tmix") (hostname "pfill") (command "/probe" "say" "ready" "sleep" "3")'
@@ -3661,8 +3661,8 @@ until grep -q '^ready$' "$root/pkept.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
 done
 kill -KILL "$(head -1 "$XDG_RUNTIME_DIR/hull/core.lock")" 2> /dev/null
 wait "$pkept" 2>/dev/null
-expect 0 "^$both +tmix +2 +0 +-\$" "$hull" lease ls
-expect 0 "^$other +tmix +1 +0 +-\$" "$hull" lease ls
+expect 0 "^$both +tmix +2 +0 +- +-\$" "$hull" lease ls
+expect 0 "^$other +tmix +1 +0 +- +-\$" "$hull" lease ls
 expect 0 "^gpu +slot +-1 +leased +$both\$" "$hull" pool ls tmix
 expect 0 '^tmix +3 +3 +0$' "$hull" pool ls
 expect 0 '^tcap +1 +1 +0$' "$hull" pool ls
@@ -3709,7 +3709,7 @@ expect 125 'member word: \(by_name maybe\) is true or left out' "$hull" run -f "
 # back after. One that ran out with no core about is gone from the next.
 expect 2 'usage' "$hull" reserve tend --for soon
 ending=$(timeout 20 "$hull" reserve tend --for 3s)
-expect 0 "^$ending +tend +1 +0 +20[0-9-]+T[0-9:]+Z\$" "$hull" lease ls
+expect 0 "^$ending +tend +1 +0 +20[0-9-]+T[0-9:]+Z +-\$" "$hull" lease ls
 cases=$((cases + 1))
 grep -Eq '^until [1-9]' "$XDG_RUNTIME_DIR/hull/leases/$ending" ||
 	fail "a lease's end was not in its file" "$(cat "$XDG_RUNTIME_DIR/hull/leases/$ending")"

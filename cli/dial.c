@@ -70,16 +70,11 @@ int hull_dial_parse(const char *url, hull_dial_target *out, char *why, size_t ca
 	return 0;
 }
 
-int hull_dial_host(const hull_dial_target *remote)
+static int dial_with(const hull_dial_target *remote, const char *command, int batch)
 {
 	int         pair[2];
 	pid_t       child;
-	const char *far = getenv("HULL_REMOTE_HULL");
-	char        command[1100];
 
-	if (far == NULL || far[0] == '\0')
-		far = "hull";
-	snprintf(command, sizeof command, "%s dial", far);
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0)
 		return -1;
 	child = fork();
@@ -89,20 +84,26 @@ int hull_dial_host(const hull_dial_target *remote)
 		return -1;
 	}
 	if (child == 0) {
-		char *argv[10];
+		char *argv[18];
 		int   n = 0;
 
 		if (dup2(pair[1], 0) < 0 || dup2(pair[1], 1) < 0)
 			_exit(126);
 		argv[n++] = "ssh";
 		argv[n++] = "-T";
+		if (batch) {
+			argv[n++] = "-oBatchMode=yes";
+			argv[n++] = "-oConnectTimeout=15";
+			argv[n++] = "-oServerAliveInterval=15";
+			argv[n++] = "-oServerAliveCountMax=3";
+		}
 		if (remote->port[0] != '\0') {
 			argv[n++] = "-p";
 			argv[n++] = (char *)remote->port;
 		}
 		argv[n++] = "--";
 		argv[n++] = (char *)remote->destination;
-		argv[n++] = command;
+		argv[n++] = (char *)command;
 		argv[n] = NULL;
 		execvp("ssh", argv);
 		fprintf(stderr, "hull: ssh: %s\n", strerror(errno));
@@ -110,6 +111,41 @@ int hull_dial_host(const hull_dial_target *remote)
 	}
 	close(pair[1]);
 	return pair[0];
+}
+
+int hull_dial_host(const hull_dial_target *remote)
+{
+	const char *far = getenv("HULL_REMOTE_HULL");
+	char        command[1100];
+
+	if (far == NULL || far[0] == '\0')
+		far = "hull";
+	snprintf(command, sizeof command, "%s dial", far);
+	return dial_with(remote, command, 0);
+}
+
+int hull_dial_broker(const hull_dial_target *remote)
+{
+	const char *far = getenv("HULL_REMOTE_HULL");
+	char        command[2400];
+	size_t      at;
+
+	if (far == NULL || far[0] == '\0')
+		far = "hull";
+	/* A shell reads this at the far end, so the directory is quoted; a
+	 * forced command there takes no notice of it. */
+	at = (size_t)snprintf(command, sizeof command, "%s broker-dial --dir '", far);
+	for (const char *c = remote->dir; *c != '\0' && at + 6u < sizeof command; c++) {
+		if (*c == '\'') {
+			memcpy(command + at, "'\\''", 4u);
+			at += 4u;
+		} else {
+			command[at++] = *c;
+		}
+	}
+	command[at++] = '\'';
+	command[at] = '\0';
+	return dial_with(remote, command, 1);
 }
 
 /* Every byte of `n` to `fd`: 0, or -1. */

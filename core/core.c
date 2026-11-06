@@ -47,6 +47,7 @@
 #include <sys/statfs.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <pwd.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -95,6 +96,9 @@ typedef struct client {
 	int        used;
 	hull_wire  wire;
 	int        dead;  /* a send failed: closed at the end of this turn */
+	char       holder[64];  /* a broker's: who it speaks for, the peer's account or its --as */
+	int        owner;       /* a broker's: the peer is the account it runs as */
+	int        spoke;       /* a broker's: it has said something, so is past identifying */
 
 	/* Framed messages not yet written; the socket does not block, and
 	 * poll() says when it takes more. */
@@ -145,6 +149,8 @@ struct slot {
 	int                lease_ended;    /* its lease ended under it: status 79, section 4.12 */
 	unsigned           memory_mib;     /* what its plan declares, against its pool's budget */
 	unsigned           cpus;
+	char               broker_lease[24];  /* the broker's lease it is under, or "" */
+	long long          broker_end;     /* when that lease ends, monotonic ms, or 0 */
 	hull_core          core;
 	hull_machine      *handle;
 	char               state[16];
@@ -1642,6 +1648,94 @@ static void forget_ssh(slot *s)
 	s->ssh = 0;
 }
 
+/* --- what a broker gave -------------------------------------------------- */
+
+/*
+ * hull/held/MACHINE.LEASE, one line each, what a broker gave this user's
+ * machine: written before the run can be refused, so that what was given
+ * goes back however the run ends, and a core that dies leaves the record
+ * for the next. Each second a machine not running under it is settled by
+ * `hull broker-settle FILE` in a process of its own, the far end being a
+ * network away, which removes the file once the broker has it and leaves
+ * it for the next try otherwise. So a broker out of reach frees nothing
+ * and loses nothing: the entry stays held until the word arrives, which
+ * can leave an entry idle, and can never give it to two.
+ */
+#define SETTLE_EVERY_MS 30000LL
+
+static long long monotonic_ms(void);
+
+static char      held_dir[4200];
+static int       held_pending;
+static long long held_tried;
+
+static void hold_note(const char *id, const char *url, const char *lease_id, const char *member,
+                      int own)
+{
+	char  path[4400];
+	FILE *file;
+
+	if (held_dir[0] == '\0')
+		return;
+	snprintf(path, sizeof path, "%s/%s.%s", held_dir, id, lease_id);
+	if ((file = fopen(path, "we")) != NULL) {
+		fprintf(file, "%s\n%s\n%s\n%d\n", url, lease_id, member, own);
+		fclose(file);
+	}
+	held_tried = 0;
+}
+
+static void settle_held(void)
+{
+	DIR           *dir;
+	struct dirent *entry;
+	long long      now = monotonic_ms();
+	int            pending = 0;
+
+	if (held_dir[0] == '\0' || (dir = opendir(held_dir)) == NULL)
+		return;
+	while ((entry = readdir(dir)) != NULL) {
+		char        id[300];
+		char       *dot;
+		const slot *s;
+
+		if (entry->d_name[0] == '.')
+			continue;
+		snprintf(id, sizeof id, "%s", entry->d_name);
+		if ((dot = strchr(id, '.')) == NULL)
+			continue;
+		*dot = '\0';
+		s = find_machine(id);
+		if (s != NULL && !s->exited && strcmp(s->broker_lease, dot + 1) == 0)
+			continue;
+		pending = 1;
+		if (held_tried != 0 && now - held_tried < SETTLE_EVERY_MS)
+			continue;
+		{
+			char  path[4600];
+			pid_t child;
+
+			snprintf(path, sizeof path, "%s/%s", held_dir, entry->d_name);
+			/* Twice forked, so that nothing here waits for it. */
+			if ((child = fork()) == 0) {
+				if (fork() == 0) {
+					execl("/proc/self/exe", "hull", "broker-settle", path, (char *)NULL);
+					_exit(127);
+				}
+				_exit(0);
+			}
+			if (child > 0)
+				waitpid(child, NULL, 0);
+		}
+	}
+	closedir(dir);
+	if (pending && (held_tried == 0 || now - held_tried >= SETTLE_EVERY_MS))
+		held_tried = now;
+	if (!pending)
+		held_tried = 0;
+	held_pending = pending;
+}
+
 /* --- machines that outlive the core -------------------------------------- */
 
 /*
@@ -1693,6 +1787,8 @@ static void keep_machine(slot *s)
 	hull_msg_text(&m, s->lease);
 	hull_msg_raw(&m, ")(6:member");
 	hull_msg_text(&m, s->member);
+	hull_msg_raw(&m, ")(12:broker_lease");
+	hull_msg_text(&m, s->broker_lease);
 	hull_msg_raw(&m, ")(4:cpus");
 	hull_msg_number(&m, s->cpus);
 	hull_msg_raw(&m, ")(6:memory");
@@ -1806,6 +1902,8 @@ static int adopt_one(const char *id)
 			hull_msg_string(&doc, &held, s->lease, sizeof s->lease);
 		if (hull_msg_find(&doc, "member", &held))
 			hull_msg_string(&doc, &held, s->member, sizeof s->member);
+		if (hull_msg_find(&doc, "broker_lease", &held))
+			hull_msg_string(&doc, &held, s->broker_lease, sizeof s->broker_lease);
 		if (hull_msg_find(&doc, "memory", &held) && hull_msg_long(&doc, &held, &number))
 			s->memory_mib = (unsigned)number;
 		if (hull_msg_find(&doc, "cpus", &held) && hull_msg_long(&doc, &held, &number))
@@ -2294,6 +2392,11 @@ typedef struct waiting {
 	want      asked;
 } waiting;
 
+static int broker_mode;   /* this is `hull broker`: no machines, its leases for others */
+
+/* What a broker gives a machine past its lease's end to stop in. */
+#define BROKER_GRACE_S 120
+
 /* An entry of a pool by name, held by a lease. */
 typedef struct held_member {
 	char name[64];
@@ -2314,6 +2417,12 @@ typedef struct lease {
 	long long until;     /* when it ends, seconds since the epoch, or 0 for its release */
 	unsigned    held_count;
 	held_member held[HULL_POOL_MEMBERS];
+	char        holder[64];     /* a broker's: who it is held for, the only one who may end it */
+	unsigned    memory_mib;     /* a broker's run's: what its plan declares */
+	unsigned    cpus;
+	int         run;            /* a broker's: made for one run */
+	uint8_t     claimed[HULL_POOL_MEMBERS];  /* a broker's: the held in use by a run */
+	unsigned    unnamed_claimed;
 } lease;
 
 static lease leases[MAX_LEASES];
@@ -2324,6 +2433,7 @@ static long long admitting;   /* when what admit_waiting calls began to wait, or
 static long long monotonic_ms(void);
 static void      handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body);
 static void      handle_lease_ask(client *c, uint32_t ch, const hull_sexpr_doc *body);
+static int       over_quota(const char *holder);
 
 /* Who holds the entry `name`: a lease, `*leased` set, or a machine, or
  * NULL for nobody. An entry is one thing by its name, so a board listed in
@@ -2372,6 +2482,12 @@ static void declared_in(const char *pool, unsigned *memory_mib, unsigned *cpus)
 		if (machines[i].used && !machines[i].exited && strcmp(machines[i].pool, pool) == 0) {
 			*memory_mib += machines[i].memory_mib;
 			*cpus       += machines[i].cpus;
+		}
+	/* A broker holds no machine: a run's lease says what it declared. */
+	for (unsigned i = 0u; i < MAX_LEASES; i++)
+		if (leases[i].used && strcmp(leases[i].pool, pool) == 0) {
+			*memory_mib += leases[i].memory_mib;
+			*cpus       += leases[i].cpus;
 		}
 }
 
@@ -2709,9 +2825,12 @@ static int save_lease(const lease *l)
 	if ((file = fopen(made, "we")) == NULL)
 		return -1;
 	ok = fprintf(file, "pool %s\ncount %u\nuntil %lld\n", l->pool, l->count, l->until) > 0;
+	if (l->holder[0] != '\0')
+		ok = ok && fprintf(file, "holder %s\nmemory %u\ncpus %u\nrun %d\nclaims %u\n", l->holder,
+		                   l->memory_mib, l->cpus, l->run, l->unnamed_claimed) > 0;
 	for (unsigned i = 0u; ok && i < l->held_count; i++)
-		ok = fprintf(file, "member %s %s\n", l->held[i].board ? "board" : "slot",
-		             l->held[i].name) > 0;
+		ok = fprintf(file, "member %s %s %d\n", l->held[i].board ? "board" : "slot",
+		             l->held[i].name, l->claimed[i]) > 0;
 	ok = fclose(file) == 0 && ok;
 	if (!ok || rename(made, path) != 0) {
 		unlink(made);
@@ -2745,9 +2864,15 @@ static void load_leases(void)
 			memcpy(l.id, entry->d_name, length + 1u);
 			if (fscanf(file, " until %lld", &l.until) != 1)
 				l.until = 0;
-			while (l.held_count < HULL_POOL_MEMBERS &&
-			       fscanf(file, " member %7s %63s", kind, l.held[l.held_count].name) == 2)
-				l.held[l.held_count++].board = strcmp(kind, "board") == 0;
+			if (fscanf(file, " holder %63s memory %u cpus %u run %d claims %u", l.holder,
+			           &l.memory_mib, &l.cpus, &l.run, &l.unnamed_claimed) != 5)
+				l.holder[0] = '\0';
+			for (int claimed = 0; l.held_count < HULL_POOL_MEMBERS &&
+			     fscanf(file, " member %7s %63s %d", kind, l.held[l.held_count].name, &claimed) == 3;
+			     l.held_count++) {
+				l.held[l.held_count].board = strcmp(kind, "board") == 0;
+				l.claimed[l.held_count] = claimed != 0;
+			}
 			leases[n++] = l;
 		}
 		fclose(file);
@@ -2916,6 +3041,8 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	char               pool_name[64];
 	char               lease_id[24];
 	char               member[64] = "";
+	char               broker_lease[24] = "";
+	long long          broker_left = 0;
 	int                on_board;
 	unsigned           memory_mib = 0u;
 	unsigned           cpus = 0u;
@@ -2959,6 +3086,46 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		if ((name = hull_access_value(&plan_doc, &machine, "cpus")) != NULL)
 			cpus = (unsigned)strtoul(name, NULL, 10);
 		free(name);
+	}
+	/* Given by a broker, the plan's (under_broker ...): the frontend asked
+	 * it, waiting there, so this core neither counts nor waits. Written
+	 * down before anything can refuse the run, so that what the broker
+	 * gave goes back however this ends. */
+	{
+		hull_sexpr_form top;
+		hull_sexpr_form given_by;
+
+		hull_sexpr_first(&plan_doc, &top);
+		if (hull_access_find(&plan_doc, &top, "under_broker", &given_by)) {
+			char *url   = hull_access_value(&plan_doc, &given_by, "broker");
+			char *lid   = hull_access_value(&plan_doc, &given_by, "id");
+			char *left  = hull_access_value(&plan_doc, &given_by, "left");
+			char *entry = hull_access_value(&plan_doc, &given_by, "member");
+			char *own   = hull_access_value(&plan_doc, &given_by, "own");
+			char *pool  = hull_access_value(&plan_doc, &machine, "pool");
+			int   fine  = url != NULL && lid != NULL && left != NULL && entry != NULL &&
+			              own != NULL && pool != NULL && strlen(lid) < sizeof broker_lease &&
+			              strncmp(lid, "lease-", 6u) == 0 && strchr(lid, '/') == NULL &&
+			              strlen(entry) < sizeof member;
+
+			if (fine) {
+				snprintf(broker_lease, sizeof broker_lease, "%s", lid);
+				snprintf(member, sizeof member, "%s", entry);
+				snprintf(pool_name, sizeof pool_name, "%s", pool);
+				broker_left = strtoll(left, NULL, 10);
+				hold_note(id, url, lid, entry, strcmp(own, "1") == 0);
+			}
+			free(url);
+			free(lid);
+			free(left);
+			free(entry);
+			free(own);
+			free(pool);
+			if (!fine) {
+				send_error(c, ch, "the plan's (under_broker ...) is not one");
+				return;
+			}
+		}
 	}
 	/* Under a lease, `hull run --lease ID`, the plan's (under ID): a slot
 	 * of the lease's, its pool's already held, so it neither waits nor
@@ -3007,7 +3174,7 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 			snprintf(pool_name, sizeof pool_name, "%s", l->pool);
 		}
 	}
-	if (lease_id[0] == '\0') {
+	if (lease_id[0] == '\0' && broker_lease[0] == '\0') {
 		char *pool = hull_access_value(&plan_doc, &machine, "pool");
 
 		/* A machine naming no pool is in the user's default, a pool like
@@ -3036,6 +3203,12 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 				snprintf(why, sizeof why, "pool %s is not one the user's pools.conf names: "
 				         "(pools (%s (capacity N))) in ~/.config/hull/pools.conf",
 				         pool_name, pool_name);
+				send_error(c, ch, why);
+				return;
+			}
+			if (p.broker[0] != '\0') {
+				snprintf(why, sizeof why, "pool %s is a broker's, and this run brought nothing "
+				         "of it: `hull run` asks it from where pools.conf says so", pool_name);
 				send_error(c, ch, why);
 				return;
 			}
@@ -3202,8 +3375,11 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	snprintf(s->pool, sizeof s->pool, "%s", pool_name);
 	snprintf(s->lease, sizeof s->lease, "%s", lease_id);
 	snprintf(s->member, sizeof s->member, "%s", member);
-	s->memory_mib = memory_mib;
-	s->cpus       = cpus;
+	snprintf(s->broker_lease, sizeof s->broker_lease, "%s", broker_lease);
+	s->broker_end = broker_left > 0 ? monotonic_ms() + broker_left * 1000 : 0;
+	/* What a broker gave counts there, and not in this core's own pool. */
+	s->memory_mib = broker_lease[0] != '\0' ? 0u : memory_mib;
+	s->cpus       = broker_lease[0] != '\0' ? 0u : cpus;
 	free(class_name);
 	/* Its arch, for what is committed of it while it runs; the host's is
 	 * said by saying none. */
@@ -4440,6 +4616,9 @@ static void handle_lease_ask(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	char               names[HULL_POOL_MEMBERS * 64u];
 	long long          count = 0;
 	long long          lasts = 0;
+	long long          memory = 0;
+	long long          cpus = 0;
+	long long          run = 0;
 	long long          wait = -1;
 	long long          since = admitting != 0 ? admitting : monotonic_ms() + 1;
 	unsigned           picked_count = 0u;
@@ -4452,12 +4631,29 @@ static void handle_lease_ask(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	    !hull_msg_find(body, "for", &value) || !hull_msg_long(body, &value, &lasts) || lasts < 0 ||
 	    !hull_msg_find(body, "kind", &value) || !hull_msg_string(body, &value, kind, sizeof kind) ||
 	    !hull_msg_find(body, "members", &value) ||
-	    !hull_msg_string(body, &value, names, sizeof names)) {
+	    !hull_msg_string(body, &value, names, sizeof names) ||
+	    !hull_msg_find(body, "memory", &value) || !hull_msg_long(body, &value, &memory) ||
+	    memory < 0 || memory > 0x7fffffff || !hull_msg_find(body, "cpus", &value) ||
+	    !hull_msg_long(body, &value, &cpus) || cpus < 0 || cpus > 0xffff ||
+	    !hull_msg_find(body, "run", &value) || !hull_msg_long(body, &value, &run)) {
 		send_error(c, ch, "a lease is of a pool, by its name, and of 1 slot or more");
+		return;
+	}
+	if (hull_pool_read(pool, &p) == 0 && p.broker[0] != '\0') {
+		snprintf(why, sizeof why, "pool %s is a broker's: `hull reserve` asks it from here", pool);
+		send_error(c, ch, why);
+		return;
+	}
+	if (broker_mode && !admitting && over_quota(c->holder)) {
+		snprintf(why, sizeof why, "%s holds or waits for as much as one holder may", c->holder);
+		send_error(c, ch, why);
 		return;
 	}
 	memset(&asked, 0, sizeof asked);
 	asked.count = (unsigned)count;
+	asked.is_run = broker_mode && run != 0;
+	asked.memory_mib = (unsigned)memory;
+	asked.cpus = (unsigned)cpus;
 	asked.kind  = strcmp(kind, "board") == 0 ? WANT_BOARD :
 	              strcmp(kind, "slot") == 0  ? WANT_SOFTWARE : WANT_ANY;
 	for (char *name = strtok(names, ","); name != NULL; name = strtok(NULL, ",")) {
@@ -4514,6 +4710,19 @@ static void handle_lease_ask(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		*l = (lease){ .used = 1, .count = (unsigned)count, .held_count = picked_count };
 		memcpy(l->held, picked, picked_count * sizeof picked[0]);
 		l->until = lasts > 0 ? (long long)time(NULL) + lasts : 0;
+		if (broker_mode) {
+			snprintf(l->holder, sizeof l->holder, "%s", c->holder);
+			l->run = run != 0;
+			if (l->run) {
+				/* A run's own: it is in use from now, and what it declares counts. */
+				l->memory_mib = asked.memory_mib;
+				l->cpus       = asked.cpus;
+				if (l->held_count > 0u)
+					l->claimed[0] = 1;
+				else
+					l->unnamed_claimed = 1u;
+			}
+		}
 		snprintf(l->id, sizeof l->id, "lease-%08x", random_id);
 		snprintf(l->pool, sizeof l->pool, "%s", pool);
 		if (save_lease(l) != 0) {
@@ -4525,9 +4734,142 @@ static void handle_lease_ask(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		hull_msg_channel(&m, ch);
 		hull_msg_raw(&m, "(2:id");
 		hull_msg_text(&m, l->id);
+		hull_msg_raw(&m, ")(4:left");
+		hull_msg_number(&m, lasts);
+		hull_msg_raw(&m, ")(6:member");
+		hull_msg_text(&m, l->held_count > 0u ? l->held[0].name : "");
 		hull_msg_raw(&m, "))");
 		send_to(c, &m);
+		if (broker_mode)
+			fprintf(stderr, "hull broker: %s holds %s of %s, %u of it\n", l->holder, l->id, l->pool,
+			        l->count);
 	}
+}
+
+/* Whether `holder` may be given no more: what a network reaches is not
+ * one person's to fill, so one holder has at most a quarter of what the
+ * broker can keep, leases and requests waiting alike. */
+static int over_quota(const char *holder)
+{
+	unsigned leased = 0u;
+	unsigned waits = 0u;
+
+	for (unsigned i = 0u; i < MAX_LEASES; i++)
+		leased += leases[i].used && strcmp(leases[i].holder, holder) == 0;
+	for (unsigned i = 0u; i < MAX_WAITING; i++)
+		waits += waiters[i].used && strcmp(clients[waiters[i].client].holder, holder) == 0;
+	return leased >= MAX_LEASES / 4u || waits >= MAX_WAITING / 4u;
+}
+
+/* Whether `c` may act on `l`: its holder, or the account the broker runs
+ * as, who is who clears what a holder cannot come back for. */
+static int may_touch(const client *c, const lease *l)
+{
+	return strcmp(c->holder, l->holder) == 0 || c->owner;
+}
+
+/* `(claim (ch n) (id ID) (kind K))`: an entry of a broker's lease for a
+ * run under it, K board or slot, answered with it and the seconds left. */
+static void handle_claim(client *c, uint32_t ch, const hull_sexpr_doc *body)
+{
+	hull_sexpr_form value;
+	char            id[24];
+	char            kind[8];
+	lease          *l;
+	hull_msg        m = { 0 };
+	const char     *member = NULL;
+	int             board;
+
+	if (!hull_msg_find(body, "id", &value) || !hull_msg_string(body, &value, id, sizeof id) ||
+	    !hull_msg_find(body, "kind", &value) || !hull_msg_string(body, &value, kind, sizeof kind) ||
+	    (l = find_lease(id)) == NULL || !may_touch(c, l)) {
+		send_error(c, ch, "no such lease is held");
+		return;
+	}
+	board = strcmp(kind, "board") == 0;
+	for (unsigned i = 0u; i < l->held_count && member == NULL; i++)
+		if (l->held[i].board == board && !l->claimed[i]) {
+			l->claimed[i] = 1;
+			member = l->held[i].name;
+		}
+	if (member == NULL && !board && l->unnamed_claimed < l->count - l->held_count) {
+		l->unnamed_claimed++;
+		member = "";
+	}
+	if (member == NULL) {
+		char why[120];
+
+		snprintf(why, sizeof why, "lease %s holds no %s free", l->id,
+		         board ? "board" : "slot for a software machine");
+		send_error(c, ch, why);
+		return;
+	}
+	save_lease(l);
+	hull_msg_raw(&m, "(5:claim");
+	hull_msg_channel(&m, ch);
+	hull_msg_raw(&m, "(4:left");
+	hull_msg_number(&m, l->until != 0 ? l->until - (long long)time(NULL) : 0);
+	hull_msg_raw(&m, ")(6:member");
+	hull_msg_text(&m, member);
+	hull_msg_raw(&m, "))");
+	send_to(c, &m);
+}
+
+/* `(broken (ch n) (id ID) (member M))`: a board of a lease its holder has
+ * found broken: out of the pool for everybody, which `hull board fix`
+ * with this directory for its data undoes. Only of a board it holds. */
+static void handle_broken(client *c, uint32_t ch, const hull_sexpr_doc *body)
+{
+	hull_sexpr_form value;
+	char            id[24];
+	char            member[64];
+	const lease    *l;
+	int             held = 0;
+
+	if (hull_msg_find(body, "id", &value) && hull_msg_string(body, &value, id, sizeof id) &&
+	    hull_msg_find(body, "member", &value) &&
+	    hull_msg_string(body, &value, member, sizeof member) &&
+	    (l = find_lease(id)) != NULL && may_touch(c, l))
+		for (unsigned i = 0u; i < l->held_count; i++)
+			held |= l->held[i].board && strcmp(l->held[i].name, member) == 0;
+	if (!held) {
+		send_error(c, ch, "no such lease is held");
+		return;
+	}
+	fprintf(stderr, "hull broker: %s found board %s broken\n", c->holder, member);
+	hull_hw_mark(member, "its holder found it broken");
+	send_simple(c, "(4:done", ch);
+}
+
+/* `(settle (ch n) (id ID) (member M))`: a run under a broker's lease over,
+ * its entry back in the lease. A lease gone is settled already: a core
+ * retries this until it lands, so it may land twice. */
+static void handle_settle(client *c, uint32_t ch, const hull_sexpr_doc *body)
+{
+	hull_sexpr_form value;
+	char            id[24];
+	char            member[64];
+	lease          *l;
+
+	if (!hull_msg_find(body, "id", &value) || !hull_msg_string(body, &value, id, sizeof id) ||
+	    !hull_msg_find(body, "member", &value) ||
+	    !hull_msg_string(body, &value, member, sizeof member)) {
+		send_error(c, ch, "a settle names its lease and its entry");
+		return;
+	}
+	if ((l = find_lease(id)) != NULL) {
+		if (!may_touch(c, l)) {
+			send_error(c, ch, "no such lease is held");
+			return;
+		}
+		if (member[0] == '\0' && l->unnamed_claimed > 0u)
+			l->unnamed_claimed--;
+		for (unsigned i = 0u; member[0] != '\0' && i < l->held_count; i++)
+			if (strcmp(l->held[i].name, member) == 0)
+				l->claimed[i] = 0;
+		save_lease(l);
+	}
+	send_simple(c, "(4:done", ch);
 }
 
 /* A lease over, by its holder or its time: its machines stopped, each
@@ -4563,9 +4905,30 @@ static void end_leases_due(void)
 {
 	long long now = (long long)time(NULL);
 
-	for (unsigned i = 0u; i < MAX_LEASES; i++)
-		if (leases[i].used && leases[i].until != 0 && now >= leases[i].until)
+	for (unsigned i = 0u; i < MAX_LEASES; i++) {
+		const lease *l = &leases[i];
+		int          claimed = l->unnamed_claimed > 0u;
+
+		for (unsigned k = 0u; k < l->held_count; k++)
+			claimed |= l->claimed[k];
+		/* A broker's machines are elsewhere, stopped by their cores at
+		 * this end: what is in use is given them to stop in. */
+		if (l->used && l->until != 0 && now >= l->until + (claimed ? BROKER_GRACE_S : 0))
 			end_lease(&leases[i], "its time ran out");
+	}
+	/* And the other half: a machine under a broker's lease that is ending. */
+	for (unsigned i = 0u; i < MAX_MACHINES; i++) {
+		slot *s = &machines[i];
+
+		if (s->used && !s->exited && s->broker_end != 0 && monotonic_ms() >= s->broker_end) {
+			static const char line[] = "hull: its broker's lease ended: its time ran out\n";
+
+			s->broker_end = 0;
+			keep_log(s, 2, (const uint8_t *)line, sizeof line - 1u);
+			s->lease_ended = 1;
+			stop_machine(s, s->stop_ms);
+		}
+	}
 }
 
 /* `(free (ch n) (id ID))`: the lease ended by its holder. */
@@ -4576,10 +4939,12 @@ static void handle_free(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	lease          *l;
 
 	if (!hull_msg_find(body, "id", &value) || !hull_msg_string(body, &value, id, sizeof id) ||
-	    (l = find_lease(id)) == NULL) {
+	    (l = find_lease(id)) == NULL || (broker_mode && !may_touch(c, l))) {
 		send_error(c, ch, "no such lease is held");
 		return;
 	}
+	if (broker_mode)
+		fprintf(stderr, "hull broker: %s ends %s, %s's\n", c->holder, l->id, l->holder);
 	end_lease(l, "released");
 	send_simple(c, "(4:done", ch);
 }
@@ -4599,6 +4964,8 @@ static void handle_leases(client *c, uint32_t ch)
 		hull_msg_number(&m, leases[i].count);
 		hull_msg_raw(&m, ")(4:ends");
 		hull_msg_number(&m, leases[i].until);
+		hull_msg_raw(&m, ")(6:holder");
+		hull_msg_text(&m, leases[i].holder);
 		hull_msg_raw(&m, ")(2:id");
 		hull_msg_text(&m, leases[i].id);
 		hull_msg_raw(&m, ")(8:machines");
@@ -4616,8 +4983,6 @@ static void handle_leases(client *c, uint32_t ch)
  * has none. */
 static void handle_pools(client *c, uint32_t ch)
 {
-	const char     *config = getenv("XDG_CONFIG_HOME");
-	const char     *home   = getenv("HOME");
 	char            path[4200] = "";
 	uint8_t        *text = malloc(65536u);
 	size_t          length = 0u;
@@ -4627,11 +4992,8 @@ static void handle_pools(client *c, uint32_t ch)
 	hull_sexpr_form item;
 	hull_msg        m = { 0 };
 
-	if (config != NULL && config[0] == '/')
-		snprintf(path, sizeof path, "%s/hull/pools.conf", config);
-	else if (home != NULL)
-		snprintf(path, sizeof path, "%s/.config/hull/pools.conf", home);
-	if (text != NULL && path[0] != '\0' && (file = fopen(path, "re")) != NULL) {
+	if (text != NULL && hull_pool_path(path, sizeof path) != NULL &&
+	    (file = fopen(path, "re")) != NULL) {
 		length = fread(text, 1u, 65536u, file);
 		fclose(file);
 	}
@@ -4654,7 +5016,9 @@ static void handle_pools(client *c, uint32_t ch)
 			unsigned         used = 0u;
 			unsigned         total = 0u;
 
-			if (hull_pool_read((const char *)pool, &p) == 0)
+			if (hull_pool_read((const char *)pool, &p) == 0 && p.broker[0] != '\0')
+				continue;  /* the frontend asks it */
+			if (p.wrong[0] == '\0' || !broker_mode)
 				tally((const char *)pool, &p, WANT_ANY, 0, &used, &total);
 			hull_msg_raw(&m, "(4:pool(8:capacity");
 			hull_msg_number(&m, total);
@@ -4719,6 +5083,42 @@ static void handle_members(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	send_to(c, &m);
 }
 
+/* A holder's name, which goes into a lease's file and a broker's log. */
+static int is_holder(const char *name)
+{
+	if (name[0] == '\0' || name[0] == '-')
+		return 0;
+	for (; *name != '\0'; name++)
+		if (!(*name >= 'a' && *name <= 'z') && !(*name >= 'A' && *name <= 'Z') &&
+		    !(*name >= '0' && *name <= '9') && *name != '-' && *name != '_' && *name != '.' &&
+		    *name != '@')
+			return 0;
+	return 1;
+}
+
+/* Who is on `fd`, as the kernel says: a broker's holders are accounts. */
+static void name_peer(client *c, int fd)
+{
+	struct ucred   peer;
+	socklen_t      length = sizeof peer;
+	struct passwd  entry;
+	struct passwd *found = NULL;
+	char           text[1024];
+
+	c->holder[0] = '\0';
+	c->spoke     = 0;
+	c->owner     = 0;
+	if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &length) != 0) {
+		c->dead = 1;
+		return;
+	}
+	c->owner = peer.uid == getuid();
+	if (getpwuid_r(peer.uid, &entry, text, sizeof text, &found) == 0 && found != NULL)
+		snprintf(c->holder, sizeof c->holder, "%s", found->pw_name);
+	else
+		snprintf(c->holder, sizeof c->holder, "uid-%lu", (unsigned long)peer.uid);
+}
+
 /* Set by a signal, or by a hello this core goes for: the loop's last. */
 static volatile sig_atomic_t ending;
 /* This core's executable as it started (hull_wire_exe), before a rebuild
@@ -4738,6 +5138,36 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		send_error(c, 0u, "a message carries its channel");
 		return;
 	}
+	/* A broker answers for pools alone, to more than its own user. */
+	if (broker_mode) {
+		static const char *const allowed[] = { "hello", "lease", "free", "leases", "pools",
+		                                       "members", "claim", "settle", "identify",
+		                                       "broken" };
+		int                      fine = 0;
+
+		for (unsigned i = 0u; i < sizeof allowed / sizeof allowed[0]; i++)
+			fine |= hull_msg_is(body, allowed[i]);
+		if (!fine) {
+			send_error(c, (uint32_t)ch, "a broker runs no machines");
+			return;
+		}
+		if (hull_msg_is(body, "identify")) {
+			char name[64];
+
+			/* Its forced command's word, so only from the account that
+			 * runs one, and before anything the frontend behind it says. */
+			if (!c->owner || c->spoke || !hull_msg_find(body, "as", &value) ||
+			    !hull_msg_string(body, &value, name, sizeof name) || !is_holder(name)) {
+				send_error(c, (uint32_t)ch, "this connection cannot say who it is");
+				return;
+			}
+			snprintf(c->holder, sizeof c->holder, "%s", name);
+			c->owner = 0;
+			c->spoke = 1;
+			return;
+		}
+		c->spoke = 1;
+	}
 	if (hull_msg_is(body, "hello")) {
 		hull_msg m = { 0 };
 		char     commit[128] = "";
@@ -4752,7 +5182,7 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		    hull_msg_string(body, &value, commit, sizeof commit) &&
 		    hull_msg_find(body, "exe", &value) && hull_msg_string(body, &value, exe, sizeof exe) &&
 		    !hull_wire_same_build(HULL_COMMIT, core_exe, commit, exe) && !any_machines() &&
-		    clients_but(c) == 0u) {
+		    clients_but(c) == 0u && !broker_mode) {
 			replaced = 1;
 			ending = 1;
 			fprintf(stderr, "hull core %ld: a frontend of %s is another build, and none of "
@@ -4822,6 +5252,12 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		handle_leases(c, (uint32_t)ch);
 	} else if (hull_msg_is(body, "members")) {
 		handle_members(c, (uint32_t)ch, body);
+	} else if (hull_msg_is(body, "claim")) {
+		handle_claim(c, (uint32_t)ch, body);
+	} else if (hull_msg_is(body, "settle")) {
+		handle_settle(c, (uint32_t)ch, body);
+	} else if (hull_msg_is(body, "broken")) {
+		handle_broken(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "pools")) {
 		handle_pools(c, (uint32_t)ch);
 	} else {
@@ -5072,7 +5508,7 @@ static void check_place(const char *dir, const char *path, const char *lock_path
 	}
 }
 
-int hull_core_run(const char *host_arch)
+static int core_loop(const char *host_arch, const char *broker_dir)
 {
 	char               dir[4096];
 	char               path[4200];
@@ -5110,12 +5546,15 @@ int hull_core_run(const char *host_arch)
 		unsetenv("HULL_CORE_LOG");
 	}
 
-	if (runtime == NULL || runtime[0] != '/') {
+	if (broker_dir == NULL && (runtime == NULL || runtime[0] != '/')) {
 		fprintf(stderr, "hull core: XDG_RUNTIME_DIR is not set\n");
 		return 1;
 	}
-	snprintf(dir, sizeof dir, "%s/hull", runtime);
-	if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+	if (broker_dir != NULL)
+		snprintf(dir, sizeof dir, "%s", broker_dir);
+	else
+		snprintf(dir, sizeof dir, "%s/hull", runtime);
+	if (broker_dir == NULL && mkdir(dir, 0700) != 0 && errno != EEXIST) {
 		fprintf(stderr, "hull core: %s: %s\n", dir, strerror(errno));
 		return 1;
 	}
@@ -5167,9 +5606,22 @@ int hull_core_run(const char *host_arch)
 	}
 	if (pipe2(wake, O_CLOEXEC | O_NONBLOCK) != 0)
 		return 1;
+	/* A broker's socket is its group's, as the directory it was given is:
+	 * the kernel's permission on it is the gate, not anything said here. */
+	if (broker_mode) {
+		struct stat is;
+
+		if (stat(dir, &is) != 0 || chown(path, (uid_t)-1, is.st_gid) != 0 ||
+		    chmod(path, 0660) != 0) {
+			fprintf(stderr, "hull broker: %s: %s\n", path, strerror(errno));
+			return 1;
+		}
+	}
 
 	hull_registry_init(&registry, host_arch);
-	if (hull_registry_add(&registry, hull_engine_docker(&host_ops), &reason) != HULL_REGISTRY_OK ||
+	if (broker_mode) {
+		/* No engine: nothing here can start a machine. */
+	} else if (hull_registry_add(&registry, hull_engine_docker(&host_ops), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_qemu(&host_ops), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_virtualbox(&host_ops), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_chroot(&host_ops), &reason) != HULL_REGISTRY_OK ||
@@ -5186,20 +5638,23 @@ int hull_core_run(const char *host_arch)
 		lease_dir[0] = '\0';  /* no lease can be kept, so none is given */
 	else
 		load_leases();
+	snprintf(held_dir, sizeof held_dir, "%s/held", dir);
+	if (!broker_mode && mkdir(held_dir, 0700) != 0 && errno != EEXIST)
+		held_dir[0] = '\0';
 	snprintf(kept_dir, sizeof kept_dir, "%s/machines", dir);
-	if (mkdir(kept_dir, 0700) != 0 && errno != EEXIST)
+	if (broker_mode || (mkdir(kept_dir, 0700) != 0 && errno != EEXIST))
 		kept_dir[0] = '\0';  /* nothing is kept, and nothing taken back */
 	else
 		adopt_kept();
 	snprintf(secrets_root, sizeof secrets_root, "%s/secrets", dir);
-	if (mkdir(secrets_root, 0700) != 0 && errno != EEXIST)
+	if (broker_mode || (mkdir(secrets_root, 0700) != 0 && errno != EEXIST))
 		secrets_root[0] = '\0';  /* no machine with secrets can run */
 	else
 		remove_stale_secrets();
 	snprintf(ssh_root, sizeof ssh_root, "%s/ssh", dir);
-	if (mkdir(ssh_root, 0700) != 0 && errno != EEXIST)
+	if (broker_mode || (mkdir(ssh_root, 0700) != 0 && errno != EEXIST))
 		ssh_root[0] = '\0';  /* no machine with (ssh true) can run */
-	{
+	if (!broker_mode) {
 		/* The persistent per-machine host keys, where the store is, so
 		 * they outlive a core and a reboot as machine state (section 8.1
 		 * item 2): $XDG_DATA_HOME/hull/machines or ~/.local/share's. Empty
@@ -5262,7 +5717,10 @@ int hull_core_run(const char *host_arch)
 		}
 		end_leases_due();
 		admit_waiting();
-		busy = any_clients() || running_machines();
+		if (!broker_mode)
+			settle_held();
+		/* A core stays for what it owes a broker; a broker stays. */
+		busy = any_clients() || running_machines() || held_pending || broker_mode;
 		if (!busy) {
 			long long waited = monotonic_ms() - idle_since;
 
@@ -5300,6 +5758,8 @@ int hull_core_run(const char *host_arch)
 					if (hull_wire_open(&clients[i].wire, fd, HULL_WIRE_FROM_CLIENT) == 0) {
 						clients[i].used = 1;
 						client_generation[i]++;
+						if (broker_mode)
+							name_peer(&clients[i], fd);
 						fd = -1;
 					}
 				}
@@ -5363,4 +5823,24 @@ int hull_core_run(const char *host_arch)
 	unlink(hosts_path);
 	close(lock);
 	return 0;
+}
+
+int hull_core_run(const char *host_arch)
+{
+	return core_loop(host_arch, NULL);
+}
+
+/* `hull broker DIR` (section 4.12): this core's leases, queue and pools
+ * with no engine, for every user who can reach DIR/core.sock, as the
+ * group of DIR says. Its pools are DIR/pools.conf and its marks of a
+ * broken board DIR/hull/boards, what a holder said being in DIR's log. */
+int hull_broker_run(const char *dir)
+{
+	char config[4200];
+
+	broker_mode = 1;
+	snprintf(config, sizeof config, "%s/pools.conf", dir);
+	hull_pool_config(config);
+	setenv("XDG_DATA_HOME", dir, 1);
+	return core_loop("none", dir);
 }

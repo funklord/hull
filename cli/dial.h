@@ -22,6 +22,11 @@ int hull_dial_parse(const char *url, hull_dial_target *out, char *why, size_t ca
  * when the socket does, this process's end closing with it. */
 int hull_dial_host(const hull_dial_target *remote);
 
+/* A broker on another host (section 4.12): `hull broker-dial` there. As
+ * hull_dial_host(), but for a script: nothing prompts, and a dead link
+ * ends the connection rather than hanging it. */
+int hull_dial_broker(const hull_dial_target *remote);
+
 /* `hull dial`'s body: stdin and stdout joined to `fd`, until the core or
  * the far end closes. A process status. */
 int hull_dial_pump(int fd);
