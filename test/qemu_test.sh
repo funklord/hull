@@ -45,18 +45,30 @@ passt='^passt --quiet --fd 3 --one-off --ipv4-only --address 10\.0\.2\.15 '
 # `others=$(passts_now)` took them before the machine a check is about.
 # Those arguments are every hull vm's, and passt runs non-dumpable, so
 # neither its environment nor its descriptors say whose it is: another
-# session's hull vm on the host is told apart only by having been there
-# first, and one started within a check's own window is not.
+# session's hull vm on the host is told apart by having been there first,
+# and one started within a check's own window by its qemu, which names its
+# runtime directory, one passt less for each such vm still running.
+foreign_vms() {
+	pgrep -af '^qemu-system-x86_64 ' | grep '/hull/qemu-' |
+		grep -Fv "$XDG_RUNTIME_DIR/hull/qemu-" | cut -d' ' -f1
+}
 passts_now() {
-	pgrep -f "$passt" | tr '\n' ' '
+	{ pgrep -f "$passt"; foreign_vms; } | tr '\n' ' '
 }
 passts_new() {
+	foreign=0
+	for p in $(foreign_vms); do
+		case " $1 " in
+		*" $p "*) ;;
+		*) foreign=$((foreign + 1)) ;;
+		esac
+	done
 	for p in $(pgrep -f "$passt"); do
 		case " $1 " in
 		*" $p "*) ;;
 		*) printf '%s\n' "$p" ;;
 		esac
-	done
+	done | tail -n "+$((foreign + 1))"
 }
 others_at_start=$(passts_now)
 cases=0
