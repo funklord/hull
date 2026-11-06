@@ -136,4 +136,8 @@ int hull_access_machine(hull_sexpr_doc *doc, const uint8_t *plan, size_t length,
 }
 #endif
 
+/* The signal `name` says: SIGQUIT, QUIT, RTMIN+3 or a number, as an image's
+ * STOPSIGNAL may. 0 where it says none. */
+int hull_access_signal(const char *name);
+
 #endif /* HULL_ACCESS_H */

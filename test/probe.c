@@ -60,9 +60,10 @@
  *   orphan      leave a grandchild to the machine's init, which ends a
  *               second later, and wait two for the init to reap it
  *   exit N      exit with N           die         end by SIGTERM
+ *   ignore      ignore SIGTERM, as a workload that will not stop does
  *   wait        wait for a signal, for 20 seconds at most, so that a
  *               test whose stop fails leaves no probe behind
- *   trap        catch SIGHUP, SIGINT or SIGTERM, for 20 seconds at most,
+ *   trap        catch SIGHUP, SIGINT, SIGQUIT or SIGTERM, for 20 seconds at most,
  *               and say which; the probe goes on
  *   tty         whether stdin is a terminal, its size, and whether it is
  *               this process's controlling terminal
@@ -1478,10 +1479,12 @@ int main(int argc, char **argv)
 			return atoi(arg);
 		} else if (strcmp(step, "die") == 0) {
 			raise(SIGTERM);
+		} else if (strcmp(step, "ignore") == 0) {
+			signal(SIGTERM, SIG_IGN);
 		} else if (strcmp(step, "trap") == 0) {
-			static const int signals[] = { SIGHUP, SIGINT, SIGTERM };
+			static const int signals[] = { SIGHUP, SIGINT, SIGQUIT, SIGTERM };
 
-			printf("signal=%d\n", await(signals, 3u));
+			printf("signal=%d\n", await(signals, 4u));
 		} else if (strcmp(step, "tty") == 0) {
 			printf("tty=%s\n", isatty(0) ? "yes" : "no");
 			print_size();

@@ -120,6 +120,7 @@ static char  *argv_[MAX_ARGS + 1u];
 static char  *envp_[MAX_ENV + 1u];
 static char  *workdir;
 static char  *user_;        /* (user ...), or NULL for the machine's root */
+static int    stop_signal_ = SIGTERM;   /* what a stop sends first */
 static char  *init_;       /* (init PATH): the image's init, PID 1 once handed to */
 static int    handed;      /* PID 1 is the image's init, and this is the agent beside it */
 static int    run_made;    /* /run is a tmpfs made here, as an initramfs makes it */
@@ -1336,6 +1337,14 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	init_ = hull_access_value(doc, machine, "init");
 	if (init_ != NULL && init_[0] != '/')
 		return "the machine's init is not an absolute path";
+	{
+		char *name = hull_access_value(doc, machine, "stop_signal");
+
+		stop_signal_ = name != NULL ? hull_access_signal(name) : SIGTERM;
+		free(name);
+		if (stop_signal_ == 0)
+			return "(stop_signal ...) names no signal";
+	}
 	user_ = hull_access_value(doc, machine, "user");
 	if (user_ != NULL && init_ != NULL)
 		return "(user ...) is whom a command runs as; an (init ...) starts its own";
@@ -1962,7 +1971,7 @@ static void begin_stop(long long timeout_ms)
 		kill_at.tv_sec++;
 		kill_at.tv_nsec -= 1000000000L;
 	}
-	signal_channel(workload(), SIGTERM);
+	signal_channel(workload(), stop_signal_);
 }
 
 /* Milliseconds until the stop's SIGKILL, or -1 for none pending. */

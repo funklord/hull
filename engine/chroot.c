@@ -120,6 +120,7 @@ struct hull_machine {
 	char            *root;       /* the dir source, without "dir:" */
 	char            *workdir;
 	char            *user;     /* (user ...), or NULL for the machine's root */
+	int              stop_signal;  /* what a stop sends first */
 	char            *tmpfs[MAX_TMPFS];  /* (tmpfs ...), each a path in the machine */
 	unsigned         tmpfs_count;
 	char            *hostname;   /* or NULL */
@@ -310,6 +311,14 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		return "the plan is missing its source or workdir";
 	if (m->user != NULL && m->init != NULL)
 		return "(user ...) is whom a command runs as; an (init ...) starts its own";
+	{
+		char *name = hull_access_value(doc, &machine, "stop_signal");
+
+		m->stop_signal = name != NULL ? hull_access_signal(name) : SIGTERM;
+		free(name);
+		if (m->stop_signal == 0)
+			return "(stop_signal ...) names no signal";
+	}
 	if (hull_access_find(doc, &machine, "tmpfs", &entry)) {
 		hull_sexpr_child(doc, &entry, &item);
 		for (more = hull_sexpr_next(doc, &item, &item); more;
@@ -3279,7 +3288,7 @@ static hull_status chroot_stop(hull_core *core, hull_machine *m, int timeout_ms,
 	if (!m->started || wait_done(m, 0))
 		return HULL_OK;
 	host->on_state(core, m, "stopping");
-	signal_init(m, SIGTERM);
+	signal_init(m, m->stop_signal);
 	if (!wait_done(m, timeout_ms)) {
 		signal_init(m, SIGKILL);
 		wait_done(m, 60000);
@@ -4268,6 +4277,8 @@ static const hull_cap_entry entries[] = {
 	{ "command",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "workdir",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "user",                   HULL_SUP_NATIVE,   NULL, NULL },
+	{ "stop_signal",            HULL_SUP_NATIVE,   NULL, NULL },
+	{ "stop_grace",             HULL_SUP_NATIVE,   NULL, NULL },
 	{ "tmpfs",                  HULL_SUP_NATIVE,   NULL, NULL },
 	{ "env",                    HULL_SUP_NATIVE,   "the environment is what env names, and docker's default PATH where it names none",
 	  NULL },

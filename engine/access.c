@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
 #include <string.h>
@@ -644,4 +645,39 @@ const char *hull_access_filesystem(const char *path, const char **type)
 	}
 	close(fd);
 	return module;
+}
+
+int hull_access_signal(const char *name)
+{
+	static const struct {
+		const char *name;
+		int         number;
+	} signals[] = {
+		{ "HUP", SIGHUP }, { "INT", SIGINT }, { "QUIT", SIGQUIT }, { "ILL", SIGILL },
+		{ "TRAP", SIGTRAP }, { "ABRT", SIGABRT }, { "BUS", SIGBUS }, { "FPE", SIGFPE },
+		{ "KILL", SIGKILL }, { "USR1", SIGUSR1 }, { "SEGV", SIGSEGV }, { "USR2", SIGUSR2 },
+		{ "PIPE", SIGPIPE }, { "ALRM", SIGALRM }, { "TERM", SIGTERM }, { "CHLD", SIGCHLD },
+		{ "CONT", SIGCONT }, { "STOP", SIGSTOP }, { "TSTP", SIGTSTP }, { "TTIN", SIGTTIN },
+		{ "TTOU", SIGTTOU }, { "URG", SIGURG }, { "XCPU", SIGXCPU }, { "XFSZ", SIGXFSZ },
+		{ "VTALRM", SIGVTALRM }, { "PROF", SIGPROF }, { "WINCH", SIGWINCH }, { "IO", SIGIO },
+		{ "PWR", SIGPWR }, { "SYS", SIGSYS },
+	};
+	char *end;
+	long  number;
+
+	if (name[0] >= '0' && name[0] <= '9') {
+		number = strtol(name, &end, 10);
+		return *end == '\0' && number > 0 && number <= SIGRTMAX ? (int)number : 0;
+	}
+	if (strncmp(name, "SIG", 3u) == 0)
+		name += 3;
+	if (strncmp(name, "RTMIN", 5u) == 0) {
+		number = name[5] == '\0' ? 0 : name[5] == '+' ? strtol(name + 6, &end, 10) : -1;
+		return number >= 0 && (name[5] == '\0' || *end == '\0') &&
+		       SIGRTMIN + number <= SIGRTMAX ? SIGRTMIN + (int)number : 0;
+	}
+	for (size_t i = 0u; i < sizeof signals / sizeof signals[0]; i++)
+		if (strcmp(signals[i].name, name) == 0)
+			return signals[i].number;
+	return 0;
 }

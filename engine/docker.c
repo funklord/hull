@@ -1232,6 +1232,11 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	} else if (!root_granted(doc, "security.allow")) {
 		addf(&body, ",\"User\":\"%u:%u\"", (unsigned)getuid(), (unsigned)getgid());
 	}
+	if ((value = hull_access_value(doc, machine, "stop_signal")) != NULL) {
+		add_text(&body, ",\"StopSignal\":");
+		add_json(&body, value);
+		free(value);
+	}
 	add_text(&body, ",\"Labels\":{\"hull.machine\":");
 	add_json(&body, m->name);
 	add_text(&body, "}");
@@ -4158,6 +4163,8 @@ static const hull_cap_entry entries[] = {
 	{ "command",            HULL_SUP_NATIVE,   NULL, NULL },
 	{ "workdir",            HULL_SUP_NATIVE,   NULL, NULL },
 	{ "user",               HULL_SUP_NATIVE,   NULL, NULL },
+	{ "stop_signal",        HULL_SUP_NATIVE,   NULL, NULL },
+	{ "stop_grace",         HULL_SUP_NATIVE,   NULL, NULL },
 	{ "tmpfs",              HULL_SUP_NATIVE,   NULL, NULL },
 	{ "env",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "network.host",       HULL_SUP_NATIVE,   NULL, NULL },

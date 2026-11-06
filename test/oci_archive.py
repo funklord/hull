@@ -39,7 +39,7 @@ def main():
 	layer = layer.getvalue()
 	runtime = {'Cmd': ['/greeting'], 'Env': ['SAVED=1'], 'WorkingDir': '/'}
 	if form == 'user':
-		runtime.update({'Cmd': ['/greeting', 'uid'], 'User': '4321'})
+		runtime.update({'Cmd': ['/greeting', 'uid'], 'User': '4321', 'StopSignal': 'SIGQUIT'})
 	config = json.dumps({
 		'architecture': 'amd64', 'os': 'linux',
 		'config': runtime,

@@ -888,6 +888,8 @@ typedef struct svc {
 	char memory[32];       /* from mem_limit: */
 	char cpus[16];         /* from cpus:, a whole number */
 	char user[128];        /* from user: */
+	char stop_signal[32];  /* from stop_signal: */
+	long stop_ms;          /* from stop_grace_period:, or 0 */
 	sb   tmpfs;            /* from tmpfs:, each path quoted */
 	int  read_only;        /* from read_only: */
 	hull_build_arg build_arg[HULL_MAX_BUILD_ARGS];
@@ -1481,6 +1483,19 @@ static void svc_flush(svc *s, sb *out)
 	if (s->tmpfs.data != NULL) {
 		sb_str(out, " (tmpfs");
 		sb_str(out, s->tmpfs.data);
+		sb_str(out, ")");
+	}
+	if (s->stop_signal[0] != '\0') {
+		sb_str(out, " (stop_signal ");
+		sb_quoted(out, s->stop_signal);
+		sb_str(out, ")");
+	}
+	if (s->stop_ms > 0) {
+		char grace[32];
+
+		snprintf(grace, sizeof grace, "%lds", (s->stop_ms + 999) / 1000);
+		sb_str(out, " (stop_grace ");
+		sb_quoted(out, grace);
 		sb_str(out, ")");
 	}
 	if (s->user[0] != '\0') {
@@ -2330,6 +2345,15 @@ static char *compose_text(FILE *file, const char *project)
 				svc_note(&s, "cpus of a fraction not translated", text);
 		} else if (strcmp(key, "user") == 0) {
 			snprintf(s.user, sizeof s.user, "%s", scalar(value));
+		} else if (strcmp(key, "stop_signal") == 0) {
+			snprintf(s.stop_signal, sizeof s.stop_signal, "%s", scalar(value));
+		} else if (strcmp(key, "stop_grace_period") == 0) {
+			long ms = compose_ms(scalar(value));
+
+			if (ms >= 1000)
+				s.stop_ms = ms;
+			else
+				svc_note(&s, "stop_grace_period not translated", scalar(value));
 		} else if (strcmp(key, "tmpfs") == 0) {
 			compose_tmpfs(&s, scalar(value));
 		} else if (strcmp(key, "read_only") == 0) {

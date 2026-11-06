@@ -401,6 +401,7 @@ python3 -I "$(dirname "$0")/oci_archive.py" user "$root/ld/user.tar" "$probe"
 expect 0 '^loaded/user sha256:' "$hull" load "$root/ld/user.tar" loaded/user
 printf '(machine (backend chroot) (source "loaded/user"))\n' > "$root/ld/user.conf"
 expect 0 '^uid=4321$' "$hull" run -f "$root/ld/user.conf"
+expect 0 '\(stop_signal "SIGQUIT"\)' "$hull" plan --resolved -f "$root/ld/user.conf"
 printf '(machine (backend chroot) (source "loaded/user") (user "4400"))\n' > "$root/ld/mine.conf"
 expect 0 '^uid=4400$' "$hull" run -f "$root/ld/mine.conf"
 printf 'nothing' > "$root/ld/short"

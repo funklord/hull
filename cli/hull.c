@@ -600,6 +600,24 @@ static int runtime_defaults(const char *file, const char *name, const hull_spec 
 		else if (!has_env)
 			add_text(&at_end, ")");
 	}
+	/* And a stop as the image asks, SIGTERM being what one is anyway. */
+	if (!hull_spec_find(spec, machine, "stop_signal", &found) &&
+	    record_find(&doc, &runtime, "stop_signal", &found)) {
+		hull_sexpr_form head;
+		hull_sexpr_form signal_name;
+
+		hull_sexpr_child(&doc, &found, &head);
+		hull_sexpr_next(&doc, &head, &signal_name);
+		if (!hull_sexpr_is(&doc, &signal_name, "SIGTERM") &&
+		    !hull_sexpr_is(&doc, &signal_name, "TERM") &&
+		    signal_name.content_length < 40u) {
+			char text[64];
+
+			snprintf(text, sizeof text, " (stop_signal \"%.*s\")",
+			         (int)signal_name.content_length, (const char *)doc.data + signal_name.content);
+			add_text(&at_end, text);
+		}
+	}
 	if (record_find(&doc, &runtime, "user", &found)) {
 		hull_sexpr_form head;
 		hull_sexpr_form user;
@@ -1660,7 +1678,7 @@ static int follow(hull_wire *wire, uint32_t ch, const char *stop_id)
 
 		if (interrupted && stop_id != NULL && !stopping) {
 			stopping = 1;
-			send_request(wire, "(4:stop", ch + 1u, stop_id, "(10:timeout_ms5:10000)");
+			send_request(wire, "(4:stop", ch + 1u, stop_id, "(10:timeout_ms2:-1)");
 		}
 		status = hull_wire_read(wire, &body);
 		if (status == HULL_WIRE_WAIT)
@@ -2540,7 +2558,7 @@ static int run_all(options *o, const hull_registry *registry, hull_spec *spec, u
 					continue;
 				if (members[i].sent) {
 					send_request(&wire, "(4:stop", 2u + 2u * i, members[i].id,
-					             "(10:timeout_ms5:10000)");
+					             "(10:timeout_ms2:-1)");
 				} else {
 					members[i].ended = 1;
 					left--;
@@ -6962,6 +6980,7 @@ static int about(const char *command, const char *id, int follow_logs, long time
 		return status == 1 ? 1 : 2;
 	}
 	if (strcmp(command, "stop") == 0) {
+		/* -1, unasked: the machine's own grace. */
 		snprintf(rest, sizeof rest, "(10:timeout_ms%zu:%ld)",
 		         (size_t)snprintf(NULL, 0, "%ld", timeout_ms), timeout_ms);
 		send_request(&wire, "(4:stop", 1u, id, rest);
@@ -7335,14 +7354,14 @@ int main(int argc, char **argv)
 		const char *id          = NULL;
 		const char *signal_name = "KILL";
 		int         follow      = 0;
-		long        timeout     = 10000;
+		long        timeout     = -1;
 
 		for (int i = 2; i < argc; i++) {
 			if (strcmp(command, "logs") == 0 && strcmp(argv[i], "-f") == 0)
 				follow = 1;
 			else if (strcmp(command, "stop") == 0 && strcmp(argv[i], "--timeout") == 0 &&
 			         i + 1 < argc)
-				timeout = strtol(argv[++i], NULL, 10) * 1000L;
+				timeout = labs(strtol(argv[++i], NULL, 10)) * 1000L;
 			else if (strcmp(command, "kill") == 0 && strcmp(argv[i], "-s") == 0 &&
 			         i + 1 < argc)
 				signal_name = canonical_signal(argv[++i]);
@@ -7357,7 +7376,7 @@ int main(int argc, char **argv)
 			usage(stderr);
 			return 2;
 		}
-		return about(command, id, follow, timeout < 0 ? 0 : timeout, signal_name);
+		return about(command, id, follow, timeout, signal_name);
 	}
 
 	if (strcmp(command, "segment") == 0)

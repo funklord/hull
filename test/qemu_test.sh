@@ -272,6 +272,20 @@ for class in vm emu; do
 	has 0 '^write=ok$'
 done
 
+# (stop_signal ...): what the agent sends a workload that a stop ends.
+conf stopq '(backend vm) (command "/probe" "say" "up" "trap") (stop_signal "SIGQUIT") (hostname "stopq")'
+(cd / && timeout 90 "$hull" run -f "$root/stopq.conf" > "$root/stopq.out" 2>&1) &
+pid=$!
+n=0
+while [ "$n" -lt 60 ] && ! grep -q '^ready' "$root/stopq.out" 2> /dev/null; do
+	sleep 1
+	n=$((n + 1))
+done
+"$hull" stop stopq > /dev/null 2>&1
+wait "$pid"
+cases=$((cases + 1))
+grep -q '^signal=3$' "$root/stopq.out" || fail 'a vm stopped by (stop_signal ...)' "$(tail -3 "$root/stopq.out")"
+
 conf suid '(backend vm) (command "/suid" "uid" "euid" "owner" "/suid")'
 name=suid
 boot suid

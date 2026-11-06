@@ -96,6 +96,20 @@ expect 0 '^uid=4321:4322$' run -f "$root/asuser.conf"
 conf tmpfsro '(command "sh" "-c" "echo x > /scratch/x && cat /scratch/x") (tmpfs "/scratch")' \
 	'(security (readonly_root true))'
 expect 0 '^x$' run -f "$root/tmpfsro.conf"
+# (stop_signal ...) is the daemon's StopSignal.
+conf stopq '(command "sh" "-c" "trap \"echo got-quit; exit 0\" QUIT; echo up; sleep 20 & wait")' \
+	'(stop_signal "SIGQUIT")'
+timeout 40 "$hull" run -f "$root/stopq.conf" > "$root/stopq.out" 2>&1 &
+pid=$!
+n=0
+while [ "$n" -lt 30 ] && ! grep -q '^up$' "$root/stopq.out" 2> /dev/null; do
+	sleep 1
+	n=$((n + 1))
+done
+"$hull" stop dtest > /dev/null 2>&1
+wait "$pid"
+cases=$((cases + 1))
+grep -q 'got-quit' "$root/stopq.out" || fail 'a container stopped by (stop_signal ...)' "$(tail -3 "$root/stopq.out")"
 conf asroot '(command "true") (user "root")'
 expect 125 'a container.s root is the host.s' run -f "$root/asroot.conf"
 cases=$((cases + 1))

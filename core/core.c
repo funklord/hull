@@ -130,6 +130,7 @@ struct hull_core {
 };
 
 struct slot {
+	int              stop_ms;     /* a stop's grace where the caller names none */
 	int                used;
 	unsigned           generation;  /* counts the machines this slot has held */
 	char               id[64];
@@ -913,6 +914,29 @@ static void wake_machine(slot *s)
 	s->engine->ops->pause(&s->core, s->handle, 0, &error);
 	s->paused = 0;
 	snprintf(s->state, sizeof s->state, "running");
+}
+
+/* A plan's (stop_grace ...) in milliseconds, or the 10 seconds everything
+ * else gets; at most the ten minutes a stop may ask. The spec has checked
+ * its form: digits and one of s, m, h, d or w. */
+static int stop_grace(hull_buf plan)
+{
+	hull_sexpr_doc  doc;
+	hull_sexpr_form machine;
+	char           *text;
+	long long       ms = 10000;
+
+	if (hull_sexpr_open(&doc, plan.data, plan.len, HULL_SEXPR_CANONICAL, NULL) == HULL_SEXPR_OK &&
+	    hull_sexpr_first(&doc, &machine) && hull_access_find(&doc, &machine, "machine", &machine) &&
+	    (text = hull_access_value(&doc, &machine, "stop_grace")) != NULL) {
+		char     *end;
+		long long n = strtoll(text, &end, 10);
+
+		ms = n * 1000 * (*end == 'm' ? 60 : *end == 'h' ? 3600 : *end == 'd' ? 86400 :
+		                 *end == 'w' ? 604800 : 1);
+		free(text);
+	}
+	return ms > 600000 ? 600000 : (int)ms;
 }
 
 static void stop_machine(slot *s, int timeout_ms)
@@ -1707,6 +1731,7 @@ static int adopt_one(const char *id)
 	s->core.generation = s->generation;
 	s->keep            = 1;
 	s->kept            = 1;
+	s->stop_ms         = 10000;   /* its plan is not kept, so not its grace */
 	snprintf(s->id, sizeof s->id, "%.63s", id);  /* a label, so whole */
 	address_of(id, s->address);
 	snprintf(s->class_name, sizeof s->class_name, "%s", class_name);
@@ -2785,6 +2810,7 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		plan.len  = addressed_length;
 	}
 	snprintf(s->root_hash, sizeof s->root_hash, "%s", granted_root);
+	s->stop_ms = stop_grace(plan);
 	created = engine->ops->create(&s->core, plan, &s->handle, &error);
 	free(addressed);
 	if (created != HULL_OK) {
@@ -2870,22 +2896,26 @@ static void handle_logs(client *c, uint32_t ch, const hull_sexpr_doc *body)
 static void handle_stop(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
 	hull_sexpr_form value;
-	long long       timeout = 10000;
+	long long       timeout;
 	slot           *s = named(c, ch, body);
 
 	if (s == NULL)
 		return;
+	timeout = -1;
 	if (hull_msg_find(body, "timeout_ms", &value) && !hull_msg_long(body, &value, &timeout)) {
 		send_error(c, ch, "timeout_ms is a number");
 		return;
 	}
+	/* -1, as a caller that named none says: the machine's own grace. */
+	if (timeout < 0)
+		timeout = s->stop_ms;
 	if (s->exited) {
 		send_simple(c, "(4:done", ch);
 		return;
 	}
 	if (s->stop_count < MAX_STOPS)
 		s->stops[s->stop_count++] = (follower){ c, ch, 0u, 0u, 0 };
-	stop_machine(s, timeout < 0 ? 0 : timeout > 600000 ? 600000 : (int)timeout);
+	stop_machine(s, timeout > 600000 ? 600000 : (int)timeout);
 }
 
 /* A command in a running machine; the request itself is the engine's
@@ -3989,7 +4019,7 @@ static void handle_free(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		if (s->used && strcmp(s->lease, id) == 0) {
 			s->lease[0] = '\0';
 			if (!s->exited)
-				stop_machine(s, 10000);
+				stop_machine(s, s->stop_ms);
 		}
 	}
 	snprintf(path, sizeof path, "%s/%s", lease_dir, id);
@@ -4214,7 +4244,7 @@ static void disconnect(client *c)
 		if (s->owner == c) {
 			s->owner = NULL;
 			if (!s->keep)
-				stop_machine(s, 10000);
+				stop_machine(s, s->stop_ms);
 		}
 	}
 	hull_wire_close(&c->wire);
@@ -4694,7 +4724,7 @@ int hull_core_run(const char *host_arch)
 	/* Every machine still running is stopped, and waited for. */
 	for (unsigned i = 0u; i < MAX_MACHINES; i++)
 		if (machines[i].used && !machines[i].exited)
-			stop_machine(&machines[i], 10000);
+			stop_machine(&machines[i], machines[i].stop_ms);
 	while (running_machines()) {
 		struct pollfd fd = { wake[0], POLLIN, 0 };
 

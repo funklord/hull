@@ -240,6 +240,14 @@ expect 0 '\(NESTED "down"\)' "$hull" import "$dir/vars/compose.yaml"
 expect 0 '\(FROMFILE "1"\)' "$hull" import "$dir/vars/compose.yaml"
 expect 0 '\(memory "256M"\) \(cpus 2\)' "$hull" import "$dir/vars/compose.yaml"
 expect 0 '; key not translated: labels' "$hull" import "$dir/vars/compose.yaml"
+cat > "$dir/vars/stop.yaml" <<'COMPOSE'
+services:
+  web:
+    image: alpine
+    stop_signal: SIGQUIT
+    stop_grace_period: 1m30s
+COMPOSE
+expect 0 '\(stop_signal "SIGQUIT"\) \(stop_grace "90s"\)' "$hull" import "$dir/vars/stop.yaml"
 printf 'services:\n  web:\n    image: alpine\n    user: "1000:1000"\n' > "$dir/vars/user.yaml"
 expect 0 '\(user "1000:1000"\)' "$hull" import "$dir/vars/user.yaml"
 cat > "$dir/vars/ro.yaml" <<'COMPOSE'
@@ -2359,6 +2367,40 @@ done
 expect 0 '^uid=4321$' "$hull" exec asapp -- /probe uid
 "$hull" stop asapp > /dev/null 2>&1
 wait "$pid"
+# (stop_signal ...) and (stop_grace ...): what a stop sends, and how long it
+# waits for that, unless the caller says. A workload that traps QUIT says so;
+# one that ignores what it is sent is killed when the grace ends.
+user_conf stopquit '(command "/probe" "trap" "say" "ended") (stop_signal "SIGQUIT") (hostname "stopq")'
+timeout 25 "$hull" run -f "$root/stopquit.conf" > "$root/stopq.out" 2>&1 &
+pid=$!
+n=0
+while [ "$n" -lt 50 ] && ! "$hull" ps 2> /dev/null | grep -q '^stopq .* running'; do
+	sleep 0.2
+	n=$((n + 1))
+done
+sleep 0.5
+"$hull" stop stopq > /dev/null 2>&1
+wait "$pid"
+expect 0 '^signal=3$' cat "$root/stopq.out"
+user_conf stopbad '(command "/probe" "say" "no") (stop_signal "SIGNOPE")'
+from_root 125 'names no signal' -f "$root/stopbad.conf"
+# A grace of a second ends sooner than the 10 a stop gives by default, and
+# one named by --timeout beats it.
+user_conf stopshort '(command "/probe" "ignore" "wait") (stop_grace "1s") (hostname "stopg")'
+timeout 25 "$hull" run -f "$root/stopshort.conf" > /dev/null 2>&1 &
+pid=$!
+n=0
+while [ "$n" -lt 50 ] && ! "$hull" ps 2> /dev/null | grep -q '^stopg .* running'; do
+	sleep 0.2
+	n=$((n + 1))
+done
+sleep 0.5
+began=$(date +%s)
+"$hull" stop stopg > /dev/null 2>&1
+took=$(($(date +%s) - began))
+wait "$pid"
+cases=$((cases + 1))
+[ "$took" -le 5 ] || fail "(stop_grace 1s) took ${took}s" ''
 # (tmpfs ...): a path a read-only root can write, and nothing left behind it.
 mkdir -p "$root/userfs/scratch"
 user_conf tmpfsro '(command "/probe" "write" "/scratch/x") (tmpfs "/scratch")' \
