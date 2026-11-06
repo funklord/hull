@@ -48,6 +48,7 @@
 #define MAX_ENV        64u
 #define MAX_ARGS       64u
 #define MAX_BUSY       64u
+#define MAX_PORTS      32u
 #define SCRIPT_MAX     32768u
 #define WAIT_SECONDS   60     /* a board's sshd, from its power on, unless it says */
 #define HOOK_SECONDS   60     /* power and health */
@@ -74,6 +75,11 @@ struct hull_machine {
 	char           *env[MAX_ENV];
 	unsigned        env_count;
 	int             stop_signal;
+	unsigned        port_host[MAX_PORTS];
+	unsigned        port_guest[MAX_PORTS];
+	unsigned        port_count;
+	char            address[16];  /* the machine's, where its ports are */
+	pid_t           forward;      /* the ssh holding them, or 0 */
 	char            id[80];
 	char            tree[640];    /* where it lands on the board */
 	pid_t           workload;     /* the local ssh running the command */
@@ -592,6 +598,61 @@ static int bring_up(hull_machine *m)
 	return 0;
 }
 
+/* The machine's ports at its own address, goal 7's, by one ssh -L each to the
+ * board's loopback: a board's network is its own and hull cannot reach into
+ * it otherwise. 0, or -1 with the port said. */
+static int start_ports(hull_machine *m)
+{
+	const char *argv[16 + 2u * MAX_PORTS];
+	char        forwards[MAX_PORTS][64];
+	char        port[16];
+	char        target[256];
+	unsigned    n = 0u;
+	int         null;
+
+	if (m->port_count == 0u)
+		return 0;
+	snprintf(port, sizeof port, "%u", m->board.port);
+	if (m->board.login[0] != '\0')
+		snprintf(target, sizeof target, "%s@%s", m->board.login, m->board.address);
+	else
+		snprintf(target, sizeof target, "%s", m->board.address);
+	argv[n++] = "ssh";
+	argv[n++] = "-N";
+	argv[n++] = "-o";
+	argv[n++] = "BatchMode=yes";
+	argv[n++] = "-o";
+	argv[n++] = "ExitOnForwardFailure=yes";
+	argv[n++] = "-p";
+	argv[n++] = port;
+	for (unsigned i = 0u; i < m->port_count; i++) {
+		snprintf(forwards[i], sizeof forwards[i], "%s:%u:127.0.0.1:%u", m->address,
+		         m->port_host[i], m->port_guest[i]);
+		argv[n++] = "-L";
+		argv[n++] = forwards[i];
+	}
+	argv[n++] = target;
+	argv[n]   = NULL;
+	null = open("/dev/null", O_RDWR | O_CLOEXEC);
+	m->forward = null >= 0 ? spawn(argv, null, null, null) : -1;
+	if (null >= 0)
+		close(null);
+	if (m->forward <= 0) {
+		m->forward = 0;
+		return -1;
+	}
+	return 0;
+}
+
+static void end_ports(hull_machine *m)
+{
+	if (m->forward > 0) {
+		kill(m->forward, SIGTERM);
+		waitpid(m->forward, NULL, 0);
+		m->forward = 0;
+	}
+}
+
 /* The workload to its end: its exit status, 125 for a failure of hull's. */
 static int run_workload(hull_machine *m)
 {
@@ -668,8 +729,11 @@ static void *run_machine(void *arg)
 			    m->board.name, m->tree);
 			mark_broken(m->board.name, "a deploy failed after a power cycle");
 		} else {
+			if (start_ports(m) != 0)
+				say(m, "hull: board %s: its ports could not be forwarded%s\n", m->board.name, "");
 			host->on_state(m->core, m, "running");
 			code = run_workload(m);
+			end_ports(m);
 			/* ssh's own failure, the board gone from under the command. */
 			if (code == 255 && board_ssh(m, "true", 8) != 0) {
 				say(m, "hull: board %s: marked broken: it went away during the run%s\n",
@@ -760,6 +824,38 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 				m->env_count++;
 			free(k);
 			free(v);
+		}
+	}
+	if (hull_access_find(doc, &machine, "ports", &entry)) {
+		hull_sexpr_form top;
+		char           *address = NULL;
+
+		if (hull_sexpr_first(doc, &top))
+			address = hull_access_value(doc, &top, "address");
+		if (address == NULL || strlen(address) >= sizeof m->address) {
+			free(address);
+			return "the plan gives its ports no address";
+		}
+		snprintf(m->address, sizeof m->address, "%s", address);
+		free(address);
+		hull_sexpr_child(doc, &entry, &item);
+		for (more = hull_sexpr_next(doc, &item, &item); more;
+		     more = hull_sexpr_next(doc, &item, &item)) {
+			char *host_port = hull_access_value(doc, &item, "host");
+			char *guest     = hull_access_value(doc, &item, "guest");
+			char *proto     = hull_access_value(doc, &item, "proto");
+			int   udp = proto != NULL && strcmp(proto, "udp") == 0;
+
+			if (m->port_count < MAX_PORTS && host_port != NULL && guest != NULL) {
+				m->port_host[m->port_count]  = (unsigned)strtoul(host_port, NULL, 10);
+				m->port_guest[m->port_count] = (unsigned)strtoul(guest, NULL, 10);
+				m->port_count++;
+			}
+			free(host_port);
+			free(guest);
+			free(proto);
+			if (udp)
+				return "a board's ports are ssh's forwards, which are TCP";
 		}
 	}
 	name = hull_access_value(doc, &machine, "stop_signal");
@@ -1123,6 +1219,8 @@ static const hull_cap_entry entries[] = {
 	{ "security.no_new_privs", HULL_SUP_EMULATED,
 	  "not set: what the command may do is the board's login's", NULL },
 	{ "on_disconnect.stop", HULL_SUP_NATIVE,   NULL, NULL },
+	{ "ports",              HULL_SUP_EMULATED,
+	  "ssh -L from the machine's address to the board's loopback, TCP alone", NULL },
 	{ "stop_signal",        HULL_SUP_NATIVE,   NULL, NULL },
 	{ "stop_grace",         HULL_SUP_NATIVE,   NULL, NULL },
 	{ NULL, HULL_SUP_NATIVE, NULL, NULL },

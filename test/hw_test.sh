@@ -212,6 +212,35 @@ wait "$second"
 wait "$pid"
 expect 0 '^signal=3$' cat "$root/onb.out"
 
+# --- a port, at the machine's own address -------------------------------------
+
+guest=$((port + 7))
+hostport=$((port + 8))
+conf served "(backend hw) (pool \"bench\") (hostname \"served\") (ports (port (host $hostport) (guest $guest)))" \
+	"(command \"/probe\" \"serve\" \"tcp\" \"$guest\")"
+timeout 40 "$hull" run -f "$root/project/served.conf" > "$root/served.out" 2>&1 &
+pid=$!
+n=0
+address=
+while [ "$n" -lt 100 ] && [ -z "$address" ]; do
+	address=$("$hull" ps 2> /dev/null | awk '$1 == "served" && $5 == "running" { print $2 }')
+	sleep 0.2
+	n=$((n + 1))
+done
+out=
+n=0
+while [ "$n" -lt 40 ] && [ -z "$out" ]; do
+	out=$(printf 'through the port\n' | timeout 3 nc -w 2 "$address" "$hostport" 2>&1)
+	sleep 0.3
+	n=$((n + 1))
+done
+wait "$pid"
+cases=$((cases + 1))
+[ -n "$out" ] || fail 'a port at the machine address reached the board' "$(tail -3 "$root/served.out")"
+expect 0 'through the port' cat "$root/served.out"
+cases=$((cases + 1))
+! ps -eo args= | grep -F -- "$address:$hostport" | grep -qv grep || fail 'its forward went with the run' ''
+
 # --- recovery: cycled, then marked, and out of its pool -----------------------
 
 conf sick '(backend hw) (pool "sick") (command "/probe" "say" "never")'
