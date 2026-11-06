@@ -23,6 +23,7 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
@@ -162,6 +163,7 @@ static void add_member(hull_pool *pool, const hull_sexpr_doc *doc, const hull_se
 	hull_member     m = { 0 };
 	char            address[128];
 	char            priority[24];
+	char            by_name[8];
 	char           *end;
 	size_t          n = 0u;
 	unsigned        at;
@@ -184,6 +186,21 @@ static void add_member(hull_pool *pool, const hull_sexpr_doc *doc, const hull_se
 		         m.name, priority);
 		return;
 	}
+	field(doc, item, "by_name", by_name, sizeof by_name);
+	m.by_name = strcmp(by_name, "true") == 0;
+	if (!m.by_name && by_name[0] != '\0') {
+		snprintf(pool->wrong, sizeof pool->wrong, "member %s: (by_name %s) is true or left out",
+		         m.name, by_name);
+		return;
+	}
+	/* It never fills, so a priority on it could only mislead. */
+	if (m.by_name && priority[0] != '\0') {
+		snprintf(pool->wrong, sizeof pool->wrong, "member %s: (by_name true) is never filled, "
+		         "so it takes no priority", m.name);
+		return;
+	}
+	if (m.by_name)
+		m.priority = INT_MIN;
 	if (m.board) {
 		field(doc, item, "address", address, sizeof address);
 		if (address[0] == '\0') {

@@ -3503,7 +3503,11 @@ cat > "$root/home/.config/hull/pools.conf" <<'CONF'
         (members (slot "gpu" (priority -1)) (slot "plain" (priority 5))))
   (tcap (capacity 1))
   (tboards (members (board "nb" (address "127.0.0.1"))))
-  (tbad (members (slot "x" (priority soon)))))
+  (tbad (members (slot "x" (priority soon))))
+  (tkept (capacity 1) (members (slot "lab" (by_name true)) (slot "open")))
+  (tonly (members (slot "only" (by_name true))))
+  (tboth (members (slot "both" (by_name true) (priority 1))))
+  (tword (members (slot "word" (by_name maybe)))))
 CONF
 expect 0 '^plain +slot +5 +free +-$' "$hull" pool ls tmix
 expect 0 '^gpu +slot +-1 +free +-$' "$hull" pool ls tmix
@@ -3630,6 +3634,40 @@ expect 75 'no slot of pool tcap: 1 of 1 in use' "$hull" run --no-wait -f "$root/
 expect 0 '' "$hull" stop --timeout 1 pkept
 expect 0 '' "$hull" release "$both"
 expect 0 '' "$hull" release "$other"
+# (by_name true): what asks for anything never gets it, though all else is
+# held and it is free; a name does, and a lease is how. It lists last and
+# counts in the pool, and not in what a request with no name is told of.
+expect 0 '^lab +slot +by-name +free +-$' "$hull" pool ls tkept
+cases=$((cases + 1))
+[ "$(timeout 20 "$hull" pool ls tkept | awk 'NR > 1 { print $1 }' | tr '\n' ' ')" = "open lab " ] ||
+	fail "an entry given by name is not last in the list" "$("$hull" pool ls tkept 2>&1)"
+expect 0 '^tkept +3 +0 +0$' "$hull" pool ls
+expect 125 'pool tkept has 2 slots, and the lease asks 3' "$hull" reserve tkept --count 3
+two=$(timeout 20 "$hull" reserve tkept --count 2)
+expect 0 '^lab +slot +by-name +free +-$' "$hull" pool ls tkept
+expect 75 'no slot of pool tkept: 2 of 2 in use, and the lease does not wait' \
+	"$hull" reserve tkept --no-wait
+conf pkept2 '(pool "tkept") (hostname "pkept2") (command "/probe" "say" "ran")'
+expect 75 'no slot of pool tkept: 2 of 2 in use, and the run does not wait' \
+	"$hull" run --no-wait -f "$root/pkept2.conf"
+lab=$(timeout 20 "$hull" reserve tkept --member lab --no-wait)
+expect 0 "^lab +slot +by-name +leased +$lab\$" "$hull" pool ls tkept
+expect 0 '^tkept +3 +3 +0$' "$hull" pool ls
+expect 0 '^ran$' "$hull" run --lease "$lab" -f "$root/pkept2.conf"
+expect 0 '' "$hull" release "$lab"
+expect 0 '' "$hull" release "$two"
+# A pool of nothing else: refused at once, naming the way in, not queued.
+conf ponly '(pool "tonly") (hostname "ponly") (command "/probe" "say" "ran")'
+expect 125 'pool tonly gives what this asks only by name' "$hull" run -f "$root/ponly.conf"
+expect 125 'pool tonly gives what this asks only by name' "$hull" reserve tonly
+only=$(timeout 20 "$hull" reserve tonly --member only)
+expect 0 '^ran$' "$hull" run --lease "$only" -f "$root/ponly.conf"
+expect 0 '' "$hull" release "$only"
+conf pboth '(pool "tboth") (hostname "pboth") (command "/probe" "say" "ran")'
+expect 125 'member both: \(by_name true\) is never filled, so it takes no priority' \
+	"$hull" run -f "$root/pboth.conf"
+conf pword '(pool "tword") (hostname "pword") (command "/probe" "say" "ran")'
+expect 125 'member word: \(by_name maybe\) is true or left out' "$hull" run -f "$root/pword.conf"
 # A machine the pool has nothing for is refused, not left to wait or to
 # take a slot from what the pool is for; nor is a file that cannot be meant.
 conf pnoboard '(pool "tboards") (hostname "pnoboard") (command "/probe" "say" "ran")'

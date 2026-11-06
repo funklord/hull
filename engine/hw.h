@@ -26,6 +26,7 @@ typedef struct hull_member {
 	char name[64];
 	int  board;     /* a (board ...), or 0 for a (slot ...) */
 	int  priority;  /* the higher fills first; 0 where it says none */
+	int  by_name;   /* (by_name true): given only to what names it, and last in the list */
 	int  broken;    /* a board marked broken */
 } hull_member;
 

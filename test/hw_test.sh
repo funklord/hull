@@ -142,7 +142,10 @@ cat > "$XDG_CONFIG_HOME/hull/pools.conf" <<CONF
            (power "$root/power low $((port + 4))"))
     (board "high" (priority 3) (address "127.0.0.1") (port $((port + 5))) (root "$root/on-b")
            (power "$root/power high $((port + 5))"))))
-  (soft (capacity 1)))
+  (soft (capacity 1))
+  (lab (members
+    (board "kept" (by_name true) (address "127.0.0.1") (port $((port + 6))) (root "$root/on-a")
+           (power "$root/power kept $((port + 6))")))))
 CONF
 : > "$root/d.dead"
 
@@ -331,6 +334,16 @@ lease=$(timeout 20 "$hull" reserve steer --kind slot)
 expect 125 "lease $lease holds no board free" "$hull" run --lease "$lease" -f "$root/project/fill.conf"
 expect 0 '^high +board +3 +free +-$' "$hull" pool ls steer
 expect 0 '^ran$' "$hull" run --no-wait -f "$root/project/fill.conf"
+expect 0 '' "$hull" release "$lease"
+# A board given only by name: a run is refused, naming the way; a lease by
+# its name runs on it.
+conf lab '(backend hw) (pool "lab") (command "/probe" "say" "ran")'
+expect 125 'pool lab gives what this asks only by name' "$hull" run -f "$root/project/lab.conf"
+lease=$(timeout 20 "$hull" reserve lab --member kept)
+: > "$root/power.log"
+expect 0 '^ran$' "$hull" run --lease "$lease" -f "$root/project/lab.conf"
+cases=$((cases + 1))
+[ "$(powered)" = 'kept ' ] || fail 'a lease of a board by name did not run on it' "$(cat "$root/power.log")"
 expect 0 '' "$hull" release "$lease"
 # What the pool has nothing for is refused: a chroot machine in a pool of
 # boards would hold a board it does not use, a hw machine in a pool of

@@ -583,6 +583,7 @@ pool's `(capacity N)` and its slots, a hw machine on its boards.
 | `(board "NAME" ...)` | a computer reached by ssh, a vm included |
 | `(slot "NAME")` | a named place for a software machine: one at a time on what the name stands for |
 | `(priority N)` | on a board or slot: the higher fills first, 0 by default; below 0 keeps an entry clear until the rest is held |
+| `(by_name true)` | on a board or slot: given only to a lease that names it, however full the pool is |
 
 - `hull reserve bench --member fpga` holds that entry, and `hull run --lease ID`
   runs on it. `--count N` adds whatever fills first, and `--kind board` keeps

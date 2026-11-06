@@ -2359,8 +2359,9 @@ static int member_fits(const hull_member *m, int kind)
 }
 
 /* What of `kind` the pool has now, not counting a board broken, and how
- * much of that is held. */
-static void tally(const char *pool, const hull_pool *p, int kind, unsigned *used, unsigned *total)
+ * much of that is held; with `open` only what is given without a name. */
+static void tally(const char *pool, const hull_pool *p, int kind, int open, unsigned *used,
+                  unsigned *total)
 {
 	*used = *total = 0u;
 	if (kind != WANT_BOARD) {
@@ -2368,7 +2369,8 @@ static void tally(const char *pool, const hull_pool *p, int kind, unsigned *used
 		*used  = unnamed_held(pool);
 	}
 	for (unsigned i = 0u; i < p->count; i++)
-		if (member_fits(&p->members[i], kind) && !p->members[i].broken) {
+		if (member_fits(&p->members[i], kind) && !p->members[i].broken &&
+		    !(open && p->members[i].by_name)) {
 			(*total)++;
 			*used += is_held(p->members[i].name) ? 1u : 0u;
 		}
@@ -2392,8 +2394,10 @@ static int refused(const char *pool, const hull_pool *p, want *w, const char *cl
 {
 	unsigned used;
 	unsigned total;
+	unsigned every;
 	unsigned boards = 0u;
 	unsigned slots = 0u;
+	unsigned kept = 0u;   /* of those named, what only a name is given */
 
 	if (p->wrong[0] != '\0') {
 		snprintf(why, cap, "pool %s in pools.conf: %s", pool, p->wrong);
@@ -2423,6 +2427,7 @@ static int refused(const char *pool, const hull_pool *p, want *w, const char *cl
 			}
 		boards += m->board ? 1u : 0u;
 		slots  += m->board ? 0u : 1u;
+		kept   += m->by_name ? 1u : 0u;
 	}
 	if (w->kind == WANT_ANY && w->named == w->count && w->named > 0u && (boards == 0u || slots == 0u))
 		w->kind = boards > 0u ? WANT_BOARD : WANT_SOFTWARE;
@@ -2436,7 +2441,14 @@ static int refused(const char *pool, const hull_pool *p, want *w, const char *cl
 	boards = 0u;
 	for (unsigned i = 0u; i < p->count; i++)
 		boards += p->members[i].board ? 1u : 0u;
-	tally(pool, p, w->kind, &used, &total);
+	tally(pool, p, w->kind, 0, &used, &every);
+	tally(pool, p, w->kind, 1, &used, &total);
+	total += kept;
+	if (total == 0u && every > 0u) {
+		snprintf(why, cap, "pool %s gives what this asks only by name: `hull reserve %s --member "
+		         "NAME`, the names in `hull pool ls %s`", pool, pool, pool);
+		return 1;
+	}
 	if (total == 0u && w->kind == WANT_SOFTWARE) {
 		snprintf(why, cap, "pool %s has nothing for a %s machine, only boards: a (capacity N) or "
 		         "a (slot ...) of its members in pools.conf", pool,
@@ -2535,8 +2547,8 @@ static int pick(const char *pool, const hull_pool *p, const want *w, long long s
 			break;
 		for (unsigned k = 0u; k < w->named; k++)
 			by_name |= strcmp(w->names[k], m->name) == 0;
-		if (by_name || !member_fits(m, w->kind) || m->broken || is_held(m->name) ||
-		    named_ahead(pool, m->name, since))
+		if (by_name || m->by_name || !member_fits(m, w->kind) || m->broken ||
+		    is_held(m->name) || named_ahead(pool, m->name, since))
 			continue;
 		snprintf(out[taken].name, sizeof out[taken].name, "%s", m->name);
 		out[taken++].board = m->board;
@@ -2557,7 +2569,7 @@ static void in_use(const char *pool, const hull_pool *p, const want *w, char *te
 			snprintf(text, cap, "%s is held", w->names[i]);
 			return;
 		}
-	tally(pool, p, w->kind, &used, &total);
+	tally(pool, p, w->kind, 1, &used, &total);
 	snprintf(text, cap, "%u of %u in use", used, total);
 }
 
@@ -4499,7 +4511,7 @@ static void handle_pools(client *c, uint32_t ch)
 			unsigned         total = 0u;
 
 			if (hull_pool_read((const char *)pool, &p) == 0)
-				tally((const char *)pool, &p, WANT_ANY, &used, &total);
+				tally((const char *)pool, &p, WANT_ANY, 0, &used, &total);
 			hull_msg_raw(&m, "(4:pool(8:capacity");
 			hull_msg_number(&m, total);
 			hull_msg_raw(&m, ")(4:held");
@@ -4518,7 +4530,8 @@ static void handle_pools(client *c, uint32_t ch)
 
 /* `(members (ch n) (pool P))`: each entry of P in the order it fills,
  * `(member (holder H) (kind K) (name N) (priority R) (state S))`, S free,
- * running, leased or broken, H who holds it or "". */
+ * running, leased or broken, H who holds it or "", R `by-name` where only
+ * a name is given it. */
 static void handle_members(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
 	static hull_pool p;
@@ -4541,7 +4554,10 @@ static void handle_members(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		const char        *holder = holder_of(entry->name, &leased);
 		char               priority[16];
 
-		snprintf(priority, sizeof priority, "%d", entry->priority);
+		if (entry->by_name)
+			snprintf(priority, sizeof priority, "by-name");
+		else
+			snprintf(priority, sizeof priority, "%d", entry->priority);
 		hull_msg_raw(&m, "(6:member(6:holder");
 		hull_msg_text(&m, holder != NULL ? holder : "");
 		hull_msg_raw(&m, ")(4:kind");
