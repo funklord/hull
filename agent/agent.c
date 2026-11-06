@@ -1573,6 +1573,24 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	if (mount("devpts", "/machine/dev/pts", "devpts", 0u, "ptmxmode=0666") != 0 &&
 	    errno != ENOENT)
 		say("devpts", strerror(errno));
+	/* What devtmpfs leaves to userspace and a container has made for it:
+	 * without these `> /dev/stderr` fails, or as root makes a plain file, and
+	 * shared memory has nowhere to be. Where the machine has a /dev at all. */
+	{
+		static const char *const links[][2] = {
+			{ "/machine/dev/fd", "/proc/self/fd" }, { "/machine/dev/stdin", "/proc/self/fd/0" },
+			{ "/machine/dev/stdout", "/proc/self/fd/1" },
+			{ "/machine/dev/stderr", "/proc/self/fd/2" },
+		};
+
+		for (unsigned i = 0u; i < sizeof links / sizeof links[0]; i++)
+			if (symlink(links[i][1], links[i][0]) != 0 && errno != EEXIST && errno != ENOENT)
+				say("dev", strerror(errno));
+		mkdir("/machine/dev/shm", 01777);
+		if (mount("tmpfs", "/machine/dev/shm", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777") != 0 &&
+		    errno != ENOENT)
+			say("/dev/shm", strerror(errno));
+	}
 	if (chdir("/machine") != 0 || mount(".", "/", NULL, MS_MOVE, NULL) != 0 ||
 	    chroot(".") != 0 || chdir("/") != 0)
 		return "the machine's directory could not become its root";

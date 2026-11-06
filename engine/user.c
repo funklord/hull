@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -207,6 +208,16 @@ const char *hull_user_resolve(const char *root, const char *spec, hull_user *use
 
 int hull_user_become(const hull_user *user)
 {
+	/* Its stdio given to it, as runc does: a pipe is its creator's, mode 0600,
+	 * and an image's log that is a link to /dev/stderr, as nginx's is, opens
+	 * it again by path. A device is not this process's to give. */
+	for (int fd = 0; fd < 3; fd++) {
+		struct stat st;
+
+		if (fstat(fd, &st) == 0 && !S_ISCHR(st.st_mode) && fchown(fd, user->uid, user->gid) != 0 &&
+		    errno != EPERM && errno != EINVAL)
+			return -1;
+	}
 	if (syscall(SYS_setgroups, (long)user->group_count, user->groups) != 0 ||
 	    syscall(SYS_setgid, (long)user->gid) != 0 || syscall(SYS_setuid, (long)user->uid) != 0)
 		return -1;

@@ -272,6 +272,14 @@ for class in vm emu; do
 	has 0 '^write=ok$'
 done
 
+# What a container has made for it and devtmpfs does not: the links scripts
+# write to, shared memory, and for a user its own stdio by path.
+conf devlinks '(backend vm) (mutable overlay) (user "4321") (command "/probe" "write" "/dev/stderr" "write" "/dev/stdout" "write" "/dev/shm/x")'
+name=devlinks
+boot devlinks 120
+has 0 '^write=ok$'
+refute_out '^write=[^o]'
+
 # (stop_signal ...): what the agent sends a workload that a stop ends.
 conf stopq '(backend vm) (command "/probe" "say" "up" "trap") (stop_signal "SIGQUIT") (hostname "stopq")'
 (cd / && timeout 90 "$hull" run -f "$root/stopq.conf" > "$root/stopq.out" 2>&1) &

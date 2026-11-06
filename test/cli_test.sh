@@ -2328,7 +2328,7 @@ printf '%s\n' "$out" | grep -q 'one uid is mapped' &&
 # (user ...): whom the command runs as, by the machine's own files, as many
 # uids mapped and as the one the host gives. One uid can be any uid, so there
 # the map itself says it, with nothing to switch to.
-mkdir -p "$root/userfs/etc"
+mkdir -p "$root/userfs/etc" "$root/userfs/proc" "$root/userfs/dev"
 cp "$root/rootfs/probe" "$root/userfs/probe"
 printf 'root:x:0:0::/root:/x\napp:x:4321:4322::/home/app:/x\n' > "$root/userfs/etc/passwd"
 printf 'app:x:4322:\nextra:x:4400:app\n' > "$root/userfs/etc/group"
@@ -2346,6 +2346,10 @@ user_conf userhome '(command "/probe" "env" "HOME") (user "app") (env (HOME "/gi
 from_root 0 '/given' -f "$root/userhome.conf"
 user_conf usernum '(command "/probe" "uid") (user "5000:5001")'
 from_root 0 '^uid=5000$' -f "$root/usernum.conf"
+# Its stdio is given to it, as an image's log linked to /dev/stderr opens it
+# again by path: nginx's is, and it would not start.
+user_conf userlog '(command "/probe" "write" "/dev/stderr") (user "app")'
+from_root 0 '^write=ok$' -f "$root/userlog.conf"
 user_conf usernone '(command "/probe" "uid") (user "nobody")'
 from_root 125 'names a user the machine.s /etc/passwd does not' -f "$root/usernone.conf"
 user_conf usergroup '(command "/probe" "uid") (user "app:nogroup")'
