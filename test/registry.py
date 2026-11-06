@@ -3,6 +3,8 @@
 
     registry.py build DIR PROBE ARCH   write the images into DIR/blobs, DIR/repos
     registry.py serve DIR CERT KEY     serve them on 127.0.0.1, its port to DIR/port
+    registry.py serve DIR plain - ADDRESS NAME
+                                       the same in plain HTTP on ADDRESS, to DIR/NAME
 
 It speaks enough of the distribution spec to be pulled from, and as a real
 registry does: a manifest wants a bearer token, which /token gives for the
@@ -231,7 +233,7 @@ class handler(BaseHTTPRequestHandler):
 		port = self.server.server_address[1]
 		if path == "/hop":
 			# A realm that sends its asker on to another host.
-			self.send(307, b"", [("Location", "https://localhost:%d/token?%s" % (port, query))])
+			self.send(307, b"", [("Location", "%s://localhost:%d/token?%s" % (self.server.scheme, port, query))])
 			return
 		if path == "/token" and self.headers.get("Host", "").startswith("localhost") and \
 		   self.headers.get("Authorization") is not None:
@@ -268,8 +270,15 @@ class handler(BaseHTTPRequestHandler):
 		if not self.authorized(parts):
 			return
 		repo, kind, reference = "/".join(parts[2:-2]), parts[-2], parts[-1]
+		if kind == "manifests" and reference == "toplain":
+			# A registry naming a port on the asker's own loopback.
+			at = open(os.path.join(root, "plainport")).read().strip()
+			self.send(307, b"", [("Location", "http://127.0.0.1:%s/v2/%s/manifests/1" % (at, repo))])
+			return
 		if kind == "blobs":
-			self.send(307, b"", [("Location", "https://localhost:%d/cdn/%s" % (port, reference))])
+			# Another name for this host, whichever the asker did not use.
+			other = "127.0.0.1" if self.headers.get("Host", "").startswith("localhost") else "localhost"
+			self.send(307, b"", [("Location", "%s://%s:%d/cdn/%s" % (self.server.scheme, other, port, reference))])
 			return
 		if kind != "manifests":
 			self.send(404)
@@ -301,8 +310,8 @@ class handler(BaseHTTPRequestHandler):
 		scope = "pull,push" if self.command in ("POST", "PUT") else "pull"
 		realm = "hop" if repo == "test/hopped" else "token"
 		self.send(401, b"", [("WWW-Authenticate",
-		                      'Bearer realm="https://127.0.0.1:%d/%s",service="test",'
-		                      'scope="repository:%s:%s"' % (self.server.server_address[1], realm,
+		                      'Bearer realm="%s://127.0.0.1:%d/%s",service="test",'
+		                      'scope="repository:%s:%s"' % (self.server.scheme, self.server.server_address[1], realm,
 		                                                    repo, scope))])
 		return False
 
@@ -374,16 +383,18 @@ class handler(BaseHTTPRequestHandler):
 		self.send(201, b"", [("Docker-Content-Digest", digest(data))])
 
 
-def serve(root, cert, key):
-	server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+def serve(root, cert, key, address="127.0.0.1", name="port"):
+	server = ThreadingHTTPServer((address, 0), handler)
 	server.root = root
 	server.uploads = 0
-	context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-	context.load_cert_chain(cert, key)
-	server.socket = context.wrap_socket(server.socket, server_side=True)
-	with open(os.path.join(root, "port.new"), "w") as f:
+	server.scheme = "http" if cert == "plain" else "https"
+	if cert != "plain":
+		context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+		context.load_cert_chain(cert, key)
+		server.socket = context.wrap_socket(server.socket, server_side=True)
+	with open(os.path.join(root, name + ".new"), "w") as f:
 		f.write("%d\n" % server.server_address[1])
-	os.rename(os.path.join(root, "port.new"), os.path.join(root, "port"))
+	os.rename(os.path.join(root, name + ".new"), os.path.join(root, name))
 	threading.Thread(target=lambda: (time.sleep(300), server.shutdown()), daemon=True).start()
 	server.serve_forever()
 
@@ -392,4 +403,4 @@ if __name__ == "__main__":
 	if sys.argv[1] == "build":
 		build(*sys.argv[2:5])
 	else:
-		serve(*sys.argv[2:5])
+		serve(*sys.argv[2:])

@@ -1,8 +1,9 @@
 /*
- * https.c -- one GET over TLS: the connection, OpenSSL's verification of
- * the peer and its name, the request, and the response's status, headers
+ * https.c -- one request over TLS: the connection, OpenSSL's verification
+ * of the peer and its name, the request, and the response's status, headers
  * and body, framed by Content-Length, by chunks, or by a closed
- * connection, and each refused when it ends short. See https.h.
+ * connection, and each refused when it ends short. Plain HTTP is taken from
+ * a loopback peer alone, as open_conn says. See https.h.
  */
 
 #define _GNU_SOURCE
@@ -46,7 +47,17 @@ typedef struct url {
 	char port[8];
 	char path[8192];
 	int  port_given;
+	int  plain;  /* http://, which reaches a loopback peer alone */
 } url;
+
+/* Whether plain HTTP is in play at all: a registry session's, and not a
+ * package fetch's, which is https:// and nothing else. */
+static int plain_allowed;
+
+void hull_https_allow_loopback(void)
+{
+	plain_allowed = 1;
+}
 
 static int parse_url(const char *text, url *out)
 {
@@ -55,9 +66,10 @@ static int parse_url(const char *text, url *out)
 	const char *colon;
 	size_t      n;
 
-	if (strncmp(text, "https://", 8u) != 0)
+	out->plain = plain_allowed && strncmp(text, "http://", 7u) == 0;
+	if (!out->plain && strncmp(text, "https://", 8u) != 0)
 		return -1;
-	at = text + 8;
+	at = text + (out->plain ? 7 : 8);
 	slash = strchr(at, '/');
 	n = slash != NULL ? (size_t)(slash - at) : strlen(at);
 	if (n == 0u || n >= sizeof out->host || memchr(at, '[', n) != NULL || memchr(at, '@', n) != NULL)
@@ -74,7 +86,7 @@ static int parse_url(const char *text, url *out)
 		out->port[digits] = '\0';
 		n = (size_t)(colon - at);
 	} else {
-		strcpy(out->port, "443");
+		strcpy(out->port, out->plain ? "80" : "443");
 	}
 	memcpy(out->host, at, n);
 	out->host[n] = '\0';
@@ -107,6 +119,7 @@ typedef struct conn {
 	size_t  at;
 	size_t  length;
 	int     clean;  /* the peer ended with a TLS close, not a cut */
+	int     plain;  /* no TLS: a loopback peer's plain HTTP */
 } conn;
 
 static int dial(const url *u, char *why, size_t cap)
@@ -183,10 +196,83 @@ static void tls_reason(const url *u, SSL *ssl, char *why, size_t cap)
 	ERR_clear_error();
 }
 
+/* Whether `fd` is connected to this machine's own loopback: asked of the
+ * socket, so that no name, and nothing a resolver answers, can make it so. */
+static int peer_is_loopback(int fd)
+{
+	struct sockaddr_storage peer;
+	socklen_t               size = sizeof peer;
+
+	if (getpeername(fd, (struct sockaddr *)&peer, &size) != 0)
+		return 0;
+	if (peer.ss_family == AF_INET)
+		return (ntohl(((struct sockaddr_in *)&peer)->sin_addr.s_addr) >> 24) == 127u;
+	if (peer.ss_family == AF_INET6) {
+		const struct in6_addr *a = &((struct sockaddr_in6 *)&peer)->sin6_addr;
+
+		return IN6_IS_ADDR_LOOPBACK(a) || (IN6_IS_ADDR_V4MAPPED(a) && a->s6_addr[12] == 127u);
+	}
+	return 0;
+}
+
+/* Whether the peer said anything of TLS, a handshake message or an alert. */
+static void heard_tls(int write_p, int version, int content_type, const void *data, size_t n,
+                      SSL *ssl, void *arg)
+{
+	(void)version;
+	(void)data;
+	(void)n;
+	(void)ssl;
+	if (!write_p && (content_type == SSL3_RT_HANDSHAKE || content_type == SSL3_RT_ALERT))
+		*(int *)arg = 1;
+}
+
+/* The loopback peers this process has met speaking plain HTTP, by host and
+ * port, so that each later request of a pull goes straight to it. */
+static char plain_peers[8][sizeof ((url *)0)->host + 8u];
+
+static int known_plain(const url *u)
+{
+	char name[sizeof plain_peers[0]];
+
+	snprintf(name, sizeof name, "%s:%s", u->host, u->port);
+	for (unsigned i = 0u; i < sizeof plain_peers / sizeof plain_peers[0]; i++)
+		if (strcmp(plain_peers[i], name) == 0)
+			return 1;
+	return 0;
+}
+
+int hull_https_host_plain(const char *host)
+{
+	char text[320];
+	url  u;
+
+	snprintf(text, sizeof text, "https://%s", host);
+	return parse_url(text, &u) == 0 && known_plain(&u);
+}
+
+static void remember_plain(const url *u)
+{
+	static unsigned next;
+
+	snprintf(plain_peers[next % 8u], sizeof plain_peers[0], "%s:%s", u->host, u->port);
+	next++;
+}
+
+/*
+ * The connection. TLS always, but for one case, docker's: a registry on this
+ * machine's loopback, every hull machine's address being there, may speak
+ * plain HTTP, since nothing between it and us can read or change the bytes.
+ * The test is the connected socket's peer. A peer that speaks TLS keeps
+ * being held to its certificate: a handshake that failed having heard any
+ * TLS from the peer is a refusal, never a reason to try without. Only a peer
+ * that said nothing of TLS at all is met again in plain.
+ */
 static int open_conn(conn *c, const url *u, char *why, size_t cap)
 {
 	SSL_CTX        *ctx = context();
 	struct in6_addr address;
+	int             spoke_tls = 0;
 	int             literal = inet_pton(AF_INET, u->host, &address) == 1 ||
 	                          inet_pton(AF_INET6, u->host, &address) == 1;
 
@@ -196,6 +282,11 @@ static int open_conn(conn *c, const url *u, char *why, size_t cap)
 		return say(why, cap, "TLS", "the host's trust store could not be read");
 	if ((c->fd = dial(u, why, cap)) < 0)
 		return -1;
+	if (u->plain || (plain_allowed && known_plain(u))) {
+		c->plain = 1;
+		return peer_is_loopback(c->fd) ? 0 :
+		       say(why, cap, u->host, "plain HTTP is taken from this machine's loopback alone");
+	}
 	if ((c->ssl = SSL_new(ctx)) == NULL || SSL_set_fd(c->ssl, c->fd) != 1)
 		return say(why, cap, u->host, "TLS could not be begun");
 	/* The peer's certificate must name the host the URL does: by DNS
@@ -203,7 +294,22 @@ static int open_conn(conn *c, const url *u, char *why, size_t cap)
 	if (literal ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(c->ssl), u->host) != 1 :
 	              SSL_set_tlsext_host_name(c->ssl, u->host) != 1 || SSL_set1_host(c->ssl, u->host) != 1)
 		return say(why, cap, u->host, "its name could not be set to be verified");
+	SSL_set_msg_callback(c->ssl, heard_tls);
+	SSL_set_msg_callback_arg(c->ssl, &spoke_tls);
 	if (SSL_connect(c->ssl) != 1 || SSL_get_verify_result(c->ssl) != X509_V_OK) {
+		if (plain_allowed && !spoke_tls && peer_is_loopback(c->fd)) {
+			ERR_clear_error();
+			SSL_free(c->ssl);
+			close(c->fd);
+			c->ssl = NULL;
+			if ((c->fd = dial(u, why, cap)) < 0)
+				return -1;
+			if (!peer_is_loopback(c->fd))
+				return say(why, cap, u->host, "plain HTTP is taken from this machine's loopback alone");
+			c->plain = 1;
+			remember_plain(u);
+			return 0;
+		}
 		tls_reason(u, c->ssl, why, cap);
 		return -1;
 	}
@@ -223,7 +329,8 @@ static void close_conn(conn *c)
 static int send_all(conn *c, const char *data, size_t n)
 {
 	while (n > 0u) {
-		int sent = SSL_write(c->ssl, data, n > 65536u ? 65536 : (int)n);
+		int sent = c->plain ? (int)send(c->fd, data, n > 65536u ? 65536u : n, MSG_NOSIGNAL) :
+		           SSL_write(c->ssl, data, n > 65536u ? 65536 : (int)n);
 
 		if (sent <= 0)
 			return -1;
@@ -241,6 +348,15 @@ static int fill(conn *c)
 	if (c->at < c->length)
 		return 1;
 	c->at = c->length = 0u;
+	if (c->plain) {
+		ssize_t n = recv(c->fd, c->buffer, sizeof c->buffer, 0);
+
+		if (n < 0)
+			return -1;
+		c->length = (size_t)n;
+		c->clean  = n == 0;  /* a close is all the end plain HTTP has */
+		return n > 0;
+	}
 	got = SSL_read(c->ssl, c->buffer, (int)sizeof c->buffer);
 	if (got > 0) {
 		c->length = (size_t)got;
@@ -415,7 +531,7 @@ int hull_https_request(const char *method, const char *text, const char *const *
 	memset(out, 0, sizeof *out);
 	out->length = -1;
 	if (parse_url(text, &u) != 0)
-		return say(why, cap, text, "not an https:// URL this reads");
+		return say(why, cap, text, "not a URL this reads");
 	for (const char *const *h = headers; h != NULL && *h != NULL; h++) {
 		room += strlen(*h) + 2u;
 		if (strpbrk(*h, "\r\n") != NULL)

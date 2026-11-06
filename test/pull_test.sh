@@ -103,13 +103,13 @@ wrong_server=$!
 # Each stopped at the end by its pid, timeout's, which passes the TERM on;
 # the pid's command is read again first, in case it has gone to another.
 stop_servers() {
-	for pid in $server $wrong_server; do
+	for pid in $server $wrong_server ${plain_server:-} ${far_server:-}; do
 		if [ -r "/proc/$pid/cmdline" ] &&
 		   tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q '^timeout .*registry\.py serve'; then
 			kill "$pid" 2> /dev/null
 		fi
 	done
-	wait "$server" "$wrong_server" 2> /dev/null
+	wait "$server" "$wrong_server" ${plain_server:-} ${far_server:-} 2> /dev/null
 }
 trap stop_servers EXIT
 tries=0
@@ -406,6 +406,48 @@ expect 1 'not found there' "$hull" pull "127.0.0.1:$port/test/image:nope"
 expect 1 'certificate' env SSL_CERT_FILE="$root/other.pem" "$hull" pull "$image" other/ca
 expect 1 'certificate|hostname|mismatch' "$hull" pull "127.0.0.1:$wrong_port/test/image:1" wrong/name
 expect 1 'its repository is not one' "$hull" pull "127.0.0.1:$port/Test/Image:1"
+
+# Plain HTTP, from this machine's loopback alone. The same registry with no
+# TLS: a whole pull, its token and its redirect to localhost included, no
+# trust store involved, and a push back. The refusals are the point: the
+# certificate cases above stay refused on the loopback, a peer that speaks
+# TLS being held to it, and these are the two ways round the rule.
+(exec timeout -k 2 300 python3 "$here/registry.py" serve "$root/registry" plain - 127.0.0.1 plainport \
+	2> "$root/plain.log") &
+plain_server=$!
+elsewhere=$(hostname -I 2> /dev/null | tr ' ' '\n' | grep -v '^127\.' | grep -F . | head -1)
+far_server=
+if [ -n "$elsewhere" ]; then
+	(exec timeout -k 2 300 python3 "$here/registry.py" serve "$root/registry" plain - "$elsewhere" farport \
+		2> "$root/far.log") &
+	far_server=$!
+fi
+tries=0
+until [ -s "$root/registry/plainport" ] && { [ -z "$far_server" ] || [ -s "$root/registry/farport" ]; } ||
+	[ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+plain_port=$(cat "$root/registry/plainport" 2> /dev/null)
+expect 0 'sha256:[0-9a-f]{64}' env -u SSL_CERT_FILE "$hull" pull "127.0.0.1:$plain_port/test/image:1" plain/one
+expect 0 'sha256:[0-9a-f]{64}' env -u SSL_CERT_FILE "$hull" pull "localhost:$plain_port/test/image:1" plain/two
+cases=$((cases + 1))
+[ "$(sed -n 1p "$store/refs/plain/one")" = "$(sed -n 1p "$store/refs/plain/two")" ] &&
+	[ -s "$store/refs/plain/one" ] || fail "a pull in plain HTTP took another tree" ""
+expect 0 'sha256:[0-9a-f]{64}' "$hull" push plain/one "127.0.0.1:$plain_port/test/pushed-plain:1"
+cases=$((cases + 1))
+[ -s "$root/registry/repos/test/pushed-plain/tags/1" ] || fail "a push in plain HTTP landed nothing" ""
+# A registry elsewhere naming a port on this machine is not followed there.
+expect 1 'plain HTTP, named by a registry that is not one' "$hull" pull "127.0.0.1:$port/test/image:toplain"
+if [ -n "$far_server" ]; then
+	far_port=$(cat "$root/registry/farport" 2> /dev/null)
+	# Not the loopback, so no plain: TLS or nothing, however it answers.
+	expect 1 "$elsewhere" "$hull" pull "$elsewhere:$far_port/test/image:1" plain/far
+	cases=$((cases + 1))
+	[ ! -e "$store/refs/plain/far" ] || fail "a pull took plain HTTP from an address elsewhere" ""
+else
+	printf 'pull: no address but the loopback, plain HTTP from elsewhere not tried\n'
+fi
 cases=$((cases + 1))
 for ref in other/ca wrong/name; do
 	[ ! -e "$store/refs/$ref" ] || fail "a refused pull left a ref, $ref" ""

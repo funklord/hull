@@ -418,7 +418,12 @@ int hull_remote_request(hull_remote *s, const char *method, const char *url,
 		unsigned    n = 0u;
 
 		if (hull_https_host(here, host, sizeof host) != 0)
-			return say(why, cap, here, "not an https:// URL; hull reaches registries by TLS only");
+			return say(why, cap, here, "not an https:// URL; hull reaches registries by TLS, "
+			           "or by plain HTTP on this machine's loopback");
+		/* A registry elsewhere does not get to send a request to a port on
+		 * this machine: an http:// URL is a loopback registry's to name. */
+		if (strncmp(here, "http://", 7u) == 0 && !hull_https_host_plain(s->img.host))
+			return say(why, cap, here, "plain HTTP, named by a registry that is not one");
 		/* A caller's credentials go to the host it asked, not to one a
 		 * redirect names. */
 		for (const char *const *h = extra; h != NULL && *h != NULL && n < 6u; h++)
@@ -452,7 +457,8 @@ int hull_remote_request(hull_remote *s, const char *method, const char *url,
 			char next[8192];
 
 			if (out->location[0] == '/')
-				snprintf(next, sizeof next, "https://%s%s", host, out->location);
+				snprintf(next, sizeof next, "%s://%s%s",
+				         strncmp(here, "http://", 7u) == 0 ? "http" : "https", host, out->location);
 			else
 				snprintf(next, sizeof next, "%s", out->location);
 			snprintf(here, sizeof here, "%s", next);

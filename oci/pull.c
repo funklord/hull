@@ -377,6 +377,7 @@ int hull_pull(hull_store *store, const char *name, const char *ref, const char *
 	scratch[0] = '\0';
 	if (data == NULL)
 		return say(why, cap, "out of memory", NULL);
+	hull_https_allow_loopback();
 	if (hull_remote_parse(name, &s.img, why, cap) != 0)
 		goto done;
 	if (fetch_manifest(&s, s.img.reference, &body, &doc, &root, digest, why, cap) != 0)

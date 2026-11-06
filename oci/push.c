@@ -331,6 +331,7 @@ int hull_push(hull_store *store, const char *name, const char *image, char diges
 	if (l == NULL)
 		return say(why, cap, "out of memory", NULL);
 	l->fd = -1;
+	hull_https_allow_loopback();
 	if (hull_remote_parse(image, &r.img, why, cap) != 0)
 		goto done;
 	if (r.img.by_digest) {

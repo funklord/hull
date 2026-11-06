@@ -240,6 +240,27 @@ CONF
 	fi
 	timeout 20 "$hull" stop reg > /dev/null 2>&1
 	wait "$pid"
+	sleep 2
+
+	# The same registry with no TLS, on the machine's loopback address: plain
+	# HTTP is taken there, and registry:2 answers an upload with an absolute
+	# http:// URL, which a push has to follow. No CA anywhere.
+	printf '(machine (backend chroot) (source "registry:2") (hostname "reg") (ports (port (host 5000) (guest 5000))))\n' \
+		> "$root/reg/plain.conf"
+	(cd "$root/reg" && timeout 60 "$hull" run -f plain.conf > "$root/plain.out" 2>&1) &
+	pid=$!
+	address reg > /dev/null
+	n=0
+	while [ "$n" -lt 30 ] && ! curl -s -m 2 -o /dev/null "http://$at:5000/v2/"; do
+		sleep 1
+		n=$((n + 1))
+	done
+	says 'a push in plain HTTP to a real registry' "$(timeout 60 "$hull" push pushed "$at:5000/test/plain:1" 2>&1)" 'sha256:'
+	says 'which lists it' "$(curl -s -m 4 "http://$at:5000/v2/_catalog")" 'test/plain'
+	says 'and a pull back' "$(timeout 60 "$hull" pull "$at:5000/test/plain:1" backplain 2>&1)" 'sha256:'
+	says 'its runtime whole' "$("$hull" manifest show backplain 2>&1)" '(FROM_HULL yes)'
+	timeout 20 "$hull" stop reg > /dev/null 2>&1
+	wait "$pid"
 fi
 
 printf 'images: %s cases, %s failed\n' "$cases" "$failures"
