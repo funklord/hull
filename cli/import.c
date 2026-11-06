@@ -888,6 +888,10 @@ typedef struct svc {
 	char memory[32];       /* from mem_limit: */
 	char cpus[16];         /* from cpus:, a whole number */
 	char user[128];        /* from user: */
+	char arch[16];         /* from platform: */
+	sb   devices;          /* from devices:, each path quoted */
+	sb   secrets;          /* from secrets:, each a whole entry */
+	int  in_reservations;  /* under deploy:'s reservations:, not its limits: */
 	char stop_signal[32];  /* from stop_signal: */
 	long stop_ms;          /* from stop_grace_period:, or 0 */
 	sb   tmpfs;            /* from tmpfs:, each path quoted */
@@ -1278,6 +1282,8 @@ static void svc_reset(svc *s)
 	free(s->notes.data);
 	free(s->file_env.data);
 	free(s->tmpfs.data);
+	free(s->devices.data);
+	free(s->secrets.data);
 	free(s->hosts.data);
 	free(s->dns.data);
 	free(s->sysctls.data);
@@ -1539,6 +1545,21 @@ static void svc_flush(svc *s, sb *out)
 	}
 	if (s->read_only)
 		sb_str(out, " (security (readonly_root true))");
+	if (s->arch[0] != '\0') {
+		sb_str(out, " (arch ");
+		sb_str(out, s->arch);
+		sb_str(out, ")");
+	}
+	if (s->devices.data != NULL) {
+		sb_str(out, " (devices (node");
+		sb_str(out, s->devices.data);
+		sb_str(out, "))");
+	}
+	if (s->secrets.data != NULL) {
+		sb_str(out, " (secrets");
+		sb_str(out, s->secrets.data);
+		sb_str(out, ")");
+	}
 	{
 		const struct { const char *key; const sb *list; } lists[] = {
 			{ "hosts", &s->hosts }, { "dns", &s->dns }, { "sysctls", &s->sysctls },
@@ -2013,6 +2034,124 @@ static void compose_memory(svc *s, const char *text)
 		snprintf(s->memory, sizeof s->memory, "%lu%c", n, unit);
 }
 
+/* A cpus: value, whole, or noted. */
+static void compose_cpus(svc *s, const char *text)
+{
+	if (text[0] != '\0' && strspn(text, "0123456789") == strlen(text) &&
+	    strtol(text, NULL, 10) > 0)
+		snprintf(s->cpus, sizeof s->cpus, "%s", text);
+	else
+		svc_note(s, "cpus of a fraction not translated", text);
+}
+
+/* An entry under deploy:. Its limits are the machine's; a reservation asks
+ * for what hull has no way to promise, so it is said and left. */
+static void compose_deploy(svc *s, char *content)
+{
+	char *colon = strchr(content, ':');
+	char *key = content;
+	char *value;
+
+	if (colon == NULL)
+		return;
+	*colon = '\0';
+	key = trim(key);
+	value = scalar(trim(colon + 1));
+	if (strcmp(key, "resources") == 0)
+		return;
+	if (strcmp(key, "limits") == 0) {
+		s->in_reservations = 0;
+	} else if (strcmp(key, "reservations") == 0) {
+		s->in_reservations = 1;
+	} else if (s->in_reservations) {
+		svc_note(s, "deploy reservation not translated", key);
+	} else if (strcmp(key, "memory") == 0) {
+		compose_memory(s, value);
+	} else if (strcmp(key, "cpus") == 0) {
+		compose_cpus(s, value);
+	} else {
+		svc_note(s, "deploy key not translated", key);
+	}
+}
+
+/* Whether a compose file's top-level secrets: gives `name` a file: its path
+ * into `path`. Read from the file before its services, which come first. */
+static char secret_files[16][2][256];
+static unsigned secret_file_count;
+
+static void compose_secrets_scan(FILE *file)
+{
+	char line[LINE_CAP];
+	int  in_secrets = 0;
+	char current[256] = "";
+
+	secret_file_count = 0u;
+	while (fgets(line, sizeof line, file) != NULL) {
+		int   indented = line[0] == ' ' || line[0] == '\t';
+		char *content;
+		char *colon;
+
+		line[strcspn(line, "\r\n")] = '\0';
+		content = trim(line);
+		colon = strchr(content, ':');
+
+		if (!indented && content[0] != '\0' && content[0] != '#') {
+			in_secrets = strncmp(content, "secrets:", 8u) == 0;
+			continue;
+		}
+		if (!in_secrets || colon == NULL)
+			continue;
+		*colon = '\0';
+		if (strcmp(trim(content), "file") == 0 && current[0] != '\0' && secret_file_count < 16u) {
+			snprintf(secret_files[secret_file_count][0], 256u, "%s", current);
+			snprintf(secret_files[secret_file_count][1], 256u, "%s", scalar(trim(colon + 1)));
+			secret_file_count++;
+		} else {
+			snprintf(current, sizeof current, "%s", trim(content));
+		}
+	}
+	rewind(file);
+}
+
+static void compose_secret(svc *s, const char *name)
+{
+	for (unsigned i = 0u; i < secret_file_count; i++)
+		if (strcmp(secret_files[i][0], name) == 0) {
+			char source[300];
+
+			sb_str(&s->secrets, " (");
+			sb_str(&s->secrets, name);
+			sb_str(&s->secrets, " (source ");
+			snprintf(source, sizeof source, "file:%s", secret_files[i][1]);
+			sb_quoted(&s->secrets, source);
+			sb_str(&s->secrets, "))");
+			svc_note(s, "secret at /run/hull/secrets, not /run/secrets", name);
+			return;
+		}
+	svc_note(s, "secret with no file: not translated", name);
+}
+
+/* `/dev/x` or `/dev/x:/dev/y:rwm`: hull's node, the guest path its own. */
+static void compose_device(svc *s, char *spec)
+{
+	char *colon = strchr(spec, ':');
+
+	if (colon != NULL) {
+		if (strncmp(colon + 1, spec, (size_t)(colon - spec)) != 0)
+			svc_note(s, "device at another path not translated", spec);
+		*colon = '\0';
+	}
+	sb_str(&s->devices, " ");
+	sb_quoted(&s->devices, spec);
+}
+
+/* no-new-privileges is what every machine has; the rest is docker's. */
+static void compose_security_opt(svc *s, const char *word)
+{
+	if (strcmp(word, "no-new-privileges:true") != 0 && strcmp(word, "no-new-privileges") != 0)
+		svc_note(s, "security_opt not translated", word);
+}
+
 static char *compose_text(FILE *file, const char *project)
 {
 	svc    s = { 0 };
@@ -2038,6 +2177,10 @@ static char *compose_text(FILE *file, const char *project)
 	as_label(name, sizeof name, project);
 	snprintf(build_project, sizeof build_project, "%s", name);
 
+	/* Not from a pipe: it cannot be read twice, and its secrets are noted. */
+	secret_file_count = 0u;
+	if (ftell(file) >= 0)
+		compose_secrets_scan(file);
 	while (fgets(line, sizeof line, file) != NULL) {
 		const char *c;
 		int         ind;
@@ -2068,7 +2211,8 @@ static char *compose_text(FILE *file, const char *project)
 				*colon = '\0';
 				/* A top-level volumes: declares the names a service's
 				 * volumes then keep. */
-				if (strcmp(content, "version") != 0 && strcmp(content, "volumes") != 0) {
+				if (strcmp(content, "version") != 0 && strcmp(content, "volumes") != 0 &&
+				    strcmp(content, "secrets") != 0) {
 					sb_str(&top_notes, "\n; top-level key not translated: ");
 					sb_str(&top_notes, content);
 					if (warnings != NULL)
@@ -2182,6 +2326,12 @@ static char *compose_text(FILE *file, const char *project)
 				compose_env_file(&s, scalar(item));
 			else if (strcmp(field, "tmpfs") == 0)
 				compose_tmpfs(&s, scalar(item));
+			else if (strcmp(field, "devices") == 0)
+				compose_device(&s, scalar(item));
+			else if (strcmp(field, "secrets") == 0)
+				compose_secret(&s, scalar(item));
+			else if (strcmp(field, "security_opt") == 0)
+				compose_security_opt(&s, scalar(item));
 			else if (strcmp(field, "extra_hosts") == 0)
 				compose_host(&s, scalar(item));
 			else if (strcmp(field, "dns") == 0)
@@ -2200,6 +2350,8 @@ static char *compose_text(FILE *file, const char *project)
 			else if (strcmp(field, "extra_hosts") == 0 || strcmp(field, "sysctls") == 0 ||
 			         strcmp(field, "ulimits") == 0) {
 				compose_pair(&s, field, content);
+			} else if (strcmp(field, "deploy") == 0) {
+				compose_deploy(&s, content);
 			} else if (strcmp(field, "networks") == 0) {
 				/* A networks map: each name, its options under it, an
 				 * alias or an address, which a segment does not take. */
@@ -2327,7 +2479,8 @@ static char *compose_text(FILE *file, const char *project)
 			static const char *const blocks[] = {
 				"environment", "ports", "volumes", "command", "entrypoint", "networks",
 				"depends_on", "healthcheck", "build", "profiles", "env_file", "tmpfs",
-				"extra_hosts", "dns", "sysctls", "ulimits", NULL
+				"extra_hosts", "dns", "sysctls", "ulimits", "deploy", "devices", "secrets",
+				"security_opt", NULL
 			};
 			int known = 0;
 
@@ -2419,13 +2572,7 @@ static char *compose_text(FILE *file, const char *project)
 		} else if (strcmp(key, "mem_limit") == 0) {
 			compose_memory(&s, scalar(value));
 		} else if (strcmp(key, "cpus") == 0) {
-			char *text = scalar(value);
-
-			if (text[0] != '\0' && strspn(text, "0123456789") == strlen(text) &&
-			    strtol(text, NULL, 10) > 0)
-				snprintf(s.cpus, sizeof s.cpus, "%s", text);
-			else
-				svc_note(&s, "cpus of a fraction not translated", text);
+			compose_cpus(&s, scalar(value));
 		} else if (strcmp(key, "user") == 0) {
 			snprintf(s.user, sizeof s.user, "%s", scalar(value));
 		} else if (strcmp(key, "stop_signal") == 0) {
@@ -2437,10 +2584,36 @@ static char *compose_text(FILE *file, const char *project)
 				s.stop_ms = ms;
 			else
 				svc_note(&s, "stop_grace_period not translated", scalar(value));
-		} else if (strcmp(key, "tmpfs") == 0) {
-			compose_tmpfs(&s, scalar(value));
-		} else if (strcmp(key, "dns") == 0) {
-			compose_word(&s.dns, scalar(value));
+		} else if (strcmp(key, "tmpfs") == 0 || strcmp(key, "dns") == 0 ||
+		           strcmp(key, "devices") == 0 || strcmp(key, "secrets") == 0 ||
+		           strcmp(key, "security_opt") == 0) {
+			/* One value, or a flow list of them: `dns: [1.1.1.1, 8.8.8.8]`. */
+			char *rest = value[0] == '[' ? value + 1 : value;
+			char *stop = value[0] == '[' ? strrchr(value, ']') : NULL;
+
+			if (stop != NULL)
+				*stop = '\0';
+			for (char *item = strtok(rest, ","); item != NULL; item = strtok(NULL, ",")) {
+				char *word = scalar(trim(item));
+
+				if (key[0] == 't')
+					compose_tmpfs(&s, word);
+				else if (strcmp(key, "dns") == 0)
+					compose_word(&s.dns, word);
+				else if (key[0] == 'd')
+					compose_device(&s, word);
+				else if (strcmp(key, "secrets") == 0)
+					compose_secret(&s, word);
+				else
+					compose_security_opt(&s, word);
+			}
+		} else if (strcmp(key, "platform") == 0) {
+			char *slash = strchr(scalar(value), '/');
+
+			if (slash != NULL && strchr(slash + 1, '/') == NULL)
+				snprintf(s.arch, sizeof s.arch, "%s", slash + 1);
+			else
+				svc_note(&s, "platform not translated", scalar(value));
 		} else if (strcmp(key, "read_only") == 0) {
 			s.read_only = strcmp(scalar(value), "true") == 0;
 		} else if (strcmp(key, "init") == 0 || strcmp(key, "expose") == 0) {

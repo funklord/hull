@@ -280,6 +280,48 @@ expect 0 '\(ulimits "nproc=512" "nofile=1024:4096"\)' "$hull" import "$dir/vars/
 expect 0 '\(hosts "other:10.0.0.6"\)' "$hull" import "$dir/vars/more.yaml"
 expect 0 '\(dns "1.1.1.1" "8.8.8.8"\)' "$hull" import "$dir/vars/more.yaml"
 expect 0 '\(sysctls "net.ipv4.ip_forward=1"\)' "$hull" import "$dir/vars/more.yaml"
+cat > "$dir/vars/deploy.yaml" <<'COMPOSE'
+services:
+  web:
+    image: alpine
+    platform: linux/arm64
+    dns: [1.1.1.1, "8.8.8.8"]
+    tmpfs: [/run, /tmp]
+    devices:
+      - /dev/fuse
+      - "/dev/i2c-1:/dev/i2c-1:rwm"
+    security_opt: [no-new-privileges:true]
+    secrets: [token, nofile]
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          memory: 512M
+          cpus: "2"
+        reservations:
+          memory: 100M
+secrets:
+  token:
+    file: ./token.txt
+  nofile:
+    external: true
+COMPOSE
+expect 0 '\(memory "512M"\)' "$hull" import "$dir/vars/deploy.yaml"
+expect 0 '\(cpus 2\)' "$hull" import "$dir/vars/deploy.yaml"
+expect 0 '\(arch arm64\)' "$hull" import "$dir/vars/deploy.yaml"
+expect 0 '\(dns "1.1.1.1" "8.8.8.8"\)' "$hull" import "$dir/vars/deploy.yaml"
+expect 0 '\(tmpfs "/run" "/tmp"\)' "$hull" import "$dir/vars/deploy.yaml"
+expect 0 '\(devices \(node "/dev/fuse" "/dev/i2c-1"\)\)' "$hull" import "$dir/vars/deploy.yaml"
+expect 0 '\(secrets \(token \(source "file:./token.txt"\)\)\)' "$hull" import "$dir/vars/deploy.yaml"
+expect 0 '; secret with no file: not translated: nofile' "$hull" import "$dir/vars/deploy.yaml"
+expect 0 '; deploy reservation not translated: memory' "$hull" import "$dir/vars/deploy.yaml"
+cases=$((cases + 1))
+"$hull" import "$dir/vars/deploy.yaml" | grep -q 'top-level key not translated: secrets' &&
+	fail 'a top-level secrets: read is not said to be unread' ''
+expect 0 '; deploy key not translated: replicas' "$hull" import "$dir/vars/deploy.yaml"
+cases=$((cases + 1))
+"$hull" import "$dir/vars/deploy.yaml" | grep -q 'security_opt' &&
+	fail 'no-new-privileges is what every machine has' "$("$hull" import "$dir/vars/deploy.yaml")"
 printf 'services:\n  web:\n    image: alpine\n    user: "1000:1000"\n' > "$dir/vars/user.yaml"
 expect 0 '\(user "1000:1000"\)' "$hull" import "$dir/vars/user.yaml"
 cat > "$dir/vars/ro.yaml" <<'COMPOSE'
