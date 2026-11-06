@@ -3473,7 +3473,7 @@ cases=$((cases + 1))
 lease=$(timeout 20 "$hull" reserve tpool 2>&1)
 printf '%s\n' "$lease" | grep -Eqx 'lease-[0-9a-f]{8}' ||
 	fail "hull reserve did not print a lease's id alone" "$lease"
-expect 0 "^$lease +tpool +1 +0\$" "$hull" lease ls
+expect 0 "^$lease +tpool +1 +0 +-\$" "$hull" lease ls
 expect 0 '^tpool +2 +1 +0$' "$hull" pool ls
 conf plow '(pool "tpool") (hostname "plow") (command "/probe" "say" "ready" "sleep" "3")'
 rm -f "$root/plow.out"
@@ -3484,7 +3484,7 @@ until grep -q '^ready$' "$root/plow.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
 	tries=$((tries + 1))
 	sleep 0.25
 done
-expect 0 "^$lease +tpool +1 +1\$" "$hull" lease ls
+expect 0 "^$lease +tpool +1 +1 +-\$" "$hull" lease ls
 expect 125 "lease $lease.s 1 slots are in use" "$hull" run --lease "$lease" -f "$root/pnext.conf"
 wait "$plow" 2>/dev/null
 expect 125 'pool tpool has 2 slots, and the lease asks 3' "$hull" reserve tpool --count 3
@@ -3507,7 +3507,8 @@ cat > "$root/home/.config/hull/pools.conf" <<'CONF'
   (tkept (capacity 1) (members (slot "lab" (by_name true)) (slot "open")))
   (tonly (members (slot "only" (by_name true))))
   (tboth (members (slot "both" (by_name true) (priority 1))))
-  (tword (members (slot "word" (by_name maybe)))))
+  (tword (members (slot "word" (by_name maybe))))
+  (tend (capacity 1)))
 CONF
 expect 0 '^plain +slot +5 +free +-$' "$hull" pool ls tmix
 expect 0 '^gpu +slot +-1 +free +-$' "$hull" pool ls tmix
@@ -3550,7 +3551,7 @@ until grep -q '^ready$' "$root/pgpu.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
 	tries=$((tries + 1))
 	sleep 0.25
 done
-expect 0 "^$named +tmix +1 +1\$" "$hull" lease ls
+expect 0 "^$named +tmix +1 +1 +-\$" "$hull" lease ls
 wait "$pgpu" 2>/dev/null
 # A run with no lease takes what fills first, and goes past gpu's holder.
 conf pfill '(pool "tmix") (hostname "pfill") (command "/probe" "say" "ready" "sleep" "3")'
@@ -3625,8 +3626,8 @@ until grep -q '^ready$' "$root/pkept.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
 done
 kill -KILL "$(head -1 "$XDG_RUNTIME_DIR/hull/core.lock")" 2> /dev/null
 wait "$pkept" 2>/dev/null
-expect 0 "^$both +tmix +2 +0\$" "$hull" lease ls
-expect 0 "^$other +tmix +1 +0\$" "$hull" lease ls
+expect 0 "^$both +tmix +2 +0 +-\$" "$hull" lease ls
+expect 0 "^$other +tmix +1 +0 +-\$" "$hull" lease ls
 expect 0 "^gpu +slot +-1 +leased +$both\$" "$hull" pool ls tmix
 expect 0 '^tmix +3 +3 +0$' "$hull" pool ls
 expect 0 '^tcap +1 +1 +0$' "$hull" pool ls
@@ -3668,6 +3669,38 @@ expect 125 'member both: \(by_name true\) is never filled, so it takes no priori
 	"$hull" run -f "$root/pboth.conf"
 conf pword '(pool "tword") (hostname "pword") (command "/probe" "say" "ran")'
 expect 125 'member word: \(by_name maybe\) is true or left out' "$hull" run -f "$root/pword.conf"
+# A lease with an end: said in lease ls, kept in its file; its machine told
+# why on its stderr and ended 79, as one under a lease released is; the slot
+# back after. One that ran out with no core about is gone from the next.
+expect 2 'usage' "$hull" reserve tend --for soon
+ending=$(timeout 20 "$hull" reserve tend --for 3s)
+expect 0 "^$ending +tend +1 +0 +20[0-9-]+T[0-9:]+Z\$" "$hull" lease ls
+cases=$((cases + 1))
+grep -Eq '^until [1-9]' "$XDG_RUNTIME_DIR/hull/leases/$ending" ||
+	fail "a lease's end was not in its file" "$(cat "$XDG_RUNTIME_DIR/hull/leases/$ending")"
+conf pend '(pool "tend") (hostname "pend") (command "/probe" "say" "ready" "sleep" "25" "say" "never")'
+expect 79 "lease $ending ended: its time ran out" "$hull" run --lease "$ending" -f "$root/pend.conf"
+expect 0 '^tend +1 +0 +0$' "$hull" pool ls
+held=$(timeout 20 "$hull" reserve tend)
+rm -f "$root/pend.out"
+(cd / && timeout -k 2 30 "$hull_abs" run --lease "$held" -f "$root/pend.conf" > "$root/pend.out" 2>&1; echo "status $?" >> "$root/pend.out") &
+pend=$!
+tries=0
+until grep -q '^ready$' "$root/pend.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+expect 0 '' "$hull" release "$held"
+wait "$pend" 2>/dev/null
+cases=$((cases + 1))
+grep -q "lease $held ended: released" "$root/pend.out" && grep -q '^status 79$' "$root/pend.out" ||
+	fail "a machine under a released lease was not told, or did not end 79" "$(cat "$root/pend.out")"
+gone=$(timeout 20 "$hull" reserve tend --for 2s)
+kill -KILL "$(head -1 "$XDG_RUNTIME_DIR/hull/core.lock")" 2> /dev/null
+sleep 3
+refute "$gone" "$hull" lease ls
+cases=$((cases + 1))
+[ ! -e "$XDG_RUNTIME_DIR/hull/leases/$gone" ] || fail "a lease past its end kept its file" ""
 # A machine the pool has nothing for is refused, not left to wait or to
 # take a slot from what the pool is for; nor is a file that cannot be meant.
 conf pnoboard '(pool "tboards") (hostname "pnoboard") (command "/probe" "say" "ran")'

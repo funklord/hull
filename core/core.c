@@ -142,6 +142,7 @@ struct slot {
 	char               pool[64];       /* the plan's (pool ...), or "" for none (4.12) */
 	char               lease[24];      /* the lease it runs under, or "" */
 	char               member[64];     /* the pool's entry it holds, or "" for an unnamed slot */
+	int                lease_ended;    /* its lease ended under it: status 79, section 4.12 */
 	hull_core          core;
 	hull_machine      *handle;
 	char               state[16];
@@ -976,8 +977,8 @@ static void machine_exited(slot *s, int code, int signal)
 
 	forget_machine(s);
 	s->exited = 1;
-	s->code   = code;
-	s->signal = signal;
+	s->code   = s->lease_ended ? 79 : code;
+	s->signal = s->lease_ended ? 0 : signal;
 	snprintf(s->state, sizeof s->state, "exited");
 	/* Its followers hear the exit once they have read to the end. */
 	for (unsigned i = 0u; i < s->stop_count; i++)
@@ -2295,6 +2296,7 @@ typedef struct lease {
 	char     id[24];
 	char     pool[64];
 	unsigned count;
+	long long until;     /* when it ends, seconds since the epoch, or 0 for its release */
 	unsigned    held_count;
 	held_member held[HULL_POOL_MEMBERS];
 } lease;
@@ -2632,7 +2634,7 @@ static int save_lease(const lease *l)
 	snprintf(made, sizeof made, "%s.new", path);
 	if ((file = fopen(made, "we")) == NULL)
 		return -1;
-	ok = fprintf(file, "pool %s\ncount %u\n", l->pool, l->count) > 0;
+	ok = fprintf(file, "pool %s\ncount %u\nuntil %lld\n", l->pool, l->count, l->until) > 0;
 	for (unsigned i = 0u; ok && i < l->held_count; i++)
 		ok = fprintf(file, "member %s %s\n", l->held[i].board ? "board" : "slot",
 		             l->held[i].name) > 0;
@@ -2667,6 +2669,8 @@ static void load_leases(void)
 		if (fscanf(file, "pool %63s count %u", l.pool, &l.count) == 2 && l.count > 0u) {
 			l.used = 1;
 			memcpy(l.id, entry->d_name, length + 1u);
+			if (fscanf(file, " until %lld", &l.until) != 1)
+				l.until = 0;
 			while (l.held_count < HULL_POOL_MEMBERS &&
 			       fscanf(file, " member %7s %63s", kind, l.held[l.held_count].name) == 2)
 				l.held[l.held_count++].board = strcmp(kind, "board") == 0;
@@ -4310,11 +4314,12 @@ static void handle_gc(client *c, uint32_t ch)
 	pthread_detach(thread);
 }
 
-/* `(lease (ch n) (count N) (kind K) (members NAMES) (pool P) (wait S)?)`:
- * N slots of P held as a lease, those NAMES lists, comma between them, and
- * the rest what fills first, of kind K, any, board or slot; answered with
- * its id, or waited for in P's line as a run waits (section 4.12). A lease
- * has no end but its release. */
+/* `(lease (ch n) (count N) (for S) (kind K) (members NAMES) (pool P)
+ * (wait S)?)`: N slots of P held as a lease, those NAMES lists, comma
+ * between them, and the rest what fills first, of kind K, any, board or
+ * slot; answered with its id, or waited for in P's line as a run waits
+ * (section 4.12). It ends S seconds after it is given, or with S 0 at its
+ * release alone. */
 static void handle_lease_ask(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
 	static hull_pool   p;
@@ -4325,6 +4330,7 @@ static void handle_lease_ask(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	char               kind[8];
 	char               names[HULL_POOL_MEMBERS * 64u];
 	long long          count = 0;
+	long long          lasts = 0;
 	long long          wait = -1;
 	long long          since = admitting != 0 ? admitting : monotonic_ms() + 1;
 	unsigned           picked_count = 0u;
@@ -4334,6 +4340,7 @@ static void handle_lease_ask(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	if (!hull_msg_find(body, "pool", &value) || !hull_msg_string(body, &value, pool, sizeof pool) ||
 	    !is_label(pool) || !hull_msg_find(body, "count", &value) ||
 	    !hull_msg_long(body, &value, &count) || count < 1 || count > 65535 ||
+	    !hull_msg_find(body, "for", &value) || !hull_msg_long(body, &value, &lasts) || lasts < 0 ||
 	    !hull_msg_find(body, "kind", &value) || !hull_msg_string(body, &value, kind, sizeof kind) ||
 	    !hull_msg_find(body, "members", &value) ||
 	    !hull_msg_string(body, &value, names, sizeof names)) {
@@ -4397,6 +4404,7 @@ static void handle_lease_ask(client *c, uint32_t ch, const hull_sexpr_doc *body)
 			random_id = (uint32_t)getpid() ^ (uint32_t)monotonic_ms();
 		*l = (lease){ .used = 1, .count = (unsigned)count, .held_count = picked_count };
 		memcpy(l->held, picked, picked_count * sizeof picked[0]);
+		l->until = lasts > 0 ? (long long)time(NULL) + lasts : 0;
 		snprintf(l->id, sizeof l->id, "lease-%08x", random_id);
 		snprintf(l->pool, sizeof l->pool, "%s", pool);
 		if (save_lease(l) != 0) {
@@ -4413,36 +4421,61 @@ static void handle_lease_ask(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	}
 }
 
-/* `(free (ch n) (id ID))`: the lease ended by its holder, its machines
- * stopped first, each counted against its pool until it has gone. */
+/* A lease over, by its holder or its time: its machines stopped, each
+ * counted against its pool until it has gone, told why on its stderr and
+ * ending 79, which a pipeline can tell from its workload's (section 4.12). */
+static void end_lease(lease *l, const char *why)
+{
+	char path[4300];
+
+	for (unsigned i = 0u; i < MAX_MACHINES; i++) {
+		slot *s = &machines[i];
+
+		if (s->used && strcmp(s->lease, l->id) == 0) {
+			s->lease[0] = '\0';
+			if (!s->exited) {
+				char line[120];
+				int  n = snprintf(line, sizeof line, "hull: lease %s ended: %s\n", l->id, why);
+
+				if (n > 0)
+					keep_log(s, 2, (const uint8_t *)line, (size_t)n);  /* its followers read it there */
+				s->lease_ended = 1;
+				stop_machine(s, s->stop_ms);
+			}
+		}
+	}
+	snprintf(path, sizeof path, "%s/%s", lease_dir, l->id);
+	unlink(path);
+	*l = (lease){ 0 };
+}
+
+/* Each lease whose time has come. */
+static void end_leases_due(void)
+{
+	long long now = (long long)time(NULL);
+
+	for (unsigned i = 0u; i < MAX_LEASES; i++)
+		if (leases[i].used && leases[i].until != 0 && now >= leases[i].until)
+			end_lease(&leases[i], "its time ran out");
+}
+
+/* `(free (ch n) (id ID))`: the lease ended by its holder. */
 static void handle_free(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
 	hull_sexpr_form value;
 	char            id[24];
 	lease          *l;
-	char            path[4300];
 
 	if (!hull_msg_find(body, "id", &value) || !hull_msg_string(body, &value, id, sizeof id) ||
 	    (l = find_lease(id)) == NULL) {
 		send_error(c, ch, "no such lease is held");
 		return;
 	}
-	for (unsigned i = 0u; i < MAX_MACHINES; i++) {
-		slot *s = &machines[i];
-
-		if (s->used && strcmp(s->lease, id) == 0) {
-			s->lease[0] = '\0';
-			if (!s->exited)
-				stop_machine(s, s->stop_ms);
-		}
-	}
-	snprintf(path, sizeof path, "%s/%s", lease_dir, id);
-	unlink(path);
-	*l = (lease){ 0 };
+	end_lease(l, "released");
 	send_simple(c, "(4:done", ch);
 }
 
-/* `(leases (ch n))`: each lease, `(lease (count N) (id ID) (machines N)
+/* `(leases (ch n))`: each lease, `(lease (count N) (ends T) (id ID) (machines N)
  * (pool P))`. */
 static void handle_leases(client *c, uint32_t ch)
 {
@@ -4455,6 +4488,8 @@ static void handle_leases(client *c, uint32_t ch)
 			continue;
 		hull_msg_raw(&m, "(5:lease(5:count");
 		hull_msg_number(&m, leases[i].count);
+		hull_msg_raw(&m, ")(4:ends");
+		hull_msg_number(&m, leases[i].until);
 		hull_msg_raw(&m, ")(2:id");
 		hull_msg_text(&m, leases[i].id);
 		hull_msg_raw(&m, ")(8:machines");
@@ -5116,6 +5151,7 @@ int hull_core_run(const char *host_arch)
 				fds[n++]  = (struct pollfd){ clients[i].wire.fd, events, 0 };
 			}
 		}
+		end_leases_due();
 		admit_waiting();
 		busy = any_clients() || running_machines();
 		if (!busy) {

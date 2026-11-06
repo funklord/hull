@@ -184,13 +184,15 @@ struct stop {
 
 // A lease of `count` slots of a pool (section 4.12), those `members` lists
 // by name, a comma between them, the rest what fills first of `kind`: any,
-// board or slot. Waited for as a run waits, `(wait N)` seconds, 0 not at
-// all; answered `lease`, its id.
+// board or slot. It lasts `for` seconds, 0 until released. Waited for as a
+// run waits, `(wait N)` seconds, 0 not at all; answered `lease`, its id.
 struct lease_ask {
 	preamble u8[7] = "5:lease";
 	channel  ch;
 	preamble u8[8] = "(5:count";
 	atom  count;
+	preamble u8[7] = ")(3:for";
+	atom  lasts;
 	preamble u8[8] = ")(4:kind";
 	atom  kind;
 	preamble u8[11] = ")(7:members";
@@ -633,7 +635,7 @@ struct leased {
 	preamble u8[2] = "))";
 }
 
-// `leases`' answer: each lease, its id, pool, count and machines, framed.
+// `leases`' answer: each lease, its id, pool, count, end and machines, framed.
 struct leases {
 	preamble u8[8] = "6:leases";
 	channel  ch;

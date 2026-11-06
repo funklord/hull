@@ -127,7 +127,7 @@ static void usage(FILE *out)
 	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [--wait D|--no-wait]\n"
 	      "                [--lease ID] [NAME]\n"
 	      "       hull reserve POOL [--count N] [--member NAME]... [--kind board|slot]\n"
-	      "                    [--wait D|--no-wait] | hull release ID\n"
+	      "                    [--for D] [--wait D|--no-wait] | hull release ID\n"
 	      "       hull pool ls [POOL] | hull lease ls\n"
 	      "       hull pack DIR|REF FILE | hull unpack FILE|- DIR\n"
 	      "       hull export --bootable DIR|REF IMAGE [--init PATH | --host TTY]\n"
@@ -4873,7 +4873,7 @@ static int ask_core(hull_wire *wire, hull_msg *m, hull_sexpr_doc *body, int *sta
 }
 
 /* `hull reserve POOL [--count N] [--member NAME]... [--kind board|slot]
- * [--wait D|--no-wait]`: a lease's id, alone on stdout, so that
+ * [--for D] [--wait D|--no-wait]`: a lease's id, alone on stdout, so that
  * `lease=$(hull reserve ci)` takes it. Its count is what it names, or 1,
  * unless it says; what is not named is what fills first. */
 static int reserve(int argc, char **argv)
@@ -4884,6 +4884,7 @@ static int reserve(int argc, char **argv)
 	hull_msg        m = { 0 };
 	const char     *pool = NULL;
 	long long       count = 0;
+	long long       lasts = 0;
 	long long       wait = -1;
 	int             status = 0;
 	char            id[64] = "";
@@ -4906,6 +4907,8 @@ static int reserve(int argc, char **argv)
 			if (!bad)
 				names_at += (size_t)n;
 			named++;
+		} else if (strcmp(argv[i], "--for") == 0 && i + 1 < argc) {
+			bad |= (lasts = seconds_of(argv[++i])) <= 0;
 		} else if (strcmp(argv[i], "--kind") == 0 && i + 1 < argc) {
 			kind = argv[++i];
 			bad |= strcmp(kind, "board") != 0 && strcmp(kind, "slot") != 0;
@@ -4928,6 +4931,8 @@ static int reserve(int argc, char **argv)
 	hull_msg_channel(&m, 1u);
 	hull_msg_raw(&m, "(5:count");
 	hull_msg_number(&m, count);
+	hull_msg_raw(&m, ")(3:for");
+	hull_msg_number(&m, lasts);
 	hull_msg_raw(&m, ")(4:kind");
 	hull_msg_text(&m, kind);
 	hull_msg_raw(&m, ")(7:members");
@@ -4980,8 +4985,8 @@ static int release(const char *id)
  * fixed, a header first, as `hull ps` prints. */
 static int list_of(int pools)
 {
-	static const char *const lease_keys[] = { "id", "pool", "count", "machines" };
-	static const char *const pool_keys[]  = { "name", "capacity", "held", "waiting" };
+	static const char *const lease_keys[] = { "id", "pool", "count", "machines", "ends" };
+	static const char *const pool_keys[]  = { "name", "capacity", "held", "waiting", "" };
 	const char *const       *keys = pools ? pool_keys : lease_keys;
 	hull_wire                wire;
 	hull_sexpr_doc           body;
@@ -4996,7 +5001,7 @@ static int list_of(int pools)
 	if (pools)
 		printf("%-24s %-9s %-6s %s\n", "POOL", "CAPACITY", "HELD", "WAITING");
 	else
-		printf("%-24s %-24s %-6s %s\n", "ID", "POOL", "COUNT", "MACHINES");
+		printf("%-24s %-24s %-6s %-9s %s\n", "ID", "POOL", "COUNT", "MACHINES", "ENDS");
 	/* The core is started to say: a lease outlives the core that made
 	 * it, kept in hull/leases/, and the next one reads it back. */
 	if (ask_core(&wire, &m, &body, &status, 1) != 0)
@@ -5004,13 +5009,16 @@ static int list_of(int pools)
 	hull_sexpr_first(&body, &message);
 	hull_sexpr_child(&body, &message, &item);
 	while (hull_sexpr_next(&body, &item, &item)) {
-		char            values[4][64] = { "", "", "", "" };
+		char            values[5][64] = { "", "", "", "", "" };
+		char            ends[32] = "-";
+		time_t          at;
+		struct tm       utc;
 		hull_sexpr_form head;
 
 		if (item.kind != HULL_SEXPR_LIST || !hull_sexpr_child(&body, &item, &head) ||
 		    !hull_sexpr_is(&body, &head, pools ? "pool" : "lease"))
 			continue;
-		for (unsigned k = 0u; k < 4u; k++) {
+		for (unsigned k = 0u; k < 5u; k++) {
 			hull_sexpr_form value;
 
 			if (hull_access_find(&body, &item, keys[k], &value)) {
@@ -5023,8 +5031,12 @@ static int list_of(int pools)
 		}
 		if (pools)
 			printf("%-24s %-9s %-6s %s\n", values[0], values[1], values[2], values[3]);
-		else
-			printf("%-24s %-24s %-6s %s\n", values[0], values[1], values[2], values[3]);
+		else {
+			at = (time_t)strtoll(values[4], NULL, 10);
+			if (at != 0 && gmtime_r(&at, &utc) != NULL)
+				strftime(ends, sizeof ends, "%Y-%m-%dT%H:%M:%SZ", &utc);
+			printf("%-24s %-24s %-6s %-9s %s\n", values[0], values[1], values[2], values[3], ends);
+		}
 	}
 	hull_wire_close(&wire);
 	return 0;
