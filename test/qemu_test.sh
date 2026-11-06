@@ -24,7 +24,7 @@ XDG_DATA_HOME=$(cd "${BUILD_DIR:?}" && pwd)/test/qemu/data
 export XDG_DATA_HOME
 export HULL_CORE_IDLE=1
 mkdir -p "$XDG_RUNTIME_DIR" "$dir/rootfs/proc" "$dir/rootfs/dev" "$dir/rootfs/sys" \
-	"$dir/rootfs/srv" "$dir/rootfs/etc" "$dir/data"
+	"$dir/rootfs/srv" "$dir/rootfs/etc" "$dir/rootfs/scratch" "$dir/data"
 chmod 700 "$XDG_RUNTIME_DIR"
 cp "$probe" "$dir/rootfs/probe"
 # A resolver no machine can reach, which the agent's must cover.
@@ -265,6 +265,11 @@ for class in vm emu; do
 	name="user$class"
 	boot "user$class" 120
 	has 0 '^uid=4321$'
+	conf "tmpfs$class" "(backend $class) (command \"/probe\" \"write\" \"/scratch/x\")" \
+		'(tmpfs "/scratch") (security (readonly_root true))'
+	name="tmpfs$class"
+	boot "tmpfs$class" 120
+	has 0 '^write=ok$'
 done
 
 conf suid '(backend vm) (command "/suid" "uid" "euid" "owner" "/suid")'

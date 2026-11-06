@@ -770,6 +770,7 @@ static const key machine_keys[] = {
 	{ .name = "pool",          .type = STRING, .value = label },
 	{ .name = "display",       .type = CHOICE, .choices = display_values },
 	{ .name = "user",          .type = STRING, .value = nonempty },
+	{ .name = "tmpfs",         .type = STRINGS, .value = absolute },
 };
 static hull_spec_status machine_across(walk *w, const hull_sexpr_form *record,
                                        const hull_sexpr_form *found, uint64_t present);

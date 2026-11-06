@@ -1242,6 +1242,27 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	 * own: PID 1 ignores a signal it has no handler for, so a workload
 	 * there would sit through stop's SIGTERM, and nothing would reap. */
 	add_text(&body, ",\"HostConfig\":{\"Init\":true,\"CapDrop\":[\"ALL\"]");
+	if (hull_access_find(doc, machine, "tmpfs", &entry)) {
+		hull_sexpr_form path;
+		int             more;
+		int             first = 1;
+
+		add_text(&body, ",\"Tmpfs\":{");
+		hull_sexpr_child(doc, &entry, &path);
+		for (more = hull_sexpr_next(doc, &path, &path); more;
+		     more = hull_sexpr_next(doc, &path, &path)) {
+			char *text_ = hull_access_text(doc, &path);
+
+			if (text_ == NULL)
+				continue;
+			add_text(&body, first ? "" : ",");
+			add_json(&body, text_);
+			add_text(&body, ":\"\"");
+			first = 0;
+			free(text_);
+		}
+		add_text(&body, "}");
+	}
 	{
 		hull_sexpr_form allow;
 		hull_sexpr_form item;
@@ -4137,6 +4158,7 @@ static const hull_cap_entry entries[] = {
 	{ "command",            HULL_SUP_NATIVE,   NULL, NULL },
 	{ "workdir",            HULL_SUP_NATIVE,   NULL, NULL },
 	{ "user",               HULL_SUP_NATIVE,   NULL, NULL },
+	{ "tmpfs",              HULL_SUP_NATIVE,   NULL, NULL },
 	{ "env",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "network.host",       HULL_SUP_NATIVE,   NULL, NULL },
 	{ "network.nat",        HULL_SUP_NATIVE,   "docker's own bridge, as no network key gives", NULL },

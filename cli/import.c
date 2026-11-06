@@ -888,6 +888,8 @@ typedef struct svc {
 	char memory[32];       /* from mem_limit: */
 	char cpus[16];         /* from cpus:, a whole number */
 	char user[128];        /* from user: */
+	sb   tmpfs;            /* from tmpfs:, each path quoted */
+	int  read_only;        /* from read_only: */
 	hull_build_arg build_arg[HULL_MAX_BUILD_ARGS];
 	unsigned build_arg_count;
 	int  args_indent;      /* where build's args: key is, or -1 */
@@ -1192,6 +1194,23 @@ static void compose_volume(svc *s, char *spec)
 	sb_str(&s->volumes, ")");
 }
 
+/* `/path` or `/path:size=64m`: the path; its options said and left. */
+static void compose_tmpfs(svc *s, char *spec)
+{
+	char *options = strchr(spec, ':');
+
+	if (options != NULL) {
+		*options = '\0';
+		svc_note(s, "tmpfs options not translated", options + 1);
+	}
+	if (spec[0] != '/') {
+		svc_note(s, "tmpfs not translated", spec);
+		return;
+	}
+	sb_str(&s->tmpfs, " ");
+	sb_quoted(&s->tmpfs, spec);
+}
+
 static void svc_reset(svc *s)
 {
 	free(s->after.data);
@@ -1201,6 +1220,7 @@ static void svc_reset(svc *s)
 	free(s->volumes.data);
 	free(s->notes.data);
 	free(s->file_env.data);
+	free(s->tmpfs.data);
 	memset(s, 0, sizeof *s);
 	s->dep_indent  = -1;
 	s->args_indent = -1;
@@ -1454,6 +1474,13 @@ static void svc_flush(svc *s, sb *out)
 	if (s->memory[0] != '\0') {
 		sb_str(out, " (memory ");
 		sb_quoted(out, s->memory);
+		sb_str(out, ")");
+	}
+	if (s->read_only)
+		sb_str(out, " (security (readonly_root true))");
+	if (s->tmpfs.data != NULL) {
+		sb_str(out, " (tmpfs");
+		sb_str(out, s->tmpfs.data);
 		sb_str(out, ")");
 	}
 	if (s->user[0] != '\0') {
@@ -2065,6 +2092,8 @@ static char *compose_text(FILE *file, const char *project)
 				svc_build_arg(&s, item, '=');
 			else if (strcmp(field, "env_file") == 0)
 				compose_env_file(&s, scalar(item));
+			else if (strcmp(field, "tmpfs") == 0)
+				compose_tmpfs(&s, scalar(item));
 			else if (strcmp(field, "profiles") == 0 && s.profile_count < 8)
 				snprintf(s.profile[s.profile_count++], sizeof s.profile[0], "%s", scalar(item));
 			continue;
@@ -2200,7 +2229,7 @@ static char *compose_text(FILE *file, const char *project)
 			 * under: another goes unread, and is said. */
 			static const char *const blocks[] = {
 				"environment", "ports", "volumes", "command", "entrypoint", "networks",
-				"depends_on", "healthcheck", "build", "profiles", "env_file", NULL
+				"depends_on", "healthcheck", "build", "profiles", "env_file", "tmpfs", NULL
 			};
 			int known = 0;
 
@@ -2301,6 +2330,16 @@ static char *compose_text(FILE *file, const char *project)
 				svc_note(&s, "cpus of a fraction not translated", text);
 		} else if (strcmp(key, "user") == 0) {
 			snprintf(s.user, sizeof s.user, "%s", scalar(value));
+		} else if (strcmp(key, "tmpfs") == 0) {
+			compose_tmpfs(&s, scalar(value));
+		} else if (strcmp(key, "read_only") == 0) {
+			s.read_only = strcmp(scalar(value), "true") == 0;
+		} else if (strcmp(key, "init") == 0 || strcmp(key, "expose") == 0) {
+			/* Said by every machine already: a PID 1 that reaps, on every
+			 * engine, and an EXPOSE that publishes nothing. */
+		} else if (strcmp(key, "privileged") == 0) {
+			if (strcmp(scalar(value), "false") != 0)
+				svc_note(&s, "privileged not translated", scalar(value));
 		} else if (strcmp(key, "network_mode") == 0) {
 			/* bridge is docker's own network, which hull's nat names on
 			 * every engine; host and none are hull's as they are. Another

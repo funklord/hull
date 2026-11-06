@@ -93,6 +93,9 @@ expect 3 "^uid=$(id -u):$(id -g)\$" run
 # (user ...) is the daemon's User, its root refused as the host's.
 conf asuser '(command "sh" "-c" "echo uid=$(id -u):$(id -g)") (user "4321:4322")'
 expect 0 '^uid=4321:4322$' run -f "$root/asuser.conf"
+conf tmpfsro '(command "sh" "-c" "echo x > /scratch/x && cat /scratch/x") (tmpfs "/scratch")' \
+	'(security (readonly_root true))'
+expect 0 '^x$' run -f "$root/tmpfsro.conf"
 conf asroot '(command "true") (user "root")'
 expect 125 'a container.s root is the host.s' run -f "$root/asroot.conf"
 cases=$((cases + 1))

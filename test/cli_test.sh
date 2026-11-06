@@ -242,6 +242,29 @@ expect 0 '\(memory "256M"\) \(cpus 2\)' "$hull" import "$dir/vars/compose.yaml"
 expect 0 '; key not translated: labels' "$hull" import "$dir/vars/compose.yaml"
 printf 'services:\n  web:\n    image: alpine\n    user: "1000:1000"\n' > "$dir/vars/user.yaml"
 expect 0 '\(user "1000:1000"\)' "$hull" import "$dir/vars/user.yaml"
+cat > "$dir/vars/ro.yaml" <<'COMPOSE'
+services:
+  web:
+    image: alpine
+    read_only: true
+    init: true
+    privileged: false
+    expose: ["8080"]
+    tmpfs:
+      - /run
+      - /tmp:size=64m
+  one:
+    image: alpine
+    tmpfs: /cache
+    privileged: true
+COMPOSE
+expect 0 '\(security \(readonly_root true\)\) \(tmpfs "/run" "/tmp"\)' "$hull" import "$dir/vars/ro.yaml"
+expect 0 '\(tmpfs "/cache"\)' "$hull" import "$dir/vars/ro.yaml"
+expect 0 '; tmpfs options not translated: size=64m' "$hull" import "$dir/vars/ro.yaml"
+expect 0 '; privileged not translated: true' "$hull" import "$dir/vars/ro.yaml"
+cases=$((cases + 1))
+"$hull" import "$dir/vars/ro.yaml" | grep -Eq 'key not translated: (init|expose|privileged|read_only|tmpfs)' &&
+	fail 'a key with a home is said to have none' "$("$hull" import "$dir/vars/ro.yaml")"
 cases=$((cases + 1))
 "$hull" import "$dir/vars/compose.yaml" | grep -q 'lost' &&
 	fail 'environment wins over env_file' "$("$hull" import "$dir/vars/compose.yaml")"
@@ -2333,6 +2356,21 @@ done
 expect 0 '^uid=4321$' "$hull" exec asapp -- /probe uid
 "$hull" stop asapp > /dev/null 2>&1
 wait "$pid"
+# (tmpfs ...): a path a read-only root can write, and nothing left behind it.
+mkdir -p "$root/userfs/scratch"
+user_conf tmpfsro '(command "/probe" "write" "/scratch/x") (tmpfs "/scratch")' \
+	'(security (readonly_root true)) (mutable direct)'
+sed -i 's/ (mutable overlay)//' "$root/tmpfsro.conf"
+from_root 0 '^write=ok$' -f "$root/tmpfsro.conf"
+cases=$((cases + 1))
+[ ! -e "$root/userfs/scratch/x" ] || fail 'a tmpfs wrote through to the tree' ''
+user_conf tmpfsmade '(command "/probe" "write" "/made/deep/x") (tmpfs "/made/deep")'
+from_root 0 '^write=ok$' -f "$root/tmpfsmade.conf"
+cases=$((cases + 1))
+[ ! -e "$root/userfs/made" ] || fail 'a path made above an overlay reached the tree' ''
+user_conf tmpfsgone '(mutable direct) (command "/probe" "say" "no") (tmpfs "/notthere")'
+sed -i 's/ (mutable overlay)//' "$root/tmpfsgone.conf"
+from_root 125 'notthere' -f "$root/tmpfsgone.conf"
 printf '(machine (source "dir:./rootfs") (backend dos) (command "HELLO") (user "app"))\n' > "$root/userdos.conf"
 expect 1 'user: rejected' "$hull" plan -f "$root/userdos.conf"
 sleep 2

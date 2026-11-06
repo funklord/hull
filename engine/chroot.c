@@ -113,11 +113,15 @@ typedef struct frame {
 	uint32_t length;
 } frame;
 
+#define MAX_TMPFS 16u
+
 struct hull_machine {
 	hull_core       *core;       /* what create() was given, for the callbacks */
 	char            *root;       /* the dir source, without "dir:" */
 	char            *workdir;
 	char            *user;     /* (user ...), or NULL for the machine's root */
+	char            *tmpfs[MAX_TMPFS];  /* (tmpfs ...), each a path in the machine */
+	unsigned         tmpfs_count;
 	char            *hostname;   /* or NULL */
 	char            *init;       /* (init PATH): the image's init, PID 1 once handed to */
 	char             binfmt[400]; /* a foreign arch's binfmt_misc registration, or "" */
@@ -201,6 +205,8 @@ static void release(hull_machine *m)
 	free(m->root);
 	free(m->workdir);
 	free(m->user);
+	for (unsigned i = 0u; i < m->tmpfs_count; i++)
+		free(m->tmpfs[i]);
 	free(m->hostname);
 	free(m->init);
 	free(m->secrets);
@@ -304,6 +310,16 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		return "the plan is missing its source or workdir";
 	if (m->user != NULL && m->init != NULL)
 		return "(user ...) is whom a command runs as; an (init ...) starts its own";
+	if (hull_access_find(doc, &machine, "tmpfs", &entry)) {
+		hull_sexpr_child(doc, &entry, &item);
+		for (more = hull_sexpr_next(doc, &item, &item); more;
+		     more = hull_sexpr_next(doc, &item, &item)) {
+			if (m->tmpfs_count == MAX_TMPFS)
+				return "the machine has too many tmpfs paths";
+			if ((m->tmpfs[m->tmpfs_count++] = hull_access_text(doc, &item)) == NULL)
+				return "a tmpfs path holds a NUL byte";
+		}
+	}
 	{
 		char       *arch = hull_access_value(doc, &machine, "arch");
 		const char *why  = foreign_arch(m, arch);
@@ -2294,6 +2310,15 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	 * the dir's /run, which FHS has emptied at every boot, is hidden, and
 	 * nothing is created in the user's dir. A dir with no /run cannot
 	 * have them. */
+	/* Its (tmpfs ...), as docker's: anyone's to write, and gone with it. The
+	 * path is made above an overlay alone, as a volume's: never in the user's
+	 * own tree. */
+	for (unsigned i = 0u; i < m->tmpfs_count; i++) {
+		if (m->overlay && make_path(m->tmpfs[i]) != 0)
+			child_fail(report, m->tmpfs[i]);
+		if (mount("tmpfs", m->tmpfs[i], "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777") != 0)
+			child_fail(report, m->tmpfs[i]);
+	}
 	if (secrets >= 0 || ssh_tree >= 0) {
 		/* A tmpfs at /run for the material, hiding the dir's own /run (FHS
 		 * empties it each boot); a dir with no /run cannot have either. */
@@ -4243,6 +4268,7 @@ static const hull_cap_entry entries[] = {
 	{ "command",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "workdir",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "user",                   HULL_SUP_NATIVE,   NULL, NULL },
+	{ "tmpfs",                  HULL_SUP_NATIVE,   NULL, NULL },
 	{ "env",                    HULL_SUP_NATIVE,   "the environment is what env names, and docker's default PATH where it names none",
 	  NULL },
 	{ "hostname",               HULL_SUP_NATIVE,   NULL, NULL },

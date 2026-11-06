@@ -1511,6 +1511,29 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 		else
 			run_made = 1;
 	}
+	if (hull_access_find(doc, machine, "tmpfs", &entry)) {
+		hull_sexpr_child(doc, &entry, &item);
+		for (more = hull_sexpr_next(doc, &item, &item); more;
+		     more = hull_sexpr_next(doc, &item, &item)) {
+			char  at[4200];
+			char *path = hull_access_text(doc, &item);
+
+			if (path == NULL || path[0] != '/' || strstr(path, "..") != NULL) {
+				free(path);
+				return "a tmpfs path is not one the agent mounts";
+			}
+			snprintf(at, sizeof at, "/machine%s", path);
+			free(path);
+			make_path(at);
+			if (mount("tmpfs", at, "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777") != 0) {
+				static char reason_[4400];
+
+				snprintf(reason_, sizeof reason_, "a tmpfs could not be mounted at %s: %s",
+				         at + strlen("/machine"), strerror(errno));
+				return reason_;
+			}
+		}
+	}
 	if (secrets != NULL && (reason = place_secrets(doc, machine, secrets, &n)) != NULL)
 		return reason;
 	ssh_enabled = hull_access_true(doc, machine, "ssh");
