@@ -4610,6 +4610,7 @@ static int vagrant_builds(const options *o, const hull_registry *registry)
  * machines a core that went kept for it. */
 /* The engine of the machine list_machines() was last asked for. */
 static char listed_engine[64];
+static char listed_board[320];  /* "[LOGIN@]ADDRESS PORT", a board's, or "" */
 
 /* `hull ps`; or with `want`, nothing printed, and that machine's arch
  * into `arch`, "" where it says none, the host's: 0 where it is listed. */
@@ -4641,14 +4642,14 @@ static int list_machines(const char *want, char *arch, size_t cap)
 	hull_sexpr_child(&body, &message, &item);
 	for (more = hull_sexpr_next(&body, &item, &item); more;
 	     more = hull_sexpr_next(&body, &item, &item)) {
-		const char *keys[] = { "id", "address", "engine", "class", "state", "root", "arch" };
-		char        values[7][64] = { "", "", "", "", "", "", "" };
+		const char *keys[] = { "id", "address", "engine", "class", "state", "root", "arch", "board" };
+		char        values[8][320] = { "", "", "", "", "", "", "", "" };
 		hull_sexpr_form head;
 
 		hull_sexpr_child(&body, &item, &head);
 		if (!hull_sexpr_is(&body, &head, "machine"))
 			continue;
-		for (unsigned k = 0u; k < 7u; k++) {
+		for (unsigned k = 0u; k < 8u; k++) {
 			hull_sexpr_form entry;
 			hull_sexpr_form name;
 			hull_sexpr_form value;
@@ -4665,8 +4666,9 @@ static int list_machines(const char *want, char *arch, size_t cap)
 		if (want != NULL) {
 			if (strcmp(values[0], want) != 0)
 				continue;
-			snprintf(arch, cap, "%s", values[6]);
-			snprintf(listed_engine, sizeof listed_engine, "%s", values[2]);
+			snprintf(arch, cap, "%.63s", values[6]);
+			snprintf(listed_engine, sizeof listed_engine, "%.63s", values[2]);
+			snprintf(listed_board, sizeof listed_board, "%s", values[7]);
 			hull_wire_close(&wire);
 			return 0;
 		}
@@ -6378,6 +6380,42 @@ static int machine_sshd_open(const char *id)
 	return open;
 }
 
+/*
+ * A board's own sshd, by the user's own ssh, as `hull run` reaches it: the
+ * key met is the board's, judged by the user's known_hosts under the
+ * board's address, which hull's own ssh to the board needed already. The
+ * machine's kept host key, from a run on another backend, is no part of it.
+ * Its exit, or -1 where ssh cannot be started.
+ */
+static int ssh_board(void)
+{
+	char  target[sizeof listed_board];
+	char *port;
+	char *argv[5];
+	pid_t child;
+	int   status;
+
+	snprintf(target, sizeof target, "%s", listed_board);
+	if ((port = strrchr(target, ' ')) == NULL)
+		return -1;
+	*port++ = '\0';
+	argv[0] = "ssh";
+	argv[1] = "-p";
+	argv[2] = port;
+	argv[3] = target;
+	argv[4] = NULL;
+	child = fork();
+	if (child == 0) {
+		execvp("ssh", argv);
+		_exit(127);
+	}
+	if (child < 0 || waitpid(child, &status, 0) != child)
+		return -1;
+	if (WIFEXITED(status) && WEXITSTATUS(status) == 127)
+		return -1;
+	return WIFEXITED(status) ? WEXITSTATUS(status) : 125;
+}
+
 static int ssh_into(const char *id)
 {
 	const char *term = getenv("TERM");
@@ -6402,6 +6440,8 @@ static int ssh_into(const char *id)
 
 		list_machines(id, arch, sizeof arch);
 	}
+	if (listed_board[0] != '\0' && (rc = ssh_board()) >= 0)
+		return rc;
 	if (machine_sshd_open(id)) {
 		if ((rc = ssh_client(id, machine_host_pub(id, pub, sizeof pub) ? pub : NULL)) >= 0)
 			return rc;

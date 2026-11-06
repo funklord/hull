@@ -555,6 +555,8 @@ and exit status the machine's, then the tree removed and the power off. A
 board that does not answer is power cycled; one that still fails is marked
 broken and leaves the pool until `hull board fix NAME`. `hull board ls POOL`
 says which are up. `hull exec` and `hull stop` reach the command on the board.
+`(ssh true)` is the board's own sshd and its own host key: `hull ssh` logs in
+to the board, and another board of the pool is another key.
 
 **When you want it:** a test that has to meet real hardware, or a run on a
 machine you already have, with the same file you use on a vm.

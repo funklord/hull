@@ -241,6 +241,58 @@ expect 0 'through the port' cat "$root/served.out"
 cases=$((cases + 1))
 ! ps -eo args= | grep -F -- "$address:$hostport" | grep -qv grep || fail 'its forward went with the run' ''
 
+# --- (ssh true): the board's sshd, and the board's key ------------------------
+
+# ssh strict here, a known_hosts of the test's own, which the wrapper above
+# is not: this is the one place the key is the point. The key is held under
+# the board's address, as hull's own ssh to the board needs it, and a stale
+# host key of the machine's, from a run on another backend, is planted to be
+# passed over.
+mkdir -p "$root/strict" "$root/data/hull/machines/door"
+ssh-keygen -q -t ed25519 -N '' -f "$root/otherkey"
+cp "$root/otherkey.pub" "$root/data/hull/machines/door/host_key.pub"
+cat > "$root/strict/ssh" <<WRAP
+#!/bin/sh
+exec "$real_ssh" -i "$root/userkey" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+	-o GlobalKnownHostsFile=/dev/null -o UserKnownHostsFile="$root/known" -o LogLevel=ERROR "\$@"
+WRAP
+chmod +x "$root/strict/ssh"
+printf '[127.0.0.1]:%s %s\ndoor.hull %s\n' "$port" "$(cut -d' ' -f1,2 "$root/hostkey.pub")" \
+	"$(cut -d' ' -f1,2 "$root/hostkey.pub")" > "$root/known"
+conf door '(backend hw) (pool "bench") (hostname "door") (ssh true) (command "/probe" "sleep" "25")'
+expect 0 'ssh +true|emulated' "$hull" plan -f "$root/project/door.conf"
+timeout 40 "$hull" run -f "$root/project/door.conf" > "$root/door.out" 2>&1 &
+pid=$!
+n=0
+state=
+while [ "$n" -lt 100 ] && [ "$state" != running ]; do
+	state=$("$hull" ps 2> /dev/null | awk '$1 == "door" { print $5 }')
+	sleep 0.2
+	n=$((n + 1))
+done
+# Into the board: `hull ssh`, a shell whose answer only a login there gives.
+out=$( (printf 'echo door-$((6 * 7)); exit\n'; sleep 3) | PATH=$root/strict:$PATH timeout 15 \
+	script -qec "$hull ssh door" /dev/null 2>&1 | tr -d '\r')
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q 'door-42$' || fail 'hull ssh reached the board on its own key' "$out"
+# The same, the key a stranger's: refused, and no shell fallen back to.
+cp "$root/known" "$root/known.good"
+printf '[127.0.0.1]:%s %s\n' "$port" "$(cut -d' ' -f1,2 "$root/otherkey.pub")" > "$root/known"
+out=$( (printf 'echo door-$((6 * 7)); exit\n'; sleep 2) | PATH=$root/strict:$PATH timeout 15 \
+	script -qec "$hull ssh door" /dev/null 2>&1 | tr -d '\r')
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q 'Host key verification failed\|REMOTE HOST IDENTIFICATION' &&
+	! printf '%s\n' "$out" | grep -q 'door-42$' || fail 'a known_hosts holding another key was refused' "$out"
+cp "$root/known.good" "$root/known"
+# `ssh door.hull`, by the ProxyCommand, its key under that name.
+out=$(PATH=$root/strict:$PATH timeout 15 ssh -o ProxyCommand="$hull proxy-ssh %h" door.hull 'echo door-$((6 * 7))' 2>&1)
+cases=$((cases + 1))
+[ "$out" = door-42 ] || fail 'ssh door.hull reached the board' "$out"
+cases=$((cases + 1))
+[ ! -e "$root/data/hull/machines/door/host_key" ] || fail 'a host key was made for a board' ''
+timeout 20 "$hull" stop --timeout 1 door > /dev/null 2>&1
+wait "$pid"
+
 # --- recovery: cycled, then marked, and out of its pool -----------------------
 
 conf sick '(backend hw) (pool "sick") (command "/probe" "say" "never")'

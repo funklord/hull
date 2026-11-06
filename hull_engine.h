@@ -244,6 +244,13 @@ typedef struct hull_engine_ops {
 	 * own, as chroot's, sharing the host's network. Appended (rule 4). */
 	hull_status (*dial)(hull_core*, hull_machine*, uint16_t port, hull_stream**, hull_error*);
 
+	/* Where a machine's ssh is somebody else's, a board's: its target and
+	 * its port, "[LOGIN@]ADDRESS PORT", into `out`, for `hull ssh` to give
+	 * the user's own ssh, so that the key met is judged as any host's is.
+	 * 0, or -1 where the machine has none now. It does not block: the core
+	 * calls it on its loop. NULL elsewhere. Appended (rule 4). */
+	int (*login)(hull_machine*, char *out, size_t cap);
+
 	/* Every process of the machine stopped where it is, `paused` 1, or
 	 * let go on, 0: a peer gone to sleep mid-transfer. Its clock runs on
 	 * meanwhile, and its network stops answering. The core resumes a

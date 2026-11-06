@@ -67,6 +67,7 @@ struct hull_stream {
 struct hull_machine {
 	hull_core      *core;
 	hull_board      board;
+	int             on_board;     /* `board` is taken, for hw_login */
 	char           *pool;
 	char           *source;       /* the tree here */
 	char           *workdir;
@@ -757,6 +758,7 @@ static void *run_machine(void *arg)
 	__atomic_store_n(&m->stopping, 0, __ATOMIC_RELAXED);
 	end_console(m);
 	hook(m, m->board.power, "off");
+	__atomic_store_n(&m->on_board, 0, __ATOMIC_RELEASE);
 	give_board(&m->board);
 	pthread_mutex_lock(&m->lock);
 	m->done = 1;
@@ -905,6 +907,7 @@ static hull_status hw_create(hull_core *core, hull_buf plan, hull_machine **out,
 		release(m);
 		return fail(error, HULL_ERR_RUNTIME, why);
 	}
+	m->on_board = 1;
 	snprintf(m->tree, sizeof m->tree, "%s/%s", m->board.root, m->id);
 	*out = m;
 	return HULL_OK;
@@ -1197,6 +1200,17 @@ static hull_status hw_stream_close(hull_core *core, hull_stream *st, hull_error 
 	return HULL_OK;
 }
 
+/* The board's own target for `hull ssh`, while the machine holds one. */
+static int hw_login(hull_machine *m, char *out, size_t cap)
+{
+	const hull_board *board = &m->board;
+
+	if (!__atomic_load_n(&m->on_board, __ATOMIC_ACQUIRE))
+		return -1;
+	return snprintf(out, cap, "%s%s%s %u", board->login, board->login[0] != '\0' ? "@" : "",
+	                board->address, board->port) < (int)cap ? 0 : -1;
+}
+
 /* --- the engine ---------------------------------------------------------- */
 
 static const hull_cap_entry entries[] = {
@@ -1221,6 +1235,9 @@ static const hull_cap_entry entries[] = {
 	{ "on_disconnect.stop", HULL_SUP_NATIVE,   NULL, NULL },
 	{ "ports",              HULL_SUP_EMULATED,
 	  "ssh -L from the machine's address to the board's loopback, TCP alone", NULL },
+	{ "ssh",                HULL_SUP_EMULATED,
+	  "the board's own sshd and its own host key, judged by the user's known_hosts: the login "
+	  "is the board's, not the tree's, and another board of the pool is another key", NULL },
 	{ "stop_signal",        HULL_SUP_NATIVE,   NULL, NULL },
 	{ "stop_grace",         HULL_SUP_NATIVE,   NULL, NULL },
 	{ NULL, HULL_SUP_NATIVE, NULL, NULL },
@@ -1251,6 +1268,7 @@ static const hull_engine_ops ops = {
 	.stream_eof   = hw_stream_eof,
 	.stream_close = hw_stream_close,
 	.dial         = hw_dial,
+	.login        = hw_login,
 };
 
 static const hull_engine engine = {

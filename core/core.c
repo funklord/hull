@@ -2797,7 +2797,10 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		s->used = 0;
 		return;
 	}
-	if (hull_access_true(&plan_doc, &machine, "ssh")) {
+	/* A board's sshd and its key are its own, the holder's word: there is
+	 * nothing of the machine's to make for it (section 8.1). */
+	if (hull_access_true(&plan_doc, &machine, "ssh") &&
+	    strcmp(engine->caps->engine_name, "board") != 0) {
 		char        dir[4300];
 		const char *why = write_ssh(id, dir, sizeof dir);
 		uint8_t    *with = why == NULL ? with_ssh(&plan, dir, &addressed_length) : NULL;
@@ -3833,6 +3836,7 @@ static void handle_list(client *c, uint32_t ch)
 	hull_msg_channel(&m, ch);
 	for (unsigned i = 0u; i < MAX_MACHINES; i++) {
 		const slot *s = &machines[i];
+		char        login[320];
 
 		if (!s->used)
 			continue;
@@ -3841,6 +3845,12 @@ static void handle_list(client *c, uint32_t ch)
 		if (s->arch[0] != '\0') {
 			hull_msg_raw(&m, ")(4:arch");
 			hull_msg_text(&m, s->arch);
+		}
+		if (s->handle != NULL &&
+		    s->engine->ops->struct_size >= offsetof(hull_engine_ops, login) + sizeof s->engine->ops->login &&
+		    s->engine->ops->login != NULL && s->engine->ops->login(s->handle, login, sizeof login) == 0) {
+			hull_msg_raw(&m, ")(5:board");
+			hull_msg_text(&m, login);
 		}
 		hull_msg_raw(&m, ")(5:class");
 		hull_msg_text(&m, s->class_name);
