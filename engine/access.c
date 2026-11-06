@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <sys/resource.h>
 #include <arpa/inet.h>
 #include <string.h>
 #include <unistd.h>
@@ -680,4 +681,140 @@ int hull_access_signal(const char *name)
 		if (strcmp(signals[i].name, name) == 0)
 			return signals[i].number;
 	return 0;
+}
+
+int hull_access_strings(const hull_sexpr_doc *doc, const hull_sexpr_form *record, const char *key,
+                        char **out, unsigned cap)
+{
+	hull_sexpr_form entry;
+	hull_sexpr_form item;
+	unsigned        n = 0u;
+
+	if (!hull_access_find(doc, record, key, &entry) || !hull_sexpr_child(doc, &entry, &item))
+		return 0;
+	while (hull_sexpr_next(doc, &item, &item)) {
+		if (n == cap)
+			return -1;
+		if ((out[n] = hull_access_text(doc, &item)) == NULL)
+			return -1;
+		n++;
+	}
+	return (int)n;
+}
+
+int hull_access_limit(const char *text, int *resource, unsigned long long *soft,
+                      unsigned long long *hard)
+{
+	static const struct {
+		const char *name;
+		int         resource;
+	} limits[] = {
+		{ "core", RLIMIT_CORE }, { "cpu", RLIMIT_CPU }, { "data", RLIMIT_DATA },
+		{ "fsize", RLIMIT_FSIZE }, { "locks", RLIMIT_LOCKS }, { "memlock", RLIMIT_MEMLOCK },
+		{ "msgqueue", RLIMIT_MSGQUEUE }, { "nice", RLIMIT_NICE }, { "nofile", RLIMIT_NOFILE },
+		{ "nproc", RLIMIT_NPROC }, { "rss", RLIMIT_RSS }, { "rtprio", RLIMIT_RTPRIO },
+		{ "rttime", RLIMIT_RTTIME }, { "sigpending", RLIMIT_SIGPENDING },
+		{ "stack", RLIMIT_STACK }, { "as", RLIMIT_AS },
+	};
+	const char *equals = strchr(text, '=');
+	char       *end;
+
+	if (equals == NULL)
+		return -1;
+	*soft = strtoull(equals + 1, &end, 10);
+	*hard = *soft;
+	if (end == equals + 1)
+		return -1;
+	if (*end == ':') {
+		const char *rest = end + 1;
+
+		*hard = strtoull(rest, &end, 10);
+		if (end == rest)
+			return -1;
+	}
+	if (*end != '\0' || *soft > *hard)
+		return -1;
+	for (size_t i = 0u; i < sizeof limits / sizeof limits[0]; i++)
+		if (strlen(limits[i].name) == (size_t)(equals - text) &&
+		    strncmp(limits[i].name, text, (size_t)(equals - text)) == 0) {
+			*resource = limits[i].resource;
+			return 0;
+		}
+	return -1;
+}
+
+int hull_access_sysctl(const char *text, char *path, size_t cap, const char **value)
+{
+	const char *equals = strchr(text, '=');
+	size_t      at = (size_t)snprintf(path, cap, "/proc/sys/");
+
+	if (equals == NULL || equals == text || equals[1] == '\0' ||
+	    at + (size_t)(equals - text) + 1u > cap)
+		return -1;
+	for (const char *c = text; c < equals; c++) {
+		if (*c == '/' || (*c == '.' && (c == text || c[-1] == '.')))
+			return -1;
+		path[at++] = *c == '.' ? '/' : *c;
+	}
+	path[at] = '\0';
+	*value = equals + 1;
+	return 0;
+}
+
+char *hull_access_extra_hosts(const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
+                              const char *base, int *wrong)
+{
+	char *entries[64];
+	int   count = hull_access_strings(doc, machine, "hosts", entries, 64u);
+	size_t cap = strlen(base) + 2u;
+	size_t at;
+	char  *text;
+
+	*wrong = count < 0;
+	if (count <= 0)
+		return NULL;
+	for (int i = 0; i < count; i++)
+		cap += strlen(entries[i]) + 2u;
+	if ((text = malloc(cap)) != NULL) {
+		at = (size_t)sprintf(text, "%s", base);
+		if (at > 0u && text[at - 1u] != '\n')
+			text[at++] = '\n';
+		for (int i = 0; i < count && !*wrong; i++) {
+			/* Its address after the first colon, an IPv6 one holding more. */
+			char *colon = strchr(entries[i], ':');
+
+			if (colon == NULL || colon == entries[i] || colon[1] == '\0')
+				*wrong = 1;
+			else
+				at += (size_t)sprintf(text + at, "%s\t%.*s\n", colon + 1,
+				                      (int)(colon - entries[i]), entries[i]);
+		}
+	}
+	for (int i = 0; i < count; i++)
+		free(entries[i]);
+	if (*wrong) {
+		free(text);
+		return NULL;
+	}
+	return text;
+}
+
+char *hull_access_dns(const hull_sexpr_doc *doc, const hull_sexpr_form *machine)
+{
+	char  *entries[8];
+	int    count = hull_access_strings(doc, machine, "dns", entries, 8u);
+	size_t cap = 1u;
+	size_t at = 0u;
+	char  *text;
+
+	if (count <= 0)
+		return NULL;
+	for (int i = 0; i < count; i++)
+		cap += strlen(entries[i]) + 12u;
+	if ((text = malloc(cap)) != NULL)
+		for (int i = 0; i < count; i++)
+			at += (size_t)sprintf(text + at, "nameserver %s\n", entries[i]);
+	for (int i = 0; i < count; i++)
+		free(entries[i]);
+	return text;
 }

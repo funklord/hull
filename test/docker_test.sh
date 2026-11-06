@@ -110,6 +110,12 @@ done
 wait "$pid"
 cases=$((cases + 1))
 grep -q 'got-quit' "$root/stopq.out" || fail 'a container stopped by (stop_signal ...)' "$(tail -3 "$root/stopq.out")"
+# (hosts ...), (dns ...), (sysctls ...), (ulimits ...) as the daemon's.
+conf names '(command "sh" "-c" "grep db.internal /etc/hosts; grep -c 9.9.9.9 /etc/resolv.conf; cat /proc/sys/net/core/somaxconn; ulimit -n")' \
+	'(hosts "db.internal:10.0.0.5") (dns "9.9.9.9") (sysctls "net.core.somaxconn=1234") (ulimits "nofile=2048:4096")'
+expect 0 '^10.0.0.5' run -f "$root/names.conf"
+expect 0 '^1234$' run -f "$root/names.conf"
+expect 0 '^2048$' run -f "$root/names.conf"
 conf asroot '(command "true") (user "root")'
 expect 125 'a container.s root is the host.s' run -f "$root/asroot.conf"
 cases=$((cases + 1))

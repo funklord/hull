@@ -70,6 +70,7 @@
 #include <sys/reboot.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/syscall.h>
@@ -121,6 +122,11 @@ static char  *envp_[MAX_ENV + 1u];
 static char  *workdir;
 static char  *user_;        /* (user ...), or NULL for the machine's root */
 static int    stop_signal_ = SIGTERM;   /* what a stop sends first */
+#define MAX_LIMITS 32u
+static char  *limits_[MAX_LIMITS];      /* (ulimits ...) */
+static unsigned limit_count;
+static char  *sysctls_[MAX_LIMITS];     /* (sysctls ...) */
+static unsigned sysctl_count;
 static char  *init_;       /* (init PATH): the image's init, PID 1 once handed to */
 static int    handed;      /* PID 1 is the image's init, and this is the agent beside it */
 static int    run_made;    /* /run is a tmpfs made here, as an initramfs makes it */
@@ -1543,6 +1549,56 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 			}
 		}
 	}
+	/* (hosts ...) after what the machine's /etc/hosts says by now, its own or
+	 * its segments', and (dns ...) over its resolver. */
+	{
+		static char base[8192];
+		FILE       *file = fopen("/machine/etc/hosts", "r");
+		char       *dns = hull_access_dns(doc, machine);
+		char       *hosts;
+		int         wrong;
+
+		snprintf(base, sizeof base, "127.0.0.1\tlocalhost\n");
+		if (file != NULL) {
+			base[fread(base, 1u, sizeof base - 1u, file)] = '\0';
+			fclose(file);
+		}
+		hosts = hull_access_extra_hosts(doc, machine, base, &wrong);
+		if (wrong)
+			return "(hosts ...) is each NAME:ADDRESS";
+		reason = hosts != NULL ? bind_named(hosts, "/hull/hosts.more", "/machine/etc/hosts", 1) : NULL;
+		free(hosts);
+		if (reason == NULL && dns != NULL)
+			reason = bind_named(dns, "/hull/resolv.more", "/machine/etc/resolv.conf", 1);
+		free(dns);
+		if (reason != NULL)
+			return reason;
+	}
+	{
+		int count = hull_access_strings(doc, machine, "ulimits", limits_, MAX_LIMITS);
+
+		if (count < 0)
+			return "(ulimits ...) has too many entries";
+		limit_count = (unsigned)count;
+		for (unsigned i = 0u; i < limit_count; i++) {
+			unsigned long long soft;
+			unsigned long long hard;
+			int                resource;
+
+			if (hull_access_limit(limits_[i], &resource, &soft, &hard) != 0)
+				return "(ulimits ...) is each NAME=SOFT or NAME=SOFT:HARD, soft at most hard";
+		}
+		if ((count = hull_access_strings(doc, machine, "sysctls", sysctls_, MAX_LIMITS)) < 0)
+			return "(sysctls ...) has too many entries";
+		sysctl_count = (unsigned)count;
+		for (unsigned i = 0u; i < sysctl_count; i++) {
+			char        path[4200];
+			const char *value;
+
+			if (hull_access_sysctl(sysctls_[i], path, sizeof path, &value) != 0)
+				return "(sysctls ...) is each NAME=VALUE";
+		}
+	}
 	if (secrets != NULL && (reason = place_secrets(doc, machine, secrets, &n)) != NULL)
 		return reason;
 	ssh_enabled = hull_access_true(doc, machine, "ssh");
@@ -1594,6 +1650,20 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	if (chdir("/machine") != 0 || mount(".", "/", NULL, MS_MOVE, NULL) != 0 ||
 	    chroot(".") != 0 || chdir("/") != 0)
 		return "the machine's directory could not become its root";
+	/* Its (sysctls ...), the guest's kernel being its own. */
+	for (unsigned i = 0u; i < sysctl_count; i++) {
+		char        path[4200];
+		const char *value;
+		FILE       *file;
+
+		if (hull_access_sysctl(sysctls_[i], path, sizeof path, &value) == 0 &&
+		    ((file = fopen(path, "w")) == NULL || fputs(value, file) == EOF || fclose(file) != 0)) {
+			static char reason_[4400];
+
+			snprintf(reason_, sizeof reason_, "(sysctls ...) %s: %s", sysctls_[i], strerror(errno));
+			return reason_;
+		}
+	}
 	/* The image's own sshd, now that its root is in place: the first of the
 	 * usual two paths that is executable. Absent, the dropbear `hull sshd
 	 * fetch` put beside the machine (section 8.1 item 3), which logs in as
@@ -1750,6 +1820,21 @@ static const char *spawn(uint32_t ch, char *const *argv, const char *cwd, char *
 		if (cwd != NULL && chdir(cwd) != 0) {
 			fprintf(stderr, "hull agent: workdir %s: %s\n", cwd, strerror(errno));
 			_exit(127);
+		}
+		for (unsigned i = 0u; i < limit_count && argv[0] != NULL; i++) {
+			unsigned long long soft;
+			unsigned long long hard;
+			struct rlimit      limit;
+			int                resource;
+
+			if (hull_access_limit(limits_[i], &resource, &soft, &hard) != 0)
+				continue;
+			limit.rlim_cur = (rlim_t)soft;
+			limit.rlim_max = (rlim_t)hard;
+			if (setrlimit(resource, &limit) != 0) {
+				fprintf(stderr, "hull agent: %s: %s\n", limits_[i], strerror(errno));
+				_exit(126);
+			}
 		}
 		/* A (tree true) is hull's own, and reads what the user may not. */
 		if (user_ != NULL && argv[0] != NULL) {

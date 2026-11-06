@@ -280,6 +280,14 @@ boot devlinks 120
 has 0 '^write=ok$'
 refute_out '^write=[^o]'
 
+# (hosts ...), (dns ...), (sysctls ...) from inside the guest.
+conf namesvm '(backend vm) (mutable overlay) (hosts "db.internal:10.0.0.5") (dns "9.9.9.9")' \
+	'(sysctls "kernel.pid_max=70000") (command "/probe" "read" "/etc/resolv.conf" "read" "/proc/sys/kernel/pid_max")'
+name=namesvm
+boot namesvm 120
+has 0 '^read=nameserver 9.9.9.9$'
+has 0 '^read=70000$'
+
 # (stop_signal ...): what the agent sends a workload that a stop ends.
 conf stopq '(backend vm) (command "/probe" "say" "up" "trap") (stop_signal "SIGQUIT") (hostname "stopq")'
 (cd / && timeout 90 "$hull" run -f "$root/stopq.conf" > "$root/stopq.out" 2>&1) &

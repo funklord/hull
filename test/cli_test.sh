@@ -248,6 +248,38 @@ services:
     stop_grace_period: 1m30s
 COMPOSE
 expect 0 '\(stop_signal "SIGQUIT"\) \(stop_grace "90s"\)' "$hull" import "$dir/vars/stop.yaml"
+cat > "$dir/vars/more.yaml" <<'COMPOSE'
+services:
+  web:
+    image: alpine
+    extra_hosts:
+      - "db.internal:10.0.0.5"
+      - "new=10.0.0.7"
+    dns: 9.9.9.9
+    sysctls:
+      - net.core.somaxconn=1024
+    ulimits:
+      nproc: 512
+      nofile:
+        soft: 1024
+        hard: 4096
+  map:
+    image: alpine
+    extra_hosts:
+      other: 10.0.0.6
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    sysctls:
+      net.ipv4.ip_forward: 1
+COMPOSE
+expect 0 '\(hosts "db.internal:10.0.0.5" "new:10.0.0.7"\)' "$hull" import "$dir/vars/more.yaml"
+expect 0 '\(dns "9.9.9.9"\)' "$hull" import "$dir/vars/more.yaml"
+expect 0 '\(sysctls "net.core.somaxconn=1024"\)' "$hull" import "$dir/vars/more.yaml"
+expect 0 '\(ulimits "nproc=512" "nofile=1024:4096"\)' "$hull" import "$dir/vars/more.yaml"
+expect 0 '\(hosts "other:10.0.0.6"\)' "$hull" import "$dir/vars/more.yaml"
+expect 0 '\(dns "1.1.1.1" "8.8.8.8"\)' "$hull" import "$dir/vars/more.yaml"
+expect 0 '\(sysctls "net.ipv4.ip_forward=1"\)' "$hull" import "$dir/vars/more.yaml"
 printf 'services:\n  web:\n    image: alpine\n    user: "1000:1000"\n' > "$dir/vars/user.yaml"
 expect 0 '\(user "1000:1000"\)' "$hull" import "$dir/vars/user.yaml"
 cat > "$dir/vars/ro.yaml" <<'COMPOSE'
@@ -2405,6 +2437,21 @@ took=$(($(date +%s) - began))
 wait "$pid"
 cases=$((cases + 1))
 [ "$took" -le 5 ] || fail "(stop_grace 1s) took ${took}s" ''
+# (hosts ...), (dns ...), (ulimits ...) and (sysctls ...), read from inside.
+user_conf names '(network nat) (hosts "db.internal:10.0.0.5") (dns "9.9.9.9") (ulimits "core=0:0")' \
+	'(sysctls "net.core.somaxconn=1234") (command "/probe" "read" "/etc/resolv.conf" "read" "/proc/sys/net/core/somaxconn")'
+from_root 0 '^read=nameserver 9.9.9.9$' -f "$root/names.conf"
+says_more=$out
+cases=$((cases + 1))
+printf '%s\n' "$says_more" | grep -q '^read=1234$' || fail '(sysctls ...) reached the machine' "$says_more"
+user_conf hostbad '(hosts "noaddress") (command "/probe" "say" "no")'
+from_root 125 'each NAME:ADDRESS' -f "$root/hostbad.conf"
+user_conf limitbad '(ulimits "nofile=9:1") (command "/probe" "say" "no")'
+from_root 125 'soft at most hard' -f "$root/limitbad.conf"
+user_conf ctlbad '(network nat) (sysctls "kernel.pid_max=4194304") (command "/probe" "say" "no")'
+from_root 125 'net.\* alone' -f "$root/ctlbad.conf"
+user_conf ctlhost '(network host) (sysctls "net.core.somaxconn=1") (command "/probe" "say" "no")'
+from_root 125 'a network namespace of the machine.s own' -f "$root/ctlhost.conf"
 # (tmpfs ...): a path a read-only root can write, and nothing left behind it.
 mkdir -p "$root/userfs/scratch"
 user_conf tmpfsro '(command "/probe" "write" "/scratch/x") (tmpfs "/scratch")' \

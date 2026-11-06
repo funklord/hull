@@ -891,6 +891,12 @@ typedef struct svc {
 	char stop_signal[32];  /* from stop_signal: */
 	long stop_ms;          /* from stop_grace_period:, or 0 */
 	sb   tmpfs;            /* from tmpfs:, each path quoted */
+	sb   hosts;            /* from extra_hosts:, quoted NAME:ADDRESS */
+	sb   dns;              /* from dns: */
+	sb   sysctls;          /* from sysctls: */
+	sb   ulimits;          /* from ulimits: */
+	char ulimit_name[32];  /* the name a nested soft: or hard: is under */
+	char ulimit_soft[32];
 	int  read_only;        /* from read_only: */
 	hull_build_arg build_arg[HULL_MAX_BUILD_ARGS];
 	unsigned build_arg_count;
@@ -1213,6 +1219,55 @@ static void compose_tmpfs(svc *s, char *spec)
 	sb_quoted(&s->tmpfs, spec);
 }
 
+static void compose_word(sb *list, const char *word)
+{
+	sb_str(list, " ");
+	sb_quoted(list, word);
+}
+
+/* `name:address` or the newer `name=address`, as hull's NAME:ADDRESS. */
+static void compose_host(svc *s, char *entry)
+{
+	char *equals = strchr(entry, '=');
+
+	if (equals != NULL)
+		*equals = ':';
+	compose_word(&s->hosts, entry);
+}
+
+/* A map's entry of extra_hosts:, sysctls: or ulimits:, `KEY: VALUE`, a limit's
+ * `soft:` and `hard:` nested under its name. */
+static void compose_pair(svc *s, const char *field, char *content)
+{
+	char  line[300];
+	char *colon = strchr(content, ':');
+	char *key = content;
+	char *value;
+
+	if (colon == NULL)
+		return;
+	*colon = '\0';
+	key = trim(key);
+	value = scalar(trim(colon + 1));
+	if (strcmp(field, "extra_hosts") == 0) {
+		snprintf(line, sizeof line, "%s:%s", key, value);
+		compose_word(&s->hosts, line);
+	} else if (strcmp(field, "sysctls") == 0) {
+		snprintf(line, sizeof line, "%s=%s", key, value);
+		compose_word(&s->sysctls, line);
+	} else if (strcmp(key, "soft") == 0) {
+		snprintf(s->ulimit_soft, sizeof s->ulimit_soft, "%s", value);
+	} else if (strcmp(key, "hard") == 0) {
+		snprintf(line, sizeof line, "%s=%s:%s", s->ulimit_name, s->ulimit_soft, value);
+		compose_word(&s->ulimits, line);
+	} else if (value[0] == '\0') {
+		snprintf(s->ulimit_name, sizeof s->ulimit_name, "%s", key);
+	} else {
+		snprintf(line, sizeof line, "%s=%s", key, value);
+		compose_word(&s->ulimits, line);
+	}
+}
+
 static void svc_reset(svc *s)
 {
 	free(s->after.data);
@@ -1223,6 +1278,10 @@ static void svc_reset(svc *s)
 	free(s->notes.data);
 	free(s->file_env.data);
 	free(s->tmpfs.data);
+	free(s->hosts.data);
+	free(s->dns.data);
+	free(s->sysctls.data);
+	free(s->ulimits.data);
 	memset(s, 0, sizeof *s);
 	s->dep_indent  = -1;
 	s->args_indent = -1;
@@ -1480,6 +1539,20 @@ static void svc_flush(svc *s, sb *out)
 	}
 	if (s->read_only)
 		sb_str(out, " (security (readonly_root true))");
+	{
+		const struct { const char *key; const sb *list; } lists[] = {
+			{ "hosts", &s->hosts }, { "dns", &s->dns }, { "sysctls", &s->sysctls },
+			{ "ulimits", &s->ulimits },
+		};
+
+		for (size_t i = 0u; i < sizeof lists / sizeof lists[0]; i++)
+			if (lists[i].list->data != NULL) {
+				sb_str(out, " (");
+				sb_str(out, lists[i].key);
+				sb_str(out, lists[i].list->data);
+				sb_str(out, ")");
+			}
+	}
 	if (s->tmpfs.data != NULL) {
 		sb_str(out, " (tmpfs");
 		sb_str(out, s->tmpfs.data);
@@ -2109,6 +2182,12 @@ static char *compose_text(FILE *file, const char *project)
 				compose_env_file(&s, scalar(item));
 			else if (strcmp(field, "tmpfs") == 0)
 				compose_tmpfs(&s, scalar(item));
+			else if (strcmp(field, "extra_hosts") == 0)
+				compose_host(&s, scalar(item));
+			else if (strcmp(field, "dns") == 0)
+				compose_word(&s.dns, scalar(item));
+			else if (strcmp(field, "sysctls") == 0)
+				compose_word(&s.sysctls, scalar(item));
 			else if (strcmp(field, "profiles") == 0 && s.profile_count < 8)
 				snprintf(s.profile[s.profile_count++], sizeof s.profile[0], "%s", scalar(item));
 			continue;
@@ -2118,7 +2197,10 @@ static char *compose_text(FILE *file, const char *project)
 		if (ind > field_indent && field[0] != '\0') {   /* a map entry of `field` */
 			if (strcmp(field, "environment") == 0)
 				compose_env(&s, content, 1);
-			else if (strcmp(field, "networks") == 0) {
+			else if (strcmp(field, "extra_hosts") == 0 || strcmp(field, "sysctls") == 0 ||
+			         strcmp(field, "ulimits") == 0) {
+				compose_pair(&s, field, content);
+			} else if (strcmp(field, "networks") == 0) {
 				/* A networks map: each name, its options under it, an
 				 * alias or an address, which a segment does not take. */
 				char *at = strchr(content, ':');
@@ -2244,7 +2326,8 @@ static char *compose_text(FILE *file, const char *project)
 			 * under: another goes unread, and is said. */
 			static const char *const blocks[] = {
 				"environment", "ports", "volumes", "command", "entrypoint", "networks",
-				"depends_on", "healthcheck", "build", "profiles", "env_file", "tmpfs", NULL
+				"depends_on", "healthcheck", "build", "profiles", "env_file", "tmpfs",
+				"extra_hosts", "dns", "sysctls", "ulimits", NULL
 			};
 			int known = 0;
 
@@ -2356,6 +2439,8 @@ static char *compose_text(FILE *file, const char *project)
 				svc_note(&s, "stop_grace_period not translated", scalar(value));
 		} else if (strcmp(key, "tmpfs") == 0) {
 			compose_tmpfs(&s, scalar(value));
+		} else if (strcmp(key, "dns") == 0) {
+			compose_word(&s.dns, scalar(value));
 		} else if (strcmp(key, "read_only") == 0) {
 			s.read_only = strcmp(scalar(value), "true") == 0;
 		} else if (strcmp(key, "init") == 0 || strcmp(key, "expose") == 0) {

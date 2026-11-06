@@ -114,12 +114,17 @@ typedef struct frame {
 } frame;
 
 #define MAX_TMPFS 16u
+#define MAX_LIMITS 32u
 
 struct hull_machine {
 	hull_core       *core;       /* what create() was given, for the callbacks */
 	char            *root;       /* the dir source, without "dir:" */
 	char            *workdir;
 	char            *user;     /* (user ...), or NULL for the machine's root */
+	char            *limit[MAX_LIMITS];   /* (ulimits ...) */
+	unsigned         limit_count;
+	char            *sysctl[MAX_LIMITS];  /* (sysctls ...) */
+	unsigned         sysctl_count;
 	int              stop_signal;  /* what a stop sends first */
 	char            *tmpfs[MAX_TMPFS];  /* (tmpfs ...), each a path in the machine */
 	unsigned         tmpfs_count;
@@ -206,6 +211,10 @@ static void release(hull_machine *m)
 	free(m->root);
 	free(m->workdir);
 	free(m->user);
+	for (unsigned i = 0u; i < m->limit_count; i++)
+		free(m->limit[i]);
+	for (unsigned i = 0u; i < m->sysctl_count; i++)
+		free(m->sysctl[i]);
 	for (unsigned i = 0u; i < m->tmpfs_count; i++)
 		free(m->tmpfs[i]);
 	free(m->hostname);
@@ -282,6 +291,68 @@ static unsigned long long bytes_of(const char *size)
 }
 
 static const char *foreign_arch(hull_machine *m, const char *arch);
+
+/* (hosts ...), (dns ...), (sysctls ...) and (ulimits ...), read and checked. */
+static const char *read_names(hull_machine *m, const hull_sexpr_doc *doc,
+                              const hull_sexpr_form *machine)
+{
+	char *dns = hull_access_dns(doc, machine);
+	char  path[4200];
+	char  base[8192] = "127.0.0.1\tlocalhost\n";
+	char *hosts;
+	int   wrong;
+	int   count;
+
+	if (dns != NULL) {
+		free(m->resolver);
+		m->resolver = dns;
+	}
+	/* After what segments said, or the tree's own. */
+	if (m->hosts != NULL) {
+		snprintf(base, sizeof base, "%s", m->hosts);
+	} else {
+		FILE *file;
+
+		snprintf(path, sizeof path, "%s/etc/hosts", m->root);
+		if ((file = fopen(path, "r")) != NULL) {
+			base[fread(base, 1u, sizeof base - 1u, file)] = '\0';
+			fclose(file);
+		}
+	}
+	hosts = hull_access_extra_hosts(doc, machine, base, &wrong);
+	if (wrong)
+		return "(hosts ...) is each NAME:ADDRESS";
+	if (hosts != NULL) {
+		free(m->hosts);
+		m->hosts = hosts;
+	}
+	if ((count = hull_access_strings(doc, machine, "ulimits", m->limit, MAX_LIMITS)) < 0)
+		return "(ulimits ...) has too many entries";
+	m->limit_count = (unsigned)count;
+	for (unsigned i = 0u; i < m->limit_count; i++) {
+		unsigned long long soft;
+		unsigned long long hard;
+		int                resource;
+
+		if (hull_access_limit(m->limit[i], &resource, &soft, &hard) != 0)
+			return "(ulimits ...) is each NAME=SOFT or NAME=SOFT:HARD, soft at most hard";
+	}
+	if ((count = hull_access_strings(doc, machine, "sysctls", m->sysctl, MAX_LIMITS)) < 0)
+		return "(sysctls ...) has too many entries";
+	m->sysctl_count = (unsigned)count;
+	for (unsigned i = 0u; i < m->sysctl_count; i++) {
+		const char *value;
+
+		if (hull_access_sysctl(m->sysctl[i], path, sizeof path, &value) != 0)
+			return "(sysctls ...) is each NAME=VALUE";
+		if (strncmp(m->sysctl[i], "net.", 4u) != 0)
+			return "(sysctls ...) on chroot is net.* alone: the rest are the host's kernel's";
+		if (!m->no_network && !m->nat && !m->bridge && m->segment_count == 0u)
+			return "(sysctls ...) needs a network namespace of the machine's own: not "
+			       "(network host)";
+	}
+	return NULL;
+}
 
 /* The plan's machine, read into `m`. Returns a reason, or NULL. */
 static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
@@ -718,7 +789,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		snprintf(m->address_text, sizeof m->address_text, "%s", addr);
 		free(addr);
 	}
-	return NULL;
+	return read_names(m, doc, &machine);
 }
 
 /* --- the child ----------------------------------------------------------- */
@@ -885,6 +956,21 @@ static char *const *as_user(const hull_machine *m, int report)
 	unsigned     n = 0u;
 	int          has_home = 0;
 
+	/* (ulimits ...), while still root in the namespace; lowering is always
+	 * allowed, and raising past the host's hard limit is the host's to refuse. */
+	for (unsigned i = 0u; i < m->limit_count; i++) {
+		unsigned long long soft;
+		unsigned long long hard;
+		struct rlimit      limit;
+		int                resource;
+
+		if (hull_access_limit(m->limit[i], &resource, &soft, &hard) != 0)
+			child_refuse(report, "(ulimits ...) is each NAME=SOFT or NAME=SOFT:HARD");
+		limit.rlim_cur = (rlim_t)soft;
+		limit.rlim_max = (rlim_t)hard;
+		if (setrlimit(resource, &limit) != 0)
+			child_fail(report, m->limit[i]);
+	}
 	if (m->user == NULL)
 		return (char *const *)m->envp;
 	if ((reason = hull_user_resolve("", m->user, &user)) != NULL)
@@ -2319,6 +2405,15 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 	 * the dir's /run, which FHS has emptied at every boot, is hidden, and
 	 * nothing is created in the user's dir. A dir with no /run cannot
 	 * have them. */
+	/* Its (sysctls ...), the namespace's own, as root in it may. */
+	for (unsigned i = 0u; i < m->sysctl_count; i++) {
+		char        path[4200];
+		const char *value;
+
+		if (hull_access_sysctl(m->sysctl[i], path, sizeof path, &value) != 0 ||
+		    write_file(path, value) != 0)
+			child_fail(report, m->sysctl[i]);
+	}
 	/* Its (tmpfs ...), as docker's: anyone's to write, and gone with it. The
 	 * path is made above an overlay alone, as a volume's: never in the user's
 	 * own tree. */
@@ -4279,6 +4374,10 @@ static const hull_cap_entry entries[] = {
 	{ "user",                   HULL_SUP_NATIVE,   NULL, NULL },
 	{ "stop_signal",            HULL_SUP_NATIVE,   NULL, NULL },
 	{ "stop_grace",             HULL_SUP_NATIVE,   NULL, NULL },
+	{ "hosts",                  HULL_SUP_NATIVE,   NULL, NULL },
+	{ "dns",                    HULL_SUP_NATIVE,   NULL, NULL },
+	{ "sysctls",                HULL_SUP_EMULATED, "a user namespace holds net.* alone, in a network namespace of the machine's own", NULL },
+	{ "ulimits",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "tmpfs",                  HULL_SUP_NATIVE,   NULL, NULL },
 	{ "env",                    HULL_SUP_NATIVE,   "the environment is what env names, and docker's default PATH where it names none",
 	  NULL },

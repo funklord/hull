@@ -1099,6 +1099,49 @@ static const char *add_binds(text *t, const hull_sexpr_doc *doc, const hull_sexp
 	return NULL;
 }
 
+/* (sysctls ...) and (ulimits ...) as docker's Sysctls and Ulimits. */
+static void add_host_settings(text *body, const hull_sexpr_doc *doc, const hull_sexpr_form *machine)
+{
+	char *entries[32];
+	int   count = hull_access_strings(doc, machine, "sysctls", entries, 32u);
+
+	if (count > 0) {
+		add_text(body, ",\"Sysctls\":{");
+		for (int i = 0; i < count; i++) {
+			char *equals = strchr(entries[i], '=');
+
+			if (equals != NULL) {
+				*equals = '\0';
+				add_text(body, i != 0 ? "," : "");
+				add_json(body, entries[i]);
+				add_text(body, ":");
+				add_json(body, equals + 1);
+			}
+			free(entries[i]);
+		}
+		add_text(body, "}");
+	}
+	count = hull_access_strings(doc, machine, "ulimits", entries, 32u);
+	if (count > 0) {
+		add_text(body, ",\"Ulimits\":[");
+		for (int i = 0; i < count; i++) {
+			unsigned long long soft = 0u;
+			unsigned long long hard = 0u;
+			int                resource;
+			char              *equals = strchr(entries[i], '=');
+
+			if (equals != NULL && hull_access_limit(entries[i], &resource, &soft, &hard) == 0) {
+				*equals = '\0';
+				add_text(body, i != 0 ? ",{\"Name\":" : "{\"Name\":");
+				add_json(body, entries[i]);
+				addf(body, ",\"Soft\":%llu,\"Hard\":%llu}", soft, hard);
+			}
+			free(entries[i]);
+		}
+		add_text(body, "]");
+	}
+}
+
 /* `(ports (port ...))` as ExposedPorts into `exposed` and PortBindings
  * into `bindings`, each bound on `address`. */
 static void add_ports(text *exposed, text *bindings, const hull_sexpr_doc *doc,
@@ -1247,6 +1290,17 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	 * own: PID 1 ignores a signal it has no handler for, so a workload
 	 * there would sit through stop's SIGTERM, and nothing would reap. */
 	add_text(&body, ",\"HostConfig\":{\"Init\":true,\"CapDrop\":[\"ALL\"]");
+	if (hull_access_find(doc, machine, "hosts", &entry)) {
+		add_text(&body, ",\"ExtraHosts\":[");
+		add_strings(&body, doc, &entry);
+		add_text(&body, "]");
+	}
+	if (hull_access_find(doc, machine, "dns", &entry)) {
+		add_text(&body, ",\"Dns\":[");
+		add_strings(&body, doc, &entry);
+		add_text(&body, "]");
+	}
+	add_host_settings(&body, doc, machine);
 	if (hull_access_find(doc, machine, "tmpfs", &entry)) {
 		hull_sexpr_form path;
 		int             more;
@@ -4165,6 +4219,10 @@ static const hull_cap_entry entries[] = {
 	{ "user",               HULL_SUP_NATIVE,   NULL, NULL },
 	{ "stop_signal",        HULL_SUP_NATIVE,   NULL, NULL },
 	{ "stop_grace",         HULL_SUP_NATIVE,   NULL, NULL },
+	{ "hosts",              HULL_SUP_NATIVE,   NULL, NULL },
+	{ "dns",                HULL_SUP_NATIVE,   NULL, NULL },
+	{ "sysctls",            HULL_SUP_NATIVE,   NULL, NULL },
+	{ "ulimits",            HULL_SUP_NATIVE,   NULL, NULL },
 	{ "tmpfs",              HULL_SUP_NATIVE,   NULL, NULL },
 	{ "env",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "network.host",       HULL_SUP_NATIVE,   NULL, NULL },

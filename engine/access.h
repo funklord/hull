@@ -140,4 +140,25 @@ int hull_access_machine(hull_sexpr_doc *doc, const uint8_t *plan, size_t length,
  * STOPSIGNAL may. 0 where it says none. */
 int hull_access_signal(const char *name);
 
+/* `key`'s strings in `record`, each owned by the caller: their count, or -1
+ * where there are more than `cap`. */
+int hull_access_strings(const hull_sexpr_doc *doc, const hull_sexpr_form *record, const char *key,
+                        char **out, unsigned cap);
+
+/* "nofile=65536" or "nofile=1024:4096", docker's --ulimit: 0, and its resource,
+ * soft and hard limits; -1 where it is not one. `name` is `text`'s, for docker. */
+int hull_access_limit(const char *text, int *resource, unsigned long long *soft,
+                      unsigned long long *hard);
+
+/* "net.core.somaxconn=1024": 0, its /proc/sys path and its value; or -1. */
+int hull_access_sysctl(const char *text, char *path, size_t cap, const char **value);
+
+/* (hosts "NAME:ADDRESS" ...) as lines after `base`, or NULL where the machine
+ * says none or one is not that form. `*wrong` tells the two apart. */
+char *hull_access_extra_hosts(const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
+                              const char *base, int *wrong);
+
+/* (dns "ADDRESS" ...) as a resolv.conf, or NULL where the machine says none. */
+char *hull_access_dns(const hull_sexpr_doc *doc, const hull_sexpr_form *machine);
+
 #endif /* HULL_ACCESS_H */
