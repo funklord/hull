@@ -15,6 +15,8 @@ import time
 import zlib
 
 KEY_RETURN = 0xff0d
+KEY_SHIFT = 0xffe1
+SHIFTED = '~!@#$%^&*()_+{}|:"<>?'
 NAMED = {"up": 0xff52, "down": 0xff54, "left": 0xff51, "right": 0xff53,
 	 "escape": 0xff1b, "tab": 0xff09, "return": KEY_RETURN}
 
@@ -58,7 +60,14 @@ def key(sock, symbol):
 
 def type_text(sock, text):
 	for character in text:
+		# qemu presses what a key is, so Shift is the client's to hold, as a
+		# person's finger would: alone, `:` reaches the guest as `;`.
+		shifted = character in SHIFTED or character.isupper()
+		if shifted:
+			sock.sendall(struct.pack(">BBxxI", 4, 1, KEY_SHIFT))
 		key(sock, KEY_RETURN if character == "\n" else ord(character))
+		if shifted:
+			sock.sendall(struct.pack(">BBxxI", 4, 0, KEY_SHIFT))
 
 
 def frame(sock, width, height):
