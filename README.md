@@ -607,7 +607,7 @@ owner for who holds what: `hull broker`. It runs as an ordinary user with no
 root, and starts no machines.
 
 ```sh
-hull broker /srv/hull-broker      # pools.conf beside it; the directory's group may ask
+hull broker /srv/hull-broker      # pools.conf beside it; the directory's group may ask, and must not write
 ```
 
 ```scheme

@@ -3,16 +3,18 @@
 # sshd: its keys forced to `hull broker-dial --as`, known_hosts strict, so
 # what crosses is what a network would carry. Each user is a home, a
 # runtime directory and a core of its own. One account plays both, which
-# is what --as is for; what the kernel says of a second account is not
-# measured here. Bounded by each command's timeout and the sshd's and
-# broker's pids, which the trap ends.
+# is what --as is for. What the kernel says of a second account is the last
+# part: two real accounts, in a user namespace over /etc/subuid's range.
+# Bounded by each command's timeout and the sshd's and broker's pids, which
+# the trap ends.
 
 set -u
 
 hull=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 probe=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
 dir=${BUILD_DIR:?}/test/broker
-rm -rf "${dir:?}"
+# A run killed part-way leaves what only the namespace's root can remove.
+rm -rf "${dir:?}" 2> /dev/null || unshare --map-auto --map-root-user rm -rf "${dir:?}"
 mkdir -p "$dir"
 root=$(cd "$dir" && pwd)
 broker=$root/b
@@ -115,7 +117,7 @@ trap 'stop_all; exit 1' INT TERM
 mkdir -p "$broker" "$root/project/tree/srv" "$root/on-board"
 printf '#!/bin/sh\nexit 0\n' > "$root/health"
 chmod +x "$root/health"
-chmod 770 "$broker"
+chmod 750 "$broker"
 cp "$probe" "$root/project/tree/probe"
 cat > "$broker/pools.conf" <<'CONF'
 (pools
@@ -126,6 +128,7 @@ cat > "$broker/pools.conf" <<'CONF'
   (many (capacity 60))
   (budget (capacity 4) (memory "1G")))
 CONF
+chmod 640 "$broker/pools.conf"
 for u in alice bob; do
 	cat > "$root/$u/config/hull/pools.conf" <<CONF
 (pools
@@ -438,6 +441,114 @@ done
 [ "$held" = 16 ] && grep -q 'bob holds or waits for as much as one holder may' "$root/quota.err" ||
 	fail "a holder was given $held leases" "$(cat "$root/quota.err")"
 as alice 0 'lease-' reserve many --no-wait
+
+# --- two real accounts: what the kernel says ----------------------------------
+
+# Everything above is one account playing both, which is what --as is for.
+# A user namespace over /etc/subuid's range holds uids the kernel tells apart,
+# so the gate itself is tried here, and only where that range is given.
+accounts=$root/accounts
+mkdir -p "$accounts"
+# The tree may be setgid to a group the namespace does not map, and root there
+# cannot chown what carries a gid it cannot name.
+chgrp "$(id -g)" "$accounts"
+chmod g-s "$accounts"
+chmod 755 "$root" "$accounts"
+cat > "$root/accounts.sh" <<'INNER'
+hull=$1
+a=$2
+b=$a/b
+n=0
+said() { # NAME: what was run went as it should, or it did not
+	n=$((n + 1))
+	printf 'FAIL %s\n' "$1"
+}
+user() { # UID GROUPS COMMAND...
+	u=$1
+	g=$2
+	shift 2
+	mkdir -p "$a/$u/run"
+	chown -R "$u:$u" "$a/$u"
+	chmod 700 "$a/$u/run"
+	setpriv --reuid "$u" --regid "$u" --groups "$g" env -i PATH="$PATH" HOME="$a/$u" \
+		XDG_RUNTIME_DIR="$a/$u/run" XDG_CONFIG_HOME="$a/$u/config" XDG_DATA_HOME="$a/$u/data" \
+		HULL_CORE_IDLE=1 DOCKER_HOST="unix://$a/none.sock" timeout 20 "$@"
+}
+for u in 3001 3002 3003 3004; do
+	mkdir -p "$a/$u/config/hull"
+	printf '(pools (bench (broker "%s")))\n' "$b" > "$a/$u/config/hull/pools.conf"
+done
+mkdir -p "$b"
+printf '(pools (bench (capacity 3)))\n' > "$b/pools.conf"
+chown -R 3001:3000 "$b"
+
+# A directory its group can write is its leases and pools that group's.
+chmod 770 "$b"
+out=$(user 3001 3001,3000 "$hull" broker "$b" 2>&1)
+[ $? != 0 ] && printf '%s\n' "$out" | grep -q 'writable by others' || said "a group-writable directory was taken: $out"
+chmod 750 "$b"
+chmod 664 "$b/pools.conf"
+out=$(user 3001 3001,3000 "$hull" broker "$b" 2>&1)
+[ $? != 0 ] && printf '%s\n' "$out" | grep -q 'writable by others' || said "a group-writable pools.conf was taken: $out"
+chmod 640 "$b/pools.conf"
+
+# The broker's primary group is not the directory's, nor is it setgid.
+user 3001 3001,3000 "$hull" broker "$b" > "$a/log" 2>&1 &
+i=0
+until [ -S "$b/core.sock" ] || [ "$i" -ge 50 ]; do
+	i=$((i + 1))
+	sleep 0.1
+done
+[ "$(stat -c '%a %g' "$b/core.sock")" = '660 3000' ] || said "the socket is not the group's: $(stat -c '%a %g' "$b/core.sock")"
+
+alice() { user 3002 3002,3000 "$@"; }
+carol() { user 3004 3004,3000 "$@"; }
+bob() { user 3003 3003 "$@"; }
+
+lease=$(alice "$hull" reserve bench --no-wait 2>&1) || said "a member was refused: $lease"
+case $lease in lease-*) ;; *) said "no lease: $lease" ;; esac
+# Each holder is its account, whoever says what.
+out=$(carol "$hull" lease ls 2>&1)
+printf '%s\n' "$out" | grep -Eq "^$lease +bench .* uid-3002\$" || said "the holder is not the account: $out"
+out=$(carol "$hull" release "$lease" 2>&1)
+[ $? = 125 ] || said "a member ended another's lease: $out"
+# Outside the group, the kernel says no before hull is asked anything.
+out=$(bob "$hull" reserve bench --no-wait 2>&1)
+[ $? = 75 ] || said "one outside the group got: $out"
+out=$(bob sh -c "cat '$b/core.lock'" 2>&1) && said "one outside the group read the directory: $out"
+# A member is a member: it cannot say it is another, or write what the broker keeps.
+out=$(alice python3 -I -c '
+import os, socket, struct, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(5)
+s.connect(sys.argv[1])
+m = b"(8:identify(2:ch1:1)(2:as5:carol))"
+s.sendall(struct.pack(">I", len(m)) + m)
+print(s.recv(200))
+' "$b/core.sock" 2>&1)
+printf '%s\n' "$out" | grep -q 'cannot say who it is' || said "a member said it was another: $out"
+alice sh -c "echo > '$b/pools.conf'" 2> /dev/null && said 'a member wrote the pools'
+alice touch "$b/leases/x" 2> /dev/null && said 'a member wrote a lease'
+alice rm -f "$b/leases/$lease" 2> /dev/null
+[ -e "$b/leases/$lease" ] || said 'a member removed a lease'
+# The broker's own account ends what its holder cannot come back for.
+out=$(user 3001 3001,3000 "$hull" release "$lease" 2>&1)
+[ $? = 0 ] || said "the broker's account could not end a lease: $out"
+pkill_pid=$(head -1 "$b/core.lock")
+kill "$pkill_pid" 2> /dev/null
+wait
+rm -rf "${b:?}" "${a:?}"/3* "${a:?}/log"
+[ -z "$(ls -A "$a")" ] || said "accounts left: $(ls "$a")"
+printf 'done %s\n' "$n"
+INNER
+if grep -q "^$account:" /etc/subuid 2> /dev/null && command -v setpriv > /dev/null &&
+   unshare --map-auto --map-root-user true 2> /dev/null; then
+	cases=$((cases + 1))
+	out=$(timeout -k 2 120 unshare --map-auto --map-root-user sh "$root/accounts.sh" "$hull" "$accounts" 2>&1)
+	printf '%s\n' "$out" | grep -q '^done 0$' || fail 'two accounts' "$out"
+else
+	printf 'broker: no subuid range here, two real accounts not tried\n'
+fi
 
 printf 'broker: %u cases, %u failed\n' "$cases" "$failures"
 [ "$failures" -eq 0 ]

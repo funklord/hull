@@ -751,6 +751,7 @@ sanitize-run: $(filter-out $(BUILD_DIR)/test/tree_tar,$(TEST_BINS)) $(HULL)
 	ASAN_OPTIONS=detect_leaks=0 BUILD_DIR='$(BUILD_DIR)' sh test/store_test.sh '$(HULL)' '$(SITU_MARK)'
 	ASAN_OPTIONS=detect_leaks=0 BUILD_DIR='$(BUILD_DIR)' sh test/pull_test.sh '$(HULL)' \
 		'$(SANITIZE_PROBE)' '$(SITU_MARK)'
+	ASAN_OPTIONS=detect_leaks=0 BUILD_DIR='$(BUILD_DIR)' sh test/broker_test.sh '$(HULL)' '$(SANITIZE_PROBE)'
 
 # The readers of what a registry sends -- oci/json.c, and store/unpack.c,
 # which applies a layer -- under libFuzzer with ASan and UBSan, from

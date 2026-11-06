@@ -5835,6 +5835,26 @@ int hull_core_run(const char *host_arch)
 	return core_loop(host_arch, NULL);
 }
 
+/* What the group may ask is one thing and what it may write another: a
+ * member who can write DIR or pools.conf sets its own capacity and removes
+ * another's lease, whatever the socket's permission says. So, as sshd will
+ * not take an authorized_keys its owner alone cannot write, a broker will
+ * not start on them: measured, a pools.conf under an ordinary umask of
+ * 0002 was rewritten by a member. */
+static int broker_private(const char *path)
+{
+	struct stat is;
+
+	if (stat(path, &is) != 0)
+		return errno == ENOENT ? 0 : -1;
+	if (is.st_uid != getuid() || (is.st_mode & 022) != 0) {
+		fprintf(stderr, "hull broker: %s is writable by others, who could then hold what they like; "
+		        "it must be this account's, and mode 750 or less\n", path);
+		return -1;
+	}
+	return 0;
+}
+
 /* `hull broker DIR` (section 4.12): this core's leases, queue and pools
  * with no engine, for every user who can reach DIR/core.sock, as the
  * group of DIR says. Its pools are DIR/pools.conf and its marks of a
@@ -5845,6 +5865,8 @@ int hull_broker_run(const char *dir)
 
 	broker_mode = 1;
 	snprintf(config, sizeof config, "%s/pools.conf", dir);
+	if (broker_private(dir) != 0 || broker_private(config) != 0)
+		return 1;
 	hull_pool_config(config);
 	setenv("XDG_DATA_HOME", dir, 1);
 	return core_loop("none", dir);
