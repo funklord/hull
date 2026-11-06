@@ -192,7 +192,7 @@ reason, and where one exists, the `--accept` token that takes it anyway).
 | `virtualbox` | vm | hardware virtualization, inside a qemu vm | its own | VirtualBox's `vboxdrv`, `/dev/kvm`, `hull virtualbox fetch` | written |
 | vmware | vm | hardware virtualization | its own | the hypervisor | designed |
 | hyperv | vm | hardware virtualization | its own | Windows | reserved |
-| `hw` | hw | a real machine | its own | a board and its leases | designed |
+| `board` | hw | anything hull reaches by ssh | its own | a pool of boards in `pools.conf`, each its sshd, `unshare` and `tar` | written |
 
 ## chroot — namespaces, as the user
 
@@ -527,6 +527,38 @@ from a directory and scripted like any other machine.
   its audio tracks played from beside it, on DOSBox. Its copy-protection
   quirks are not replayed by either emulator, so such a disc is refused.
 
+## board — a machine that is a computer of yours
+
+The hw class runs a machine on anything hull can reach by ssh: a dev board
+on a bench, a server, or a vm standing in for either. A board is whatever its
+hooks say, so hull needs no driver for any of them. They are commands in
+`pools.conf`, and a test written against a pool of qemu machines runs
+unchanged against a pool of boards.
+
+```scheme
+(pools
+  (bench (members
+    (board "rpi4-a" (address "192.168.7.21") (login "root")
+           (power "pdu-switch 7/1")          ; given on, off or cycle
+           (console "cat /dev/ttyUSB0")      ; its output is the machine's log
+           (health "ping -c1 192.168.7.21")))))
+```
+
+```scheme
+(machine (backend hw) (pool "bench") (source "dir:./rootfs")
+  (command "/app/test") (env (MODE "ci")))
+```
+
+A run takes a free board: power on, wait for its sshd, its health, the tree
+deployed under the board's `root`, the command run in that tree, its output
+and exit status the machine's, then the tree removed and the power off. A
+board that does not answer is power cycled; one that still fails is marked
+broken and leaves the pool until `hull board fix NAME`. `hull board ls POOL`
+says which are up. `hull exec` and `hull stop` reach the command on the board.
+
+**When you want it:** a test that has to meet real hardware, or a run on a
+machine you already have, with the same file you use on a vm.
+
 ## Designed, not written
 
 - **crun**, ns: crun under user namespaces, with idmapped mounts for
@@ -539,9 +571,6 @@ from a directory and scripted like any other machine.
   what is there, through a block image built from the tree.
 - **hyperv**: the Windows-host slot, reserved so that Windows support
   arrives as an engine.
-- **hw**: real machines, a board on a lab bench reached through leases
-  from a pool, with the same spec and commands as a software one.
-
 ## Choosing one
 
 | You need | Use |

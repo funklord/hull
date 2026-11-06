@@ -62,6 +62,7 @@
 #include "kernel_fetch.h"
 #include "sshd_fetch.h"
 #include "media.h"
+#include "hw.h"
 #include "vagrant.h"
 #include "vbox_fetch.h"
 #include "vbox_host.h"
@@ -155,6 +156,7 @@ static void usage(FILE *out)
 	      "       hull import COMPOSE-FILE | hull import IMAGE DIR\n"
 	      "       hull media import IMAGE DIR | verify DIR | export DIR IMAGE\n"
 	      "       hull media change ID DRIVE [IMAGE]\n"
+	      "       hull board ls POOL | hull board fix NAME\n"
 	      "       hull vagrant box add NAME FILE\n"
 	      "       hull up [-f COMPOSE-FILE] [--backend B] [--profile P]... [NAME]\n"
 	      "       hull core\n"
@@ -5249,6 +5251,23 @@ done:
 	return status != 0;
 }
 
+/* `hull board ls POOL`: each member, a line of fixed columns, as section
+ * 4.12 asks of what a script reads. */
+static int board_list(const char *pool)
+{
+	static hull_board boards[64];
+	int               count = hull_hw_boards(pool, boards, 64u);
+
+	if (count < 0) {
+		fprintf(stderr, "hull: board ls: pool %s has no members in pools.conf\n", pool);
+		return 1;
+	}
+	for (int i = 0; i < count; i++)
+		printf("%-24s %-15s %s\n", boards[i].name, boards[i].address,
+		       hull_hw_broken(boards[i].name) ? "broken" : "up");
+	return 0;
+}
+
 /* `hull media change ID DRIVE [IMAGE]`: a running pc machine's floppy or CD
  * swapped, or with no image taken out, for a set of disks. It goes by exec,
  * the engine's own word as `console` is, so it is asked of a pc machine alone:
@@ -7308,6 +7327,15 @@ int main(int argc, char **argv)
 	if (strcmp(command, "manifest") == 0 && (argc == 3 || argc == 4) &&
 	    strcmp(argv[2], "compile") == 0)
 		return compile_manifest(argc == 4 ? argv[3] : NULL);
+	if (strcmp(command, "board") == 0 && argc == 4 && strcmp(argv[2], "ls") == 0)
+		return board_list(argv[3]);
+	if (strcmp(command, "board") == 0 && argc == 4 && strcmp(argv[2], "fix") == 0) {
+		if (hull_hw_fix(argv[3]) != 0) {
+			fprintf(stderr, "hull: board fix: %s is not marked broken\n", argv[3]);
+			return 1;
+		}
+		return 0;
+	}
 	if (strcmp(command, "media") == 0 && argc == 4 && strcmp(argv[2], "verify") == 0)
 		return media_verify(argv[3]);
 	if (strcmp(command, "media") == 0 && (argc == 5 || argc == 6) && strcmp(argv[2], "change") == 0)
@@ -7424,6 +7452,7 @@ int main(int argc, char **argv)
 	    hull_registry_add(&registry, hull_engine_chroot(NULL), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_dosbox(NULL), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_dosemu(NULL), &reason) != HULL_REGISTRY_OK ||
+	    hull_registry_add(&registry, hull_engine_hw(NULL), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_qemu_pc(NULL), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_set_default(&registry, "ns", "chroot") != HULL_REGISTRY_OK) {
 		fprintf(stderr, "hull: a built-in engine is refused: %s\n", reason);

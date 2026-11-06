@@ -18,7 +18,7 @@
 /* pc, since 2026-11-05: a whole PC whose system is its own, booted from
  * its media, has no agent, so none of vm's and emu's exec, ssh, kernel or
  * volumes -- dos's reason for a class of its own, met again. */
-static const char *const classes[] = { "ns", "vm", "emu", "dos", "pc" };
+static const char *const classes[] = { "ns", "vm", "emu", "dos", "pc", "hw" };
 
 #define CLASS_COUNT (sizeof classes / sizeof classes[0])
 

@@ -54,6 +54,7 @@
 #include <linux/magic.h>
 
 #include "access.h"
+#include "hw.h"
 #include "builtin.h"
 #include "core.h"
 #include "registry.h"
@@ -2265,6 +2266,14 @@ static long long pool_capacity(const char *pool)
 		/* The file is written by hand, its numbers bare: read as the
 		 * spec's values are, not as a canonical plan's atoms. */
 		capacity = 0;
+		/* A pool of boards holds as many as are not broken. */
+		if (hull_access_find(&doc, &entry, "members", &found)) {
+			static hull_board boards[64];
+			int               count = hull_hw_boards(pool, boards, 64u);
+
+			for (int i = 0; i < count; i++)
+				capacity += !hull_hw_broken(boards[i].name);
+		}
 		if (hull_access_find(&doc, &entry, "capacity", &found) &&
 		    hull_sexpr_child(&doc, &found, &head) && hull_sexpr_next(&doc, &head, &value) &&
 		    hull_sexpr_value(&doc, &value, n, sizeof n - 1u, &n_length) == HULL_SEXPR_OK) {
@@ -4562,6 +4571,7 @@ int hull_core_run(const char *host_arch)
 	    hull_registry_add(&registry, hull_engine_chroot(&host_ops), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_dosbox(&host_ops), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_dosemu(&host_ops), &reason) != HULL_REGISTRY_OK ||
+	    hull_registry_add(&registry, hull_engine_hw(&host_ops), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_qemu_pc(&host_ops), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_set_default(&registry, "ns", "chroot") != HULL_REGISTRY_OK) {
 		fprintf(stderr, "hull core: a built-in engine is refused: %s\n", reason);
