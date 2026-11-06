@@ -1699,8 +1699,11 @@ static void settle_held(void)
 	long long      now = monotonic_ms();
 	int            pending = 0;
 
-	if (held_dir[0] == '\0' || (dir = opendir(held_dir)) == NULL)
+	/* No directory is no record, so nothing owed: left set, the core stayed. */
+	if (held_dir[0] == '\0' || (dir = opendir(held_dir)) == NULL) {
+		held_pending = 0;
 		return;
+	}
 	while ((entry = readdir(dir)) != NULL) {
 		char        id[300];
 		char       *dot;

@@ -618,6 +618,34 @@ cases=$((cases + 1))
 soft=$(sed -n 's/^soft //p' "$root/fds.out")
 [ -n "$soft" ] && [ "$soft" -gt 30 ] || fail 'a core kept a soft limit too low for its tables' "$(cat "$root/fds.out")"
 
+# What a core owes is in its held directory. With that gone there is nothing
+# it could settle, and it goes when idle, as any core: one stayed four hours.
+conf owed '(backend chroot) (pool "many") (hostname "owed") (command "/probe" "say" "ready" "sleep" "2")'
+: > "$root/owed.out"
+(run_as bob timeout -k 2 40 "$hull" run -f "$root/project/owed.conf" > "$root/owed.out" 2>&1 < /dev/null) &
+owed=$!
+wait_ready "$root/owed.out"
+owes=$(head -1 "$root/bob/run/hull/core.lock")
+sshd_down gate
+wait "$owed"
+sleep 2
+rm -rf "${root:?}/bob/run/hull/held"
+n=0
+while [ -r "/proc/$owes/cmdline" ] && [ -n "$(tr -d '\0' < "/proc/$owes/cmdline" 2> /dev/null)" ] && [ "$n" -lt 40 ]; do
+	n=$((n + 1))
+	sleep 0.25
+done
+cases=$((cases + 1))
+[ "$n" -lt 40 ] || {
+	fail 'a core stayed for what it had no record of' "$(ps -o pid,etime,args -p "$owes")"
+	kill "$owes" 2> /dev/null
+}
+sshd_up gate "$port" "$root/authorized"
+run_as admin timeout 20 "$hull" lease ls < /dev/null 2> /dev/null | awk '/^lease-/ { print $1 }' > "$root/owed.left"
+while read -r id; do
+	run_as admin timeout 20 "$hull" release "$id" > /dev/null 2>&1 < /dev/null
+done < "$root/owed.left"
+
 # A broker that lies: what it answers goes into a file and a plan here, so a
 # name that is no name is refused, and the machine does not run.
 mkdir -p "$root/evil"
