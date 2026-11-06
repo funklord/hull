@@ -474,6 +474,12 @@ and installing from a disc then booting the disk is one changed line.
 **When you want it:** a system that is not Linux and not DOS, or an old
 VM's disk, run from a plain file with no VM manager around it.
 
+FreeDOS and ReactOS boot from their publishers' images as they come. For
+`ssh name.hull` to land at a DOS prompt, the system's own autoexec moves its
+console to the port with `CTTY COM1`. FreeDOS 1.4 reads nothing there until
+the BIOS keyboard has a key waiting, so run a program that stuffs one first;
+`test/legacy_test.sh` writes the eight bytes.
+
 ## dosbox and dosemu — a DOS PC, for software written for one
 
 The dos class has two engines, run as the user with no window, and the

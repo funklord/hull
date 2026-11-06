@@ -318,7 +318,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all kernel limine nss root install-root check check-docker check-pc check-remote check-qemu check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all kernel limine nss root install-root check check-docker check-pc check-legacy check-remote check-qemu check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -340,6 +340,7 @@ help:
 	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
 	@echo '  check-qemu    hull run on the qemu engine, as the user, with KVM'
 	@echo '  check-pc      a whole PC booting its own media, as the user'
+	@echo '  check-legacy  FreeDOS, fetched and pinned, on a pc: screen and ssh door'
 	@echo '  check-remote  hull -H over a private sshd on 127.0.0.1'
 	@echo '  check-virtualbox  hull run on VirtualBox, inside a vm, as the user'
 	@echo '  check-root    root mode'"'"'s native grants, hull-root setuid, inside a vm'
@@ -699,6 +700,9 @@ check-remote: $(HULL) $(AGENT_BIN) $(PROBE)
 
 check-pc: $(HULL) $(AGENT_BIN)
 	BUILD_DIR='$(BUILD_DIR)' sh test/pc_test.sh '$(HULL)'
+
+check-legacy: $(HULL) $(AGENT_BIN)
+	BUILD_DIR='$(BUILD_DIR)' sh test/legacy_test.sh '$(HULL)'
 
 check-qemu: $(HULL) $(AGENT_BIN) $(PROBE) $(AGENT_ARM64) $(ARM64_PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/qemu_test.sh '$(HULL)' '$(PROBE)'
