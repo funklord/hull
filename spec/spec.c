@@ -769,6 +769,7 @@ static const key machine_keys[] = {
 	{ .name = "ready",         .type = RECORD, .record = &ready },
 	{ .name = "pool",          .type = STRING, .value = label },
 	{ .name = "display",       .type = CHOICE, .choices = display_values },
+	{ .name = "user",          .type = STRING, .value = nonempty },
 };
 static hull_spec_status machine_across(walk *w, const hull_sexpr_form *record,
                                        const hull_sexpr_form *found, uint64_t present);
@@ -808,6 +809,7 @@ static const key step_keys[] = {
 	{ .name = "discard", .type = STRINGS, .value = absolute },
 	{ .name = "env",     .type = MAP, .names = env_name },
 	{ .name = "workdir", .type = STRING, .value = absolute },
+	{ .name = "user",    .type = STRING, .value = nonempty },
 };
 static const schema step = TABLE_ACROSS(step_keys, step_across);
 

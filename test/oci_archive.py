@@ -5,6 +5,8 @@
                                      FILE, tagged test/saved:1
     oci_archive.py oci OUT FILE      an OCI layout's, under an index of two
                                      platforms, this host's among them
+    oci_archive.py user OUT FILE     docker's, FILE a program its config runs
+                                     as `uid`, with USER 4321
 
 Written here rather than by docker, which `make check` does not need.
 """
@@ -16,9 +18,10 @@ import sys
 import tarfile
 
 
-def add(tar, name, data):
+def add(tar, name, data, mode=0o644):
 	info = tarfile.TarInfo(name)
 	info.size = len(data)
+	info.mode = mode
 	tar.addfile(info, io.BytesIO(data))
 
 
@@ -32,17 +35,20 @@ def main():
 		content = f.read()
 	layer = io.BytesIO()
 	with tarfile.open(fileobj=layer, mode='w', format=tarfile.USTAR_FORMAT) as t:
-		add(t, 'greeting', content)
+		add(t, 'greeting', content, 0o755 if form == 'user' else 0o644)
 	layer = layer.getvalue()
+	runtime = {'Cmd': ['/greeting'], 'Env': ['SAVED=1'], 'WorkingDir': '/'}
+	if form == 'user':
+		runtime.update({'Cmd': ['/greeting', 'uid'], 'User': '4321'})
 	config = json.dumps({
 		'architecture': 'amd64', 'os': 'linux',
-		'config': {'Cmd': ['/greeting'], 'Env': ['SAVED=1'], 'WorkingDir': '/'},
+		'config': runtime,
 		'rootfs': {'type': 'layers', 'diff_ids': ['sha256:' + sha(layer)]},
 	}).encode()
 	with tarfile.open(out, 'w', format=tarfile.USTAR_FORMAT) as tar:
 		add(tar, 'blobs/sha256/' + sha(config), config)
 		add(tar, 'blobs/sha256/' + sha(layer), layer)
-		if form == 'docker':
+		if form != 'oci':
 			add(tar, 'manifest.json', json.dumps([{
 				'Config': 'blobs/sha256/' + sha(config),
 				'RepoTags': ['test/saved:1'],

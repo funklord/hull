@@ -189,14 +189,16 @@ printf '%s\n' "$verified" | grep -q '^situc: 1 vectors conform to' ||
 expect 0 '' "$hull" pull "127.0.0.1:$port/test/bad:real" plain/1
 expect 0 '^  \(runtime \(cmd /probe\) \(workdir /\)\)$' "$hull" manifest show plain/1
 # A machine that names no command runs the image's, entrypoint and then
-# command, in its workdir, with its env; its user is said and not taken.
+# command, in its workdir, with its env, and as its user.
 printf '(machine (source "%s") (backend chroot) (hostname "defaults"))\n' "$image" \
 	> "$root/defaults.conf"
 expect 0 '^cwd=/etc$' sh -c 'cd / && exec "$0" run -f "$1"' "$hull" "$root/defaults.conf"
 cases=$((cases + 1))
-printf '%s\n' "$out" | grep -qx 'from-config' && printf '%s\n' "$out" | grep -qx 'GREETING=hi' &&
-	printf '%s\n' "$out" | grep -q 'the image runs as 1000, which is not taken' ||
-	fail "the image's command, env or user was not as its config says" "$out"
+printf '%s\n' "$out" | grep -qx 'from-config' && printf '%s\n' "$out" | grep -qx 'GREETING=hi' ||
+	fail "the image's command or env was not as its config says" "$out"
+printf '(machine (source "%s") (backend chroot) (hostname "asimage") (command "/probe" "uid"))\n' \
+	"$image" > "$root/asimage.conf"
+expect 0 '^uid=1000$' sh -c 'cd / && exec "$0" run -f "$1"' "$hull" "$root/asimage.conf"
 # And what the machine says is its own.
 printf '(machine (source "%s") (backend chroot) (hostname "own") %s)\n' "$image" \
 	'(workdir "/") (env (GREETING "mine"))' > "$root/own.conf"
@@ -351,10 +353,15 @@ for ref in private/none basic/none private/wrong private/helper; do
 	[ ! -e "$store/refs/$ref" ] || fail "a pull refused for its credentials left a ref, $ref" ""
 done
 
-# The image runs, its name its source, as J.1's image ref in the store.
+# The image runs, its name its source, as J.1's image ref in the store. The
+# file is root's alone and the image's USER is not root: docker's answer, and
+# a machine that says (user ...) has its own.
 printf '(machine (source "%s") (backend chroot) (hostname "pulled") %s)\n' "$image" \
 	'(command "/probe" "read" "/etc/greeting")' > "$root/pulled.conf"
-expect 0 '^read=replaced$' sh -c 'cd / && exec "$0" run -f "$1"' "$hull" "$root/pulled.conf"
+expect 0 '^read=Permission denied$' sh -c 'cd / && exec "$0" run -f "$1"' "$hull" "$root/pulled.conf"
+printf '(machine (source "%s") (backend chroot) (hostname "pulled") %s)\n' "$image" \
+	'(command "/probe" "read" "/etc/greeting") (user "root")' > "$root/pulledroot.conf"
+expect 0 '^read=replaced$' sh -c 'cd / && exec "$0" run -f "$1"' "$hull" "$root/pulledroot.conf"
 
 # Pulled again, nothing is new. By the manifest's digest, the same tree
 # and defaults, its provenance alone another, having no index to name.

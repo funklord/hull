@@ -603,14 +603,22 @@ static int runtime_defaults(const char *file, const char *name, const hull_spec 
 	if (record_find(&doc, &runtime, "user", &found)) {
 		hull_sexpr_form head;
 		hull_sexpr_form user;
+		hull_sexpr_form mine;
+		int             has_user = hull_spec_find(spec, machine, "user", &mine);
 
 		hull_sexpr_child(&doc, &found, &head);
 		hull_sexpr_next(&doc, &head, &user);
+		/* As docker runs it, where the machine says nothing of its own. */
 		if (!hull_sexpr_is(&doc, &user, "root") && !hull_sexpr_is(&doc, &user, "0") &&
-		    !hull_sexpr_is(&doc, &user, "0:0"))
-			fprintf(stderr, "%s: %s: the image runs as %.*s, which is not taken: the "
-			        "machine runs as its root\n", file, name, (int)user.content_length,
-			        (const char *)doc.data + user.content);
+		    !hull_sexpr_is(&doc, &user, "0:0") && !has_user) {
+			char text[160];
+
+			if (user.content_length < sizeof text - 20u) {
+				snprintf(text, sizeof text, " (user \"%.*s\")", (int)user.content_length,
+				         (const char *)doc.data + user.content);
+				add_text(&at_end, text);
+			}
+		}
 	}
 	if (into_env.length > 0u &&
 	    add_rewrite(rewrites, count, env.offset + env.extent - 1u, 0u, &into_env) != 0)
@@ -3960,6 +3968,7 @@ next_pass:
 		int               network;
 		int               has_run;
 		int               ok;
+		char              step_user[128];
 
 		record_text(&spec, &step, "name", name, sizeof name);
 		has_run = record_text(&spec, &step, "run", run_line, sizeof run_line);
@@ -4232,6 +4241,11 @@ next_pass:
 				add_text(&conf, ") (hostname \"build-");
 				add_bytes(&conf, key_hex, 12u);
 				add_text(&conf, "\")");
+				if (record_text(&spec, &step, "user", step_user, sizeof step_user)) {
+					add_text(&conf, " (user ");
+					add_quoted(&conf, (const uint8_t *)step_user, strlen(step_user));
+					add_text(&conf, ")");
+				}
 				if (strcmp(build_arch, host_arch()) != 0) {
 					add_text(&conf, " (arch ");
 					add_text(&conf, build_arch);

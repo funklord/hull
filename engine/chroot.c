@@ -68,6 +68,7 @@
 #include <unistd.h>
 
 #include "access.h"
+#include "user.h"
 #include "hostnet.h"
 #include "rootmode.h"
 #include "tree.h"
@@ -116,6 +117,7 @@ struct hull_machine {
 	hull_core       *core;       /* what create() was given, for the callbacks */
 	char            *root;       /* the dir source, without "dir:" */
 	char            *workdir;
+	char            *user;     /* (user ...), or NULL for the machine's root */
 	char            *hostname;   /* or NULL */
 	char            *init;       /* (init PATH): the image's init, PID 1 once handed to */
 	char             binfmt[400]; /* a foreign arch's binfmt_misc registration, or "" */
@@ -198,6 +200,7 @@ static void release(hull_machine *m)
 	hull_hostdev_unclaim(m);
 	free(m->root);
 	free(m->workdir);
+	free(m->user);
 	free(m->hostname);
 	free(m->init);
 	free(m->secrets);
@@ -296,8 +299,11 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	m->workdir  = hull_access_value(doc, &machine, "workdir");
 	m->hostname = hull_access_value(doc, &machine, "hostname");
 	m->init = hull_access_value(doc, &machine, "init");
+	m->user = hull_access_value(doc, &machine, "user");
 	if (m->root == NULL || m->workdir == NULL)
 		return "the plan is missing its source or workdir";
+	if (m->user != NULL && m->init != NULL)
+		return "(user ...) is whom a command runs as; an (init ...) starts its own";
 	{
 		char       *arch = hull_access_value(doc, &machine, "arch");
 		const char *why  = foreign_arch(m, arch);
@@ -840,6 +846,36 @@ static void child_refuse(int report, const char *reason)
 	if (write(report, reason, strlen(reason)) < 0)
 		_exit(127);
 	_exit(127);
+}
+
+/* In a command's child, in the machine's root: it become (user ...), where
+ * one uid mapped has not made it so already. The environment to exec with,
+ * that user's HOME in it where the machine gave it none. */
+static char *const *as_user(const hull_machine *m, int report)
+{
+	static char  home[300];
+	static char *envp[MAX_ENV + 2u];
+	hull_user    user;
+	const char  *reason;
+	unsigned     n = 0u;
+	int          has_home = 0;
+
+	if (m->user == NULL)
+		return (char *const *)m->envp;
+	if ((reason = hull_user_resolve("", m->user, &user)) != NULL)
+		child_refuse(report, reason);
+	if ((geteuid() != user.uid || getegid() != user.gid) && hull_user_become(&user) != 0)
+		child_fail(report, "(user ...)");
+	for (; m->envp[n] != NULL; n++) {
+		envp[n] = m->envp[n];
+		has_home |= strncmp(m->envp[n], "HOME=", 5u) == 0;
+	}
+	if (!has_home) {
+		snprintf(home, sizeof home, "HOME=%s", user.home);
+		envp[n++] = home;
+	}
+	envp[n] = NULL;
+	return envp;
 }
 
 /* fork() for the machine's init, which is a raw clone of the core and so
@@ -1984,11 +2020,20 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 			if (syscall(SYS_setgroups, 0, NULL) != 0)
 				child_fail(report, "setgroups");
 		} else {
-			snprintf(map, sizeof map, "0 %u 1", (unsigned)uid);
+			/* One uid can be any uid: under (user ...) the user this
+			 * machine has is that user, and no switch is wanted. Its
+			 * capabilities last to the exec, as root's do. */
+			hull_user   inner = { .uid = 0u, .gid = 0u };
+			const char *wrong = m->user != NULL ?
+			                    hull_user_resolve(m->root, m->user, &inner) : NULL;
+
+			if (wrong != NULL)
+				child_refuse(report, wrong);
+			snprintf(map, sizeof map, "%u %u 1", (unsigned)inner.uid, (unsigned)uid);
 			if (write_file("/proc/self/setgroups", "deny") != 0 ||
 			    write_file("/proc/self/uid_map", map) != 0)
 				child_fail(report, "uid_map");
-			snprintf(map, sizeof map, "0 %u 1", (unsigned)gid);
+			snprintf(map, sizeof map, "%u %u 1", (unsigned)inner.gid, (unsigned)gid);
 			if (write_file("/proc/self/gid_map", map) != 0)
 				child_fail(report, "gid_map");
 		}
@@ -2352,7 +2397,7 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		sigaction(SIGPIPE, &action, NULL);
 		if (setsid() < 0 || dup2(out[1], 1) < 0 || dup2(err[1], 2) < 0)
 			child_fail(report, "the workload's stdio");
-		hull_access_execute((char *const *)m->argv, (char *const *)m->envp);
+		hull_access_execute((char *const *)m->argv, as_user(m, report));
 		child_fail(report, m->argv[0]);
 	}
 	/* The engine reads `report` to its end: this copy, and the workload's
@@ -3715,7 +3760,7 @@ static void run_helper(const hull_machine *m, char *const *argv, const int *ns, 
 				dprintf(2, "hull: the machine's tree: %s\n", detail);
 			_exit(failed ? 1 : 0);
 		}
-		hull_access_execute(argv, (char *const *)m->envp);
+		hull_access_execute(argv, as_user(m, report));
 		child_fail(report, argv[0]);
 	}
 	close(report);
@@ -4197,6 +4242,7 @@ static const hull_cap_entry entries[] = {
 	{ "writeback.none",         HULL_SUP_NATIVE,   NULL, NULL },
 	{ "command",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "workdir",                HULL_SUP_NATIVE,   NULL, NULL },
+	{ "user",                   HULL_SUP_NATIVE,   NULL, NULL },
 	{ "env",                    HULL_SUP_NATIVE,   "the environment is what env names, and docker's default PATH where it names none",
 	  NULL },
 	{ "hostname",               HULL_SUP_NATIVE,   NULL, NULL },

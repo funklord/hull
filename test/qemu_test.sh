@@ -259,6 +259,14 @@ cases=$((cases + 1))
 # ran as the user, uid 1000 say, and mount, su and sudo with it.
 cp "$probe" "$root/rootfs/suid"
 chmod 4755 "$root/rootfs/suid"
+# (user ...): the agent becomes it, on either class, by the guest's files.
+for class in vm emu; do
+	conf "user$class" "(backend $class) (command \"/probe\" \"uid\") (user \"4321:4322\")"
+	name="user$class"
+	boot "user$class" 120
+	has 0 '^uid=4321$'
+done
+
 conf suid '(backend vm) (command "/suid" "uid" "euid" "owner" "/suid")'
 name=suid
 boot suid

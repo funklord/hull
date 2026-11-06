@@ -105,7 +105,7 @@ ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/access.o \
               $(BUILD_DIR)/engine/usage.o $(BUILD_DIR)/engine/sha256.o $(BUILD_DIR)/engine/verity.o \
               $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/ip6.o $(BUILD_DIR)/engine/idmap.o \
-              $(BUILD_DIR)/engine/tree.o $(BUILD_DIR)/engine/hostnet.o \
+              $(BUILD_DIR)/engine/tree.o $(BUILD_DIR)/engine/user.o $(BUILD_DIR)/engine/hostnet.o \
               $(BUILD_DIR)/engine/hostdev.o $(BUILD_DIR)/engine/rootmode.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o $(BUILD_DIR)/cli/runtime.o $(BUILD_DIR)/cli/doctor.o \
               $(BUILD_DIR)/cli/import.o $(BUILD_DIR)/cli/export.o $(BUILD_DIR)/cli/kernel_fetch.o $(BUILD_DIR)/cli/vbox_fetch.o $(BUILD_DIR)/cli/vbox_host.o $(BUILD_DIR)/cli/vagrant.o $(BUILD_DIR)/cli/dial.o \
@@ -144,7 +144,7 @@ HULL        = $(BUILD_DIR)/hull
 # looks for it.
 AGENT_BIN_OBJS = $(BUILD_DIR)/agent/agent.o $(WIRE_OBJS) $(BUILD_DIR)/engine/access.o \
                  $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/ip6.o \
-                 $(BUILD_DIR)/engine/tree.o
+                 $(BUILD_DIR)/engine/tree.o $(BUILD_DIR)/engine/user.o
 AGENT_BIN      = $(BUILD_DIR)/hull-agent
 # The same agent for an arm64 machine under emu, beside it, where a cross
 # compiler is installed (ARM64_CC, below): its sources the native one's,

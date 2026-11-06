@@ -90,6 +90,11 @@ expect 3 '^GREETING=hi$' run
 expect 3 '^/tmp$' run
 expect 3 '^dtest$' run
 expect 3 "^uid=$(id -u):$(id -g)\$" run
+# (user ...) is the daemon's User, its root refused as the host's.
+conf asuser '(command "sh" "-c" "echo uid=$(id -u):$(id -g)") (user "4321:4322")'
+expect 0 '^uid=4321:4322$' run -f "$root/asuser.conf"
+conf asroot '(command "true") (user "root")'
+expect 125 'a container.s root is the host.s' run -f "$root/asroot.conf"
 cases=$((cases + 1))
 if (cd / && timeout 60 "$hull" run -f "$root/run.conf" 2>/dev/null) | grep -q '^to stderr$'; then
 	fail "stderr reached stdout" ""

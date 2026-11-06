@@ -4565,6 +4565,7 @@ static const hull_cap_entry entries[] = {
 	/* Applied by the guest agent. */
 	{ "command",            HULL_SUP_NATIVE,   NULL, NULL },
 	{ "workdir",            HULL_SUP_NATIVE,   NULL, NULL },
+	{ "user",               HULL_SUP_NATIVE,   NULL, NULL },
 	{ "env",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "hostname",           HULL_SUP_NATIVE,   NULL, NULL },
 	{ "volumes",            HULL_SUP_NATIVE,   "a 9p share each", NULL },
@@ -4800,6 +4801,7 @@ static const hull_cap_entry vbox_entries[] = {
 	{ "writeback.none",     HULL_SUP_NATIVE, NULL, NULL },
 	{ "command",            HULL_SUP_NATIVE, NULL, NULL },
 	{ "workdir",            HULL_SUP_NATIVE, NULL, NULL },
+	{ "user",               HULL_SUP_NATIVE, NULL, NULL },
 	{ "env",                HULL_SUP_NATIVE, NULL, NULL },
 	{ "hostname",           HULL_SUP_NATIVE, NULL, NULL },
 	{ "secrets",            HULL_SUP_NATIVE,

@@ -203,6 +203,11 @@ cases=$((cases + 1))
 printf '%s\n' "$out" | grep -q '^hull: build: pass 2 of 2$' &&
 	! printf '%s\n' "$out" | grep -q ': cached, sha256:' ||
 	fail "--check did not run every step twice, uncached" "$out"
+# A step's (user ...) is whom its run line runs as, as a Dockerfile's USER is.
+cat > "$root/b/asuser.conf" <<'EOF'
+(build (base "dir:./base") (steps (step (name "as") (run "probe uid") (user "4321"))))
+EOF
+expect 0 '^uid=4321$' "$hull" build -f "$root/b/asuser.conf" app/asuser
 cat > "$root/b/stamp.conf" <<'EOF'
 (build (base "dir:./base") (steps (step (name "pure") (run "probe write /pure"))
                                   (step (name "stamped") (run "probe stamp /stamp"))))
@@ -391,6 +396,13 @@ at = data.find(b"from the archive")
 data[at] ^= 1
 open(sys.argv[1], "wb").write(data)' "$root/ld/saved.tar"
 expect 1 'not the digest that names it' "$hull" load "$root/ld/saved.tar" tampered/1
+# An image's USER is whom its command runs as, unless the machine says.
+python3 -I "$(dirname "$0")/oci_archive.py" user "$root/ld/user.tar" "$probe"
+expect 0 '^loaded/user sha256:' "$hull" load "$root/ld/user.tar" loaded/user
+printf '(machine (backend chroot) (source "loaded/user"))\n' > "$root/ld/user.conf"
+expect 0 '^uid=4321$' "$hull" run -f "$root/ld/user.conf"
+printf '(machine (backend chroot) (source "loaded/user") (user "4400"))\n' > "$root/ld/mine.conf"
+expect 0 '^uid=4400$' "$hull" run -f "$root/ld/mine.conf"
 printf 'nothing' > "$root/ld/short"
 expect 1 'not a tar' "$hull" load "$root/ld/short"
 gzip -c "$root/ld/layout.tar" > "$root/ld/layout.tar.gz"

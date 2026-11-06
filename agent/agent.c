@@ -89,6 +89,7 @@
 #include "ip6.h"
 #include "sshd.h"
 #include "access.h"
+#include "user.h"
 #include "tree.h"
 #include "wire.h"
 
@@ -118,6 +119,7 @@
 static char  *argv_[MAX_ARGS + 1u];
 static char  *envp_[MAX_ENV + 1u];
 static char  *workdir;
+static char  *user_;        /* (user ...), or NULL for the machine's root */
 static char  *init_;       /* (init PATH): the image's init, PID 1 once handed to */
 static int    handed;      /* PID 1 is the image's init, and this is the agent beside it */
 static int    run_made;    /* /run is a tmpfs made here, as an initramfs makes it */
@@ -1334,6 +1336,9 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	init_ = hull_access_value(doc, machine, "init");
 	if (init_ != NULL && init_[0] != '/')
 		return "the machine's init is not an absolute path";
+	user_ = hull_access_value(doc, machine, "user");
+	if (user_ != NULL && init_ != NULL)
+		return "(user ...) is whom a command runs as; an (init ...) starts its own";
 	{
 		char *disconnect = hull_access_value(doc, machine, "on_disconnect");
 
@@ -1695,6 +1700,25 @@ static const char *spawn(uint32_t ch, char *const *argv, const char *cwd, char *
 		if (cwd != NULL && chdir(cwd) != 0) {
 			fprintf(stderr, "hull agent: workdir %s: %s\n", cwd, strerror(errno));
 			_exit(127);
+		}
+		/* A (tree true) is hull's own, and reads what the user may not. */
+		if (user_ != NULL && argv[0] != NULL) {
+			static char home[300];
+			hull_user   user;
+			const char *wrong = hull_user_resolve("", user_, &user);
+			unsigned    i = 0u;
+
+			if (wrong != NULL || hull_user_become(&user) != 0) {
+				fprintf(stderr, "hull agent: %s\n", wrong != NULL ? wrong : strerror(errno));
+				_exit(126);
+			}
+			while (i < n && strncmp(envp[i], "HOME=", 5u) != 0)
+				i++;
+			if (i == n) {
+				snprintf(home, sizeof home, "HOME=%s", user.home);
+				envp[n] = home;
+				envp[n + 1u] = NULL;
+			}
 		}
 		if (no_new_privs)
 			prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);

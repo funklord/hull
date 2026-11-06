@@ -138,6 +138,22 @@ ENTRYPOINT ["/srv/app"]
 CMD echo hi
 HEALTHCHECK CMD true
 DF
+cat > "$dir/Dockerfile.user" <<'DF'
+FROM debian:13-slim AS one
+RUN echo as-root
+USER app:app
+RUN echo as-app
+USER root
+RUN echo root-again
+USER app
+FROM debian:13-slim
+RUN echo next-stage
+DF
+"$hull" import "$dir/Dockerfile.user" > "$dir/user.build" 2>&1
+expect 0 '\(run "echo as-app"\) \(user "app:app"\)' cat "$dir/user.build"
+expect 0 '\(run "echo as-root"\)\)' cat "$dir/user.build"
+expect 0 '\(run "echo root-again"\)\)' cat "$dir/user.build"
+expect 0 '\(run "echo next-stage"\)\)' cat "$dir/user.build"
 "$hull" import "$dir/Dockerfile.in" > "$dir/imported.build" 2>&1
 expect 0 'no machine to plan, only a build' "$hull" plan -f "$dir/imported.build"
 gb() {
@@ -224,6 +240,8 @@ expect 0 '\(NESTED "down"\)' "$hull" import "$dir/vars/compose.yaml"
 expect 0 '\(FROMFILE "1"\)' "$hull" import "$dir/vars/compose.yaml"
 expect 0 '\(memory "256M"\) \(cpus 2\)' "$hull" import "$dir/vars/compose.yaml"
 expect 0 '; key not translated: labels' "$hull" import "$dir/vars/compose.yaml"
+printf 'services:\n  web:\n    image: alpine\n    user: "1000:1000"\n' > "$dir/vars/user.yaml"
+expect 0 '\(user "1000:1000"\)' "$hull" import "$dir/vars/user.yaml"
 cases=$((cases + 1))
 "$hull" import "$dir/vars/compose.yaml" | grep -q 'lost' &&
 	fail 'environment wins over env_file' "$("$hull" import "$dir/vars/compose.yaml")"
@@ -2273,6 +2291,50 @@ from_root 0 '^ran$' -f "$root/onemap.conf"
 cases=$((cases + 1))
 printf '%s\n' "$out" | grep -q 'one uid is mapped' &&
 	fail "one uid was said where many are mapped" "$out"
+# (user ...): whom the command runs as, by the machine's own files, as many
+# uids mapped and as the one the host gives. One uid can be any uid, so there
+# the map itself says it, with nothing to switch to.
+mkdir -p "$root/userfs/etc"
+cp "$root/rootfs/probe" "$root/userfs/probe"
+printf 'root:x:0:0::/root:/x\napp:x:4321:4322::/home/app:/x\n' > "$root/userfs/etc/passwd"
+printf 'app:x:4322:\nextra:x:4400:app\n' > "$root/userfs/etc/group"
+user_conf() { # NAME ENTRIES...
+	name=$1
+	shift
+	printf '(machine (source "dir:./userfs") (backend chroot) (mutable overlay) %s)\n' "$*" > "$root/$name.conf"
+}
+user_conf username '(command "/probe" "uid" "env" "HOME") (user "app")'
+from_root 0 '^uid=4321$' -f "$root/username.conf"
+says_home=$out
+cases=$((cases + 1))
+printf '%s\n' "$says_home" | grep -q '/home/app' || fail "a user's HOME came from its passwd" "$says_home"
+user_conf userhome '(command "/probe" "env" "HOME") (user "app") (env (HOME "/given"))'
+from_root 0 '/given' -f "$root/userhome.conf"
+user_conf usernum '(command "/probe" "uid") (user "5000:5001")'
+from_root 0 '^uid=5000$' -f "$root/usernum.conf"
+user_conf usernone '(command "/probe" "uid") (user "nobody")'
+from_root 125 'names a user the machine.s /etc/passwd does not' -f "$root/usernone.conf"
+user_conf usergroup '(command "/probe" "uid") (user "app:nogroup")'
+from_root 125 'names a group the machine.s /etc/group does not' -f "$root/usergroup.conf"
+user_conf userinit '(init "/probe") (user "app")'
+from_root 125 'an \(init ...\) starts its own' -f "$root/userinit.conf"
+expect 0 '^uid=4321$' \
+	unshare -r env XDG_RUNTIME_DIR="$root/onerun" sh -c 'cd / && exec "$0" run -f "$1"' \
+	"$(cd "$(dirname "$hull")" && pwd)/$(basename "$hull")" "$root/username.conf"
+sleep 2
+user_conf userexec '(command "/probe" "say" "up" "wait") (user "app") (hostname "asapp")'
+timeout 20 "$hull" run -f "$root/userexec.conf" > /dev/null 2>&1 &
+pid=$!
+n=0
+while [ "$n" -lt 50 ] && ! "$hull" ps 2> /dev/null | grep -q '^asapp .* running'; do
+	sleep 0.2
+	n=$((n + 1))
+done
+expect 0 '^uid=4321$' "$hull" exec asapp -- /probe uid
+"$hull" stop asapp > /dev/null 2>&1
+wait "$pid"
+printf '(machine (source "dir:./rootfs") (backend dos) (command "HELLO") (user "app"))\n' > "$root/userdos.conf"
+expect 1 'user: rejected' "$hull" plan -f "$root/userdos.conf"
 sleep 2
 rm -rf "${root:?}/onerun"
 expect 1 'no such machine' "$hull" stats nobody

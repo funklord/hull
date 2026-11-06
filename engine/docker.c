@@ -59,6 +59,7 @@
 #include <netinet/in.h>
 
 #include "access.h"
+#include "user.h"
 #include "builtin.h"
 #include "sha256.h"
 #include "stack.h"
@@ -76,6 +77,7 @@ struct hull_machine {
 	hull_core       *core;
 	char            *body;       /* the create request */
 	char             name[96];
+	char             user[128];  /* (user ...), or "" for the invoking user */
 	char             id[80];     /* the container, once created */
 	int              attach;     /* the attach stream, once started */
 	pthread_t        reader;
@@ -1224,8 +1226,12 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	/* As the user, unless root mode granted a capability, which docker
 	 * gives only to a root workload: then the container's root, its
 	 * capabilities those granted (section 7). */
-	if (!root_granted(doc, "security.allow"))
+	if (m->user[0] != '\0') {
+		add_text(&body, ",\"User\":");
+		add_json(&body, m->user);
+	} else if (!root_granted(doc, "security.allow")) {
 		addf(&body, ",\"User\":\"%u:%u\"", (unsigned)getuid(), (unsigned)getgid());
+	}
 	add_text(&body, ",\"Labels\":{\"hull.machine\":");
 	add_json(&body, m->name);
 	add_text(&body, "}");
@@ -3212,6 +3218,19 @@ static hull_status docker_create(hull_core *core, hull_buf plan, hull_machine **
 	snprintf(m->name, sizeof m->name, "hull-%s-%ld-%u", hostname != NULL ? hostname : "machine",
 	         (long)getpid(), machines_made++);
 	free(hostname);
+	{
+		char *user = hull_access_value(&doc, &machine, "user");
+
+		if (user != NULL && hull_user_is_root(user)) {
+			free(user);
+			release(m);
+			return fail(error, HULL_ERR_UNSUPPORTED, "(user root): under a rootful daemon a "
+			            "container's root is the host's, which docker's adapter does not use");
+		}
+		if (user != NULL)
+			snprintf(m->user, sizeof m->user, "%s", user);
+		free(user);
+	}
 
 	reason = read_stacks(m, &doc, &machine);
 	if (reason == NULL)
@@ -3807,7 +3826,13 @@ static hull_status docker_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	tty = hull_access_terminal(&doc, &message, &cols, &rows);
 	add_text(&body, "{\"AttachStdin\":true,\"AttachStdout\":true,\"AttachStderr\":true,");
 	addf(&body, "\"Tty\":%s,", tty ? "true" : "false");
-	addf(&body, "\"User\":\"%u:%u\",\"Cmd\":[", (unsigned)getuid(), (unsigned)getgid());
+	if (m->user[0] != '\0') {
+		add_text(&body, "\"User\":");
+		add_json(&body, m->user);
+		add_text(&body, ",\"Cmd\":[");
+	} else {
+		addf(&body, "\"User\":\"%u:%u\",\"Cmd\":[", (unsigned)getuid(), (unsigned)getgid());
+	}
 	add_strings(&body, &doc, &argv);
 	add_text(&body, "]}");
 	st = calloc(1u, sizeof *st);
@@ -4111,6 +4136,7 @@ static const hull_cap_entry entries[] = {
 	/* "ports/volumes/env map directly" (5.0). */
 	{ "command",            HULL_SUP_NATIVE,   NULL, NULL },
 	{ "workdir",            HULL_SUP_NATIVE,   NULL, NULL },
+	{ "user",               HULL_SUP_NATIVE,   NULL, NULL },
 	{ "env",                HULL_SUP_NATIVE,   NULL, NULL },
 	{ "network.host",       HULL_SUP_NATIVE,   NULL, NULL },
 	{ "network.nat",        HULL_SUP_NATIVE,   "docker's own bridge, as no network key gives", NULL },

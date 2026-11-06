@@ -32,6 +32,7 @@
 #include <strings.h>
 
 #include "import.h"
+#include "user.h"
 
 #define MAX_ENV   128
 
@@ -157,6 +158,7 @@ static unsigned              given_count;
 static const char           *given_target;
 
 typedef struct build {
+	char      user[128];    /* the USER in force for a RUN, or "" for root */
 	sb       steps;        /* each (step ...) as it is met */
 	char     env_name[MAX_ENV][256];
 	char     env_value[MAX_ENV][1024];
@@ -458,6 +460,11 @@ static void do_run(build *b, char *arg)
 	sb_str(&b->steps, "\") (run ");
 	sb_quoted(&b->steps, trim(arg));
 	sb_str(&b->steps, ")");
+	if (b->user[0] != '\0') {
+		sb_str(&b->steps, " (user ");
+		sb_quoted(&b->steps, b->user);
+		sb_str(&b->steps, ")");
+	}
 	step_context(b, &b->steps);
 	sb_str(&b->steps, ")");
 }
@@ -723,6 +730,7 @@ static int import_dockerfile(FILE *file)
 					free(base);
 				}
 				b.had_from = 1;
+				b.user[0] = '\0';   /* a stage starts as its base's root */
 				b.arg_count = 0u;
 				while (strncmp(word, "--", 2u) == 0) {   /* --platform and the like */
 					char *end = strpbrk(word, " \t");
@@ -769,7 +777,9 @@ static int import_dockerfile(FILE *file)
 				sb_str(&after, "\n    (user ");
 				sb_quoted(&after, trim(s));
 				sb_str(&after, ")");
-				note(&b.steps, "USER set on the image; a RUN is not run as it", trim(s));
+				/* Every RUN after it runs as it, root being what one runs as
+				 * unasked. */
+				snprintf(b.user, sizeof b.user, "%s", hull_user_is_root(trim(s)) ? "" : trim(s));
 			} else if (strcmp(instr, "STOPSIGNAL") == 0) {
 				sb_str(&after, "\n    (stop_signal ");
 				sb_quoted(&after, trim(s));
@@ -877,6 +887,7 @@ typedef struct svc {
 	sb   file_env;         /* env_file:'s `NAME=value` lines, environment: winning */
 	char memory[32];       /* from mem_limit: */
 	char cpus[16];         /* from cpus:, a whole number */
+	char user[128];        /* from user: */
 	hull_build_arg build_arg[HULL_MAX_BUILD_ARGS];
 	unsigned build_arg_count;
 	int  args_indent;      /* where build's args: key is, or -1 */
@@ -1443,6 +1454,11 @@ static void svc_flush(svc *s, sb *out)
 	if (s->memory[0] != '\0') {
 		sb_str(out, " (memory ");
 		sb_quoted(out, s->memory);
+		sb_str(out, ")");
+	}
+	if (s->user[0] != '\0') {
+		sb_str(out, " (user ");
+		sb_quoted(out, s->user);
 		sb_str(out, ")");
 	}
 	if (s->cpus[0] != '\0') {
@@ -2283,9 +2299,9 @@ static char *compose_text(FILE *file, const char *project)
 				snprintf(s.cpus, sizeof s.cpus, "%s", text);
 			else
 				svc_note(&s, "cpus of a fraction not translated", text);
-		} else if (strcmp(key, "user") == 0)
-			svc_note(&s, "user not translated", scalar(value));
-		else if (strcmp(key, "network_mode") == 0) {
+		} else if (strcmp(key, "user") == 0) {
+			snprintf(s.user, sizeof s.user, "%s", scalar(value));
+		} else if (strcmp(key, "network_mode") == 0) {
 			/* bridge is docker's own network, which hull's nat names on
 			 * every engine; host and none are hull's as they are. Another
 			 * container's network, service: or container:, hull has no
