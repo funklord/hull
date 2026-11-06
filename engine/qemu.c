@@ -75,6 +75,7 @@
 #include <linux/vm_sockets.h>
 
 #include "access.h"
+#include "hw.h"
 #include "hostnet.h"
 #include "rootmode.h"
 #include "usage.h"
@@ -447,22 +448,6 @@ static void release(hull_machine *m)
 /* --- reading the plan ---------------------------------------------------- */
 
 /* J.1's `memory`, "2G" or "512M" or bytes, in MiB; 0 if it is not one. */
-static unsigned long mebibytes(const char *text)
-{
-	char         *end;
-	unsigned long n = strtoul(text, &end, 10);
-
-	if (end == text)
-		return 0u;
-	if (*end == 'G' || *end == 'g')
-		return n * 1024u;
-	if (*end == 'M' || *end == 'm')
-		return n;
-	if (*end == 'K' || *end == 'k')
-		return n / 1024u;
-	return *end == '\0' ? n / (1024u * 1024u) : 0u;
-}
-
 static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 {
 	hull_sexpr_form top;
@@ -689,7 +674,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	}
 	m->memory_mib = 512u;
 	if ((text = hull_access_value(doc, &machine, "memory")) != NULL) {
-		m->memory_mib = mebibytes(text);
+		m->memory_mib = hull_size_mib(text);
 		free(text);
 		if (m->memory_mib < 64u)
 			return "memory is not a size of 64M or more";

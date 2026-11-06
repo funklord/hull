@@ -221,6 +221,24 @@ static void add_member(hull_pool *pool, const hull_sexpr_doc *doc, const hull_se
 	pool->count++;
 }
 
+unsigned hull_size_mib(const char *text)
+{
+	char              *end;
+	unsigned long long n = strtoull(text, &end, 10);
+
+	if (end == text)
+		return 0u;
+	if (*end == 'G' || *end == 'g')
+		n *= 1024u;
+	else if (*end == 'K' || *end == 'k')
+		n /= 1024u;
+	else if (*end == '\0')
+		n /= 1024u * 1024u;
+	else if (*end != 'M' && *end != 'm')
+		return 0u;
+	return n > 0x7fffffffu ? 0u : (unsigned)n;
+}
+
 int hull_pool_read(const char *name, hull_pool *pool)
 {
 	size_t          length = 0u;
@@ -246,6 +264,13 @@ int hull_pool_read(const char *name, hull_pool *pool)
 		pool->capacity = strtoll(capacity, &end, 10);
 		if (*end != '\0' || pool->capacity < 0)
 			snprintf(pool->wrong, sizeof pool->wrong, "(capacity %s) is not a count", capacity);
+		field(&doc, &entry, "memory", capacity, sizeof capacity);
+		if (capacity[0] != '\0' && (pool->memory_mib = hull_size_mib(capacity)) == 0u)
+			snprintf(pool->wrong, sizeof pool->wrong, "(memory %s) is not a size", capacity);
+		field(&doc, &entry, "cpus", capacity, sizeof capacity);
+		pool->cpus = (unsigned)strtoul(capacity, &end, 10);
+		if (*end != '\0')
+			snprintf(pool->wrong, sizeof pool->wrong, "(cpus %s) is not a count", capacity);
 		if (hull_access_find(&doc, &entry, "members", &members) &&
 		    hull_sexpr_child(&doc, &members, &item))
 			while (hull_sexpr_next(&doc, &item, &item))

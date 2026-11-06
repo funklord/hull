@@ -3524,7 +3524,8 @@ cat > "$root/home/.config/hull/pools.conf" <<'CONF'
   (tonly (members (slot "only" (by_name true))))
   (tboth (members (slot "both" (by_name true) (priority 1))))
   (tword (members (slot "word" (by_name maybe))))
-  (tend (capacity 1)))
+  (tend (capacity 1))
+  (tbudget (capacity 4) (memory "1G") (cpus 3)))
 CONF
 expect 0 '^plain +slot +5 +free +-$' "$hull" pool ls tmix
 expect 0 '^gpu +slot +-1 +free +-$' "$hull" pool ls tmix
@@ -3717,6 +3718,13 @@ sleep 3
 refute "$gone" "$hull" lease ls
 cases=$((cases + 1))
 [ ! -e "$XDG_RUNTIME_DIR/hull/leases/$gone" ] || fail "a lease past its end kept its file" ""
+# A budget, of what plans declare: more than all of it, or nothing declared,
+# cannot be held to it and is refused, 125. What a running machine spends is
+# in test/qemu_test.sh: a chroot machine's memory wants a systemd scope.
+conf phuge '(pool "tbudget") (hostname "phuge") (memory "2G") (cpus 1) (command "/probe" "say" "ran")'
+conf pnone '(pool "tbudget") (hostname "pnone") (command "/probe" "say" "ran")'
+expect 125 'pool tbudget.s budget is less than the machine declares' "$hull" run -f "$root/phuge.conf"
+expect 125 'the machine needs its \(memory ...\) and \(cpus ...\)' "$hull" run -f "$root/pnone.conf"
 # --json: the same records as an array, read back by a JSON parser.
 jsoned=$(timeout 20 "$hull" reserve tmix --member gpu --for 1h)
 cases=$((cases + 1))

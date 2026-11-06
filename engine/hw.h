@@ -32,10 +32,15 @@ typedef struct hull_member {
 
 typedef struct hull_pool {
 	long long   capacity;  /* (capacity N), unnamed slots at priority 0; or 0 */
+	unsigned    memory_mib;  /* (memory "16G"), what its machines may declare in all; or 0 */
+	unsigned    cpus;        /* (cpus N), the same; or 0 */
 	unsigned    count;
 	hull_member members[HULL_POOL_MEMBERS];  /* in the order they fill */
 	char        wrong[200];                  /* what the file says that cannot be, or "" */
 } hull_pool;
+
+/* A size, "16G", "512M", "1024K" or bytes: mebibytes, or 0 where it is not one. */
+unsigned hull_size_mib(const char *text);
 
 /* The pool `name` of pools.conf: 0, or -1 where it does not name it. */
 int hull_pool_read(const char *name, hull_pool *pool);

@@ -2939,6 +2939,52 @@ print("ready" if b"hull-agent ready\n" in got else "not ready: " + repr(got[-200
 fi
 rm -f "$root/boot.img" "$root/boot2.img" "$root/boot.serial"
 
+# A pool's budget, of what plans declare (section 4.12), on vms, whose memory
+# is a hard allocation: past it a run is told 75 or waits, by memory or by
+# cpus; one that fits goes past; a lease's machine is held to it as it runs.
+pools_dir=${XDG_CONFIG_HOME:-$HOME/.config}/hull
+mkdir -p "$pools_dir"
+printf '(pools (tb (capacity 4) (memory "1G") (cpus 3)))\n' > "$pools_dir/pools.conf"
+conf vbig '(backend vm) (pool "tb") (hostname "vbig") (memory "768M") (cpus 1)' \
+	'(command "/probe" "say" "ready" "sleep" "20")'
+conf vover '(backend vm) (pool "tb") (hostname "vover") (memory "512M") (cpus 1) (command "/probe" "say" "ran")'
+conf vcpus '(backend vm) (pool "tb") (hostname "vcpus") (memory "64M") (cpus 3) (command "/probe" "say" "ran")'
+conf vfits '(backend vm) (pool "tb") (hostname "vfits") (memory "128M") (cpus 1) (command "/probe" "say" "ran")'
+rm -f "$root/vbig.out"
+(cd / && exec timeout -k 2 80 "$hull" run -f "$root/vbig.conf" > "$root/vbig.out" 2>&1) &
+vbig=$!
+tries=0
+until grep -q '^ready$' "$root/vbig.out" 2>/dev/null || [ "$tries" -ge 120 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+name='a budget spent, by memory'
+out=$(cd / && timeout 30 "$hull" run --no-wait -f "$root/vover.conf" 2>&1)
+got=$?
+has 75 'no slot of pool tb: 768M of its 1024M of memory declared, and this asks 512M'
+name='a budget spent, by cpus'
+out=$(cd / && timeout 30 "$hull" run --no-wait -f "$root/vcpus.conf" 2>&1)
+got=$?
+has 75 'no slot of pool tb: 1 of its 3 cpus declared, and this asks 3'
+name='what fits the budget goes past'
+out=$(cd / && timeout 60 "$hull" run --no-wait -f "$root/vfits.conf" 2>&1)
+got=$?
+has 0 '^ran$'
+name='a budget spent, under a lease'
+held=$(timeout 20 "$hull" reserve tb)
+out=$(cd / && timeout 30 "$hull" run --lease "$held" -f "$root/vover.conf" 2>&1)
+got=$?
+has 75 'no slot of pool tb: 768M of its 1024M'
+timeout 20 "$hull" release "$held"
+name='a run waits for the budget'
+boot vover 90
+has 0 '^ran$'
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q 'waiting for a slot of pool tb: 768M of its 1024M' ||
+	fail 'a run past the budget did not say it waits' "$out"
+wait "$vbig" 2>/dev/null
+rm -f "$pools_dir/pools.conf"
+
 # Nothing left: no qemu of this suite's, no passt, no machine directory.
 cases=$((cases + 1))
 sleep 2

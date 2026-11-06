@@ -588,6 +588,9 @@ pool's `(capacity N)` and its slots, a hw machine on its boards.
 - `hull reserve bench --member fpga` holds that entry, and `hull run --lease ID`
   runs on it. `--count N` adds whatever fills first, and `--kind board` keeps
   that to boards.
+- `(memory "16G")` and `(cpus 8)` on a pool cap what its running machines
+  declare between them. A run past that waits as for a slot, and a machine
+  declaring neither is refused.
 - `hull reserve bench --for 30m` gives the lease an end. A machine still under
   it is stopped and exits 79, as it does if the lease is released.
 - `hull pool ls bench` lists the entries in the order they fill, with who

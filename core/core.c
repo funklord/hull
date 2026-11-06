@@ -143,6 +143,8 @@ struct slot {
 	char               lease[24];      /* the lease it runs under, or "" */
 	char               member[64];     /* the pool's entry it holds, or "" for an unnamed slot */
 	int                lease_ended;    /* its lease ended under it: status 79, section 4.12 */
+	unsigned           memory_mib;     /* what its plan declares, against its pool's budget */
+	unsigned           cpus;
 	hull_core          core;
 	hull_machine      *handle;
 	char               state[16];
@@ -1648,7 +1650,7 @@ static void forget_ssh(slot *s)
  * should this one go without stopping it, killed or crashed.
  *
  *     (4:kept (7:machine ID) (6:engine NAME) (5:class CLASS) (5:lease L)
- *             (6:member M) (4:pool P) (5:state S))
+ *             (6:member M) (4:cpus N) (6:memory MIB) (4:pool P) (5:state S))
  *
  * canonical, S the engine's persist(). It is written whole, by a rename,
  * once the machine has started, and removed once it has exited. A core
@@ -1691,6 +1693,10 @@ static void keep_machine(slot *s)
 	hull_msg_text(&m, s->lease);
 	hull_msg_raw(&m, ")(6:member");
 	hull_msg_text(&m, s->member);
+	hull_msg_raw(&m, ")(4:cpus");
+	hull_msg_number(&m, s->cpus);
+	hull_msg_raw(&m, ")(6:memory");
+	hull_msg_number(&m, s->memory_mib);
 	hull_msg_raw(&m, ")(4:pool");
 	hull_msg_text(&m, s->pool);
 	hull_msg_raw(&m, ")(5:state");
@@ -1792,6 +1798,7 @@ static int adopt_one(const char *id)
 	snprintf(s->state, sizeof s->state, "adopting");
 	{
 		hull_sexpr_form held;
+		long long       number = 0;
 
 		if (hull_msg_find(&doc, "pool", &held))
 			hull_msg_string(&doc, &held, s->pool, sizeof s->pool);
@@ -1799,6 +1806,10 @@ static int adopt_one(const char *id)
 			hull_msg_string(&doc, &held, s->lease, sizeof s->lease);
 		if (hull_msg_find(&doc, "member", &held))
 			hull_msg_string(&doc, &held, s->member, sizeof s->member);
+		if (hull_msg_find(&doc, "memory", &held) && hull_msg_long(&doc, &held, &number))
+			s->memory_mib = (unsigned)number;
+		if (hull_msg_find(&doc, "cpus", &held) && hull_msg_long(&doc, &held, &number))
+			s->cpus = (unsigned)number;
 	}
 	status = engine->ops->adopt(&s->core, state, &s->handle, &error);
 	if (status == HULL_OK) {
@@ -1814,6 +1825,7 @@ static int adopt_one(const char *id)
 	s->kept = 0;
 	s->handle = NULL;
 	s->pool[0] = s->lease[0] = s->member[0] = '\0';
+	s->memory_mib = s->cpus = 0u;
 	if (status == HULL_ERR_GONE || status == HULL_ERR_UNSUPPORTED) {
 		fprintf(stderr, "hull core: machine %s is forgotten: %s\n", id, why);
 		unlink(path);
@@ -2262,7 +2274,10 @@ typedef struct want {
 	int      kind;
 	unsigned count;
 	unsigned named;
+	int      is_run;      /* a run, not a lease */
 	char     names[HULL_POOL_MEMBERS][64];
+	unsigned memory_mib;  /* a run's, as its plan declares, against the pool's budget */
+	unsigned cpus;
 } want;
 
 typedef struct waiting {
@@ -2349,6 +2364,40 @@ static unsigned unnamed_held(const char *pool)
 	return n;
 }
 
+/* What the machines of `pool` declare, running now. */
+static void declared_in(const char *pool, unsigned *memory_mib, unsigned *cpus)
+{
+	*memory_mib = *cpus = 0u;
+	for (unsigned i = 0u; i < MAX_MACHINES; i++)
+		if (machines[i].used && !machines[i].exited && strcmp(machines[i].pool, pool) == 0) {
+			*memory_mib += machines[i].memory_mib;
+			*cpus       += machines[i].cpus;
+		}
+}
+
+/* Whether a run's declared memory and cpus fit what the pool's budget has
+ * left: 0 where a line for a person is written, in `text` if it is given. */
+static int within_budget(const char *pool, const hull_pool *p, const want *w, char *text, size_t cap)
+{
+	unsigned memory_mib;
+	unsigned cpus;
+
+	declared_in(pool, &memory_mib, &cpus);
+	if (p->memory_mib != 0u && memory_mib + w->memory_mib > p->memory_mib) {
+		if (text != NULL)
+			snprintf(text, cap, "%uM of its %uM of memory declared, and this asks %uM",
+			         memory_mib, p->memory_mib, w->memory_mib);
+		return 0;
+	}
+	if (p->cpus != 0u && cpus + w->cpus > p->cpus) {
+		if (text != NULL)
+			snprintf(text, cap, "%u of its %u cpus declared, and this asks %u", cpus, p->cpus,
+			         w->cpus);
+		return 0;
+	}
+	return 1;
+}
+
 /* A pool with neither a capacity nor members is the limit of nothing. */
 static int is_unlimited(const hull_pool *p)
 {
@@ -2384,6 +2433,25 @@ static const hull_member *member_of(const hull_pool *p, const char *name)
 		if (strcmp(p->members[i].name, name) == 0)
 			return &p->members[i];
 	return NULL;
+}
+
+/* Whether a run can never be held to the pool's budget. A budget is of
+ * what plans declare, all there is at admission, so a machine declaring
+ * nothing could not be. A lease holds places and no budget: its machines
+ * are held to it as they run. */
+static int over_budget(const char *pool, const hull_pool *p, const want *w, char *why, size_t cap)
+{
+	if ((p->memory_mib != 0u && w->memory_mib == 0u) || (p->cpus != 0u && w->cpus == 0u)) {
+		snprintf(why, cap, "pool %s has a budget of what machines declare: the machine needs "
+		         "its (memory ...) and (cpus ...)", pool);
+		return 1;
+	}
+	if ((p->memory_mib != 0u && w->memory_mib > p->memory_mib) ||
+	    (p->cpus != 0u && w->cpus > p->cpus)) {
+		snprintf(why, cap, "pool %s's budget is less than the machine declares", pool);
+		return 1;
+	}
+	return 0;
 }
 
 /* Whether `w` can never be had of the pool, whatever is released: said
@@ -2433,6 +2501,8 @@ static int refused(const char *pool, const hull_pool *p, want *w, const char *cl
 	}
 	if (w->kind == WANT_ANY && w->named == w->count && w->named > 0u && (boards == 0u || slots == 0u))
 		w->kind = boards > 0u ? WANT_BOARD : WANT_SOFTWARE;
+	if (w->is_run && w->kind == WANT_SOFTWARE && over_budget(pool, p, w, why, cap))
+		return 1;
 	if (is_unlimited(p)) {
 		if (w->kind != WANT_BOARD)
 			return 0;
@@ -2521,6 +2591,8 @@ static int pick(const char *pool, const hull_pool *p, const want *w, long long s
 	unsigned taken = 0u;
 	int      unnamed_done = w->kind == WANT_BOARD;
 
+	if (!within_budget(pool, p, w, NULL, 0u))
+		return 0;
 	if (w->kind != WANT_BOARD) {
 		unsigned held = unnamed_held(pool);
 
@@ -2572,6 +2644,8 @@ static void in_use(const char *pool, const hull_pool *p, const want *w, char *te
 			return;
 		}
 	tally(pool, p, w->kind, 1, &used, &total);
+	if (used < total && !within_budget(pool, p, w, text, cap))
+		return;
 	snprintf(text, cap, "%u of %u in use", used, total);
 }
 
@@ -2843,6 +2917,8 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	char               lease_id[24];
 	char               member[64] = "";
 	int                on_board;
+	unsigned           memory_mib = 0u;
+	unsigned           cpus = 0u;
 
 	if (!hull_msg_find(body, "machine", &value) || !hull_msg_string(body, &value, id, sizeof id) ||
 	    !is_label(id)) {
@@ -2877,6 +2953,12 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		name = hull_access_value(&plan_doc, &top, "engine");
 		on_board = name != NULL && strcmp(name, "board") == 0;
 		free(name);
+		if ((name = hull_access_value(&plan_doc, &machine, "memory")) != NULL)
+			memory_mib = hull_size_mib(name);
+		free(name);
+		if ((name = hull_access_value(&plan_doc, &machine, "cpus")) != NULL)
+			cpus = (unsigned)strtoul(name, NULL, 10);
+		free(name);
 	}
 	/* Under a lease, `hull run --lease ID`, the plan's (under ID): a slot
 	 * of the lease's, its pool's already held, so it neither waits nor
@@ -2901,6 +2983,20 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 			else if (!lease_entry(l, on_board, member, sizeof member))
 				snprintf(why, sizeof why, "lease %s holds no %s free", l->id,
 				         on_board ? "board" : "slot for a software machine");
+			else if (!on_board) {
+				static hull_pool p;
+				want             asked = { .kind = WANT_SOFTWARE, .count = 1u, .is_run = 1,
+				                           .memory_mib = memory_mib, .cpus = cpus };
+				char             busy[100];
+
+				/* It has its place and neither waits nor takes another, so
+				 * a budget spent stops it here: a run past it would spend
+				 * what the host does not have. */
+				if (hull_pool_read(l->pool, &p) == 0 &&
+				    !over_budget(l->pool, &p, &asked, why, sizeof why) &&
+				    !within_budget(l->pool, &p, &asked, busy, sizeof busy))
+					snprintf(why, sizeof why, "no slot of pool %s: %s", l->pool, busy);
+			}
 			free(pool);
 			free(id_given);
 			if (why[0] != '\0') {
@@ -2927,13 +3023,15 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 			static hull_pool   p;
 			static held_member picked[HULL_POOL_MEMBERS];
 			want               asked = { .kind = on_board ? WANT_BOARD : WANT_SOFTWARE,
-			                             .count = 1u };
+			                             .count = 1u, .is_run = 1 };
 			long long          since = admitting != 0 ? admitting : monotonic_ms() + 1;
 			unsigned           count = 0u;
 			char               why[300];
 
 			snprintf(pool_name, sizeof pool_name, "%s", pool);
 			free(pool);
+			asked.memory_mib = memory_mib;
+			asked.cpus       = cpus;
 			if (hull_pool_read(pool_name, &p) != 0) {
 				snprintf(why, sizeof why, "pool %s is not one the user's pools.conf names: "
 				         "(pools (%s (capacity N))) in ~/.config/hull/pools.conf",
@@ -3104,6 +3202,8 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	snprintf(s->pool, sizeof s->pool, "%s", pool_name);
 	snprintf(s->lease, sizeof s->lease, "%s", lease_id);
 	snprintf(s->member, sizeof s->member, "%s", member);
+	s->memory_mib = memory_mib;
+	s->cpus       = cpus;
 	free(class_name);
 	/* Its arch, for what is committed of it while it runs; the host's is
 	 * said by saying none. */
