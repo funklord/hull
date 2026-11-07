@@ -2664,6 +2664,86 @@ if [ -r "$(dirname "$hull")/vmlinuz-hull" ]; then
 	has 4 '^read=Linux version '
 	refute_out '^read=Linux version .*deb13'
 	runs="$khnone $khrun"
+	# The micro profile (section 5.2): on hull's kernel a machine is a
+	# microvm, its devices on virtio-mmio and its PCI bus empty; a pin, TCG,
+	# no ELF of the kernel, or more volumes than there are slots, is q35, and
+	# each still runs.
+	if [ -r "$(dirname "$hull")/vmlinux-hull" ]; then
+		micro_conf() { # FILE BACKEND TUNING VOLUMES
+			printf '(machine (source "dir:./rootfs") (backend %s) (mutable overlay) %s %s %s)\n' \
+				"$2" "(tuning (vm (kernel hull) $3))" "${4:+(volumes $4)}" \
+				'(command "/probe" "list" "/sys/bus/pci/devices" "exit" "6")' > "$1"
+		}
+		micro_run() { # NAME FILE
+			name=$1
+			out=$(cd / && XDG_RUNTIME_DIR=$khrun timeout 120 "${3:-$hull}" run -f "$2" 2>&1)
+			got=$?
+		}
+		micro_conf "$root/micro.conf" vm '' ''
+		micro_run 'a vm on hull'"'"'s own kernel is a microvm' "$root/micro.conf"
+		has 6 '^list= *$'
+		micro_conf "$root/full.conf" vm '(profile full)' ''
+		micro_run '(profile full) on hull'"'"'s own kernel is q35' "$root/full.conf"
+		has 6 '^list= 0000:'
+		# The agent's port by name, which virtio-console announces after
+		# init has started on a machine this quick.
+		printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) %s %s)\n' \
+			'(tuning (vm (kernel hull)) (qemu (transport serial)))' \
+			'(command "/probe" "list" "/sys/bus/pci/devices" "exit" "6")' > "$root/microserial.conf"
+		micro_run 'a microvm over a serial port' "$root/microserial.conf"
+		has 6 '^list= *$'
+		printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) %s %s)\n' \
+			'(tuning (vm (kernel hull)) (qemu (transport uart)))' \
+			'(command "/probe" "list" "/sys/bus/pci/devices" "exit" "6")' > "$root/microuart.conf"
+		micro_run '(transport uart) on hull'"'"'s own kernel is q35' "$root/microuart.conf"
+		has 6 '^list= 0000:'
+		# Its NICs in the order q35 gives them: passt's eth0 and each segment
+		# next, which the agent and every wire rest on.
+		for profile in micro full; do
+			printf '(machine (source "dir:./rootfs") (backend vm) (hostname "nics") (mutable overlay) %s %s %s)\n' \
+				'(segments "mwa" "mwb" "mwc")' "(tuning (vm (kernel hull) (profile $profile)))" \
+				'(command "/probe" "read" "/sys/class/net/eth0/address" "read" "/sys/class/net/eth1/address" "read" "/sys/class/net/eth2/address" "read" "/sys/class/net/eth3/address" "exit" "6")' \
+				> "$root/nics-$profile.conf"
+		done
+		micro_run 'a microvm of four NICs' "$root/nics-micro.conf"
+		has 6 '^read=52:54:00:12:34:56$'
+		nics_micro=$(printf '%s\n' "$out" | grep '^read=')
+		micro_run 'q35 of four NICs' "$root/nics-full.conf"
+		has 6 '^read=52:54:00:12:34:56$'
+		name='a microvm'"'"'s NICs in q35'"'"'s order'
+		cases=$((cases + 1))
+		[ "$(printf '%s\n' "$out" | grep '^read=')" = "$nics_micro" ] && [ "$(printf '%s\n' "$nics_micro" | wc -l)" = 4 ] ||
+			fail "$name" "$nics_micro
+$out"
+		micro_conf "$root/microemu.conf" emu '' ''
+		micro_run 'hull'"'"'s own kernel under emu is q35' "$root/microemu.conf"
+		has 6 '^list= 0000:'
+		rm -rf "$root/noelfbin"
+		mkdir -p "$root/noelfbin"
+		cp "$hull" "$(dirname "$hull")/hull-agent" "$(dirname "$hull")/vmlinuz-hull" "$root/noelfbin/"
+		noelf=$(mktemp -d "$root/run-noelf.XXXXXX")
+		name='no vmlinux-hull beside hull is q35'
+		out=$(cd / && XDG_RUNTIME_DIR=$noelf timeout 120 "$root/noelfbin/hull" run -f "$root/micro.conf" 2>&1)
+		got=$?
+		has 6 '^list= 0000:'
+		runs="$runs $noelf"
+		volumes=
+		i=0
+		while [ "$i" -lt 16 ]; do
+			i=$((i + 1))
+			mkdir -p "$root/mv$i"
+			volumes="$volumes (volume (host \"$root/mv$i\") (guest \"/mv$i\"))"
+		done
+		micro_conf "$root/micro16.conf" vm '' "$volumes"
+		micro_run 'sixteen volumes fill a microvm' "$root/micro16.conf"
+		has 6 '^list= *$'
+		mkdir -p "$root/mv17"
+		micro_conf "$root/micro17.conf" vm '' "$volumes (volume (host \"$root/mv17\") (guest \"/mv17\"))"
+		micro_run 'seventeen volumes are q35' "$root/micro17.conf"
+		has 6 '^list= 0000:'
+	else
+		printf 'qemu: a microvm not tried: `make kernel` has not built vmlinux-hull\n'
+	fi
 else
 	printf 'qemu: hull'"'"'s own kernel not tried: `make kernel` has not built vmlinuz-hull\n'
 	runs=$khnone
@@ -2676,7 +2756,7 @@ for run in $runs; do
 	done
 	rm -rf "${run:?}"
 done
-rm -rf "${root:?}/nokernelbin"
+rm -rf "${root:?}/nokernelbin" "${root:?}/noelfbin"
 
 # Phase 2's exit, its ARM half (section 12): an arm64 directory rootfs on
 # x86 under emu, qemu-system-aarch64's virt machine booting Debian's arm64

@@ -162,6 +162,7 @@ KERNEL_SHA256  = a5f8c5be3fde2d6d9ca14e9631642cf1f44487143f11059da730dcd5892e307
 KERNEL_TAR     = $(BUILD_DIR)/kernel/linux-$(KERNEL_VERSION).tar.xz
 KERNEL_SRC     = $(BUILD_DIR)/kernel/linux-$(KERNEL_VERSION)
 KERNEL_BIN     = $(BUILD_DIR)/vmlinuz-hull
+KERNEL_ELF     = $(BUILD_DIR)/vmlinux-hull
 
 # Limine from source (section 3.13), beside hull in limine/, where
 # `hull export --bootable` takes it in place of the fetched 11.x UEFI
@@ -474,7 +475,7 @@ $(HULL): $(CLI_OBJS) $(CORE_OBJS) $(ENGINE_OBJS) $(STORE_OBJS) $(OCI_OBJS) $(PLA
 $(AGENT_BIN): $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
 	$(CC) -static $(CFLAGS) -o $@ $^
 
-kernel: $(KERNEL_BIN)
+kernel: $(KERNEL_BIN) $(KERNEL_ELF)
 
 $(KERNEL_TAR):
 	@mkdir -p '$(@D)'
@@ -494,6 +495,10 @@ $(KERNEL_BIN): $(KERNEL_TAR) kernel/x86_64.config
 	done
 	$(MAKE) -C '$(KERNEL_SRC)' bzImage
 	cp '$(KERNEL_SRC)/arch/x86/boot/bzImage' '$@'
+
+# The same kernel as an ELF, which qemu enters directly (section 5.2).
+$(KERNEL_ELF): $(KERNEL_BIN)
+	strip -o '$@' '$(KERNEL_SRC)/vmlinux'
 
 limine: $(LIMINE_FILES)
 

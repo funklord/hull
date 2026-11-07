@@ -106,6 +106,12 @@
 #define NETWORK_FD   3       /* passt's socket, in qemu */
 #define SEGMENT_FD   4       /* the first segment's port, in qemu */
 #define MAX_SEGMENTS 8u
+/* section 5.2. With its PIC left on, a microvm on hull's kernel dies before
+ * the console and qemu exits 0, 40 boots of 40, measured. No serial port of
+ * its own: the console is hvc0. */
+#define MICROVM_OPTIONS "microvm,pic=off,isa-serial=off"
+#define MICROVM_TRANSPORTS 24u /* virtio-mmio slots, measured: the 25th is refused */
+#define MICROVM_FIXED 8u       /* at most: console, rng, agent, root, net, sshd, cfs, objects */
 #define FLOW_IDLE    90      /* seconds a udp client's flow is kept unused */
 
 /* The guest's network, which the agent sets to the same addresses. */
@@ -145,6 +151,8 @@ struct hull_machine {
 	int              kernel_image; /* (kernel image): the image's own /hull/kernel */
 	int              kernel_fetched; /* (kernel fetched): `hull kernel fetch`'s, on any host */
 	int              kernel_hull;  /* (kernel hull): vmlinuz-hull beside hull, `make kernel`'s */
+	int              profile_full; /* (profile full): a q35 machine whatever the kernel */
+	int              micro;        /* this start is a microvm: virtio-mmio, no PCI */
 	char            *volume_host[MAX_VOLUMES];
 	int              volume_readonly[MAX_VOLUMES];
 	hull_stack       volume_stack[MAX_VOLUMES];  /* a volume of (layers ...), or count 0 */
@@ -646,6 +654,16 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			free(text);
 		}
 	}
+
+	/* (tuning (vm (profile ...))): micro is the key's default, and what it
+	 * comes to is settled at the start (micro_fits()); full is a pin. */
+	if (hull_access_find(doc, &machine, "tuning", &entry) &&
+	    hull_access_find(doc, &entry, "vm", &item) &&
+	    (text = hull_access_value(doc, &item, "profile")) != NULL) {
+		m->profile_full = strcmp(text, "full") == 0;
+		free(text);
+	}
+
 
 	/* (tuning (qemu (transport ...))): how the agent is reached. */
 	if (hull_access_find(doc, &machine, "tuning", &entry) &&
@@ -1641,28 +1659,17 @@ static void segment_mac(const hull_machine *m, unsigned i, char *out, size_t cap
 	         mac[5]);
 }
 
-/*
- * In qemu's child, in its own user and mount namespace: the overlay of the
- * machine's directory, its layers, each above the last, and its upper, or
- * a tmpfs where it keeps none, mounted at merged/ in its runtime
- * directory, as the chroot engine mounts its own (engine/chroot.c). The
- * upper's directory is cloned once with the work directory beside it,
- * which overlayfs wants on one mount, and that work directory is made the
- * user's own group and not setgid, overlayfs refusing one of a group the
- * namespace does not map. The step that failed, or NULL.
- */
-/* Whether `path` takes what virtiofs_daemon gives it, by its own --help: a
- * daemon too old for it, the C one qemu used to carry above all, would stop a
- * machine that 9p starts. Bounded by the alarm, which outlives the exec. */
-static int virtiofsd_fits(const char *path)
+/* What `program first second` prints, stdout and stderr, in text, at most
+ * five seconds of it: how a program installed here says what it can do. */
+static int help_text(const char *program, const char *first, const char *second, char *text,
+                     size_t cap)
 {
-	char   text[32768];
 	size_t have = 0u;
 	int    fds[2];
 	int    status;
 	pid_t  pid;
 
-	if (access(path, X_OK) != 0 || pipe2(fds, O_CLOEXEC) != 0)
+	if (pipe2(fds, O_CLOEXEC) != 0)
 		return 0;
 	pid = fork();
 	if (pid < 0) {
@@ -1674,12 +1681,12 @@ static int virtiofsd_fits(const char *path)
 		alarm(5u);
 		dup2(fds[1], STDOUT_FILENO);
 		dup2(fds[1], STDERR_FILENO);
-		execl(path, "virtiofsd", "--help", (char *)NULL);
+		execlp(program, program, first, second, (char *)NULL);
 		_exit(127);
 	}
 	close(fds[1]);
 	for (;;) {
-		ssize_t got = read(fds[0], text + have, sizeof text - 1u - have);
+		ssize_t got = read(fds[0], text + have, cap - 1u - have);
 
 		if (got < 0 && errno == EINTR)
 			continue;
@@ -1691,7 +1698,18 @@ static int virtiofsd_fits(const char *path)
 	text[have] = '\0';
 	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
 		;
-	return strstr(text, "--translate-uid") != NULL && strstr(text, "--no-announce-submounts") != NULL;
+	return 1;
+}
+
+/* Whether `path` takes what virtiofs_daemon gives it, by its own --help: a
+ * daemon too old for it, the C one qemu used to carry above all, would stop a
+ * machine that 9p starts. Bounded by the alarm, which outlives the exec. */
+static int virtiofsd_fits(const char *path)
+{
+	char text[32768];
+
+	return access(path, X_OK) == 0 && help_text(path, "--help", NULL, text, sizeof text) &&
+	       strstr(text, "--translate-uid") != NULL && strstr(text, "--no-announce-submounts") != NULL;
 }
 
 /* The daemon a share by virtiofs needs: HULL_VIRTIOFSD, or where the
@@ -1890,6 +1908,16 @@ static int virtiofs_daemons(const hull_machine *m)
 	return 1;
 }
 
+/*
+ * In qemu's child, in its own user and mount namespace: the overlay of the
+ * machine's directory, its layers, each above the last, and its upper, or
+ * a tmpfs where it keeps none, mounted at merged/ in its runtime
+ * directory, as the chroot engine mounts its own (engine/chroot.c). The
+ * upper's directory is cloned once with the work directory beside it,
+ * which overlayfs wants on one mount, and that work directory is made the
+ * user's own group and not setgid, overlayfs refusing one of a group the
+ * namespace does not map. The step that failed, or NULL.
+ */
 static const char *stage_overlay(const hull_machine *m)
 {
 	char   options[8800u + 16u * MAX_VOLUMES];
@@ -1994,6 +2022,8 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        device_chardev[HULL_MAX_DEVICES][600];
 	char        device_device[HULL_MAX_DEVICES][96];
 	char        shared_memory[96];
+	char        mmio[MICROVM_TRANSPORTS][128];
+	unsigned    mmio_count = 0u;
 	const char *argv[80 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS + 4u * HULL_MAX_DEVICES + 2u];
 	unsigned    serial = 0u;
 	unsigned    parallel = 0u;
@@ -2050,7 +2080,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	argv[n++] = "none";
 	argv[n++] = "-no-reboot";
 	argv[n++] = "-M";
-	argv[n++] = m->arm64 ? "virt" : "q35";
+	argv[n++] = m->arm64 ? "virt" : m->micro ? MICROVM_OPTIONS : "q35";
 	argv[n++] = "-accel";
 	argv[n++] = m->emu ? "tcg" : "kvm";
 	argv[n++] = "-cpu";
@@ -2328,6 +2358,17 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		argv[n++] = "-device";
 		argv[n++] = segment_device[i];
 	}
+	/* A microvm has no PCI bus: each virtio device is the same device on
+	 * virtio-mmio, by its other name, done here so that none is left out. */
+	for (unsigned i = 1u; m->micro && i < n; i++) {
+		const char *pci = strcmp(argv[i - 1u], "-device") == 0 ? strstr(argv[i], "-pci") : NULL;
+
+		if (pci != NULL && mmio_count < MICROVM_TRANSPORTS) {
+			snprintf(mmio[mmio_count], sizeof mmio[mmio_count], "%.*s-device%s",
+			         (int)(pci - argv[i]), argv[i], pci + 4);
+			argv[i] = mmio[mmio_count++];
+		}
+	}
 	argv[n] = NULL;
 
 	/* The parent maps the user's subordinate range into the child's user
@@ -2542,6 +2583,47 @@ static void last_line(const hull_machine *m, const char *file, char *out, size_t
 	line = strrchr(text, '\n');
 	snprintf(out, cap, "%s", line != NULL ? line + 1 : text);
 	free(data);
+}
+
+/* Whether this qemu has the machine: a distribution may leave it out, and
+ * once asked is enough for a core. */
+static int qemu_has_microvm(void)
+{
+	static int known = -1;
+	char       text[16384];
+
+	if (known < 0)
+		known = help_text("qemu-system-x86_64", "-M", "help", text, sizeof text) &&
+		        strstr(text, "\nmicrovm ") != NULL;
+	return known;
+}
+
+/* Whether this start is a microvm (section 5.2), and if so kernel, which
+ * holds vmlinuz-hull's path, becomes vmlinux-hull's: qemu enters that
+ * directly by PVH, where a bzImage goes through firmware and decompressing.
+ * Only hull's kernel is known to have virtio-mmio and PVH, a distribution's
+ * having the first as a module and no way to say so; KVM's alone, 5 boots of
+ * 30 hanging before the console under TCG, measured, and none of q35's; and a
+ * microvm has no bus for a device of the host's or a UART for the agent.
+ * Anything else is q35. */
+static int micro_fits(const hull_machine *m, char *kernel, size_t cap)
+{
+	char        elf[4300];
+	char       *slash;
+	unsigned    transports = MICROVM_FIXED + m->volume_count + m->segment_count;
+
+	if (m->profile_full || m->arm64 || m->emu || m->device_count != 0u || m->transport == 3 ||
+	    transports > MICROVM_TRANSPORTS || !qemu_has_microvm())
+		return 0;
+	snprintf(elf, sizeof elf, "%s", kernel);
+	slash = strrchr(elf, '/');
+	if (slash == NULL || (size_t)(slash - elf) + sizeof "/vmlinux-hull" > sizeof elf)
+		return 0;
+	memcpy(slash, "/vmlinux-hull", sizeof "/vmlinux-hull");
+	if (access(elf, R_OK) != 0)
+		return 0;
+	snprintf(kernel, cap, "%s", elf);
+	return 1;
 }
 
 /* The agent's channel for a new machine: 1, vsock; 0, a virtio-serial
@@ -3624,6 +3706,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 			            "and there is none: `make kernel` builds it");
 		kernel = kbuf;
 		load_modules = 0;
+		m->micro = micro_fits(m, kbuf, sizeof kbuf);
 	} else if (m->arm64 && m->kernel_path == NULL && !m->kernel_image) {
 		const hull_kernel_pin *pin = hull_kernel_pin_of("arm64");
 		char                   fetched[4096];
@@ -4995,8 +5078,11 @@ static const hull_cap_entry entries[] = {
 	/* J.5. A q35 machine on the host's own kernel stands in for the
 	 * micro profile and Appendix F's bundled kernel. */
 	{ "vm.profile.micro",    HULL_SUP_EMULATED,
-	  "a q35 machine on the host's kernel, which boots in about two seconds; an arm64 "
-	  "machine is qemu's virt under emu", NULL },
+	  "a q35 machine, about a second to boot, on every kernel but hull's own, which under KVM is "
+	  "a microvm where the machine has no device of the host's; an arm64 machine is "
+	  "qemu's virt under emu", NULL },
+	{ "vm.profile.full",     HULL_SUP_NATIVE,
+	  "a q35 machine, whatever the kernel; an arm64 machine is qemu's virt", NULL },
 	{ "vm.kernel.bundled",   HULL_SUP_EMULATED,
 	  "the host's own kernel and modules, until Appendix F ships one; for an arm64 machine "
 	  "Debian's arm64 kernel, `hull kernel fetch --arch arm64`'s", NULL },
