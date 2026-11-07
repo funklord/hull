@@ -2608,21 +2608,12 @@ static int  port_dropped;
 static int  port_uart;
 /* What the agent says on a UART once it may be written to (listen_host). */
 #define UART_READY "hull-agent ready\n"
+#define PORT_WAIT 3000u /* looks for a port the engine said is coming, 10 ms apart */
 
-static void find_host_port(void)
+/* The port named hull.agent among `ports`, in host_port. */
+static void find_named_port(DIR *ports)
 {
-	DIR           *ports;
 	struct dirent *port;
-	char           named[64];
-
-	/* hull.host=ttyS1: a UART, which carries no name of its own. */
-	if (cmdline_value("hull.host", named, sizeof named) && strncmp(named, "tty", 3u) == 0 &&
-	    strchr(named, '/') == NULL) {
-		snprintf(host_port, sizeof host_port, "/dev/%s", named);
-		port_uart = 1;
-		return;
-	}
-	ports = opendir("/sys/class/virtio-ports");
 
 	while (ports != NULL && host_port[0] == '\0' && (port = readdir(ports)) != NULL) {
 		char  path[300];
@@ -2641,8 +2632,36 @@ static void find_host_port(void)
 		}
 		fclose(file);
 	}
-	if (ports != NULL)
-		closedir(ports);
+}
+
+static void find_host_port(void)
+{
+	DIR  *ports;
+	char  named[64];
+	int   expected;
+
+	/* hull.host=ttyS1: a UART, which carries no name of its own. */
+	expected = cmdline_value("hull.host", named, sizeof named);
+	if (expected && strncmp(named, "tty", 3u) == 0 && strchr(named, '/') == NULL) {
+		snprintf(host_port, sizeof host_port, "/dev/%s", named);
+		port_uart = 1;
+		return;
+	}
+	/* hull.host=port: one is coming. virtio-console announces its ports
+	 * by message after its probe, so a machine at init in 200 ms is here
+	 * first, and looking once would leave it listening on a vsock it does
+	 * not have. Thirty seconds, for TCG. */
+	for (unsigned tries = 0u; tries < PORT_WAIT; tries++) {
+		ports = opendir("/sys/class/virtio-ports");
+		find_named_port(ports);
+		if (ports != NULL)
+			closedir(ports);
+		if (!expected || (host_port[0] != '\0' && access(host_port, R_OK | W_OK) == 0))
+			return;
+		host_port[0] = '\0';
+		nanosleep(&(struct timespec){ .tv_nsec = 10000000 }, NULL);
+	}
+	say("hull.host", "no port named hull.agent came");
 }
 
 /* What is listened on for the host: the vsock port, or the serial port,

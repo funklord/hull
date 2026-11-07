@@ -2111,10 +2111,14 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		snprintf(m->append + at, sizeof m->append - at, " hull.share=virtiofs");
 	}
 	/* (transport uart): the agent told its port, a UART having no name;
-	 * the first ISA serial port, the console being hvc0. */
+	 * the first ISA serial port, the console being hvc0. A virtio-serial
+	 * port it finds by name, told only that one is coming. */
 	if (m->transport == 3)
 		snprintf(m->append + strlen(m->append), sizeof m->append - strlen(m->append),
 		         " hull.host=ttyS0");
+	else if (cid == 0u)
+		snprintf(m->append + strlen(m->append), sizeof m->append - strlen(m->append),
+		         " hull.host=port");
 	argv[n++] = m->append;
 	argv[n++] = "-device";
 	argv[n++] = "virtio-serial-pci";
