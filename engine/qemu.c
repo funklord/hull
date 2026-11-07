@@ -7,9 +7,10 @@
  * (agent/agent.c, Appendix B) and the modules it needs to reach its
  * directory and the host, which are the kernel's 9p, vsock, virtio_net
  * and overlay modules and what modules.dep says they need. The machine's
- * directory is shared over qemu's own 9p server, which needs nothing the
- * user does not have, and read-only under (mutable overlay), which the
- * agent layers in the guest; each volume is a share of its own. /dev/kvm and /dev/vhost-vsock are open
+ * directory is shared by virtiofs where virtiofsd is installed, else over
+ * qemu's own 9p server, which needs nothing the user does not have, and
+ * read-only under (mutable overlay), which the agent layers in the guest;
+ * each volume is a share of its own. /dev/kvm and /dev/vhost-vsock are open
  * to the user on hosts that grant them, and nothing here asks for root.
  *
  * The host is always the initiator (B.1): start() connects to the agent
@@ -88,9 +89,10 @@
 #include "tree.h"
 #include "vbox.h"
 
+#define VIRTIOFS_ID_RANGES 16u  /* options of one id map: a namespace has a few lines */
+#define VIRTIOFS_FILES 524288u  /* the hard limit systemd gives: section 4.11 */
 #define MAX_VOLUMES  64u
 
-static char *virtiofsd_path(void);
 #define MAX_PORTS    64u
 #define MAX_MODULES  64u
 #define MAX_SERIAL   4u   /* isa-serial's indices, ttyS0 to ttyS3 */
@@ -190,7 +192,8 @@ struct hull_machine {
 	int              pidfd;        /* qemu's, when adopted, else -1 */
 	uint32_t         cid;          /* its vsock context id; 0, the serial port's agent.sock */
 	int              transport;    /* (tuning (qemu (transport ...))): 0 auto, 1 vsock, 2 serial, 3 uart */
-	char            *virtiofsd;    /* (tuning (qemu (share virtiofs))): the daemon, or NULL for 9p */
+	char            *virtiofsd;    /* a tree goes by virtiofs, this daemon; NULL for 9p */
+	int              share_auto;   /* (share auto), as no key is: chosen at the start (section 4.11) */
 	int              hosted;       /* the virtualbox engine's: `qemu` is `hull virtualbox host` */
 	int              hosted_fd;    /* the wire to it, until the reader opens it */
 	int              ready;        /* the agent has started the workload */
@@ -652,17 +655,19 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		               strcmp(text, "uart") == 0 ? 3 : 0;
 		free(text);
 	}
-	/* (tuning (qemu (share ...))): how a tree reaches the guest. auto is 9p
-	 * until the holder says otherwise (section 4.11): the key's absence is
-	 * following that, and only virtiofs here is a choice of it. */
+	/* (tuning (qemu (share ...))): how a tree reaches the guest. The key's
+	 * absence is auto, which follows hull's default and is settled at the
+	 * start, the kernel being known there; 9p and virtiofs are pins. */
+	m->share_auto = !m->hosted;
 	if (hull_access_find(doc, &machine, "tuning", &entry) &&
 	    hull_access_find(doc, &entry, "qemu", &item) &&
 	    (text = hull_access_value(doc, &item, "share")) != NULL) {
 		int wanted = strcmp(text, "virtiofs") == 0;
 
+		m->share_auto = strcmp(text, "auto") == 0;
 		free(text);
-		if (wanted && (m->virtiofsd = virtiofsd_path()) == NULL)
-			return "(share virtiofs) needs virtiofsd, which is not installed: "
+		if (wanted && (m->virtiofsd = hull_qemu_virtiofsd()) == NULL)
+			return "(share virtiofs) needs virtiofsd with --translate-uid, and none is installed: "
 			       "its package, or HULL_VIRTIOFSD naming the program";
 	}
 
@@ -1646,20 +1651,156 @@ static void segment_mac(const hull_machine *m, unsigned i, char *out, size_t cap
  * user's own group and not setgid, overlayfs refusing one of a group the
  * namespace does not map. The step that failed, or NULL.
  */
-/* The daemon (tuning (qemu (share virtiofs))) needs: HULL_VIRTIOFSD, or where
- * the distributions put it. Allocated, or NULL. */
-static char *virtiofsd_path(void)
+/* Whether `path` takes what virtiofs_daemon gives it, by its own --help: a
+ * daemon too old for it, the C one qemu used to carry above all, would stop a
+ * machine that 9p starts. Bounded by the alarm, which outlives the exec. */
+static int virtiofsd_fits(const char *path)
+{
+	char   text[32768];
+	size_t have = 0u;
+	int    fds[2];
+	int    status;
+	pid_t  pid;
+
+	if (access(path, X_OK) != 0 || pipe2(fds, O_CLOEXEC) != 0)
+		return 0;
+	pid = fork();
+	if (pid < 0) {
+		close(fds[0]);
+		close(fds[1]);
+		return 0;
+	}
+	if (pid == 0) {
+		alarm(5u);
+		dup2(fds[1], STDOUT_FILENO);
+		dup2(fds[1], STDERR_FILENO);
+		execl(path, "virtiofsd", "--help", (char *)NULL);
+		_exit(127);
+	}
+	close(fds[1]);
+	for (;;) {
+		ssize_t got = read(fds[0], text + have, sizeof text - 1u - have);
+
+		if (got < 0 && errno == EINTR)
+			continue;
+		if (got <= 0)
+			break;
+		have += (size_t)got;
+	}
+	close(fds[0]);
+	text[have] = '\0';
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+		;
+	return strstr(text, "--translate-uid") != NULL && strstr(text, "--no-announce-submounts") != NULL;
+}
+
+/* The daemon a share by virtiofs needs: HULL_VIRTIOFSD, or where the
+ * distributions put it, or on the PATH, where `cargo install` leaves one.
+ * Allocated, or NULL. */
+char *hull_qemu_virtiofsd(void)
 {
 	static const char *const places[] = { "/usr/libexec/virtiofsd", "/usr/lib/qemu/virtiofsd",
-	                                      "/usr/bin/virtiofsd" };
+	                                      "/usr/lib/virtiofsd", "/usr/bin/virtiofsd" };
 	const char *chosen = getenv("HULL_VIRTIOFSD");
+	const char *search = getenv("PATH");
 
 	if (chosen != NULL && chosen[0] != '\0')
-		return access(chosen, X_OK) == 0 ? strdup(chosen) : NULL;
+		return virtiofsd_fits(chosen) ? strdup(chosen) : NULL;
 	for (unsigned i = 0u; i < sizeof places / sizeof places[0]; i++)
-		if (access(places[i], X_OK) == 0)
+		if (virtiofsd_fits(places[i]))
 			return strdup(places[i]);
+	while (search != NULL && *search != '\0') {
+		const char *end = strchr(search, ':');
+		size_t      length = end != NULL ? (size_t)(end - search) : strlen(search);
+		char        path[4200];
+
+		if (length > 0u && length < 4096u) {
+			snprintf(path, sizeof path, "%.*s/virtiofsd", (int)length, search);
+			if (path[0] == '/' && virtiofsd_fits(path))
+				return strdup(path);
+		}
+		search = end != NULL ? end + 1 : NULL;
+	}
 	return NULL;
+}
+
+/* Whether a daemon has the descriptors a tree can want. It keeps one for each
+ * inode the guest has looked up, so that past the limit the guest is refused
+ * everything, its libc included, where 9p goes on: a hard limit of 1024 ended
+ * a walk at 1,272 of 165,632 entries. */
+int hull_qemu_virtiofs_room(void)
+{
+	struct rlimit files;
+
+	return getrlimit(RLIMIT_NOFILE, &files) != 0 || files.rlim_max == RLIM_INFINITY ||
+	       files.rlim_max >= VIRTIOFS_FILES;
+}
+
+/* Whether the kernel of `modules`, a /lib/modules/RELEASE, has virtiofs, as a
+ * module or built in. */
+static int kernel_has_virtiofs(const char *modules)
+{
+	static const char *const lists[] = { "modules.dep", "modules.builtin" };
+
+	for (unsigned i = 0u; i < sizeof lists / sizeof lists[0]; i++) {
+		char  path[4400];
+		char  line[1024];
+		FILE *file;
+
+		snprintf(path, sizeof path, "%s/%s", modules, lists[i]);
+		file = fopen(path, "r");
+		if (file == NULL)
+			continue;
+		while (fgets(line, sizeof line, file) != NULL)
+			if (strstr(line, "/virtiofs.ko") != NULL) {
+				fclose(file);
+				return 1;
+			}
+		fclose(file);
+	}
+	return 0;
+}
+
+/* The options for one id map of this namespace, `map` being its
+ * /proc/self/uid_map or gid_map, into `options`; how many. An id the namespace
+ * holds is that id, so that a chown to it is kept, as a build's step leans on;
+ * any other comes to the user, so that a chown to it is taken and keeps
+ * nothing, as 9p's is: refused, EINVAL, dpkg and tar would fail in the guest. */
+static unsigned virtiofs_ids(const char *map, const char *flag, char options[][64])
+{
+	unsigned long long inside[VIRTIOFS_ID_RANGES];
+	unsigned long long count[VIRTIOFS_ID_RANGES];
+	unsigned long long next = 0u;
+	unsigned long long outside;
+	unsigned           ranges = 0u;
+	unsigned           n = 0u;
+	FILE              *file = fopen(map, "re");
+
+	while (file != NULL && ranges < VIRTIOFS_ID_RANGES / 2u - 1u &&
+	       fscanf(file, "%llu %llu %llu", &inside[ranges], &outside, &count[ranges]) == 3) {
+		unsigned at = ranges++;
+
+		for (; at > 0u && inside[at - 1u] > inside[at]; at--) {
+			unsigned long long a = inside[at];
+			unsigned long long b = count[at];
+
+			inside[at] = inside[at - 1u];
+			count[at] = count[at - 1u];
+			inside[at - 1u] = a;
+			count[at - 1u] = b;
+		}
+	}
+	if (file != NULL)
+		fclose(file);
+	for (unsigned i = 0u; i < ranges; i++) {
+		if (inside[i] > next)
+			snprintf(options[n++], 64u, "%s=squash-guest:%llu:0:%llu", flag, next, inside[i] - next);
+		snprintf(options[n++], 64u, "%s=map:%llu:%llu:%llu", flag, inside[i], inside[i], count[i]);
+		next = inside[i] + count[i];
+	}
+	if (next < 4294967295ull)
+		snprintf(options[n++], 64u, "%s=squash-guest:%llu:0:%llu", flag, next, 4294967295ull - next);
+	return n;
 }
 
 /* One daemon for `dir`, as tag `tag`, its socket in the cwd: run in qemu's own
@@ -1669,14 +1810,19 @@ static char *virtiofsd_path(void)
  * machine being no security boundary (section 1). Mount points stay
  * unannounced, one tree as 9p shows it: announced, the guest's overlay
  * refuses each, EREMOTE, a root of the host's tree losing all under /home.
- * A guest's ids all come to the user, so that a chown is taken and keeps
- * nothing, as 9p's is: refused, EINVAL, dpkg and tar would fail in the guest. */
+ * Ids as virtiofs_ids says. */
 static int virtiofs_daemon(const hull_machine *m, const char *tag, const char *dir, int readonly)
 {
-	char  socket_path[64];
-	char  socket_option[96];
-	char  dir_option[4400];
-	pid_t pid;
+	char        socket_path[64];
+	char        socket_option[96];
+	char        dir_option[4400];
+	char        uid_options[VIRTIOFS_ID_RANGES][64];
+	char        gid_options[VIRTIOFS_ID_RANGES][64];
+	const char *argv[16 + 2 * VIRTIOFS_ID_RANGES];
+	unsigned    n = 0u;
+	unsigned    uids = virtiofs_ids("/proc/self/uid_map", "--translate-uid", uid_options);
+	unsigned    gids = virtiofs_ids("/proc/self/gid_map", "--translate-gid", gid_options);
+	pid_t       pid;
 
 	snprintf(socket_path, sizeof socket_path, "vfs-%s.sock", tag);
 	snprintf(socket_option, sizeof socket_option, "--socket-path=%s", socket_path);
@@ -1687,9 +1833,21 @@ static int virtiofs_daemon(const hull_machine *m, const char *tag, const char *d
 	if (pid == 0) {
 		prctl(PR_SET_PDEATHSIG, SIGTERM);
 		syscall(SYS_close_range, 3u, ~0u, 0u);
-		execl(m->virtiofsd, "virtiofsd", socket_option, dir_option, "--sandbox=none", "--cache=auto",
-		      "--log-level=error", "--no-announce-submounts", "--translate-uid=squash-guest:0:0:4294967295",
-		      "--translate-gid=squash-guest:0:0:4294967295", readonly ? "--readonly" : (char *)NULL, (char *)NULL);
+		argv[n++] = "virtiofsd";
+		argv[n++] = socket_option;
+		argv[n++] = dir_option;
+		argv[n++] = "--sandbox=none";
+		argv[n++] = "--cache=auto";
+		argv[n++] = "--log-level=error";
+		argv[n++] = "--no-announce-submounts";
+		for (unsigned i = 0u; i < uids; i++)
+			argv[n++] = uid_options[i];
+		for (unsigned i = 0u; i < gids; i++)
+			argv[n++] = gid_options[i];
+		if (readonly)
+			argv[n++] = "--readonly";
+		argv[n] = NULL;
+		execv(m->virtiofsd, (char *const *)argv);
 		_exit(127);
 	}
 	for (int tries = 0; tries < 500; tries++) {
@@ -3081,6 +3239,19 @@ static void remove_files(const char *dir)
 		snprintf(path, sizeof path, "%s/%s", dir, files[i]);
 		unlink(path);
 	}
+	/* A daemon's socket and the lock it keeps beside it. */
+	for (unsigned i = 0u; i <= MAX_VOLUMES; i++) {
+		char tag[16];
+
+		if (i == MAX_VOLUMES)
+			snprintf(tag, sizeof tag, "root");
+		else
+			snprintf(tag, sizeof tag, "v%u", i);
+		snprintf(path, sizeof path, "%s/vfs-%s.sock", dir, tag);
+		unlink(path);
+		snprintf(path, sizeof path, "%s/vfs-%s.sock.pid", dir, tag);
+		unlink(path);
+	}
 	/* What a host-side overlay staged, by name: on the host each is an empty
 	 * directory, its mounts having been in qemu's own namespace, and rmdir
 	 * takes nothing that is not. */
@@ -3509,6 +3680,16 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		}
 		kernel = kbuf;
 		load_modules = 1;
+	}
+
+	/* (share auto): virtiofs where it will work, and 9p where hull cannot
+	 * tell. A kernel with no modules here says nothing of what it has, and
+	 * a guest missing virtiofs has no root at all; hull's own has it. */
+	if (m->share_auto) {
+		free(m->virtiofsd);
+		m->virtiofsd = hull_qemu_virtiofs_room() &&
+		               (m->kernel_hull || (load_modules && kernel_has_virtiofs(mbuf))) ?
+		               hull_qemu_virtiofsd() : NULL;
 	}
 
 	/* Its devices as the host has them now: a board is plugged in, reset
@@ -4369,9 +4550,36 @@ static void add_passt(const hull_machine *m, hull_usage *usage)
 	fclose(f);
 }
 
+/* The virtiofsd of a machine, qemu's children: where its file work is done,
+ * none of it in qemu's own figures as 9p's is. Under the lock, as qemu's are. */
+static void add_virtiofsd(const hull_machine *m, hull_usage *usage)
+{
+	char  path[96];
+	FILE *children;
+	long  child;
+
+	if (m->virtiofsd == NULL)
+		return;
+	snprintf(path, sizeof path, "/proc/%ld/task/%ld/children", (long)m->qemu, (long)m->qemu);
+	if ((children = fopen(path, "re")) == NULL)
+		return;
+	while (fscanf(children, "%ld", &child) == 1) {
+		char  name[32] = "";
+		FILE *comm;
+
+		snprintf(path, sizeof path, "/proc/%ld/comm", child);
+		if ((comm = fopen(path, "re")) == NULL)
+			continue;
+		if (fgets(name, sizeof name, comm) != NULL && strcmp(name, "virtiofsd\n") == 0)
+			hull_usage_add((pid_t)child, usage);
+		fclose(comm);
+	}
+	fclose(children);
+}
+
 /* What the host spends on the machine: qemu, which holds the guest's
- * memory and runs its CPUs, and its passt. Read under the lock, so that
- * qemu's pid is still qemu's. */
+ * memory and runs its CPUs, its virtiofsd and its passt. Read under the
+ * lock, so that qemu's pid is still qemu's. */
 static hull_status qemu_stats(hull_core *core, hull_machine *m, hull_buf *out, hull_error *error)
 {
 	hull_usage usage = { 0u, 0u, 0u };
@@ -4380,6 +4588,8 @@ static hull_status qemu_stats(hull_core *core, hull_machine *m, hull_buf *out, h
 	(void)core;
 	pthread_mutex_lock(&m->lock);
 	read_all = m->started && !m->done && hull_usage_add(m->qemu, &usage);
+	if (read_all)
+		add_virtiofsd(m, &usage);
 	pthread_mutex_unlock(&m->lock);
 	if (!read_all)
 		return fail(error, HULL_ERR_GONE, "the machine is not running");
@@ -4803,7 +5013,7 @@ static const hull_cap_entry entries[] = {
 	/* The agent's channel: vsock where /dev/vhost-vsock is open to the
 	 * user, else a virtio-serial port behind a unix socket. */
 	{ "qemu.share",            HULL_SUP_NATIVE, NULL, NULL },
-	{ "qemu.share.auto",       HULL_SUP_NATIVE, "9p, until the holder says otherwise", NULL },
+	{ "qemu.share.auto",       HULL_SUP_NATIVE, "virtiofs where virtiofsd is installed and the kernel is known to have it, else 9p", NULL },
 	{ "qemu.share.9p",         HULL_SUP_NATIVE, NULL, NULL },
 	{ "qemu.share.virtiofs",   HULL_SUP_NATIVE, "needs virtiofsd installed", NULL },
 	{ "qemu.transport.auto",   HULL_SUP_NATIVE, NULL, NULL },

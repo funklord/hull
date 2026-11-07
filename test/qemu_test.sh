@@ -905,7 +905,7 @@ boot vlayered
 # through to the host-side overlay's kept upper, not an overlayfs. Were it a
 # guest overlay, /d below would land in a tmpfs and not in vdata. Its root,
 # /proc/mounts' first line, is the share, 9p and not overlay.
-has 0 '^read=root / 9p'
+has 0 '^read=root / (9p|virtiofs)'
 has 0 '^read=site$'
 has 0 '^read=c$'
 has 0 '^remove=ok$'

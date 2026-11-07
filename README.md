@@ -270,8 +270,9 @@ where nothing else is available, since it needs only user namespaces.
 
 A q35 virtual machine under KVM, booting the host's kernel, or one given
 as a file or carried by the image, with hull's agent as its init. The
-machine's directory and each volume are 9p shares of qemu's own, the
-agent mounts them, and everything hull asks of a machine -- exec, logs,
+machine's directory and each volume are shares, by virtiofs where
+virtiofsd is installed and by qemu's own 9p where it is not, the agent
+mounts them, and everything hull asks of a machine -- exec, logs,
 stats, a terminal, a forwarded port -- goes to the agent over vsock. By
 default the network is passt, in user space, so no bridge, tap or root
 is involved. It boots in about two seconds.
@@ -313,17 +314,21 @@ for testing network software against real layer 2.
   1, with the agent going on beside it.
 - `(mutable overlay)` keeps every write in the guest's memory, so a
   machine can be broken freely and starts clean; `(upper PATH)` keeps
-  them in a directory of yours instead, through 9p.
+  them in a directory of yours instead, through the share.
 
 **Cons**
 - Memory is reserved: `(memory "1G")` is a gigabyte the host gives up
   while the machine runs, where on chroot it is a ceiling.
-- 9p between the machine and its files: slower than a bind mount for
-  heavy I/O, and changes made on the host are not seen by inotify in the
-  guest, so `(fidelity inotify)` is refused unless accepted as polling.
+- A share between the machine and its files: slower than a bind mount,
+  and 9p, with no virtiofsd installed, several times slower again across
+  many small files. Changes made on the host are not seen by inotify in
+  the guest, so `(fidelity inotify)` is refused unless accepted as
+  polling, and under virtiofs can take a second to show at all;
+  `(tuning (qemu (share 9p)))` pins 9p.
 - x86_64 hosts only, so far.
 - Needs `/dev/kvm` and `/dev/vhost-vsock` open to the user, and passt and
-  `qemu-system-x86_64` installed. `hull doctor` checks each.
+  `qemu-system-x86_64` installed; virtiofsd, its package of that name, is
+  worth installing. `hull doctor` checks each.
 
 **Caveats**
 - **The host's kernel unless one is given**: a distribution image boots
@@ -335,8 +340,9 @@ for testing network software against real layer 2.
   nobody's, 65534, as on chroot -- except in a stored image, whose owners
   are given back where your subordinate id range holds them. A chown to
   another id in a directory used in place is not kept on the host.
-- **`(mutable direct)` writes through 9p as the user**, so a chown in the
-  guest fails, and an apt install with it; use `(mutable overlay)`, or
+- **`(mutable direct)` writes through the share as the user**, so a chown
+  in the guest does not hold, and an apt install with it; use
+  `(mutable overlay)`, or
   put packages in the image.
 - A volume is a directory: naming a file is refused by qemu.
 - With `(init …)`, the workload starts at once, not when the init says

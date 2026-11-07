@@ -27,6 +27,7 @@
 #include <sys/xattr.h>
 #include <unistd.h>
 
+#include "builtin.h"
 #include "doctor.h"
 #include "kernel.h"
 #include "sshd.h"
@@ -402,6 +403,31 @@ static void tool(const char *name, const char *for_what)
 	line("ok", name, text);
 }
 
+/* What a vm's files go by (section 4.11): nothing is wrong without it, and
+ * walking a tree is many times slower. */
+static void virtiofs(void)
+{
+	char *found = hull_qemu_virtiofsd();
+	char  text[4600];
+
+	if (found == NULL) {
+		line("absent", "virtiofsd", "a vm's files go by 9p, many times slower across many small files");
+		fix("install the package virtiofsd, a recent one: hull asks for --translate-uid");
+		return;
+	}
+	if (!hull_qemu_virtiofs_room()) {
+		snprintf(text, sizeof text, "%s, and a vm's files go by 9p: it keeps a file open for each "
+		         "the guest has looked at, and this user's hard limit is too low", found);
+		line("absent", "virtiofsd", text);
+		fix("a hard nofile limit of 524288 or more, in limits.conf");
+		free(found);
+		return;
+	}
+	snprintf(text, sizeof text, "a vm's files, in place of 9p (%s)", found);
+	line("ok", "virtiofsd", text);
+	free(found);
+}
+
 int hull_doctor(const char *runtime_why)
 {
 	struct passwd *me = getpwuid(getuid());
@@ -424,6 +450,7 @@ int hull_doctor(const char *runtime_why)
 	virtualbox();
 	usable = runtime(runtime_why) && usable;
 	tool("passt", "a vm's network");
+	virtiofs();
 	tool("qemu-system-x86_64", "vm and emu machines on x86_64");
 	tool("docker", "the docker engine");
 	tool("mkfs.ext4", "an ext4 image made from a directory, -d, with no loop mount");

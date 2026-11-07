@@ -33,6 +33,14 @@ const hull_engine *hull_engine_hw(const hull_host_ops *host);
 /* A bootable export's kernel, the host's, its path into `kernel`, and
  * `dir`/initrd, whose /hull/boot is `boot` (engine/qemu.c). NULL, or why
  * in `detail`. */
+/* The virtiofsd a vm's trees can go by, allocated: one that takes what hull
+ * gives it. NULL where there is none, and they go by 9p. */
+char *hull_qemu_virtiofsd(void);
+
+/* Whether this process's hard limit on files leaves a daemon enough: (share
+ * auto) is 9p where it does not. */
+int hull_qemu_virtiofs_room(void);
+
 const char *hull_qemu_boot_files(const char *dir, const char *boot, char *kernel, size_t cap,
                                  char *detail, size_t detail_cap);
 
