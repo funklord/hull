@@ -428,6 +428,31 @@ static void virtiofs(void)
 	free(found);
 }
 
+/* Whether (kernel hull) is here and a microvm with it (section 4.11): nothing
+ * is wrong without either, and the machine boots a second or so slower. */
+static void own_kernel(void)
+{
+	char    self[4096];
+	char    text[4200];
+	ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1u);
+	char   *slash;
+
+	if (n <= 0)
+		return;
+	self[n] = '\0';
+	slash = strrchr(self, '/');
+	if (slash == NULL || (size_t)(slash - self) + sizeof "/vmlinux-hull" > sizeof self)
+		return;
+	memcpy(slash, "/vmlinux-hull", sizeof "/vmlinux-hull");
+	if (access(self, R_OK) == 0) {
+		snprintf(text, sizeof text, "(kernel hull), a microvm under KVM (%s)", self);
+		line("ok", "hull's own kernel", text);
+		return;
+	}
+	line("absent", "hull's own kernel", "(kernel hull) and the microvm it boots, about 0.4 s a run: "
+	     "`make kernel` builds it, beside hull");
+}
+
 int hull_doctor(const char *runtime_why)
 {
 	struct passwd *me = getpwuid(getuid());
@@ -451,6 +476,7 @@ int hull_doctor(const char *runtime_why)
 	usable = runtime(runtime_why) && usable;
 	tool("passt", "a vm's network");
 	virtiofs();
+	own_kernel();
 	tool("qemu-system-x86_64", "vm and emu machines on x86_64");
 	tool("docker", "the docker engine");
 	tool("mkfs.ext4", "an ext4 image made from a directory, -d, with no loop mount");

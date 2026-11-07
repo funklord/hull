@@ -537,6 +537,11 @@ expect 0 '^ok +user namespaces$' "$hull" doctor
 # A vm's kernel: where the host's cannot be read, as on Ubuntu, and none
 # has been fetched, the fix is the user's own command (Appendix F).
 expect 0 '^ok +a vm.s kernel, the host.s: /' "$hull" doctor
+if [ -r "$(dirname "$hull")/vmlinux-hull" ]; then
+	expect 0 '^ok +hull.s own kernel: \(kernel hull\), a microvm' "$hull" doctor
+else
+	expect 0 '^absent +hull.s own kernel: ' "$hull" doctor
+fi
 expect 0 '^  fix \(as the user\): hull kernel fetch$' \
 	env HULL_BOOT_DIR=/nonexistent XDG_CACHE_HOME="$(pwd)/$dir/nocache" "$hull" doctor
 # The sshd for an image with none: its fix where nothing is fetched.
