@@ -2747,6 +2747,28 @@ static int accept_host(int *listener, short revents)
 	return *listener;
 }
 
+/* Each connection said before the machine goes, as the loop would have:
+ * the loop reads every output, then settles the channels in their order,
+ * so a connection whose end was read in the same turn as the workload's
+ * exit came after channel 0 and was never said -- the machine powered off
+ * first, and the host ended the connection as killed with it, its client
+ * exiting 137 with all its data delivered: 2 runs of 72 of a dial at a
+ * load of 15, measured, its end read and unsaid. One whose end is
+ * waiting is read out too; one still open is ended with the machine. */
+static void settle_connections(void)
+{
+	for (unsigned i = 0u; i < MAX_CHANNELS; i++) {
+		channel *c = &channels[i];
+
+		if (!c->used || !c->socket || c->datagram)
+			continue;
+		while (c->out >= 0 && drain(c, &c->out, 1))
+			;
+		if (c->out < 0)
+			settle(c);
+	}
+}
+
 /* The workload has ended and said all it will: tell the host, end what is
  * left, and power off. */
 static void finish(void)
@@ -2757,6 +2779,7 @@ static void finish(void)
 		awaiting = 1;
 		return;
 	}
+	settle_connections();
 	send_status(0u, workload()->status);
 	/* What the image's init started is its own to end, as it shuts down. */
 	if (!handed)
