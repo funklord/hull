@@ -155,10 +155,13 @@ AGENT_SOURCES  = $(patsubst $(BUILD_DIR)/%.o,%.c,$(patsubst $(BUILD_DIR)/situ/si
 # hull's own kernel for a vm (Appendix F), beside hull as its agent is,
 # where `(kernel hull)` boots it: Linux at a pinned stable version, its
 # tarball checked against the sha256 kernel.org signs, tinyconfig with
-# kernel/x86_64.config merged, every driver a hull vm needs built in.
-# Its modules, the fragment's set, in modules-hull beside it as a root's
-# lib/modules/RELEASE, which the engine shares with the guest. Built by
-# `make kernel` alone, it being a long build and a download.
+# kernel/common.config and kernel/ARCH.config merged, every driver a hull
+# vm needs built in. Its modules, the fragment's set, in modules-hull
+# beside it as a root's lib/modules/RELEASE, which the engine shares with
+# the guest. arm64's too, for an arm64 machine under emu, where the cross
+# compiler is installed: vmlinuz-hull-arm64 and modules-hull-arm64, from a
+# source tree of its own. Built by `make kernel` alone, it being a long
+# build and a download.
 KERNEL_VERSION = 6.12.107
 KERNEL_SHA256  = a5f8c5be3fde2d6d9ca14e9631642cf1f44487143f11059da730dcd5892e307a
 KERNEL_TAR     = $(BUILD_DIR)/kernel/linux-$(KERNEL_VERSION).tar.xz
@@ -166,6 +169,10 @@ KERNEL_SRC     = $(BUILD_DIR)/kernel/linux-$(KERNEL_VERSION)
 KERNEL_BIN     = $(BUILD_DIR)/vmlinuz-hull
 KERNEL_ELF     = $(BUILD_DIR)/vmlinux-hull
 KERNEL_MODULES = $(BUILD_DIR)/modules-hull/lib/modules/$(KERNEL_VERSION)
+KERNEL_A64_SRC = $(BUILD_DIR)/kernel-arm64/linux-$(KERNEL_VERSION)
+KERNEL_A64_BIN = $(BUILD_DIR)/vmlinuz-hull-arm64
+KERNEL_A64_MOD = $(BUILD_DIR)/modules-hull-arm64/lib/modules/$(KERNEL_VERSION)
+KERNEL_A64     = ARCH=arm64 CROSS_COMPILE=$(patsubst %gcc,%,$(ARM64_CC))
 
 # Limine from source (section 3.13), beside hull in limine/, where
 # `hull export --bootable` takes it in place of the fetched 11.x UEFI
@@ -294,6 +301,7 @@ PROBE = $(BUILD_DIR)/test/cli/rootfs/probe
 ARM64_CC    ?= aarch64-linux-gnu-gcc
 ARM64_PROBE := $(if $(shell command -v $(ARM64_CC) 2>/dev/null),$(BUILD_DIR)/test/arm64/rootfs/probe)
 AGENT_ARM64 := $(if $(shell command -v $(ARM64_CC) 2>/dev/null),$(BUILD_DIR)/hull-agent-arm64)
+KERNEL_ARM64 := $(if $(shell command -v $(ARM64_CC) 2>/dev/null),$(KERNEL_A64_BIN) $(KERNEL_A64_MOD)/modules.dep)
 
 TEST_SPEC_OBJS    = $(BUILD_DIR)/test/spec_test.o
 TEST_MATRIX_OBJS  = $(BUILD_DIR)/test/matrix_test.o
@@ -478,7 +486,7 @@ $(HULL): $(CLI_OBJS) $(CORE_OBJS) $(ENGINE_OBJS) $(STORE_OBJS) $(OCI_OBJS) $(PLA
 $(AGENT_BIN): $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
 	$(CC) -static $(CFLAGS) -o $@ $^
 
-kernel: $(KERNEL_BIN) $(KERNEL_ELF) $(KERNEL_MODULES)/modules.dep
+kernel: $(KERNEL_BIN) $(KERNEL_ELF) $(KERNEL_MODULES)/modules.dep $(KERNEL_ARM64)
 
 $(KERNEL_TAR):
 	@mkdir -p '$(@D)'
@@ -488,12 +496,13 @@ $(KERNEL_TAR):
 
 # The source extracted once; a fragment option that did not take, which
 # merge_config.sh only warns of, stops the build.
-$(KERNEL_BIN): $(KERNEL_TAR) kernel/x86_64.config
+$(KERNEL_BIN): $(KERNEL_TAR) kernel/common.config kernel/x86_64.config
 	test -d '$(KERNEL_SRC)' || tar -C '$(BUILD_DIR)/kernel' -xf '$(KERNEL_TAR)'
 	$(MAKE) -C '$(KERNEL_SRC)' tinyconfig > /dev/null
-	cd '$(KERNEL_SRC)' && scripts/kconfig/merge_config.sh -m .config '$(abspath kernel/x86_64.config)' > /dev/null
+	cd '$(KERNEL_SRC)' && scripts/kconfig/merge_config.sh -m .config '$(abspath kernel/common.config)' \
+		'$(abspath kernel/x86_64.config)' > /dev/null
 	$(MAKE) -C '$(KERNEL_SRC)' olddefconfig > /dev/null
-	@for option in $$(grep '^CONFIG_' kernel/x86_64.config); do \
+	@for option in $$(grep -h '^CONFIG_' kernel/common.config kernel/x86_64.config); do \
 		grep -qx "$$option" '$(KERNEL_SRC)/.config' || { echo "kernel: $$option did not take" >&2; exit 1; }; \
 	done
 	$(MAKE) -C '$(KERNEL_SRC)' bzImage
@@ -508,6 +517,27 @@ $(KERNEL_ELF): $(KERNEL_BIN)
 $(KERNEL_MODULES)/modules.dep: $(KERNEL_BIN)
 	$(MAKE) -C '$(KERNEL_SRC)' modules
 	$(MAKE) -C '$(KERNEL_SRC)' INSTALL_MOD_PATH='$(abspath $(BUILD_DIR))/modules-hull' \
+		INSTALL_MOD_STRIP=1 modules_install > /dev/null
+	touch '$@'
+
+# arm64's, the same steps cross-compiled, booted by qemu's virt as the
+# gzipped Image it unpacks itself.
+$(KERNEL_A64_BIN): $(KERNEL_TAR) kernel/common.config kernel/arm64.config
+	@mkdir -p '$(BUILD_DIR)/kernel-arm64'
+	test -d '$(KERNEL_A64_SRC)' || tar -C '$(BUILD_DIR)/kernel-arm64' -xf '$(KERNEL_TAR)'
+	$(MAKE) -C '$(KERNEL_A64_SRC)' $(KERNEL_A64) tinyconfig > /dev/null
+	cd '$(KERNEL_A64_SRC)' && $(KERNEL_A64) scripts/kconfig/merge_config.sh -m .config \
+		'$(abspath kernel/common.config)' '$(abspath kernel/arm64.config)' > /dev/null
+	$(MAKE) -C '$(KERNEL_A64_SRC)' $(KERNEL_A64) olddefconfig > /dev/null
+	@for option in $$(grep -h '^CONFIG_' kernel/common.config kernel/arm64.config); do \
+		grep -qx "$$option" '$(KERNEL_A64_SRC)/.config' || { echo "kernel: arm64: $$option did not take" >&2; exit 1; }; \
+	done
+	$(MAKE) -C '$(KERNEL_A64_SRC)' $(KERNEL_A64) Image.gz
+	cp '$(KERNEL_A64_SRC)/arch/arm64/boot/Image.gz' '$@'
+
+$(KERNEL_A64_MOD)/modules.dep: $(KERNEL_A64_BIN)
+	$(MAKE) -C '$(KERNEL_A64_SRC)' $(KERNEL_A64) modules
+	$(MAKE) -C '$(KERNEL_A64_SRC)' $(KERNEL_A64) INSTALL_MOD_PATH='$(abspath $(BUILD_DIR))/modules-hull-arm64' \
 		INSTALL_MOD_STRIP=1 modules_install > /dev/null
 	touch '$@'
 

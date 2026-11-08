@@ -2828,14 +2828,60 @@ else
 	out=$(timeout 30 "$hull" plan -f "$root/a64vm.conf" 2>&1)
 	got=$?
 	has 1 'only the emu class runs an arch other than the host'
-	for run in "$a64none" "$a64run"; do
+	# hull's own kernel on arm64 (Appendix F): vmlinuz-hull-arm64 beside
+	# hull, `make kernel`'s where the cross compiler is, with modules of
+	# its own; refused naming the target where it is not built, where it
+	# had booted the x86 kernel and waited out the agent.
+	printf '(machine (source "dir:./a64root") (backend emu) (arch arm64) %s %s)\n' \
+		'(tuning (vm (kernel hull)))' \
+		'(command "/probe" "say" "own arm64" "read" "/proc/version" "exit" "5")' > "$root/a64hull.conf"
+	a64khnone=$(mktemp -d "$root/run-a64khnone.XXXXXX")
+	rm -rf "$root/a64nokernel"
+	mkdir -p "$root/a64nokernel"
+	cp "$hull" "$(dirname "$hull")/hull-agent" "$(dirname "$hull")/hull-agent-arm64" "$root/a64nokernel/"
+	name='(kernel hull) on arm64 with no vmlinuz-hull-arm64 beside hull'
+	out=$(cd / && XDG_RUNTIME_DIR=$a64khnone timeout 60 "$root/a64nokernel/hull" run -f "$root/a64hull.conf" 2>&1)
+	got=$?
+	has 125 'boots vmlinuz-hull-arm64 beside hull'
+	if [ -r "$(dirname "$hull")/vmlinuz-hull-arm64" ]; then
+		name='an arm64 machine on hull'"'"'s own kernel'
+		out=$(cd / && XDG_RUNTIME_DIR=$a64run timeout 300 "$hull" run -f "$root/a64hull.conf" 2>&1)
+		got=$?
+		has 5 '^own arm64$'
+		has 5 '^read=Linux version '
+		refute_out '^read=Linux version .*deb'
+		a64modules=$(dirname "$hull")/modules-hull-arm64/lib/modules
+		a64hwsim=$(grep -h '/mac80211_hwsim\.ko:' "$a64modules"/*/modules.dep 2>/dev/null)
+		if [ -n "$a64hwsim" ]; then
+			loads=
+			for module in $(printf '%s\n' "${a64hwsim#*:}" | tr ' ' '\n' | sed '/^$/d' | tac) \
+			              "${a64hwsim%%:*}"; do
+				loads="$loads \"load\" \"$module\""
+			done
+			printf '(machine (source "dir:./a64root") (backend emu) (arch arm64) (mutable overlay) %s %s)\n' \
+				'(tuning (vm (kernel hull)))' \
+				"(command \"/probe\" $loads \"list\" \"/sys/class/ieee80211\" \"exit\" \"4\")" \
+				> "$root/a64modules.conf"
+			name='hull'"'"'s own arm64 kernel loads its own modules'
+			out=$(cd / && XDG_RUNTIME_DIR=$a64run timeout 300 "$hull" run -f "$root/a64modules.conf" 2>&1)
+			got=$?
+			has 4 '^load=ok$'
+			has 4 '^list= phy0 phy1$'
+			refute_out '^load=[^o]'
+		else
+			printf 'qemu: hull'"'"'s own arm64 modules not tried: `make kernel` built none\n'
+		fi
+	else
+		printf 'qemu: hull'"'"'s own arm64 kernel not tried: `make kernel` has not built it\n'
+	fi
+	for run in "$a64none" "$a64run" "$a64khnone"; do
 		tries=0
 		while [ -S "$run/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
 			tries=$((tries + 1))
 			sleep 0.25
 		done
 	done
-	rm -rf "${a64none:?}" "${a64run:?}"
+	rm -rf "${a64none:?}" "${a64run:?}" "${a64khnone:?}"
 fi
 
 # hull export --bootable (section 3.13): a tree as a disk image that boots

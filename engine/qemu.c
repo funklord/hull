@@ -1202,6 +1202,27 @@ static const char *build_root_image(hull_machine *m)
 	return NULL;
 }
 
+/* The release under `dir`, a modules-hull-arm64/lib/modules, that
+ * depmod indexed: the one make kernel installed. 1 where there is one. */
+static int own_release(const char *dir, char *out, size_t cap)
+{
+	DIR           *list = opendir(dir);
+	struct dirent *entry;
+	char           path[4600];
+	int            found = 0;
+
+	if (list == NULL)
+		return 0;
+	while (!found && (entry = readdir(list)) != NULL) {
+		if (entry->d_name[0] == '.')
+			continue;
+		snprintf(path, sizeof path, "%s/%s/modules.dep", dir, entry->d_name);
+		found = access(path, R_OK) == 0 && snprintf(out, cap, "%s", entry->d_name) < (int)cap;
+	}
+	closedir(list);
+	return found;
+}
+
 static const char *write_initramfs(const hull_machine *m, const char *modules, int load_modules)
 {
 	const char *dir = m->dir;
@@ -3703,20 +3724,33 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		 * so its initramfs loads none; the modules it was built with,
 		 * modules-hull beside it, are the guest's to modprobe. The host's
 		 * cannot be: a module loads only into the build it came from. */
-		char dep[4400];
+		/* An arm64 machine's is arm64's, vmlinuz-hull-arm64, a gzipped
+		 * Image, which carries no release a reader can find as a
+		 * bzImage does: its modules are the one release modules.dep
+		 * indexes under modules-hull-arm64. */
+		const char *arch = m->arm64 ? "-arm64" : "";
+		char        dep[4400];
 
 		if (!agent_path(kbuf, sizeof kbuf, 0) || strrchr(kbuf, '/') == NULL)
 			return fail(error, HULL_ERR_RUNTIME, "hull's own kernel cannot be found");
 		snprintf(strrchr(kbuf, '/'), sizeof kbuf - (size_t)(strrchr(kbuf, '/') - kbuf),
-		         "/vmlinuz-hull");
+		         "/vmlinuz-hull%s", arch);
 		if (access(kbuf, R_OK) != 0)
-			return fail(error, HULL_ERR_RUNTIME, "(kernel hull) boots vmlinuz-hull beside hull, "
+			return fail(error, HULL_ERR_RUNTIME, m->arm64 ?
+			            "(kernel hull) on an arm64 machine boots vmlinuz-hull-arm64 beside hull, "
+			            "and there is none: `make kernel` builds it where aarch64-linux-gnu-gcc "
+			            "is installed" :
+			            "(kernel hull) boots vmlinuz-hull beside hull, "
 			            "and there is none: `make kernel` builds it");
 		kernel = kbuf;
 		load_modules = 0;
-		if (kernel_release(kbuf, rbuf, sizeof rbuf)) {
-			snprintf(mbuf, sizeof mbuf, "%.*s/modules-hull/lib/modules/%s",
-			         (int)(strrchr(kbuf, '/') - kbuf), kbuf, rbuf);
+		snprintf(mbuf, sizeof mbuf, "%.*s/modules-hull%s/lib/modules",
+		         (int)(strrchr(kbuf, '/') - kbuf), kbuf, arch);
+		if (m->arm64 ? own_release(mbuf, rbuf, sizeof rbuf) :
+		    kernel_release(kbuf, rbuf, sizeof rbuf)) {
+			size_t at = strlen(mbuf);
+
+			snprintf(mbuf + at, sizeof mbuf - at, "/%s", rbuf);
 			snprintf(dep, sizeof dep, "%s/modules.dep", mbuf);
 			share_modules = access(dep, R_OK) == 0;
 		} else {
@@ -5113,7 +5147,8 @@ static const hull_cap_entry entries[] = {
 	  "kernel on every host, its modules its own", NULL },
 	{ "vm.kernel.hull",      HULL_SUP_NATIVE,
 	  "hull's own kernel, vmlinuz-hull beside hull, `make kernel`'s: Linux with every driver a "
-	  "hull vm boots with built in, and its own modules beside it for what a workload loads", NULL },
+	  "hull vm boots with built in, and its own modules beside it for what a workload loads; for "
+	  "an arm64 machine vmlinuz-hull-arm64, the same built for arm64", NULL },
 	{ "vm.kernel.image",     HULL_SUP_NATIVE,
 	  "the image's own /hull/kernel, booted as given; a different kernel version per machine, "
 	  "its modules the host's for its release where it has them, else built in", NULL },
