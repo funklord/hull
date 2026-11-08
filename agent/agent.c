@@ -2205,6 +2205,21 @@ static void settle(channel *c)
 	memset(c, 0, sizeof *c);
 }
 
+/* A reaped channel's output read while there is any and credit for it,
+ * then closed, and its end said once both are. */
+static void wind_up(channel *c)
+{
+	while (c->out >= 0 && (!c->credited || c->credit > 0u) && drain(c, &c->out, 1))
+		;
+	while (c->err >= 0 && (!c->credited || c->credit > 0u) && drain(c, &c->err, 2))
+		;
+	if (c->out >= 0 && (!c->credited || c->credit > 0u))
+		close_fd(&c->out);
+	if (c->err >= 0 && (!c->credited || c->credit > 0u))
+		close_fd(&c->err);
+	settle(c);
+}
+
 /* --- the host's messages ------------------------------------------------- */
 
 /* A believed host back: the workload's start as it was said, what it wrote
@@ -2747,25 +2762,32 @@ static int accept_host(int *listener, short revents)
 	return *listener;
 }
 
-/* Each connection said before the machine goes, as the loop would have:
- * the loop reads every output, then settles the channels in their order,
- * so a connection whose end was read in the same turn as the workload's
+/* Each channel that has ended said before the machine goes, as the loop
+ * would have: the loop reads every output, then settles the channels in
+ * their order, so one whose end came in the same turn as the workload's
  * exit came after channel 0 and was never said -- the machine powered off
- * first, and the host ended the connection as killed with it, its client
- * exiting 137 with all its data delivered: 2 runs of 72 of a dial at a
- * load of 15, measured, its end read and unsaid. One whose end is
- * waiting is read out too; one still open is ended with the machine. */
-static void settle_connections(void)
+ * first, and the host ended it as killed with it, a client exiting 137
+ * with all its data delivered: 2 runs of 72 of a dial at a load of 15,
+ * measured, a connection's end read and unsaid. An exec reaped in that
+ * turn is the same case by the loop, though not reproduced: the agent
+ * reaps faster than a workload can see an exec's zombie and exit. A
+ * connection whose end is waiting is read out too; one still open, or an
+ * exec still running, ends with the machine. */
+static void settle_ended(void)
 {
 	for (unsigned i = 0u; i < MAX_CHANNELS; i++) {
 		channel *c = &channels[i];
 
-		if (!c->used || !c->socket || c->datagram)
+		if (!c->used || c->ch == 0u || c->datagram)
 			continue;
-		while (c->out >= 0 && drain(c, &c->out, 1))
-			;
-		if (c->out < 0)
-			settle(c);
+		if (c->socket) {
+			while (c->out >= 0 && drain(c, &c->out, 1))
+				;
+			if (c->out < 0)
+				settle(c);
+		} else if (c->reaped) {
+			wind_up(c);
+		}
 	}
 }
 
@@ -2779,7 +2801,7 @@ static void finish(void)
 		awaiting = 1;
 		return;
 	}
-	settle_connections();
+	settle_ended();
 	send_status(0u, workload()->status);
 	/* What the image's init started is its own to end, as it shuts down. */
 	if (!handed)
@@ -3090,15 +3112,7 @@ int main(int argc, char **argv)
 			}
 			if (!c->used || !c->reaped)
 				continue;
-			while (c->out >= 0 && (!c->credited || c->credit > 0u) && drain(c, &c->out, 1))
-				;
-			while (c->err >= 0 && (!c->credited || c->credit > 0u) && drain(c, &c->err, 2))
-				;
-			if (c->out >= 0 && (!c->credited || c->credit > 0u))
-				close_fd(&c->out);
-			if (c->err >= 0 && (!c->credited || c->credit > 0u))
-				close_fd(&c->err);
-			settle(c);
+			wind_up(c);
 		}
 		if (!connected && listener >= 0 && fds[0].revents != 0) {
 			int fd = accept_host(&listener, fds[0].revents);
