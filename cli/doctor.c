@@ -14,6 +14,7 @@
 
 #define _GNU_SOURCE
 
+#include <dirent.h>
 #include <grp.h>
 #include <pwd.h>
 #include <sched.h>
@@ -430,6 +431,27 @@ static void virtiofs(void)
 
 /* Whether (kernel hull) is here and a microvm with it (section 4.11): nothing
  * is wrong without either, and the machine boots a second or so slower. */
+/* Whether `dir`, a modules-hull/lib/modules, holds a release indexed by
+ * depmod. */
+static int has_modules(const char *dir)
+{
+	DIR           *list = opendir(dir);
+	struct dirent *entry;
+	char           path[4400];
+	int            found = 0;
+
+	if (list == NULL)
+		return 0;
+	while (!found && (entry = readdir(list)) != NULL) {
+		if (entry->d_name[0] == '.')
+			continue;
+		snprintf(path, sizeof path, "%s/%s/modules.dep", dir, entry->d_name);
+		found = access(path, R_OK) == 0;
+	}
+	closedir(list);
+	return found;
+}
+
 static void own_kernel(void)
 {
 	char    self[4096];
@@ -441,12 +463,18 @@ static void own_kernel(void)
 		return;
 	self[n] = '\0';
 	slash = strrchr(self, '/');
-	if (slash == NULL || (size_t)(slash - self) + sizeof "/vmlinux-hull" > sizeof self)
+	if (slash == NULL || (size_t)(slash - self) + sizeof "/modules-hull/lib/modules" > sizeof self)
 		return;
 	memcpy(slash, "/vmlinux-hull", sizeof "/vmlinux-hull");
 	if (access(self, R_OK) == 0) {
 		snprintf(text, sizeof text, "(kernel hull), a microvm under KVM (%s)", self);
 		line("ok", "hull's own kernel", text);
+		/* Its modules, which a build before them did not make: a
+		 * machine on it then has no modprobe. */
+		memcpy(slash, "/modules-hull/lib/modules", sizeof "/modules-hull/lib/modules");
+		if (!has_modules(self))
+			line("absent", "hull's own modules", "modprobe in a machine on (kernel hull): "
+			     "`make kernel` builds them, beside hull");
 		return;
 	}
 	line("absent", "hull's own kernel", "(kernel hull) and the microvm it boots, about 0.4 s a run: "

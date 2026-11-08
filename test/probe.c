@@ -1306,10 +1306,13 @@ int main(int argc, char **argv)
 			i++;
 		} else if (strcmp(step, "load") == 0) {
 			/* As modprobe would, a compressed module the kernel
-			 * unpacks: 4 is MODULE_INIT_COMPRESSED_FILE. */
+			 * unpacks: 4 is MODULE_INIT_COMPRESSED_FILE; hull's own
+			 * kernel's are plain .ko, which take none. */
 			struct utsname kernel;
 			char           path[4400];
 			int            fd = -1;
+			size_t         length = strlen(arg);
+			int            flags = length > 3u && strcmp(arg + length - 3u, ".ko") == 0 ? 0 : 4;
 
 			if (uname(&kernel) == 0) {
 				snprintf(path, sizeof path, "/lib/modules/%s/%s", kernel.release, arg);
@@ -1317,7 +1320,7 @@ int main(int argc, char **argv)
 			}
 			if (fd < 0)
 				printf("load=%s\n", strerror(errno));
-			else if (syscall(SYS_finit_module, fd, "", 4) != 0 && errno != EEXIST)
+			else if (syscall(SYS_finit_module, fd, "", flags) != 0 && errno != EEXIST)
 				printf("load=%s\n", strerror(errno));
 			else
 				printf("load=ok\n");

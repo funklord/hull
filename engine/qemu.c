@@ -111,7 +111,8 @@
  * its own: the console is hvc0. */
 #define MICROVM_OPTIONS "microvm,pic=off,isa-serial=off"
 #define MICROVM_TRANSPORTS 24u /* virtio-mmio slots, measured: the 25th is refused */
-#define MICROVM_FIXED 8u       /* at most: console, rng, agent, root, net, sshd, cfs, objects */
+#define MICROVM_FIXED 9u       /* at most: console, rng, agent, root, net, sshd, cfs, objects,
+                                * modules */
 #define FLOW_IDLE    90      /* seconds a udp client's flow is kept unused */
 
 /* The guest's network, which the agent sets to the same addresses. */
@@ -1991,7 +1992,7 @@ static int write_map(const char *path, const char *format, unsigned id)
 
 /* Fork qemu for `m`, with `cid` for its vsock device. Its stdout and
  * stderr go to qemu.log. */
-static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir, int load_modules,
+static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir, int share_modules,
                    uint32_t cid)
 {
 	uid_t       uid = getuid();   /* read here: unmapped once unshared */
@@ -2265,9 +2266,10 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	/* The guest runs this release's kernel, so its modules are that
 	 * release's on the host: shared read-only, for the agent to mount where
 	 * modprobe in the machine looks, as a test of network software loads
-	 * mac80211_hwsim or pppoe. A path kernel the host has no modules for is
-	 * taken to have its drivers built in, and gets no share. */
-	if (load_modules) {
+	 * mac80211_hwsim or pppoe; hull's own kernel's are those `make kernel`
+	 * built beside it. A path kernel the host has no modules for is taken
+	 * to have its drivers built in, and gets no share. */
+	if (share_modules) {
 		snprintf(path, sizeof path, "%s", modules_dir);
 		escaped(modules_at, sizeof modules_at, path);
 		snprintf(modules, sizeof modules,
@@ -3672,6 +3674,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	char           ibuf[4200];     /* the image's /hull/kernel, for (kernel image) */
 	char           rbuf[256];      /* a path kernel's release */
 	int            load_modules;   /* the host has this release's modules */
+	int            share_modules = 0; /* the guest is given them, in /lib/modules */
 	int            fd = -1;
 
 	if (m->started || m->qemu > 0)
@@ -3696,7 +3699,12 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	 * arm64` put in the cache, with its modules, the host's being amd64's;
 	 * a kernel given by path is booted as given. */
 	if (m->kernel_hull) {
-		/* hull's own (Appendix F): every driver built in, so no modules. */
+		/* hull's own (Appendix F): every driver it boots with built in,
+		 * so its initramfs loads none; the modules it was built with,
+		 * modules-hull beside it, are the guest's to modprobe. The host's
+		 * cannot be: a module loads only into the build it came from. */
+		char dep[4400];
+
 		if (!agent_path(kbuf, sizeof kbuf, 0) || strrchr(kbuf, '/') == NULL)
 			return fail(error, HULL_ERR_RUNTIME, "hull's own kernel cannot be found");
 		snprintf(strrchr(kbuf, '/'), sizeof kbuf - (size_t)(strrchr(kbuf, '/') - kbuf),
@@ -3706,6 +3714,14 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 			            "and there is none: `make kernel` builds it");
 		kernel = kbuf;
 		load_modules = 0;
+		if (kernel_release(kbuf, rbuf, sizeof rbuf)) {
+			snprintf(mbuf, sizeof mbuf, "%.*s/modules-hull/lib/modules/%s",
+			         (int)(strrchr(kbuf, '/') - kbuf), kbuf, rbuf);
+			snprintf(dep, sizeof dep, "%s/modules.dep", mbuf);
+			share_modules = access(dep, R_OK) == 0;
+		} else {
+			share_modules = 0;
+		}
 		m->micro = micro_fits(m, kbuf, sizeof kbuf);
 	} else if (m->arm64 && m->kernel_path == NULL && !m->kernel_image) {
 		const hull_kernel_pin *pin = hull_kernel_pin_of("arm64");
@@ -3768,6 +3784,9 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		kernel = kbuf;
 		load_modules = 1;
 	}
+
+	if (!m->kernel_hull)
+		share_modules = load_modules;
 
 	/* (share auto): virtiofs where it will work, and 9p where hull cannot
 	 * tell. A kernel with no modules here says nothing of what it has, and
@@ -3855,7 +3874,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 			close_segments(m);
 			break;
 		}
-		m->qemu = spawn(m, kernel, mbuf, load_modules, cid);
+		m->qemu = spawn(m, kernel, mbuf, share_modules, cid);
 		if (cid == 0u) {
 			close(m->agent_listen);
 			m->agent_listen = -1;
@@ -5094,7 +5113,7 @@ static const hull_cap_entry entries[] = {
 	  "kernel on every host, its modules its own", NULL },
 	{ "vm.kernel.hull",      HULL_SUP_NATIVE,
 	  "hull's own kernel, vmlinuz-hull beside hull, `make kernel`'s: Linux with every driver a "
-	  "hull vm uses built in, so no modules", NULL },
+	  "hull vm boots with built in, and its own modules beside it for what a workload loads", NULL },
 	{ "vm.kernel.image",     HULL_SUP_NATIVE,
 	  "the image's own /hull/kernel, booted as given; a different kernel version per machine, "
 	  "its modules the host's for its release where it has them, else built in", NULL },

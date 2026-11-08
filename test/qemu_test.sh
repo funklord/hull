@@ -2664,6 +2664,29 @@ if [ -r "$(dirname "$hull")/vmlinuz-hull" ]; then
 	has 4 '^read=Linux version '
 	refute_out '^read=Linux version .*deb13'
 	runs="$khnone $khrun"
+	# Its own modules, which `make kernel` built beside it, where modprobe
+	# looks: mac80211_hwsim and what its modules.dep says it needs, the
+	# host's being of another build and never loadable into this one.
+	kmodules=$(dirname "$hull")/modules-hull/lib/modules
+	khwsim=$(grep -h '/mac80211_hwsim\.ko:' "$kmodules"/*/modules.dep 2>/dev/null)
+	if [ -n "$khwsim" ]; then
+		loads=
+		for module in $(printf '%s\n' "${khwsim#*:}" | tr ' ' '\n' | sed '/^$/d' | tac) "${khwsim%%:*}"; do
+			loads="$loads \"load\" \"$module\""
+		done
+		printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) %s %s)\n' \
+			'(tuning (vm (kernel hull)))' \
+			"(command \"/probe\" $loads \"list\" \"/sys/class/ieee80211\" \"exit\" \"4\")" \
+			> "$root/khmodules.conf"
+		name='hull'"'"'s own kernel loads its own modules'
+		out=$(cd / && XDG_RUNTIME_DIR=$khrun timeout 60 "$hull" run -f "$root/khmodules.conf" 2>&1)
+		got=$?
+		has 4 '^load=ok$'
+		has 4 '^list= phy0 phy1$'
+		refute_out '^load=[^o]'
+	else
+		printf 'qemu: hull'"'"'s own modules not tried: `make kernel` built none\n'
+	fi
 	# The micro profile (section 5.2): on hull's kernel a machine is a
 	# microvm, its devices on virtio-mmio and its PCI bus empty; a pin, TCG,
 	# no ELF of the kernel, or more volumes than there are slots, is q35, and
@@ -2729,17 +2752,17 @@ $out"
 		runs="$runs $noelf"
 		volumes=
 		i=0
-		while [ "$i" -lt 16 ]; do
+		while [ "$i" -lt 15 ]; do
 			i=$((i + 1))
 			mkdir -p "$root/mv$i"
 			volumes="$volumes (volume (host \"$root/mv$i\") (guest \"/mv$i\"))"
 		done
 		micro_conf "$root/micro16.conf" vm '' "$volumes"
-		micro_run 'sixteen volumes fill a microvm' "$root/micro16.conf"
+		micro_run 'fifteen volumes fill a microvm' "$root/micro16.conf"
 		has 6 '^list= *$'
 		mkdir -p "$root/mv17"
 		micro_conf "$root/micro17.conf" vm '' "$volumes (volume (host \"$root/mv17\") (guest \"/mv17\"))"
-		micro_run 'seventeen volumes are q35' "$root/micro17.conf"
+		micro_run 'sixteen volumes are q35' "$root/micro17.conf"
 		has 6 '^list= 0000:'
 	else
 		printf 'qemu: a microvm not tried: `make kernel` has not built vmlinux-hull\n'
