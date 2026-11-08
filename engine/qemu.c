@@ -1401,6 +1401,27 @@ static const char *write_initramfs(const hull_machine *m, const char *modules, i
 	if (m->boot != NULL)
 		entry(&a, "hull/boot", 0100644u, 0u, 0u, (const uint8_t *)m->boot, strlen(m->boot));
 	entry(&a, "TRAILER!!!", 0u, 0u, 0u, NULL, 0u);
+	/* Zeros after the trailer, to the page and 64 KiB more, which the
+	 * kernel's reader skips: qemu puts the initramfs at the top of low
+	 * memory, page-aligned, and on a microvm something written at the top
+	 * of memory, growing with its devices, met the archive's tail -- the
+	 * agent's last bytes -- so that fifteen volumes never answered for 4
+	 * of 8 agent lengths across a page, measured, where q35 or twelve
+	 * volumes did; what writes there is inferred, qemu's code not read.
+	 * The tail is padding now, whatever reaches it. */
+	{
+		static const uint8_t zeros[4096];
+		long                 at = ftell(a.file);
+		size_t               pad = at < 0 ? 0u : 65536u + (4096u - (size_t)at % 4096u) % 4096u;
+
+		while (pad > 0u && !a.failed) {
+			size_t n = pad < sizeof zeros ? pad : sizeof zeros;
+
+			if (fwrite(zeros, 1u, n, a.file) != n)
+				a.failed = 1;
+			pad -= n;
+		}
+	}
 	for (unsigned i = 0u; i < list.count; i++)
 		free(list.path[i]);
 	if (fclose(a.file) != 0 || a.failed)

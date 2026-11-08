@@ -2764,6 +2764,25 @@ $out"
 		micro_conf "$root/micro17.conf" vm '' "$volumes (volume (host \"$root/mv17\") (guest \"/mv17\"))"
 		micro_run 'sixteen volumes are q35' "$root/micro17.conf"
 		has 6 '^list= 0000:'
+		# Whatever the agent's length: qemu puts the initramfs at the top
+		# of low memory, and a microvm's tables there grew into its tail,
+		# so that fifteen volumes never answered for half the lengths an
+		# agent can have, measured; the tail is zeros now. A copy of the
+		# agent made longer, a kilobyte at a time across a page, on a core
+		# of the copy's, which reads the agent beside it at each start.
+		rm -rf "$root/padbin"
+		mkdir -p "$root/padbin"
+		cp "$hull" "$(dirname "$hull")/vmlinuz-hull" "$(dirname "$hull")/vmlinux-hull" "$root/padbin/"
+		padrun=$(mktemp -d "$root/run-pad.XXXXXX")
+		for pad in 0 1024 2048 3072; do
+			cp "$(dirname "$hull")/hull-agent" "$root/padbin/hull-agent"
+			head -c "$pad" /dev/zero >> "$root/padbin/hull-agent"
+			name="fifteen volumes on a microvm, the agent $pad bytes longer"
+			out=$(cd / && XDG_RUNTIME_DIR=$padrun timeout 120 "$root/padbin/hull" run -f "$root/micro16.conf" 2>&1)
+			got=$?
+			has 6 '^list= *$'
+		done
+		runs="$runs $padrun"
 	else
 		printf 'qemu: a microvm not tried: `make kernel` has not built vmlinux-hull\n'
 	fi
@@ -2779,7 +2798,7 @@ for run in $runs; do
 	done
 	rm -rf "${run:?}"
 done
-rm -rf "${root:?}/nokernelbin" "${root:?}/noelfbin"
+rm -rf "${root:?}/nokernelbin" "${root:?}/noelfbin" "${root:?}/padbin"
 
 # Phase 2's exit, its ARM half (section 12): an arm64 directory rootfs on
 # x86 under emu, qemu-system-aarch64's virt machine booting Debian's arm64
