@@ -17,6 +17,11 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QComboBox>
+#include <QHBoxLayout>
+#include <QLineEdit>
+#include <QPushButton>
+#include <QVBoxLayout>
 #include <QCloseEvent>
 #include <QDir>
 #include <QFileDialog>
@@ -74,6 +79,10 @@ main_window::main_window(const QString &hull_program, QWidget *parent)
 	tree->setRootIsDecorated(false);
 	tree->setUniformRowHeights(true);
 	tree->header()->setStretchLastSection(true);
+	/* Its three columns whole beside details that do not wrap, which
+	 * would otherwise take the width: about 36 characters, cells under
+	 * qtty. */
+	tree->setMinimumWidth(tree->fontMetrics().horizontalAdvance(QString(36, QLatin1Char('x'))));
 	connect(tree, &QTreeWidget::currentItemChanged, this, &main_window::selected_changed);
 
 	details = new QPlainTextEdit;
@@ -90,6 +99,8 @@ main_window::main_window(const QString &hull_program, QWidget *parent)
 	tabs->addTab(details, QStringLiteral("&Details"));
 	tabs->addTab(output, QStringLiteral("&Output"));
 	tabs->addTab(usage, QStringLiteral("&Usage"));
+	tabs->addTab(build_network(), QStringLiteral("&Network"));
+	connect(tabs, &QTabWidget::currentChanged, this, [this]() { ask_ports(); });
 
 	QSplitter *split = new QSplitter;
 	split->addWidget(tree);
@@ -118,6 +129,7 @@ main_window::main_window(const QString &hull_program, QWidget *parent)
 	connect(poll, &QTimer::timeout, this, [this]() {
 		refresh();
 		ask_stats();
+		ask_ports();
 	});
 	poll->start(2000);
 	refresh();
@@ -134,48 +146,53 @@ main_window::~main_window()
 }
 
 /*
+ * The actions carry no mnemonic. Under qtty a menu action's Alt+letter
+ * answers with its menu closed and beats a tab's or a button's, so
+ * Alt+N opened New where the Network tab was meant; the actions have
+ * shortcuts, and the menus' own titles keep theirs.
+ *
  * The shortcuts keep off the keys qtty gives text editing on a terminal,
  * Ctrl+A, E, K, U, W and D, and Ctrl+L, its redraw: bound here, they would
  * answer differently by where the focus is, or never. Hence F7 and F8.
  */
 void main_window::build_actions()
 {
-	new_action = new QAction(QStringLiteral("&New..."), this);
+	new_action = new QAction(QStringLiteral("New..."), this);
 	new_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+N")));
 	new_action->setToolTip(QStringLiteral("Write a new machine's hull.conf and add it"));
 	connect(new_action, &QAction::triggered, this, [this]() { ask_new(); });
-	add_action = new QAction(QStringLiteral("&Add..."), this);
+	add_action = new QAction(QStringLiteral("Add..."), this);
 	add_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+O")));
 	add_action->setToolTip(QStringLiteral("Add a machine's hull.conf to the list"));
 	connect(add_action, &QAction::triggered, this, &main_window::ask_add);
-	remove_action = new QAction(QStringLiteral("&Remove from List"), this);
+	remove_action = new QAction(QStringLiteral("Remove from List"), this);
 	connect(remove_action, &QAction::triggered, this, &main_window::remove_machine);
-	start_action = new QAction(QStringLiteral("&Start"), this);
+	start_action = new QAction(QStringLiteral("Start"), this);
 	start_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+S")));
 	connect(start_action, &QAction::triggered, this, &main_window::start);
-	stop_action = new QAction(QStringLiteral("S&top"), this);
+	stop_action = new QAction(QStringLiteral("Stop"), this);
 	stop_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+T")));
 	stop_action->setToolTip(QStringLiteral("Stop: TERM, then KILL after the machine's grace"));
 	connect(stop_action, &QAction::triggered, this, &main_window::stop);
-	kill_action = new QAction(QStringLiteral("&Power Off"), this);
+	kill_action = new QAction(QStringLiteral("Power Off"), this);
 	kill_action->setToolTip(QStringLiteral("KILL the workload at once"));
 	connect(kill_action, &QAction::triggered, this, &main_window::kill_machine);
-	pause_action = new QAction(QStringLiteral("&Pause"), this);
+	pause_action = new QAction(QStringLiteral("Pause"), this);
 	pause_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+P")));
 	connect(pause_action, &QAction::triggered, this, [this]() { pause_machine(true); });
-	resume_action = new QAction(QStringLiteral("Res&ume"), this);
+	resume_action = new QAction(QStringLiteral("Resume"), this);
 	resume_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+R")));
 	connect(resume_action, &QAction::triggered, this, [this]() { pause_machine(false); });
-	terminal_action = new QAction(QStringLiteral("&Terminal"), this);
+	terminal_action = new QAction(QStringLiteral("Terminal"), this);
 	terminal_action->setShortcut(QKeySequence(QStringLiteral("F7")));
 	terminal_action->setToolTip(QStringLiteral("A shell in the machine: hull exec -t ID /bin/sh"));
 	connect(terminal_action, &QAction::triggered, this, &main_window::open_terminal);
-	screen_action = new QAction(QStringLiteral("Scr&een"), this);
+	screen_action = new QAction(QStringLiteral("Screen"), this);
 	screen_action->setShortcut(QKeySequence(QStringLiteral("F8")));
 	screen_action->setToolTip(QStringLiteral("The machine's screen, where (display vnc) gives "
 	                                         "one, in a VNC client"));
 	connect(screen_action, &QAction::triggered, this, &main_window::open_screen);
-	refresh_action = new QAction(QStringLiteral("Re&fresh"), this);
+	refresh_action = new QAction(QStringLiteral("Refresh"), this);
 	refresh_action->setShortcut(QKeySequence(QStringLiteral("F5")));
 	connect(refresh_action, &QAction::triggered, this, [this]() {
 		for (int i = 0; i < rows.size(); i++)
@@ -183,7 +200,7 @@ void main_window::build_actions()
 				plan_of(i);
 		refresh();
 	});
-	QAction *quit = new QAction(QStringLiteral("&Quit"), this);
+	QAction *quit = new QAction(QStringLiteral("Quit"), this);
 	quit->setShortcut(QKeySequence(QStringLiteral("Ctrl+Q")));
 	connect(quit, &QAction::triggered, this, &QWidget::close);
 
@@ -205,7 +222,7 @@ void main_window::build_actions()
 	machine->addAction(quit);
 
 	QMenu   *store = menuBar()->addMenu(QStringLiteral("&Store"));
-	QAction *images = store->addAction(QStringLiteral("&Images..."));
+	QAction *images = store->addAction(QStringLiteral("Images..."));
 
 	images->setToolTip(QStringLiteral("The store's images: pull, remove, a machine from one"));
 	connect(images, &QAction::triggered, this, &main_window::show_images);
@@ -398,7 +415,11 @@ static QStringList accept_arguments(const QStringList &accepted)
 }
 
 /* `hull plan --explain --resolved` for an added machine: its backend, its
- * hostname and so its id, and what the matrix says of each field. */
+ * hostname and so its id, and what the matrix says of each field. plan
+ * takes no machine's name, so a file of (machines ...) is planned whole
+ * and a named row keeps its own lines: "...: NAME on ..." of the explain,
+ * and the resolved form whose hostname is the name, which the plan writes
+ * in for each machine of such a file. */
 void main_window::plan_of(int index)
 {
 	QProcess     *plan = new QProcess(this);
@@ -408,8 +429,6 @@ void main_window::plan_of(int index)
 		                        QStringLiteral("--explain"), QStringLiteral("--resolved") };
 
 	arguments << accept_arguments(rows[index].accepted);
-	if (!name.isEmpty())
-		arguments << name;
 	plan->setProcessChannelMode(QProcess::MergedChannels);
 	plan->setStandardInputFile(QProcess::nullDevice());
 	plan->setWorkingDirectory(QFileInfo(file).absolutePath());
@@ -420,14 +439,22 @@ void main_window::plan_of(int index)
 		for (row &r : rows)
 			if (r.added.file == file && r.added.name == name) {
 				QString resolved;
+				QString own;
 
-				for (const QString &line : said.split(QLatin1Char('\n')))
-					if (line.startsWith(QStringLiteral("(machine ")))
-						resolved = line;
+				for (const QString &line : said.split(QLatin1Char('\n'))) {
+					if (line.startsWith(QStringLiteral("(machine "))) {
+						if (resolved.isEmpty() &&
+						    (name.isEmpty() || hostname_in(line) == name))
+							resolved = line;
+					} else if (name.isEmpty() ||
+					           line.contains(QStringLiteral(": ") + name + QStringLiteral(" on "))) {
+						own += line + QLatin1Char('\n');
+					}
+				}
 				r.resolved = resolved;
-				r.explain = code == 0 ? said : said + QStringLiteral("\n(refused: hull plan "
-				                                                      "exited %1)\n")
-				                                          .arg(code);
+				r.explain = code == 0 ? own : own + QStringLiteral("\n(refused: hull plan "
+				                                                    "exited %1)\n")
+				                                        .arg(code);
 				r.id = machine_id_of(r.added, hostname_in(resolved));
 			}
 		rebuild();
@@ -450,6 +477,8 @@ void main_window::selected_changed()
 	show_output();
 	usage->clear();
 	ask_stats();
+	ports->clear();
+	ask_ports();
 }
 
 void main_window::update_actions()
@@ -1048,6 +1077,162 @@ void main_window::open_screen()
 		}
 	}
 	say(QStringLiteral("no VNC client found: %1's screen is at %2").arg(id, at));
+}
+
+/*
+ * The Network tab: hull's own wires (section 8, Appendix D) as the
+ * selected machine's plan names them, each port's counters as `hull
+ * segment NAME` reads them, and the machine's link impaired, cleared or
+ * taken down as `hull segment NAME impair` does it. The CLI is asked,
+ * as the counters and the impairments are its words, netem's names
+ * among them, and parsing them a second time here would drift.
+ */
+QWidget *main_window::build_network()
+{
+	network = new QWidget;
+	ports = new QTreeWidget;
+	ports->setColumnCount(7);
+	ports->setHeaderLabels({ QStringLiteral("Segment"), QStringLiteral("Machine"),
+	                         QStringLiteral("Way"), QStringLiteral("Frames"),
+	                         QStringLiteral("Bytes"), QStringLiteral("Passed"),
+	                         QStringLiteral("Lost") });
+	ports->setRootIsDecorated(false);
+	network_note = new QLabel;
+	network_note->setWordWrap(true);
+	impair_way = new QComboBox;
+	impair_way->addItems({ QStringLiteral("both"), QStringLiteral("in"), QStringLiteral("out") });
+	impair_words = new QLineEdit;
+	impair_words->setPlaceholderText(QStringLiteral("loss=10% delay=50ms rate=1mbit"));
+	impair_words->setToolTip(QStringLiteral("netem's names, KEY=VALUE: loss, delay, jitter, "
+	                                        "rate, reorder, duplicate, corrupt, limit, mtu, ..."));
+	QPushButton *apply = new QPushButton(QStringLiteral("&Impair"));
+	QPushButton *clear = new QPushButton(QStringLiteral("C&lear"));
+	QPushButton *down = new QPushButton(QStringLiteral("Link Do&wn"));
+
+	connect(apply, &QPushButton::clicked, this, [this]() {
+		impair(impair_words->text().split(QLatin1Char(' '), Qt::SkipEmptyParts));
+	});
+	connect(clear, &QPushButton::clicked, this, [this]() { impair({}); });
+	connect(down, &QPushButton::clicked, this, [this]() { impair({ QStringLiteral("down") }); });
+
+	QHBoxLayout *controls = new QHBoxLayout;
+	controls->addWidget(impair_way);
+	controls->addWidget(impair_words, 1);
+	controls->addWidget(apply);
+	controls->addWidget(clear);
+	controls->addWidget(down);
+	QVBoxLayout *layout = new QVBoxLayout(network);
+	layout->addWidget(ports, 1);
+	layout->addWidget(network_note);
+	layout->addLayout(controls);
+	return network;
+}
+
+/* Each segment of the selected machine, its ports read again, while the
+ * tab is the one shown. A machine started elsewhere has no plan here, so
+ * its segments are not known. */
+void main_window::ask_ports()
+{
+	const int i = current();
+
+	if (tabs->currentWidget() != network || ports_pending > 0)
+		return;
+	if (i < 0 || i >= rows.size()) {
+		ports->clear();
+		network_note->setText(QString());
+		return;
+	}
+	const QStringList segments = segments_in(rows[i].resolved);
+
+	if (segments.isEmpty()) {
+		ports->clear();
+		network_note->setText(rows[i].resolved.isEmpty()
+		                          ? QStringLiteral("Its plan is not known here: add its hull.conf "
+		                                           "to see its segments.")
+		                          : QStringLiteral("On no segment of hull's: (segments ...) puts "
+		                                           "a machine on a wire of its own."));
+		return;
+	}
+	network_note->setText(rows[i].is_held ? QString()
+	                                      : QStringLiteral("Not running: the counters are "
+	                                                       "a running machine's."));
+	if (!rows[i].is_held) {
+		ports->clear();
+		return;
+	}
+	ports->clear();
+	for (const QString &segment : segments) {
+		QProcess *read = new QProcess(this);
+
+		ports_pending++;
+		read->setStandardInputFile(QProcess::nullDevice());
+		connect(read, &QProcess::finished, this, [this, read, segment]() {
+			static const QRegularExpression line(QStringLiteral("^(\\S+)\\s+(in|out)\\s+(.*)$"));
+
+			ports_pending--;
+			read->deleteLater();
+			for (const QString &text : QString::fromUtf8(read->readAllStandardOutput())
+			                               .split(QLatin1Char('\n'))) {
+				const QRegularExpressionMatch m = line.match(text);
+				QHash<QString, QString>       counts;
+
+				if (!m.hasMatch())
+					continue;
+				for (const QString &pair : m.captured(3).split(QLatin1Char(' '), Qt::SkipEmptyParts))
+					counts.insert(pair.section(QLatin1Char('='), 0, 0),
+					              pair.section(QLatin1Char('='), 1));
+				ports->addTopLevelItem(new QTreeWidgetItem(
+				    { segment, m.captured(1), m.captured(2), counts.value(QStringLiteral("frames")),
+				      counts.value(QStringLiteral("bytes")), counts.value(QStringLiteral("passed")),
+				      counts.value(QStringLiteral("lost")) }));
+			}
+			for (int c = 0; c < ports->columnCount(); c++)
+				ports->resizeColumnToContents(c);
+		});
+		connect(read, &QProcess::errorOccurred, this, [this, read](QProcess::ProcessError e) {
+			if (e != QProcess::FailedToStart)
+				return;
+			ports_pending--;
+			read->deleteLater();
+		});
+		read->start(hull, { QStringLiteral("segment"), segment });
+	}
+}
+
+/* The selected machine's link on the segment of the selected port, else
+ * its first: `hull segment NAME impair ID WAY [WORD...]`, no word clearing
+ * it. What the CLI says is the status line's. */
+void main_window::impair(const QStringList &words)
+{
+	const int i = current();
+
+	if (i < 0 || i >= rows.size() || !rows[i].is_held)
+		return;
+	const QStringList segments = segments_in(rows[i].resolved);
+	QString           segment = segments.value(0);
+
+	if (ports->currentItem() != nullptr)
+		segment = ports->currentItem()->text(0);
+	if (segment.isEmpty()) {
+		say(QStringLiteral("%1 is on no segment known here").arg(rows[i].id));
+		return;
+	}
+	QProcess     *process = new QProcess(this);
+	const QString id = rows[i].id;
+
+	process->setProcessChannelMode(QProcess::MergedChannels);
+	process->setStandardInputFile(QProcess::nullDevice());
+	connect(process, &QProcess::finished, this, [this, process, id, segment](int code) {
+		const QString said = QString::fromUtf8(process->readAll()).trimmed();
+
+		process->deleteLater();
+		say(code == 0 ? QStringLiteral("%1's link on %2 set").arg(id, segment)
+		              : said.isEmpty() ? QStringLiteral("hull segment exited %1").arg(code) : said);
+		ask_ports();
+	});
+	process->start(hull, QStringList{ QStringLiteral("segment"), segment, QStringLiteral("impair"),
+	                                  id, impair_way->currentText() } +
+	                         words);
 }
 
 void main_window::closeEvent(QCloseEvent *event)

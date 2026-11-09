@@ -17,6 +17,8 @@
 #include "machine_list.h"
 
 class QAction;
+class QComboBox;
+class QLineEdit;
 class QLabel;
 class QPlainTextEdit;
 class QProcess;
@@ -76,6 +78,9 @@ private:
 	void say(const QString &text);
 	void follow_logs();
 	void ask_stats();
+	QWidget *build_network();
+	void     ask_ports();
+	void     impair(const QStringList &words);
 
 	QString         hull;
 	QList<row>      rows;
@@ -84,6 +89,12 @@ private:
 	QPlainTextEdit *details;
 	QPlainTextEdit *output;
 	QPlainTextEdit *usage;
+	QWidget        *network;
+	QTreeWidget    *ports;
+	QLabel         *network_note;
+	QComboBox      *impair_way;
+	QLineEdit      *impair_words;
+	int             ports_pending = 0;
 	QLabel         *core_state;
 	QTimer         *poll;
 	QAction        *new_action;

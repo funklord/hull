@@ -43,6 +43,10 @@ printf '%s\n' '(machine (hostname "gui-b") (source "dir:./rootfs") (command "/pr
 
 # Refused on a vm unless --accept: one machine, though plan names it on
 # the refused field's line as well as on its own.
+printf '%s\n' '(machines' \
+	'  (gui-da (source "dir:./rootfs") (segments "gui-wire") (command "/probe" "ticks" "600"))' \
+	'  (gui-db (source "dir:./rootfs") (segments "gui-wire") (command "/probe" "ticks" "600")))' \
+	> "$dir/d.conf"
 printf '%s\n' '(machine (hostname "gui-c") (backend vm) (source "dir:./rootfs") (fidelity inotify))' \
 	> "$dir/c.conf"
 
@@ -128,10 +132,11 @@ if ! grep -q '(command "/probe" "say" "made-by-new")' "$dir/newm/hull.conf" 2>/d
 fi
 has "$out" 'gui-n' "New's machine listed"
 
-# Images: one of two refs removed through Store > Images.
+# Images: one of two refs removed through Store > Images: the menu opened,
+# Down onto its item, Enter; Alt+R onto Remove, Enter, and Enter for Yes.
 timeout 30 "$hull" commit "$dir/rootfs" gui/one > /dev/null 2>&1
 timeout 30 "$hull" commit "$dir/rootfs" gui/two > /dev/null 2>&1
-keys "$dir" "b'\\x1bs'" "b'i'" "b'\\x1br'" "b'\\r'"
+keys "$dir" "b'\\x1bs'" "b'\\x1b[B'" "b'\\r'" "b'\\x1br'" "b'\\r'" "b'\\r'"
 has "$out" 'hull tag -d gui/one' "Images ran the removal"
 out=$(timeout 10 "$hull" images 2>&1)
 refute "$out" 'gui/one' "Images removed the ref"
@@ -158,9 +163,8 @@ has "$out" 'gui-b +running +chroot \(ns\)' "a core's machine listed"
 has "$out" 'gui-a +stopped' "the added machine beside it"
 has "$out" 'core: 1 machine' "the status counts the core's"
 
-# Screen on a machine with none: said, from its address. The core's
-# machine is the last row.
-keys "$dir" "b'\\x1b[F'" "b'\\x1b[19~'"
+# Screen on a machine with none: said, from its address.
+keys "$dir" "b'gui-b'" "b'\\x1b[19~'"
 has "$out" 'gui-b shows no screen at 127' "Screen on a machine with none"
 
 # Each request the window makes, against that machine.
@@ -182,6 +186,28 @@ cases=$((cases + 1))
 if [ "$status" != 0 ]; then
 	fail "machine_list_test exited $status" "$out"
 fi
+
+# Two machines on a wire of hull's: the Network tab lists the wire's
+# ports, and Link Down sets the selected machine's link, as hull segment
+# does.
+(cd "$dir" && exec timeout 120 "$hull" run -f d.conf > "$dir/wire.out" 2>&1) &
+run_pid=$!
+tries=0
+until [ "$(timeout 10 "$hull" ps 2>/dev/null | grep -c 'gui-d. .*running')" = 2 ]; do
+	tries=$((tries + 1))
+	if [ "$tries" -gt 100 ]; then
+		break
+	fi
+	sleep 0.1
+done
+# The row is chosen by typing its name, the list's own search.
+keys "$dir" "b'gui-db'" "b'\\x1bn'" "b'\\x1bw'" -- d.conf
+has "$out" 'gui-wire gui-da out' "the Network tab lists the wire's ports"
+has "$out" "gui-db's link on gui-wire set" "Link Down sets the link"
+timeout 30 "$hull" stop gui-da > /dev/null 2>&1
+timeout 30 "$hull" stop gui-db > /dev/null 2>&1
+wait "$run_pid" 2>/dev/null
+run_pid=
 
 rm -rf "${dir:?}/config" "${dir:?}/new" "${dir:?}/newm" "${dir:?}/data" "${dir:?}/screen.txt"
 printf 'gui_test: %d cases, %d failed\n' "$((cases))" "$failures"

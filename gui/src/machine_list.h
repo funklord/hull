@@ -42,6 +42,10 @@ QString machine_id_of(const added_machine &machine, const QString &hostname);
 /* The hostname a `hull plan --resolved` line says, "" where none. */
 QString hostname_in(const QString &resolved);
 
+/* The segments a `hull plan --resolved` line names, `(segments "a" (b
+ * ...))`, each once, in order; none where it names none. */
+QStringList segments_in(const QString &resolved);
+
 /* A machine as New writes it: each field left empty, 0 or false is left
  * out of the file, so the spec's default holds and says so in the plan. */
 struct new_machine {

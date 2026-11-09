@@ -85,8 +85,14 @@ int main(int argc, char **argv)
 #endif
 	QApplication application(argc, argv);
 #ifdef HULL_QTTY
-	if (tui)
+	/* And a terminal's habits: Enter on the focused control, Up and Down
+	 * between controls, Ctrl+PgUp/PgDn between tabs, Alt+letter to jump.
+	 * qtty leaves them off for an application that binds those keys
+	 * itself; this one binds none of them. */
+	if (tui) {
 		Qtty::setup(application);
+		Qtty::set_keyboard_conventions(true);
+	}
 #endif
 	QApplication::setApplicationName(QStringLiteral("hull-gui"));
 	QApplication::setApplicationVersion(QStringLiteral(HULL_VERSION));

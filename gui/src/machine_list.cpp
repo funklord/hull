@@ -145,6 +145,45 @@ QString spec_text(const new_machine &machine, QString *why)
 	return text + QStringLiteral(")\n");
 }
 
+QStringList segments_in(const QString &resolved)
+{
+	const int   start = resolved.indexOf(QStringLiteral("(segments "));
+	QStringList names;
+	int         depth = 0;
+
+	if (start < 0)
+		return names;
+	/* Inside the form: a string at its own depth is a bare segment, a list
+	 * there one with settings, named by its head. */
+	for (int i = start + 1; i < resolved.size(); i++) {
+		const QChar c = resolved[i];
+
+		if (c == QLatin1Char('"')) {
+			int end = i + 1;
+
+			while (end < resolved.size() && resolved[end] != QLatin1Char('"'))
+				end += resolved[end] == QLatin1Char('\\') ? 2 : 1;
+			if (depth == 0 && !names.contains(resolved.mid(i + 1, end - i - 1)))
+				names << resolved.mid(i + 1, end - i - 1);
+			i = end;
+		} else if (c == QLatin1Char('(')) {
+			if (depth == 0) {
+				const int     end = resolved.indexOf(QRegularExpression(QStringLiteral("[ ()]")),
+				                                     i + 1);
+				const QString head = resolved.mid(i + 1, end - i - 1);
+
+				if (!head.isEmpty() && !names.contains(head))
+					names << head;
+			}
+			depth++;
+		} else if (c == QLatin1Char(')')) {
+			if (depth-- == 0)
+				break;
+		}
+	}
+	return names;
+}
+
 QString hostname_in(const QString &resolved)
 {
 	static const QRegularExpression hostname(QStringLiteral("\\(hostname \"([^\"\\\\]*)\"\\)"));
