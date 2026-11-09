@@ -189,3 +189,7 @@ with open(os.path.join(spec, 'kinds'), 'w') as f:
 	f.write('; a comment\n(machine (source "dir:./r") ; another\n'
 	        '  (env (A "x\\"y") (B "t\\tz")) (hostname "h(o)s;t")\n'
 	        '  (command "/bin/sh" "-c" "echo \\"hi\\"") (key #0a1f#))\n')
+# And canonical form, a manifest's and the wire's, which spec_fuzz.c
+# opens every input as as well.
+with open(os.path.join(spec, 'canonical'), 'wb') as f:
+	f.write(b'(8:manifest(7:version1:1)(5:entry(4:path5:a/b c)(4:kind3:reg)(4:size2:12)))')

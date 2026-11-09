@@ -2,9 +2,9 @@
  * spec_fuzz.c -- libFuzzer over spec/spec.c and the s-expression reader
  * under it, which read every hull.conf: each input checked as a whole
  * file, from seeds that are project.md's own examples. Wherever it reads
- * as forms, spec or not, every form is also framed twice -- by the
- * tokens, as a checked document is read, and by situ, as it was before --
- * and the two must agree. A crash, a sanitizer's report or a disagreement
+ * as forms, spec or not, readable or canonical, every form is also
+ * framed twice -- by the tokens, as a checked document is read, and by
+ * situ, as it was before -- and the two must agree. A crash, a sanitizer's report or a disagreement
  * stops the run. `make check-fuzz` runs it.
  */
 
@@ -44,11 +44,15 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
 	if (hull_spec_open(&spec, data, size, &error) == HULL_SPEC_OK && spec.has_machine)
 		(void)hull_spec_find(&spec, &spec.machine, "source", &entry);
-	/* Whether or not it is a spec, wherever it reads as forms. */
-	if (hull_sexpr_open(&doc, data, size, HULL_SEXPR_READABLE, NULL) != HULL_SEXPR_OK)
-		return 0;
-	judged = doc;
-	judged.checked = 0;
-	agree(&doc, &judged, hull_sexpr_first(&doc, &a), a, hull_sexpr_first(&judged, &b), b);
+	/* Whether or not it is a spec, wherever it reads as forms, readable
+	 * or canonical, a manifest's and the wire's. */
+	for (int syntax = 0; syntax < 2; syntax++) {
+		if (hull_sexpr_open(&doc, data, size, syntax == 0 ? HULL_SEXPR_READABLE :
+		                    HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK)
+			continue;
+		judged = doc;
+		judged.checked = 0;
+		agree(&doc, &judged, hull_sexpr_first(&doc, &a), a, hull_sexpr_first(&judged, &b), b);
+	}
 	return 0;
 }
