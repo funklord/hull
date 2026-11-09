@@ -230,7 +230,7 @@ void main_window::rebuild()
 		if (r.is_held && r.held.root)
 			state += QStringLiteral(" ROOT");
 		if (backend.isEmpty()) {
-			static const QRegularExpression on(QStringLiteral(" on (\\S+) \\((\\S+)\\): ok$"),
+			static const QRegularExpression on(QStringLiteral(" on (\\S+) \\((\\S+)\\): (ok|rejected, .*)$"),
 			                                   QRegularExpression::MultilineOption);
 			const QRegularExpressionMatch match = on.match(r.explain);
 

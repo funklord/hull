@@ -1597,9 +1597,9 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 - **Terminal is the CLI's `hull exec -t ID /bin/sh`.** On the desktop it opens in a terminal emulator: `$TERMINAL`, else `x-terminal-emulator`, else `xterm`. Under qtty the window hands its own terminal over (`Qtty::shell_out`) until the shell exits. A shell that cannot start leaves its reason on screen until Enter.
 
 **Measured** by `test/gui_test.sh` (`make check-gui`, which needs qtty), on a core and a chroot machine of its own:
-- the window drawn as text by qtty's snapshot, with no core, then with the list it saved, then beside a machine the CLI started;
+- the window drawn as text by qtty's snapshot, with no core, with a refused one-machine file (one row, its backend read from the refusal), with the list it saved, then beside a machine the CLI started;
 - `gui/test/core_link_test.cpp`, every request the window makes against a running machine: list, stats, logs, pause and resume (each seen in the list), kill with a signal the core refuses, stop, and no core.
-- 9 cases. Two sabotages each failed a named case: the state read under another key, and the core's own machines dropped from the list.
+- 11 cases. Three sabotages each failed a named case: the state read under another key, the core's own machines dropped from the list, and a refused machine's name counted per line.
 - A machine stopped stays listed as `exited` until its run's frontend has gone, which the core does on purpose. The window offers nothing to do to it.
 
 **Not yet:**

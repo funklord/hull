@@ -38,6 +38,11 @@ printf '%s\n' '(machine (hostname "gui-a") (source "dir:./rootfs") (command "/pr
 printf '%s\n' '(machine (hostname "gui-b") (source "dir:./rootfs") (command "/probe" "say" "gui-hello" "ticks" "600"))' \
 	> "$dir/b.conf"
 
+# Refused on a vm unless --accept: one machine, though plan names it on
+# the refused field's line as well as on its own.
+printf '%s\n' '(machine (hostname "gui-c") (backend vm) (source "dir:./rootfs") (fidelity inotify))' \
+	> "$dir/c.conf"
+
 cases=0
 failures=0
 run_pid=
@@ -76,6 +81,19 @@ out=$(snapshot a.conf)
 has "$out" 'gui-a +stopped +chroot \(ns\)' "no core: the added machine"
 has "$out" 'core: not running' "no core: the status"
 has "$out" 'on_disconnect stop' "no core: the plan in the details"
+
+# refute TEXT PATTERN WHAT: no line of TEXT matches PATTERN.
+refute() {
+	cases=$((cases + 1))
+	if printf '%s\n' "$1" | grep -Eq -- "$2"; then
+		fail "$3: a line matches /$2/" "$1"
+	fi
+}
+
+# A refused one-machine file is one row, named for its machine.
+out=$(snapshot c.conf)
+has "$out" 'gui-c +stopped +qemu \(vm\)' "a refused machine added"
+refute "$out" '^.{0,3}machine +stopped' "a refused machine added once"
 
 # Saved: the list again, with no file given.
 out=$(snapshot)
