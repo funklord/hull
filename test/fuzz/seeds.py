@@ -163,3 +163,13 @@ CMD --serve
 for name, text in (('compose', COMPOSE), ('dockerfile', DOCKERFILE)):
 	with open(os.path.join(imp, name), 'w') as f:
 		f.write(text)
+
+# Two that import_fuzz.c found, kept as seeds so a regression fails at
+# once: profiles: given in flow form more than once, past the eight a
+# service holds; and a healthcheck interval past what a long holds.
+with open(os.path.join(imp, 'profiles'), 'w') as f:
+	f.write('services:\n  web:\n    image: a\n    profiles: [a, b, c, d, e]\n'
+	        '    profiles: [f, g, h, i, j, k]\n')
+with open(os.path.join(imp, 'interval'), 'w') as f:
+	f.write('services:\n  web:\n    image: a\n    healthcheck:\n      test: ["CMD", "true"]\n'
+	        '      interval: 1e30h\n')

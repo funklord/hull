@@ -1403,7 +1403,12 @@ static long compose_ms(const char *text)
 				break;
 		if (i == sizeof units / sizeof units[0])
 			return -1;
-		total += (long)(n * (double)units[i].ms);
+		/* Not a duration where it is negative, not a number, or past
+		 * a thousand years, which a long need not hold as a double. */
+		n *= (double)units[i].ms;
+		if (!(n >= 0.0) || n > 3.2e13 || (double)total + n > 3.2e13)
+			return -1;
+		total += (long)n;
 		text = end + strlen(units[i].unit);
 	}
 	return total;
@@ -2628,7 +2633,9 @@ static char *compose_text(FILE *file, const char *project)
 			char *items[8];
 			int   n = flow_list(value, items, 8);
 
-			for (int i = 0; i < n; i++)
+			/* Held to the list's room as the block form is: a service
+			 * may name profiles: more than once. */
+			for (int i = 0; i < n && s.profile_count < 8; i++)
 				snprintf(s.profile[s.profile_count++], sizeof s.profile[0], "%s", items[i]);
 		} else if (strcmp(key, "build") == 0)
 			snprintf(s.build_context, sizeof s.build_context, "%s", scalar(value));
