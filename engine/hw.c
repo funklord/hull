@@ -877,8 +877,8 @@ static int run_workload(hull_machine *m)
 	char        target[256];
 	char        pid_file[700];
 	char       *script = malloc(SCRIPT_MAX);
-	int         out[2];
-	int         err[2];
+	int         out[2] = { -1, -1 };
+	int         err[2] = { -1, -1 };
 	int         null;
 	int         status = 0;
 	pid_t       pid;
@@ -890,6 +890,10 @@ static int run_workload(hull_machine *m)
 		return 125;
 	}
 	if (pipe2(out, O_CLOEXEC) != 0 || pipe2(err, O_CLOEXEC) != 0) {
+		/* The first made, where the second failed: the core lives on. */
+		for (unsigned i = 0u; i < 2u; i++)
+			if (out[i] >= 0)
+				close(out[i]);
 		free(script);
 		return 125;
 	}
@@ -1268,9 +1272,9 @@ static hull_status hw_exec(hull_core *core, hull_machine *m, hull_buf spec, hull
 	const char     *argv[12];
 	char            port[16];
 	char            target[256];
-	int             in[2];
-	int             outs[2];
-	int             errs[2];
+	int             in[2] = { -1, -1 };
+	int             outs[2] = { -1, -1 };
+	int             errs[2] = { -1, -1 };
 	hull_stream    *st;
 
 	if (hull_sexpr_open(&doc, spec.data, spec.len, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
@@ -1291,6 +1295,13 @@ static hull_status hw_exec(hull_core *core, hull_machine *m, hull_buf spec, hull
 		free(words[i]);
 	if ((st = calloc(1u, sizeof *st)) == NULL || pipe2(in, O_CLOEXEC) != 0 ||
 	    pipe2(outs, O_CLOEXEC) != 0 || pipe2(errs, O_CLOEXEC) != 0) {
+		/* Those made before the one that failed: the core lives on. */
+		for (unsigned i = 0u; i < 2u; i++) {
+			if (in[i] >= 0)
+				close(in[i]);
+			if (outs[i] >= 0)
+				close(outs[i]);
+		}
 		free(script);
 		free(st);
 		return fail(error, HULL_ERR_RUNTIME, "pipes for the command could not be made");

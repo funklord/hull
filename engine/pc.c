@@ -838,34 +838,42 @@ static void read_machine(hull_machine *m)
 	       WIFSIGNALED(status) ? WTERMSIG(status) : 0);
 }
 
-/* qemu started, its stdio this machine's: 0, or -1 with m->why. Forked
- * from the thread that lives as long as it, PR_SET_PDEATHSIG going by the
- * thread and not the process. */
+/* Each of the `n` descriptors that is open, closed. */
+static void close_all(int *fds, unsigned n)
+{
+	for (unsigned i = 0u; i < n; i++)
+		if (fds[i] >= 0)
+			close(fds[i]);
+}
+
+/* qemu started, its stdio this machine's: 0, or -1 with m->why, nothing
+ * of it left open, the core living on past a failure. Forked from the
+ * thread that lives as long as it, PR_SET_PDEATHSIG going by the thread
+ * and not the process. */
 static int launch(hull_machine *m)
 {
-	int   out[2];
-	int   err[2];
-	int   in[2];
-	int   monitor[2];
+	int   fds[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+	int  *in = fds, *monitor = fds + 2, *out = fds + 4, *err = fds + 6;
 	pid_t parent = getpid();
 	pid_t child;
 
-	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, in) != 0) {
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, in) != 0 ||
+	    socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, monitor) != 0) {
 		snprintf(m->why, sizeof m->why, "a socket for the machine could not be made\n");
-		return -1;
-	}
-	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, monitor) != 0) {
-		snprintf(m->why, sizeof m->why, "a socket for the machine could not be made\n");
+		close_all(fds, 8u);
 		return -1;
 	}
 	if (pipe2(out, O_CLOEXEC) != 0 || pipe2(err, O_CLOEXEC) != 0) {
 		snprintf(m->why, sizeof m->why, "a pipe for the machine could not be made\n");
+		close_all(fds, 8u);
 		return -1;
 	}
 	m->monitor_peer = monitor[1];
 	child = fork();
 	if (child < 0) {
 		snprintf(m->why, sizeof m->why, "qemu could not be started\n");
+		m->monitor_peer = -1;
+		close_all(fds, 8u);
 		return -1;
 	}
 	if (child == 0) {
