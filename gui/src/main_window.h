@@ -68,6 +68,7 @@ private:
 	void kill_machine();
 	void pause_machine(bool paused);
 	void open_terminal();
+	void open_screen();
 	void remove_machine();
 	void ask_add();
 	void say(const QString &text);
@@ -92,6 +93,7 @@ private:
 	QAction        *resume_action;
 	QAction        *refresh_action;
 	QAction        *terminal_action;
+	QAction        *screen_action;
 	core_request   *logs = nullptr;    /* following the selected machine's */
 	QString         logs_of;
 	bool            listing = false;

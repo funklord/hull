@@ -37,7 +37,13 @@
 #include <QToolBar>
 #include <QTreeWidget>
 
+#include <arpa/inet.h>
 #include <errno.h>
+#include <string.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -121,10 +127,15 @@ main_window::~main_window()
 		}
 }
 
+/*
+ * The shortcuts keep off the keys qtty gives text editing on a terminal,
+ * Ctrl+A, E, K, U, W and D, and Ctrl+L, its redraw: bound here, they would
+ * answer differently by where the focus is, or never. Hence F7 and F8.
+ */
 void main_window::build_actions()
 {
 	add_action = new QAction(QStringLiteral("&Add..."), this);
-	add_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+A")));
+	add_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+O")));
 	add_action->setToolTip(QStringLiteral("Add a machine's hull.conf to the list"));
 	connect(add_action, &QAction::triggered, this, &main_window::ask_add);
 	remove_action = new QAction(QStringLiteral("&Remove from List"), this);
@@ -143,12 +154,17 @@ void main_window::build_actions()
 	pause_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+P")));
 	connect(pause_action, &QAction::triggered, this, [this]() { pause_machine(true); });
 	resume_action = new QAction(QStringLiteral("Res&ume"), this);
-	resume_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+U")));
+	resume_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+R")));
 	connect(resume_action, &QAction::triggered, this, [this]() { pause_machine(false); });
 	terminal_action = new QAction(QStringLiteral("&Terminal"), this);
-	terminal_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+E")));
+	terminal_action->setShortcut(QKeySequence(QStringLiteral("F7")));
 	terminal_action->setToolTip(QStringLiteral("A shell in the machine: hull exec -t ID /bin/sh"));
 	connect(terminal_action, &QAction::triggered, this, &main_window::open_terminal);
+	screen_action = new QAction(QStringLiteral("Scr&een"), this);
+	screen_action->setShortcut(QKeySequence(QStringLiteral("F8")));
+	screen_action->setToolTip(QStringLiteral("The machine's screen, where (display vnc) gives "
+	                                         "one, in a VNC client"));
+	connect(screen_action, &QAction::triggered, this, &main_window::open_screen);
 	refresh_action = new QAction(QStringLiteral("Re&fresh"), this);
 	refresh_action->setShortcut(QKeySequence(QStringLiteral("F5")));
 	connect(refresh_action, &QAction::triggered, this, [this]() {
@@ -171,6 +187,7 @@ void main_window::build_actions()
 	machine->addAction(pause_action);
 	machine->addAction(resume_action);
 	machine->addAction(terminal_action);
+	machine->addAction(screen_action);
 	machine->addSeparator();
 	machine->addAction(refresh_action);
 	machine->addSeparator();
@@ -186,6 +203,7 @@ void main_window::build_actions()
 	bar->addAction(pause_action);
 	bar->addAction(resume_action);
 	bar->addAction(terminal_action);
+	bar->addAction(screen_action);
 	update_actions();
 }
 
@@ -433,6 +451,7 @@ void main_window::update_actions()
 	pause_action->setEnabled(held && state != QStringLiteral("paused"));
 	resume_action->setEnabled(held && state == QStringLiteral("paused"));
 	terminal_action->setEnabled(state == QStringLiteral("running"));
+	screen_action->setEnabled(state == QStringLiteral("running") && !rows[i].held.address.isEmpty());
 }
 
 void main_window::show_details()
@@ -887,6 +906,80 @@ void main_window::open_terminal()
 	}
 	say(QStringLiteral("no terminal emulator found: set $TERMINAL, or run `hull exec -t %1 "
 	                   "/bin/sh`").arg(id));
+}
+
+/* Whether something answers TCP at `address`:`port` within a second. */
+static bool answers(const QString &address, quint16 port)
+{
+	struct sockaddr_in to;
+	struct pollfd      ready;
+	int                error = 0;
+	socklen_t          length = sizeof error;
+	int                fd;
+	bool               open = false;
+
+	memset(&to, 0, sizeof to);
+	to.sin_family = AF_INET;
+	to.sin_port = htons(port);
+	if (inet_pton(AF_INET, address.toLatin1().constData(), &to.sin_addr) != 1)
+		return false;
+	fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	if (fd < 0)
+		return false;
+	if (::connect(fd, (struct sockaddr *)&to, sizeof to) == 0) {
+		open = true;
+	} else if (errno == EINPROGRESS) {
+		ready.fd = fd;
+		ready.events = POLLOUT;
+		open = poll(&ready, 1, 1000) == 1 &&
+		       getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0 && error == 0;
+	}
+	close(fd);
+	return open;
+}
+
+/*
+ * The selected machine's screen: `(display vnc)` serves it on port 5900
+ * of the machine's address (section 5.0's pc), for any VNC client. On the
+ * desktop the first client found is started on it; under qtty there is no
+ * screen to show one on, so the address is said. A machine with no screen
+ * says so rather than a client that fails to connect.
+ */
+void main_window::open_screen()
+{
+	const int i = current();
+
+	if (i < 0 || i >= rows.size() || !rows[i].is_held || rows[i].held.address.isEmpty())
+		return;
+	const QString id = rows[i].id;
+	const QString address = rows[i].held.address;
+	const QString at = address + QStringLiteral(":5900");
+
+	if (!answers(address, 5900)) {
+		say(QStringLiteral("%1 shows no screen at %2: a machine gives one with (display vnc)")
+		        .arg(id, at));
+		return;
+	}
+	if (on_terminal()) {
+		say(QStringLiteral("%1's screen is at %2, for a VNC client").arg(id, at));
+		return;
+	}
+	const QList<QStringList> clients = {
+		{ QStringLiteral("vncviewer"), address + QStringLiteral("::5900") },
+		{ QStringLiteral("xtigervncviewer"), address + QStringLiteral("::5900") },
+		{ QStringLiteral("remmina"), QStringLiteral("-c"), QStringLiteral("vnc://") + at },
+		{ QStringLiteral("krdc"), QStringLiteral("vnc://") + at },
+		{ QStringLiteral("xdg-open"), QStringLiteral("vnc://") + at },
+	};
+	for (const QStringList &client : clients) {
+		const QString found = QStandardPaths::findExecutable(client.first());
+
+		if (!found.isEmpty() && QProcess::startDetached(found, client.mid(1))) {
+			say(QStringLiteral("%1's screen, %2, in %3").arg(id, at, client.first()));
+			return;
+		}
+	}
+	say(QStringLiteral("no VNC client found: %1's screen is at %2").arg(id, at));
 }
 
 void main_window::closeEvent(QCloseEvent *event)
