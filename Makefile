@@ -1001,12 +1001,13 @@ clean:
 	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) $(FUZZ_FILES) \
 	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor $(CLIENT_LIB) $(GUI_BIN)
 	@# qmake's builds, each cleaned by its own Makefile, which names its files.
-	@if [ -f '$(BUILD_DIR)/gui/Makefile' ]; then $(MAKE) -s -C '$(BUILD_DIR)/gui' distclean; fi
-	@if [ -f '$(BUILD_DIR)/test/gui-build/Makefile' ]; then \
-	    $(MAKE) -s -C '$(BUILD_DIR)/test/gui-build' distclean; fi
-	@if [ -f '$(BUILD_DIR)/test/gui-list/Makefile' ]; then \
-	    $(MAKE) -s -C '$(BUILD_DIR)/test/gui-list' distclean; fi
-	@if [ -f '$(BUILD_DIR)/qtty/Makefile' ]; then $(MAKE) -s -C '$(BUILD_DIR)/qtty' distclean; fi
+	@# The guard shares the line: make runs a line holding $(MAKE) even under
+	@# -n or -t, and a dry run would otherwise clean.
+	@case "$(firstword $(MAKEFLAGS))" in -*) ;; *[nt]*) exit 0 ;; esac; \
+	for sub in gui test/gui-build test/gui-list qtty; do \
+	    if [ -f '$(BUILD_DIR)/'"$$sub"/Makefile ]; then \
+	        $(MAKE) -s -C '$(BUILD_DIR)/'"$$sub" distclean; fi; \
+	done
 	@# check-sanitize's own build, cleaned as this one is, by name; one level
 	@# down only, there being no sanitize/sanitize to go on to.
 	@if [ -d '$(BUILD_DIR)/sanitize' ]; then $(MAKE) -s BUILD_DIR='$(BUILD_DIR)/sanitize' clean; fi
