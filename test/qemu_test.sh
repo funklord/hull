@@ -1762,6 +1762,39 @@ else
 	# converted through the fetched loader, where dropbearconvert's own
 	# interpreter names the image's, which such an image has not.
 	rm -rf "$root/dbstatic"
+	mkdir -p "$root/dbstatic/bin" "$root/dbstatic/etc" "$root/dbstatic/run" "$root/dbstatic/tmp" \
+		"$root/dbstatic/proc" "$root/dbstatic/dev" "$root/dbstatic/sys" "$root/dbstatic/root"
+	cp "$probe" "$root/dbstatic/bin/sh"
+	printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/dbstatic/etc/passwd"
+	chmod 755 "$root/dbstatic"
+	printf '(machine (source "dir:./dbstatic") (backend vm) (mutable overlay) (hostname "qdbs") %s %s)\n' \
+		'(ssh true)' '(command "/bin/sh" "-c" "probe say ready sleep 300")' > "$root/qdbs.conf"
+	sed 's/qdb\.hull/qdbs.hull/; s/qdb\.known/qdbs.known/' "$root/qdb.ssh" > "$root/qdbs.ssh"
+	rm -f "$root/qdbs.out" "$root/qdbs.known"
+	(cd / && exec env XDG_RUNTIME_DIR="$dbrt" XDG_CACHE_HOME="$root/cache" timeout -k 2 300 \
+		"$hull" run -f "$root/qdbs.conf" > "$root/qdbs.out" 2>&1) &
+	runner=$!
+	tries=0
+	until grep -q '^ready$' "$root/qdbs.out" 2>/dev/null || [ "$tries" -ge 60 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+	printf 'qdbs.hull %s\n' "$(cut -d' ' -f1,2 "$root/data/hull/machines/qdbs/host_key.pub" 2>&1)" \
+		> "$root/qdbs.known"
+	tries=0
+	until timeout 10 ssh -F "$root/qdbs.ssh" qdbs.hull 'probe say up' < /dev/null 2>/dev/null |
+	      grep -q '^up$' || [ "$tries" -ge 40 ]; do
+		tries=$((tries + 1))
+		sleep 0.5
+	done
+	who=$(timeout 10 ssh -F "$root/qdbs.ssh" qdbs.hull 'probe uid host' < /dev/null 2>&1)
+	XDG_RUNTIME_DIR="$dbrt" timeout 30 "$hull" stop qdbs > /dev/null 2>&1
+	wait "$runner"
+	cases=$((cases + 1))
+	[ "$who" = "$(printf 'uid=0\nhost=qdbs')" ] ||
+		fail "ssh did not log in through the fetched dropbear to a root with no C library" \
+			"$who; $(cat "$root/qdbs.out")"
+	rm -rf "$root/dbstatic"
 	rm -f "$root/home/.ssh/dbkey" "$root/home/.ssh/dbkey.pub"
 	rm -rf "$dbrt"
 fi
@@ -2866,6 +2899,99 @@ else
 		has 5 '^from arm64$'
 		has 5 '^host=qa64$'
 		has 5 '^read=aarch64$'
+		# (ssh true) on an arm64 machine whose image has no sshd (section
+		# 8.1 item 3): arm64's dropbear, `hull sshd fetch --arch arm64`'s,
+		# where amd64's, which an arm64 guest cannot run, had been shared.
+		# Its root the arm64 probe as /bin/sh, which runs `sh -c "probe
+		# ..."` as dropbear runs a command, a passwd naming root, and no
+		# sshd. Refused at start naming the command where the cache has
+		# amd64's alone; fetched, real ssh logs in as root by a key of the
+		# test's against the machine's own host key, pinned. Runtimes on a
+		# tmpfs, the host key being private; each a core of its own, the
+		# engine reading the cache from the core's environment.
+		a64nossh=$(mktemp -d /dev/shm/hull-qa64n.XXXXXX 2>/dev/null)
+		a64dbrt=$(mktemp -d /dev/shm/hull-qa64d.XXXXXX 2>/dev/null)
+		if [ -z "$a64nossh" ] || [ -z "$a64dbrt" ]; then
+			printf 'qemu: the arm64 fetched sshd not tried: no tmpfs under /dev/shm\n'
+		else
+			chmod 700 "$a64nossh" "$a64dbrt"
+			rm -rf "$root/a64db" "$root/cache-a64nossh"
+			mkdir -p "$root/a64db/bin" "$root/a64db/etc" "$root/a64db/run" "$root/a64db/tmp" \
+				"$root/a64db/proc" "$root/a64db/dev" "$root/a64db/sys" "$root/a64db/root" \
+				"$root/cache-a64nossh/hull"
+			cp "$arm64_probe" "$root/a64db/bin/sh"
+			printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/a64db/etc/passwd"
+			chmod 755 "$root/a64db"
+			# The arm64 kernel and amd64's sshd, not arm64's.
+			for d in "$root"/cache/hull/kernel-arm64-* "$root"/cache/hull/dropbear-2*; do
+				[ -d "$d" ] && ln -s "$d" "$root/cache-a64nossh/hull/$(basename "$d")"
+			done
+			printf '(machine (source "dir:./a64db") (backend emu) (arch arm64) %s %s %s)\n' \
+				'(mutable overlay) (hostname "qa64db") (ssh true)' \
+				'(tuning (vm (profile full)))' \
+				'(command "/bin/sh" "-c" "probe say ready sleep 600")' > "$root/a64db.conf"
+			name='(ssh true) on arm64 with only amd64'"'"'s sshd fetched'
+			out=$(cd / && XDG_RUNTIME_DIR=$a64nossh XDG_CACHE_HOME="$root/cache-a64nossh" \
+				timeout -k 2 300 "$hull" run -f "$root/a64db.conf" 2>&1)
+			got=$?
+			cases=$((cases + 1))
+			{ [ "$got" != 0 ] && printf '%s\n' "$out" | grep -q '`hull sshd fetch --arch arm64`'; } ||
+				fail "$name was not refused naming hull sshd fetch --arch arm64" "$got: $out"
+			name='hull sshd fetch --arch arm64'
+			out=$(XDG_CACHE_HOME="$root/cache" timeout 120 "$hull" sshd fetch --arch arm64 2>&1)
+			got=$?
+			has 0 'dropbear-arm64-'
+			cases=$((cases + 1))
+			[ -x "$(printf '%s\n' "$out" | tail -1)/usr/sbin/dropbear" ] ||
+				fail "hull sshd fetch --arch arm64 put no dropbear in the cache" "$out"
+			rm -f "$root/home/.ssh/a64key" "$root/home/.ssh/a64key.pub"
+			ssh-keygen -q -t ed25519 -N '' -C hull-test-a64 -f "$root/home/.ssh/a64key"
+			{
+				printf 'Host qa64db.hull\n'
+				printf '  ProxyCommand env XDG_RUNTIME_DIR=%s %s proxy-ssh %%h\n' "$a64dbrt" "$hull"
+				printf '  User root\n  IdentityFile %s\n  IdentitiesOnly yes\n' "$root/home/.ssh/a64key"
+				printf '  BatchMode yes\n  ConnectTimeout 20\n  LogLevel error\n'
+				printf '  StrictHostKeyChecking yes\n  UserKnownHostsFile %s\n' "$root/a64db.known"
+			} > "$root/a64db.ssh"
+			rm -f "$root/a64db.out" "$root/a64db.known"
+			(cd / && exec env XDG_RUNTIME_DIR="$a64dbrt" XDG_CACHE_HOME="$root/cache" timeout -k 2 400 \
+				"$hull" run -f "$root/a64db.conf" > "$root/a64db.out" 2>&1) &
+			runner=$!
+			tries=0
+			until grep -q '^ready$' "$root/a64db.out" 2>/dev/null || [ "$tries" -ge 240 ]; do
+				tries=$((tries + 1))
+				sleep 0.5
+			done
+			printf 'qa64db.hull %s\n' \
+				"$(cut -d' ' -f1,2 "$root/data/hull/machines/qa64db/host_key.pub" 2>&1)" \
+				> "$root/a64db.known"
+			# dropbear starts once the emulated guest's kernel has its
+			# randomness and the key is converted, slower under TCG.
+			tries=0
+			until timeout 20 ssh -F "$root/a64db.ssh" qa64db.hull 'probe say up' < /dev/null 2>/dev/null |
+			      grep -q '^up$' || [ "$tries" -ge 60 ]; do
+				tries=$((tries + 1))
+				sleep 1
+			done
+			who=$(timeout 20 ssh -F "$root/a64db.ssh" qa64db.hull 'probe uid host' < /dev/null 2>&1)
+			XDG_RUNTIME_DIR="$a64dbrt" timeout 30 "$hull" stop qa64db > /dev/null 2>&1
+			wait "$runner"
+			cases=$((cases + 1))
+			[ "$who" = "$(printf 'uid=0\nhost=qa64db')" ] ||
+				fail "ssh did not log in as root to an arm64 machine through arm64's dropbear" \
+					"$who; $(cat "$root/a64db.out")"
+			rm -f "$root/home/.ssh/a64key" "$root/home/.ssh/a64key.pub"
+		fi
+		for run in "$a64nossh" "$a64dbrt"; do
+			[ -n "$run" ] || continue
+			tries=0
+			while [ -S "$run/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+				tries=$((tries + 1))
+				sleep 0.25
+			done
+			rm -rf "${run:?}"
+		done
+		rm -rf "${root:?}/a64db" "${root:?}/cache-a64nossh"
 	fi
 	# Only emu runs another arch: on vm, refused at plan.
 	printf '(machine (source "dir:./a64root") (backend vm) (arch arm64) (command "/probe"))\n' \

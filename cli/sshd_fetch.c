@@ -5,7 +5,8 @@
  * one tree by the store's layer reader, their documentation and the C
  * library's character-set converters left out, dropbear's sftp-server and
  * loader paths rewritten to hull's, and the script and the link those
- * paths name made beside them.
+ * paths name made beside them. amd64's for the host's machines, and
+ * arm64's, `--arch arm64`, for an arm64 machine under emu.
  * Nothing in it is run on the host.
  */
 #define _GNU_SOURCE
@@ -46,14 +47,14 @@ static void file_sha256(const uint8_t *data, size_t n, char hex[65])
  * kernel's, not the loader's it was started by. The binary is Debian's as
  * the package's sha256 said, and is held to hull's pin after.
  */
-static int patch_dropbear(const char *path, char *why, size_t cap)
+static int patch_dropbear(const hull_sshd_arch *arch, const char *path, char *why, size_t cap)
 {
-	static const struct {
+	const struct {
 		const char *from;
 		const char *to;
 	} rewrites[] = {
 		{ HULL_SSHD_SFTP_FROM, HULL_SSHD_GUEST "/" HULL_SSHD_SFTP },
-		{ HULL_SSHD_INTERP_FROM, HULL_SSHD_GUEST "/" HULL_SSHD_INTERP },
+		{ arch->interp_from, HULL_SSHD_GUEST "/" HULL_SSHD_INTERP },
 	};
 	uint8_t    *data = NULL;
 	char        hex[65];
@@ -72,7 +73,7 @@ static int patch_dropbear(const char *path, char *why, size_t cap)
 		goto done;
 	}
 	file_sha256(data, n, hex);
-	if (strcmp(hex, HULL_SSHD_DROPBEAR_SHA256) != 0) {
+	if (strcmp(hex, arch->dropbear_sha256) != 0) {
 		snprintf(why, cap, "the fetched dropbear is not the one pinned: sha256 %s", hex);
 		goto done;
 	}
@@ -103,7 +104,7 @@ static int patch_dropbear(const char *path, char *why, size_t cap)
 		memcpy(found, rewrites[r].to, to);
 	}
 	file_sha256(data, n, hex);
-	if (strcmp(hex, HULL_SSHD_PATCHED_SHA256) != 0) {
+	if (strcmp(hex, arch->patched_sha256) != 0) {
 		snprintf(why, cap, "dropbear rewritten is not the one pinned: sha256 %s", hex);
 		goto done;
 	}
@@ -120,12 +121,12 @@ done:
 }
 
 /* The loader the rewritten interpreter names, at the tree's top. */
-static int link_loader(const char *tree, char *why, size_t cap)
+static int link_loader(const hull_sshd_arch *arch, const char *tree, char *why, size_t cap)
 {
 	char path[4400];
 
 	snprintf(path, sizeof path, "%s/%s", tree, HULL_SSHD_INTERP);
-	if (symlink(HULL_SSHD_LOADER, path) != 0) {
+	if (symlink(arch->loader, path) != 0) {
 		snprintf(why, cap, "%s: %s", path, strerror(errno));
 		return -1;
 	}
@@ -138,17 +139,20 @@ static int link_loader(const char *tree, char *why, size_t cap)
  * given a file the kernel will not execute reads it as a script itself,
  * which every POSIX shell does, and no /bin/sh is assumed of the image.
  */
-static int write_sftp(const char *tree, char *why, size_t cap)
+static int write_sftp(const hull_sshd_arch *arch, const char *tree, char *why, size_t cap)
 {
-	static const char script[] = "exec " HULL_SSHD_GUEST "/" HULL_SSHD_LOADER
-	                             " --library-path " HULL_SSHD_GUEST "/" HULL_SSHD_LIBS
-	                             " " HULL_SSHD_GUEST "/" HULL_SSHD_SFTP_SERVER " \"$@\"\n";
-	char path[4400];
-	int  fd;
+	char   script[600];
+	char   path[4400];
+	size_t n;
+	int    fd;
 
+	snprintf(script, sizeof script, "exec %s/%s --library-path %s/%s %s/%s \"$@\"\n",
+	         HULL_SSHD_GUEST, arch->loader, HULL_SSHD_GUEST, arch->libs, HULL_SSHD_GUEST,
+	         HULL_SSHD_SFTP_SERVER);
+	n = strlen(script);
 	snprintf(path, sizeof path, "%s/%s", tree, HULL_SSHD_SFTP);
 	fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0755);
-	if (fd < 0 || write(fd, script, sizeof script - 1u) != (ssize_t)(sizeof script - 1u)) {
+	if (fd < 0 || write(fd, script, n) != (ssize_t)n) {
 		snprintf(why, cap, "%s: %s", path, strerror(errno));
 		if (fd >= 0)
 			close(fd);
@@ -157,9 +161,9 @@ static int write_sftp(const char *tree, char *why, size_t cap)
 	return close(fd);
 }
 
-int hull_sshd_fetch(char *why, size_t cap)
+int hull_sshd_fetch(const char *arch_name, char *why, size_t cap)
 {
-	const size_t count = sizeof hull_sshd_packages / sizeof hull_sshd_packages[0];
+	const hull_sshd_arch *arch = hull_sshd_arch_of(arch_name);
 	char         dir[4096];
 	char         work[4200];
 	char         deb[4300], tar[4300], tree[4300], made[4400];
@@ -167,7 +171,11 @@ int hull_sshd_fetch(char *why, size_t cap)
 	hull_unpack *u = NULL;
 	int          status = -1;
 
-	if (hull_sshd_dir(dir, sizeof dir) != 0) {
+	if (arch == NULL) {
+		snprintf(why, cap, "hull fetches no sshd for %s: amd64 and arm64", arch_name);
+		return -1;
+	}
+	if (hull_sshd_dir_of(arch->name, dir, sizeof dir) != 0) {
 		snprintf(why, cap, "neither XDG_CACHE_HOME nor HOME names a place for the sshd");
 		return -1;
 	}
@@ -199,13 +207,13 @@ int hull_sshd_fetch(char *why, size_t cap)
 	}
 	if ((u = hull_unpack_begin(tree, why, cap)) == NULL)
 		goto done;
-	fprintf(stderr, "hull: fetching Debian's dropbear %s and what it links, about 4 MB, from %s\n",
-	        HULL_SSHD_VERSION, HULL_DEBIAN_POOL);
-	for (size_t i = 0u; i < count; i++) {
+	fprintf(stderr, "hull: fetching Debian's %s dropbear %s and what it links, about 4 MB, "
+	        "from %s\n", arch->name, HULL_SSHD_VERSION, HULL_DEBIAN_POOL);
+	for (size_t i = 0u; i < arch->count; i++) {
 		int fd;
 		int applied;
 
-		if (hull_fetch_deb(hull_sshd_packages[i].path, hull_sshd_packages[i].sha256, deb, tar,
+		if (hull_fetch_deb(arch->packages[i].path, arch->packages[i].sha256, deb, tar,
 		                   why, cap) != 0)
 			goto done;
 		if ((fd = open(tar, O_RDONLY | O_CLOEXEC)) < 0) {
@@ -236,15 +244,15 @@ int hull_sshd_fetch(char *why, size_t cap)
 			hull_store_remove_tree(parent, "share");
 			close(parent);
 		}
-		snprintf(at, sizeof at, "%s/%s", tree, HULL_SSHD_LIBS);
+		snprintf(at, sizeof at, "%s/%s", tree, arch->libs);
 		if ((parent = open(at, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) >= 0) {
 			hull_store_remove_tree(parent, "gconv");
 			close(parent);
 		}
 	}
 	snprintf(made, sizeof made, "%s/%s", tree, HULL_SSHD_DROPBEAR);
-	if (patch_dropbear(made, why, cap) != 0 || write_sftp(tree, why, cap) != 0 ||
-	    link_loader(tree, why, cap) != 0)
+	if (patch_dropbear(arch, made, why, cap) != 0 || write_sftp(arch, tree, why, cap) != 0 ||
+	    link_loader(arch, tree, why, cap) != 0)
 		goto done;
 	if (rename(tree, dir) != 0) {
 		snprintf(why, cap, "%s: %s", dir, strerror(errno));

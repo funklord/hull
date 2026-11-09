@@ -33,6 +33,9 @@ typedef struct hull_sshd_package {
 	const char *sha256; /* the .deb's */
 } hull_sshd_package;
 
+/* amd64's, the host's, and arm64's for an arm64 machine under emu: the
+ * same versions, each .deb's sha256 from Debian's index for trixie as its
+ * signed Release names it, arm64's read 2026-11-09. */
 static const hull_sshd_package hull_sshd_packages[] = {
 	{ "d/dropbear/dropbear-bin_2025.89-1~deb13u1_amd64.deb",
 	  "1ddbd76749c7076097fb899eaf55f0a398d6f62799a6000501b32ed7b5d9257b" },
@@ -52,37 +55,112 @@ static const hull_sshd_package hull_sshd_packages[] = {
 	  "28a82485438fafc8d6a7552ab61cac827338c16f39e3790d6ebcc146d452e542" },
 };
 
-/* dropbear as Debian builds it, and as hull runs it: its two paths
- * rewritten (above). */
-#define HULL_SSHD_DROPBEAR_SHA256 "7896833aa1d4eb0d4edf7cbefe91dce6dd0a9795a1610032a9ef7d01dac13c75"
-#define HULL_SSHD_PATCHED_SHA256  "1454240f4e25f28cf4050fc006d38c9be4d37d10fc896d599a3c4d1c75261a3f"
-#define HULL_SSHD_SFTP_FROM       "/usr/lib/sftp-server"
-#define HULL_SSHD_INTERP_FROM     "/lib64/ld-linux-x86-64.so.2"
+static const hull_sshd_package hull_sshd_packages_arm64[] = {
+	{ "d/dropbear/dropbear-bin_2025.89-1~deb13u1_arm64.deb",
+	  "1cfab9f1d5dbf89a8ad790cafe5585a8e08a7c0e0ce098c7a89f957a6428976e" },
+	{ "libt/libtomcrypt/libtomcrypt1_1.18.2+dfsg-7+b2_arm64.deb",
+	  "30c14959f4ae9ba1b41dab47f6d7ca212b7cf45ce340d1a3a52e1fd25a5b643b" },
+	{ "libt/libtommath/libtommath1_1.3.0-1_arm64.deb",
+	  "7e53ae5d16d06801b1c0c88e2fcb3b38e08d76aa3855bcbd6abc8e9639cb6945" },
+	{ "g/gmp/libgmp10_6.3.0+dfsg-3_arm64.deb",
+	  "a27bbc27f119161ea9702c8dd66f54131cdf0d2ca73000f50ea91ef2fdfef0fb" },
+	{ "z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+b1_arm64.deb",
+	  "209aa5cf671e97b9eb0410844fa6df4cae2e75b0c72e7802ab6c8ece13e6ddef" },
+	{ "libx/libxcrypt/libcrypt1_4.4.38-1_arm64.deb",
+	  "b9aaa808aa3812b3de3e54eb5dfb16762c1779db032604abef2354c02fdc29b8" },
+	{ "g/glibc/libc6_2.41-12+deb13u4_arm64.deb",
+	  "8784eda966b189c777a384dac5ce009e8fc9b52d006926c5a013e7fa8aa688cc" },
+	{ "o/openssh/openssh-sftp-server_10.0p1-7+deb13u4_arm64.deb",
+	  "c949831340f9af9e70a6dab740fc9cdff6dd0b249bf9d7d640f6486036476e05" },
+};
 
-/* Where a machine has it, and the files in it a machine runs. */
+/* What differs between the two: dropbear as Debian builds it and as hull
+ * runs it, its two paths rewritten (above); the loader it names; where
+ * the libraries are. */
+typedef struct hull_sshd_arch {
+	const char              *name;
+	const hull_sshd_package *packages;
+	size_t                   count;
+	const char              *dropbear_sha256;
+	const char              *patched_sha256;
+	const char              *interp_from;
+	const char              *libs;
+	const char              *loader;
+} hull_sshd_arch;
+
+#define HULL_SSHD_LIBS_AMD64   "usr/lib/x86_64-linux-gnu"
+#define HULL_SSHD_LOADER_AMD64 HULL_SSHD_LIBS_AMD64 "/ld-linux-x86-64.so.2"
+#define HULL_SSHD_LIBS_ARM64   "usr/lib/aarch64-linux-gnu"
+#define HULL_SSHD_LOADER_ARM64 HULL_SSHD_LIBS_ARM64 "/ld-linux-aarch64.so.1"
+
+static const hull_sshd_arch hull_sshd_arches[] = {
+	{ "amd64", hull_sshd_packages, sizeof hull_sshd_packages / sizeof hull_sshd_packages[0],
+	  "7896833aa1d4eb0d4edf7cbefe91dce6dd0a9795a1610032a9ef7d01dac13c75",
+	  "1454240f4e25f28cf4050fc006d38c9be4d37d10fc896d599a3c4d1c75261a3f",
+	  "/lib64/ld-linux-x86-64.so.2", HULL_SSHD_LIBS_AMD64, HULL_SSHD_LOADER_AMD64 },
+	{ "arm64", hull_sshd_packages_arm64,
+	  sizeof hull_sshd_packages_arm64 / sizeof hull_sshd_packages_arm64[0],
+	  "800a3be86c192a94008853f033f66bf505ca457fdc20d4cdb703d021afcb7750",
+	  "c7403dbc89a3f536682f19b5f64ba0a6b9f5575dda8d4713d2f90a7f91556a93",
+	  "/lib/ld-linux-aarch64.so.1", HULL_SSHD_LIBS_ARM64, HULL_SSHD_LOADER_ARM64 },
+};
+
+/* `arch`'s, or NULL where hull fetches none for it. */
+static inline const hull_sshd_arch *hull_sshd_arch_of(const char *arch)
+{
+	for (size_t i = 0u; i < sizeof hull_sshd_arches / sizeof hull_sshd_arches[0]; i++)
+		if (strcmp(hull_sshd_arches[i].name, arch) == 0)
+			return &hull_sshd_arches[i];
+	return NULL;
+}
+
+#define HULL_SSHD_SFTP_FROM "/usr/lib/sftp-server"
+
+/* Where a machine has it, and the files in it a machine runs; the
+ * libraries and the loader are those of the arch this is built for, the
+ * agent's in a machine, the host's in chroot's init and docker's. */
 #define HULL_SSHD_GUEST       "/run/hull/sshd"
-#define HULL_SSHD_LIBS        "usr/lib/x86_64-linux-gnu"
-#define HULL_SSHD_LOADER      HULL_SSHD_LIBS "/ld-linux-x86-64.so.2"
+#if defined(__aarch64__)
+#define HULL_SSHD_LIBS        HULL_SSHD_LIBS_ARM64
+#define HULL_SSHD_LOADER      HULL_SSHD_LOADER_ARM64
+#define HULL_SSHD_FETCH_ARCH  " --arch arm64"
+#else
+#define HULL_SSHD_LIBS        HULL_SSHD_LIBS_AMD64
+#define HULL_SSHD_LOADER      HULL_SSHD_LOADER_AMD64
+#define HULL_SSHD_FETCH_ARCH  ""
+#endif
 #define HULL_SSHD_DROPBEAR    "usr/sbin/dropbear"
 #define HULL_SSHD_CONVERT     "usr/bin/dropbearconvert"
 #define HULL_SSHD_SFTP_SERVER "usr/lib/openssh/sftp-server"
 #define HULL_SSHD_SFTP        "sftp"
 #define HULL_SSHD_INTERP      "ld.so"
 
-/* The fetched sshd's directory, $XDG_CACHE_HOME/hull/dropbear-VERSION or
- * under ~/.cache. 0, or -1 where neither variable names a place. */
-static inline int hull_sshd_dir(char *out, size_t cap)
+/* `arch`'s fetched sshd's directory, $XDG_CACHE_HOME/hull/dropbear-VERSION
+ * for amd64 and dropbear-ARCH-VERSION for another, or under ~/.cache. 0,
+ * or -1 where neither variable names a place. */
+static inline int hull_sshd_dir_of(const char *arch, char *out, size_t cap)
 {
 	const char *cache = getenv("XDG_CACHE_HOME");
 	const char *home = getenv("HOME");
+	char        name[96];
 
+	if (strcmp(arch, "amd64") == 0)
+		snprintf(name, sizeof name, "dropbear-%s", HULL_SSHD_VERSION);
+	else
+		snprintf(name, sizeof name, "dropbear-%s-%s", arch, HULL_SSHD_VERSION);
 	if (cache != NULL && cache[0] == '/')
-		snprintf(out, cap, "%s/hull/dropbear-%s", cache, HULL_SSHD_VERSION);
+		snprintf(out, cap, "%s/hull/%s", cache, name);
 	else if (home != NULL && home[0] == '/')
-		snprintf(out, cap, "%s/.cache/hull/dropbear-%s", home, HULL_SSHD_VERSION);
+		snprintf(out, cap, "%s/.cache/hull/%s", home, name);
 	else
 		return -1;
 	return 0;
+}
+
+/* The host's, amd64's. */
+static inline int hull_sshd_dir(char *out, size_t cap)
+{
+	return hull_sshd_dir_of("amd64", out, cap);
 }
 
 /*
@@ -111,7 +189,8 @@ static inline const char *hull_sshd_choose(const char **found)
 		}
 	if (access(HULL_SSHD_GUEST "/" HULL_SSHD_DROPBEAR, R_OK) != 0)
 		return "(ssh true): the image has no sshd at /usr/sbin/sshd or /usr/bin/sshd, and "
-		       "none has been fetched: `hull sshd fetch` downloads dropbear, once";
+		       "none has been fetched: `hull sshd fetch" HULL_SSHD_FETCH_ARCH "` downloads "
+		       "dropbear, once";
 	/* Read by the system calls alone, as hull_sshd_exec_dropbear is run:
 	 * chroot calls this in its init too. Its first 64 KiB, which hold
 	 * root's line wherever a passwd has one. */

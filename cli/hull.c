@@ -133,7 +133,7 @@ static void usage(FILE *out)
 	      "       hull pack DIR|REF FILE | hull unpack FILE|- DIR\n"
 	      "       hull export --bootable DIR|REF IMAGE [--init PATH | --host TTY]\n"
 	      "       hull kernel fetch [--arch ARCH]\n"
-	      "       hull sshd fetch\n"
+	      "       hull sshd fetch [--arch ARCH]\n"
 	      "       hull virtualbox fetch\n"
 	      "       hull export --bootable -f FILE [NAME] IMAGE\n"
 	      "       hull build [-f FILE] [--check] REF\n"
@@ -8032,10 +8032,11 @@ int main(int argc, char **argv)
 	    strcmp(argv[2], "host") == 0)
 		return hull_vbox_host(argv[3], argv[4], argv[5], argv[6], argv[7], argv[8], argv[9],
 		                      argv + 10, (unsigned)(argc - 10) / 2u);
-	if (strcmp(command, "sshd") == 0 && argc == 3 && strcmp(argv[2], "fetch") == 0) {
+	if (strcmp(command, "sshd") == 0 && (argc == 3 || (argc == 5 && strcmp(argv[3], "--arch") == 0)) &&
+	    strcmp(argv[2], "fetch") == 0) {
 		char why[4400] = "";
 
-		if (hull_sshd_fetch(why, sizeof why) != 0) {
+		if (hull_sshd_fetch(argc == 5 ? argv[4] : "amd64", why, sizeof why) != 0) {
 			fprintf(stderr, "hull: sshd fetch: %s\n", why);
 			return 1;
 		}

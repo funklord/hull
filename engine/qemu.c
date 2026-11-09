@@ -2324,9 +2324,10 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	}
 	/* (ssh true)'s fallback, the sshd `hull sshd fetch` put in the cache,
 	 * shared read-only for the agent to run where the image has no sshd of
-	 * its own (section 8.1 item 3). Not fetched, there is no share, and the
+	 * its own (section 8.1 item 3); an arm64 machine's is arm64's, `--arch
+	 * arm64`'s, where amd64's would not run. Not fetched, there is no share, and the
 	 * agent says so if the image needs it. */
-	if (m->ssh.data != NULL && hull_sshd_dir(path, sizeof path) == 0) {
+	if (m->ssh.data != NULL && hull_sshd_dir_of(m->arm64 ? "arm64" : "amd64", path, sizeof path) == 0) {
 		char dropbear[8600];
 
 		snprintf(dropbear, sizeof dropbear, "%s/%s", path, HULL_SSHD_DROPBEAR);
