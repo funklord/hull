@@ -611,6 +611,40 @@ expect 1 'unpack: an object of the pack is cut or not what its index says' "$hul
 expect 1 'unpack: it is not a Hull pack' "$hull" unpack "$root/owned.tar" "$root/cutout"
 expect 1 'unpack: [0-9a-f]{64}: the object.s bytes are not the object its name says' \
 	"$hull" unpack "$root/renamed.hull" "$root/cutout"
+# A pack against a base: a second version of the tree, one file changed
+# and one added, packed without the objects the first names, for a store
+# that holds the first -- what a new version moves to a host with the old.
+# Into a store of its own, standing for that host: refused, naming the
+# base, where the base is not there; after the base's own pack, the second
+# version, equal to the tree; and holding only the two objects it adds.
+rm -rf "${root:?}/second" "${root:?}/otherhost" "${root:?}/fromdelta"
+cp -a "$root/direct" "$root/second"
+chmod -R u+w "$root/second"
+printf 'changed\n' > "$root/second/etc/greeting"
+printf 'added\n' > "$root/second/added"
+expect 0 '^second/tree:1 sha256:' "$hull" commit "$root/second" second/tree:1
+expect 0 '' "$hull" pack second/tree:1 "$root/second.hull"
+expect 0 '' "$hull" pack --against one/tree:1 second/tree:1 "$root/delta.hull"
+# The header's count of objects, bytes 12 to 15: the two that changed.
+cases=$((cases + 1))
+held=$(od -An -tu1 -j12 -N4 "$root/delta.hull" | awk '{ print $1 * 16777216 + $2 * 65536 + $3 * 256 + $4 }')
+[ "$held" = 2 ] || fail "a pack against a base holds $held objects, not the 2 that changed" ""
+mkdir -p "$root/otherhost"
+expect 1 'unpack: .*neither the pack nor this store holds' \
+	env XDG_DATA_HOME="$root/otherhost" "$hull" unpack "$root/delta.hull" "$root/fromdelta"
+expect 0 '' env XDG_DATA_HOME="$root/otherhost" "$hull" unpack "$root/one.hull" "$root/otherhost/base"
+expect 0 '' env XDG_DATA_HOME="$root/otherhost" "$hull" unpack "$root/delta.hull" "$root/fromdelta"
+listing "$root/second" > "$root/second.list"
+listing "$root/fromdelta" > "$root/fromdelta.list"
+cases=$((cases + 1))
+cmp -s "$root/second.list" "$root/fromdelta.list" ||
+	fail "a pack against a base, unpacked after it, is not the tree" \
+		"$(diff "$root/second.list" "$root/fromdelta.list" 2>&1 | head)"
+expect 1 'pack: no/such:1: no such ref' "$hull" pack --against no/such:1 second/tree:1 "$root/none.hull"
+chmod -R u+w "$root/second" "$root/otherhost" "$root/fromdelta" 2>/dev/null
+rm -rf "${root:?}/second" "${root:?}/otherhost" "${root:?}/fromdelta"
+rm -f "$root/second.hull" "$root/delta.hull" "$root/second.list" "$root/fromdelta.list" "$root/none.hull"
+
 # hull export --tar: the same tree as a tar anything reads, for someone
 # without hull -- extracted by GNU tar, with its xattrs, equal to the tree
 # materialized; through zstd where the name says so, the same tar inside;

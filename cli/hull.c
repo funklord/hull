@@ -131,7 +131,7 @@ static void usage(FILE *out)
 	      "                    [--for D] [--wait D|--no-wait] | hull release ID\n"
 	      "       hull pool ls [POOL] [--json] | hull lease ls [--json]\n"
 	      "       hull broker DIR | hull broker-dial --dir DIR [--as NAME]\n"
-	      "       hull pack DIR|REF FILE | hull unpack FILE|- DIR\n"
+	      "       hull pack [--against DIR|REF] DIR|REF FILE | hull unpack FILE|- DIR\n"
 	      "       hull export --tar DIR|REF FILE|-\n"
 	      "       hull export --bootable DIR|REF IMAGE [--init PATH | --host TTY]\n"
 	      "       hull kernel fetch [--arch ARCH]\n"
@@ -6163,13 +6163,16 @@ static int export_machine(const char *file, const char *name, const char *image)
 	return status;
 }
 
-/* `hull pack SRC FILE` (section 3.13): the tree SRC is, a directory --
- * committed first, its owners as a commit takes them -- or a stored ref,
- * as one file, its manifest's hash printed. */
-static int pack(const char *source, const char *file)
+/* `hull pack [--against BASE] SRC FILE` (section 3.13): the tree SRC is,
+ * a directory -- committed first, its owners as a commit takes them -- or
+ * a stored ref, as one file, its manifest's hash printed; against BASE,
+ * named the same way, without the objects BASE names, for a store that
+ * holds BASE already: what a new version moves to a host with the old. */
+static int pack(const char *source, const char *against, const char *file)
 {
 	hull_store store;
 	char       name[200];
+	char       base[200];
 	char       hex[65];
 	char       why[4400] = "";
 	int        status;
@@ -6177,7 +6180,8 @@ static int pack(const char *source, const char *file)
 
 	if ((status = open_store(&store, 1)) != 0)
 		return status;
-	if (tree_name(&store, source, name, sizeof name, why, sizeof why) != 0) {
+	if (tree_name(&store, source, name, sizeof name, why, sizeof why) != 0 ||
+	    (against != NULL && tree_name(&store, against, base, sizeof base, why, sizeof why) != 0)) {
 		hull_store_close(&store);
 		fprintf(stderr, "hull: pack: %s\n", why);
 		return 1;
@@ -6187,7 +6191,7 @@ static int pack(const char *source, const char *file)
 		fprintf(stderr, "hull: pack: %s: %s\n", file, strerror(errno));
 		return 1;
 	}
-	status = hull_store_pack(&store, name, fd, hex, why, sizeof why);
+	status = hull_store_pack(&store, name, against != NULL ? base : NULL, fd, hex, why, sizeof why);
 	hull_store_close(&store);
 	if (close(fd) != 0 && status == 0)
 		snprintf(why, sizeof why, "%s: %s", file, strerror(errno)), status = -1;
@@ -8182,8 +8186,10 @@ int main(int argc, char **argv)
 	if (strcmp(command, "export") == 0 && argc == 7 && strcmp(argv[2], "--bootable") == 0 &&
 	    strcmp(argv[5], "--host") == 0)
 		return export_bootable(argv[3], argv[4], NULL, argv[6]);
+	if (strcmp(command, "pack") == 0 && argc == 6 && strcmp(argv[2], "--against") == 0)
+		return pack(argv[4], argv[3], argv[5]);
 	if (strcmp(command, "pack") == 0 && argc == 4)
-		return pack(argv[2], argv[3]);
+		return pack(argv[2], NULL, argv[3]);
 	if (strcmp(command, "unpack") == 0 && argc == 4)
 		return unpack(argv[2], argv[3]);
 	if (strcmp(command, "reserve") == 0 && argc >= 3)

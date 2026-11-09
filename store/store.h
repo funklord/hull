@@ -106,12 +106,15 @@ int hull_store_manifest_put(hull_store *store, const uint8_t *data, size_t lengt
                             const char *ref, char hex[65], char *why, size_t cap);
 
 /* A pack (project.md section 3.13), the tree `name` names written to
- * `out` whole -- its manifest and every object it names, each a zstd
- * frame, behind an index -- its manifest's hash into `hex`; and a pack
- * read from `in` into the store, every object and the manifest checked
- * against their names, `ref` set to it. Each 0, or -1 with why. */
-int hull_store_pack(hull_store *store, const char *name, int out, char hex[65], char *why,
-                    size_t cap);
+ * `out` -- its manifest and every object it names, each a zstd frame,
+ * behind an index -- its manifest's hash into `hex`, less each object
+ * the tree `against` names where that is not NULL, for a store that holds
+ * it; and a pack read from `in` into the store, every object and the
+ * manifest checked against their names, each object the manifest names
+ * held by the pack or by the store already, `ref` set to it. Each 0, or
+ * -1 with why. */
+int hull_store_pack(hull_store *store, const char *name, const char *against, int out,
+                    char hex[65], char *why, size_t cap);
 int hull_store_unpack(hull_store *store, int in, const char *ref, char hex[65], char *why,
                       size_t cap);
 

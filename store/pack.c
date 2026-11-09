@@ -245,8 +245,8 @@ static int compress_into(ZSTD_CCtx *cctx, int in, uint64_t length, int out, uint
 	return 0;
 }
 
-int hull_store_pack(hull_store *store, const char *name, int out, char hex[65], char *why,
-                    size_t cap)
+int hull_store_pack(hull_store *store, const char *name, const char *against, int out,
+                    char hex[65], char *why, size_t cap)
 {
 	uint8_t   *manifest = NULL;
 	size_t     manifest_length = 0u;
@@ -263,6 +263,30 @@ int hull_store_pack(hull_store *store, const char *name, int out, char hex[65], 
 		return -1;
 	if (objects_of(manifest, manifest_length, &objects, &count, why, cap) != 0)
 		goto done;
+	/* Against a base: only what the base does not name, both lists in
+	 * digest order, for a store that holds the base already. */
+	if (against != NULL) {
+		uint8_t *base = NULL;
+		size_t   base_length = 0u;
+		object  *held = NULL;
+		uint32_t held_count = 0u;
+		uint32_t kept = 0u;
+		char     base_hex[65];
+
+		if (hull_store_manifest_of(store, against, base_hex, &base, &base_length, why, cap) != 0)
+			goto done;
+		if (objects_of(base, base_length, &held, &held_count, why, cap) != 0) {
+			free(base);
+			goto done;
+		}
+		for (uint32_t i = 0u; i < count; i++)
+			if (held_count == 0u ||
+			    bsearch(&objects[i], held, held_count, sizeof *held, by_digest) == NULL)
+				objects[kept++] = objects[i];
+		count = kept;
+		free(held);
+		free(base);
+	}
 	if ((cctx = ZSTD_createCCtx()) == NULL ||
 	    ZSTD_isError(ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, PACK_LEVEL)) ||
 	    ZSTD_isError(ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1)) ||
@@ -465,8 +489,9 @@ int hull_store_unpack(hull_store *store, int in, const char *ref, char hex[65], 
 		fclose(made);
 		made = NULL;
 	}
-	/* The manifest last, once every object it names is in, and each it
-	 * names among the pack's. */
+	/* The manifest last, once every object it names is in: each it names
+	 * among the pack's, or, for a pack made against a base, already in
+	 * the store. */
 	{
 		object  *named = NULL;
 		uint32_t named_count = 0u;
@@ -474,11 +499,22 @@ int hull_store_unpack(hull_store *store, int in, const char *ref, char hex[65], 
 
 		if (objects_of(manifest, manifest_length, &named, &named_count, why, cap) != 0)
 			goto done;
-		for (uint32_t i = 0u; i < named_count && all; i++)
-			all = bsearch(&named[i], objects, count, sizeof *objects, by_digest) != NULL;
+		for (uint32_t i = 0u; i < named_count && all; i++) {
+			int executable;
+			int fd;
+
+			if (count > 0u &&
+			    bsearch(&named[i], objects, count, sizeof *objects, by_digest) != NULL)
+				continue;
+			if ((fd = hull_store_object_open(store, named[i].digest, &executable)) >= 0)
+				close(fd);
+			else
+				all = 0;
+		}
 		free(named);
 		if (!all) {
-			say(why, cap, "the pack's manifest names an object the pack does not hold", NULL);
+			say(why, cap, "the pack's manifest names an object neither the pack nor this store "
+			    "holds: a pack made against a base wants that base unpacked first", NULL);
 			goto done;
 		}
 	}
