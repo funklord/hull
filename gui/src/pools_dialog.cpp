@@ -100,12 +100,13 @@ void pools_dialog::reload()
 		const char  *noun;
 		QStringList  keys;
 	};
+	const QStringList pool_keys =
+	    QStringLiteral("pool capacity held waiting").split(QLatin1Char(' '));
+	const QStringList lease_keys =
+	    QStringLiteral("id pool count machines ends holder").split(QLatin1Char(' '));
 	const list lists[] = {
-		{ pools, "pool", { QStringLiteral("pool"), QStringLiteral("capacity"),
-		                   QStringLiteral("held"), QStringLiteral("waiting") } },
-		{ leases, "lease", { QStringLiteral("id"), QStringLiteral("pool"), QStringLiteral("count"),
-		                     QStringLiteral("machines"), QStringLiteral("ends"),
-		                     QStringLiteral("holder") } },
+		{ pools, "pool", pool_keys },
+		{ leases, "lease", lease_keys },
 	};
 
 	for (const list &l : lists) {
