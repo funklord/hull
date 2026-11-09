@@ -1583,7 +1583,7 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 | Details tab | id, file, state, engine, class, address, arch, root mode; `hull plan --resolved` and `--explain` of an added machine |
 | Output tab | a run started here, as `hull run` said it; else the core's log of the machine, followed |
 | Usage tab | `stats` every 2 s: CPU seconds and per cent of one CPU, io, Pss |
-| Actions | Add, Remove from List, Start, Stop (the machine's grace), Power Off (KILL), Pause, Resume, Refresh |
+| Actions | Add, Remove from List, Start, Stop (the machine's grace), Power Off (KILL), Pause, Resume, Terminal, Refresh |
 
 **Decisions, and why:**
 - **The window speaks the core's protocol itself** (`gui/src/core_link.cpp`), with the CLI's C: `core/wire.c`, the situ validator and the reader, linked as `build/libhull_client.a`. One request per connection, answered through the event loop, so a slow `stop` never blocks the window. Nothing reads the protocol a second way.
@@ -1592,6 +1592,7 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 - **The list it saves is the user's choices only**: the added files, in `QSettings` (`~/.config/hull/hull-gui.conf`). A machine the core holds is never saved.
 - **An added machine's id follows the CLI's rule** (`machine_id()`: its name, else its hostname, else its directory's name), read from `hull plan --resolved`. A running machine is matched to its row by that id.
 - **On a terminal, Add asks for a path rather than opening a file dialog.**
+- **Terminal is the CLI's `hull exec -t ID /bin/sh`.** On the desktop it opens in a terminal emulator: `$TERMINAL`, else `x-terminal-emulator`, else `xterm`. Under qtty the window hands its own terminal over (`Qtty::shell_out`) until the shell exits. A shell that cannot start leaves its reason on screen until Enter.
 
 **Measured** by `test/gui_test.sh` (`make check-gui`, which needs qtty), on a core and a chroot machine of its own:
 - the window drawn as text by qtty's snapshot, with no core, then with the list it saved, then beside a machine the CLI started;
@@ -1600,7 +1601,7 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 - A machine stopped stays listed as `exited` until its run's frontend has gone, which the core does on purpose. The window offers nothing to do to it.
 
 **Not yet:**
-- a console: a vm's or pc's screen (`(display vnc)`) or a terminal attached to the machine (`hull attach`, `exec -t`);
+- a console: a vm's or pc's screen (`(display vnc)`). Terminal is in the suite only by hand: on 2026-11-09, in a pty, a busybox chroot machine was selected and Ctrl+E pressed, and the shell printed `inside-42` for `echo inside-$((6*7))`;
 - `--accept` tokens and secrets that prompt. A run started here has no terminal, so its refusal shows in Output;
 - `-H` remote cores, pools and leases, segments, the store's images;
 - creating or editing a `hull.conf`.

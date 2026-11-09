@@ -30,13 +30,21 @@
 #include <QRegularExpression>
 #include <QScrollBar>
 #include <QSplitter>
+#include <QStandardPaths>
 #include <QStatusBar>
 #include <QTabWidget>
 #include <QTimer>
 #include <QToolBar>
 #include <QTreeWidget>
 
+#include <errno.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <unistd.h>
+
+#ifdef HULL_QTTY
+#include <qtty/qtty.h>
+#endif
 
 /* Under qtty there is no window system: a file dialog of icons and a
  * mouse is the wrong question to put on a terminal, so a path is asked. */
@@ -137,6 +145,10 @@ void main_window::build_actions()
 	resume_action = new QAction(QStringLiteral("Res&ume"), this);
 	resume_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+U")));
 	connect(resume_action, &QAction::triggered, this, [this]() { pause_machine(false); });
+	terminal_action = new QAction(QStringLiteral("&Terminal"), this);
+	terminal_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+E")));
+	terminal_action->setToolTip(QStringLiteral("A shell in the machine: hull exec -t ID /bin/sh"));
+	connect(terminal_action, &QAction::triggered, this, &main_window::open_terminal);
 	refresh_action = new QAction(QStringLiteral("Re&fresh"), this);
 	refresh_action->setShortcut(QKeySequence(QStringLiteral("F5")));
 	connect(refresh_action, &QAction::triggered, this, [this]() {
@@ -158,6 +170,7 @@ void main_window::build_actions()
 	machine->addAction(kill_action);
 	machine->addAction(pause_action);
 	machine->addAction(resume_action);
+	machine->addAction(terminal_action);
 	machine->addSeparator();
 	machine->addAction(refresh_action);
 	machine->addSeparator();
@@ -172,6 +185,7 @@ void main_window::build_actions()
 	bar->addAction(stop_action);
 	bar->addAction(pause_action);
 	bar->addAction(resume_action);
+	bar->addAction(terminal_action);
 	update_actions();
 }
 
@@ -386,6 +400,7 @@ void main_window::update_actions()
 	kill_action->setEnabled(held);
 	pause_action->setEnabled(held && state != QStringLiteral("paused"));
 	resume_action->setEnabled(held && state == QStringLiteral("paused"));
+	terminal_action->setEnabled(state == QStringLiteral("running"));
 }
 
 void main_window::show_details()
@@ -735,6 +750,67 @@ void main_window::pause_machine(bool paused)
 		                : QStringLiteral("%1: %2").arg(id, reason));
 		        refresh();
 	        });
+}
+
+/*
+ * A shell in the selected machine, `hull exec -t ID /bin/sh`, the CLI's,
+ * on a terminal of its own: on the desktop a terminal emulator's window,
+ * $TERMINAL's, else x-terminal-emulator's, else xterm's; under qtty this
+ * terminal, handed over for as long as the shell runs. A shell that cannot
+ * start leaves its reason on the screen until Enter, rather than a window
+ * that closes before it can be read. A machine with no agent -- a pc --
+ * has no exec, and says so there.
+ */
+void main_window::open_terminal()
+{
+	const int i = current();
+
+	if (i < 0 || i >= rows.size() || !rows[i].is_held)
+		return;
+	const QString id = rows[i].id;
+	const QString script = QStringLiteral(
+	    "\"$0\" exec -t \"$1\" /bin/sh || { echo; echo 'press Enter to close'; read x; }");
+	const QStringList shell = { QStringLiteral("/bin/sh"), QStringLiteral("-c"), script, hull, id };
+
+	if (on_terminal()) {
+#ifdef HULL_QTTY
+		Qtty::shell_out([&shell]() {
+			QByteArrayList bytes;
+			QList<char *>  argv;
+			pid_t          child;
+
+			for (const QString &arg : shell)
+				bytes.append(arg.toLocal8Bit());
+			for (QByteArray &arg : bytes)
+				argv.append(arg.data());
+			argv.append(nullptr);
+			child = fork();
+			if (child == 0) {
+				execv(argv[0], argv.data());
+				_exit(127);
+			}
+			if (child > 0)
+				while (waitpid(child, nullptr, 0) < 0 && errno == EINTR)
+					;
+		});
+#endif
+		return;
+	}
+	QStringList candidates;
+
+	if (!qEnvironmentVariableIsEmpty("TERMINAL"))
+		candidates << qEnvironmentVariable("TERMINAL");
+	candidates << QStringLiteral("x-terminal-emulator") << QStringLiteral("xterm");
+	for (const QString &candidate : candidates) {
+		const QString found = QStandardPaths::findExecutable(candidate);
+
+		if (!found.isEmpty() && QProcess::startDetached(found, QStringList{ QStringLiteral("-e") } + shell)) {
+			say(QStringLiteral("a terminal on %1").arg(id));
+			return;
+		}
+	}
+	say(QStringLiteral("no terminal emulator found: set $TERMINAL, or run `hull exec -t %1 "
+	                   "/bin/sh`").arg(id));
 }
 
 void main_window::closeEvent(QCloseEvent *event)
