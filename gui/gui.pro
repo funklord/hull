@@ -44,6 +44,7 @@ DEFINES += HULL_VERSION=\\\"$$cat($$ROOT/VERSION, singleline)\\\"
 
 SOURCES += \
 	src/core_link.cpp \
+	src/images_dialog.cpp \
 	src/machine_list.cpp \
 	src/main.cpp \
 	src/main_window.cpp \
@@ -51,6 +52,7 @@ SOURCES += \
 
 HEADERS += \
 	src/core_link.h \
+	src/images_dialog.h \
 	src/machine_list.h \
 	src/main_window.h \
 	src/new_machine_dialog.h

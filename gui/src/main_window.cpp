@@ -12,6 +12,7 @@
  */
 
 #include "main_window.h"
+#include "images_dialog.h"
 #include "new_machine_dialog.h"
 
 #include <QAction>
@@ -142,7 +143,7 @@ void main_window::build_actions()
 	new_action = new QAction(QStringLiteral("&New..."), this);
 	new_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+N")));
 	new_action->setToolTip(QStringLiteral("Write a new machine's hull.conf and add it"));
-	connect(new_action, &QAction::triggered, this, &main_window::ask_new);
+	connect(new_action, &QAction::triggered, this, [this]() { ask_new(); });
 	add_action = new QAction(QStringLiteral("&Add..."), this);
 	add_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+O")));
 	add_action->setToolTip(QStringLiteral("Add a machine's hull.conf to the list"));
@@ -202,6 +203,12 @@ void main_window::build_actions()
 	machine->addAction(refresh_action);
 	machine->addSeparator();
 	machine->addAction(quit);
+
+	QMenu   *store = menuBar()->addMenu(QStringLiteral("&Store"));
+	QAction *images = store->addAction(QStringLiteral("&Images..."));
+
+	images->setToolTip(QStringLiteral("The store's images: pull, remove, a machine from one"));
+	connect(images, &QAction::triggered, this, &main_window::show_images);
 
 	QToolBar *bar = addToolBar(QStringLiteral("Machine"));
 	bar->setObjectName(QStringLiteral("machine"));
@@ -691,7 +698,19 @@ void main_window::ask_add()
 
 /* New: the store's refs offered as sources, `hull images`' first column,
  * then the file the dialog wrote added as any other. */
-void main_window::ask_new()
+void main_window::show_images()
+{
+	images_dialog dialog(hull, this);
+
+	connect(&dialog, &images_dialog::new_machine_from, this, [this, &dialog](const QString &ref) {
+		dialog.accept();
+		QTimer::singleShot(0, this, [this, ref]() { ask_new(ref); });
+	});
+	dialog.resize(760, 480);
+	dialog.exec();
+}
+
+void main_window::ask_new(const QString &source)
 {
 	QStringList images;
 	QProcess    list;
@@ -704,7 +723,7 @@ void main_window::ask_new()
 			if (!line.trimmed().isEmpty())
 				images << line.section(QLatin1Char(' '), 0, 0);
 
-	new_machine_dialog dialog(images, this);
+	new_machine_dialog dialog(images, source, this);
 
 	if (dialog.exec() == QDialog::Accepted) {
 		say(QStringLiteral("wrote %1").arg(dialog.written()));

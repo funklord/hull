@@ -1583,6 +1583,7 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 | Details tab | id, file, state, engine, class, address, arch, root mode; `hull plan --resolved` and `--explain` of an added machine |
 | Output tab | a run started here, as `hull run` said it; else the core's log of the machine, followed |
 | Usage tab | `stats` every 2 s: CPU seconds and per cent of one CPU, io, Pss |
+| Images (Store menu) | the store's refs and manifests, as VirtualBox's media manager lists disks: Pull, Remove, New Machine on one |
 | Actions | New, Add, Remove from List, Start, Stop (the machine's grace), Power Off (KILL), Pause, Resume, Terminal, Screen, Refresh |
 
 **Decisions, and why:**
@@ -1593,6 +1594,7 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 - **An added machine's id follows the CLI's rule** (`machine_id()`: its name, else its hostname, else its directory's name), read from `hull plan --resolved`. A running machine is matched to its row by that id.
 - **On a terminal, Add asks for a path rather than opening a file dialog.**
 - **New writes a `hull.conf` from a few common keys** (`gui/src/new_machine_dialog.cpp`), as VirtualBox's New writes a machine's settings: name, folder, source (`dir:./rootfs` or a ref `hull images` lists), backend, command, memory, CPUs, overlay and ssh. It then adds the file like any other. A field left empty is left out of the file, so the spec's default holds and the plan says what it is. It never writes over a file that is there. Strings carry the reader's four escapes; a field the spec could not hold (memory that is not a size, a backend that is not a word, a control character) is refused with its reason. Anything more is the file's, by hand.
+- **Images runs the store's CLI** (`hull images`, `hull pull`, `hull tag -d`), one at a time, its output in the dialog's log. The store has no protocol of its own and needs no core. New Machine on an image opens New with the ref as its source. Tried by hand on 2026-11-09 in a pty, on a store of its own: two refs committed, Alt+S, I, Alt+R and Enter removed one (`hull images` then listed the other alone); Alt+N on the other, a name and Enter wrote `(source "gui/two")`, which plans.
 - **Screen is `(display vnc)`'s port 5900 at the machine's address** (§5.0's pc). It is probed for a second first, so a machine with no screen says so rather than a client that fails. On the desktop the first VNC client found is started (`vncviewer`, `xtigervncviewer`, `remmina`, `krdc`, then `xdg-open vnc://`); under qtty the address is said. Tried by hand on 2026-11-09 in a pty: F8 on a pc booting a spinning sector named `127.107.38.102:5900`, and on a chroot machine said it shows no screen.
 - **`--picture FILE` draws the window as a PNG** once the core and the plans have answered, as `--snapshot` draws it as text, for looking at the desktop form without a display (`QT_QPA_PLATFORM=offscreen`). The first look found the details' key column misaligned in a proportional font and every plan line repeating the file's whole path, so the details are in the fixed font and a plan line reads `LINE:COL FIELD: VERDICT`.
 - **Shortcuts keep off the keys qtty gives text editing on a terminal** (Ctrl+A, E, K, U, W, D and L), which answer differently by focus or never. Ctrl+D for Screen never fired under qtty, which is how this was found. So: New Ctrl+N, Add Ctrl+O, Start Ctrl+S, Stop Ctrl+T, Pause Ctrl+P, Resume Ctrl+R, Terminal F7, Screen F8, Refresh F5, Quit Ctrl+Q.
@@ -1611,7 +1613,8 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 **Not yet:**
 - Terminal, Screen and the `--accept` offer in the suite: each was tried by hand in a pty only. Terminal: on 2026-11-09, a busybox chroot machine selected and F7 pressed, and the shell printed `inside-42` for `echo inside-$((6*7))`;
 - secrets that prompt (`exec:`, `age:`). A run started here has no terminal, so its refusal shows in Output;
-- `-H` remote cores, pools and leases, segments, the store's images;
+- pools and leases, segments;
+- **`-H` remote cores, decided against for now:** over ssh, each request would be an ssh of its own every two seconds, or the window would need one connection multiplexing its channels. `ssh HOST hull-gui --tui` already gives the whole manager on the far host, which is what qtty is for;
 - editing a `hull.conf` past what New writes, or a `(machines …)` file.
 
 ## 5. Engines

@@ -71,7 +71,8 @@ private:
 	void open_screen();
 	void remove_machine();
 	void ask_add();
-	void ask_new();
+	void ask_new(const QString &source = QString());
+	void show_images();
 	void say(const QString &text);
 	void follow_logs();
 	void ask_stats();

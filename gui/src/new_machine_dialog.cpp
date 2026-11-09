@@ -19,7 +19,8 @@
 
 #include "machine_list.h"
 
-new_machine_dialog::new_machine_dialog(const QStringList &images, QWidget *parent)
+new_machine_dialog::new_machine_dialog(const QStringList &images, const QString &chosen,
+                                       QWidget *parent)
     : QDialog(parent)
 {
 	setWindowTitle(QStringLiteral("New Machine"));
@@ -34,6 +35,8 @@ new_machine_dialog::new_machine_dialog(const QStringList &images, QWidget *paren
 	source->addItem(QStringLiteral("dir:./rootfs"));
 	for (const QString &image : images)
 		source->addItem(image);
+	if (!chosen.isEmpty())
+		source->setCurrentText(chosen);
 	backend = new QComboBox;
 	backend->addItem(QStringLiteral("default (ns)"), QString());
 	for (const char *word : { "ns", "vm", "emu", "pc", "dos", "chroot", "docker", "qemu" })
