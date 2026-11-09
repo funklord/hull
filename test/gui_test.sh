@@ -82,7 +82,7 @@ has "$out" '^hull-gui [0-9]' "--version"
 out=$(snapshot a.conf)
 has "$out" 'gui-a +stopped +chroot \(ns\)' "no core: the added machine"
 has "$out" 'core: not running' "no core: the status"
-has "$out" 'on_disconnect stop' "no core: the plan in the details"
+has "$out" 'on_disconnect.stop: native' "no core: the plan in the details"
 
 # refute TEXT PATTERN WHAT: no line of TEXT matches PATTERN.
 refute() {
