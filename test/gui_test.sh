@@ -27,11 +27,12 @@ esac
 
 XDG_RUNTIME_DIR=$dir/run
 XDG_CONFIG_HOME=$dir/config
-export XDG_RUNTIME_DIR XDG_CONFIG_HOME
+XDG_DATA_HOME=$dir/data
+export XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME
 export HULL_CORE_IDLE=1
 DOCKER_HOST=unix://$XDG_RUNTIME_DIR/no-docker.sock
 export DOCKER_HOST
-rm -rf "${dir:?}/config" "${dir:?}/rootfs"
+rm -rf "${dir:?}/config" "${dir:?}/rootfs" "${dir:?}/data" "${dir:?}/newm"
 mkdir -p "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME" "$dir/rootfs"
 chmod 700 "$XDG_RUNTIME_DIR"
 cp "$probe" "$dir/rootfs/probe"
@@ -71,6 +72,18 @@ has() {
 	fi
 }
 
+here=$(cd "$(dirname "$0")" && pwd)
+
+# keys WORKDIR KEY... [-- FILE...]: the window on a terminal of its own,
+# sent the keys, its screen's text in $out.
+keys() {
+	work=$1
+	shift
+	timeout 90 python3 -I "$here/gui_keys.py" "$gui" "$hull" "$work" "$dir/screen.txt" "$@" \
+		> /dev/null 2>&1
+	out=$(tr -s ' ' < "$dir/screen.txt")
+}
+
 snapshot() {
 	(cd "$dir" && timeout 60 "$gui" --hull "$hull" --tui --snapshot 110x26 "$@" 2>/dev/null)
 }
@@ -97,6 +110,33 @@ out=$(snapshot c.conf)
 has "$out" 'gui-c +stopped +qemu \(vm\)' "a refused machine added"
 refute "$out" '^.{0,3}machine +stopped' "a refused machine added once"
 
+# Start on it offers the token that would honour the refusal; Esc
+# declines, and nothing runs.
+keys "$dir" "b'\\x1b[B'" "b'\\x13'" "b'\\x1b'"
+has "$out" 'vm:inotify-poll\?' "Start offers --accept"
+cases=$((cases + 1))
+if timeout 10 "$hull" ps 2>/dev/null | grep -q gui-c; then
+	fail "declined, gui-c ran" "$(timeout 10 "$hull" ps 2>&1)"
+fi
+
+# New: a name and a command typed, Enter, and the file written and listed.
+mkdir -p "$dir/newm/rootfs"
+keys "$dir/newm" "b'\\x0e'" "b'gui-n'" "b'\\t\\t\\t\\t/probe say made-by-new'" "b'\\r'"
+cases=$((cases + 1))
+if ! grep -q '(command "/probe" "say" "made-by-new")' "$dir/newm/hull.conf" 2>/dev/null; then
+	fail "New wrote no such command" "$(cat "$dir/newm/hull.conf" 2>&1)"
+fi
+has "$out" 'gui-n' "New's machine listed"
+
+# Images: one of two refs removed through Store > Images.
+timeout 30 "$hull" commit "$dir/rootfs" gui/one > /dev/null 2>&1
+timeout 30 "$hull" commit "$dir/rootfs" gui/two > /dev/null 2>&1
+keys "$dir" "b'\\x1bs'" "b'i'" "b'\\x1br'" "b'\\r'"
+has "$out" 'hull tag -d gui/one' "Images ran the removal"
+out=$(timeout 10 "$hull" images 2>&1)
+refute "$out" 'gui/one' "Images removed the ref"
+has "$out" 'gui/two' "Images kept the other"
+
 # Saved: the list again, with no file given.
 out=$(snapshot)
 has "$out" 'gui-a +stopped' "the added machine kept"
@@ -118,6 +158,11 @@ has "$out" 'gui-b +running +chroot \(ns\)' "a core's machine listed"
 has "$out" 'gui-a +stopped' "the added machine beside it"
 has "$out" 'core: 1 machine' "the status counts the core's"
 
+# Screen on a machine with none: said, from its address. The core's
+# machine is the last row.
+keys "$dir" "b'\\x1b[F'" "b'\\x1b[19~'"
+has "$out" 'gui-b shows no screen at 127' "Screen on a machine with none"
+
 # Each request the window makes, against that machine.
 out=$(timeout 60 "$link_test" gui-b gui-hello 2>&1)
 status=$?
@@ -138,6 +183,6 @@ if [ "$status" != 0 ]; then
 	fail "machine_list_test exited $status" "$out"
 fi
 
-rm -rf "${dir:?}/config" "${dir:?}/new"
+rm -rf "${dir:?}/config" "${dir:?}/new" "${dir:?}/newm" "${dir:?}/data" "${dir:?}/screen.txt"
 printf 'gui_test: %d cases, %d failed\n' "$((cases))" "$failures"
 [ "$failures" = 0 ]

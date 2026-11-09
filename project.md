@@ -1606,12 +1606,13 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 - the window drawn as text by qtty's snapshot, with no core, with a refused one-machine file (one row, its backend read from the refusal), with the list it saved, then beside a machine the CLI started;
 - `gui/test/core_link_test.cpp`, every request the window makes against a running machine: list, stats, logs, pause and resume (each seen in the list), kill with a signal the core refuses, stop, and no core.
 - `gui/test/machine_list_test.cpp`: the id rule, a file New writes read back by the real `hull plan` (a command with quotes, a backslash, a tab and a newline; a vm with memory, CPUs, overlay and ssh), each of the writer's refusals, and the saved list's round trip.
-- 12 cases. Four sabotages each failed a named case: the state read under another key, the core's own machines dropped from the list, a refused machine's name counted per line, and a backslash written unescaped.
+- the window on a pseudo-terminal of its own, driven by keys (`test/gui_keys.py`): Start on a refused vm machine offers its `--accept` token, and Esc runs nothing; New writes the file typed into it and lists the machine; Store > Images removes one ref of two; Screen on a chroot machine says it has none. The text read back is the stream the window wrote, not the screen, so a cell already shown is not written again and a pattern matches a part drawn once.
+- 20 cases. Six sabotages each failed a named case: the state read under another key, the core's own machines dropped from the list, a refused machine's name counted per line, a backslash written unescaped, no token offered, and every address taken to show a screen.
 - New tried by hand in a pty on 2026-11-09: Ctrl+N, a name and a command typed, Enter, and the machine was listed as `chroot (ns)` and saved.
 - A machine stopped stays listed as `exited` until its run's frontend has gone, which the core does on purpose. The window offers nothing to do to it.
 
 **Not yet:**
-- Terminal, Screen and the `--accept` offer in the suite: each was tried by hand in a pty only. Terminal: on 2026-11-09, a busybox chroot machine selected and F7 pressed, and the shell printed `inside-42` for `echo inside-$((6*7))`;
+- Terminal and a screen found, in the suite: the test rootfs has no shell and the suite no VNC machine, so both were tried by hand only. Terminal: on 2026-11-09, a busybox chroot machine selected and F7 pressed, and the shell printed `inside-42` for `echo inside-$((6*7))`;
 - secrets that prompt (`exec:`, `age:`). A run started here has no terminal, so its refusal shows in Output;
 - pools and leases, segments;
 - **`-H` remote cores, decided against for now:** over ssh, each request would be an ssh of its own every two seconds, or the window would need one connection multiplexing its channels. `ssh HOST hull-gui --tui` already gives the whole manager on the far host, which is what qtty is for;
