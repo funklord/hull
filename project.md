@@ -1592,6 +1592,8 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 - **The list it saves is the user's choices only**: the added files, in `QSettings` (`~/.config/hull/hull-gui.conf`). A machine the core holds is never saved.
 - **An added machine's id follows the CLI's rule** (`machine_id()`: its name, else its hostname, else its directory's name), read from `hull plan --resolved`. A running machine is matched to its row by that id.
 - **On a terminal, Add asks for a path rather than opening a file dialog.**
+- **A plan refused where `--accept TOKEN` would honour it asks on Start**, showing the lines that name the token. Agreed, the token is kept for the session and passed to `hull run`. It is never saved, as the CLI flag is given per run. Root mode's `root:` tokens are never offered: §7 keeps root as far from a click as it can, and its grant needs the host owner's listing anyway. Tried by hand on 2026-11-09 in a pty: a vm machine with `(fidelity inotify)`, Start, Enter, and the run's plan said `fidelity.inotify: accepted`.
+- **Add asks `hull plan` for the machines of a file**, one row each, and counts each name once: a refused machine is named again on every refused field's line. Before this was found, a refused one-machine file was added as two machines named `machine`.
 - **Terminal is the CLI's `hull exec -t ID /bin/sh`.** On the desktop it opens in a terminal emulator: `$TERMINAL`, else `x-terminal-emulator`, else `xterm`. Under qtty the window hands its own terminal over (`Qtty::shell_out`) until the shell exits. A shell that cannot start leaves its reason on screen until Enter.
 
 **Measured** by `test/gui_test.sh` (`make check-gui`, which needs qtty), on a core and a chroot machine of its own:
@@ -1602,7 +1604,7 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 
 **Not yet:**
 - a console: a vm's or pc's screen (`(display vnc)`). Terminal is in the suite only by hand: on 2026-11-09, in a pty, a busybox chroot machine was selected and Ctrl+E pressed, and the shell printed `inside-42` for `echo inside-$((6*7))`;
-- `--accept` tokens and secrets that prompt. A run started here has no terminal, so its refusal shows in Output;
+- secrets that prompt (`exec:`, `age:`). A run started here has no terminal, so its refusal shows in Output;
 - `-H` remote cores, pools and leases, segments, the store's images;
 - creating or editing a `hull.conf`.
 

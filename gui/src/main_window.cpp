@@ -330,6 +330,37 @@ void main_window::refresh(std::function<void()> after)
 	        });
 }
 
+/*
+ * The tokens a refused plan says would honour its refusals, "(--accept
+ * TOKEN honours it)", each once. Root mode's are left out: the window
+ * never makes root a click away (section 7), and its grant needs the host
+ * owner's listing anyway, which the CLI's refusal explains.
+ */
+static QStringList tokens_wanted(const QString &explain)
+{
+	static const QRegularExpression honours(QStringLiteral("\\(--accept (\\S+) honours it\\)"));
+	QStringList                     tokens;
+	QRegularExpressionMatchIterator it = honours.globalMatch(explain);
+
+	while (it.hasNext()) {
+		const QString token = it.next().captured(1);
+
+		if (!token.startsWith(QStringLiteral("root:")) && !tokens.contains(token))
+			tokens << token;
+	}
+	return tokens;
+}
+
+/* `--accept TOKEN` for each of `accepted`. */
+static QStringList accept_arguments(const QStringList &accepted)
+{
+	QStringList arguments;
+
+	for (const QString &token : accepted)
+		arguments << QStringLiteral("--accept") << token;
+	return arguments;
+}
+
 /* `hull plan --explain --resolved` for an added machine: its backend, its
  * hostname and so its id, and what the matrix says of each field. */
 void main_window::plan_of(int index)
@@ -340,6 +371,7 @@ void main_window::plan_of(int index)
 	QStringList   arguments = { QStringLiteral("plan"), QStringLiteral("-f"), file,
 		                        QStringLiteral("--explain"), QStringLiteral("--resolved") };
 
+	arguments << accept_arguments(rows[index].accepted);
 	if (!name.isEmpty())
 		arguments << name;
 	plan->setProcessChannelMode(QProcess::MergedChannels);
@@ -431,6 +463,8 @@ void main_window::show_details()
 		if (r.held.root)
 			line("Root", QStringLiteral("yes: root mode granted this machine (section 7)"));
 	}
+	if (!r.accepted.isEmpty())
+		line("Accepted", r.accepted.join(QLatin1Char(' ')));
 	if (!r.resolved.isEmpty())
 		text += QStringLiteral("\nAs planned:\n%1\n").arg(r.resolved);
 	if (!r.explain.isEmpty()) {
@@ -552,8 +586,14 @@ void main_window::add_machine(const QString &given, const QString &name)
 			QRegularExpressionMatchIterator it =
 			    line.globalMatch(QString::fromUtf8(plan.readAllStandardOutput()));
 
-			while (it.hasNext())
-				names << it.next().captured(1);
+			/* Each machine once: a refused one is named again on the
+			 * line of each field refused. */
+			while (it.hasNext()) {
+				const QString found = it.next().captured(1);
+
+				if (!names.contains(found))
+					names << found;
+			}
 		}
 		if (names.size() < 2)
 			names = { QString() };
@@ -629,11 +669,47 @@ void main_window::start()
 
 	if (i < 0 || i >= rows.size() || rows[i].added.file.isEmpty() || rows[i].run != nullptr)
 		return;
-	row        &r = rows[i];
+	const added_machine which = rows[i].added;
+	const QStringList   wanted = tokens_wanted(rows[i].explain);
+	const QString       explain = rows[i].explain;
+	QStringList         asked;
+	int                 at = i;
+
+	/* A plan refused where a token would honour it: asked, with the lines
+	 * that say why, once a session; the run then carries --accept. */
+	for (const QString &token : wanted)
+		if (!rows[i].accepted.contains(token))
+			asked << token;
+	if (!asked.isEmpty()) {
+		QStringList lines;
+
+		for (const QString &line : explain.split(QLatin1Char('\n')))
+			for (const QString &token : asked)
+				if (line.contains(QStringLiteral("--accept ") + token + QLatin1Char(' ')))
+					lines << line.section(QStringLiteral(": "), 1);
+		if (QMessageBox::question(
+		        this, QStringLiteral("Accept"),
+		        QStringLiteral("This machine's plan refuses what the backend can only "
+		                       "approximate:\n\n%1\n\nRun it with %2?")
+		            .arg(lines.join(QLatin1Char('\n')),
+		                 accept_arguments(asked).join(QLatin1Char(' ')))) != QMessageBox::Yes)
+			return;
+		/* The dialog ran the event loop, and a refresh may have built the
+		 * rows again: found anew, by what it names. */
+		at = -1;
+		for (int k = 0; k < rows.size(); k++)
+			if (rows[k].added == which)
+				at = k;
+		if (at < 0 || rows[at].is_held || rows[at].run != nullptr)
+			return;
+		rows[at].accepted << asked;
+		plan_of(at);
+	}
+	row        &r = rows[at];
 	QProcess   *run = new QProcess(this);
 	QStringList arguments = { QStringLiteral("run"), QStringLiteral("-f"), r.added.file };
-	const added_machine which = r.added;
 
+	arguments << accept_arguments(r.accepted);
 	if (!r.added.name.isEmpty())
 		arguments << r.added.name;
 	run->setProcessChannelMode(QProcess::MergedChannels);

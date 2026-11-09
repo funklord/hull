@@ -52,6 +52,7 @@ private:
 		bool          is_held = false;
 		QProcess     *run = nullptr;  /* `hull run` started here */
 		QByteArray    output;      /* what that run said */
+		QStringList   accepted;    /* --accept tokens agreed to here, this session */
 	};
 
 	void build_actions();
