@@ -101,6 +101,69 @@ static const char *skip(const hull_sexpr_doc *doc, uint32_t *at)
 }
 
 /* Frame the form starting at `at`, which is neither a lead nor a `)`. */
+/* Where the readable token at `at`, which is not a list, ends, in a
+ * document hull_sexpr_open() has passed: readable.situ's rules stepped
+ * over -- a string to its unescaped quote, octets and a comment to their
+ * closing byte, a symbol to the byte before whitespace, a paren, a quote
+ * or a comment. 0 where it would run past the end, which a checked
+ * document cannot. */
+static uint32_t checked_token_end(const hull_sexpr_doc *doc, uint32_t i)
+{
+	const uint8_t *d = doc->data;
+	uint32_t       n = doc->length;
+	uint8_t        close;
+
+	switch (d[i]) {
+	case '"':
+		for (i++; i < n && d[i] != '"'; i++)
+			if (d[i] == '\\')
+				i++;
+		return i < n ? i + 1u : 0u;
+	case '#':
+	case ';':
+		close = d[i] == '#' ? '#' : '\n';
+		for (i++; i < n && d[i] != close; i++)
+			;
+		return i < n ? i + 1u : 0u;
+	default:
+		while (i < n && !is_space(d[i]) && d[i] != '(' && d[i] != ')' && d[i] != '"' &&
+		       d[i] != ';')
+			i++;
+		return i;
+	}
+}
+
+/* A readable form's extent in a checked document, by its tokens, as
+ * checked_extent() is canonical's; 0 where it would run past the end. */
+static uint32_t checked_readable_extent(const hull_sexpr_doc *doc, uint32_t at)
+{
+	const uint8_t *d = doc->data;
+	uint32_t       i = at;
+	uint32_t       depth = 0u;
+
+	if (d[at] != '(') {
+		uint32_t end = checked_token_end(doc, at);
+
+		return end > at ? end - at : 0u;
+	}
+	do {
+		if (i >= doc->length)
+			return 0u;
+		if (d[i] == '(') {
+			depth++;
+			i++;
+		} else if (d[i] == ')') {
+			depth--;
+			i++;
+		} else if (is_space(d[i])) {
+			i++;
+		} else if ((i = checked_token_end(doc, i)) == 0u) {
+			return 0u;
+		}
+	} while (depth > 0u);
+	return i - at;
+}
+
 static hull_sexpr_status frame_readable(const hull_sexpr_doc *doc, uint32_t at,
                                         hull_sexpr_form *out, const char **reason)
 {
@@ -109,6 +172,39 @@ static hull_sexpr_status frame_readable(const hull_sexpr_doc *doc, uint32_t at,
 	situ_view_t arm;
 	uint8_t     kind = doc->data[at];
 
+	/* Read again once open has passed it, as canonical's is: situ framed
+	 * every form then, so a form is found by its tokens rather than
+	 * judged at every level it is nested under, and every time a reader
+	 * steps onto it. Without this a hull.conf of 160 machines, 16 KB,
+	 * took about a second to check. */
+	if (doc->checked) {
+		uint32_t extent = checked_readable_extent(doc, at);
+
+		if (extent == 0u) {
+			*reason = "a form that does not fit in the input";
+			return HULL_SEXPR_ERR_SYNTAX;
+		}
+		out->offset = at;
+		out->extent = extent;
+		switch (kind) {
+		case '(':
+			out->kind           = HULL_SEXPR_LIST;
+			out->content        = at + 1u;
+			out->content_length = 0u;
+			return HULL_SEXPR_OK;
+		case '"':
+		case '#':
+			out->kind           = kind == '"' ? HULL_SEXPR_STRING : HULL_SEXPR_OCTETS;
+			out->content        = at + 1u;
+			out->content_length = extent - 2u;
+			return HULL_SEXPR_OK;
+		default:
+			out->kind           = HULL_SEXPR_SYMBOL;
+			out->content        = at;
+			out->content_length = extent;
+			return HULL_SEXPR_OK;
+		}
+	}
 	bind(doc, &msg);
 	if (hull_sexpr_r_form_view(&msg, at, doc->length - at, &view) != SITU_OK) {
 		*reason = "a form that does not fit in the input";

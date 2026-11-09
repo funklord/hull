@@ -173,3 +173,19 @@ with open(os.path.join(imp, 'profiles'), 'w') as f:
 with open(os.path.join(imp, 'interval'), 'w') as f:
 	f.write('services:\n  web:\n    image: a\n    healthcheck:\n      test: ["CMD", "true"]\n'
 	        '      interval: 1e30h\n')
+
+# hull.conf as project.md writes it, for spec_fuzz.c: every ```scheme
+# example, and one with each kind of token -- escapes in strings, parens
+# and a `;` inside one, comments between forms.
+spec = os.path.join(out, 'spec')
+os.makedirs(spec, exist_ok=True)
+doc = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'project.md')
+with open(doc) as f:
+	blocks = f.read().split('```scheme\n')[1:]
+for n, block in enumerate(blocks):
+	with open(os.path.join(spec, 'example%03d' % n), 'w') as f:
+		f.write(block.split('```')[0])
+with open(os.path.join(spec, 'kinds'), 'w') as f:
+	f.write('; a comment\n(machine (source "dir:./r") ; another\n'
+	        '  (env (A "x\\"y") (B "t\\tz")) (hostname "h(o)s;t")\n'
+	        '  (command "/bin/sh" "-c" "echo \\"hi\\"") (key #0a1f#))\n')

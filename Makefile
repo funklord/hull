@@ -842,7 +842,13 @@ $(FUZZ_DIR)/import_fuzz: test/fuzz/import_fuzz.c cli/import.c cli/import.h engin
 	@mkdir -p $(dir $@)
 	$(FUZZ_CC) $(FUZZ_FLAGS) -Icli -Iengine -o $@ $(filter %.c,$^)
 
-check-fuzz: $(FUZZ_DIR)/json_fuzz $(FUZZ_DIR)/unpack_fuzz $(FUZZ_DIR)/media_fuzz $(FUZZ_DIR)/import_fuzz
+$(FUZZ_DIR)/spec_fuzz: test/fuzz/spec_fuzz.c spec/spec.c spec/spec.h sexpr/sexpr.c sexpr/sexpr.h \
+                       $(GEN_DIR)/readable.c $(GEN_DIR)/canonical.c $(SITU_DIR)/runtime/c/situ.c
+	@mkdir -p $(dir $@)
+	$(FUZZ_CC) $(FUZZ_FLAGS) $(CPPFLAGS) -o $@ $(filter %.c,$^)
+
+check-fuzz: $(FUZZ_DIR)/json_fuzz $(FUZZ_DIR)/unpack_fuzz $(FUZZ_DIR)/media_fuzz $(FUZZ_DIR)/import_fuzz \
+            $(FUZZ_DIR)/spec_fuzz
 	$(PYTHON) test/fuzz/seeds.py '$(FUZZ_DIR)/corpus'
 	mkdir -p '$(FUZZ_DIR)/work' '$(FUZZ_DIR)/found'
 	cd '$(FUZZ_DIR)/found' && ../json_fuzz -max_total_time=$(FUZZ_TIME) -max_len=4096 \
@@ -853,6 +859,8 @@ check-fuzz: $(FUZZ_DIR)/json_fuzz $(FUZZ_DIR)/unpack_fuzz $(FUZZ_DIR)/media_fuzz
 		-max_total_time=$(FUZZ_TIME) -max_len=65536 -timeout=10 ../corpus/disc
 	cd '$(FUZZ_DIR)/found' && FUZZ_DIR='$(abspath $(FUZZ_DIR))' ../import_fuzz \
 		-max_total_time=$(FUZZ_TIME) -max_len=8192 -timeout=10 ../corpus/import
+	cd '$(FUZZ_DIR)/found' && ../spec_fuzz -max_total_time=$(FUZZ_TIME) -max_len=8192 -timeout=10 \
+		../corpus/spec
 
 # Root mode's native grants with hull-root really setuid root, inside a vm
 # whose guest root is the only root it needs (project.md section 7). Not
