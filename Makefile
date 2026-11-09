@@ -173,6 +173,12 @@ KERNEL_A64_SRC = $(BUILD_DIR)/kernel-arm64/linux-$(KERNEL_VERSION)
 KERNEL_A64_BIN = $(BUILD_DIR)/vmlinuz-hull-arm64
 KERNEL_A64_MOD = $(BUILD_DIR)/modules-hull-arm64/lib/modules/$(KERNEL_VERSION)
 KERNEL_A64     = ARCH=arm64 CROSS_COMPILE=$(patsubst %gcc,%,$(ARM64_CC))
+# What a kernel build stamps from the machine and the clock -- the builder,
+# the host, the date, a count of builds in that tree -- fixed, so that two
+# builds of one version and one config are the same bytes wherever they
+# run (Appendix F's reproducible build). The date is a fixed one.
+KERNEL_STAMP   = KBUILD_BUILD_TIMESTAMP='2026-08-29' KBUILD_BUILD_USER=hull \
+                 KBUILD_BUILD_HOST=hull KBUILD_BUILD_VERSION=1
 
 # Limine from source (section 3.13), beside hull in limine/, where
 # `hull export --bootable` takes it in place of the fetched 11.x UEFI
@@ -505,7 +511,7 @@ $(KERNEL_BIN): $(KERNEL_TAR) kernel/common.config kernel/x86_64.config
 	@for option in $$(grep -h '^CONFIG_' kernel/common.config kernel/x86_64.config); do \
 		grep -qx "$$option" '$(KERNEL_SRC)/.config' || { echo "kernel: $$option did not take" >&2; exit 1; }; \
 	done
-	$(MAKE) -C '$(KERNEL_SRC)' bzImage
+	$(MAKE) -C '$(KERNEL_SRC)' $(KERNEL_STAMP) bzImage
 	cp '$(KERNEL_SRC)/arch/x86/boot/bzImage' '$@'
 
 # The same kernel as an ELF, which qemu enters directly (section 5.2).
@@ -515,7 +521,7 @@ $(KERNEL_ELF): $(KERNEL_BIN)
 # Stripped, and indexed by depmod; the kernel's install clears an earlier
 # set's kernel/ first, so no module of it stays behind.
 $(KERNEL_MODULES)/modules.dep: $(KERNEL_BIN)
-	$(MAKE) -C '$(KERNEL_SRC)' modules
+	$(MAKE) -C '$(KERNEL_SRC)' $(KERNEL_STAMP) modules
 	$(MAKE) -C '$(KERNEL_SRC)' INSTALL_MOD_PATH='$(abspath $(BUILD_DIR))/modules-hull' \
 		INSTALL_MOD_STRIP=1 modules_install > /dev/null
 	touch '$@'
@@ -532,11 +538,11 @@ $(KERNEL_A64_BIN): $(KERNEL_TAR) kernel/common.config kernel/arm64.config
 	@for option in $$(grep -h '^CONFIG_' kernel/common.config kernel/arm64.config); do \
 		grep -qx "$$option" '$(KERNEL_A64_SRC)/.config' || { echo "kernel: arm64: $$option did not take" >&2; exit 1; }; \
 	done
-	$(MAKE) -C '$(KERNEL_A64_SRC)' $(KERNEL_A64) Image.gz
+	$(MAKE) -C '$(KERNEL_A64_SRC)' $(KERNEL_A64) $(KERNEL_STAMP) Image.gz
 	cp '$(KERNEL_A64_SRC)/arch/arm64/boot/Image.gz' '$@'
 
 $(KERNEL_A64_MOD)/modules.dep: $(KERNEL_A64_BIN)
-	$(MAKE) -C '$(KERNEL_A64_SRC)' $(KERNEL_A64) modules
+	$(MAKE) -C '$(KERNEL_A64_SRC)' $(KERNEL_A64) $(KERNEL_STAMP) modules
 	$(MAKE) -C '$(KERNEL_A64_SRC)' $(KERNEL_A64) INSTALL_MOD_PATH='$(abspath $(BUILD_DIR))/modules-hull-arm64' \
 		INSTALL_MOD_STRIP=1 modules_install > /dev/null
 	touch '$@'
