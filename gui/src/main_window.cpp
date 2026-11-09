@@ -20,6 +20,7 @@
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFontDatabase>
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QLabel>
@@ -76,6 +77,9 @@ main_window::main_window(const QString &hull_program, QWidget *parent)
 
 	details = new QPlainTextEdit;
 	details->setReadOnly(true);
+	/* Its keys are a column, which a proportional font does not keep. */
+	details->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+	details->setLineWrapMode(QPlainTextEdit::NoWrap);
 	output = new QPlainTextEdit;
 	output->setReadOnly(true);
 	output->setMaximumBlockCount(5000);
@@ -494,11 +498,26 @@ void main_window::show_details()
 	if (!r.resolved.isEmpty())
 		text += QStringLiteral("\nAs planned:\n%1\n").arg(r.resolved);
 	if (!r.explain.isEmpty()) {
+		/* "FILE:LINE:COL: NAME on ENGINE (CLASS): FIELD: VERDICT" as
+		 * "LINE:COL  FIELD: VERDICT": the file and the machine are above. */
+		static const QRegularExpression field(
+		    QStringLiteral("^.*:(\\d+:\\d+): \\S+ on \\S+ \\(\\S+\\): (.*)$"));
+		static const QRegularExpression summary(
+		    QStringLiteral("^.*: \\S+ on \\S+ \\(\\S+\\): (.*)$"));
 		QString explain;
 
-		for (const QString &l : r.explain.split(QLatin1Char('\n')))
-			if (!l.startsWith(QStringLiteral("(machine ")))
+		for (const QString &l : r.explain.split(QLatin1Char('\n'))) {
+			QRegularExpressionMatch m;
+
+			if (l.startsWith(QStringLiteral("(machine ")))
+				continue;
+			if ((m = field.match(l)).hasMatch())
+				explain += QStringLiteral("%1 %2\n").arg(m.captured(1), -7).arg(m.captured(2));
+			else if ((m = summary.match(l)).hasMatch())
+				explain += QStringLiteral("=> %1\n").arg(m.captured(1));
+			else
 				explain += l + QLatin1Char('\n');
+		}
 		text += QStringLiteral("\nPlan:\n") + explain.trimmed() + QLatin1Char('\n');
 	}
 	if (r.added.file.isEmpty())

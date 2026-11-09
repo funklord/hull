@@ -111,7 +111,13 @@ int main(int argc, char **argv)
 	parser.addOption(hull_option);
 	parser.addOption(tui_option);
 	parser.addOption(gui_option);
+	QCommandLineOption picture_option(
+	    QStringLiteral("picture"),
+	    QStringLiteral("Draw the window once the core and the plans have answered, as a PNG "
+	                   "in FILE, and exit. For tests and pictures of it."),
+	    QStringLiteral("file"));
 	parser.addOption(snapshot_option);
+	parser.addOption(picture_option);
 	parser.addPositionalArgument(QStringLiteral("file"),
 	                             QStringLiteral("A hull.conf to add to the list."),
 	                             QStringLiteral("[file...]"));
@@ -121,6 +127,29 @@ int main(int argc, char **argv)
 	for (const QString &file : parser.positionalArguments())
 		window.add_machine(file, QString());
 
+	if (parser.isSet(picture_option)) {
+		const QString file = parser.value(picture_option);
+		QTimer       *wait = new QTimer(&window);
+		int           waited = 0;
+
+		/* As --snapshot waits: the plans run, and a list asked after. */
+		QObject::connect(wait, &QTimer::timeout, &window, [&window, wait, &waited, file]() {
+			bool busy = false;
+
+			for (QProcess *p : window.findChildren<QProcess *>())
+				busy = busy || p->state() != QProcess::NotRunning;
+			if (busy && ++waited < 100)
+				return;
+			wait->stop();
+			window.refresh([&window, file]() {
+				QCoreApplication::exit(window.grab().save(file, "PNG") ? 0 : 1);
+			});
+		});
+		window.resize(900, 560);
+		window.show();
+		wait->start(100);
+		return application.exec();
+	}
 	if (parser.isSet(snapshot_option)) {
 #ifdef HULL_QTTY
 		const QStringList size = parser.value(snapshot_option).split(QLatin1Char('x'));
