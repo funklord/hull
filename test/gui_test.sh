@@ -141,10 +141,10 @@ fi
 has "$out" 'gui-n' "New's machine listed"
 
 # Images: one of two refs removed through Store > Images: the menu opened,
-# Down onto its item, Enter; Alt+R onto Remove, Enter, and Enter for Yes.
+# Down onto its item, Enter; Alt+R, which clicks Remove, and Enter for Yes.
 timeout 30 "$hull" commit "$dir/rootfs" gui/one > /dev/null 2>&1
 timeout 30 "$hull" commit "$dir/rootfs" gui/two > /dev/null 2>&1
-keys "$dir" "b'\\x1bs'" "b'\\x1b[B'" "b'\\r'" "b'\\x1br'" "b'\\r'" "b'\\r'"
+keys "$dir" "b'\\x1bs'" "b'\\x1b[B'" "b'\\r'" "b'\\x1br'" "b'\\r'"
 has "$out" 'hull tag -d gui/one' "Images ran the removal"
 out=$(timeout 10 "$hull" images 2>&1)
 refute "$out" 'gui/one' "Images removed the ref"
@@ -164,6 +164,19 @@ if ! grep -q gui-e1 "$dir/e.conf"; then
 	fail "Edit ran no editor on the file" "$(cat "$dir/e.conf")"
 fi
 has "$out" 'gui-e1' "Edit planned the file again"
+
+# Pools: a lease reserved in a pool of pools.conf, then released, each by
+# its button's Alt+letter.
+mkdir -p "$XDG_CONFIG_HOME/hull"
+printf '%s\n' '(pools (gui-pool (capacity 2)))' > "$XDG_CONFIG_HOME/hull/pools.conf"
+keys "$dir" "b'\\x1bp'" "b'\\x1b[B'" "b'\\r'" "b'\\x1br'"
+has "$out" 'hull reserve: lease-' "Pools reserved a lease"
+out=$(timeout 10 "$hull" lease ls 2>&1)
+has "$out" '^lease-.* gui-pool +1 ' "the lease held in the pool"
+keys "$dir" "b'\\x1bp'" "b'\\x1b[B'" "b'\\r'" "b'\\x1bl'"
+out=$(timeout 10 "$hull" lease ls 2>&1)
+refute "$out" 'gui-pool' "Pools released it"
+rm -f "$XDG_CONFIG_HOME/hull/pools.conf"
 
 # Saved: the list again, with no file given.
 out=$(snapshot)

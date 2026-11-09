@@ -13,6 +13,7 @@
 
 #include "main_window.h"
 #include "images_dialog.h"
+#include "pools_dialog.h"
 #include "new_machine_dialog.h"
 
 #include <QAction>
@@ -233,6 +234,17 @@ void main_window::build_actions()
 
 	images->setToolTip(QStringLiteral("The store's images: pull, remove, a machine from one"));
 	connect(images, &QAction::triggered, this, &main_window::show_images);
+
+	QMenu   *pool_menu = menuBar()->addMenu(QStringLiteral("&Pools"));
+	QAction *pools = pool_menu->addAction(QStringLiteral("Pools and Leases..."));
+
+	pools->setToolTip(QStringLiteral("The core's pools and leases: reserve, release"));
+	connect(pools, &QAction::triggered, this, [this]() {
+		pools_dialog dialog(hull, this);
+
+		dialog.resize(760, 480);
+		dialog.exec();
+	});
 
 	QToolBar *bar = addToolBar(QStringLiteral("Machine"));
 	bar->setObjectName(QStringLiteral("machine"));

@@ -48,11 +48,13 @@ SOURCES += \
 	src/machine_list.cpp \
 	src/main.cpp \
 	src/main_window.cpp \
-	src/new_machine_dialog.cpp
+	src/new_machine_dialog.cpp \
+	src/pools_dialog.cpp
 
 HEADERS += \
 	src/core_link.h \
 	src/images_dialog.h \
 	src/machine_list.h \
 	src/main_window.h \
-	src/new_machine_dialog.h
+	src/new_machine_dialog.h \
+	src/pools_dialog.h
