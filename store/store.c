@@ -1240,6 +1240,8 @@ static int materialize_locked(hull_store *store, const char *ref, const char *di
 	int             root;
 	int             more;
 	int             result = -1;
+	uint64_t        kept = 0u;       /* owners the user's file stands for */
+	char            first_kept[4096] = "";
 
 	*skipped = 0u;
 	if (name_manifest(store, ref, hex, why, cap) != 0 ||
@@ -1365,7 +1367,10 @@ static int materialize_locked(hull_store *store, const char *ref, const char *di
 		/* An owner other than root and the user cannot be given rootless:
 		 * the user's file stands for both. */
 		if (field(&doc, &entry, "owner", &value) && value.kind == HULL_SEXPR_LIST) {
-			fprintf(stderr, "hull: materialize: %s: its owner is kept as the user\n", path);
+			/* Said once, at the end: a tree of a distribution's
+			 * files is every entry of it. */
+			if (kept++ == 0u)
+				snprintf(first_kept, sizeof first_kept, "%s", path);
 			(*skipped)++;
 		}
 		if (field(&doc, &entry, "xattrs", &value)) {
@@ -1419,6 +1424,10 @@ static int materialize_locked(hull_store *store, const char *ref, const char *di
 bad:
 	say(why, cap, ref, "its manifest has an entry that is not one");
 done:
+	if (kept > 0u)
+		fprintf(stderr, "hull: materialize: %llu %s owner kept as the user's, %s's among them: "
+		        "another owner is not given rootless\n", (unsigned long long)kept,
+		        kept == 1u ? "entry's" : "entries'", first_kept);
 	for (size_t i = 0u; i < dir_count; i++)
 		free(dirs[i]);
 	free(dirs);

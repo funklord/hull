@@ -507,6 +507,17 @@ for want in '(entry (kind dir) (mode 493) (owner root) (path "etc"))' \
 	grep -qF -- "$want" "$root/tarred.view" || fail "a tar's entry is not as it was: $want" \
 		"$(cat "$root/tarred.view")"
 done
+# Its two entries of other owners materialized as the user's, rootless,
+# and said in one line naming the first, not a line an entry, which for a
+# distribution's tree was every one of 37,956.
+rm -rf "${root:?}/tarredout"
+cases=$((cases + 1))
+said=$(timeout 30 "$hull" materialize tarred/1 "$root/tarredout" 2>&1 >/dev/null)
+[ "$(printf '%s\n' "$said" | grep -c 'owner')" = 1 ] &&
+	printf '%s\n' "$said" | grep -q "^hull: materialize: 2 entries' owner kept as the user's, etc/owned's among them" ||
+	fail "other owners materialized were not said once" "$said"
+chmod -R u+w "$root/tarredout" 2>/dev/null
+rm -rf "${root:?}/tarredout"
 head -c 1500 "$root/owned.tar" > "$root/cut.tar"
 expect 1 'commit: the tree.s tar: (it ends before its end|a pax header could not be read)$' "$hull" commit --tar "$root/cut.tar" tarred/cut
 expect 1 'no such ref' "$hull" manifest show tarred/cut
