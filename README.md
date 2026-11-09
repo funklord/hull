@@ -713,6 +713,20 @@ far end, whose core it starts. `/srv/app` is what the file's relative
 paths mean there, the directory you `rsync`ed. `HULL_HOST` says the same
 for a whole shell, and `ps`, `exec`, `logs` and `stop` go with it.
 
+## A window, or the same on a terminal
+
+`make gui` builds `hull-gui`, a manager in the shape of VirtualBox's:
+
+- the machines you added, a `hull.conf` each, and every machine the core
+  runs, whoever started it;
+- each one's plan, state, address, output and what it spends;
+- Start, Stop, Power Off, Pause, Resume and a Terminal into it.
+
+It is a frontend of the same core as the CLI, and starts machines with
+`hull run`. The same window draws on a terminal with
+`hull-gui --tui`, through qtty, so a host with no display gets the
+same manager over ssh.
+
 # Images, when you want them
 
 The store is optional, and a machine never needs it: `dir:` is a source
