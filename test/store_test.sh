@@ -600,6 +600,33 @@ expect 1 'unpack: an object of the pack is cut or not what its index says' "$hul
 expect 1 'unpack: it is not a Hull pack' "$hull" unpack "$root/owned.tar" "$root/cutout"
 expect 1 'unpack: [0-9a-f]{64}: the object.s bytes are not the object its name says' \
 	"$hull" unpack "$root/renamed.hull" "$root/cutout"
+# hull export --tar: the same tree as a tar anything reads, for someone
+# without hull -- extracted by GNU tar, with its xattrs, equal to the tree
+# materialized; through zstd where the name says so, the same tar inside;
+# to stdout for -, the same bytes; and nothing left where the tree is not.
+rm -rf "${root:?}/fromtar"
+mkdir -p "$root/fromtar"
+expect 0 '' "$hull" export --tar one/tree:1 "$root/one.tar"
+expect 0 '' "$hull" export --tar one/tree:1 "$root/one.tar.zst"
+cases=$((cases + 1))
+tar -p --xattrs --xattrs-include='user.*' -xf "$root/one.tar" -C "$root/fromtar" 2>/dev/null
+listing "$root/direct" > "$root/direct.list"
+listing "$root/fromtar" > "$root/fromtar.list"
+cmp -s "$root/direct.list" "$root/fromtar.list" ||
+	fail "a tree exported as a tar is not the tree" \
+		"$(diff "$root/direct.list" "$root/fromtar.list" 2>&1 | head)"
+cases=$((cases + 1))
+timeout 30 zstd -dqc "$root/one.tar.zst" 2>/dev/null | cmp -s - "$root/one.tar" ||
+	fail "an exported .tar.zst is not the tar compressed" ""
+cases=$((cases + 1))
+timeout 30 "$hull" export --tar one/tree:1 - 2>/dev/null | cmp -s - "$root/one.tar" ||
+	fail "hull export --tar to stdout is not the same tar" ""
+expect 1 'export: no/such:1: no such ref' "$hull" export --tar no/such:1 "$root/none.tar"
+cases=$((cases + 1))
+[ ! -e "$root/none.tar" ] || fail "a failed export --tar left its file" ""
+chmod -R u+w "$root/fromtar" 2>/dev/null
+rm -rf "${root:?}/fromtar"
+rm -f "$root/one.tar" "$root/one.tar.zst" "$root/direct.list" "$root/fromtar.list"
 rm -f "$root/one.hull" "$root/again.hull" "$root/bad.hull" "$root/cut.hull" "$root/renamed.hull"
 chmod -R u+w "$root/unpacked" "$root/direct" 2>/dev/null
 rm -rf "${root:?}/unpacked" "${root:?}/direct"

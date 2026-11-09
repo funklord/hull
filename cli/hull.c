@@ -52,6 +52,7 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <zstd.h>
 
 #include "access.h"
 #include "builtin.h"
@@ -131,6 +132,7 @@ static void usage(FILE *out)
 	      "       hull pool ls [POOL] [--json] | hull lease ls [--json]\n"
 	      "       hull broker DIR | hull broker-dial --dir DIR [--as NAME]\n"
 	      "       hull pack DIR|REF FILE | hull unpack FILE|- DIR\n"
+	      "       hull export --tar DIR|REF FILE|-\n"
 	      "       hull export --bootable DIR|REF IMAGE [--init PATH | --host TTY]\n"
 	      "       hull kernel fetch [--arch ARCH]\n"
 	      "       hull sshd fetch [--arch ARCH]\n"
@@ -6198,6 +6200,131 @@ static int pack(const char *source, const char *file)
 	return 0;
 }
 
+/* Where `hull export --tar` puts the layer: to a file or stdout as it
+ * is, or through zstd where the file is named for it. */
+typedef struct tar_out {
+	int          fd;
+	ZSTD_CCtx   *zstd;
+	uint8_t      buffer[1u << 17];
+	int          failed;
+} tar_out;
+
+static int tar_write(int fd, const uint8_t *data, size_t n)
+{
+	for (size_t done = 0u; done < n;) {
+		ssize_t wrote = write(fd, data + done, n - done);
+
+		if (wrote < 0 && errno == EINTR)
+			continue;
+		if (wrote <= 0)
+			return -1;
+		done += (size_t)wrote;
+	}
+	return 0;
+}
+
+/* `n` bytes of the tar on, compressed where it goes through zstd; at the
+ * end, `end` set, the frame closed. 0, or -1. */
+static int tar_put(tar_out *out, const uint8_t *data, size_t n, int end)
+{
+	ZSTD_inBuffer in = { data, n, 0u };
+
+	if (out->zstd == NULL)
+		return tar_write(out->fd, data, n);
+	for (;;) {
+		ZSTD_outBuffer to = { out->buffer, sizeof out->buffer, 0u };
+		size_t        left = ZSTD_compressStream2(out->zstd, &to, &in,
+		                                          end ? ZSTD_e_end : ZSTD_e_continue);
+
+		if (ZSTD_isError(left) || tar_write(out->fd, out->buffer, to.pos) != 0)
+			return -1;
+		if (end ? left == 0u : in.pos == in.size)
+			return 0;
+	}
+}
+
+static int tar_sink(void *context, const uint8_t *data, size_t n)
+{
+	tar_out *out = context;
+
+	if (tar_put(out, data, n, 0) != 0)
+		out->failed = 1;
+	return out->failed ? -1 : 0;
+}
+
+/* `hull export --tar SRC FILE` (section 3.13): the tree SRC is, a
+ * directory -- committed first, as `hull pack` commits one -- or a stored
+ * ref, as a tar anything reads, for someone without hull: the pack is
+ * hull's own form, this the way out of it. Its owners, modes, links and
+ * xattrs as the manifest holds them, every mtime 0; zstd-compressed where
+ * FILE ends .zst or .tzst, level 9 as a pack is, and to stdout for `-`. */
+static int export_tar(const char *source, const char *file)
+{
+	hull_store store;
+	tar_out   *out;
+	char       name[200];
+	char       arch[64];
+	char       why[4400] = "";
+	size_t     length = strlen(file);
+	int        to_stdout = strcmp(file, "-") == 0;
+	int        status;
+
+	if ((out = calloc(1u, sizeof *out)) == NULL) {
+		fprintf(stderr, "hull: export: out of memory\n");
+		return 1;
+	}
+	if ((length > 4u && strcmp(file + length - 4u, ".zst") == 0) ||
+	    (length > 5u && strcmp(file + length - 5u, ".tzst") == 0)) {
+		if ((out->zstd = ZSTD_createCCtx()) == NULL ||
+		    ZSTD_isError(ZSTD_CCtx_setParameter(out->zstd, ZSTD_c_compressionLevel, 9)) ||
+		    ZSTD_isError(ZSTD_CCtx_setParameter(out->zstd, ZSTD_c_checksumFlag, 1))) {
+			ZSTD_freeCCtx(out->zstd);
+			free(out);
+			fprintf(stderr, "hull: export: zstd could not be set up\n");
+			return 1;
+		}
+	}
+	if ((status = open_store(&store, 1)) != 0) {
+		ZSTD_freeCCtx(out->zstd);
+		free(out);
+		return status;
+	}
+	if (tree_name(&store, source, name, sizeof name, why, sizeof why) != 0) {
+		hull_store_close(&store);
+		ZSTD_freeCCtx(out->zstd);
+		free(out);
+		fprintf(stderr, "hull: export: %s\n", why);
+		return 1;
+	}
+	out->fd = to_stdout ? 1 : open(file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (out->fd < 0) {
+		hull_store_close(&store);
+		ZSTD_freeCCtx(out->zstd);
+		free(out);
+		fprintf(stderr, "hull: export: %s: %s\n", file, strerror(errno));
+		return 1;
+	}
+	status = hull_store_layer(&store, name, tar_sink, out, arch, why, sizeof why);
+	hull_store_close(&store);
+	if (status == 0 && tar_put(out, NULL, 0u, 1) != 0)
+		status = -1;
+	if (status != 0 && why[0] == '\0')
+		snprintf(why, sizeof why, "%s: %s", file, out->failed ? strerror(errno) : "not written");
+	if (!to_stdout && close(out->fd) != 0 && status == 0) {
+		snprintf(why, sizeof why, "%s: %s", file, strerror(errno));
+		status = -1;
+	}
+	ZSTD_freeCCtx(out->zstd);
+	free(out);
+	if (status != 0) {
+		if (!to_stdout)
+			unlink(file);
+		fprintf(stderr, "hull: export: %s\n", why);
+		return 1;
+	}
+	return 0;
+}
+
 /* `hull unpack FILE DIR`: the pack into the store, as pack/ and its
  * manifest's hash's first 32 hex digits, every object and the manifest
  * checked, then materialized into DIR. */
@@ -8045,6 +8172,8 @@ int main(int argc, char **argv)
 	if (strcmp(command, "export") == 0 && (argc == 6 || argc == 7) &&
 	    strcmp(argv[2], "--bootable") == 0 && strcmp(argv[3], "-f") == 0)
 		return export_machine(argv[4], argc == 7 ? argv[5] : NULL, argv[argc - 1]);
+	if (strcmp(command, "export") == 0 && argc == 5 && strcmp(argv[2], "--tar") == 0)
+		return export_tar(argv[3], argv[4]);
 	if (strcmp(command, "export") == 0 && argc == 5 && strcmp(argv[2], "--bootable") == 0)
 		return export_bootable(argv[3], argv[4], "/sbin/init", NULL);
 	if (strcmp(command, "export") == 0 && argc == 7 && strcmp(argv[2], "--bootable") == 0 &&
