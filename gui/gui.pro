@@ -46,9 +46,11 @@ SOURCES += \
 	src/core_link.cpp \
 	src/machine_list.cpp \
 	src/main.cpp \
-	src/main_window.cpp
+	src/main_window.cpp \
+	src/new_machine_dialog.cpp
 
 HEADERS += \
 	src/core_link.h \
 	src/machine_list.h \
-	src/main_window.h
+	src/main_window.h \
+	src/new_machine_dialog.h

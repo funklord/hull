@@ -4,7 +4,8 @@
 # core_link, the GUI's side of the protocol, driven through each request
 # against a running machine.
 #
-# Arguments: hull, hull-gui, core_link_test, the static probe. Everything
+# Arguments: hull, hull-gui, core_link_test, the static probe,
+# machine_list_test. Everything
 # is under $BUILD_DIR/test/gui: the machines' rootfs, the core's runtime
 # directory, and the configuration directory the GUI saves its list in,
 # so that the account's own list is never read or written. Every command
@@ -17,6 +18,7 @@ hull=$1
 gui=$2
 link_test=$3
 probe=$4
+list_test=$5
 dir=$(mkdir -p "${BUILD_DIR:?}/test/gui" && cd "${BUILD_DIR:?}/test/gui" && pwd)
 case $dir in
 */test/gui) ;;
@@ -126,6 +128,16 @@ fi
 wait "$run_pid" 2>/dev/null
 run_pid=
 
-rm -rf "${dir:?}/config"
+# The id rule, the spec New writes read back by hull plan, the writer's
+# refusals, and the saved list.
+rm -rf "${dir:?}/new"
+out=$(timeout 60 "$list_test" "$hull" "$dir/new" 2>&1)
+status=$?
+cases=$((cases + 1))
+if [ "$status" != 0 ]; then
+	fail "machine_list_test exited $status" "$out"
+fi
+
+rm -rf "${dir:?}/config" "${dir:?}/new"
 printf 'gui_test: %d cases, %d failed\n' "$((cases))" "$failures"
 [ "$failures" = 0 ]

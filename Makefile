@@ -402,6 +402,16 @@ $(GUI_BIN): $(BUILD_DIR)/gui/Makefile $(CLIENT_LIB) $(GUI_QTTY) $(GUI_SOURCES)
 # request, against a core and a chroot machine of the test's own. Needs
 # qtty: the snapshot is qtty's.
 LINK_TEST = $(BUILD_DIR)/test/gui/core_link_test
+LIST_TEST = $(BUILD_DIR)/test/gui/machine_list_test
+
+$(BUILD_DIR)/test/gui-list/Makefile: gui/test/machine_list_test.pro
+	@mkdir -p '$(@D)'
+	cd '$(@D)' && $(QMAKE) '$(CURDIR)/gui/test/machine_list_test.pro' \
+	    HULL_BUILD='$(abspath $(BUILD_DIR))'
+
+$(LIST_TEST): $(BUILD_DIR)/test/gui-list/Makefile gui/test/machine_list_test.cpp \
+              gui/src/machine_list.cpp gui/src/machine_list.h
+	$(MAKE) -C '$(BUILD_DIR)/test/gui-list'
 
 $(BUILD_DIR)/test/gui-build/Makefile: gui/test/core_link_test.pro
 	@mkdir -p '$(@D)'
@@ -412,11 +422,11 @@ $(LINK_TEST): $(BUILD_DIR)/test/gui-build/Makefile $(CLIENT_LIB) gui/test/core_l
               gui/src/core_link.cpp gui/src/core_link.h
 	$(MAKE) -C '$(BUILD_DIR)/test/gui-build'
 
-check-gui: $(HULL) $(GUI_BIN) $(LINK_TEST) $(PROBE)
+check-gui: $(HULL) $(GUI_BIN) $(LINK_TEST) $(LIST_TEST) $(PROBE)
 	@if [ -z '$(GUI_QTTY)' ]; then echo 'check-gui: needs vendor/qtty, for the snapshot' >&2; \
 	    exit 1; fi
 	BUILD_DIR='$(BUILD_DIR)' sh test/gui_test.sh '$(abspath $(HULL))' '$(abspath $(GUI_BIN))' \
-	    '$(abspath $(LINK_TEST))' '$(abspath $(PROBE))'
+	    '$(abspath $(LINK_TEST))' '$(abspath $(PROBE))' '$(abspath $(LIST_TEST))'
 
 help:
 	@echo 'Targets:'
@@ -994,6 +1004,8 @@ clean:
 	@if [ -f '$(BUILD_DIR)/gui/Makefile' ]; then $(MAKE) -s -C '$(BUILD_DIR)/gui' distclean; fi
 	@if [ -f '$(BUILD_DIR)/test/gui-build/Makefile' ]; then \
 	    $(MAKE) -s -C '$(BUILD_DIR)/test/gui-build' distclean; fi
+	@if [ -f '$(BUILD_DIR)/test/gui-list/Makefile' ]; then \
+	    $(MAKE) -s -C '$(BUILD_DIR)/test/gui-list' distclean; fi
 	@if [ -f '$(BUILD_DIR)/qtty/Makefile' ]; then $(MAKE) -s -C '$(BUILD_DIR)/qtty' distclean; fi
 	@# check-sanitize's own build, cleaned as this one is, by name; one level
 	@# down only, there being no sanitize/sanitize to go on to.

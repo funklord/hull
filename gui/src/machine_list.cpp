@@ -77,6 +77,74 @@ QString machine_id_of(const added_machine &machine, const QString &hostname)
 	return id;
 }
 
+/* `text` as a readable string; `*ok` cleared where it holds a control
+ * character the reader has no escape for. */
+static QString quoted(const QString &text, bool *ok)
+{
+	QString out = QStringLiteral("\"");
+
+	for (QChar c : text) {
+		if (c == QLatin1Char('\\') || c == QLatin1Char('"'))
+			out += QLatin1Char('\\') + QString(c);
+		else if (c == QLatin1Char('\n'))
+			out += QStringLiteral("\\n");
+		else if (c == QLatin1Char('\t'))
+			out += QStringLiteral("\\t");
+		else if (c.unicode() < 0x20 || c.unicode() == 0x7f)
+			*ok = false;
+		else
+			out += c;
+	}
+	return out + QLatin1Char('"');
+}
+
+QString spec_text(const new_machine &machine, QString *why)
+{
+	static const QRegularExpression word(QStringLiteral("^[a-z][a-z0-9-]*$"));
+	static const QRegularExpression size(QStringLiteral("^[0-9]+[KMGT]?$"));
+	bool    ok = true;
+	QString text = QStringLiteral("(machine\n");
+
+	if (machine.source.isEmpty()) {
+		*why = QStringLiteral("a machine needs a source");
+		return QString();
+	}
+	if (!machine.backend.isEmpty() && !word.match(machine.backend).hasMatch()) {
+		*why = QStringLiteral("a backend is a word: ns, vm, emu, pc, dos, or an engine's name");
+		return QString();
+	}
+	if (!machine.memory.isEmpty() && !size.match(machine.memory).hasMatch()) {
+		*why = QStringLiteral("memory is a size such as 512M or 2G");
+		return QString();
+	}
+	if (!machine.hostname.isEmpty())
+		text += QStringLiteral("  (hostname %1)\n").arg(quoted(machine.hostname, &ok));
+	if (!machine.backend.isEmpty())
+		text += QStringLiteral("  (backend %1)\n").arg(machine.backend);
+	text += QStringLiteral("  (source %1)\n").arg(quoted(machine.source, &ok));
+	if (machine.overlay)
+		text += QStringLiteral("  (mutable overlay)\n");
+	if (!machine.command.isEmpty()) {
+		QStringList words;
+
+		for (const QString &arg : machine.command)
+			words << quoted(arg, &ok);
+		text += QStringLiteral("  (command %1)\n").arg(words.join(QLatin1Char(' ')));
+	}
+	if (!machine.memory.isEmpty())
+		text += QStringLiteral("  (memory \"%1\")\n").arg(machine.memory);
+	if (machine.cpus > 0)
+		text += QStringLiteral("  (cpus %1)\n").arg(machine.cpus);
+	if (machine.ssh)
+		text += QStringLiteral("  (ssh true)\n");
+	if (!ok) {
+		*why = QStringLiteral("a field holds a control character the spec cannot carry");
+		return QString();
+	}
+	text.chop(1);
+	return text + QStringLiteral(")\n");
+}
+
 QString hostname_in(const QString &resolved)
 {
 	static const QRegularExpression hostname(QStringLiteral("\\(hostname \"([^\"\\\\]*)\"\\)"));

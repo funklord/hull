@@ -71,6 +71,7 @@ private:
 	void open_screen();
 	void remove_machine();
 	void ask_add();
+	void ask_new();
 	void say(const QString &text);
 	void follow_logs();
 	void ask_stats();
@@ -84,6 +85,7 @@ private:
 	QPlainTextEdit *usage;
 	QLabel         *core_state;
 	QTimer         *poll;
+	QAction        *new_action;
 	QAction        *add_action;
 	QAction        *remove_action;
 	QAction        *start_action;

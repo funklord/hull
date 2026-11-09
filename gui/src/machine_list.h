@@ -14,6 +14,7 @@
 
 #include <QList>
 #include <QString>
+#include <QStringList>
 
 /* One added machine: `file`, its hull.conf, and `name` where the file's
  * (machines ...) holds more than one, as `hull run -f FILE NAME` takes. */
@@ -40,5 +41,27 @@ QString machine_id_of(const added_machine &machine, const QString &hostname);
 
 /* The hostname a `hull plan --resolved` line says, "" where none. */
 QString hostname_in(const QString &resolved);
+
+/* A machine as New writes it: each field left empty, 0 or false is left
+ * out of the file, so the spec's default holds and says so in the plan. */
+struct new_machine {
+	QString     hostname;
+	QString     source;
+	QString     backend;   /* a class or an engine, "" for the default */
+	QStringList command;
+	QString     memory;
+	int         cpus = 0;
+	bool        overlay = false;
+	bool        ssh = false;
+};
+
+/*
+ * `machine` as a hull.conf's text, in the readable syntax of section 4.1:
+ * strings with the reader's four escapes, `\\`, `\"`, `\n` and `\t`. ""
+ * where a field could not be written as the spec's type -- a backend or
+ * memory that is not a word, a control character in a string -- and
+ * `why` then says which.
+ */
+QString spec_text(const new_machine &machine, QString *why);
 
 #endif

@@ -1583,7 +1583,7 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 | Details tab | id, file, state, engine, class, address, arch, root mode; `hull plan --resolved` and `--explain` of an added machine |
 | Output tab | a run started here, as `hull run` said it; else the core's log of the machine, followed |
 | Usage tab | `stats` every 2 s: CPU seconds and per cent of one CPU, io, Pss |
-| Actions | Add, Remove from List, Start, Stop (the machine's grace), Power Off (KILL), Pause, Resume, Terminal, Screen, Refresh |
+| Actions | New, Add, Remove from List, Start, Stop (the machine's grace), Power Off (KILL), Pause, Resume, Terminal, Screen, Refresh |
 
 **Decisions, and why:**
 - **The window speaks the core's protocol itself** (`gui/src/core_link.cpp`), with the CLI's C: `core/wire.c`, the situ validator and the reader, linked as `build/libhull_client.a`. One request per connection, answered through the event loop, so a slow `stop` never blocks the window. Nothing reads the protocol a second way.
@@ -1592,8 +1592,9 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 - **The list it saves is the user's choices only**: the added files, in `QSettings` (`~/.config/hull/hull-gui.conf`). A machine the core holds is never saved.
 - **An added machine's id follows the CLI's rule** (`machine_id()`: its name, else its hostname, else its directory's name), read from `hull plan --resolved`. A running machine is matched to its row by that id.
 - **On a terminal, Add asks for a path rather than opening a file dialog.**
+- **New writes a `hull.conf` from a few common keys** (`gui/src/new_machine_dialog.cpp`), as VirtualBox's New writes a machine's settings: name, folder, source (`dir:./rootfs` or a ref `hull images` lists), backend, command, memory, CPUs, overlay and ssh. It then adds the file like any other. A field left empty is left out of the file, so the spec's default holds and the plan says what it is. It never writes over a file that is there. Strings carry the reader's four escapes; a field the spec could not hold (memory that is not a size, a backend that is not a word, a control character) is refused with its reason. Anything more is the file's, by hand.
 - **Screen is `(display vnc)`'s port 5900 at the machine's address** (§5.0's pc). It is probed for a second first, so a machine with no screen says so rather than a client that fails. On the desktop the first VNC client found is started (`vncviewer`, `xtigervncviewer`, `remmina`, `krdc`, then `xdg-open vnc://`); under qtty the address is said. Tried by hand on 2026-11-09 in a pty: F8 on a pc booting a spinning sector named `127.107.38.102:5900`, and on a chroot machine said it shows no screen.
-- **Shortcuts keep off the keys qtty gives text editing on a terminal** (Ctrl+A, E, K, U, W, D and L), which answer differently by focus or never. Ctrl+D for Screen never fired under qtty, which is how this was found. So: Add Ctrl+O, Start Ctrl+S, Stop Ctrl+T, Pause Ctrl+P, Resume Ctrl+R, Terminal F7, Screen F8, Refresh F5, Quit Ctrl+Q.
+- **Shortcuts keep off the keys qtty gives text editing on a terminal** (Ctrl+A, E, K, U, W, D and L), which answer differently by focus or never. Ctrl+D for Screen never fired under qtty, which is how this was found. So: New Ctrl+N, Add Ctrl+O, Start Ctrl+S, Stop Ctrl+T, Pause Ctrl+P, Resume Ctrl+R, Terminal F7, Screen F8, Refresh F5, Quit Ctrl+Q.
 - **A plan refused where `--accept TOKEN` would honour it asks on Start**, showing the lines that name the token. Agreed, the token is kept for the session and passed to `hull run`. It is never saved, as the CLI flag is given per run. Root mode's `root:` tokens are never offered: §7 keeps root as far from a click as it can, and its grant needs the host owner's listing anyway. Tried by hand on 2026-11-09 in a pty: a vm machine with `(fidelity inotify)`, Start, Enter, and the run's plan said `fidelity.inotify: accepted`.
 - **Add asks `hull plan` for the machines of a file**, one row each, and counts each name once: a refused machine is named again on every refused field's line. Before this was found, a refused one-machine file was added as two machines named `machine`.
 - **Terminal is the CLI's `hull exec -t ID /bin/sh`.** On the desktop it opens in a terminal emulator: `$TERMINAL`, else `x-terminal-emulator`, else `xterm`. Under qtty the window hands its own terminal over (`Qtty::shell_out`) until the shell exits. A shell that cannot start leaves its reason on screen until Enter.
@@ -1601,14 +1602,16 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 **Measured** by `test/gui_test.sh` (`make check-gui`, which needs qtty), on a core and a chroot machine of its own:
 - the window drawn as text by qtty's snapshot, with no core, with a refused one-machine file (one row, its backend read from the refusal), with the list it saved, then beside a machine the CLI started;
 - `gui/test/core_link_test.cpp`, every request the window makes against a running machine: list, stats, logs, pause and resume (each seen in the list), kill with a signal the core refuses, stop, and no core.
-- 11 cases. Three sabotages each failed a named case: the state read under another key, the core's own machines dropped from the list, and a refused machine's name counted per line.
+- `gui/test/machine_list_test.cpp`: the id rule, a file New writes read back by the real `hull plan` (a command with quotes, a backslash, a tab and a newline; a vm with memory, CPUs, overlay and ssh), each of the writer's refusals, and the saved list's round trip.
+- 12 cases. Four sabotages each failed a named case: the state read under another key, the core's own machines dropped from the list, a refused machine's name counted per line, and a backslash written unescaped.
+- New tried by hand in a pty on 2026-11-09: Ctrl+N, a name and a command typed, Enter, and the machine was listed as `chroot (ns)` and saved.
 - A machine stopped stays listed as `exited` until its run's frontend has gone, which the core does on purpose. The window offers nothing to do to it.
 
 **Not yet:**
 - Terminal, Screen and the `--accept` offer in the suite: each was tried by hand in a pty only. Terminal: on 2026-11-09, a busybox chroot machine selected and F7 pressed, and the shell printed `inside-42` for `echo inside-$((6*7))`;
 - secrets that prompt (`exec:`, `age:`). A run started here has no terminal, so its refusal shows in Output;
 - `-H` remote cores, pools and leases, segments, the store's images;
-- creating or editing a `hull.conf`.
+- editing a `hull.conf` past what New writes, or a `(machines …)` file.
 
 ## 5. Engines
 
