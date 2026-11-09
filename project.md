@@ -1585,7 +1585,7 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 | Usage tab | `stats` every 2 s: CPU seconds and per cent of one CPU, io, Pss |
 | Network tab | each segment the machine's plan names, every port's counters on it (`hull segment NAME`), and its link impaired, cleared or taken down (`hull segment NAME impair`) |
 | Images (Store menu) | the store's refs and manifests, as VirtualBox's media manager lists disks: Pull, Remove, New Machine on one |
-| Actions | New, Add, Remove from List, Start, Stop (the machine's grace), Power Off (KILL), Pause, Resume, Terminal, Screen, Refresh |
+| Actions | New, Add, Edit hull.conf, Remove from List, Start, Stop (the machine's grace), Power Off (KILL), Pause, Resume, Terminal, Screen, Refresh |
 
 **Decisions, and why:**
 - **The window speaks the core's protocol itself** (`gui/src/core_link.cpp`), with the CLI's C: `core/wire.c`, the situ validator and the reader, linked as `build/libhull_client.a`. One request per connection, answered through the event loop, so a slow `stop` never blocks the window. Nothing reads the protocol a second way.
@@ -1596,6 +1596,7 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 - **On a terminal, Add asks for a path rather than opening a file dialog.**
 - **New writes a `hull.conf` from a few common keys** (`gui/src/new_machine_dialog.cpp`), as VirtualBox's New writes a machine's settings: name, folder, source (`dir:./rootfs` or a ref `hull images` lists), backend, command, memory, CPUs, overlay and ssh. It then adds the file like any other. A field left empty is left out of the file, so the spec's default holds and the plan says what it is. It never writes over a file that is there. Strings carry the reader's four escapes; a field the spec could not hold (memory that is not a size, a backend that is not a word, a control character) is refused with its reason. Anything more is the file's, by hand.
 - **Images runs the store's CLI** (`hull images`, `hull pull`, `hull tag -d`), one at a time, its output in the dialog's log. The store has no protocol of its own and needs no core. New Machine on an image opens New with the ref as its source. Tried by hand on 2026-11-09 in a pty, on a store of its own: two refs committed, Alt+S, I, Alt+R and Enter removed one (`hull images` then listed the other alone); Alt+N on the other, a name and Enter wrote `(source "gui/two")`, which plans.
+- **Edit hull.conf (F4)** opens the file in `$VISUAL`, else `$EDITOR`, else `vi`, on the window's own terminal under qtty, and plans it again when the editor exits. On the desktop it opens the file with whatever the desktop opens text with, and Refresh plans it again, there being no end of an editor's window to wait for.
 - **The Network tab asks the CLI** for a segment's counters and for an impairment: the words are netem's and the CLI's, and a second reading of them here would drift. A machine's segments come from its plan, so a machine started elsewhere shows none until its file is added.
 - **An added row of a `(machines …)` file is planned with the whole file**, `hull plan` taking no machine's name, and keeps its own lines: `…: NAME on …`, and the resolved form whose hostname is its name, which the plan writes for each machine of such a file. Until 2026-11-09 the name was passed, and every such row showed plan's usage text for its details.
 - **Under qtty, menu actions carry no mnemonic and the terminal conventions are on.** A menu action's Alt+letter answers with its menu closed there and beats a tab's: Alt+N opened New where the Network tab was meant. The actions have shortcuts. `Qtty::set_keyboard_conventions(true)` gives Enter on the focused control, Up and Down between controls, Ctrl+PgUp/PgDn between tabs and Alt+letter to jump; hull-gui binds none of those keys itself.
@@ -1610,9 +1611,10 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 - the window drawn as text by qtty's snapshot, with no core, with a refused one-machine file (one row, its backend read from the refusal), with the list it saved, then beside a machine the CLI started;
 - `gui/test/core_link_test.cpp`, every request the window makes against a running machine: list, stats, logs, pause and resume (each seen in the list), kill with a signal the core refuses, stop, and no core.
 - `gui/test/machine_list_test.cpp`: the id rule, a file New writes read back by the real `hull plan` (a command with quotes, a backslash, a tab and a newline; a vm with memory, CPUs, overlay and ssh), each of the writer's refusals, and the saved list's round trip.
-- the window on a pseudo-terminal of its own, driven by keys (`test/gui_keys.py`): Start on a refused vm machine offers its `--accept` token, and Esc runs nothing; New writes the file typed into it and lists the machine; Store > Images removes one ref of two; Screen on a chroot machine says it has none. The text read back is the stream the window wrote, not the screen, so a cell already shown is not written again and a pattern matches a part drawn once.
+- the window on a pseudo-terminal of its own, driven by keys (`test/gui_keys.py`): Start on a refused vm machine offers its `--accept` token, and Esc runs nothing; New writes the file typed into it and lists the machine; Store > Images removes one ref of two; Screen on a chroot machine says it has none. The text read back is the stream the window wrote, not the screen: a cell already shown is not written again, so a renamed `gui-e0` came back as a lone `1`, and a case passed or failed by whether a redraw happened. Each run now ends with Ctrl+L, qtty's redraw, so the final screen is in the text whole. The suite also waits for an earlier run's core to unlink its socket before its no-core case.
 - the Network tab, against two chroot machines on a wire: the wire's ports listed, and Link Down on the one chosen by typing its name answered as set.
-- 22 cases. Seven sabotages each failed a named case: the state read under another key, the core's own machines dropped from the list, a refused machine's name counted per line, a backslash written unescaped, no token offered, every address taken to show a screen, and no segment read from a plan.
+- Edit, with an editor that is a script renaming the machine: the file changed, and the new name listed.
+- 24 cases. Eight sabotages each failed a named case: the state read under another key, the core's own machines dropped from the list, a refused machine's name counted per line, a backslash written unescaped, no token offered, every address taken to show a screen, no segment read from a plan, and no plan after Edit.
 - New tried by hand in a pty on 2026-11-09: Ctrl+N, a name and a command typed, Enter, and the machine was listed as `chroot (ns)` and saved.
 - A machine stopped stays listed as `exited` until its run's frontend has gone, which the core does on purpose. The window offers nothing to do to it.
 
@@ -1621,7 +1623,7 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 - secrets that prompt (`exec:`, `age:`). A run started here has no terminal, so its refusal shows in Output;
 - pools and leases; a segment's `tamper`, `inject` and `capture`;
 - **`-H` remote cores, decided against for now:** over ssh, each request would be an ssh of its own every two seconds, or the window would need one connection multiplexing its channels. `ssh HOST hull-gui --tui` already gives the whole manager on the far host, which is what qtty is for;
-- editing a `hull.conf` past what New writes, or a `(machines …)` file.
+- a form for keys New does not ask; past those, Edit opens the file.
 
 ## 5. Engines
 

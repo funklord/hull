@@ -23,6 +23,8 @@
 #include <QPushButton>
 #include <QVBoxLayout>
 #include <QCloseEvent>
+#include <QDesktopServices>
+#include <QUrl>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -165,6 +167,10 @@ void main_window::build_actions()
 	add_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+O")));
 	add_action->setToolTip(QStringLiteral("Add a machine's hull.conf to the list"));
 	connect(add_action, &QAction::triggered, this, &main_window::ask_add);
+	edit_action = new QAction(QStringLiteral("Edit hull.conf"), this);
+	edit_action->setShortcut(QKeySequence(QStringLiteral("F4")));
+	edit_action->setToolTip(QStringLiteral("The machine's file in an editor, planned again after"));
+	connect(edit_action, &QAction::triggered, this, &main_window::edit_spec);
 	remove_action = new QAction(QStringLiteral("Remove from List"), this);
 	connect(remove_action, &QAction::triggered, this, &main_window::remove_machine);
 	start_action = new QAction(QStringLiteral("Start"), this);
@@ -207,6 +213,7 @@ void main_window::build_actions()
 	QMenu *machine = menuBar()->addMenu(QStringLiteral("&Machine"));
 	machine->addAction(new_action);
 	machine->addAction(add_action);
+	machine->addAction(edit_action);
 	machine->addAction(remove_action);
 	machine->addSeparator();
 	machine->addAction(start_action);
@@ -491,6 +498,7 @@ void main_window::update_actions()
 	const bool held = state == QStringLiteral("running") || state == QStringLiteral("paused");
 
 	remove_action->setEnabled(any && !rows[i].added.file.isEmpty());
+	edit_action->setEnabled(any && !rows[i].added.file.isEmpty());
 	start_action->setEnabled(any && !rows[i].is_held && rows[i].run == nullptr &&
 	                         !rows[i].added.file.isEmpty());
 	stop_action->setEnabled(held);
@@ -944,6 +952,33 @@ void main_window::pause_machine(bool paused)
 	        });
 }
 
+#ifdef HULL_QTTY
+/* `argv` run on the terminal qtty draws on, handed over to it until it
+ * exits, as a shell's job in the foreground has it. */
+static void on_this_terminal(const QStringList &command)
+{
+	Qtty::shell_out([&command]() {
+		QByteArrayList bytes;
+		QList<char *>  argv;
+		pid_t          child;
+
+		for (const QString &arg : command)
+			bytes.append(arg.toLocal8Bit());
+		for (QByteArray &arg : bytes)
+			argv.append(arg.data());
+		argv.append(nullptr);
+		child = fork();
+		if (child == 0) {
+			execv(argv[0], argv.data());
+			_exit(127);
+		}
+		if (child > 0)
+			while (waitpid(child, nullptr, 0) < 0 && errno == EINTR)
+				;
+	});
+}
+#endif
+
 /*
  * A shell in the selected machine, `hull exec -t ID /bin/sh`, the CLI's,
  * on a terminal of its own: on the desktop a terminal emulator's window,
@@ -966,25 +1001,7 @@ void main_window::open_terminal()
 
 	if (on_terminal()) {
 #ifdef HULL_QTTY
-		Qtty::shell_out([&shell]() {
-			QByteArrayList bytes;
-			QList<char *>  argv;
-			pid_t          child;
-
-			for (const QString &arg : shell)
-				bytes.append(arg.toLocal8Bit());
-			for (QByteArray &arg : bytes)
-				argv.append(arg.data());
-			argv.append(nullptr);
-			child = fork();
-			if (child == 0) {
-				execv(argv[0], argv.data());
-				_exit(127);
-			}
-			if (child > 0)
-				while (waitpid(child, nullptr, 0) < 0 && errno == EINTR)
-					;
-		});
+		on_this_terminal(shell);
 #endif
 		return;
 	}
@@ -1233,6 +1250,46 @@ void main_window::impair(const QStringList &words)
 	process->start(hull, QStringList{ QStringLiteral("segment"), segment, QStringLiteral("impair"),
 	                                  id, impair_way->currentText() } +
 	                         words);
+}
+
+/*
+ * The selected machine's hull.conf in an editor: under qtty $VISUAL, else
+ * $EDITOR, else vi, on the window's own terminal until it exits; on the
+ * desktop whatever the desktop opens a text file with. The file is
+ * planned again after, at once under qtty, and on the desktop at the
+ * next Refresh, there being no end of an editor's window to wait for.
+ */
+void main_window::edit_spec()
+{
+	const int i = current();
+
+	if (i < 0 || i >= rows.size() || rows[i].added.file.isEmpty())
+		return;
+	const QString file = rows[i].added.file;
+
+	if (on_terminal()) {
+#ifdef HULL_QTTY
+		QString editor = qEnvironmentVariable("VISUAL");
+
+		if (editor.isEmpty())
+			editor = qEnvironmentVariable("EDITOR");
+		if (editor.isEmpty())
+			editor = QStringLiteral("vi");
+		/* As a shell reads $EDITOR: it may carry arguments. */
+		const QStringList shell = { QStringLiteral("/bin/sh"), QStringLiteral("-c"),
+			                        editor + QStringLiteral(" \"$0\""), file };
+
+		on_this_terminal(shell);
+		for (int k = 0; k < rows.size(); k++)
+			if (rows[k].added.file == file)
+				plan_of(k);
+#endif
+		return;
+	}
+	if (!QDesktopServices::openUrl(QUrl::fromLocalFile(file)))
+		say(QStringLiteral("nothing opens %1 here: edit it, then Refresh").arg(file));
+	else
+		say(QStringLiteral("%1 opened: Refresh plans it again").arg(file));
 }
 
 void main_window::closeEvent(QCloseEvent *event)

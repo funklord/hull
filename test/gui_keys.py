@@ -7,8 +7,10 @@
 # (four after the start), and the screen's text with its escapes taken out
 # is written to OUT at the end. That text is the stream the window wrote,
 # not the screen: a cell the terminal already shows is not written again,
-# so a word can come out with letters missing, and a pattern should match
-# a part of what it looks for that is drawn once. FILEs are given to hull-gui to add. The
+# so a word can come out with letters missing. The run ends with Ctrl+L,
+# which draws the screen whole once more, so what the screen shows at the
+# end is there whole; a pattern for something shown only in between should
+# match a part of it that is drawn once. FILEs are given to hull-gui to add. The
 # window is killed at the end by its pid, and the whole run is bounded by
 # the caller's timeout as well.
 
@@ -60,6 +62,10 @@ pump(4)
 for key in keys:
 	os.write(fd, key)
 	pump(3)
+# Ctrl+L, qtty's redraw: the last frame drawn whole, so what is on the
+# screen at the end is in the text whole, whatever was drawn before.
+os.write(fd, b'\x0c')
+pump(2)
 with open(out, 'w') as f:
 	f.write(re.sub(rb'\x1b\[[0-9;?]*[ -/]*[@-~]', b' ', screen).decode('utf-8', 'replace'))
 os.kill(pid, signal.SIGKILL)

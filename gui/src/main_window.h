@@ -71,6 +71,7 @@ private:
 	void pause_machine(bool paused);
 	void open_terminal();
 	void open_screen();
+	void edit_spec();
 	void remove_machine();
 	void ask_add();
 	void ask_new(const QString &source = QString());
@@ -108,6 +109,7 @@ private:
 	QAction        *refresh_action;
 	QAction        *terminal_action;
 	QAction        *screen_action;
+	QAction        *edit_action;
 	core_request   *logs = nullptr;    /* following the selected machine's */
 	QString         logs_of;
 	bool            listing = false;

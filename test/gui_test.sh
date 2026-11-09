@@ -92,6 +92,14 @@ snapshot() {
 	(cd "$dir" && timeout 60 "$gui" --hull "$hull" --tui --snapshot 110x26 "$@" 2>/dev/null)
 }
 
+# A core of an earlier run gone first, as it goes a second after its
+# last machine and client, unlinking its socket as it does.
+tries=0
+while [ -S "$XDG_RUNTIME_DIR/hull/core.sock" ] && [ "$tries" -lt 100 ]; do
+	tries=$((tries + 1))
+	sleep 0.1
+done
+
 out=$(timeout 10 "$gui" --version 2>&1)
 has "$out" '^hull-gui [0-9]' "--version"
 
@@ -141,6 +149,21 @@ has "$out" 'hull tag -d gui/one' "Images ran the removal"
 out=$(timeout 10 "$hull" images 2>&1)
 refute "$out" 'gui/one' "Images removed the ref"
 has "$out" 'gui/two' "Images kept the other"
+
+# Edit: $EDITOR on the window's terminal, the file planned again after.
+# The editor is a script that renames the machine.
+printf '%s\n' '(machine (hostname "gui-e0") (source "dir:./rootfs") (command "/probe"))' \
+	> "$dir/e.conf"
+printf '%s\n' 'sed -i s/gui-e0/gui-e1/ "$1"' > "$dir/edit.sh"
+EDITOR="sh $dir/edit.sh"
+export EDITOR
+keys "$dir" "b'gui-e0'" "b'\\x1bOS'" -- e.conf
+unset EDITOR
+cases=$((cases + 1))
+if ! grep -q gui-e1 "$dir/e.conf"; then
+	fail "Edit ran no editor on the file" "$(cat "$dir/e.conf")"
+fi
+has "$out" 'gui-e1' "Edit planned the file again"
 
 # Saved: the list again, with no file given.
 out=$(snapshot)
