@@ -27,7 +27,8 @@
  * dies with the thread that started it, PR_SET_PDEATHSIG, as a chroot
  * machine dies with its core: nothing could manage it afterwards.
  *
- * The kernel is the host's, standing in for Appendix F's bundled one, so
+ * The kernel is hull's own where `make kernel` built it, Appendix F's
+ * bundled one, and elsewhere the host's standing in for it, so
  * vm.kernel.bundled is declared emulated and says so.
  *
  * An exec is a channel of the agent's. Its output flows on B.2's credit:
@@ -3740,6 +3741,18 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	/* An arm64 machine boots the arm64 kernel `hull kernel fetch --arch
 	 * arm64` put in the cache, with its modules, the host's being amd64's;
 	 * a kernel given by path is booted as given. */
+	/* (kernel bundled), every plan's default, is Appendix F's bundled
+	 * kernel: hull's own wherever `make kernel` built it beside hull, and
+	 * the host's or the fetched one standing in where it did not. (profile
+	 * full) keeps the stand-in, Appendix F's escape hatch for a full
+	 * distribution's kernel: a workload wanting a module outside hull's
+	 * set is a full machine's. */
+	if (!m->kernel_hull && !m->kernel_fetched && m->kernel_path == NULL && !m->kernel_image &&
+	    !m->profile_full && agent_path(kbuf, sizeof kbuf, 0) && strrchr(kbuf, '/') != NULL) {
+		snprintf(strrchr(kbuf, '/'), sizeof kbuf - (size_t)(strrchr(kbuf, '/') - kbuf),
+		         "/vmlinuz-hull%s", m->arm64 ? "-arm64" : "");
+		m->kernel_hull = access(kbuf, R_OK) == 0;
+	}
 	if (m->kernel_hull) {
 		/* hull's own (Appendix F): every driver it boots with built in,
 		 * so its initramfs loads none; the modules it was built with,
@@ -5158,7 +5171,8 @@ static const hull_cap_entry entries[] = {
 	{ "vm.profile.full",     HULL_SUP_NATIVE,
 	  "a q35 machine, whatever the kernel; an arm64 machine is qemu's virt", NULL },
 	{ "vm.kernel.bundled",   HULL_SUP_EMULATED,
-	  "the host's own kernel and modules, until Appendix F ships one; for an arm64 machine "
+	  "hull's own kernel, as (kernel hull), where `make kernel` built it beside hull; else, and "
+	  "under (profile full), the host's own kernel and modules, or for an arm64 machine "
 	  "Debian's arm64 kernel, `hull kernel fetch --arch arm64`'s", NULL },
 	{ "vm.kernel.path",      HULL_SUP_NATIVE,
 	  "the kernel at the given path, booted as given; its modules are the host's for its "

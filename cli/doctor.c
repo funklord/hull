@@ -429,8 +429,6 @@ static void virtiofs(void)
 	free(found);
 }
 
-/* Whether (kernel hull) is here and a microvm with it (section 4.11): nothing
- * is wrong without either, and the machine boots a second or so slower. */
 /* Whether `dir`, a modules-hull/lib/modules, holds a release indexed by
  * depmod. */
 static int has_modules(const char *dir)
@@ -452,6 +450,9 @@ static int has_modules(const char *dir)
 	return found;
 }
 
+/* Whether hull's own kernel is here, every vm's default where it is, and a
+ * microvm with it (section 4.11): nothing is wrong without it, and a vm
+ * boots the host's kernel, a second or so slower. */
 static void own_kernel(void)
 {
 	char    self[4096];
@@ -467,18 +468,18 @@ static void own_kernel(void)
 		return;
 	memcpy(slash, "/vmlinux-hull", sizeof "/vmlinux-hull");
 	if (access(self, R_OK) == 0) {
-		snprintf(text, sizeof text, "(kernel hull), a microvm under KVM (%s)", self);
+		snprintf(text, sizeof text, "a vm's default, a microvm under KVM (%s)", self);
 		line("ok", "hull's own kernel", text);
 		/* Its modules, which a build before them did not make: a
 		 * machine on it then has no modprobe. */
 		memcpy(slash, "/modules-hull/lib/modules", sizeof "/modules-hull/lib/modules");
 		if (!has_modules(self))
-			line("absent", "hull's own modules", "modprobe in a machine on (kernel hull): "
+			line("absent", "hull's own modules", "modprobe in a machine on hull's kernel: "
 			     "`make kernel` builds them, beside hull");
 		return;
 	}
-	line("absent", "hull's own kernel", "(kernel hull) and the microvm it boots, about 0.4 s a run: "
-	     "`make kernel` builds it, beside hull");
+	line("absent", "hull's own kernel", "a vm's default where it is, a microvm, about 0.4 s a run "
+	     "against the host's kernel's 1.3: `make kernel` builds it, beside hull");
 }
 
 int hull_doctor(const char *runtime_why)

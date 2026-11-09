@@ -1,6 +1,8 @@
 #!/bin/sh
 # qemu_test.sh -- build/hull run on the qemu engine, as the user, booting
-# the host's own kernel. Not part of `make check`, which needs no KVM:
+# the default kernel: hull's own where `make kernel` built it beside hull,
+# else the host's; (profile full) for the host's wherever a case needs its
+# modules. Not part of `make check`, which needs no KVM:
 # `make check-qemu` runs it.
 #
 # Each machine is booted once and every line it prints is checked, since
@@ -175,7 +177,7 @@ has 3 '^leader=1$'
 has 3 '^read=0-1$'
 # 256 MiB, less what the kernel keeps for itself.
 has 3 '^read=MemTotal: +(1[5-9][0-9]|2[0-6][0-9])[0-9]{3} kB$'
-has 3 'vm\.kernel\.bundled: emulated: the host.s own kernel'
+has 3 'vm\.kernel\.bundled: emulated: hull.s own kernel, as \(kernel hull\), where'
 # Accelerated: KVM gives the guest its clock.
 has 3 '^read=kvm-clock'
 # The host's randomness, by virtio-rng: without it a guest on a processor
@@ -327,7 +329,8 @@ conf overro '(backend vm) (mutable overlay) (security (readonly_root true))' \
 name=overro
 boot overro
 has 0 '^write=Read-only file system$'
-# The host's modules, which are the guest kernel's: where modprobe looks,
+# The host's modules, which are the guest kernel's under (profile full),
+# the escape hatch for a module outside hull's set: where modprobe looks,
 # read-only, and loadable, as a test of network software loads
 # mac80211_hwsim and gets two radios. Its dependencies are loaded first,
 # the last listed first, as modprobe does. Above an overlay their place is
@@ -341,7 +344,7 @@ else
 	for module in $(printf '%s\n' "${hwsim#*:}" | tr ' ' '\n' | sed '/^$/d' | tac) "${hwsim%%:*}"; do
 		loads="$loads \"load\" \"$module\""
 	done
-	conf modules '(backend vm) (mutable overlay)' \
+	conf modules '(backend vm) (mutable overlay) (tuning (vm (profile full)))' \
 		"(command \"/probe\" $loads \"list\" \"/sys/class/ieee80211\"" \
 		"\"write\" \"/lib/modules/$release/written\")"
 	name=modules
@@ -1816,7 +1819,7 @@ CHECK
 	printf '(machine (source "dir:./cfs/root") (backend vm) (mutable overlay) %s %s %s)\n' \
 		'(volumes (volume (host "./cfs/image") (guest "/cfs") (mode ro))' \
 		'(volume (host "./cfs/store/hull/store/objects/sha256") (guest "/objects") (mode ro)))' \
-		'(command "/bin/sh" "/check.sh")' > "$root/cfs.conf"
+		'(tuning (vm (profile full))) (command "/bin/sh" "/check.sh")' > "$root/cfs.conf"
 	out=$(cd / && timeout 90 "$hull" run -f "$root/cfs.conf" 2>&1 | grep -v ': machine on ')
 	got=$(printf '%s\n' "$out" | grep -v '^link=\|^ran from\|insmod')
 	# A directory's size is its filesystem's own, so directories are held
@@ -1871,12 +1874,16 @@ CHECK
 	printf '(machine (source "cfs/root:1") (backend vm) (security (verity true)) %s %s)\n' \
 		'(command "/bin/sh" "-c" "cat /proc/mounts; cat /guarded; echo status=$?")' \
 		'(tuning (vm (kernel KERNEL)))' > "$root/cfsverity.in"
-	for kernel in bundled hull; do
+	for kernel in host hull; do
 		if [ "$kernel" = hull ] && [ ! -r "$(dirname "$hull")/vmlinuz-hull" ]; then
 			printf 'qemu: fs-verity on hull'"'"'s own kernel not tried: no vmlinuz-hull\n'
 			continue
 		fi
-		sed "s/KERNEL/$kernel/" "$root/cfsverity.in" > "$root/cfsverity.conf"
+		case $kernel in
+		host) tuning='bundled) (profile full' ;;
+		*) tuning=hull ;;
+		esac
+		sed "s/KERNEL/$tuning/" "$root/cfsverity.in" > "$root/cfsverity.conf"
 		out=$(cd / && XDG_DATA_HOME="$root/cfs/store" timeout 90 "$hull" run -f "$root/cfsverity.conf" 2>&1)
 		cases=$((cases + 1))
 		printf '%s\n' "$out" | grep -q '^overlay / overlay .*verity=require' &&
@@ -2584,7 +2591,8 @@ fetchedrun=$(mktemp -d "$root/run-fetched.XXXXXX")
 chosenrun=$(mktemp -d "$root/run-chosen.XXXXXX")
 mkdir -p "$root/cache-empty"
 krelease=$(sed -n 's/^#define HULL_KERNEL_RELEASE "\(.*\)"$/\1/p' engine/kernel.h)
-printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) %s)\n' \
+printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) %s %s)\n' \
+	'(tuning (vm (profile full)))' \
 	"(command \"/probe\" \"say\" \"fetched\" \"list\" \"/lib/modules/$krelease\")" \
 	> "$root/vfetched.conf"
 name='a vm with no kernel to read'
@@ -2705,6 +2713,19 @@ if [ -r "$(dirname "$hull")/vmlinuz-hull" ]; then
 		micro_conf "$root/micro.conf" vm '' ''
 		micro_run 'a vm on hull'"'"'s own kernel is a microvm' "$root/micro.conf"
 		has 6 '^list= *$'
+		# The default, (kernel bundled), is hull's own where it is built:
+		# a microvm, not Debian's kernel; (profile full) keeps the host's.
+		printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) %s)\n' \
+			'(command "/probe" "list" "/sys/bus/pci/devices" "read" "/proc/version" "exit" "6")' \
+			> "$root/default.conf"
+		micro_run 'a vm with no kernel named boots hull'"'"'s own' "$root/default.conf"
+		has 6 '^list= *$'
+		refute_out '^read=.*debian-kernel@'
+		printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) %s %s)\n' \
+			'(tuning (vm (profile full)))' \
+			'(command "/probe" "read" "/proc/version" "exit" "6")' > "$root/defaultfull.conf"
+		micro_run '(profile full) with no kernel named boots the host'"'"'s' "$root/defaultfull.conf"
+		has 6 '^read=Linux version .*debian-kernel@'
 		micro_conf "$root/full.conf" vm '(profile full)' ''
 		micro_run '(profile full) on hull'"'"'s own kernel is q35' "$root/full.conf"
 		has 6 '^list= 0000:'
@@ -2815,7 +2836,8 @@ else
 	rm -rf "$root/a64root"
 	mkdir -p "$root/a64root/proc" "$root/a64root/dev" "$root/a64root/sys"
 	cp "$arm64_probe" "$root/a64root/probe"
-	printf '(machine (source "dir:./a64root") (backend emu) (arch arm64) (hostname "qa64") %s)\n' \
+	printf '(machine (source "dir:./a64root") (backend emu) (arch arm64) (hostname "qa64") %s %s)\n' \
+		'(tuning (vm (profile full)))' \
 		'(command "/probe" "say" "from arm64" "host" "read" "/proc/sys/kernel/arch" "exit" "5")' \
 		> "$root/a64.conf"
 	a64none=$(mktemp -d "$root/run-a64none.XXXXXX")

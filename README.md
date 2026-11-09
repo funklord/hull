@@ -115,10 +115,12 @@ them has:
   dropped, rewritten or replayed by pattern, or injected; and any link
   can be captured to a pcap file, with counts of what happened to every
   frame -- in the spec, or at runtime by `hull segment NAME`.
-- **A kernel of its own when the test needs one.** A vm loads the host's
-  modules, `mac80211_hwsim` radios or `pppoe`, or boots a kernel given
-  as a file or carried by the image, and the image's own init can run
-  as PID 1 on a vm or on chroot.
+- **A kernel of its own when the test needs one.** A vm boots hull's
+  own small kernel, with the modules network tests load --
+  `mac80211_hwsim` radios, `pppoe`, nftables -- or the host's kernel
+  with every module it has, or a kernel given as a file or carried by
+  the image, and the image's own init can run as PID 1 on a vm or on
+  chroot.
 - **The host's devices.** USB by vendor and product or by port, serial
   and parallel ports, and PCI by VFIO, each held by one machine at a
   time.
@@ -268,14 +270,16 @@ where nothing else is available, since it needs only user namespaces.
 
 ## qemu as vm — a KVM machine of its own
 
-A q35 virtual machine under KVM, booting the host's kernel, or one given
-as a file or carried by the image, with hull's agent as its init. The
-machine's directory and each volume are shares, by virtiofs where
-virtiofsd is installed and by qemu's own 9p where it is not, the agent
-mounts them, and everything hull asks of a machine -- exec, logs,
+A virtual machine under KVM, with hull's agent as its init. By default
+it boots hull's own small kernel as a microvm, in under half a second;
+`(profile full)` makes it a q35 PC on the host's kernel, with all of the
+host's modules, and a kernel can be given as a file or carried by the
+image. The machine's directory and each volume are shares, by virtiofs
+where virtiofsd is installed and by qemu's own 9p where it is not, the
+agent mounts them, and everything hull asks of a machine -- exec, logs,
 stats, a terminal, a forwarded port -- goes to the agent over vsock. By
 default the network is passt, in user space, so no bridge, tap or root
-is involved. It boots in about two seconds.
+is involved. On the host's kernel it boots in about two seconds.
 
 **When you want it:** anything the host's kernel must not be shared for,
 or cannot be: loading modules (`mac80211_hwsim` radios, `hci_vhci`,
@@ -289,8 +293,9 @@ for testing network software against real layer 2.
 - A kernel of its own: root in the guest is real root of that kernel,
   with no namespace's limits, so `modprobe`, `sysctl`, `ip netns`, `tc`,
   `nftables` and raw sockets all work as on hardware.
-- The host's modules are the guest's, shared read-only at
-  `/lib/modules/<release>`, so a workload's own `modprobe` finds them.
+- Its kernel's modules are the guest's, shared read-only at
+  `/lib/modules/<release>`, so a workload's own `modprobe` finds them:
+  hull's own set, for network tests, or every one of the host's.
 - A guest kernel that crashes ends the guest, not the host, so a test may
   break the kernel on purpose.
 - A kernel other than the host's: `(kernel "path:FILE")` boots one of

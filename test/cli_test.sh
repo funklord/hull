@@ -633,7 +633,7 @@ expect 0 '^\(machine \(source "debian:13"\) \(ports \(port \(host 8080\) \(guest
 	"$hull" plan --resolved -f "$dir/ref.conf" --backend docker
 expect 0 '\(tuning \(vm \(profile micro\) \(kernel bundled\) \(cpu_profile host\)\) \(qemu \(accel auto\)\)\) \(projection passthrough\)\)$' \
 	"$hull" plan --resolved -f "$dir/dir.conf" --backend vm
-expect 0 'vm\.kernel\.bundled: emulated: the host.s own kernel and modules' \
+expect 0 'vm\.kernel\.bundled: emulated: hull.s own kernel, as \(kernel hull\), where' \
 	"$hull" plan -f "$dir/dir.conf" --backend vm
 
 # --accept honours exactly the rejection that names it.
