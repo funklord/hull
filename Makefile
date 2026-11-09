@@ -402,6 +402,9 @@ $(GUI_BIN): $(BUILD_DIR)/gui/Makefile $(CLIENT_LIB) $(GUI_QTTY) $(GUI_SOURCES)
 # request, against a core and a chroot machine of the test's own. Needs
 # qtty: the snapshot is qtty's.
 LINK_TEST = $(BUILD_DIR)/test/gui/core_link_test
+# What test/gui_test.sh writes, for clean; it removes the rest itself.
+GUI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/gui/, a.conf b.conf c.conf d.conf e.conf edit.sh \
+                   run.out wire.out rootfs/probe run/hull/core.log run/hull/core.lock)
 LIST_TEST = $(BUILD_DIR)/test/gui/machine_list_test
 
 $(BUILD_DIR)/test/gui-list/Makefile: gui/test/machine_list_test.pro
@@ -999,7 +1002,8 @@ clean:
 	        $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(BUILD_DIR)/test/arm64/rootfs/probe \
 	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) $(FUZZ_FILES) \
-	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor $(CLIENT_LIB) $(GUI_BIN)
+	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor $(CLIENT_LIB) $(GUI_BIN) \
+	        $(GUI_TEST_FILES)
 	@# qmake's builds, each cleaned by its own Makefile, which names its files.
 	@# The guard shares the line: make runs a line holding $(MAKE) even under
 	@# -n or -t, and a dry run would otherwise clean.
