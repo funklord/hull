@@ -159,10 +159,13 @@ static inline void hull_sshd_exec_dropbear(const char *listen)
 	unlink(key);
 	convert = (pid_t)syscall(SYS_clone, SIGCHLD, NULL, NULL, NULL, 0L);
 	if (convert == 0) {
-		char *const run[] = { "dropbearconvert", "openssh", "dropbear",
-		                      "/run/hull/ssh/host_key", (char *)key, NULL };
+		/* Through the fetched loader, which dropbear's own interpreter
+		 * names and dropbearconvert's does not: it names the image's,
+		 * which an image of another C library, or of none, lacks. */
+		char *const run[] = { "ld.so", (char *)HULL_SSHD_AT(HULL_SSHD_CONVERT), "openssh",
+		                      "dropbear", "/run/hull/ssh/host_key", (char *)key, NULL };
 
-		execve(HULL_SSHD_AT(HULL_SSHD_CONVERT), run, envp);
+		execve(HULL_SSHD_AT(HULL_SSHD_LOADER), run, envp);
 		_exit(127);
 	}
 	if (convert < 0 || waitpid(convert, &status, 0) != convert || !WIFEXITED(status) ||

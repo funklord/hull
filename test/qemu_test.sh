@@ -1757,6 +1757,11 @@ else
 	{ [ "$code" != 0 ] && printf '%s\n' "$out" | grep -q 'chmod go-w'; } ||
 		fail "(ssh true) under dropbear on a / others may write was not refused" "$code: $out"
 	chmod 755 "$root/dbroot"
+	# A root with no C library at all, the static probe its /bin/sh, which
+	# runs `sh -c "probe ..."` as dropbear runs a command: the host key is
+	# converted through the fetched loader, where dropbearconvert's own
+	# interpreter names the image's, which such an image has not.
+	rm -rf "$root/dbstatic"
 	rm -f "$root/home/.ssh/dbkey" "$root/home/.ssh/dbkey.pub"
 	rm -rf "$dbrt"
 fi

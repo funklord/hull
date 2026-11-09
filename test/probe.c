@@ -1174,8 +1174,9 @@ int main(int argc, char **argv)
 	/* And as a build step's shell, `/bin/sh -c "probe STEP ..."`: the
 	 * line's words after `probe` are its steps, so that a build runs with
 	 * no shell in the tree. */
-	if (strcmp(argv[0], "/bin/sh") == 0 && argc == 3 && strcmp(argv[1], "-c") == 0 &&
-	    strncmp(argv[2], "probe ", 6u) == 0) {
+	/* dropbear runs a command as `sh -c LINE`, the shell's base name. */
+	if ((strcmp(argv[0], "/bin/sh") == 0 || strcmp(argv[0], "sh") == 0) && argc == 3 &&
+	    strcmp(argv[1], "-c") == 0 && strncmp(argv[2], "probe ", 6u) == 0) {
 		static char *words[64];
 		int          n = 1;
 
