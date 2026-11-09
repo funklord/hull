@@ -2043,7 +2043,7 @@ static void interpolate(const char *line, FILE *out)
 
 /* `file`, read to its end, as the file compose would parse: a new stream
  * the caller closes, or `file` itself if memory ran out. */
-static FILE *interpolated(FILE *file)
+static FILE *interpolated(FILE *file, char **held)
 {
 	char   line[LINE_CAP];
 	char  *text = NULL;
@@ -2064,7 +2064,8 @@ static FILE *interpolated(FILE *file)
 		free(text);
 		return tmpfile();
 	}
-	return in;   /* the text goes with the process: a few KiB, a run's only */
+	*held = text;   /* the stream's own bytes, the caller's to free after it */
+	return in;
 }
 
 /* `path`'s directory, for what the file names beside it. */
@@ -2782,6 +2783,7 @@ char *hull_import_compose(const char *path, FILE *notes)
 {
 	FILE *file = fopen(path, "r");
 	char *text;
+	char *held = NULL;
 	char  project[256];
 
 	if (file == NULL) {
@@ -2794,7 +2796,7 @@ char *hull_import_compose(const char *path, FILE *notes)
 	unrunnable = 0;
 	set_compose_dir(path);
 	{
-		FILE *read = interpolated(file);
+		FILE *read = interpolated(file, &held);
 
 		if (read != file) {
 			fclose(file);
@@ -2803,6 +2805,7 @@ char *hull_import_compose(const char *path, FILE *notes)
 	}
 	text = compose_text(file, project);
 	fclose(file);
+	free(held);
 	warnings = NULL;
 	if (text != NULL && unrunnable) {
 		fprintf(notes != NULL ? notes : stderr,
@@ -2835,6 +2838,7 @@ int hull_import(const char *path)
 {
 	const char *base = strrchr(path, '/');
 	FILE       *file;
+	char       *held = NULL;
 	int         compose;
 	int         status;
 
@@ -2854,7 +2858,7 @@ int hull_import(const char *path)
 
 		project_of(path, project, sizeof project);
 		set_compose_dir(path);
-		read = interpolated(file);
+		read = interpolated(file, &held);
 		if (read != file) {
 			fclose(file);
 			file = read;
@@ -2865,5 +2869,6 @@ int hull_import(const char *path)
 		status = import_dockerfile(file);
 	}
 	fclose(file);
+	free(held);
 	return status;
 }

@@ -109,3 +109,57 @@ for tool in ('/usr/sbin/mke2fs', '/sbin/mke2fs'):
 		os.rmdir(os.path.join(tree, 'd'))
 		os.rmdir(tree)
 		break
+
+# A compose file and a Dockerfile, each reaching most of what
+# import_fuzz.c's reader knows: services with every key it maps, flow and
+# block lists, anchors' absence, interpolation with defaults, and the
+# Dockerfile's ARG, multi-stage FROM, ENV forms and exec and shell forms.
+imp = os.path.join(out, 'import')
+os.makedirs(imp, exist_ok=True)
+COMPOSE = """services:
+  web:
+    image: "nginx:${TAG:-alpine}"
+    command: ["nginx", "-g", "daemon off;"]
+    environment:
+      - A=1
+      - B
+    ports:
+      - "8080:80/tcp"
+    volumes: ["./data:/data:ro"]
+    depends_on: [db]
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 5s
+    profiles: [front]
+  db:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        V: 2
+      target: run
+    working_dir: /srv
+    restart: on-failure
+    deploy:
+      resources:
+        limits: {memory: 256M, cpus: '0.5'}
+secrets:
+  key:
+    file: ./key
+"""
+DOCKERFILE = """ARG BASE=debian:13
+FROM $BASE AS build
+ENV A=1 B="two words"
+WORKDIR /src
+COPY --chown=1:1 . /src
+RUN make && \\
+    make install
+FROM build AS run
+USER 101
+EXPOSE 80/tcp
+ENTRYPOINT ["/bin/app"]
+CMD --serve
+"""
+for name, text in (('compose', COMPOSE), ('dockerfile', DOCKERFILE)):
+	with open(os.path.join(imp, name), 'w') as f:
+		f.write(text)

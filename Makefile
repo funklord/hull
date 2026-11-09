@@ -838,7 +838,11 @@ $(FUZZ_DIR)/media_fuzz: test/fuzz/media_fuzz.c engine/media.c engine/media.h eng
 	@mkdir -p $(dir $@)
 	$(FUZZ_CC) $(FUZZ_FLAGS) -Iengine -o $@ $(filter %.c,$^)
 
-check-fuzz: $(FUZZ_DIR)/json_fuzz $(FUZZ_DIR)/unpack_fuzz $(FUZZ_DIR)/media_fuzz
+$(FUZZ_DIR)/import_fuzz: test/fuzz/import_fuzz.c cli/import.c cli/import.h engine/user.c engine/user.h
+	@mkdir -p $(dir $@)
+	$(FUZZ_CC) $(FUZZ_FLAGS) -Icli -Iengine -o $@ $(filter %.c,$^)
+
+check-fuzz: $(FUZZ_DIR)/json_fuzz $(FUZZ_DIR)/unpack_fuzz $(FUZZ_DIR)/media_fuzz $(FUZZ_DIR)/import_fuzz
 	$(PYTHON) test/fuzz/seeds.py '$(FUZZ_DIR)/corpus'
 	mkdir -p '$(FUZZ_DIR)/work' '$(FUZZ_DIR)/found'
 	cd '$(FUZZ_DIR)/found' && ../json_fuzz -max_total_time=$(FUZZ_TIME) -max_len=4096 \
@@ -847,6 +851,8 @@ check-fuzz: $(FUZZ_DIR)/json_fuzz $(FUZZ_DIR)/unpack_fuzz $(FUZZ_DIR)/media_fuzz
 		-max_total_time=$(FUZZ_TIME) -max_len=8192 -timeout=10 ../corpus/tar
 	cd '$(FUZZ_DIR)/found' && FUZZ_DIR='$(abspath $(FUZZ_DIR))' ../media_fuzz \
 		-max_total_time=$(FUZZ_TIME) -max_len=65536 -timeout=10 ../corpus/disc
+	cd '$(FUZZ_DIR)/found' && FUZZ_DIR='$(abspath $(FUZZ_DIR))' ../import_fuzz \
+		-max_total_time=$(FUZZ_TIME) -max_len=8192 -timeout=10 ../corpus/import
 
 # Root mode's native grants with hull-root really setuid root, inside a vm
 # whose guest root is the only root it needs (project.md section 7). Not
