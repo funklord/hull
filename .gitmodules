@@ -1,3 +1,6 @@
 [submodule "vendor/situ"]
 	path = vendor/situ
 	url = https://github.com/funklord/situ.git
+[submodule "vendor/qtty"]
+	path = vendor/qtty
+	url = https://github.com/funklord/qtty.git

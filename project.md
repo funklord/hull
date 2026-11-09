@@ -1572,6 +1572,39 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 
 - **Measured** in `test/hostdev_test.c`, over a sysfs tree of its own: no device, two of one part, one by its serial, a serial no device has, ids in upper case, one by its port, a port and ids that are not its, an empty port, no sysfs, and a root hub and an interface carrying a device's ids not taken for one; a node only root may write refused, naming its owner, group and mode; each interface's drivers by `modules.alias`, each once, and a port that is a prefix of another's given none; a bulk endpoint, an isochronous one, and another port's; a node, a link to one, a file, a path not there, and a node the user may not write. In `test/spec_test.c`: the forms above taken, and each half of a pair alone, a serial without ids, an empty device, ids not four hex digits, ports malformed three ways, a relative path, an empty kind and an unknown one refused with their paths. In `test/cli_test.sh`, on chroot: `/dev/net/tun` bound in, read inside giving EBADFD, which a plain file cannot, and its `kind` its own `10:200`; `/dev/char/10:200`, a link under `/dev`, made a link inside and read through; a tree with no `/dev` refused; a file, a missing path, `/dev/ttyS0` the user may not write, no USB device of the ids, and a real USB device of the host's this user may not write each refused with its reason; the plan's kinds on chroot, vm and emu, the vm's USB and the emu's parallel port warned of by a plain `hull plan`, chroot's not, and docker's refusal. In `test/qemu_test.sh`: a host pty as a vm's serial port, the guest's `ttyS0` line reaching the far end held by the test; and a USB device not plugged in refused before qemu starts. **Sabotage,** in a scratch copy: the bind into `/dev` removed failed four named cases, the refusal of a tree with no `/dev` removed one, `devices.usb` declared native one, and isochronous endpoints never seen one. **Not measured here,** for want of a device this user may write: a USB device given to either engine, its drivers loaded in a guest, and the per-device notice reaching a workload; a parallel port; and the agent's links in the guest, whose only port here is a pty, skipped as under the guest's devpts.
 
+
+### 4.14 The GUI and TUI: `hull-gui`, since 2026-11-09
+
+**Started 2026-11-09, at the holder's asking: "a Qt/Qtty GUI/TUI like the other projects in src", VirtualBox's manager as the model.** One Qt Widgets program, `gui/`, built by `make gui` into `build/hull-gui` beside `hull`. With qtty (vendored at `vendor/qtty`, as netcfgd vendors it) the same widgets draw on a terminal: `hull-gui --tui`, a name ending `-tui`, or no display on a terminal. Without qtty it is the window alone, and says so when asked for a terminal.
+
+| Part | What it does |
+|---|---|
+| Machine list | the machines the user added (a `hull.conf` each, one row per machine of a `(machines …)` file) and every machine the core holds, whoever started it; state and backend |
+| Details tab | id, file, state, engine, class, address, arch, root mode; `hull plan --resolved` and `--explain` of an added machine |
+| Output tab | a run started here, as `hull run` said it; else the core's log of the machine, followed |
+| Usage tab | `stats` every 2 s: CPU seconds and per cent of one CPU, io, Pss |
+| Actions | Add, Remove from List, Start, Stop (the machine's grace), Power Off (KILL), Pause, Resume, Refresh |
+
+**Decisions, and why:**
+- **The window speaks the core's protocol itself** (`gui/src/core_link.cpp`), with the CLI's C: `core/wire.c`, the situ validator and the reader, linked as `build/libhull_client.a`. One request per connection, answered through the event loop, so a slow `stop` never blocks the window. Nothing reads the protocol a second way.
+- **A machine is started by `hull run`, as the window's child.** Planning is the frontend's (§4.7): the spec read, the matrix applied, secrets resolved as the user. A planner inside the GUI would be a second reading of `hull.conf`. So the run belongs to that child, and the machine lives as long as the child, unless its spec says `(on_disconnect keep)`. Closing the window with runs open asks first; the runs are then killed and each machine does what its `on_disconnect` says.
+- **It never starts a core and never replaces one.** Its hello names no build, so an idle core of another build stays for the CLI that wants it. No core means no machine runs, and the window says `core: not running`.
+- **The list it saves is the user's choices only**: the added files, in `QSettings` (`~/.config/hull/hull-gui.conf`). A machine the core holds is never saved.
+- **An added machine's id follows the CLI's rule** (`machine_id()`: its name, else its hostname, else its directory's name), read from `hull plan --resolved`. A running machine is matched to its row by that id.
+- **On a terminal, Add asks for a path rather than opening a file dialog.**
+
+**Measured** by `test/gui_test.sh` (`make check-gui`, which needs qtty), on a core and a chroot machine of its own:
+- the window drawn as text by qtty's snapshot, with no core, then with the list it saved, then beside a machine the CLI started;
+- `gui/test/core_link_test.cpp`, every request the window makes against a running machine: list, stats, logs, pause and resume (each seen in the list), kill with a signal the core refuses, stop, and no core.
+- 9 cases. Two sabotages each failed a named case: the state read under another key, and the core's own machines dropped from the list.
+- A machine stopped stays listed as `exited` until its run's frontend has gone, which the core does on purpose. The window offers nothing to do to it.
+
+**Not yet:**
+- a console: a vm's or pc's screen (`(display vnc)`) or a terminal attached to the machine (`hull attach`, `exec -t`);
+- `--accept` tokens and secrets that prompt. A run started here has no terminal, so its refusal shows in Output;
+- `-H` remote cores, pools and leases, segments, the store's images;
+- creating or editing a `hull.conf`.
+
 ## 5. Engines
 
 ### 5.0 Engines are plugins — the backend set is open

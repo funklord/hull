@@ -337,7 +337,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -348,12 +348,83 @@ nss: $(NSS_LIB)
 
 root: $(ROOT_BIN)
 
+# --- the GUI ------------------------------------------------------------------
+
+# hull-gui (project.md section 2): the machine manager, a frontend of the
+# core's protocol beside hull, which it runs machines with. Its own target,
+# not all's: Qt is not what hull needs to build. It links what the CLI
+# speaks the protocol with, as an archive, and qmake builds the Qt half,
+# which moc does not fit a pattern rule for, out of the tree.
+#
+# qtty draws the same window on a terminal (`hull-gui --tui`). Optional:
+# vendor/qtty is fetched for `make gui` where it was never checked out, and
+# without it hull-gui is the window alone and says so when asked for a
+# terminal. Built out of the tree too, so the submodule's checkout stays
+# as it was cloned.
+QMAKE      ?= qmake6
+CLIENT_LIB  = $(BUILD_DIR)/libhull_client.a
+GUI_BIN     = $(BUILD_DIR)/hull-gui
+GUI_SOURCES = $(wildcard gui/src/*.cpp gui/src/*.h)
+QTTY_DIR    = vendor/qtty
+QTTY_LIB    = $(BUILD_DIR)/qtty/lib/libqtty.a
+
+ifneq ($(filter gui check-gui,$(MAKECMDGOALS)),)
+ifeq ($(wildcard $(QTTY_DIR)/qtty.pri),)
+QTTY_FETCH := $(shell $(call SUBMODULE_FETCH_SH,$(QTTY_DIR),qtty))
+endif
+endif
+GUI_QTTY = $(if $(wildcard $(QTTY_DIR)/qtty.pri),$(QTTY_LIB))
+
+gui: $(HULL) $(GUI_BIN)
+
+$(CLIENT_LIB): $(WIRE_OBJS) $(SEXPR_OBJS)
+	@rm -f '$@'
+	$(AR) rcs '$@' $^
+
+$(BUILD_DIR)/qtty/Makefile: $(QTTY_DIR)/src/src.pro $(QTTY_DIR)/qtty.pri
+	@mkdir -p '$(@D)'
+	cd '$(@D)' && $(QMAKE) '$(CURDIR)/$(QTTY_DIR)/src/src.pro' \
+	    QTTY_LIB_DIR='$(abspath $(BUILD_DIR))/qtty/lib'
+
+$(QTTY_LIB): $(BUILD_DIR)/qtty/Makefile FORCE
+	$(MAKE) -C '$(BUILD_DIR)/qtty'
+
+# Written again only when the project, or whether qtty is there, changes.
+$(BUILD_DIR)/gui/Makefile: gui/gui.pro $(GUI_QTTY)
+	@mkdir -p '$(@D)'
+	cd '$(@D)' && $(QMAKE) '$(CURDIR)/gui/gui.pro' HULL_BUILD='$(abspath $(BUILD_DIR))' \
+	    $(if $(GUI_QTTY),QTTY_LIB_DIR='$(abspath $(BUILD_DIR))/qtty/lib')
+
+$(GUI_BIN): $(BUILD_DIR)/gui/Makefile $(CLIENT_LIB) $(GUI_QTTY) $(GUI_SOURCES)
+	$(MAKE) -C '$(BUILD_DIR)/gui'
+
+# The window drawn as text by qtty, and core_link driven through each
+# request, against a core and a chroot machine of the test's own. Needs
+# qtty: the snapshot is qtty's.
+LINK_TEST = $(BUILD_DIR)/test/gui/core_link_test
+
+$(BUILD_DIR)/test/gui-build/Makefile: gui/test/core_link_test.pro
+	@mkdir -p '$(@D)'
+	cd '$(@D)' && $(QMAKE) '$(CURDIR)/gui/test/core_link_test.pro' \
+	    HULL_BUILD='$(abspath $(BUILD_DIR))'
+
+$(LINK_TEST): $(BUILD_DIR)/test/gui-build/Makefile $(CLIENT_LIB) gui/test/core_link_test.cpp \
+              gui/src/core_link.cpp gui/src/core_link.h
+	$(MAKE) -C '$(BUILD_DIR)/test/gui-build'
+
+check-gui: $(HULL) $(GUI_BIN) $(LINK_TEST) $(PROBE)
+	@if [ -z '$(GUI_QTTY)' ]; then echo 'check-gui: needs vendor/qtty, for the snapshot' >&2; \
+	    exit 1; fi
+	BUILD_DIR='$(BUILD_DIR)' sh test/gui_test.sh '$(abspath $(HULL))' '$(abspath $(GUI_BIN))' \
+	    '$(abspath $(LINK_TEST))' '$(abspath $(PROBE))'
+
 help:
 	@echo 'Targets:'
 	@echo '  all       build the libraries, build/hull and its agent (the default)'
 	@echo '  limine    build Limine $(LIMINE_VERSION) from source, for BIOS-bootable exports'
 	@echo '  kernel    build the vm kernel of hull'"'"'s own, vmlinuz-hull, from Linux $(KERNEL_VERSION)'
 	@echo '  nss       build the NSS module, libnss_hull.so.2, for *.hull names'
+	@echo '  gui       build hull-gui, the machine manager, and with vendor/qtty its --tui'
 	@echo '  root      build root mode'"'"'s helper, hull-root'
 	@echo '  check     style, the situ contracts, then the tests'
 	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
@@ -368,6 +439,7 @@ help:
 	@echo '  check-root    root mode'"'"'s native grants, hull-root setuid, inside a vm'
 	@echo '  check-sanitize  the unit tests, store and pull under ASan and UBSan'
 	@echo '  check-fuzz    libFuzzer over the JSON and layer readers, FUZZ_TIME s each'
+	@echo '  check-gui     hull-gui as text, and its requests, against a core of its own'
 	@echo '  check-flip    one hull.conf, rsync'"'"'d, run on chroot, vm, emu and docker'
 	@echo '  test      build and run the reader tests, the vectors, then the gate'"'"'s'
 	@echo '  vectors   the described schemas against bytes they must accept and refuse'
@@ -917,7 +989,12 @@ clean:
 	        $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(BUILD_DIR)/test/arm64/rootfs/probe \
 	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) $(FUZZ_FILES) \
-	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor
+	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor $(CLIENT_LIB) $(GUI_BIN)
+	@# qmake's builds, each cleaned by its own Makefile, which names its files.
+	@if [ -f '$(BUILD_DIR)/gui/Makefile' ]; then $(MAKE) -s -C '$(BUILD_DIR)/gui' distclean; fi
+	@if [ -f '$(BUILD_DIR)/test/gui-build/Makefile' ]; then \
+	    $(MAKE) -s -C '$(BUILD_DIR)/test/gui-build' distclean; fi
+	@if [ -f '$(BUILD_DIR)/qtty/Makefile' ]; then $(MAKE) -s -C '$(BUILD_DIR)/qtty' distclean; fi
 	@# check-sanitize's own build, cleaned as this one is, by name; one level
 	@# down only, there being no sanitize/sanitize to go on to.
 	@if [ -d '$(BUILD_DIR)/sanitize' ]; then $(MAKE) -s BUILD_DIR='$(BUILD_DIR)/sanitize' clean; fi
