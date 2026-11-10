@@ -1111,48 +1111,123 @@ void main_window::open_screen()
 /*
  * The Network tab: hull's own wires (section 8, Appendix D) as the
  * selected machine's plan names them, each port's counters as `hull
- * segment NAME` reads them, and the machine's link impaired, cleared or
- * taken down as `hull segment NAME impair` does it. The CLI is asked,
- * as the counters and the impairments are its words, netem's names
- * among them, and parsing them a second time here would drift.
+ * segment NAME` reads them, and what `hull segment NAME` does to a link
+ * or the wire: impair a way, tamper with the frames crossing it, inject
+ * frames of the switch's own, or capture a way to a pcap file. The CLI
+ * is asked, as the counters, netem's names and the faults are its words,
+ * and parsing them a second time here would drift.
  */
+
+/* The counters shown, as `hull segment NAME` names them: what a link
+ * carries, then what an impairment, a fault and an injector did. */
+static const char *const counted[] = { "frames", "bytes", "passed", "lost",
+	                                   "matched", "tampered", "replayed", "injected" };
+
+/* What each verb's words are, shown in the field until it is typed in. */
+static QString words_hint(const QString &verb)
+{
+	if (verb == QLatin1String("tamper"))
+		return QStringLiteral("match=0:0800 drop=1 | rewrite=1 set=4:ff | flip=0.1 | "
+		                      "replay=1 copies=3 every=100");
+	if (verb == QLatin1String("inject"))
+		return QStringLiteral("frame=HEX | size=60 [count=N] [every=MS] [seed=N]");
+	if (verb == QLatin1String("capture"))
+		return QStringLiteral("FILE.pcap [frames=N]");
+	return QStringLiteral("loss=10% delay=50ms rate=1mbit");
+}
+
 QWidget *main_window::build_network()
 {
 	network = new QWidget;
 	ports = new QTreeWidget;
-	ports->setColumnCount(7);
-	ports->setHeaderLabels({ QStringLiteral("Segment"), QStringLiteral("Machine"),
-	                         QStringLiteral("Way"), QStringLiteral("Frames"),
-	                         QStringLiteral("Bytes"), QStringLiteral("Passed"),
-	                         QStringLiteral("Lost") });
+	QStringList headers = { QStringLiteral("Segment"), QStringLiteral("Machine"),
+		                    QStringLiteral("Way") };
+
+	for (const char *count : counted) {
+		QString header = QString::fromLatin1(count);
+
+		header[0] = header[0].toUpper();
+		headers << header;
+	}
+	ports->setHeaderLabels(headers);
 	ports->setRootIsDecorated(false);
 	network_note = new QLabel;
 	network_note->setWordWrap(true);
-	impair_way = new QComboBox;
-	impair_way->addItems({ QStringLiteral("both"), QStringLiteral("in"), QStringLiteral("out") });
-	impair_words = new QLineEdit;
-	impair_words->setPlaceholderText(QStringLiteral("loss=10% delay=50ms rate=1mbit"));
-	impair_words->setToolTip(QStringLiteral("netem's names, KEY=VALUE: loss, delay, jitter, "
-	                                        "rate, reorder, duplicate, corrupt, limit, mtu, ..."));
-	QPushButton *apply = new QPushButton(QStringLiteral("&Impair"));
+	segment_verb = new QComboBox;
+	segment_verb->addItems({ QStringLiteral("impair"), QStringLiteral("tamper"),
+	                         QStringLiteral("inject"), QStringLiteral("capture") });
+	segment_verb->setToolTip(QStringLiteral("impair: netem's faults on a way; tamper: frames "
+	                                        "matched and dropped, rewritten, flipped or "
+	                                        "replayed; inject: the switch's own frames; "
+	                                        "capture: a way's frames to a pcap file"));
+	segment_target = new QComboBox;
+	segment_target->addItem(QStringLiteral("this machine"), QString());
+	segment_target->addItem(QStringLiteral("all ports"), QStringLiteral("all"));
+	segment_way = new QComboBox;
+	segment_way->addItems({ QStringLiteral("both"), QStringLiteral("in"), QStringLiteral("out") });
+	segment_words = new QLineEdit;
+	segment_words->setPlaceholderText(words_hint(QStringLiteral("impair")));
+	connect(segment_verb, &QComboBox::currentTextChanged, this, [this](const QString &verb) {
+		/* One verb's words are never another's. */
+		segment_words->clear();
+		segment_words->setPlaceholderText(words_hint(verb));
+		/* An injector has no way, and a capture is one way. */
+		segment_way->setEnabled(verb != QLatin1String("inject"));
+		if (verb == QLatin1String("capture") && segment_way->currentText() == QLatin1String("both"))
+			segment_way->setCurrentText(QStringLiteral("out"));
+	});
+	QPushButton *apply = new QPushButton(QStringLiteral("&Apply"));
 	QPushButton *clear = new QPushButton(QStringLiteral("C&lear"));
 	QPushButton *down = new QPushButton(QStringLiteral("Link Do&wn"));
 
+	apply->setToolTip(QStringLiteral("hull segment NAME VERB TARGET [WAY] WORDS"));
+	clear->setToolTip(QStringLiteral("The verb undone: an impairment or fault cleared, the "
+	                                 "target's injectors removed, the capture stopped"));
 	connect(apply, &QPushButton::clicked, this, [this]() {
-		impair(impair_words->text().split(QLatin1Char(' '), Qt::SkipEmptyParts));
+		segment_act(segment_verb->currentText(), QProcess::splitCommand(segment_words->text()));
 	});
-	connect(clear, &QPushButton::clicked, this, [this]() { impair({}); });
-	connect(down, &QPushButton::clicked, this, [this]() { impair({ QStringLiteral("down") }); });
+	connect(clear, &QPushButton::clicked, this, [this]() {
+		const QString verb = segment_verb->currentText();
 
+		segment_act(verb, verb == QLatin1String("inject")    ? QStringList{ QStringLiteral("count=0") }
+		                  : verb == QLatin1String("capture") ? QStringList{ QStringLiteral("stop") }
+		                                                     : QStringList());
+	});
+	connect(down, &QPushButton::clicked, this,
+	        [this]() { segment_act(QStringLiteral("impair"), { QStringLiteral("down") }); });
+
+	/* Labels with buddies, so each control has an Alt+letter on a
+	 * terminal as well, none of them the menus', the tabs' or a
+	 * button's. Two rows, so the tab is no wider than an 80-column
+	 * terminal's window allows. */
+	QHBoxLayout *choices = new QHBoxLayout;
 	QHBoxLayout *controls = new QHBoxLayout;
-	controls->addWidget(impair_way);
-	controls->addWidget(impair_words, 1);
+	const struct {
+		const char  *label;
+		QWidget     *buddy;
+		QHBoxLayout *row;
+	} fields[] = {
+		{ "Ac&tion:", segment_verb, choices },
+		{ "&For:", segment_target, choices },
+		{ "Wa&y:", segment_way, choices },
+		{ "Wo&rds:", segment_words, controls },
+	};
+
+	for (const auto &field : fields) {
+		QLabel *label = new QLabel(QString::fromLatin1(field.label));
+
+		label->setBuddy(field.buddy);
+		field.row->addWidget(label);
+		field.row->addWidget(field.buddy, field.buddy == segment_words ? 1 : 0);
+	}
+	choices->addStretch(1);
 	controls->addWidget(apply);
 	controls->addWidget(clear);
 	controls->addWidget(down);
 	QVBoxLayout *layout = new QVBoxLayout(network);
 	layout->addWidget(ports, 1);
 	layout->addWidget(network_note);
+	layout->addLayout(choices);
 	layout->addLayout(controls);
 	return network;
 }
@@ -1210,10 +1285,11 @@ void main_window::ask_ports()
 				for (const QString &pair : m.captured(3).split(QLatin1Char(' '), Qt::SkipEmptyParts))
 					counts.insert(pair.section(QLatin1Char('='), 0, 0),
 					              pair.section(QLatin1Char('='), 1));
-				ports->addTopLevelItem(new QTreeWidgetItem(
-				    { segment, m.captured(1), m.captured(2), counts.value(QStringLiteral("frames")),
-				      counts.value(QStringLiteral("bytes")), counts.value(QStringLiteral("passed")),
-				      counts.value(QStringLiteral("lost")) }));
+				QStringList cells = { segment, m.captured(1), m.captured(2) };
+
+				for (const char *count : counted)
+					cells << counts.value(QString::fromLatin1(count));
+				ports->addTopLevelItem(new QTreeWidgetItem(cells));
 			}
 			for (int c = 0; c < ports->columnCount(); c++)
 				ports->resizeColumnToContents(c);
@@ -1228,10 +1304,12 @@ void main_window::ask_ports()
 	}
 }
 
-/* The selected machine's link on the segment of the selected port, else
- * its first: `hull segment NAME impair ID WAY [WORD...]`, no word clearing
- * it. What the CLI says is the status line's. */
-void main_window::impair(const QStringList &words)
+/* `hull segment NAME VERB ...` on the segment of the selected port, else
+ * the selected machine's first, aimed at that machine or at every port:
+ * impair and tamper with a way (both being each in turn, as the CLI does
+ * it), inject with none, capture with one, and `capture stop` with no
+ * target. What the CLI says is the status line's. */
+void main_window::segment_act(const QString &verb, const QStringList &words)
 {
 	const int i = current();
 
@@ -1246,22 +1324,45 @@ void main_window::impair(const QStringList &words)
 		say(QStringLiteral("%1 is on no segment known here").arg(rows[i].id));
 		return;
 	}
-	QProcess     *process = new QProcess(this);
 	const QString id = rows[i].id;
+	const QString target =
+	    segment_target->currentData().toString().isEmpty() ? id : QStringLiteral("all");
+	const bool    stopping = verb == QLatin1String("capture") && words == QStringList{ QStringLiteral("stop") };
+	QStringList   arguments = { QStringLiteral("segment"), segment, verb };
+
+	if (verb == QLatin1String("capture") && !stopping) {
+		if (segment_way->currentText() == QLatin1String("both")) {
+			say(QStringLiteral("a capture is one way: in or out"));
+			return;
+		}
+		if (words.isEmpty()) {
+			say(QStringLiteral("a capture names its file: FILE.pcap [frames=N]"));
+			return;
+		}
+	}
+	if (verb == QLatin1String("inject") && words.isEmpty()) {
+		say(QStringLiteral("an injection is frame=HEX or size=N"));
+		return;
+	}
+	if (!stopping)
+		arguments << target;
+	if (verb != QLatin1String("inject") && !stopping)
+		arguments << segment_way->currentText();
+	arguments << words;
+
+	QProcess *process = new QProcess(this);
 
 	process->setProcessChannelMode(QProcess::MergedChannels);
 	process->setStandardInputFile(QProcess::nullDevice());
-	connect(process, &QProcess::finished, this, [this, process, id, segment](int code) {
+	connect(process, &QProcess::finished, this, [this, process, verb, target, segment](int code) {
 		const QString said = QString::fromUtf8(process->readAll()).trimmed();
 
 		process->deleteLater();
-		say(code == 0 ? QStringLiteral("%1's link on %2 set").arg(id, segment)
+		say(code == 0 ? QStringLiteral("%1 on %2: %3 done").arg(target, segment, verb)
 		              : said.isEmpty() ? QStringLiteral("hull segment exited %1").arg(code) : said);
 		ask_ports();
 	});
-	process->start(hull, QStringList{ QStringLiteral("segment"), segment, QStringLiteral("impair"),
-	                                  id, impair_way->currentText() } +
-	                         words);
+	process->start(hull, arguments);
 }
 
 /*

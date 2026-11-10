@@ -9,8 +9,8 @@
 # is under $BUILD_DIR/test/gui: the machines' rootfs, the core's runtime
 # directory, and the configuration directory the GUI saves its list in,
 # so that the account's own list is never read or written. Every command
-# runs under `timeout`; the one machine run in the background is a
-# 60-second probe, stopped by the test and killed at the exit by its pid.
+# runs under `timeout`; the one run in the background is two 150-second
+# probes, stopped by the test and killed at the exit by its pid.
 
 set -u
 
@@ -44,8 +44,8 @@ printf '%s\n' '(machine (hostname "gui-b") (source "dir:./rootfs") (command "/pr
 # Refused on a vm unless --accept: one machine, though plan names it on
 # the refused field's line as well as on its own.
 printf '%s\n' '(machines' \
-	'  (gui-da (source "dir:./rootfs") (segments "gui-wire") (command "/probe" "ticks" "600"))' \
-	'  (gui-db (source "dir:./rootfs") (segments "gui-wire") (command "/probe" "ticks" "600")))' \
+	'  (gui-da (source "dir:./rootfs") (segments "gui-wire") (command "/probe" "ticks" "1500"))' \
+	'  (gui-db (source "dir:./rootfs") (segments "gui-wire") (command "/probe" "ticks" "1500")))' \
 	> "$dir/d.conf"
 printf '%s\n' '(machine (hostname "gui-c") (backend vm) (source "dir:./rootfs") (fidelity inotify))' \
 	> "$dir/c.conf"
@@ -226,7 +226,7 @@ fi
 # Two machines on a wire of hull's: the Network tab lists the wire's
 # ports, and Link Down sets the selected machine's link, as hull segment
 # does.
-(cd "$dir" && exec timeout 120 "$hull" run -f d.conf > "$dir/wire.out" 2>&1) &
+(cd "$dir" && exec timeout 200 "$hull" run -f d.conf > "$dir/wire.out" 2>&1) &
 run_pid=$!
 tries=0
 until [ "$(timeout 10 "$hull" ps 2>/dev/null | grep -c 'gui-d. .*running')" = 2 ]; do
@@ -239,12 +239,31 @@ done
 # The row is chosen by typing its name, the list's own search.
 keys "$dir" "b'gui-db'" "b'\\x1bn'" "b'\\x1bw'" -- d.conf
 has "$out" 'gui-wire gui-da out' "the Network tab lists the wire's ports"
-has "$out" "gui-db's link on gui-wire set" "Link Down sets the link"
+has "$out" "gui-db on gui-wire: impair done" "Link Down sets the link"
+# Capture gui-db's way in, inject three frames of the switch's own toward
+# it, and stop the capture: the file holds them as pcap, and the port
+# counts them injected. Each verb is chosen by typing its name's start
+# into the Action box, "inj" as "i" finds impair first.
+rm -f "${dir:?}/wire.pcap"
+keys "$dir" "b'gui-db'" "b'\x1bn'" "b'\x1bt'" "b'c'" "b'\x1by'" "b'i'" \
+	"b'\x1br'" "b'wire.pcap'" "b'\x1ba'" \
+	"b'\x1bt'" "b'inj'" "b'\x1br'" "b'size=60 count=3'" "b'\x1ba'" \
+	"b'\x1bt'" "b'c'" "b'\x1bl'" -- d.conf
+has "$out" "gui-db on gui-wire: capture done" "Apply starts a capture"
+cases=$((cases + 1))
+magic=$(od -An -tx1 -N4 "$dir/wire.pcap" 2>/dev/null | tr -d ' ')
+frames=$(($(wc -c < "$dir/wire.pcap" 2>/dev/null || echo 0)))
+if [ "$magic" != "4d3cb2a1" ] || [ "$frames" -lt $((24 + 3 * (16 + 60))) ]; then
+	fail "the capture holds the three injected frames" "magic $magic, $frames bytes"
+fi
+out=$(timeout 10 "$hull" segment gui-wire 2>&1)
+has "$out" 'gui-db +in .*injected=3' "inject puts three frames toward gui-db"
 timeout 30 "$hull" stop gui-da > /dev/null 2>&1
 timeout 30 "$hull" stop gui-db > /dev/null 2>&1
 wait "$run_pid" 2>/dev/null
 run_pid=
 
-rm -rf "${dir:?}/config" "${dir:?}/new" "${dir:?}/newm" "${dir:?}/data" "${dir:?}/screen.txt"
+rm -rf "${dir:?}/config" "${dir:?}/new" "${dir:?}/newm" "${dir:?}/data" "${dir:?}/screen.txt" \
+	"${dir:?}/wire.pcap"
 printf 'gui_test: %d cases, %d failed\n' "$((cases))" "$failures"
 [ "$failures" = 0 ]
