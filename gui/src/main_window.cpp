@@ -742,15 +742,19 @@ void main_window::ask_add()
 		bool given = false;
 
 		file = QInputDialog::getText(this, QStringLiteral("Add Machine"),
-		                             QStringLiteral("A machine's hull.conf:"), QLineEdit::Normal,
+		                             QStringLiteral("A machine's hull.conf, a compose file or "
+		                                            "a Vagrantfile:"),
+		                             QLineEdit::Normal,
 		                             QDir::currentPath() + QStringLiteral("/hull.conf"), &given);
 		if (!given)
 			return;
 	} else {
 		file = QFileDialog::getOpenFileName(this, QStringLiteral("Add Machine"),
 		                                    QDir::currentPath(),
-		                                    QStringLiteral("hull specs (hull.conf *.conf);;All "
-		                                                   "files (*)"));
+		                                    QStringLiteral("Machines (hull.conf *.conf compose.yaml "
+		                                                   "compose.yml docker-compose.yaml "
+		                                                   "docker-compose.yml *.yaml *.yml "
+		                                                   "Vagrantfile);;All files (*)"));
 	}
 	if (file.isEmpty())
 		return;

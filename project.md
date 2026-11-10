@@ -1579,7 +1579,7 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 
 | Part | What it does |
 |---|---|
-| Machine list | the machines the user added (a `hull.conf` each, one row per machine of a `(machines …)` file) and every machine the core holds, whoever started it; state and backend |
+| Machine list | the machines the user added (a `hull.conf` each, one row per machine of a `(machines …)` file, a compose file or a Vagrantfile, which the CLI reads as one) and every machine the core holds, whoever started it; state and backend |
 | Details tab | id, file, state, engine, class, address, arch, root mode; `hull plan --resolved` and `--explain` of an added machine |
 | Output tab | a run started here, as `hull run` said it; else the core's log of the machine, followed |
 | Usage tab | `stats` every 2 s: CPU seconds and per cent of one CPU, io, Pss |
@@ -1620,7 +1620,7 @@ Its capability declaration is honest about a board: no overlay unless deploy can
 - Change Medium, where qemu-system-i386 is here: a pc machine booted from a floppy of one spinning sector, F9 with the drive offered and a second image's name, answered as holding it, then F9 with no image, answered as taken out.
 - Edit, with an editor that is a script renaming the machine: the file changed, and the new name listed.
 - Pools: a lease reserved and released by its buttons, seen in `hull lease ls` each time; a board marked broken listed so under the pool chosen (`hull board ls POOL`), and Fix putting it back, `hull board ls` then saying `up`. Fix clears a mark of the user's own data directory; a broker's marks are under its DIR, as `hull board fix` has it. A button's Alt+letter clicks it, so a key run sends no Enter after it; one that did reserved twice.
-- 38 cases. Fifteen sabotages each failed a named case: the state read under another key, the core's own machines dropped from the list, a refused machine's name counted per line, a backslash written unescaped, no token offered, every address taken to show a screen, no segment read from a plan, no plan after Edit, Reserve naming a pool there is none of, a capture always of the way out, every verb aimed at the other machine, Fix naming a board by its address, Commit naming a machine there is none of, Change Medium always naming the cdrom, and Push with its ref and image swapped.
+- 40 cases. Fifteen sabotages each failed a named case: the state read under another key, the core's own machines dropped from the list, a refused machine's name counted per line, a backslash written unescaped, no token offered, every address taken to show a screen, no segment read from a plan, no plan after Edit, Reserve naming a pool there is none of, a capture always of the way out, every verb aimed at the other machine, Fix naming a board by its address, Commit naming a machine there is none of, Change Medium always naming the cdrom, and Push with its ref and image swapped.
 - New tried by hand in a pty on 2026-11-09: Ctrl+N, a name and a command typed, Enter, and the machine was listed as `chroot (ns)` and saved.
 - A machine stopped stays listed as `exited` until its run's frontend has gone, which the core does on purpose. The window offers nothing to do to it.
 

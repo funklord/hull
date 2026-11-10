@@ -122,6 +122,17 @@ out=$(snapshot c.conf)
 has "$out" 'gui-c +stopped +qemu \(vm\)' "a refused machine added"
 refute "$out" '^.{0,3}machine +stopped' "a refused machine added once"
 
+# A compose file added is a row per service, the CLI reading it as a
+# (machines ...) form, as hull up does; saved in a list of its own, so
+# the rows the cases below count are not changed.
+mkdir -p "$dir/compose"
+printf '%s\n' 'services:' '  gui-web:' '    image: dir:../rootfs' '    command: ["/probe"]' \
+	'  gui-db:' '    image: dir:../rootfs' '    command: ["/probe"]' > "$dir/compose/compose.yaml"
+out=$(XDG_CONFIG_HOME=$dir/compose/config snapshot compose/compose.yaml)
+has "$out" 'gui-web +stopped +chroot' "a compose file's first service added"
+has "$out" 'gui-db +stopped +chroot' "and its second"
+rm -rf "${dir:?}/compose"
+
 # Start on it offers the token that would honour the refusal; Esc
 # declines, and nothing runs.
 keys "$dir" "b'\\x1b[B'" "b'\\x13'" "b'\\x1b'"
