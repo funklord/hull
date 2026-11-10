@@ -24,6 +24,7 @@
 #include <QPushButton>
 #include <QVBoxLayout>
 #include <QCloseEvent>
+#include <QDateTime>
 #include <QDesktopServices>
 #include <QUrl>
 #include <QDir>
@@ -156,7 +157,8 @@ main_window::~main_window()
  *
  * The shortcuts keep off the keys qtty gives text editing on a terminal,
  * Ctrl+A, E, K, U, W and D, and Ctrl+L, its redraw: bound here, they would
- * answer differently by where the focus is, or never. Hence F7 and F8.
+ * answer differently by where the focus is, or never. Hence F6, F7 and
+ * F8.
  */
 void main_window::build_actions()
 {
@@ -199,6 +201,11 @@ void main_window::build_actions()
 	screen_action->setToolTip(QStringLiteral("The machine's screen, where (display vnc) gives "
 	                                         "one, in a VNC client"));
 	connect(screen_action, &QAction::triggered, this, &main_window::open_screen);
+	commit_action = new QAction(QStringLiteral("Commit to Image..."), this);
+	commit_action->setShortcut(QKeySequence(QStringLiteral("F6")));
+	commit_action->setToolTip(QStringLiteral("The running machine's tree as it is now, into the "
+	                                         "store: hull commit ID REF"));
+	connect(commit_action, &QAction::triggered, this, &main_window::commit_machine);
 	refresh_action = new QAction(QStringLiteral("Refresh"), this);
 	refresh_action->setShortcut(QKeySequence(QStringLiteral("F5")));
 	connect(refresh_action, &QAction::triggered, this, [this]() {
@@ -224,6 +231,7 @@ void main_window::build_actions()
 	machine->addAction(resume_action);
 	machine->addAction(terminal_action);
 	machine->addAction(screen_action);
+	machine->addAction(commit_action);
 	machine->addSeparator();
 	machine->addAction(refresh_action);
 	machine->addSeparator();
@@ -518,6 +526,7 @@ void main_window::update_actions()
 	pause_action->setEnabled(held && state != QStringLiteral("paused"));
 	resume_action->setEnabled(held && state == QStringLiteral("paused"));
 	terminal_action->setEnabled(state == QStringLiteral("running"));
+	commit_action->setEnabled(state == QStringLiteral("running"));
 	screen_action->setEnabled(state == QStringLiteral("running") && !rows[i].held.address.isEmpty());
 }
 
@@ -990,6 +999,53 @@ static void on_this_terminal(const QStringList &command)
 	});
 }
 #endif
+
+/*
+ * The selected machine's tree, as it is while it runs, into the store as
+ * REF: `hull commit ID REF`, VirtualBox's Take Snapshot in hull's terms.
+ * The engine writes it from inside the machine, so a write in an
+ * overlay's memory or a vm's guest is in it and a volume is not
+ * (section 3). The ref offered is the machine's name and the time, so
+ * a second commit does not move the first's ref unless asked to.
+ */
+void main_window::commit_machine()
+{
+	const int i = current();
+
+	if (i < 0 || i >= rows.size() || !rows[i].is_held)
+		return;
+	const QString id = rows[i].id;
+	bool          ok = false;
+	const QString ref = QInputDialog::getText(
+	    this, QStringLiteral("Commit to Image"),
+	    QStringLiteral("%1's tree, as it is now, stored as:").arg(id), QLineEdit::Normal,
+	    id + QStringLiteral("/") +
+	        QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")),
+	    &ok)
+	                        .trimmed();
+
+	if (!ok || ref.isEmpty())
+		return;
+	QProcess *process = new QProcess(this);
+
+	process->setProcessChannelMode(QProcess::MergedChannels);
+	process->setStandardInputFile(QProcess::nullDevice());
+	say(QStringLiteral("committing %1 as %2...").arg(id, ref));
+	connect(process, &QProcess::finished, this, [this, process, id, ref](int code) {
+		const QString said = QString::fromUtf8(process->readAll()).trimmed();
+
+		process->deleteLater();
+		say(code == 0 ? QStringLiteral("%1 committed as %2").arg(id, ref)
+		              : said.isEmpty() ? QStringLiteral("hull commit exited %1").arg(code) : said);
+	});
+	connect(process, &QProcess::errorOccurred, this, [this, process](QProcess::ProcessError e) {
+		if (e != QProcess::FailedToStart)
+			return;
+		say(process->errorString());
+		process->deleteLater();
+	});
+	process->start(hull, { QStringLiteral("commit"), id, ref });
+}
 
 /*
  * A shell in the selected machine, `hull exec -t ID /bin/sh`, the CLI's,

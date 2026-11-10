@@ -71,6 +71,7 @@ private:
 	void pause_machine(bool paused);
 	void open_terminal();
 	void open_screen();
+	void commit_machine();
 	void edit_spec();
 	void remove_machine();
 	void ask_add();
@@ -110,6 +111,7 @@ private:
 	QAction        *resume_action;
 	QAction        *refresh_action;
 	QAction        *terminal_action;
+	QAction        *commit_action;
 	QAction        *screen_action;
 	QAction        *edit_action;
 	core_request   *logs = nullptr;    /* following the selected machine's */

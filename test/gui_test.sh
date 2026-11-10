@@ -269,6 +269,13 @@ if [ "$magic" != "4d3cb2a1" ] || [ "$frames" -lt $((24 + 3 * (16 + 60))) ]; then
 fi
 out=$(timeout 10 "$hull" segment gui-wire 2>&1)
 has "$out" 'gui-db +in .*injected=3' "inject puts three frames toward gui-db"
+
+# Commit to Image: F6 on gui-da and Enter on the ref offered, its name
+# and the time; the store then holds gui-da's tree under it.
+keys "$dir" "b'gui-da'" "b'\\x1b[17~'" "b'\\r'" -- d.conf
+has "$out" 'gui-da committed as gui-da/[0-9]{8}-[0-9]{6}' "F6 commits the machine"
+out=$(timeout 10 "$hull" images 2>&1)
+has "$out" 'gui-da/[0-9]{8}-[0-9]{6}' "the store holds the commit"
 timeout 30 "$hull" stop gui-da > /dev/null 2>&1
 timeout 30 "$hull" stop gui-db > /dev/null 2>&1
 wait "$run_pid" 2>/dev/null
