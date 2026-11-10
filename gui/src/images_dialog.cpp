@@ -33,6 +33,9 @@ images_dialog::images_dialog(const QString &hull_program, QWidget *parent)
 
 	pull_button = new QPushButton(QStringLiteral("&Pull..."));
 	pull_button->setToolTip(QStringLiteral("hull pull IMAGE [REF]: an image from a registry"));
+	push_button = new QPushButton(QStringLiteral("P&ush..."));
+	push_button->setToolTip(QStringLiteral("hull push REF IMAGE: the ref to a registry, under "
+	                                       "the name given"));
 	remove_button = new QPushButton(QStringLiteral("&Remove"));
 	remove_button->setToolTip(QStringLiteral("hull tag -d REF: the ref; its objects stay "
 	                                         "until nothing names them"));
@@ -48,6 +51,23 @@ images_dialog::images_dialog(const QString &hull_program, QWidget *parent)
 
 		if (given && !image.isEmpty())
 			run({ QStringLiteral("pull"), image });
+	});
+	connect(push_button, &QPushButton::clicked, this, [this]() {
+		QTreeWidgetItem *item = list->currentItem();
+		bool             given = false;
+
+		if (item == nullptr)
+			return;
+		const QString ref = item->text(0);
+		const QString image = QInputDialog::getText(
+		    this, QStringLiteral("Push"),
+		    QStringLiteral("%1 to a registry, as (ghcr.io/owner/name:tag, "
+		                   "localhost:5000/name:tag):")
+		        .arg(ref),
+		    QLineEdit::Normal, QString(), &given).trimmed();
+
+		if (given && !image.isEmpty())
+			run({ QStringLiteral("push"), ref, image });
 	});
 	connect(remove_button, &QPushButton::clicked, this, [this]() {
 		QTreeWidgetItem *item = list->currentItem();
@@ -71,6 +91,7 @@ images_dialog::images_dialog(const QString &hull_program, QWidget *parent)
 
 	QHBoxLayout *buttons = new QHBoxLayout;
 	buttons->addWidget(pull_button);
+	buttons->addWidget(push_button);
 	buttons->addWidget(remove_button);
 	buttons->addWidget(new_button);
 	buttons->addStretch(1);
@@ -134,6 +155,7 @@ void images_dialog::selected_changed()
 	const bool any = list->currentItem() != nullptr;
 
 	remove_button->setEnabled(any && busy == nullptr);
+	push_button->setEnabled(any && busy == nullptr);
 	new_button->setEnabled(any);
 	pull_button->setEnabled(busy == nullptr);
 }

@@ -1,9 +1,9 @@
 /*
  * images_dialog.h -- the store's images (project.md section 3), as
  * VirtualBox's media manager lists disks: each ref and its manifest, with
- * Pull, Remove and New Machine. The store has no protocol of its own; the
- * window runs the CLI's commands, `hull images`, `hull pull` and `hull tag
- * -d`, as the user would.
+ * Pull, Push, Remove and New Machine. The store has no protocol of its
+ * own; the window runs the CLI's commands, `hull images`, `hull pull`,
+ * `hull push` and `hull tag -d`, as the user would.
  */
 
 #ifndef HULL_GUI_IMAGES_DIALOG_H
@@ -38,6 +38,7 @@ private:
 	QTreeWidget    *list;
 	QPlainTextEdit *log;
 	QPushButton    *pull_button;
+	QPushButton    *push_button;
 	QPushButton    *remove_button;
 	QPushButton    *new_button;
 	QProcess       *busy = nullptr;

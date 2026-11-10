@@ -149,6 +149,11 @@ has "$out" 'hull tag -d gui/one' "Images ran the removal"
 out=$(timeout 10 "$hull" images 2>&1)
 refute "$out" 'gui/one' "Images removed the ref"
 has "$out" 'gui/two' "Images kept the other"
+# Push: the ref left, by Alt+U, to an address no registry answers at.
+# The command is the one formed, and its refusal is shown, not lost.
+keys "$dir" "b'\\x1bs'" "b'\\x1b[B'" "b'\\r'" "b'\\x1bu'" "b'127.0.0.1:1/gui/two:1'" "b'\\r'"
+has "$out" 'hull push gui/two 127\.0\.0\.1:1/gui/two:1' "Push ran hull push REF IMAGE"
+has "$out" 'exited [1-9]' "Push showed the refusal"
 
 # Edit: $EDITOR on the window's terminal, the file planned again after.
 # The editor is a script that renames the machine.
