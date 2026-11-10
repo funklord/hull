@@ -176,6 +176,17 @@ has "$out" '^lease-.* gui-pool +1 ' "the lease held in the pool"
 keys "$dir" "b'\\x1bp'" "b'\\x1b[B'" "b'\\r'" "b'\\x1bl'"
 out=$(timeout 10 "$hull" lease ls 2>&1)
 refute "$out" 'gui-pool' "Pools released it"
+
+# A board marked broken listed so, and put back by Fix, as hull board fix
+# does it.
+printf '%s\n' '(pools (gui-boards (members (board "gui-gb" (address "127.0.0.1")))))' \
+	> "$XDG_CONFIG_HOME/hull/pools.conf"
+mkdir -p "$XDG_DATA_HOME/hull/boards"
+echo 'no answer' > "$XDG_DATA_HOME/hull/boards/gui-gb.broken"
+keys "$dir" "b'\\x1bp'" "b'\\x1b[B'" "b'\\r'" "b'\\x1bf'"
+has "$out" 'gui-gb +127\.0\.0\.1 +broken' "Pools lists the broken board"
+out=$(timeout 10 "$hull" board ls gui-boards 2>&1)
+has "$out" '^gui-gb .* up$' "Fix put the board back"
 rm -f "$XDG_CONFIG_HOME/hull/pools.conf"
 
 # Saved: the list again, with no file given.

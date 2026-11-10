@@ -14,6 +14,7 @@
 #include <QLineEdit>
 #include <QProcess>
 #include <QPushButton>
+#include <QSignalBlocker>
 #include <QSpinBox>
 #include <QTimer>
 #include <QTreeWidget>
@@ -42,8 +43,13 @@ pools_dialog::pools_dialog(const QString &hull_program, QWidget *parent)
 	                          QStringLiteral("Count"), QStringLiteral("Machines"),
 	                          QStringLiteral("Ends"), QStringLiteral("Holder") });
 	leases->setRootIsDecorated(false);
-	connect(pools, &QTreeWidget::currentItemChanged, this, &pools_dialog::update_buttons);
+	boards = new QTreeWidget;
+	boards->setHeaderLabels({ QStringLiteral("Board"), QStringLiteral("Address"),
+	                          QStringLiteral("State") });
+	boards->setRootIsDecorated(false);
+	connect(pools, &QTreeWidget::currentItemChanged, this, &pools_dialog::reload_boards);
 	connect(leases, &QTreeWidget::currentItemChanged, this, &pools_dialog::update_buttons);
+	connect(boards, &QTreeWidget::currentItemChanged, this, &pools_dialog::update_buttons);
 
 	count = new QSpinBox;
 	count->setRange(1, 1000);
@@ -66,6 +72,12 @@ pools_dialog::pools_dialog(const QString &hull_program, QWidget *parent)
 	connect(release_button, &QPushButton::clicked, this, [this]() {
 		act({ QStringLiteral("release"), leases->currentItem()->text(0) });
 	});
+	fix_button = new QPushButton(QStringLiteral("&Fix"));
+	fix_button->setToolTip(QStringLiteral("hull board fix NAME: a board marked broken here "
+	                                      "offered again; a broker's marks are its own"));
+	connect(fix_button, &QPushButton::clicked, this, [this]() {
+		act({ QStringLiteral("board"), QStringLiteral("fix"), boards->currentItem()->text(0) });
+	});
 	said = new QLabel;
 	said->setWordWrap(true);
 
@@ -74,6 +86,7 @@ pools_dialog::pools_dialog(const QString &hull_program, QWidget *parent)
 	controls->addWidget(span, 1);
 	controls->addWidget(reserve_button);
 	controls->addWidget(release_button);
+	controls->addWidget(fix_button);
 	QDialogButtonBox *close = new QDialogButtonBox(QDialogButtonBox::Close);
 	connect(close, &QDialogButtonBox::rejected, this, &QDialog::reject);
 
@@ -82,6 +95,8 @@ pools_dialog::pools_dialog(const QString &hull_program, QWidget *parent)
 	layout->addWidget(pools, 1);
 	layout->addWidget(new QLabel(QStringLiteral("Leases the core holds:")));
 	layout->addWidget(leases, 1);
+	layout->addWidget(new QLabel(QStringLiteral("Boards of the pool chosen:")));
+	layout->addWidget(boards, 1);
 	layout->addLayout(controls);
 	layout->addWidget(said);
 	layout->addWidget(close);
@@ -124,6 +139,9 @@ void pools_dialog::reload()
 			continue;
 		}
 		const QJsonArray rows = QJsonDocument::fromJson(ls.readAllStandardOutput()).array();
+		/* The boards are read once below, not for each row this puts
+		 * in and takes out. */
+		const QSignalBlocker quiet(l.tree);
 
 		l.tree->clear();
 		for (const QJsonValue &row : rows) {
@@ -142,6 +160,43 @@ void pools_dialog::reload()
 		for (int c = 0; c < l.tree->columnCount(); c++)
 			l.tree->resizeColumnToContents(c);
 	}
+	reload_boards();
+}
+
+/* The chosen pool's boards, as `hull board ls POOL` prints them, kept on
+ * the row they were on. A pool of slots has none, and says so on stderr,
+ * which is not shown: an empty list says it. */
+void pools_dialog::reload_boards()
+{
+	const QString keep =
+	    boards->currentItem() != nullptr ? boards->currentItem()->text(0) : QString();
+
+	boards->clear();
+	if (pools->currentItem() != nullptr) {
+		QProcess ls;
+
+		ls.setStandardInputFile(QProcess::nullDevice());
+		ls.start(hull, { QStringLiteral("board"), QStringLiteral("ls"),
+		                 pools->currentItem()->text(0) });
+		if (ls.waitForFinished(10000) && ls.exitCode() == 0) {
+			for (const QString &line : QString::fromUtf8(ls.readAllStandardOutput())
+			                               .split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+				const QStringList cells = line.split(QLatin1Char(' '), Qt::SkipEmptyParts);
+
+				if (cells.size() != 3)
+					continue;
+				QTreeWidgetItem *item = new QTreeWidgetItem(cells);
+
+				boards->addTopLevelItem(item);
+				if (cells.first() == keep)
+					boards->setCurrentItem(item);
+			}
+		}
+	}
+	if (boards->currentItem() == nullptr && boards->topLevelItemCount() > 0)
+		boards->setCurrentItem(boards->topLevelItem(0));
+	for (int c = 0; c < boards->columnCount(); c++)
+		boards->resizeColumnToContents(c);
 	update_buttons();
 }
 
@@ -149,6 +204,8 @@ void pools_dialog::update_buttons()
 {
 	reserve_button->setEnabled(!busy && pools->currentItem() != nullptr);
 	release_button->setEnabled(!busy && leases->currentItem() != nullptr);
+	fix_button->setEnabled(!busy && boards->currentItem() != nullptr &&
+	                       boards->currentItem()->text(2) == QLatin1String("broken"));
 }
 
 /* reserve or release, what it said shown, the lists read again. */
