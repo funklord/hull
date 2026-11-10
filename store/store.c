@@ -218,6 +218,7 @@ typedef struct item {
 	char        *target;      /* a symlink's */
 	uint8_t      digest[32];  /* a regular file's object */
 	buf          xattrs;      /* `(6:xattrs ...)`, or empty */
+	int          root;        /* the class root's, whatever st_uid says */
 } item;
 
 typedef struct walk {
@@ -228,6 +229,7 @@ typedef struct walk {
 	int     failed;
 	char   *why;
 	size_t  why_cap;
+	int     user_root;    /* a tar's entries of the user's uid are root's */
 } walk;
 
 static item *add_item(walk *w)
@@ -375,6 +377,9 @@ static void walk_item(hull_store *store, walk *w, int dir, const char *prefix, c
 		return;
 	}
 	it->st = st;
+	/* The user's own file is the class root's, as a rootless machine's
+	 * root is the user. */
+	it->root = st.st_uid == getuid();
 	read_xattrs(dir, name, &it->xattrs);
 	if (S_ISLNK(st.st_mode)) {
 		char    target[PATH_MAX];
@@ -470,7 +475,7 @@ static void put_entry(buf *b, const item *it)
 		put_text(b, ")");
 	}
 	put_text(b, "(5:owner");
-	if (it->st.st_uid == getuid()) {
+	if (it->root) {
 		put_text(b, "4:root");
 	} else {
 		put_text(b, "(3:gid");
@@ -856,8 +861,12 @@ static int read_tar(hull_store *store, walk *w, int fd, const char *const *drop,
 		                 (type == '5' ? S_IFDIR : type == '2' ? S_IFLNK : type == '6' ? S_IFIFO :
 		                                                                    S_IFREG);
 		/* Root inside the machine is the class root, as the user's own file
-		 * is in a directory's commit; any other owner is its ids. */
-		it->st.st_uid = uid == 0u ? getuid() : (uid_t)uid;
+		 * is in a directory's commit; any other owner is its ids, the
+		 * user's own uid among them: a machine's uid 1000 is not the
+		 * host's user of uid 1000. Only a tree whose workload ran as the
+		 * user, docker's, says that the user's uid is root's. */
+		it->root = uid == 0u || (w->user_root && uid == (uint64_t)getuid());
+		it->st.st_uid = (uid_t)uid;
 		it->st.st_gid = (gid_t)gid;
 		it->st.st_size = (off_t)(type == '0' ? size : 0u);
 		pax_xattrs(&pax, &it->xattrs);
@@ -934,7 +943,8 @@ static int finish_commit(hull_store *store, walk *wp, const char *arch, const ch
 			                                  sizeof extra->owners[0], owner_order);
 
 			if (found != NULL) {
-				w.items[i].st.st_uid = found->uid == 0u ? getuid() : (uid_t)found->uid;
+				w.items[i].root = found->uid == 0u;
+				w.items[i].st.st_uid = (uid_t)found->uid;
 				w.items[i].st.st_gid = (gid_t)found->gid;
 			}
 		}
@@ -997,7 +1007,7 @@ int hull_store_commit_tar(hull_store *store, int fd, const char *arch, const cha
                           const char *const *drop, const hull_commit_extra *extra,
                           hull_commit *out, char *why, size_t cap)
 {
-	walk w = { .why = why, .why_cap = cap };
+	walk w = { .why = why, .why_cap = cap, .user_root = extra != NULL && extra->user_root };
 	int  result;
 
 	memset(out, 0, sizeof *out);

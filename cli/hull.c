@@ -4434,6 +4434,10 @@ next_pass:
 				extra.provenance_length = provenance.length;
 				extra.runtime = runtime;
 				extra.runtime_length = runtime_length;
+				/* docker's step ran as the user, whose uid in its tar is
+				 * the step's root; the others' tars are the machine's own
+				 * ids, where 0 alone is root. */
+				extra.user_root = strcmp(backend, "docker") == 0;
 				if (!provenance.failed && exported) {
 					int tar = open(tar_path, O_RDONLY | O_CLOEXEC);
 
@@ -4732,7 +4736,8 @@ static int open_store(hull_store *store, int create)
 /* `hull commit`: a directory, or with `tar` a tar of engine/tree.c's shape
  * from the file `dir` names, `-` for stdin, its owners kept. */
 static int exec_in(const char *id, char **argv, int argc, int tty, unsigned port);
-static int commit_from(const char *dir, const char *ref, const char *arch, int fd, int quiet);
+static int commit_from(const char *dir, const char *ref, const char *arch, int fd, int quiet,
+                       int user_root);
 
 /* The running machine `id`'s root as a tar, from an exec of (tree true)
  * in a child whose output is the pipe `*fd` reads: the child's pid, or -1
@@ -4774,15 +4779,21 @@ static int commit(const char *dir, const char *ref, const char *arch, int tar)
 		int  fd;
 		int  status;
 
+		int  listed;
+
 		/* Its arch where --arch says none: a machine of a foreign one,
-		 * its programs that arch's, is stored as it, as a pull is. */
-		if (arch == NULL && list_machines(dir, own, sizeof own) == 0 && own[0] != '\0')
+		 * its programs that arch's, is stored as it, as a pull is. And
+		 * its engine: a docker machine's workload runs as the user, so
+		 * there the user's uid is the machine's root. */
+		listed_engine[0] = '\0';
+		listed = list_machines(dir, own, sizeof own) == 0;
+		if (arch == NULL && listed && own[0] != '\0')
 			arch = own;
 		if (arch == NULL)
 			arch = host_arch();
 		if ((child = tree_of(dir, &fd)) < 0)
 			return 1;
-		status = commit_from(dir, ref, arch, fd, 1);
+		status = commit_from(dir, ref, arch, fd, 1, strcmp(listed_engine, "docker") == 0);
 		close(fd);
 		while (waitpid(child, &ended, 0) < 0 && errno == EINTR)
 			;
@@ -4795,7 +4806,7 @@ static int commit(const char *dir, const char *ref, const char *arch, int tar)
 			return 1;
 		}
 		if (status != 0)
-			return commit_from(NULL, NULL, NULL, -1, 2);
+			return commit_from(NULL, NULL, NULL, -1, 2, 0);
 		return 0;
 	}
 	if (arch == NULL)
@@ -4807,18 +4818,19 @@ static int commit(const char *dir, const char *ref, const char *arch, int tar)
 			fprintf(stderr, "hull: commit: %s: %s\n", dir, strerror(errno));
 			return 1;
 		}
-		ended = commit_from(NULL, ref, arch, fd, 0);
+		ended = commit_from(NULL, ref, arch, fd, 0, 0);
 		if (fd > 0)
 			close(fd);
 		return ended;
 	}
-	return commit_from(dir, ref, arch, -1, 0);
+	return commit_from(dir, ref, arch, -1, 0, 0);
 }
 
 /* The commit itself: of the directory `dir` where `fd` is -1, else of the
  * tar `fd` reads. `quiet` 1 keeps a failure's reason for a call with
  * `quiet` 2 to say, once its caller knows it is the reason. */
-static int commit_from(const char *dir, const char *ref, const char *arch, int fd, int quiet)
+static int commit_from(const char *dir, const char *ref, const char *arch, int fd, int quiet,
+                       int user_root)
 {
 	static char why[4400];
 	hull_store  store;
@@ -4841,6 +4853,7 @@ static int commit_from(const char *dir, const char *ref, const char *arch, int f
 		         strlen(HULL_BUILDER), HULL_BUILDER);
 		extra.provenance = (const uint8_t *)provenance;
 		extra.provenance_length = strlen(provenance);
+		extra.user_root = user_root;
 		status = fd >= 0 ? hull_store_commit_tar(&store, fd, arch, ref, NULL, &extra, &made, why,
 		                                         sizeof why) :
 		                   hull_store_commit(&store, dir, arch, ref, &extra, &made, why, sizeof why);

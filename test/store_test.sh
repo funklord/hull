@@ -507,6 +507,21 @@ for want in '(entry (kind dir) (mode 493) (owner root) (path "etc"))' \
 	grep -qF -- "$want" "$root/tarred.view" || fail "a tar's entry is not as it was: $want" \
 		"$(cat "$root/tarred.view")"
 done
+# An entry of the uid the user has on the host is that uid's, not root's:
+# a machine's uid 1000 is its own user, who on most hosts shares the
+# number with the user running hull, and a build step's useradd lost its
+# home's owner to root that way.
+timeout 30 python3 - "$root/mine.tar" "$(id -u)" "$(id -g)" <<'PYEOF3'
+import sys, tarfile
+t = tarfile.open(sys.argv[1], "w", format=tarfile.PAX_FORMAT)
+i = tarfile.TarInfo("home/user")
+i.type, i.uid, i.gid, i.mode = tarfile.DIRTYPE, int(sys.argv[2]), int(sys.argv[3]), 0o700
+t.addfile(i)
+t.close()
+PYEOF3
+expect 0 '^mine/1 sha256:' "$hull" commit --tar "$root/mine.tar" mine/1
+expect 0 "\\(owner \\(gid $(id -g)\\) \\(uid $(id -u)\\)\\) \\(path \"home/user\"\\)" \
+	"$hull" manifest show mine/1
 # Its two entries of other owners materialized as the user's, rootless,
 # and said in one line naming the first, not a line an entry, which for a
 # distribution's tree was every one of 37,956.

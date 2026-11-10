@@ -60,6 +60,7 @@ typedef struct hull_commit_extra {
 	size_t            runtime_length;
 	const hull_owner *owners;       /* by path, bytewise; the owner of each, over the disk's */
 	size_t            owner_count;
+	int               user_root;    /* a tar's: the user's uid is root's, as docker's run as it */
 } hull_commit_extra;
 
 /* `dir` as a manifest of `arch`, its files into the objects, named `ref`,

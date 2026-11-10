@@ -542,7 +542,7 @@ int hull_pull(hull_store *store, const char *name, const char *ref, const char *
 		goto done;
 	}
 	extra = (hull_commit_extra){ provenance.data, provenance.length, runtime.data, runtime.length,
-	                             owners, owner_count };
+	                             owners, owner_count, 0 };
 	if (hull_store_commit(store, tree, image_arch, ref, &extra, out, why, cap) != 0)
 		goto done;
 	out->skipped += skipped;
@@ -930,7 +930,7 @@ int hull_load(hull_store *store, const char *path, const char *ref, const char *
 		goto done;
 	}
 	extra = (hull_commit_extra){ provenance.data, provenance.length, runtime.data, runtime.length,
-	                             owners, owner_count };
+	                             owners, owner_count, 0 };
 	if (hull_store_commit(store, tree, image_arch, ref_out, &extra, out, why, cap) != 0)
 		goto done;
 	out->skipped += skipped;

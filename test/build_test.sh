@@ -213,6 +213,15 @@ cat > "$root/b/keep.conf" <<'EOF'
 EOF
 expect 0 '' "$hull" build -f "$root/b/keep.conf" app/keep
 expect 0 '\(uid 4321\)\) \(path "kept"\)' "$hull" manifest show app/keep
+# And a step's file given the uid the user has on the host keeps it: the
+# machine's uid of that number is its own user, not the host's, whose uid
+# is the machine's root. useradd's first user is 1000, as is the first
+# user of most hosts, and its home went to root.
+me=$(id -u)
+printf '(build (base "dir:./base") (steps (step (name "give") (run "probe write /mine chown /mine %s"))))\n' \
+	"$me" > "$root/b/mine.conf"
+expect 0 '' "$hull" build -f "$root/b/mine.conf" app/mine
+expect 0 "\\(uid $me\\)\\) \\(path \"mine\"\\)" "$hull" manifest show app/mine
 
 # A step's (user ...) is whom its run line runs as, as a Dockerfile's USER is.
 cat > "$root/b/asuser.conf" <<'EOF'
