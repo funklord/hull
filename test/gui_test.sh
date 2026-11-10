@@ -281,7 +281,41 @@ timeout 30 "$hull" stop gui-db > /dev/null 2>&1
 wait "$run_pid" 2>/dev/null
 run_pid=
 
+# Change Medium on a pc machine, where qemu is here: a floppy of one
+# sector that spins, F9, the drive offered (floppy), and a second image;
+# then F9 again with no image, taking it out.
+if command -v qemu-system-i386 > /dev/null 2>&1; then
+	for img in spin.img swap.img; do
+		truncate -s 0 "$dir/$img"
+		truncate -s 1440K "$dir/$img"
+		printf '\353\376' | dd of="$dir/$img" conv=notrunc status=none
+		printf '\125\252' | dd of="$dir/$img" bs=1 seek=510 conv=notrunc status=none
+	done
+	printf '%s\n' '(machine (hostname "gui-pc") (backend pc) (source "media:floppy")' \
+		'  (media (medium (type floppy) (source "image:./spin.img"))))' > "$dir/pc.conf"
+	(cd "$dir" && exec timeout 120 "$hull" run -f pc.conf > "$dir/pc.out" 2>&1) &
+	run_pid=$!
+	tries=0
+	until timeout 10 "$hull" ps 2>/dev/null | grep -q 'gui-pc .*running'; do
+		tries=$((tries + 1))
+		if [ "$tries" -gt 100 ]; then
+			break
+		fi
+		sleep 0.1
+	done
+	keys "$dir" "b'gui-pc'" "b'\\x1b[20~'" "b'\\r'" "b'swap.img'" "b'\\r'" -- pc.conf
+	has "$out" "gui-pc's floppy holds $dir/swap.img" "F9 swaps the floppy"
+	keys "$dir" "b'gui-pc'" "b'\\x1b[20~'" "b'\\r'" "b'\\r'" -- pc.conf
+	has "$out" "gui-pc's floppy taken out" "F9 with no image takes it out"
+	timeout 30 "$hull" stop gui-pc > /dev/null 2>&1
+	wait "$run_pid" 2>/dev/null
+	run_pid=
+else
+	printf 'gui_test: no qemu-system-i386, Change Medium not tried\n'
+fi
+
 rm -rf "${dir:?}/config" "${dir:?}/new" "${dir:?}/newm" "${dir:?}/data" "${dir:?}/screen.txt" \
-	"${dir:?}/wire.pcap"
+	"${dir:?}/wire.pcap" "${dir:?}/spin.img" "${dir:?}/swap.img" "${dir:?}/pc.conf" \
+	"${dir:?}/pc.out"
 printf 'gui_test: %d cases, %d failed\n' "$((cases))" "$failures"
 [ "$failures" = 0 ]

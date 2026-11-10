@@ -404,7 +404,7 @@ $(GUI_BIN): $(BUILD_DIR)/gui/Makefile $(CLIENT_LIB) $(GUI_QTTY) $(GUI_SOURCES)
 LINK_TEST = $(BUILD_DIR)/test/gui/core_link_test
 # What test/gui_test.sh writes, for clean; it removes the rest itself.
 GUI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/gui/, a.conf b.conf c.conf d.conf e.conf edit.sh \
-                   run.out wire.out rootfs/probe run/hull/core.log run/hull/core.lock)
+                   run.out wire.out wire.pcap spin.img swap.img pc.conf pc.out rootfs/probe run/hull/core.log run/hull/core.lock)
 LIST_TEST = $(BUILD_DIR)/test/gui/machine_list_test
 
 $(BUILD_DIR)/test/gui-list/Makefile: gui/test/machine_list_test.pro

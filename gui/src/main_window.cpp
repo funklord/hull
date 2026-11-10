@@ -157,8 +157,7 @@ main_window::~main_window()
  *
  * The shortcuts keep off the keys qtty gives text editing on a terminal,
  * Ctrl+A, E, K, U, W and D, and Ctrl+L, its redraw: bound here, they would
- * answer differently by where the focus is, or never. Hence F6, F7 and
- * F8.
+ * answer differently by where the focus is, or never. Hence F6 to F9.
  */
 void main_window::build_actions()
 {
@@ -206,6 +205,11 @@ void main_window::build_actions()
 	commit_action->setToolTip(QStringLiteral("The running machine's tree as it is now, into the "
 	                                         "store: hull commit ID REF"));
 	connect(commit_action, &QAction::triggered, this, &main_window::commit_machine);
+	medium_action = new QAction(QStringLiteral("Change Medium..."), this);
+	medium_action->setShortcut(QKeySequence(QStringLiteral("F9")));
+	medium_action->setToolTip(QStringLiteral("A running pc machine's floppy or CD swapped, or "
+	                                         "taken out: hull media change ID DRIVE [IMAGE]"));
+	connect(medium_action, &QAction::triggered, this, &main_window::change_medium);
 	refresh_action = new QAction(QStringLiteral("Refresh"), this);
 	refresh_action->setShortcut(QKeySequence(QStringLiteral("F5")));
 	connect(refresh_action, &QAction::triggered, this, [this]() {
@@ -232,6 +236,7 @@ void main_window::build_actions()
 	machine->addAction(terminal_action);
 	machine->addAction(screen_action);
 	machine->addAction(commit_action);
+	machine->addAction(medium_action);
 	machine->addSeparator();
 	machine->addAction(refresh_action);
 	machine->addSeparator();
@@ -527,6 +532,8 @@ void main_window::update_actions()
 	resume_action->setEnabled(held && state == QStringLiteral("paused"));
 	terminal_action->setEnabled(state == QStringLiteral("running"));
 	commit_action->setEnabled(state == QStringLiteral("running"));
+	medium_action->setEnabled(state == QStringLiteral("running") &&
+	                          rows[i].held.engine == QStringLiteral("qemu-pc"));
 	screen_action->setEnabled(state == QStringLiteral("running") && !rows[i].held.address.isEmpty());
 }
 
@@ -1045,6 +1052,72 @@ void main_window::commit_machine()
 		process->deleteLater();
 	});
 	process->start(hull, { QStringLiteral("commit"), id, ref });
+}
+
+/*
+ * A running pc machine's floppy or CD swapped, as VirtualBox's Devices
+ * menu does it: `hull media change ID DRIVE [IMAGE]`, an empty image
+ * taking the medium out. The drive is one its (media ...) gave it,
+ * floppy or cdrom and floppy2 or cdrom2 for the next; the CLI says
+ * which it lacks. A path typed rather than a file dialog's, on the
+ * desktop as on a terminal, since an empty answer is how a medium is
+ * taken out and a file dialog has no such answer; a relative one is the
+ * window's directory's.
+ */
+void main_window::change_medium()
+{
+	const int i = current();
+
+	if (i < 0 || i >= rows.size() || !rows[i].is_held)
+		return;
+	const QString id = rows[i].id;
+	bool          ok = false;
+	const QString drive = QInputDialog::getItem(
+	    this, QStringLiteral("Change Medium"), QStringLiteral("%1's drive:").arg(id),
+	    { QStringLiteral("floppy"), QStringLiteral("cdrom"), QStringLiteral("floppy2"),
+	      QStringLiteral("cdrom2") },
+	    0, true, &ok);
+
+	if (!ok || drive.trimmed().isEmpty())
+		return;
+	const QString image = QInputDialog::getText(
+	    this, QStringLiteral("Change Medium"),
+	    QStringLiteral("The image for %1, or nothing to take it out:").arg(drive.trimmed()),
+	    QLineEdit::Normal, QString(), &ok)
+	                          .trimmed();
+
+	if (!ok)
+		return;
+	QStringList arguments = { QStringLiteral("media"), QStringLiteral("change"), id,
+		                      drive.trimmed() };
+	/* A relative path is the window's own directory's, made whole. */
+	const QString path = image.isEmpty() ? QString() : QFileInfo(image).absoluteFilePath();
+	const bool    out = path.isEmpty();
+
+	if (!out)
+		arguments << path;
+	QProcess *process = new QProcess(this);
+
+	process->setProcessChannelMode(QProcess::MergedChannels);
+	process->setStandardInputFile(QProcess::nullDevice());
+	connect(process, &QProcess::finished, this,
+	        [this, process, id, drive, path, out](int code) {
+		        const QString said = QString::fromUtf8(process->readAll()).trimmed();
+
+		        process->deleteLater();
+		        say(code != 0 ? (said.isEmpty() ? QStringLiteral("hull media change exited %1")
+		                                                  .arg(code)
+		                                        : said)
+		            : out ? QStringLiteral("%1's %2 taken out").arg(id, drive.trimmed())
+		                  : QStringLiteral("%1's %2 holds %3").arg(id, drive.trimmed(), path));
+	        });
+	connect(process, &QProcess::errorOccurred, this, [this, process](QProcess::ProcessError e) {
+		if (e != QProcess::FailedToStart)
+			return;
+		say(process->errorString());
+		process->deleteLater();
+	});
+	process->start(hull, arguments);
 }
 
 /*
