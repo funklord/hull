@@ -220,6 +220,8 @@ static void test_values(void)
 	NO(M("(cpus 02)"), VALUE, "02", "machine.cpus");
 	NO(M("(cpus -2)"), VALUE, "-2", "machine.cpus");
 	OK(M("(tuning (emu (cores_scale 1.5)))"));
+	OK(M("(tuning (emu (boot_limit 1800)))"));
+	NO(M("(tuning (emu (boot_limit 0)))"), VALUE, "0)", "machine.tuning.emu.boot_limit");
 	OK(M("(tuning (emu (cores_scale 0.5)))"));
 	NO(M("(tuning (emu (cores_scale 0.0)))"), VALUE, "0.0", "machine.tuning.emu.cores_scale");
 	NO(M("(tuning (emu (cores_scale 1.)))"), VALUE, "1.", "machine.tuning.emu.cores_scale");

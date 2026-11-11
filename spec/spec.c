@@ -512,6 +512,7 @@ static const schema vm = TABLE(vm_keys);
 
 static const key emu_keys[] = {
 	{ .name = "cores_scale", .type = NUMBER },
+	{ .name = "boot_limit",  .type = COUNT },
 };
 static const schema emu = TABLE(emu_keys);
 

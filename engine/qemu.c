@@ -143,6 +143,7 @@ struct hull_machine {
 	int              overlay;      /* (mutable overlay): the share is read-only */
 	int              block_root;   /* (projection block): the root a disk image of the tree */
 	int              sleep;        /* (sleep true): the guest may suspend, ACPI S3 and s2idle */
+	long             boot_limit;   /* seconds for the agent to answer: BOOT_LIMIT, or emu's */
 	char            *composefs;    /* a composefs: source, its image; root is then the objects */
 	char            *verity_disk;  /* (security (verity true)): its objects as ext4, beside it */
 	const char      *boot;         /* a bootable export's /hull/boot, else NULL */
@@ -811,6 +812,19 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		free(text);
 		if (m->cpus < 1u || m->cpus > 64u)
 			return "cpus is not 1 to 64";
+	}
+	/* emu.boot_limit: the seconds a guest under TCG may take to boot,
+	 * five minutes where the plan says nothing, a slower host saying more. */
+	m->boot_limit = m->emu ? EMU_BOOT_LIMIT : BOOT_LIMIT;
+	if (m->emu && hull_access_find(doc, &machine, "tuning", &entry) &&
+	    hull_access_find(doc, &entry, "emu", &item) &&
+	    (text = hull_access_value(doc, &item, "boot_limit")) != NULL) {
+		long n = strtol(text, NULL, 10);
+
+		free(text);
+		if (n < 1 || n > 86400)
+			return "emu's boot_limit is seconds, at most a day's";
+		m->boot_limit = n;
 	}
 	/* emu.cores_scale over-provisions vCPUs against TCG's cost (5.3). */
 	if (m->emu && hull_access_find(doc, &machine, "tuning", &entry) &&
@@ -2920,11 +2934,11 @@ static int agent_socket(const hull_machine *m)
 	return fd;
 }
 
-/* Connect to the agent, while qemu lives, for BOOT_LIMIT seconds, or
- * EMU_BOOT_LIMIT under TCG. */
+/* Connect to the agent, while qemu lives, for the machine's boot_limit:
+ * BOOT_LIMIT seconds under KVM, emu's own under TCG. */
 static int dial(hull_machine *m, uint32_t cid)
 {
-	time_t deadline = time(NULL) + (m->emu ? EMU_BOOT_LIMIT : BOOT_LIMIT);
+	time_t deadline = time(NULL) + (m->boot_limit > 0 ? m->boot_limit : BOOT_LIMIT);
 
 	/* The serial port's socket: qemu listens on it as soon as it runs,
 	 * and holds what is written until the agent opens the port, so the
@@ -3021,7 +3035,7 @@ static int expect(hull_machine *m, const char *type)
 
 	/* Over a serial port the first answer waits on the guest's boot,
 	 * the socket being qemu's from the start: TCG's limit under emu. */
-	if (hear(m, &body, m->emu ? EMU_BOOT_LIMIT : 30) != HULL_WIRE_OK) {
+	if (hear(m, &body, m->emu ? (int)m->boot_limit : 30) != HULL_WIRE_OK) {
 		snprintf(m->detail, sizeof m->detail, "the guest agent did not answer");
 		return 0;
 	}
@@ -5502,6 +5516,7 @@ static const hull_cap_entry entries[] = {
 	{ "qemu.transport.uart",   HULL_SUP_NATIVE, "a 16550 UART, for a kernel with no "
 	  "virtio-serial; no (on_disconnect keep)", NULL },
 	{ "emu.cores_scale",     HULL_SUP_NATIVE,  NULL, NULL },
+	{ "emu.boot_limit",      HULL_SUP_NATIVE,  NULL, NULL },
 
 	{ NULL,                 HULL_SUP_NATIVE,   NULL, NULL },
 };

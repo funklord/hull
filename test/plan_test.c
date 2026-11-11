@@ -44,7 +44,8 @@ static unsigned failures;
 	{ "vm.profile.micro",       HULL_SUP_NATIVE, NULL, NULL }, \
 	{ "vm.kernel.bundled",      HULL_SUP_NATIVE, NULL, NULL }, \
 	{ "vm.cpu_profile.host",    HULL_SUP_NATIVE, NULL, NULL }, \
-	{ "emu.cores_scale",        HULL_SUP_NATIVE, NULL, NULL }
+	{ "emu.cores_scale",        HULL_SUP_NATIVE, NULL, NULL }, \
+	{ "emu.boot_limit",         HULL_SUP_NATIVE, NULL, NULL }
 
 /* ns, bind only. */
 static const hull_cap_entry binder_entries[] = {
@@ -241,7 +242,7 @@ static void test_tuning(void)
 	   "(machine (source \"debian:13\") (mutable overlay) (writeback none) (ssh false)"
 	   " (on_disconnect stop) (security (readonly_root false) (no_new_privs true))"
 	   " (tuning (vm (profile micro) (kernel bundled) (cpu_profile host))"
-	   " (emu (cores_scale 1))) (projection passthrough))\n");
+	   " (emu (cores_scale 1) (boot_limit 300))) (projection passthrough))\n");
 }
 
 static void test_projection(void)

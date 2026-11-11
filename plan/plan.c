@@ -40,7 +40,8 @@ static const fallback vm_defaults[] = {
 	{ "kernel",      "(kernel bundled)" },
 	{ "cpu_profile", "(cpu_profile host)" },
 };
-static const fallback emu_defaults[]        = { { "cores_scale", "(cores_scale 1)" } };
+static const fallback emu_defaults[]        = { { "cores_scale", "(cores_scale 1)" },
+	                                             { "boot_limit", "(boot_limit 300)" } };
 static const fallback ns_defaults[]         = { { "binfmt", "(binfmt false)" } };
 static const fallback qemu_defaults[]       = { { "accel", "(accel auto)" } };
 static const fallback virtualbox_defaults[] = { { "gui", "(gui false)" } };

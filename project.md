@@ -508,7 +508,8 @@ One file describes a machine. Multi-machine files, compose-style, are the same s
     (virtualbox
       (gui false))
     (emu                         ; emu class (qemu with accel=tcg); adds emulation tuning
-      (cores_scale 2))           ; over-provision vCPUs to claw back TCG speed
+      (cores_scale 2)            ; over-provision vCPUs to claw back TCG speed
+      (boot_limit 300))          ; seconds the agent may take to answer under TCG
     (ns
       (binfmt false))))          ; opt in to qemu-user for foreign-arch sources (matrix: emulated)
 ```
@@ -594,6 +595,7 @@ J left these open, so the check settles them, and each is a row to change if it 
   - A duration is digits above zero, then `s`, `m`, `h`, `d` or `w` (`"7d"`).
   - A count (`cpus`) or port is minimal decimal, from 1; a port stops at 65535.
   - `cores_scale` is a positive decimal, `1.5` allowed.
+  - `boot_limit` is a count of seconds, the time a guest under emu may take to boot to its agent: 300 by default, since 2026-11-11, where a vm under KVM has 60. An amd64 kernel inside an emulated arm64 measured 527 s to its root mount, which `check-arm64-host` gives its machine room for; a slow board running a foreign arch may need more than five minutes as well.
   - Guest paths, `workdir` and `discard` are absolute.
   - `medium.source` and a secret's `source` must carry one of the schemes J lists. `machine.source` need not, because a bare string is an image ref.
 - **Names:**
@@ -2554,6 +2556,7 @@ engine** (overrides the class entry). Non-applicable entries warn.
 | `qemu.transport` | `auto` \| `vsock` \| `serial` \| `uart` | `auto` | The agent's channel: vsock, a virtio-serial port behind a unix socket in the machine's directory, or a 16550 UART behind one, for a kernel with no virtio-serial (no `on_disconnect keep`); `auto` takes vsock where `/dev/vhost-vsock` is open to the user (§4) |
 | `qemu.share` | `auto` \| `9p` \| `virtiofs` | `auto` | How a tree reaches the guest. `auto` is virtiofs where virtiofsd is installed and the kernel is known to have it, else 9p, and follows the default if it moves; `9p` and `virtiofs` pin one (§4.11) |
 | `emu.cores_scale` | number | `1` | vCPU over-provision to offset TCG cost (§5.3) |
+| `emu.boot_limit` | count | `300` | Seconds a guest under emu may take to boot to its agent; a vm under KVM has 60 (§4.11, J.5's notes) |
 | `ns.binfmt` | boolean | `false` | qemu-user for foreign-arch sources; matrix: emulated (§5.3) |
 | `virtualbox.gui` | boolean | `false` | |
 | `pc.machine` | `pc` \| `q35` \| `isapc` | `pc` | The PC qemu builds: an i440FX, a Q35, or an ISA-only machine (§5.0) |

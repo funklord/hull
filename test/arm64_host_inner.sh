@@ -29,11 +29,13 @@ if ! x86_64-linux-gnu-gcc -static -Os -o "$n/x86/rootfs/probe" test/probe.c; the
 fi
 printf '(machine (backend vm) (source "dir:./rootfs") (command "/probe" "arch"))\n' \
 	> "$n/arm/hull.conf"
-printf '(machine (arch amd64) (backend emu) (source "dir:./rootfs") (command "/probe" "arch"))\n' \
+# amd64 translated inside an arm64 translated: its kernel alone measured
+# 527 s to its root mount here, so it is given half an hour to answer.
+printf '(machine (arch amd64) (backend emu) (source "dir:./rootfs") (tuning (emu (boot_limit 1800))) (command "/probe" "arch"))\n' \
 	> "$n/x86/hull.conf"
 for which in arm x86; do
 	out=$(cd "$n/$which" && XDG_RUNTIME_DIR=$n/run XDG_CACHE_HOME=/cache HULL_CORE_IDLE=1 \
-		timeout 1800 "$b/hull" run -f hull.conf 2>&1)
+		timeout 3600 "$b/hull" run -f hull.conf 2>&1)
 	echo "nested: $which exited $?"
 	printf '%s\n' "$out" | sed "s/^/nested: $which: /"
 done
