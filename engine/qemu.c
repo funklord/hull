@@ -4251,8 +4251,15 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		}
 	}
 	if (fd < 0) {
-		if (m->detail[0] == '\0')
-			snprintf(m->detail, sizeof m->detail, "the guest agent never answered");
+		/* qemu said nothing, so it ran: what the guest's console said
+		 * last is where its boot stopped. */
+		if (m->detail[0] == '\0') {
+			char line[400];
+
+			last_line(m, "console.log", line, sizeof line);
+			snprintf(m->detail, sizeof m->detail, "the guest agent never answered%s%s",
+			         line[0] != '\0' ? "; the console's last line: " : "", line);
+		}
 		remove_dir(m);
 		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	}
