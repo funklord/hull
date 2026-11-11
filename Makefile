@@ -307,6 +307,10 @@ PROBE = $(BUILD_DIR)/test/cli/rootfs/probe
 ARM64_CC    ?= aarch64-linux-gnu-gcc
 ARM64_PROBE := $(if $(shell command -v $(ARM64_CC) 2>/dev/null),$(BUILD_DIR)/test/arm64/rootfs/probe)
 AGENT_ARM64 := $(if $(shell command -v $(ARM64_CC) 2>/dev/null),$(BUILD_DIR)/hull-agent-arm64)
+# And on an arm64 host, the agent for an amd64 machine under emu, where
+# x86_64's cross compiler is installed; on an x86_64 host hull-agent is it.
+AMD64_CC    ?= x86_64-linux-gnu-gcc
+AGENT_AMD64 := $(if $(filter aarch64,$(shell uname -m)),$(if $(shell command -v $(AMD64_CC) 2>/dev/null),$(BUILD_DIR)/hull-agent-amd64))
 KERNEL_ARM64 := $(if $(shell command -v $(ARM64_CC) 2>/dev/null),$(KERNEL_A64_BIN) $(KERNEL_A64_MOD)/modules.dep)
 
 TEST_SPEC_OBJS    = $(BUILD_DIR)/test/spec_test.o
@@ -337,12 +341,13 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-arm64-host check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
 # which is installed apart, as root: `make nss`, or `make install-nss`.
-all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL) $(AGENT_BIN) $(AGENT_ARM64)
+all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL) $(AGENT_BIN) $(AGENT_ARM64) \
+     $(AGENT_AMD64)
 
 nss: $(NSS_LIB)
 
@@ -442,6 +447,7 @@ help:
 	@echo '  check     style, the situ contracts, then the tests'
 	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
 	@echo '  check-qemu    hull run on the qemu engine, as the user, with KVM'
+	@echo '  check-arm64-host  hull built and make test run on arm64, under emu'
 	@echo '  check-pc      a whole PC booting its own media, as the user'
 	@echo '  check-legacy  FreeDOS, fetched and pinned, on a pc: screen and ssh door'
 	@echo '  check-images  published images and a compose project, on chroot and a vm'
@@ -655,6 +661,9 @@ $(LIMINE_FILES): $(LIMINE_SRC)/bin/limine
 $(BUILD_DIR)/hull-agent-arm64: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
 	$(ARM64_CC) -static $(CPPFLAGS) $(CFLAGS) -o $@ $(AGENT_SOURCES)
 
+$(BUILD_DIR)/hull-agent-amd64: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
+	$(AMD64_CC) -static $(CPPFLAGS) $(CFLAGS) -o $@ $(AGENT_SOURCES)
+
 # One file, its own: only the _nss_hull_ entry points are visible.
 $(NSS_LIB): nss/nss_hull.c
 	@mkdir -p '$(@D)'
@@ -865,6 +874,12 @@ check-legacy: $(HULL) $(AGENT_BIN)
 check-qemu: $(HULL) $(AGENT_BIN) $(PROBE) $(AGENT_ARM64) $(ARM64_PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/qemu_test.sh '$(HULL)' '$(PROBE)'
 
+# hull on an arm64 host, which needs no arm64 hardware: an arm64 Debian
+# under hull's own emu, hull built there from this source and its make
+# test run there. Needs the network the first time, and qemu-system-aarch64.
+check-arm64-host: $(HULL) $(AGENT_ARM64)
+	BUILD_DIR='$(BUILD_DIR)' sh test/arm64_host_test.sh '$(HULL)'
+
 # The unit tests, and the store and pull suites, built and run with
 # AddressSanitizer and UndefinedBehaviorSanitizer, in a build directory
 # of their own: a fault that a green run hides -- a NULL handed to qsort,
@@ -998,7 +1013,7 @@ clean:
 	        $(SPEC_OBJS) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS) $(PLAN_OBJS:.o=.d) \
 	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(STORE_OBJS) $(STORE_OBJS:.o=.d) $(OCI_OBJS) $(OCI_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) $(ROOT_BIN) \
 	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) $(DISC_GEN) $(FRAME_GEN) \
-	        $(AGENT_BIN) $(BUILD_DIR)/hull-agent-arm64 $(KERNEL_BIN) $(LIMINE_FILES) \
+	        $(AGENT_BIN) $(BUILD_DIR)/hull-agent-arm64 $(BUILD_DIR)/hull-agent-amd64 $(KERNEL_BIN) $(LIMINE_FILES) \
 	        $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(BUILD_DIR)/test/arm64/rootfs/probe \
 	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) $(FUZZ_FILES) \

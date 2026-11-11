@@ -831,6 +831,9 @@ static const struct foreign_arch {
 	const char *magic;
 	const char *mask;
 } foreign_arches[] = {
+	{ "amd64", "x86_64",
+	  "\\x7f\\x45\\x4c\\x46\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00",
+	  "\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff" },
 	{ "arm64", "aarch64",
 	  "\\x7f\\x45\\x4c\\x46\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\xb7\\x00",
 	  "\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff" },
@@ -4461,6 +4464,7 @@ static const hull_cap_entry entries[] = {
 	{ "owners",                 HULL_SUP_NATIVE,
 	  "given in the overlay before the workload, where many uids are mapped", NULL },
 	/* A foreign arch, its programs translated on the host's kernel. */
+	{ "arch.amd64",             HULL_SUP_EMULATED, ARCH_NOTE, NULL },
 	{ "arch.arm64",             HULL_SUP_EMULATED, ARCH_NOTE, NULL },
 	{ "arch.arm",               HULL_SUP_EMULATED, ARCH_NOTE, NULL },
 	{ "arch.riscv64",           HULL_SUP_EMULATED, ARCH_NOTE, NULL },

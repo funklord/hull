@@ -132,7 +132,8 @@ typedef struct piece {
 struct hull_machine {
 	hull_core       *core;
 	int              emu;          /* TCG, else KVM */
-	int              arm64;        /* (arch arm64) under emu: qemu-system-aarch64's virt */
+	int              arm64;        /* an arm64 guest: qemu-system-aarch64's virt */
+	char             arch[16];     /* the guest's, amd64 or arm64, as the spec spells it */
 	char            *root;         /* the dir source, without "dir:" */
 	int              readonly_root;
 	int              overlay;      /* (mutable overlay): the share is read-only */
@@ -462,6 +463,28 @@ static void release(hull_machine *m)
 	free(m);
 }
 
+/* The host's arch in the spec's spelling, as the CLI gives the planner:
+ * x86_64 is amd64 and aarch64 is arm64. */
+static const char *host_arch(void)
+{
+	static struct utsname host;
+
+	if (uname(&host) != 0)
+		return "";
+	if (strcmp(host.machine, "x86_64") == 0)
+		return "amd64";
+	if (strcmp(host.machine, "aarch64") == 0)
+		return "arm64";
+	return host.machine;
+}
+
+/* The guest's arch: what its plan said, or the host's for a machine made
+ * without one, as a bootable export's and an adopted kept machine's are. */
+static const char *guest_arch(const hull_machine *m)
+{
+	return m->arch[0] != '\0' ? m->arch : host_arch();
+}
+
 /* --- reading the plan ---------------------------------------------------- */
 
 /* J.1's `memory`, "2G" or "512M" or bytes, in MiB; 0 if it is not one. */
@@ -482,12 +505,18 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	text = hull_access_value(doc, &top, "engine");
 	m->hosted = text != NULL && strcmp(text, "virtualbox") == 0;
 	free(text);
-	/* (arch arm64), which the planner gives only to emu (section 5.3). */
+	/* The guest's arch: (arch ...), or the host's. One not the host's is
+	 * emulated, which the planner gives only to emu (section 5.3); the
+	 * host's own runs under KVM as a vm, on an x86_64 host or an arm64 one. */
 	text = hull_access_value(doc, &machine, "arch");
-	m->arm64 = text != NULL && strcmp(text, "arm64") == 0;
+	snprintf(m->arch, sizeof m->arch, "%s",
+	         text == NULL || strcmp(text, "host") == 0 ? host_arch() : text);
 	free(text);
-	if (m->arm64 && !m->emu)
-		return "an arm64 machine is emulated: (arch arm64) runs under emu";
+	if (strcmp(m->arch, "amd64") != 0 && strcmp(m->arch, "arm64") != 0)
+		return "the qemu engine runs an amd64 or an arm64 machine";
+	m->arm64 = strcmp(m->arch, "arm64") == 0;
+	if (strcmp(m->arch, host_arch()) != 0 && !m->emu)
+		return "a machine of another arch than the host's is emulated: it runs under emu";
 
 	text = hull_access_value(doc, &machine, "source");
 	/* A composefs: source (section 3.2), a stored tree's image the
@@ -1086,9 +1115,11 @@ static const char *find_modules(const char *modules, const char *const *extra,
 	return reason;
 }
 
-/* The agent: hull-agent beside the hull binary that is running, or
- * hull-agent-arm64 for an arm64 guest. */
-static int agent_path(char *out, size_t cap, int arm64)
+/* The agent for a guest of `arch`, beside the hull binary that is
+ * running: hull-agent where the guest is the host's arch, the one `make`
+ * built natively, else hull-agent-ARCH, built by that arch's cross
+ * compiler. */
+static int agent_path(char *out, size_t cap, const char *arch)
 {
 	char    self[PATH_MAX];
 	ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1u);
@@ -1101,7 +1132,9 @@ static int agent_path(char *out, size_t cap, int arm64)
 	if (slash == NULL)
 		return 0;
 	*slash = '\0';
-	return snprintf(out, cap, "%s/hull-agent%s", self, arm64 ? "-arm64" : "") < (int)cap;
+	if (strcmp(arch, host_arch()) == 0)
+		return snprintf(out, cap, "%s/hull-agent", self) < (int)cap;
+	return snprintf(out, cap, "%s/hull-agent-%s", self, arch) < (int)cap;
 }
 
 /* The release a bzImage carries, for finding its modules on the host. The
@@ -1243,10 +1276,13 @@ static const char *write_initramfs(const hull_machine *m, const char *modules, i
 	size_t      length = 0u;
 	const char *reason;
 
-	if (!agent_path(agent, sizeof agent, m->arm64) || (data = slurp(agent, &length)) == NULL)
-		return m->arm64 ? "the arm64 guest agent, hull-agent-arm64 beside hull, cannot be read: "
+	if (!agent_path(agent, sizeof agent, guest_arch(m)) || (data = slurp(agent, &length)) == NULL)
+		return strcmp(guest_arch(m), host_arch()) == 0 ?
+		       "the guest agent, hull-agent beside hull, cannot be read" :
+		       m->arm64 ? "the arm64 guest agent, hull-agent-arm64 beside hull, cannot be read: "
 		                  "it is built where aarch64-linux-gnu-gcc is installed" :
-		                  "the guest agent, hull-agent beside hull, cannot be read";
+		                  "the amd64 guest agent, hull-agent-amd64 beside hull, cannot be read: "
+		                  "it is built where x86_64-linux-gnu-gcc is installed";
 	/* A path kernel whose modules the host does not have is taken to have
 	 * its guest drivers built in (Appendix F): no module list, no share. */
 	/* Its devices' drivers: xhci for a USB device and what modules.alias
@@ -2124,7 +2160,10 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	argv[n++] = "none";
 	argv[n++] = "-no-reboot";
 	argv[n++] = "-M";
-	argv[n++] = m->arm64 ? "virt" : m->micro ? MICROVM_OPTIONS : "q35";
+	/* virt under KVM takes the host's interrupt controller, a GICv3 where
+	 * qemu's default GICv2 is one KVM cannot give. */
+	argv[n++] = m->arm64 ? (m->emu ? "virt,virtualization=on" : "virt,gic-version=host") :
+	            m->micro ? MICROVM_OPTIONS : "q35";
 	argv[n++] = "-accel";
 	argv[n++] = m->emu ? "tcg" : "kvm";
 	argv[n++] = "-cpu";
@@ -3617,7 +3656,7 @@ static hull_status hosted_start(hull_core *core, hull_machine *m, hull_error *er
 	int         pair[2];
 	char       *slash;
 
-	if (!agent_path(agent, sizeof agent, 0) || (slash = strrchr(agent, '/')) == NULL)
+	if (!agent_path(agent, sizeof agent, host_arch()) || (slash = strrchr(agent, '/')) == NULL)
 		return fail(error, HULL_ERR_RUNTIME, "hull's agent cannot be found");
 	snprintf(self, sizeof self, "%.*s/hull", (int)(slash - agent), agent);
 	/* What can be said now rather than a minute into a start. */
@@ -3725,8 +3764,9 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		return fail(error, HULL_ERR_BUSY, "the machine has been started already");
 	if (m->hosted)
 		return hosted_start(core, m, error);
-	if (uname(&name) != 0 || strcmp(name.machine, "x86_64") != 0)
-		return fail(error, HULL_ERR_RUNTIME, "the qemu engine boots on x86_64 hosts only so far");
+	if (uname(&name) != 0 ||
+	    (strcmp(name.machine, "x86_64") != 0 && strcmp(name.machine, "aarch64") != 0))
+		return fail(error, HULL_ERR_RUNTIME, "the qemu engine boots on x86_64 and aarch64 hosts");
 	if (!m->emu && access("/dev/kvm", R_OK | W_OK) != 0)
 		return fail(error, HULL_ERR_RUNTIME, "/dev/kvm is not open to this user");
 	if (m->transport == 1 && access("/dev/vhost-vsock", R_OK | W_OK) != 0)
@@ -3749,7 +3789,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	 * distribution's kernel: a workload wanting a module outside hull's
 	 * set is a full machine's. */
 	if (!m->kernel_hull && !m->kernel_fetched && m->kernel_path == NULL && !m->kernel_image &&
-	    !m->profile_full && agent_path(kbuf, sizeof kbuf, 0) && strrchr(kbuf, '/') != NULL) {
+	    !m->profile_full && agent_path(kbuf, sizeof kbuf, host_arch()) && strrchr(kbuf, '/') != NULL) {
 		snprintf(strrchr(kbuf, '/'), sizeof kbuf - (size_t)(strrchr(kbuf, '/') - kbuf),
 		         "/vmlinuz-hull%s", m->arm64 ? "-arm64" : "");
 		m->kernel_hull = access(kbuf, R_OK) == 0;
@@ -3766,7 +3806,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		const char *arch = m->arm64 ? "-arm64" : "";
 		char        dep[4400];
 
-		if (!agent_path(kbuf, sizeof kbuf, 0) || strrchr(kbuf, '/') == NULL)
+		if (!agent_path(kbuf, sizeof kbuf, host_arch()) || strrchr(kbuf, '/') == NULL)
 			return fail(error, HULL_ERR_RUNTIME, "hull's own kernel cannot be found");
 		snprintf(strrchr(kbuf, '/'), sizeof kbuf - (size_t)(strrchr(kbuf, '/') - kbuf),
 		         "/vmlinuz-hull%s", arch);
@@ -3792,17 +3832,24 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 			share_modules = 0;
 		}
 		m->micro = micro_fits(m, kbuf, sizeof kbuf);
-	} else if (m->arm64 && m->kernel_path == NULL && !m->kernel_image) {
-		const hull_kernel_pin *pin = hull_kernel_pin_of("arm64");
+	} else if (strcmp(guest_arch(m), host_arch()) != 0 && m->kernel_path == NULL && !m->kernel_image) {
+		/* A guest of another arch than the host's boots that arch's
+		 * fetched kernel, the host's being of no use to it: arm64's on
+		 * an x86_64 host, amd64's on an arm64 one. */
+		const hull_kernel_pin *pin = hull_kernel_pin_of(guest_arch(m));
 		char                   fetched[4096];
+		static char            why[200];
 
-		if (pin == NULL || hull_kernel_dir_of("arm64", fetched, sizeof fetched) != 0)
+		if (pin == NULL || hull_kernel_dir_of(guest_arch(m), fetched, sizeof fetched) != 0)
 			fetched[0] = '\0';
 		snprintf(kbuf, sizeof kbuf, "%s/boot/vmlinuz-%s", fetched, pin != NULL ? pin->release : "");
 		snprintf(mbuf, sizeof mbuf, "%s/lib/modules/%s", fetched, pin != NULL ? pin->release : "");
-		if (fetched[0] == '\0' || access(kbuf, R_OK) != 0)
-			return fail(error, HULL_ERR_RUNTIME, "an arm64 machine boots Debian's arm64 kernel, "
-			            "and none has been fetched: `hull kernel fetch --arch arm64` downloads it");
+		if (fetched[0] == '\0' || access(kbuf, R_OK) != 0) {
+			snprintf(why, sizeof why, "an %s machine boots Debian's %s kernel, and none has "
+			         "been fetched: `hull kernel fetch --arch %s` downloads it", guest_arch(m),
+			         guest_arch(m), guest_arch(m));
+			return fail(error, HULL_ERR_RUNTIME, why);
+		}
 		kernel = kbuf;
 		load_modules = 1;
 	} else if (m->kernel_path != NULL || m->kernel_image) {
@@ -3839,10 +3886,14 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		/* (kernel fetched) asks for that one wherever the host's can be
 		 * read: the same kernel on every host, Appendix F's aim. */
 		if (m->kernel_fetched || access(kbuf, R_OK) != 0) {
-			if (hull_kernel_dir(fetched, sizeof fetched) != 0)
+			/* The host's arch's: an arm64 host's is arm64's pin. */
+			const hull_kernel_pin *pin = hull_kernel_pin_of(guest_arch(m));
+			const char *release = pin != NULL ? pin->release : HULL_KERNEL_RELEASE;
+
+			if (hull_kernel_dir_of(guest_arch(m), fetched, sizeof fetched) != 0)
 				fetched[0] = '\0';
-			snprintf(kbuf, sizeof kbuf, "%s/boot/vmlinuz-%s", fetched, HULL_KERNEL_RELEASE);
-			snprintf(mbuf, sizeof mbuf, "%s/lib/modules/%s", fetched, HULL_KERNEL_RELEASE);
+			snprintf(kbuf, sizeof kbuf, "%s/boot/vmlinuz-%s", fetched, release);
+			snprintf(mbuf, sizeof mbuf, "%s/lib/modules/%s", fetched, release);
 			if (fetched[0] == '\0' || access(kbuf, R_OK) != 0)
 				return fail(error, HULL_ERR_RUNTIME, m->kernel_fetched ?
 				            "(kernel fetched) wants the kernel `hull kernel fetch` downloads, "
@@ -5210,7 +5261,7 @@ static const hull_cap_entry entries[] = {
 static const char *const classes[] = { "vm", "emu", NULL };
 
 /* What emu runs besides the host's own arch (section 5.3). */
-static const char *const qemu_arches[] = { "arm64", NULL };
+static const char *const qemu_arches[] = { "amd64", "arm64", NULL };
 
 static const hull_capabilities caps = {
 	.struct_size    = sizeof (hull_capabilities),
@@ -5219,7 +5270,7 @@ static const hull_capabilities caps = {
 	.classes        = classes,
 	.entries        = entries,
 	.migration      = HULL_MIG_LIVE,  /* H.3 */
-	.arches         = qemu_arches,    /* the host's own, and under emu arm64's virt */
+	.arches         = qemu_arches,    /* the host's own, and under emu the other one */
 };
 
 static const hull_engine_ops ops = {
