@@ -83,6 +83,15 @@ EOF
 step "the build image made" timeout 3600 "$hull" build -f "$dir/tools.conf" host64/tools
 
 boot=$(ls -d "$dir"/cache/hull/kernel-arm64-*/boot | head -1)
+# The build's own disk, ext4 of the user's: not the machine's memory,
+# which runtime_test holds a base must not be, nor its overlay root, on
+# which the suites' own overlays cannot stack. Made anew each run.
+mke2fs=$(command -v mke2fs || echo /usr/sbin/mke2fs)
+rm -f "$dir/run/build.img"
+truncate -s 8G "$dir/run/build.img"
+step "the build's disk made" timeout 120 "$mke2fs" -q -F -t ext4 -E root_owner=1000:1000 \
+	"$dir/run/build.img"
+
 # The source read-only, the build in the machine's memory under the
 # user's home, which useradd gave the user: the case that found a uid of
 # 1000 stored as root's. The machine's root does what a host's own setup
@@ -99,7 +108,8 @@ cat > "$dir/run/hull.conf" <<EOF
   (tmpfs "/tmp")
   (volumes (volume (host "$src") (guest "/src") (mode ro))
            (volume (host "$dir/cache") (guest "/cache") (mode ro))
-           (volume (host "$boot") (guest "/boot") (mode ro)))
+           (volume (host "$boot") (guest "/boot") (mode ro))
+           (volume (block "$dir/run/build.img") (guest "/b")))
   (command "/bin/sh" "-c" "uname -m && modprobe -a tun fuse vhost_vsock vhost_net && chmod 666 /dev/kvm /dev/net/tun /dev/fuse /dev/vhost-vsock /dev/vhost-net && mkdir -p /run/user && exec setpriv --reuid=1000 --regid=1000 --init-groups sh /src/test/arm64_host_inner.sh"))
 EOF
 cases=$((cases + 1))

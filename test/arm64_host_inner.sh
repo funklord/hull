@@ -8,9 +8,8 @@
 # suite's summary line, and a `nested:` line a machine.
 
 set -u
-# The build on a tmpfs: the suites lay overlays over what it holds, and
-# the machine's root is an overlay itself, which an upper cannot sit on.
-b=/tmp/b
+# The build on a disk of its own, /b (test/arm64_host_test.sh says why).
+b=/b/build
 cd /src || exit 2
 # Every suite, a failing one not stopping the next: the host's half
 # counts each one's summary line.
