@@ -139,15 +139,18 @@ for suite in sexpr framing spec matrix registry plan wire sha256 verity idmap js
 		fail "on arm64, $suite did not pass" "$(printf '%s\n' "$summaries" | grep "^$suite:")"
 done
 printf '%s\n' "$summaries" | sed 's/^/arm64: /'
-# hull's qemu engine on the arm64 host: its own arch as a vm, amd64 under
-# emu, each machine's probe saying the arch it ran as.
-for which in arm:aarch64 x86:x86_64; do
-	cases=$((cases + 1))
-	if ! printf '%s\n' "$out" | grep -qx "nested: ${which%%:*}: arch=${which#*:}"; then
-		fail "on the arm64 host, the ${which%%:*} machine did not run as ${which#*:}" \
-			"$(printf '%s\n' "$out" | grep "^nested: ${which%%:*}")"
-	fi
-done
+# hull's qemu engine on the arm64 host: its own arch as a vm under KVM,
+# held to saying it ran as aarch64. And amd64 under emu, said and not
+# held to: translated inside a machine itself translated, its kernel
+# measured 527 s to its root mount and, given half an hour, stalled in
+# soft lockups before its agent (2026-11-11, 983 s), which says what two
+# layers of TCG cost, not what a real arm64 host does.
+cases=$((cases + 1))
+if ! printf '%s\n' "$out" | grep -qx "nested: arm: arch=aarch64"; then
+	fail "on the arm64 host, its own arch did not run as a vm" \
+		"$(printf '%s\n' "$out" | grep "^nested: arm")"
+fi
+printf '%s\n' "$out" | grep '^nested: x86' | grep -v 'machine on' | sed 's/^/arm64: /'
 
 printf 'arm64-host: %d cases, %d failed\n' "$cases" "$failures"
 [ "$failures" = 0 ]
