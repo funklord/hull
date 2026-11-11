@@ -1151,6 +1151,27 @@ out=$(cd / && timeout 20 "$hull" plan -f "$root/vblockdirect.conf" 2>&1)
 [ $? = 1 ] && printf '%s\n' "$out" | grep -q 'writeback: rejected: (mutable direct) under a block projection needs' ||
 	fail "(mutable direct) under a block projection was not refused" "$out"
 
+# (sleep true): the guest's own suspend to RAM, ACPI S3 on q35, woken by
+# its RTC's alarm. CLOCK_BOOTTIME runs ahead of CLOCK_MONOTONIC only across
+# a real suspend, which a vm paused by its host would not show; and the
+# machine goes on after, its block root and its agent's port back. Its
+# conditions refused at start, each saying why: a shared root, which
+# Linux's 9p and virtiofs cannot carry across a suspend, and a vsock.
+conf vsleep '(backend vm) (mutable overlay) (projection block) (sleep true)' \
+	'(command "/probe" "suspend" "mem" "4" "write" "/after-sleep")'
+name=vsleep
+boot vsleep 120
+has 0 '^asleep=[2-9]$'
+has 0 '^write=ok$'
+for refused in 'share:(mutable overlay) (sleep true):wants (projection block)' \
+	'vsock:(mutable overlay) (projection block) (sleep true) (tuning (qemu (transport vsock))):a vsock is reset by a suspend'; do
+	conf vsleepno "(backend vm) $(printf '%s' "$refused" | cut -d: -f2)" '(command "/probe")'
+	cases=$((cases + 1))
+	out=$(cd / && timeout 60 "$hull" run -f "$root/vsleepno.conf" 2>&1)
+	[ $? != 0 ] && printf '%s\n' "$out" | grep -q "$(printf '%s' "$refused" | cut -d: -f3)" ||
+		fail "(sleep true) with a ${refused%%:*} was not refused saying why" "$out"
+done
+
 # The network, out, through passt as the user: the machine's own lo, the
 # host's DNS, and the host's address; but not the host's loopback. Two
 # listeners on the host, each taking one connection within 15 seconds,

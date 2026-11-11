@@ -53,6 +53,10 @@
  *               each crosses to the engine as a frame of its own
  *   line F T    whether file F holds a line that is exactly T: yes or no
  *   sleep N     sleep N seconds
+ *   suspend S N the machine suspended to state S, mem or freeze, the RTC's
+ *               alarm waking it N seconds on: asleep=SECONDS, how far
+ *               CLOCK_BOOTTIME ran ahead of CLOCK_MONOTONIC, which only a
+ *               real suspend makes
  *   nnp         whether no_new_privs is set
  *   session     whether it leads a session of its own
  *   pid         its pid
@@ -1453,6 +1457,41 @@ int main(int argc, char **argv)
 		} else if (strcmp(step, "sleep") == 0) {
 			sleep((unsigned)atoi(arg));
 			i++;
+		} else if (strcmp(step, "suspend") == 0 && i + 2 < argc) {
+			/* The RTC's alarm set N seconds on, then STATE written to
+			 * /sys/power/state, which returns once the machine has
+			 * woken. CLOCK_BOOTTIME counts the time asleep and
+			 * CLOCK_MONOTONIC does not, so their difference grows only
+			 * where the kernel really suspended: a vm paused by its host
+			 * would show none. */
+			struct timespec boot[2];
+			struct timespec mono[2];
+			FILE           *f = fopen("/sys/class/rtc/rtc0/wakealarm", "w");
+			int             fd;
+			int             ok;
+			long long       asleep;
+
+			if (f != NULL) {
+				fprintf(f, "+%s\n", argv[i + 2]);
+				fclose(f);
+			}
+			clock_gettime(CLOCK_BOOTTIME, &boot[0]);
+			clock_gettime(CLOCK_MONOTONIC, &mono[0]);
+			fd = open("/sys/power/state", O_WRONLY | O_CLOEXEC);
+			ok = fd >= 0 && write(fd, arg, strlen(arg)) == (ssize_t)strlen(arg);
+			if (!ok)
+				printf("suspend=%s\n", strerror(errno));
+			if (fd >= 0)
+				close(fd);
+			clock_gettime(CLOCK_BOOTTIME, &boot[1]);
+			clock_gettime(CLOCK_MONOTONIC, &mono[1]);
+			asleep = ((long long)(boot[1].tv_sec - boot[0].tv_sec) -
+			          (long long)(mono[1].tv_sec - mono[0].tv_sec)) * 1000LL +
+			         ((boot[1].tv_nsec - boot[0].tv_nsec) - (mono[1].tv_nsec - mono[0].tv_nsec)) /
+			         1000000L;
+			if (ok)
+				printf("asleep=%lld\n", asleep / 1000LL);
+			i += 2;
 		} else if (strcmp(step, "pid") == 0) {
 			printf("pid=%d\n", (int)getpid());
 		} else if (strcmp(step, "procs") == 0) {

@@ -138,6 +138,7 @@ struct hull_machine {
 	int              readonly_root;
 	int              overlay;      /* (mutable overlay): the share is read-only */
 	int              block_root;   /* (projection block): the root a disk image of the tree */
+	int              sleep;        /* (sleep true): the guest may suspend, ACPI S3 and s2idle */
 	char            *composefs;    /* a composefs: source, its image; root is then the objects */
 	char            *verity_disk;  /* (security (verity true)): its objects as ext4, beside it */
 	const char      *boot;         /* a bootable export's /hull/boot, else NULL */
@@ -486,6 +487,47 @@ static const char *guest_arch(const hull_machine *m)
 }
 
 /* --- reading the plan ---------------------------------------------------- */
+
+/*
+ * (sleep true): a machine whose guest may suspend itself, to RAM (ACPI
+ * S3) or to idle (s2idle), and resume, its own kernel doing both as on a
+ * laptop -- tasks frozen, every driver's suspend and resume run, the clock
+ * jumping by the time asleep. What a guest needs to come back, measured
+ * 2026-11-11 on Debian's 6.12 under q35: a device that can suspend under
+ * everything it uses. virtio-fs refuses to (`suspend/resume not yet
+ * supported`), so the suspend fails; virtio-9p has no suspend at all, so
+ * it resumes with a root that never answers again; and a vsock is reset,
+ * which the agent takes for its host gone. So the root is a block
+ * projection, a volume a block device, and the agent's channel a
+ * virtio-serial port, whose driver keeps its ports across a suspend; and
+ * the machine is q35's, microvm having no ACPI sleep states.
+ */
+static const char *read_sleep(hull_machine *m, const hull_sexpr_doc *doc,
+                              const hull_sexpr_form *machine)
+{
+	m->sleep = hull_access_true(doc, machine, "sleep");
+	if (!m->sleep)
+		return NULL;
+	if (m->arm64)
+		return "(sleep true) is q35's ACPI S3: an arm64 machine, qemu's virt, has no sleep state";
+	if (!m->block_root)
+		return "(sleep true) wants (projection block): Linux's 9p and virtiofs cannot suspend, "
+		       "so a root shared from the host would not come back";
+	for (unsigned i = 0u; i < m->volume_count; i++)
+		if (m->volume_block[i] == NULL)
+			return "(sleep true) takes block volumes alone: a volume shared from the host "
+			       "by 9p or virtiofs would not come back from a suspend";
+	if (m->transport == 1)
+		return "(sleep true) carries the agent on a virtio-serial port: a vsock is reset by a "
+		       "suspend, so (transport vsock) cannot be kept";
+	if (m->transport == 3)
+		return "(sleep true) carries the agent on a virtio-serial port, not the UART";
+	m->transport = 2;
+	if (m->kernel_hull)
+		return "(sleep true) needs a kernel built with suspend, which hull's own is not yet: "
+		       "(kernel bundled) takes the host's";
+	return NULL;
+}
 
 /* J.1's `memory`, "2G" or "512M" or bytes, in MiB; 0 if it is not one. */
 static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
@@ -934,6 +976,12 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	}
 	{
 		const char *reason = read_secrets(m, doc, &machine);
+
+		if (reason != NULL)
+			return reason;
+	}
+	{
+		const char *reason = read_sleep(m, doc, &machine);
 
 		if (reason != NULL)
 			return reason;
@@ -2697,7 +2745,8 @@ static int micro_fits(const hull_machine *m, char *kernel, size_t cap)
 	char       *slash;
 	unsigned    transports = MICROVM_FIXED + m->volume_count + m->segment_count;
 
-	if (m->profile_full || m->arm64 || m->emu || m->device_count != 0u || m->transport == 3 ||
+	if (m->profile_full || m->sleep || m->arm64 || m->emu || m->device_count != 0u ||
+	    m->transport == 3 ||
 	    transports > MICROVM_TRANSPORTS || !qemu_has_microvm())
 		return 0;
 	snprintf(elf, sizeof elf, "%s", kernel);
@@ -3789,7 +3838,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	 * distribution's kernel: a workload wanting a module outside hull's
 	 * set is a full machine's. */
 	if (!m->kernel_hull && !m->kernel_fetched && m->kernel_path == NULL && !m->kernel_image &&
-	    !m->profile_full && agent_path(kbuf, sizeof kbuf, host_arch()) && strrchr(kbuf, '/') != NULL) {
+	    !m->profile_full && !m->sleep && agent_path(kbuf, sizeof kbuf, host_arch()) && strrchr(kbuf, '/') != NULL) {
 		snprintf(strrchr(kbuf, '/'), sizeof kbuf - (size_t)(strrchr(kbuf, '/') - kbuf),
 		         "/vmlinuz-hull%s", m->arm64 ? "-arm64" : "");
 		m->kernel_hull = access(kbuf, R_OK) == 0;
@@ -5176,6 +5225,10 @@ static const hull_cap_entry entries[] = {
 	  "the agent supervises the image's own sshd on the guest's port 22, or where it has "
 	  "none the dropbear `hull sshd fetch` keeps, with a host key and the user's "
 	  "authorized_keys the core delivers; refused at start where there is neither", NULL },
+	{ "sleep",              HULL_SUP_NATIVE,
+	  "the guest's own suspend to RAM (ACPI S3) and to idle on q35, its kernel freezing "
+	  "tasks and suspending every driver; with a block root and block volumes alone, and "
+	  "the agent on a virtio-serial port, which come back from it where a share does not", NULL },
 	{ "export",             HULL_SUP_EMULATED,
 	  "the merged tree taken host-side in qemu's namespaces once the workload ends, the "
 	  "overlay mounted there for it", NULL },
