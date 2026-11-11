@@ -210,6 +210,9 @@ struct hull_machine {
 	int              hosted_fd;    /* the wire to it, until the reader opens it */
 	int              ready;        /* the agent has started the workload */
 	int              agent_listen; /* the serial port's socket, bound, while qemu is forked */
+	int              monitor;      /* (sleep true): qemu's QMP, our end, or -1 */
+	int              monitor_peer; /* its other end, for qemu to take as it is forked */
+	int              monitor_ready; /* the greeting read and capabilities said */
 	uint8_t          token[32];    /* what a host after this one resumes with */
 	char             persisted[4800];  /* what persist() last gave */
 	hull_wire        wire;
@@ -454,6 +457,8 @@ static void release(hull_machine *m)
 	forget_ssh(m);
 	if (m->pidfd >= 0)
 		close(m->pidfd);
+	if (m->monitor >= 0)
+		close(m->monitor);
 	pthread_mutex_destroy(&m->lock);
 	pthread_mutex_destroy(&m->send_lock);
 	pthread_cond_destroy(&m->done_cond);
@@ -2133,6 +2138,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        cpus[16];
 	char        vsock[64];
 	char        agent_chardev[4500];
+	char        monitor_chardev[64];
 	char        netdev[64];
 	char        root[9000];
 	char        modules[9000];
@@ -2287,6 +2293,15 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	argv[n++] = console;
 	argv[n++] = "-device";
 	argv[n++] = "virtconsole,chardev=console";
+	/* A sleeping machine's QMP, at the descriptor after the agent's. */
+	if (m->monitor_peer >= 0) {
+		snprintf(monitor_chardev, sizeof monitor_chardev, "socket,id=monitor,fd=%u",
+		         SEGMENT_FD + m->segment_count + (cid == 0u ? 1u : 0u));
+		argv[n++] = "-chardev";
+		argv[n++] = monitor_chardev;
+		argv[n++] = "-mon";
+		argv[n++] = "chardev=monitor,mode=control";
+	}
 	/* Its devices (section 4.13). A USB device on an xHCI controller of
 	 * the guest's, by the host's bus and port, so it is followed when it
 	 * resets and comes back at a new address, as a board does; a serial or
@@ -2579,6 +2594,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 			int      moved_network = -1;
 			int      moved[MAX_SEGMENTS];
 			int      moved_agent = -1;
+			int      moved_monitor = -1;
 			unsigned after = SEGMENT_FD + m->segment_count;
 
 			if (m->network >= 0 && (moved_network = fcntl(m->network, F_DUPFD, 64)) < 0)
@@ -2588,6 +2604,9 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 					_exit(126);
 			if (cid == 0u && (moved_agent = fcntl(m->agent_listen, F_DUPFD, 64)) < 0)
 				_exit(126);
+			if (m->monitor_peer >= 0 &&
+			    (moved_monitor = fcntl(m->monitor_peer, F_DUPFD, 64)) < 0)
+				_exit(126);
 			if (moved_network >= 0 ? dup2(moved_network, NETWORK_FD) < 0 :
 			                         close(NETWORK_FD) != 0 && errno != EBADF)
 				_exit(126);  /* (network none): no passt */
@@ -2596,6 +2615,9 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 					_exit(126);
 			/* The agent's serial socket after the segments' ports. */
 			if (moved_agent >= 0 && dup2(moved_agent, (int)after++) < 0)
+				_exit(126);
+			/* And the monitor's after it, as spawn's argv names it. */
+			if (moved_monitor >= 0 && dup2(moved_monitor, (int)after++) < 0)
 				_exit(126);
 			syscall(SYS_close_range, after, ~0u, 0u);
 		}
@@ -3362,6 +3384,8 @@ static hull_status qemu_create(hull_core *core, hull_buf plan, hull_machine **ou
 	m->network = -1;
 	m->wake = -1;
 	m->pidfd = -1;
+	m->monitor = -1;
+	m->monitor_peer = -1;
 	for (unsigned i = 0u; i < MAX_PORTS; i++)
 		m->listeners[i] = -1;
 	for (unsigned i = 0u; i < MAX_SEGMENTS; i++)
@@ -4043,10 +4067,27 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 			close_segments(m);
 			break;
 		}
+		/* A sleeping machine's monitor, for its wake (hull_qemu_wake). */
+		if (m->sleep) {
+			int pair[2];
+
+			if (m->monitor >= 0)
+				close(m->monitor);
+			m->monitor = -1;
+			m->monitor_ready = 0;
+			if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0) {
+				m->monitor = pair[0];
+				m->monitor_peer = pair[1];
+			}
+		}
 		m->qemu = spawn(m, kernel, mbuf, share_modules, cid);
 		if (cid == 0u) {
 			close(m->agent_listen);
 			m->agent_listen = -1;
+		}
+		if (m->monitor_peer >= 0) {
+			close(m->monitor_peer);
+			m->monitor_peer = -1;
 		}
 		close(m->network);
 		m->network = -1;
@@ -4243,6 +4284,8 @@ static hull_status qemu_adopt(hull_core *core, hull_buf state, hull_machine **ou
 	m->network = -1;
 	m->wake    = -1;
 	m->pidfd   = -1;
+	m->monitor = -1;
+	m->monitor_peer = -1;
 	m->keep    = 1;
 	for (unsigned i = 0u; i < MAX_PORTS; i++)
 		m->listeners[i] = -1;
@@ -5326,6 +5369,93 @@ static const hull_capabilities caps = {
 	.arches         = qemu_arches,    /* the host's own, and under emu the other one */
 };
 
+/* One answer of QMP read into `line`: 1 for a return, 0 for an error,
+ * its words in `line`, -1 for none within five seconds. Events and the
+ * greeting pass by, an answer being the only line opening with these. */
+static int monitor_answer(hull_machine *m, char *line, size_t cap)
+{
+	size_t have = 0u;
+	long   left = 5000;
+
+	while (left > 0 && cap > 1u) {
+		struct pollfd   p = { .fd = m->monitor, .events = POLLIN };
+		struct timespec before;
+		struct timespec after;
+		char           *end;
+		ssize_t         n;
+		int             ready;
+
+		clock_gettime(CLOCK_MONOTONIC, &before);
+		ready = poll(&p, 1u, (int)left);
+		clock_gettime(CLOCK_MONOTONIC, &after);
+		left -= (after.tv_sec - before.tv_sec) * 1000L + (after.tv_nsec - before.tv_nsec) / 1000000L;
+		if (ready < 0 && errno == EINTR)
+			continue;
+		if (ready <= 0)
+			break;
+		n = read(m->monitor, line + have, cap - 1u - have);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;
+		have += (size_t)n;
+		line[have] = '\0';
+		while ((end = strchr(line, '\n')) != NULL) {
+			*end = '\0';
+			if (strncmp(line, "{\"return\"", 9u) == 0)
+				return 1;
+			if (strncmp(line, "{\"error\"", 8u) == 0)
+				return 0;
+			have -= (size_t)(end + 1 - line);
+			memmove(line, end + 1, have + 1u);
+		}
+		if (have == cap - 1u)
+			have = 0u;   /* a line longer than any answer: an event's */
+	}
+	return -1;
+}
+
+/* A command said to QMP, its answer in `line`: 1, 0 or -1 as above. */
+static int monitor_say(hull_machine *m, const char *command, char *line, size_t cap)
+{
+	static const char capabilities[] = "{\"execute\":\"qmp_capabilities\"}\n";
+
+	if (!m->monitor_ready) {
+		if (send(m->monitor, capabilities, sizeof capabilities - 1u, MSG_NOSIGNAL) < 0 ||
+		    monitor_answer(m, line, cap) != 1)
+			return -1;
+		m->monitor_ready = 1;
+	}
+	if (send(m->monitor, command, strlen(command), MSG_NOSIGNAL) < 0)
+		return -1;
+	return monitor_answer(m, line, cap);
+}
+
+/* `hull wake ID`: a guest asleep in S3 woken by qemu's system_wakeup, as
+ * a lid opened or a key pressed wakes a laptop; a guest not asleep is
+ * said to be, qemu itself ignoring the wake then. */
+static hull_status qemu_wake(hull_core *core, hull_machine *m, hull_error *error)
+{
+	char line[4096];
+	int  said;
+
+	(void)core;
+	if (!m->sleep || m->monitor < 0)
+		return fail(error, HULL_ERR_UNSUPPORTED, "the machine does not sleep: (sleep true) "
+		            "is what lets its guest suspend");
+	/* The core's loop alone calls it, so the monitor is never asked
+	 * twice at once. */
+	said = monitor_say(m, "{\"execute\":\"query-status\"}\n", line, sizeof line);
+	if (said == 1 && strstr(line, "\"suspended\"") == NULL)
+		return fail(error, HULL_ERR_RUNTIME, "the machine's guest is not asleep");
+	if (said == 1)
+		said = monitor_say(m, "{\"execute\":\"system_wakeup\"}\n", line, sizeof line);
+	if (said != 1)
+		return fail(error, HULL_ERR_RUNTIME, said == 0 ? "qemu refused the wake" :
+		            "qemu's monitor did not answer");
+	return HULL_OK;
+}
+
 static const hull_engine_ops ops = {
 	.struct_size = sizeof (hull_engine_ops),
 	.create      = qemu_create,
@@ -5344,6 +5474,7 @@ static const hull_engine_ops ops = {
 	.guest_stats  = qemu_guest_stats,
 	.dial         = qemu_dial,
 	.pause        = qemu_pause,
+	.wake         = qemu_wake,
 };
 
 static const hull_engine engine = {

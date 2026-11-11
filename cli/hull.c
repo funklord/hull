@@ -142,7 +142,7 @@ static void usage(FILE *out)
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
 	      "       hull kill [-s SIGNAL] ID | hull stats [--guest] [--over S] ID\n"
-	      "       hull pause ID | hull unpause ID\n"
+	      "       hull pause ID | hull unpause ID | hull wake ID\n"
 	      "       hull segment NAME [impair MACHINE|all in|out|both [KEY=VALUE|down]...]\n"
 	      "       hull segment NAME tamper MACHINE|all in|out|both [KEY=VALUE]...\n"
 	      "       hull segment NAME inject MACHINE|all frame=HEX|size=N [count=N] [every=MS]\n"
@@ -7876,7 +7876,9 @@ static int pause_of(const char *id, int paused)
 			fprintf(stderr, "hull: no core is running, so no machine is\n");
 		return status == 1 ? 1 : 2;
 	}
-	send_request(&wire, paused ? "(5:pause" : "(7:unpause", 1u, id, NULL);
+	/* 2: `hull wake ID`, a (sleep true) machine's guest woken (4.11). */
+	send_request(&wire, paused == 2 ? "(4:wake" : paused ? "(5:pause" : "(7:unpause", 1u, id,
+	             NULL);
 	status = answered(&wire);
 	hull_wire_close(&wire);
 	return status;
@@ -8016,7 +8018,7 @@ static int remote_command(const char *command)
 {
 	static const char *const commands[] = {
 		"run", "up", "plan", "check", "ps", "stop", "kill", "logs", "attach", "exec", "stats",
-		"pause", "unpause", "segment", "ssh", "proxy-ssh", "lease", "pool", "reserve", "release",
+		"pause", "unpause", "wake", "segment", "ssh", "proxy-ssh", "lease", "pool", "reserve", "release",
 		NULL
 	};
 
@@ -8334,6 +8336,8 @@ int main(int argc, char **argv)
 	if ((strcmp(command, "pause") == 0 || strcmp(command, "unpause") == 0) && argc == 3 &&
 	    argv[2][0] != '-')
 		return pause_of(argv[2], command[0] == 'p');
+	if (strcmp(command, "wake") == 0 && argc == 3 && argv[2][0] != '-')
+		return pause_of(argv[2], 2);
 	if (strcmp(command, "stats") == 0) {
 		const char *id = NULL;
 		int         guest = 0;

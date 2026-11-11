@@ -33,6 +33,7 @@ const DIAL     = ('4' << 24) | (':' << 16) | ('d' << 8) | 'i';
 const SEGMENT  = ('7' << 24) | (':' << 16) | ('s' << 8) | 'e';
 const PAUSE    = ('5' << 24) | (':' << 16) | ('p' << 8) | 'a';
 const UNPAUSE  = ('7' << 24) | (':' << 16) | ('u' << 8) | 'n';
+const WAKE     = ('4' << 24) | (':' << 16) | ('w' << 8) | 'a';
 const IMPAIR   = ('6' << 24) | (':' << 16) | ('i' << 8) | 'm';
 const TAMPER   = ('6' << 24) | (':' << 16) | ('t' << 8) | 'a';
 const INJECT   = ('6' << 24) | (':' << 16) | ('i' << 8) | 'n';
@@ -80,6 +81,7 @@ struct client_message {
 		case DIAL:    dial          dial;
 		case PAUSE:   pause         pause;
 		case UNPAUSE: unpause       unpause;
+		case WAKE:    wake          wake;
 		case SEGMENT: segment       segment;
 		case IMPAIR:  impair        impair;
 		case TAMPER:  tamper        tamper;
@@ -440,6 +442,16 @@ struct pause {
 
 struct unpause {
 	preamble u8[9] = "7:unpause";
+	channel        ch;
+	machine_entry  machine;
+	u8  close  [must_eq = ')'];
+}
+
+// A machine whose guest has suspended itself woken by its host, as a
+// laptop's lid opened or its key pressed (project.md section 4.11);
+// answered `done`, or `error` where the guest is not asleep.
+struct wake {
+	preamble u8[6] = "4:wake";
 	channel        ch;
 	machine_entry  machine;
 	u8  close  [must_eq = ')'];

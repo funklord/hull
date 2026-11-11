@@ -1171,6 +1171,31 @@ for refused in 'share:(mutable overlay) (sleep true):wants (projection block)' \
 	[ $? != 0 ] && printf '%s\n' "$out" | grep -q "$(printf '%s' "$refused" | cut -d: -f3)" ||
 		fail "(sleep true) with a ${refused%%:*} was not refused saying why" "$out"
 done
+# `hull wake ID`: the guest asleep for ten minutes by its alarm, woken by
+# the host instead, as a lid opened, once qemu says it is suspended; a
+# wake in the three seconds before it sleeps refused, saying the guest is
+# not asleep.
+printf '(machine (hostname "vlid") (source "dir:./rootfs") (backend vm) (mutable overlay) (projection block) (sleep true) (command "/probe" "sleep" "3" "suspend" "mem" "600" "say" "woken"))\n' \
+	> "$root/vlid.conf"
+(cd / && exec timeout -k 2 120 "$hull" run -f "$root/vlid.conf" > "$root/vlid.out" 2>&1) &
+vlid=$!
+tries=0
+until timeout 10 "$hull" ps 2>/dev/null | grep -q '^vlid .*running' || [ "$tries" -ge 60 ]; do
+	tries=$((tries + 1))
+	sleep 0.5
+done
+early=$(timeout 10 "$hull" wake vlid 2>&1)
+tries=0
+until timeout 10 "$hull" wake vlid > /dev/null 2>&1 || [ "$tries" -ge 60 ]; do
+	tries=$((tries + 1))
+	sleep 0.5
+done
+wait "$vlid"
+cases=$((cases + 1))
+printf '%s\n' "$early" | grep -q 'not asleep' && grep -q '^asleep=' "$root/vlid.out" &&
+	grep -q '^woken$' "$root/vlid.out" ||
+	fail "hull wake did not wake a sleeping guest, or woke one not asleep" \
+		"$early $(cat "$root/vlid.out")"
 
 # The network, out, through passt as the user: the machine's own lo, the
 # host's DNS, and the host's address; but not the host's loopback. Two

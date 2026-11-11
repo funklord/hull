@@ -257,6 +257,12 @@ typedef struct hull_engine_ops {
 	 * paused machine before it stops or signals one. NULL where an
 	 * engine cannot. Appended (rule 4). */
 	hull_status (*pause)(hull_core*, hull_machine*, int paused, hull_error*);
+
+	/* A machine whose guest has suspended itself woken, as by its lid
+	 * opened (project.md section 4.11): HULL_OK once the guest is told,
+	 * else why, a guest not asleep among them. NULL where an engine has no
+	 * guest that sleeps. Appended (rule 4). */
+	hull_status (*wake)(hull_core*, hull_machine*, hull_error*);
 } hull_engine_ops;
 
 /* ---- Registration --------------------------------------------------------

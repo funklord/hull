@@ -3968,6 +3968,27 @@ static void handle_pause(client *c, uint32_t ch, const hull_sexpr_doc *body, int
 	}
 }
 
+/* A sleeping machine's guest woken by its engine. */
+static void handle_wake(client *c, uint32_t ch, const hull_sexpr_doc *body)
+{
+	hull_error             error = { .struct_size = sizeof error };
+	slot                  *s = named(c, ch, body);
+	const hull_engine_ops *ops;
+
+	if (s == NULL)
+		return;
+	ops = s->engine->ops;
+	if (s->exited || s->handle == NULL)
+		send_error(c, ch, "the machine is not running");
+	else if (ops->struct_size < offsetof(hull_engine_ops, wake) + sizeof ops->wake ||
+	         ops->wake == NULL)
+		send_error(c, ch, "that engine has no guest that sleeps");
+	else if (ops->wake(&s->core, s->handle, &error) != HULL_OK)
+		send_error(c, ch, error.detail != NULL ? error.detail : "refused");
+	else
+		send_simple(c, "(4:done", ch);
+}
+
 /* What the host spends on a running machine, as its engine measures it:
  * the engine's `(stats (cpu n) (io n) (memory n))`, on this channel. */
 static void handle_stats(client *c, uint32_t ch, const hull_sexpr_doc *body)
@@ -5357,6 +5378,8 @@ static void handle(client *c, const hull_sexpr_doc *body)
 		handle_pause(c, (uint32_t)ch, body, 1);
 	} else if (hull_msg_is(body, "unpause")) {
 		handle_pause(c, (uint32_t)ch, body, 0);
+	} else if (hull_msg_is(body, "wake")) {
+		handle_wake(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "segment")) {
 		handle_segment(c, (uint32_t)ch, body);
 	} else if (hull_msg_is(body, "tamper")) {
