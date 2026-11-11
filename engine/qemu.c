@@ -213,6 +213,10 @@ struct hull_machine {
 	int              monitor;      /* (sleep true): qemu's QMP, our end, or -1 */
 	int              monitor_peer; /* its other end, for qemu to take as it is forked */
 	int              monitor_ready; /* the greeting read and capabilities said */
+	int              resuming;     /* the next launch is a hibernated machine's resume */
+	char             launch_kernel[4300];  /* what a resume boots again, as the start did */
+	char             launch_modules[4300];
+	int              launch_share;
 	uint8_t          token[32];    /* what a host after this one resumes with */
 	char             persisted[4800];  /* what persist() last gave */
 	hull_wire        wire;
@@ -1249,6 +1253,50 @@ static unsigned long long tree_bytes(const char *root, unsigned depth)
 	return total;
 }
 
+/* A sleeping machine's swap.img, as large as its memory and a page more,
+ * so that a hibernation image always fits, sparse and given mkswap's
+ * header, version 1 of a 4 KiB page: the guest's agent turns it on. */
+static const char *make_swap(hull_machine *m)
+{
+	char           path[4300];
+	unsigned char  page[4096] = { 0 };
+	uint32_t       version = 1u;
+	uint32_t       last = (uint32_t)((uint64_t)m->memory_mib * 256u);
+	int            fd;
+	int            good;
+
+	snprintf(path, sizeof path, "%s/swap.img", m->dir);
+	if ((fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)) < 0)
+		return "the swap's image cannot be made";
+	memcpy(page + 1024, &version, 4u);
+	memcpy(page + 1028, &last, 4u);
+	if (getrandom(page + 1036, 16u, 0) != 16)
+		memset(page + 1036, 0x5a, 16u);
+	memcpy(page + 4086, "SWAPSPACE2", 10u);
+	good = pwrite(fd, page, sizeof page, 0) == (ssize_t)sizeof page &&
+	       ftruncate(fd, (off_t)(last + 1u) * 4096) == 0;
+	close(fd);
+	return good ? NULL : "the swap's image cannot be written";
+}
+
+/* Whether the guest wrote a hibernation image to its swap before its
+ * qemu ended: the kernel's swsusp signature in place of mkswap's. */
+static int hibernated(const hull_machine *m)
+{
+	char path[4300];
+	char sig[10];
+	int  fd;
+	int  yes;
+
+	snprintf(path, sizeof path, "%s/swap.img", m->dir);
+	if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0)
+		return 0;
+	yes = pread(fd, sig, sizeof sig, 4086) == (ssize_t)sizeof sig &&
+	      memcmp(sig, "S1SUSPEND", 9u) == 0;
+	close(fd);
+	return yes;
+}
+
 /* (projection block): root.img in the machine's directory, an ext4 image
  * of the directory by mke2fs -d, as the user, which reads the tree as
  * files and needs no mount. Its UUID, hash seed and time are fixed, and
@@ -2139,6 +2187,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        vsock[64];
 	char        agent_chardev[4500];
 	char        monitor_chardev[64];
+	char        swap[9000];
 	char        netdev[64];
 	char        root[9000];
 	char        modules[9000];
@@ -2286,6 +2335,9 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	else if (cid == 0u)
 		snprintf(m->append + strlen(m->append), sizeof m->append - strlen(m->append),
 		         " hull.host=port");
+	if (m->sleep)
+		snprintf(m->append + strlen(m->append), sizeof m->append - strlen(m->append),
+		         m->resuming ? " hull.swap=1 hull.resume=1" : " hull.swap=1");
 	argv[n++] = m->append;
 	argv[n++] = "-device";
 	argv[n++] = "virtio-serial-pci";
@@ -2362,6 +2414,17 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		argv[n++] = root;
 		argv[n++] = "-device";
 		argv[n++] = "virtio-blk-pci,drive=rootdisk,serial=root";
+		/* A sleeping machine's swap, where its hibernation image goes,
+		 * which the agent finds by its serial. */
+		if (m->sleep) {
+			snprintf(image, sizeof image, "%s/swap.img", m->dir);
+			escaped(path, sizeof path, image);
+			snprintf(swap, sizeof swap, "file=%s,format=raw,if=none,id=swapdisk", path);
+			argv[n++] = "-drive";
+			argv[n++] = swap;
+			argv[n++] = "-device";
+			argv[n++] = "virtio-blk-pci,drive=swapdisk,serial=hull-swap";
+		}
 	} else if (m->virtiofsd != NULL) {
 		argv[n++] = "-chardev";
 		argv[n++] = "socket,id=vfsroot,path=vfs-root.sock";
@@ -3230,6 +3293,54 @@ static int hosted_connect(hull_machine *m)
 	return 0;
 }
 
+static int launch(hull_machine *m, const char *kernel, const char *mbuf, int share_modules,
+                  uint32_t cid);
+
+/*
+ * A hibernated machine resumed: its qemu has ended with an image on the
+ * swap, so a new one is started on the same disks, told hull.resume=1,
+ * and its port dialled; the guest's kernel restores the image, and the
+ * agent that went to sleep goes on writing, mid-session, to the new
+ * socket. 1 where the machine is back, 0 where it is not and ends.
+ */
+static int relaunch(hull_machine *m)
+{
+	int  fd;
+	char old[4300];
+
+	while (waitpid(m->qemu, NULL, 0) < 0 && errno == EINTR)
+		;
+	/* The last qemu's port socket, bound again by the new one. */
+	snprintf(old, sizeof old, "%s/agent.sock", m->dir);
+	unlink(old);
+	m->resuming = 1;
+	fd = launch(m, m->launch_kernel, m->launch_modules, m->launch_share, 0u);
+	m->resuming = 0;
+	if (fd < 0) {
+		char message[600];
+
+		if (fd == -1) {
+			kill_qemu(m);
+			last_line(m, "qemu.log", m->detail, sizeof m->detail);
+		}
+		snprintf(message, sizeof message, "a hibernated machine's qemu did not start again: %s",
+		         m->detail[0] != '\0' ? m->detail : "its agent did not answer");
+		host->log(m->core, 3, message);
+		return 0;
+	}
+	pthread_mutex_lock(&m->send_lock);
+	hull_wire_close(&m->wire);
+	if (hull_wire_open(&m->wire, fd, HULL_WIRE_FROM_AGENT) != 0) {
+		pthread_mutex_unlock(&m->send_lock);
+		close(fd);
+		kill_qemu(m);
+		return 0;
+	}
+	pthread_mutex_unlock(&m->send_lock);
+	host->log(m->core, 6, "a machine hibernated, and its qemu is started again to resume it");
+	return 1;
+}
+
 static void *read_agent(void *arg)
 {
 	hull_machine *m = arg;
@@ -3245,6 +3356,10 @@ static void *read_agent(void *arg)
 		long long        number;
 
 		if (status == HULL_WIRE_WAIT)
+			continue;
+		/* The agent's port gone with no bye: a sleeping machine's guest
+		 * may have hibernated, which a new qemu resumes. */
+		if (status != HULL_WIRE_OK && m->sleep && !m->exited && hibernated(m) && relaunch(m))
 			continue;
 		if (status != HULL_WIRE_OK)
 			break;
@@ -3471,7 +3586,7 @@ static void remove_hosted(const char *dir)
 static void remove_files(const char *dir)
 {
 	static const char *const files[] = { "initrd", "console.log", "qemu.log", "passt.log",
-	                                     "root.img", "agent.sock",
+	                                     "root.img", "swap.img", "agent.sock",
 	                                     "passt.pid" /* written by a core before 2026-10-21 */ };
 	char path[4200];
 
@@ -3820,6 +3935,65 @@ static hull_status hosted_start(hull_core *core, hull_machine *m, hull_error *er
 	return HULL_OK;
 }
 
+/* One qemu for the machine, started and dialled: its passt, its
+ * segments' ports, the agent's socket and a sleeping machine's monitor
+ * made for it and handed over. The agent's descriptor; -1 where qemu ran
+ * and the agent was not reached, for the start to try another context id;
+ * -2 where qemu did not run, why in m->detail. The start calls it, and a
+ * hibernated machine's reader again for its resume. */
+static int launch(hull_machine *m, const char *kernel, const char *mbuf, int share_modules,
+                  uint32_t cid)
+{
+	const char *reason;
+
+	/* A passt each time: the last ended with its qemu. */
+	if ((reason = start_network(m)) != NULL) {
+		if (reason != m->detail)
+			snprintf(m->detail, sizeof m->detail, "%s", reason);
+		return -2;
+	}
+	if ((reason = open_segments(m)) != NULL) {
+		close(m->network);
+		m->network = -1;
+		return -2;
+	}
+	if (cid == 0u && (m->agent_listen = agent_socket(m)) < 0) {
+		snprintf(m->detail, sizeof m->detail, "the agent's serial socket: %s", strerror(errno));
+		close(m->network);
+		m->network = -1;
+		close_segments(m);
+		return -2;
+	}
+	/* A sleeping machine's monitor, for its wake (hull_qemu_wake). */
+	if (m->sleep) {
+		int pair[2];
+
+		if (m->monitor >= 0)
+			close(m->monitor);
+		m->monitor = -1;
+		m->monitor_ready = 0;
+		if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0) {
+			m->monitor = pair[0];
+			m->monitor_peer = pair[1];
+		}
+	}
+	m->qemu = spawn(m, kernel, mbuf, share_modules, cid);
+	if (cid == 0u) {
+		close(m->agent_listen);
+		m->agent_listen = -1;
+	}
+	if (m->monitor_peer >= 0) {
+		close(m->monitor_peer);
+		m->monitor_peer = -1;
+	}
+	close(m->network);
+	m->network = -1;
+	close_segments(m);
+	if (m->qemu < 0)
+		return -2;
+	return dial(m, cid);
+}
+
 static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *error)
 {
 	struct utsname name;
@@ -4027,6 +4201,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	}
 	if ((reason = make_dir(m)) != NULL ||
 	    (m->block_root && (reason = build_root_image(m)) != NULL) ||
+	    (m->sleep && (reason = make_swap(m)) != NULL) ||
 	    (reason = write_initramfs(m, mbuf, load_modules)) != NULL ||
 	    (reason = open_listeners(m)) != NULL) {
 		if (reason != m->detail)
@@ -4034,6 +4209,11 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		remove_dir(m);
 		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	}
+
+	/* What a hibernated machine's resume boots again (relaunch()). */
+	snprintf(m->launch_kernel, sizeof m->launch_kernel, "%s", kernel);
+	snprintf(m->launch_modules, sizeof m->launch_modules, "%s", mbuf);
+	m->launch_share = share_modules;
 
 	/* A context id is the host's to share among every VM: one taken
 	 * makes qemu refuse it, and another is tried. */
@@ -4049,52 +4229,9 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 			cid = 3u + cid % 0x7ffffff0u;
 		}
 		m->done = 0;
-		/* A passt each time: the last ended with its qemu. */
-		if ((reason = start_network(m)) != NULL) {
-			if (reason != m->detail)
-				snprintf(m->detail, sizeof m->detail, "%s", reason);
+		fd = launch(m, kernel, mbuf, share_modules, cid);
+		if (fd == -2)
 			break;
-		}
-		if ((reason = open_segments(m)) != NULL) {
-			close(m->network);
-			m->network = -1;
-			break;
-		}
-		if (cid == 0u && (m->agent_listen = agent_socket(m)) < 0) {
-			snprintf(m->detail, sizeof m->detail, "the agent's serial socket: %s", strerror(errno));
-			close(m->network);
-			m->network = -1;
-			close_segments(m);
-			break;
-		}
-		/* A sleeping machine's monitor, for its wake (hull_qemu_wake). */
-		if (m->sleep) {
-			int pair[2];
-
-			if (m->monitor >= 0)
-				close(m->monitor);
-			m->monitor = -1;
-			m->monitor_ready = 0;
-			if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0) {
-				m->monitor = pair[0];
-				m->monitor_peer = pair[1];
-			}
-		}
-		m->qemu = spawn(m, kernel, mbuf, share_modules, cid);
-		if (cid == 0u) {
-			close(m->agent_listen);
-			m->agent_listen = -1;
-		}
-		if (m->monitor_peer >= 0) {
-			close(m->monitor_peer);
-			m->monitor_peer = -1;
-		}
-		close(m->network);
-		m->network = -1;
-		close_segments(m);
-		if (m->qemu < 0)
-			break;
-		fd = dial(m, cid);
 		m->cid = cid;
 		if (fd < 0) {
 			kill_qemu(m);
@@ -5269,9 +5406,10 @@ static const hull_cap_entry entries[] = {
 	  "none the dropbear `hull sshd fetch` keeps, with a host key and the user's "
 	  "authorized_keys the core delivers; refused at start where there is neither", NULL },
 	{ "sleep",              HULL_SUP_NATIVE,
-	  "the guest's own suspend to RAM (ACPI S3) and to idle on q35, its kernel freezing "
-	  "tasks and suspending every driver; with a block root and block volumes alone, and "
-	  "the agent on a virtio-serial port, which come back from it where a share does not", NULL },
+	  "the guest's own suspend to RAM (ACPI S3) on q35, its kernel freezing tasks and "
+	  "suspending every driver, and its hibernation to a swap disk hull gives it, resumed "
+	  "by a new qemu; with a block root and block volumes alone, and the agent on a "
+	  "virtio-serial port, which come back from it where a share does not", NULL },
 	{ "export",             HULL_SUP_EMULATED,
 	  "the merged tree taken host-side in qemu's namespaces once the workload ends, the "
 	  "overlay mounted there for it", NULL },

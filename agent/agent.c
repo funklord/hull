@@ -72,6 +72,7 @@
 #include <sys/socket.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/swap.h>
 #include <sys/utsname.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -563,6 +564,81 @@ static int cmdline_value(const char *key, char *out, size_t cap)
 	if (cmdline != NULL)
 		fclose(cmdline);
 	return given;
+}
+
+/*
+ * Hibernation, (sleep true)'s S4 (project.md section 4.11): the engine
+ * gives a sleeping machine a swap disk whose serial is hull-swap, and says
+ * hull.swap=1. At every boot the agent turns it on and names it the
+ * kernel's resume device, so that `echo disk > /sys/power/state` has
+ * somewhere to write the image; and at the boot the engine makes after a
+ * hibernation, hull.resume=1, it names the device before anything else
+ * runs, which makes the kernel restore that image, the machine as it was
+ * going on, this boot's agent with it. A boot that finds no image there
+ * goes on as a new one, and says so.
+ */
+static int swap_device(char *node, size_t node_cap, char *number, size_t number_cap)
+{
+	DIR           *block = opendir("/sys/class/block");
+	struct dirent *entry;
+	int            found = 0;
+
+	while (block != NULL && !found && (entry = readdir(block)) != NULL) {
+		char  path[512];
+		char  serial[64] = "";
+		FILE *f;
+
+		if (entry->d_name[0] == '.')
+			continue;
+		snprintf(path, sizeof path, "/sys/class/block/%s/serial", entry->d_name);
+		if ((f = fopen(path, "r")) == NULL)
+			continue;
+		if (fgets(serial, sizeof serial, f) == NULL)
+			serial[0] = '\0';
+		fclose(f);
+		serial[strcspn(serial, "\n")] = '\0';
+		if (strcmp(serial, "hull-swap") != 0)
+			continue;
+		snprintf(path, sizeof path, "/sys/class/block/%s/dev", entry->d_name);
+		if ((f = fopen(path, "r")) == NULL)
+			continue;
+		if (fgets(number, (int)number_cap, f) != NULL) {
+			number[strcspn(number, "\n")] = '\0';
+			snprintf(node, node_cap, "/dev/%s", entry->d_name);
+			found = 1;
+		}
+		fclose(f);
+	}
+	if (block != NULL)
+		closedir(block);
+	return found;
+}
+
+static void hibernation(void)
+{
+	char value[8];
+	char node[300];
+	char number[32];
+	int  resume = cmdline_value("hull.resume", value, sizeof value) && strcmp(value, "1") == 0;
+	FILE *f;
+
+	if (!(cmdline_value("hull.swap", value, sizeof value) && strcmp(value, "1") == 0))
+		return;
+	if (!swap_device(node, sizeof node, number, sizeof number)) {
+		say("swap", "no disk of serial hull-swap");
+		return;
+	}
+	/* Naming the resume device restores an image there at once: from
+	 * here on, where one is, this boot is the one that went to sleep. */
+	if ((f = fopen("/sys/power/resume", "w")) != NULL) {
+		fprintf(f, "%s\n", number);
+		if (fclose(f) != 0 && resume)
+			say("resume", strerror(errno));
+	}
+	if (resume)
+		say("resume", "no image to resume from: a new boot");
+	if (swapon(node, 0) != 0)
+		say("swap", strerror(errno));
 }
 
 /* Whether the kernel's command line has hull.passt=1. */
@@ -2967,6 +3043,7 @@ int main(int argc, char **argv)
 		}
 	}
 	load_modules();
+	hibernation();
 	{
 		FILE *boot = fopen("/hull/boot", "r");
 

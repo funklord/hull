@@ -1171,6 +1171,20 @@ for refused in 'share:(mutable overlay) (sleep true):wants (projection block)' \
 	[ $? != 0 ] && printf '%s\n' "$out" | grep -q "$(printf '%s' "$refused" | cut -d: -f3)" ||
 		fail "(sleep true) with a ${refused%%:*} was not refused saying why" "$out"
 done
+# Hibernation, S4: the guest writes its image to the swap hull gives a
+# sleeping machine and powers off; hull sees the image there, starts a new
+# qemu on the same disks, and the guest's kernel restores it, the probe
+# that hibernated going on in the same process, its boot clock ahead.
+printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) (projection block) (sleep true) (memory "256M") (command "/probe" "write" "/before" "suspend" "disk" "1" "say" "resumed"))\n' \
+	> "$root/vs4.conf"
+cases=$((cases + 1))
+out=$(cd / && timeout 240 "$hull" run -f "$root/vs4.conf" 2>&1)
+got=$?
+[ "$got" = 0 ] && printf '%s\n' "$out" | grep -q '^asleep=[1-9]' &&
+	printf '%s\n' "$out" | grep -q '^resumed$' &&
+	grep -q 'a machine hibernated, and its qemu is started again' "$XDG_RUNTIME_DIR/hull/core.log" ||
+	fail "a hibernated machine was not resumed by a new qemu" "$got $out
+$(tail -3 "$XDG_RUNTIME_DIR/hull/core.log")"
 # `hull wake ID`: the guest asleep for ten minutes by its alarm, woken by
 # the host instead, as a lid opened, once qemu says it is suspended; a
 # wake in the three seconds before it sleeps refused, saying the guest is
