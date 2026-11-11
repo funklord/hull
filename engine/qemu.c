@@ -4301,6 +4301,19 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	waitpid(m->qemu, NULL, 0);
 	m->done = 1;
 	hull_wire_close(&m->wire);
+	/* Where the agent said nothing, the console says where the guest
+	 * stopped, read before its directory goes. */
+	if (strcmp(m->detail, "the guest agent did not answer") == 0) {
+		char line[400];
+
+		last_line(m, "console.log", line, sizeof line);
+		if (line[0] != '\0') {
+			size_t at = strlen(m->detail);
+
+			snprintf(m->detail + at, sizeof m->detail - at, "; the console's last line: %s",
+			         line);
+		}
+	}
 	remove_dir(m);
 	return fail(error, HULL_ERR_RUNTIME, m->detail);
 }
