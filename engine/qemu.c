@@ -99,7 +99,11 @@
 #define MAX_SERIAL   4u   /* isa-serial's indices, ttyS0 to ttyS3 */
 #define MAX_PARALLEL 3u   /* isa-parallel's, parport0 to parport2 */
 #define AGENT_PORT   1u
-#define BOOT_LIMIT   60   /* seconds for the agent to answer, TCG included */
+#define BOOT_LIMIT   60   /* seconds for the agent to answer under KVM */
+/* And under TCG: a minute held for x86 on x86, but amd64 on an arm64
+ * host, translated end to end, took longer to boot than that inside an
+ * emulated arm64 (check-arm64-host, 2026-11-11), as on a slow board. */
+#define EMU_BOOT_LIMIT 300
 #define HOSTED_LIMIT 300  /* and through VirtualBox, nested, in a vm of its own */
 #define CID_TRIES    4
 #define MAX_STREAMS  64u
@@ -2916,10 +2920,11 @@ static int agent_socket(const hull_machine *m)
 	return fd;
 }
 
-/* Connect to the agent, while qemu lives, for BOOT_LIMIT seconds. */
+/* Connect to the agent, while qemu lives, for BOOT_LIMIT seconds, or
+ * EMU_BOOT_LIMIT under TCG. */
 static int dial(hull_machine *m, uint32_t cid)
 {
-	time_t deadline = time(NULL) + BOOT_LIMIT;
+	time_t deadline = time(NULL) + (m->emu ? EMU_BOOT_LIMIT : BOOT_LIMIT);
 
 	/* The serial port's socket: qemu listens on it as soon as it runs,
 	 * and holds what is written until the agent opens the port, so the
@@ -3014,7 +3019,9 @@ static int expect(hull_machine *m, const char *type)
 	hull_sexpr_doc  body;
 	hull_sexpr_form value;
 
-	if (hear(m, &body, 30) != HULL_WIRE_OK) {
+	/* Over a serial port the first answer waits on the guest's boot,
+	 * the socket being qemu's from the start: TCG's limit under emu. */
+	if (hear(m, &body, m->emu ? EMU_BOOT_LIMIT : 30) != HULL_WIRE_OK) {
 		snprintf(m->detail, sizeof m->detail, "the guest agent did not answer");
 		return 0;
 	}
