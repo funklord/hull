@@ -27,21 +27,30 @@
 #define HULL_KERNEL_SHA256  "7d13cd82a1d377e40826c313f5dbbdb2edf1b48c713a375e4cfe5e207749cb4e"
 
 /* Each arch's kernel, the same Debian version: the host's own, amd64,
- * and arm64 for an emu machine of that arch (section 5.3), which boots
- * under qemu-system-aarch64's virt machine. */
+ * and arm64 and riscv64 for an emu machine of that arch (section 5.3),
+ * which boots under qemu-system-aarch64's or qemu-system-riscv64's virt
+ * machine. Debian names riscv64's boot/vmlinux-RELEASE, an uncompressed
+ * Image, where the others are vmlinuz. */
 typedef struct hull_kernel_pin {
 	const char *arch;
-	const char *release;   /* its modules' directory and its vmlinuz's suffix */
+	const char *release;   /* its modules' directory and its kernel's suffix */
 	const char *path;      /* under HULL_DEBIAN_POOL and _SNAPSHOT */
 	const char *sha256;    /* the .deb's */
 	unsigned    megabytes; /* about, for the fetch to say */
+	const char *image;     /* the kernel's name in boot/, before -RELEASE */
 } hull_kernel_pin;
 
 static const hull_kernel_pin hull_kernel_pins[] = {
-	{ "amd64", HULL_KERNEL_RELEASE, HULL_KERNEL_PATH, HULL_KERNEL_SHA256, 108u },
+	{ "amd64", HULL_KERNEL_RELEASE, HULL_KERNEL_PATH, HULL_KERNEL_SHA256, 108u, "vmlinuz" },
 	{ "arm64", "6.12.107+deb13-arm64",
 	  "l/linux/linux-image-6.12.107+deb13-arm64-unsigned_6.12.107-1_arm64.deb",
-	  "2f986ade1a1336423adf2316ea89c3525dd4c05a646b2141626490ca2f388339", 93u },
+	  "2f986ade1a1336423adf2316ea89c3525dd4c05a646b2141626490ca2f388339", 93u, "vmlinuz" },
+	/* riscv64's has no -unsigned package, its image being signed by
+	 * nobody; the sha256 checked against the snapshot's Packages index,
+	 * 2026-11-12. */
+	{ "riscv64", "6.12.107+deb13-riscv64",
+	  "l/linux/linux-image-6.12.107+deb13-riscv64_6.12.107-1_riscv64.deb",
+	  "abe9f65d74b434692149482b031db7a2aaf832921e09f69f775293c0e0c5799c", 112u, "vmlinux" },
 };
 
 /* `arch`'s pin, or NULL where hull fetches no kernel for it. */

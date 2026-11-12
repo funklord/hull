@@ -276,7 +276,7 @@ int hull_kernel_fetch_arch(const char *arch, char *why, size_t cap)
 		snprintf(why, cap, "neither XDG_CACHE_HOME nor HOME names a place for the kernel");
 		return -1;
 	}
-	snprintf(made, sizeof made, "%s/boot/vmlinuz-%s", dir, pin->release);
+	snprintf(made, sizeof made, "%s/boot/%s-%s", dir, pin->image, pin->release);
 	if (access(made, R_OK) == 0) {
 		printf("%s\n", dir);
 		return 0;

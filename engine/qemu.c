@@ -137,6 +137,7 @@ struct hull_machine {
 	hull_core       *core;
 	int              emu;          /* TCG, else KVM */
 	int              arm64;        /* an arm64 guest: qemu-system-aarch64's virt */
+	int              riscv64;      /* a riscv64 guest: qemu-system-riscv64's virt, emu alone */
 	char             arch[16];     /* the guest's, amd64 or arm64, as the spec spells it */
 	char            *root;         /* the dir source, without "dir:" */
 	int              readonly_root;
@@ -522,8 +523,9 @@ static const char *read_sleep(hull_machine *m, const hull_sexpr_doc *doc,
 	m->sleep = hull_access_true(doc, machine, "sleep");
 	if (!m->sleep)
 		return NULL;
-	if (m->arm64)
-		return "(sleep true) is q35's ACPI S3: an arm64 machine, qemu's virt, has no sleep state";
+	if (m->arm64 || m->riscv64)
+		return "(sleep true) is q35's ACPI S3: an arm64 or riscv64 machine, qemu's virt, has no "
+		       "sleep state";
 	if (!m->block_root)
 		return "(sleep true) wants (projection block): Linux's 9p and virtiofs cannot suspend, "
 		       "so a root shared from the host would not come back";
@@ -568,9 +570,11 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	snprintf(m->arch, sizeof m->arch, "%s",
 	         text == NULL || strcmp(text, "host") == 0 ? host_arch() : text);
 	free(text);
-	if (strcmp(m->arch, "amd64") != 0 && strcmp(m->arch, "arm64") != 0)
-		return "the qemu engine runs an amd64 or an arm64 machine";
+	if (strcmp(m->arch, "amd64") != 0 && strcmp(m->arch, "arm64") != 0 &&
+	    strcmp(m->arch, "riscv64") != 0)
+		return "the qemu engine runs an amd64, an arm64 or a riscv64 machine";
 	m->arm64 = strcmp(m->arch, "arm64") == 0;
+	m->riscv64 = strcmp(m->arch, "riscv64") == 0;
 	if (strcmp(m->arch, host_arch()) != 0 && !m->emu)
 		return "a machine of another arch than the host's is emulated: it runs under emu";
 
@@ -718,8 +722,8 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	 * overlay's tmpfs. */
 	if (m->block_root)
 		m->host_overlay = 0;
-	if (m->arm64 && m->block_root)
-		return "an arm64 machine's root is a share: a block projection is x86's so far";
+	if ((m->arm64 || m->riscv64) && m->block_root)
+		return "an arm64 or riscv64 machine's root is a share: a block projection is x86's so far";
 	if (m->composefs != NULL && (m->block_root || m->host_overlay || m->owners != NULL))
 		return "a composefs root is the image over the store's objects: a block projection, "
 		       "layers, an upper, owners and an export are a directory's";
@@ -800,8 +804,8 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			return "a vm has four serial ports: (devices (serial ...)) names more";
 		if (parallel > MAX_PARALLEL)
 			return "a vm has three parallel ports: (devices (parallel ...)) names more";
-		if (m->arm64 && m->device_count > 0u)
-			return "an arm64 machine has no host devices passed to it yet";
+		if ((m->arm64 || m->riscv64) && m->device_count > 0u)
+			return "an arm64 or riscv64 machine has no host devices passed to it yet";
 	}
 	m->memory_mib = 512u;
 	if ((text = hull_access_value(doc, &machine, "memory")) != NULL) {
@@ -1442,6 +1446,8 @@ static const char *write_initramfs(const hull_machine *m, const char *modules, i
 		       "the guest agent, hull-agent beside hull, cannot be read" :
 		       m->arm64 ? "the arm64 guest agent, hull-agent-arm64 beside hull, cannot be read: "
 		                  "it is built where aarch64-linux-gnu-gcc is installed" :
+		       m->riscv64 ? "the riscv64 guest agent, hull-agent-riscv64 beside hull, cannot be "
+		                    "read: it is built where riscv64-linux-gnu-gcc is installed" :
 		                  "the amd64 guest agent, hull-agent-amd64 beside hull, cannot be read: "
 		                  "it is built where x86_64-linux-gnu-gcc is installed";
 	/* A path kernel whose modules the host does not have is taken to have
@@ -2316,7 +2322,8 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	         m->readonly_root || (m->overlay && m->upper == NULL && m->export == NULL) ?
 	         ",readonly=on" : "");
 
-	argv[n++] = m->arm64 ? "qemu-system-aarch64" : "qemu-system-x86_64";
+	argv[n++] = m->arm64 ? "qemu-system-aarch64" : m->riscv64 ? "qemu-system-riscv64" :
+	            "qemu-system-x86_64";
 	argv[n++] = "-nodefaults";
 	argv[n++] = "-no-user-config";
 	argv[n++] = "-display";
@@ -2325,8 +2332,9 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	argv[n++] = "-M";
 	/* virt under KVM takes the host's interrupt controller, a GICv3 where
 	 * qemu's default GICv2 is one KVM cannot give. */
+	/* riscv64's virt boots OpenSBI, qemu's own, before the kernel. */
 	argv[n++] = m->arm64 ? (m->emu ? "virt,virtualization=on" : "virt,gic-version=host") :
-	            m->micro ? MICROVM_OPTIONS : "q35";
+	            m->riscv64 ? "virt" : m->micro ? MICROVM_OPTIONS : "q35";
 	argv[n++] = "-accel";
 	argv[n++] = m->emu ? "tcg" : "kvm";
 	argv[n++] = "-cpu";
@@ -2552,7 +2560,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	 * its own (section 8.1 item 3); an arm64 machine's is arm64's, `--arch
 	 * arm64`'s, where amd64's would not run. Not fetched, there is no share, and the
 	 * agent says so if the image needs it. */
-	if (m->ssh.data != NULL && hull_sshd_dir_of(m->arm64 ? "arm64" : "amd64", path, sizeof path) == 0) {
+	if (m->ssh.data != NULL && hull_sshd_dir_of(guest_arch(m), path, sizeof path) == 0) {
 		char dropbear[8600];
 
 		snprintf(dropbear, sizeof dropbear, "%s/%s", path, HULL_SSHD_DROPBEAR);
@@ -2890,7 +2898,7 @@ static int micro_fits(const hull_machine *m, char *kernel, size_t cap)
 	char       *slash;
 	unsigned    transports = MICROVM_FIXED + m->volume_count + m->segment_count;
 
-	if (m->profile_full || m->sleep || m->arm64 || m->emu || m->device_count != 0u ||
+	if (m->profile_full || m->sleep || m->arm64 || m->riscv64 || m->emu || m->device_count != 0u ||
 	    m->transport == 3 ||
 	    transports > MICROVM_TRANSPORTS || !qemu_has_microvm())
 		return 0;
@@ -4099,7 +4107,8 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	 * distribution's kernel: a workload wanting a module outside hull's
 	 * set is a full machine's. */
 	if (!m->kernel_hull && !m->kernel_fetched && m->kernel_path == NULL && !m->kernel_image &&
-	    !m->profile_full && !m->sleep && agent_path(kbuf, sizeof kbuf, host_arch()) && strrchr(kbuf, '/') != NULL) {
+	    !m->profile_full && !m->sleep && !m->riscv64 &&
+	    agent_path(kbuf, sizeof kbuf, host_arch()) && strrchr(kbuf, '/') != NULL) {
 		snprintf(strrchr(kbuf, '/'), sizeof kbuf - (size_t)(strrchr(kbuf, '/') - kbuf),
 		         "/vmlinuz-hull%s", m->arm64 ? "-arm64" : "");
 		m->kernel_hull = access(kbuf, R_OK) == 0;
@@ -4116,6 +4125,9 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		const char *arch = m->arm64 ? "-arm64" : "";
 		char        dep[4400];
 
+		if (m->riscv64)
+			return fail(error, HULL_ERR_RUNTIME, "(kernel hull) is built for amd64 and arm64: a "
+			            "riscv64 machine boots Debian's, `hull kernel fetch --arch riscv64`'s");
 		if (!agent_path(kbuf, sizeof kbuf, host_arch()) || strrchr(kbuf, '/') == NULL)
 			return fail(error, HULL_ERR_RUNTIME, "hull's own kernel cannot be found");
 		snprintf(strrchr(kbuf, '/'), sizeof kbuf - (size_t)(strrchr(kbuf, '/') - kbuf),
@@ -4152,7 +4164,8 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 
 		if (pin == NULL || hull_kernel_dir_of(guest_arch(m), fetched, sizeof fetched) != 0)
 			fetched[0] = '\0';
-		snprintf(kbuf, sizeof kbuf, "%s/boot/vmlinuz-%s", fetched, pin != NULL ? pin->release : "");
+		snprintf(kbuf, sizeof kbuf, "%s/boot/%s-%s", fetched, pin != NULL ? pin->image : "vmlinuz",
+		         pin != NULL ? pin->release : "");
 		snprintf(mbuf, sizeof mbuf, "%s/lib/modules/%s", fetched, pin != NULL ? pin->release : "");
 		if (fetched[0] == '\0' || access(kbuf, R_OK) != 0) {
 			snprintf(why, sizeof why, "an %s machine boots Debian's %s kernel, and none has "
@@ -5535,14 +5548,15 @@ static const hull_cap_entry entries[] = {
 	 * micro profile and Appendix F's bundled kernel. */
 	{ "vm.profile.micro",    HULL_SUP_EMULATED,
 	  "a q35 machine, about a second to boot, on every kernel but hull's own, which under KVM is "
-	  "a microvm where the machine has no device of the host's; an arm64 machine is "
-	  "qemu's virt under emu", NULL },
+	  "a microvm where the machine has no device of the host's; an arm64 or riscv64 machine "
+	  "is qemu's virt under emu", NULL },
 	{ "vm.profile.full",     HULL_SUP_NATIVE,
-	  "a q35 machine, whatever the kernel; an arm64 machine is qemu's virt", NULL },
+	  "a q35 machine, whatever the kernel; an arm64 or riscv64 machine is qemu's virt", NULL },
 	{ "vm.kernel.bundled",   HULL_SUP_EMULATED,
 	  "hull's own kernel, as (kernel hull), where `make kernel` built it beside hull; else, and "
-	  "under (profile full), the host's own kernel and modules, or for an arm64 machine "
-	  "Debian's arm64 kernel, `hull kernel fetch --arch arm64`'s", NULL },
+	  "under (profile full), the host's own kernel and modules, or for a machine of another "
+	  "arch Debian's kernel of that arch, `hull kernel fetch --arch ARCH`'s; riscv64 has no "
+	  "kernel of hull's", NULL },
 	{ "vm.kernel.path",      HULL_SUP_NATIVE,
 	  "the kernel at the given path, booted as given; its modules are the host's for its "
 	  "release where it has them, else it must have its guest drivers built in", NULL },
@@ -5579,7 +5593,7 @@ static const hull_cap_entry entries[] = {
 static const char *const classes[] = { "vm", "emu", NULL };
 
 /* What emu runs besides the host's own arch (section 5.3). */
-static const char *const qemu_arches[] = { "amd64", "arm64", NULL };
+static const char *const qemu_arches[] = { "amd64", "arm64", "riscv64", NULL };
 
 static const hull_capabilities caps = {
 	.struct_size    = sizeof (hull_capabilities),

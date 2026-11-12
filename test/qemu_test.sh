@@ -3078,6 +3078,125 @@ else
 		done
 		rm -rf "${root:?}/a64db" "${root:?}/cache-a64nossh"
 	fi
+	# riscv64 the same way, 2026-11-12: qemu-system-riscv64's virt booting
+	# OpenSBI and Debian's riscv64 kernel, a vmlinux and not a vmlinuz,
+	# with the agent cross-built. hull builds no riscv64 kernel of its own,
+	# so (kernel hull) is refused, naming the fetch.
+	riscv64_probe=${BUILD_DIR:?}/test/riscv64/rootfs/probe
+	if ! command -v qemu-system-riscv64 > /dev/null ||
+	   [ ! -x "$(dirname "$hull")/hull-agent-riscv64" ] || [ ! -x "$riscv64_probe" ]; then
+		printf 'qemu: riscv64 under emu not tried: no qemu-system-riscv64, hull-agent-riscv64 or riscv64 probe\n'
+	else
+		rm -rf "$root/rvroot"
+		mkdir -p "$root/rvroot/proc" "$root/rvroot/dev" "$root/rvroot/sys"
+		cp "$riscv64_probe" "$root/rvroot/probe"
+		printf '(machine (source "dir:./rvroot") (backend emu) (arch riscv64) (hostname "qrv") %s)\n' \
+			'(command "/probe" "say" "from riscv64" "host" "read" "/proc/sys/kernel/arch" "exit" "5")' \
+			> "$root/rv.conf"
+		printf '(machine (source "dir:./rvroot") (backend emu) (arch riscv64) %s %s)\n' \
+			'(tuning (vm (kernel hull)))' '(command "/probe")' > "$root/rvhull.conf"
+		rvnone=$(mktemp -d "$root/run-rvnone.XXXXXX")
+		rvrun=$(mktemp -d "$root/run-rv.XXXXXX")
+		name='a riscv64 machine with no riscv64 kernel fetched'
+		out=$(cd / && XDG_RUNTIME_DIR=$rvnone XDG_CACHE_HOME="$root/cache-empty" timeout 60 \
+			"$hull" run -f "$root/rv.conf" 2>&1)
+		got=$?
+		has 125 '`hull kernel fetch --arch riscv64` downloads it'
+		name='(kernel hull) on riscv64'
+		out=$(cd / && XDG_RUNTIME_DIR=$rvnone XDG_CACHE_HOME="$root/cache-empty" timeout 60 \
+			"$hull" run -f "$root/rvhull.conf" 2>&1)
+		got=$?
+		has 125 'is built for amd64 and arm64'
+		name='kernel fetch --arch riscv64'
+		out=$(XDG_CACHE_HOME="$root/cache" timeout 300 "$hull" kernel fetch --arch riscv64 2>&1)
+		got=$?
+		if [ "$got" -ne 0 ] && printf '%s\n' "$out" | grep -q 'answered\|could not\|resolve\|connect'; then
+			printf 'qemu: riscv64 under emu not tried: %s\n' "$out"
+		else
+			has 0 "^$root/cache/hull/kernel-riscv64-[0-9]"
+			name='a riscv64 machine under emu'
+			out=$(cd / && XDG_RUNTIME_DIR=$rvrun XDG_CACHE_HOME="$root/cache" timeout 300 \
+				"$hull" run -f "$root/rv.conf" 2>&1)
+			got=$?
+			has 5 '^from riscv64$'
+			has 5 '^host=qrv$'
+			has 5 '^read=riscv64$'
+			# (ssh true) with no sshd in the image: riscv64's dropbear,
+			# `hull sshd fetch --arch riscv64`'s, logged into by real ssh as
+			# root against the machine's own host key, as arm64's above.
+			name='hull sshd fetch --arch riscv64'
+			out=$(XDG_CACHE_HOME="$root/cache" timeout 120 "$hull" sshd fetch --arch riscv64 2>&1)
+			got=$?
+			has 0 'dropbear-riscv64-'
+			rvdbrt=$(mktemp -d /dev/shm/hull-qrvd.XXXXXX 2>/dev/null)
+			if [ "$got" = 0 ] && [ -n "$rvdbrt" ]; then
+				chmod 700 "$rvdbrt"
+				rm -rf "$root/rvdb"
+				mkdir -p "$root/rvdb/bin" "$root/rvdb/etc" "$root/rvdb/run" "$root/rvdb/tmp" \
+					"$root/rvdb/proc" "$root/rvdb/dev" "$root/rvdb/sys" "$root/rvdb/root"
+				cp "$riscv64_probe" "$root/rvdb/bin/sh"
+				printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/rvdb/etc/passwd"
+				chmod 755 "$root/rvdb"
+				printf '(machine (source "dir:./rvdb") (backend emu) (arch riscv64) %s %s)\n' \
+					'(mutable overlay) (hostname "qrvdb") (ssh true)' \
+					'(command "/bin/sh" "-c" "probe say ready sleep 600")' > "$root/rvdb.conf"
+				rm -f "$root/home/.ssh/rvkey" "$root/home/.ssh/rvkey.pub"
+				ssh-keygen -q -t ed25519 -N '' -C hull-test-rv -f "$root/home/.ssh/rvkey"
+				{
+					printf 'Host qrvdb.hull\n'
+					printf '  ProxyCommand env XDG_RUNTIME_DIR=%s %s proxy-ssh %%h\n' "$rvdbrt" "$hull"
+					printf '  User root\n  IdentityFile %s\n  IdentitiesOnly yes\n' "$root/home/.ssh/rvkey"
+					printf '  BatchMode yes\n  ConnectTimeout 20\n  LogLevel error\n'
+					printf '  StrictHostKeyChecking yes\n  UserKnownHostsFile %s\n' "$root/rvdb.known"
+				} > "$root/rvdb.ssh"
+				rm -f "$root/rvdb.out" "$root/rvdb.known"
+				(cd / && exec env XDG_RUNTIME_DIR="$rvdbrt" XDG_CACHE_HOME="$root/cache" timeout -k 2 400 \
+					"$hull" run -f "$root/rvdb.conf" > "$root/rvdb.out" 2>&1) &
+				runner=$!
+				tries=0
+				until grep -q '^ready$' "$root/rvdb.out" 2>/dev/null || [ "$tries" -ge 240 ]; do
+					tries=$((tries + 1))
+					sleep 0.5
+				done
+				printf 'qrvdb.hull %s\n' \
+					"$(cut -d' ' -f1,2 "$root/data/hull/machines/qrvdb/host_key.pub" 2>&1)" \
+					> "$root/rvdb.known"
+				tries=0
+				until timeout 20 ssh -F "$root/rvdb.ssh" qrvdb.hull 'probe say up' < /dev/null 2>/dev/null |
+				      grep -q '^up$' || [ "$tries" -ge 60 ]; do
+					tries=$((tries + 1))
+					sleep 1
+				done
+				who=$(timeout 20 ssh -F "$root/rvdb.ssh" qrvdb.hull 'probe uid host' < /dev/null 2>&1)
+				XDG_RUNTIME_DIR="$rvdbrt" timeout 30 "$hull" stop qrvdb > /dev/null 2>&1
+				wait "$runner"
+				cases=$((cases + 1))
+				[ "$who" = "$(printf 'uid=0\nhost=qrvdb')" ] ||
+					fail "ssh did not log in as root to a riscv64 machine through riscv64's dropbear" \
+						"$who; $(cat "$root/rvdb.out")"
+				rm -f "$root/home/.ssh/rvkey" "$root/home/.ssh/rvkey.pub"
+				rm -rf "${root:?}/rvdb"
+			fi
+			if [ -n "$rvdbrt" ]; then
+				tries=0
+				while [ -S "$rvdbrt/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+					tries=$((tries + 1))
+					sleep 0.25
+				done
+				rm -rf "${rvdbrt:?}"
+			fi
+		fi
+		# Each core gone by its idle second before its directory is.
+		for run in "$rvnone" "$rvrun"; do
+			tries=0
+			while [ -S "$run/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+				tries=$((tries + 1))
+				sleep 0.25
+			done
+			rm -rf "${run:?}"
+		done
+		rm -rf "${root:?}/rvroot"
+	fi
 	# Only emu runs another arch: on vm, refused at plan.
 	printf '(machine (source "dir:./a64root") (backend vm) (arch arm64) (command "/probe"))\n' \
 		> "$root/a64vm.conf"

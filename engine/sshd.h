@@ -74,6 +74,27 @@ static const hull_sshd_package hull_sshd_packages_arm64[] = {
 	  "c949831340f9af9e70a6dab740fc9cdff6dd0b249bf9d7d640f6486036476e05" },
 };
 
+/* riscv64's, for a riscv64 machine under emu, the same versions, each
+ * sha256 from the snapshot's riscv64 Packages index, 2026-11-12. */
+static const hull_sshd_package hull_sshd_packages_riscv64[] = {
+	{ "d/dropbear/dropbear-bin_2025.89-1~deb13u1_riscv64.deb",
+	  "7a89a31fc438b30319631cc3eed65ef34921b636778117ed0d819bb4a420f243" },
+	{ "libt/libtomcrypt/libtomcrypt1_1.18.2+dfsg-7+b2_riscv64.deb",
+	  "b189c4f25bd57a0326b8c86f041a1bd7610df5b7f49ac0a4c93796450d97178a" },
+	{ "libt/libtommath/libtommath1_1.3.0-1_riscv64.deb",
+	  "3b0e91b9db099f49e330c9c28756ab9500b88fb685ec32a2e206209699a8f90d" },
+	{ "g/gmp/libgmp10_6.3.0+dfsg-3_riscv64.deb",
+	  "f09a7beea39293dc5047af3750d8359c9fe4fd9f35195e7bba5048e5a66b58d8" },
+	{ "z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+b1_riscv64.deb",
+	  "38c52eef58e5fc9b13d93f8a7d0a0549c32b4f00402a778d39a135254f554314" },
+	{ "libx/libxcrypt/libcrypt1_4.4.38-1_riscv64.deb",
+	  "85ae0d868b2a27043249ca332dac782a1a67e3171139b0f57d63414eaf4ec887" },
+	{ "g/glibc/libc6_2.41-12+deb13u4_riscv64.deb",
+	  "77f0da760da3eab6318917857669ec23556b4e1ee489218cb966884a11b0d967" },
+	{ "o/openssh/openssh-sftp-server_10.0p1-7+deb13u4_riscv64.deb",
+	  "9aa7e12ac1e9b76237f6cf230fa2d794f5ac6fac1ea80259ed28ae828c8fbff8" },
+};
+
 /* What differs between the two: dropbear as Debian builds it and as hull
  * runs it, its two paths rewritten (above); the loader it names; where
  * the libraries are. */
@@ -92,6 +113,8 @@ typedef struct hull_sshd_arch {
 #define HULL_SSHD_LOADER_AMD64 HULL_SSHD_LIBS_AMD64 "/ld-linux-x86-64.so.2"
 #define HULL_SSHD_LIBS_ARM64   "usr/lib/aarch64-linux-gnu"
 #define HULL_SSHD_LOADER_ARM64 HULL_SSHD_LIBS_ARM64 "/ld-linux-aarch64.so.1"
+#define HULL_SSHD_LIBS_RISCV64   "usr/lib/riscv64-linux-gnu"
+#define HULL_SSHD_LOADER_RISCV64 HULL_SSHD_LIBS_RISCV64 "/ld-linux-riscv64-lp64d.so.1"
 
 static const hull_sshd_arch hull_sshd_arches[] = {
 	{ "amd64", hull_sshd_packages, sizeof hull_sshd_packages / sizeof hull_sshd_packages[0],
@@ -103,6 +126,11 @@ static const hull_sshd_arch hull_sshd_arches[] = {
 	  "800a3be86c192a94008853f033f66bf505ca457fdc20d4cdb703d021afcb7750",
 	  "c7403dbc89a3f536682f19b5f64ba0a6b9f5575dda8d4713d2f90a7f91556a93",
 	  "/lib/ld-linux-aarch64.so.1", HULL_SSHD_LIBS_ARM64, HULL_SSHD_LOADER_ARM64 },
+	{ "riscv64", hull_sshd_packages_riscv64,
+	  sizeof hull_sshd_packages_riscv64 / sizeof hull_sshd_packages_riscv64[0],
+	  "f6a2cf1619813ee3314c5d41ce37ab4f05c3395a89758df289920c40889a9bc5",
+	  "f8a48b40781c430344fb521204c6fa433f77356f5177b2cdc9e6df5e4702c943",
+	  "/lib/ld-linux-riscv64-lp64d.so.1", HULL_SSHD_LIBS_RISCV64, HULL_SSHD_LOADER_RISCV64 },
 };
 
 /* `arch`'s, or NULL where hull fetches none for it. */
@@ -124,10 +152,16 @@ static inline const hull_sshd_arch *hull_sshd_arch_of(const char *arch)
 #define HULL_SSHD_LIBS        HULL_SSHD_LIBS_ARM64
 #define HULL_SSHD_LOADER      HULL_SSHD_LOADER_ARM64
 #define HULL_SSHD_FETCH_ARCH  " --arch arm64"
-#else
+#elif defined(__riscv) && __riscv_xlen == 64
+#define HULL_SSHD_LIBS        HULL_SSHD_LIBS_RISCV64
+#define HULL_SSHD_LOADER      HULL_SSHD_LOADER_RISCV64
+#define HULL_SSHD_FETCH_ARCH  " --arch riscv64"
+#elif defined(__x86_64__)
 #define HULL_SSHD_LIBS        HULL_SSHD_LIBS_AMD64
 #define HULL_SSHD_LOADER      HULL_SSHD_LOADER_AMD64
 #define HULL_SSHD_FETCH_ARCH  ""
+#else
+#error "hull fetches dropbear for amd64, arm64 and riscv64 alone"
 #endif
 #define HULL_SSHD_DROPBEAR    "usr/sbin/dropbear"
 #define HULL_SSHD_CONVERT     "usr/bin/dropbearconvert"

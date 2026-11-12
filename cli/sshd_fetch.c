@@ -172,7 +172,7 @@ int hull_sshd_fetch(const char *arch_name, char *why, size_t cap)
 	int          status = -1;
 
 	if (arch == NULL) {
-		snprintf(why, cap, "hull fetches no sshd for %s: amd64 and arm64", arch_name);
+		snprintf(why, cap, "hull fetches no sshd for %s: amd64, arm64 and riscv64", arch_name);
 		return -1;
 	}
 	if (hull_sshd_dir_of(arch->name, dir, sizeof dir) != 0) {
