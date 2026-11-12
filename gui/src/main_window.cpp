@@ -210,6 +210,19 @@ void main_window::build_actions()
 	medium_action->setToolTip(QStringLiteral("A running pc machine's floppy or CD swapped, or "
 	                                         "taken out: hull media change ID DRIVE [IMAGE]"));
 	connect(medium_action, &QAction::triggered, this, &main_window::change_medium);
+	/* VirtualBox's Input > Keyboard > Insert Ctrl-Alt-Del and View > Take
+	 * Screenshot: the chord is the desktop's own before any window sees
+	 * it, and a screen to keep is wanted where no VNC client is open. */
+	keys_action = new QAction(QStringLiteral("Insert Ctrl-Alt-Del"), this);
+	keys_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+Alt+End")));
+	keys_action->setToolTip(QStringLiteral("Ctrl-Alt-Del pressed on a running pc machine's "
+	                                       "keyboard: hull key ID ctrl-alt-delete"));
+	connect(keys_action, &QAction::triggered, this, &main_window::insert_ctrl_alt_del);
+	screenshot_action = new QAction(QStringLiteral("Take Screenshot..."), this);
+	screenshot_action->setShortcut(QKeySequence(QStringLiteral("F12")));
+	screenshot_action->setToolTip(QStringLiteral("A running pc machine's screen, a PNG: hull "
+	                                             "screenshot ID FILE"));
+	connect(screenshot_action, &QAction::triggered, this, &main_window::take_screenshot);
 	refresh_action = new QAction(QStringLiteral("Refresh"), this);
 	refresh_action->setShortcut(QKeySequence(QStringLiteral("F5")));
 	connect(refresh_action, &QAction::triggered, this, [this]() {
@@ -237,6 +250,8 @@ void main_window::build_actions()
 	machine->addAction(screen_action);
 	machine->addAction(commit_action);
 	machine->addAction(medium_action);
+	machine->addAction(keys_action);
+	machine->addAction(screenshot_action);
 	machine->addSeparator();
 	machine->addAction(refresh_action);
 	machine->addSeparator();
@@ -535,6 +550,8 @@ void main_window::update_actions()
 	medium_action->setEnabled(state == QStringLiteral("running") &&
 	                          rows[i].held.engine == QStringLiteral("qemu-pc"));
 	screen_action->setEnabled(state == QStringLiteral("running") && !rows[i].held.address.isEmpty());
+	keys_action->setEnabled(medium_action->isEnabled());
+	screenshot_action->setEnabled(medium_action->isEnabled());
 }
 
 void main_window::show_details()
@@ -1115,6 +1132,64 @@ void main_window::change_medium()
 		            : out ? QStringLiteral("%1's %2 taken out").arg(id, drive.trimmed())
 		                  : QStringLiteral("%1's %2 holds %3").arg(id, drive.trimmed(), path));
 	        });
+	connect(process, &QProcess::errorOccurred, this, [this, process](QProcess::ProcessError e) {
+		if (e != QProcess::FailedToStart)
+			return;
+		say(process->errorString());
+		process->deleteLater();
+	});
+	process->start(hull, arguments);
+}
+
+void main_window::insert_ctrl_alt_del()
+{
+	const int i = current();
+
+	if (i < 0 || i >= rows.size() || !rows[i].is_held)
+		return;
+	run_for({ QStringLiteral("key"), rows[i].id, QStringLiteral("ctrl-alt-delete") },
+	        QStringLiteral("Ctrl-Alt-Del pressed on %1").arg(rows[i].id));
+}
+
+void main_window::take_screenshot()
+{
+	const int i = current();
+
+	if (i < 0 || i >= rows.size() || !rows[i].is_held)
+		return;
+	const QString id = rows[i].id;
+	bool          ok = false;
+	const QString file = QInputDialog::getText(
+	    this, QStringLiteral("Take Screenshot"), QStringLiteral("%1's screen, as a PNG, to:").arg(id),
+	    QLineEdit::Normal, QStringLiteral("%1-screen.png").arg(id), &ok)
+	                         .trimmed();
+
+	if (!ok || file.isEmpty())
+		return;
+	/* A relative path is the window's own directory's, as for a medium. */
+	const QString path = QFileInfo(file).absoluteFilePath();
+
+	run_for({ QStringLiteral("screenshot"), id, path },
+	        QStringLiteral("%1's screen is in %2").arg(id, path));
+}
+
+/* `hull ARGUMENTS...`, its word or `done` on the status line. */
+void main_window::run_for(const QStringList &arguments, const QString &done)
+{
+	QProcess *process = new QProcess(this);
+
+	process->setProcessChannelMode(QProcess::MergedChannels);
+	process->setStandardInputFile(QProcess::nullDevice());
+	connect(process, &QProcess::finished, this, [this, process, arguments, done](int code) {
+		const QString said = QString::fromUtf8(process->readAll()).trimmed();
+
+		process->deleteLater();
+		say(code != 0 ? (said.isEmpty() ? QStringLiteral("hull %1 exited %2")
+		                                      .arg(arguments.first())
+		                                      .arg(code)
+		                                : said)
+		              : done);
+	});
 	connect(process, &QProcess::errorOccurred, this, [this, process](QProcess::ProcessError e) {
 		if (e != QProcess::FailedToStart)
 			return;

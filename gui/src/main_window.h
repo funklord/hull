@@ -73,6 +73,9 @@ private:
 	void open_screen();
 	void commit_machine();
 	void change_medium();
+	void insert_ctrl_alt_del();
+	void take_screenshot();
+	void run_for(const QStringList &arguments, const QString &done);
 	void edit_spec();
 	void remove_machine();
 	void ask_add();
@@ -114,6 +117,8 @@ private:
 	QAction        *terminal_action;
 	QAction        *commit_action;
 	QAction        *medium_action;
+	QAction        *keys_action;
+	QAction        *screenshot_action;
 	QAction        *screen_action;
 	QAction        *edit_action;
 	core_request   *logs = nullptr;    /* following the selected machine's */

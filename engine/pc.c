@@ -113,6 +113,8 @@ struct hull_machine {
 	char            run_state[4300];  /* where they are this run: DIR, or a copy in the cache */
 	int             run_state_made;   /* the copy, removed at the end */
 	pid_t           swtpm;
+	long            boot_key;       /* (boot_key N): Enter, each second for N, from the start */
+	pthread_t       presser;
 	char           *nic;            /* (tuning (pc (nic ...))), or NULL for ne2k_pci */
 	char           *name;
 	int             network;        /* (network nat) */
@@ -135,6 +137,7 @@ struct hull_machine {
 	int             monitor;        /* qemu's QMP, a socket, or -1 before it starts */
 	int             monitor_peer;   /* its other end, for qemu to take */
 	int             monitor_ready;  /* the greeting read and capabilities said */
+	char            monitor_why[512];  /* qemu's refusal, kept past the call for the core */
 	pthread_mutex_t monitor_lock;
 	hull_stream    *console;        /* the one joined to COM1, or NULL */
 	char           *ssh_dir;        /* (ssh true): the core's material, door.conf beside it */
@@ -752,6 +755,16 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 			m->cpu          = hull_access_value(doc, &pc, "cpu");
 			m->tpm          = hull_access_true(doc, &pc, "tpm");
 			{
+				char *text = hull_access_value(doc, &pc, "boot_key");
+
+				if (text != NULL) {
+					m->boot_key = strtol(text, NULL, 10);
+					free(text);
+					if (m->boot_key < 1 || m->boot_key > 3600)
+						return "pc's boot_key is seconds, at most an hour's";
+				}
+			}
+			{
 				char *state = hull_access_value(doc, &pc, "state");
 
 				if (state != NULL) {
@@ -1147,12 +1160,48 @@ static int launch(hull_machine *m)
 	return 0;
 }
 
+static int         wait_done(hull_machine *m, int ms);
+static const char *monitor_say(hull_machine *m, const char *command, char *why, size_t cap);
+
+/* (boot_key N): Enter pressed by QMP once a second for the first N
+ * seconds, which is what a person at the screen does for a firmware or
+ * loader waiting on a key -- a UEFI disc's "Press any key to boot from CD
+ * or DVD", Windows' among them, which otherwise times out into the next
+ * boot entry with nobody there. Ends with the machine; a paused one is not
+ * pressed. A key too early is lost, not stored, so it repeats rather than
+ * guessing when the prompt is up, and the plan says for how long. */
+static void *press_keys(void *arg)
+{
+	static const char command[] =
+	        "{\"execute\":\"send-key\",\"arguments\":{\"keys\":"
+	        "[{\"type\":\"qcode\",\"data\":\"ret\"}]}}\n";
+	hull_machine *m = arg;
+
+	for (long left = m->boot_key; left > 0; left--) {
+		char why[256];
+		int  paused;
+
+		if (wait_done(m, 1000))
+			break;
+		pthread_mutex_lock(&m->lock);
+		paused = m->paused;
+		pthread_mutex_unlock(&m->lock);
+		if (paused)
+			continue;
+		pthread_mutex_lock(&m->monitor_lock);
+		(void)monitor_say(m, command, why, sizeof why);
+		pthread_mutex_unlock(&m->monitor_lock);
+	}
+	return NULL;
+}
+
 /* The machine's thread: its images, qemu, and what it says to its end. */
 static void *run_machine(void *arg)
 {
 	hull_machine *m = arg;
 	int           failed = 0;
 	int           stopped;
+	int           pressing;
 
 	for (unsigned i = 0u; i < m->media_count && !failed; i++)
 		if (m->media[i].collection != NULL)
@@ -1170,7 +1219,10 @@ static void *run_machine(void *arg)
 		finish(m, 125, 0);
 		return NULL;
 	}
+	pressing = m->boot_key > 0 && pthread_create(&m->presser, NULL, press_keys, m) == 0;
 	read_machine(m);
+	if (pressing)
+		pthread_join(m->presser, NULL);
 	release_state(m);
 	return NULL;
 }
@@ -1383,14 +1435,35 @@ static const char *monitor_say(hull_machine *m, const char *command, char *why, 
  * the machine: what boots next is what the file says. Under (mutable overlay)
  * a floppy goes in write-protected, qemu's snapshot being taken only as it
  * starts, so what overlay promises, the file unchanged, holds. */
+/* A command said to a running machine's QMP: HULL_OK, or why not, qemu's
+ * own words kept in the machine for the core to read after. */
+static hull_status ask_monitor(hull_machine *m, const char *command, hull_error *error)
+{
+	const char *wrong;
+
+	pthread_mutex_lock(&m->lock);
+	if (m->done || m->monitor < 0 || m->paused) {
+		int gone = m->done;
+		int paused = m->paused;
+
+		pthread_mutex_unlock(&m->lock);
+		return gone ? fail(error, HULL_ERR_GONE, "the machine is not running") :
+		       fail(error, HULL_ERR_BUSY, paused ? "the machine is paused" :
+		            "the machine's media are still being made");
+	}
+	pthread_mutex_unlock(&m->lock);
+	pthread_mutex_lock(&m->monitor_lock);
+	wrong = monitor_say(m, command, m->monitor_why, sizeof m->monitor_why);
+	pthread_mutex_unlock(&m->monitor_lock);
+	return wrong != NULL ? fail(error, HULL_ERR_RUNTIME, wrong) : HULL_OK;
+}
+
 static hull_status change_medium(hull_machine *m, const char *drive, const char *path,
                                  hull_error *error)
 {
 	char        command[8192];
 	char        escaped[4200];
-	char        why[512] = "";
 	char        id[16];
-	const char *wrong;
 	int         cdrom = strncmp(drive, "cdrom", 5u) == 0;
 	const char *rest = drive + (cdrom ? 5 : 6);
 	unsigned    wanted = 1u;
@@ -1433,21 +1506,80 @@ static hull_status change_medium(hull_machine *m, const char *drive, const char 
 		         "\"read-only-mode\":\"%s\",\"force\":true}}\n", id, escaped, probe.format,
 		         cdrom || !m->direct ? "read-only" : "read-write");
 	}
-	pthread_mutex_lock(&m->lock);
-	if (m->done || m->monitor < 0 || m->paused) {
-		int gone = m->done;
-		int paused = m->paused;
+	return ask_monitor(m, command, error);
+}
 
-		pthread_mutex_unlock(&m->lock);
-		return gone ? fail(error, HULL_ERR_GONE, "the machine is not running") :
-		       fail(error, HULL_ERR_BUSY, paused ? "the machine is paused" :
-		            "the machine's media are still being made");
+/* `hull key ID KEY...`: each word a chord of qemu's key names joined by
+ * `-`, `ctrl-alt-delete`, pressed together and let go, in order, as by a
+ * person at the machine's keyboard -- what a legacy installer with no
+ * serial console is driven by. `hull type` is this with its text spelled
+ * as keys by the CLI. */
+static hull_status press(hull_machine *m, const char *keys, hull_error *error)
+{
+	char        command[1024];
+	const char *word = keys;
+
+	while (*word != '\0') {
+		size_t   length = strcspn(word, " ");
+		size_t   at;
+		unsigned count = 0u;
+		hull_status said;
+
+		if (length == 0u) {
+			word++;
+			continue;
+		}
+		at = (size_t)snprintf(command, sizeof command,
+		                      "{\"execute\":\"send-key\",\"arguments\":{\"keys\":[");
+		for (size_t i = 0u; i < length; ) {
+			size_t name = strcspn(word + i, "- ");
+
+			if (name == 0u || name > 32u || count == 8u)
+				return fail(error, HULL_ERR_RUNTIME, "a key is a name of qemu's, `ret` or `a`, "
+				            "a chord of up to eight joined by -, `ctrl-alt-delete`");
+			for (size_t c = 0u; c < name; c++)
+				if (!((word[i + c] >= 'a' && word[i + c] <= 'z') ||
+				      (word[i + c] >= '0' && word[i + c] <= '9') || word[i + c] == '_'))
+					return fail(error, HULL_ERR_RUNTIME, "a key's name is lower case letters, "
+					            "digits and _, as qemu's are: `ret`, `spc`, `shift`, `f1`");
+			at += (size_t)snprintf(command + at, sizeof command - at,
+			                       "%s{\"type\":\"qcode\",\"data\":\"%.*s\"}",
+			                       count > 0u ? "," : "", (int)name, word + i);
+			count++;
+			i += name + (word[i + name] == '-');
+		}
+		snprintf(command + at, sizeof command - at, "]}}\n");
+		if ((said = ask_monitor(m, command, error)) != HULL_OK)
+			return said;
+		word += length;
 	}
-	pthread_mutex_unlock(&m->lock);
-	pthread_mutex_lock(&m->monitor_lock);
-	wrong = monitor_say(m, command, why, sizeof why);
-	pthread_mutex_unlock(&m->monitor_lock);
-	return wrong != NULL ? fail(error, HULL_ERR_RUNTIME, wrong) : HULL_OK;
+	return HULL_OK;
+}
+
+/* `hull screenshot ID FILE`: the machine's screen as qemu draws it, a PNG
+ * written by qemu at `path`, absolute -- what a test compares or a person
+ * reads with no VNC client open. */
+static hull_status screenshot(hull_machine *m, const char *path, hull_error *error)
+{
+	char   command[4400];
+	char   escaped[4200];
+	size_t at = 0u;
+
+	if (path == NULL || path[0] != '/')
+		return fail(error, HULL_ERR_RUNTIME, "a screenshot's path is absolute by here");
+	for (const char *c = path; *c != '\0'; c++) {
+		if (at + 3u > sizeof escaped)
+			return fail(error, HULL_ERR_RUNTIME, "the screenshot's path is too long");
+		if ((unsigned char)*c < 0x20u)
+			return fail(error, HULL_ERR_RUNTIME, "the screenshot's path holds a control character");
+		if (*c == '"' || *c == '\\')
+			escaped[at++] = '\\';
+		escaped[at++] = *c;
+	}
+	escaped[at] = '\0';
+	snprintf(command, sizeof command, "{\"execute\":\"screendump\",\"arguments\":"
+	         "{\"filename\":\"%s\",\"format\":\"png\"}}\n", escaped);
+	return ask_monitor(m, command, error);
 }
 
 /* The console's thread: the pipe, to its end, then the stream's end. */
@@ -1521,6 +1653,17 @@ static hull_status pc_exec(hull_core *core, hull_machine *m, hull_buf spec, hull
 		for (unsigned i = 0u; i < count; i++)
 			free(words[i]);
 		return changed == HULL_OK ? finished_stream(core, m, out, error) : changed;
+	}
+	/* `hull key`, `hull type` and `hull screenshot`, likewise. */
+	if (words[0] != NULL && (strcmp(words[0], "key") == 0 || strcmp(words[0], "screen") == 0)) {
+		hull_status done = words[1] == NULL ?
+		                   fail(error, HULL_ERR_RUNTIME, "nothing was given to press or write") :
+		                   words[0][0] == 'k' ? press(m, words[1], error) :
+		                   screenshot(m, words[1], error);
+
+		for (unsigned i = 0u; i < count; i++)
+			free(words[i]);
+		return done == HULL_OK ? finished_stream(core, m, out, error) : done;
 	}
 	asked = words[0] != NULL && strcmp(words[0], "console") == 0;
 	for (unsigned i = 0u; i < count; i++)
@@ -1827,6 +1970,8 @@ static const hull_cap_entry entries[] = {
 	  "machine's own copy", NULL },
 	{ "pc.tpm", HULL_SUP_EMULATED,
 	  "a TPM 2.0 in software, swtpm's, CRB on q35 and TIS on pc", NULL },
+	{ "pc.boot_key", HULL_SUP_NATIVE,
+	  "Enter pressed by qemu's monitor once a second for the seconds given, from the start", NULL },
 	{ "pc.state.path", HULL_SUP_NATIVE,
 	  "its firmware's variables and its TPM's state, kept there across runs under (mutable "
 	  "direct) as its disk is, and copied for the run under an overlay", NULL },

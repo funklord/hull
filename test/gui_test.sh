@@ -323,6 +323,12 @@ if command -v qemu-system-i386 > /dev/null 2>&1; then
 	has "$out" "gui-pc's floppy holds $dir/swap.img" "F9 swaps the floppy"
 	keys "$dir" "b'gui-pc'" "b'\\x1b[20~'" "b'\\r'" "b'\\r'" -- pc.conf
 	has "$out" "gui-pc's floppy taken out" "F9 with no image takes it out"
+	# F12, its screen kept: the name offered taken, a PNG made.
+	keys "$dir" "b'gui-pc'" "b'\\x1b[24~'" "b'\\r'" -- pc.conf
+	has "$out" "gui-pc's screen is in $dir/gui-pc-screen.png" "F12 takes a screenshot"
+	cases=$((cases + 1))
+	[ "$(od -An -tx1 -N4 "$dir/gui-pc-screen.png" 2>/dev/null | tr -d ' ')" = 89504e47 ] ||
+		fail "F12's screenshot is not a PNG"
 	timeout 30 "$hull" stop gui-pc > /dev/null 2>&1
 	wait "$run_pid" 2>/dev/null
 	run_pid=
@@ -332,6 +338,6 @@ fi
 
 rm -rf "${dir:?}/config" "${dir:?}/new" "${dir:?}/newm" "${dir:?}/data" "${dir:?}/screen.txt" \
 	"${dir:?}/wire.pcap" "${dir:?}/spin.img" "${dir:?}/swap.img" "${dir:?}/pc.conf" \
-	"${dir:?}/pc.out"
+	"${dir:?}/pc.out" "${dir:?}/gui-pc-screen.png"
 printf 'gui_test: %d cases, %d failed\n' "$((cases))" "$failures"
 [ "$failures" = 0 ]

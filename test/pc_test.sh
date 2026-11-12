@@ -452,6 +452,51 @@ INIT
 	status 'Secure Boot on the older machine is refused' "$?" 125 "$out"
 	says 'and said to be q35'"'"'s' "$out" '(machine q35)'
 
+	# (boot_key N): Enter, pressed on the machine's keyboard once a second,
+	# as a UEFI disc's "Press any key to boot from CD" wants and nobody is
+	# there to give. The guest's own kernel reads its first virtual
+	# terminal, the keyboard's, and says whether a key came; with no
+	# boot_key none does, and then `hull type` types a line into it,
+	# `hull key` presses its Enter, and `hull screenshot` takes its screen.
+	cat > "$tree/init.sh" <<'INIT'
+#!/bin/busybox sh
+/bin/busybox mount -t devtmpfs none /dev 2>/dev/null
+if read -t 10 line < /dev/tty1; then echo "key=pressed"; else echo "key=none"; fi
+echo "ready-to-type"
+read -t 60 line < /dev/tty1 && echo "typed=$line"
+/bin/busybox poweroff -f
+INIT
+	out=$(timeout 120 "$hull" export --bootable "$tree" "$root/key.img" --init /init.sh 2>&1)
+	status 'a bootable export for the keyboard' "$?" 0 "$out"
+	conf '(source "image:./key.img") (memory "512M") (tuning (pc (firmware uefi) (boot_key 60)))'
+	out=$(timeout 120 "$hull" run -f "$root/hull.conf" 2>&1)
+	status 'a machine pressed a key' "$?" 0 "$out"
+	says 'its kernel read Enter from its keyboard' "$out" 'key=pressed'
+	conf '(source "image:./key.img") (memory "512M") (tuning (pc (firmware uefi)))'
+	timeout 120 "$hull" run -f "$root/hull.conf" > "$root/key.out" 2>&1 &
+	pid=$!
+	n=0
+	while [ "$n" -lt 60 ] && ! grep -qa ready-to-type "$root/key.out"; do
+		sleep 1
+		n=$((n + 1))
+	done
+	says 'with no boot_key, no key came' "$(cat "$root/key.out")" 'key=none'
+	id=$("$hull" ps | awk '$5 == "running" { print $1 }')
+	rm -f "$root/screen.png"
+	out=$("$hull" screenshot "$id" "$root/screen.png" 2>&1)
+	status 'hull screenshot' "$?" 0 "$out"
+	cases=$((cases + 1))
+	[ "$(od -An -tx1 -N4 "$root/screen.png" 2>/dev/null | tr -d ' ')" = 89504e47 ] ||
+		fail "the screenshot is not a PNG" "$(ls -l "$root/screen.png" 2>&1)"
+	out=$("$hull" key "$id" no-such-key 2>&1)
+	status 'a key qemu has no name for is refused' "$?" 125 "$out"
+	out=$("$hull" type "$id" 'Hi, World!~' 2>&1)
+	status 'hull type' "$?" 0 "$out"
+	out=$("$hull" key "$id" ret 2>&1)
+	status 'hull key' "$?" 0 "$out"
+	wait "$pid"
+	says 'the guest read what was typed, shifted and all' "$(cat "$root/key.out")" 'typed=Hi, World!~'
+
 	# The serial bridge: a shell on COM1, driven from the host through
 	# `hull exec ... console`, with nothing of hull's in the guest.
 	cat > "$tree/init.sh" <<'INIT'

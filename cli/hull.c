@@ -160,6 +160,7 @@ static void usage(FILE *out)
 	      "       hull import COMPOSE-FILE | hull import IMAGE DIR\n"
 	      "       hull media import IMAGE DIR | verify DIR | export DIR IMAGE\n"
 	      "       hull media change ID DRIVE [IMAGE]\n"
+	      "       hull key ID KEY... | hull type ID TEXT | hull screenshot ID FILE\n"
 	      "       hull board ls POOL | hull board fix NAME\n"
 	      "       hull vagrant box add NAME FILE\n"
 	      "       hull up [-f COMPOSE-FILE] [--backend B] [--profile P]... [NAME]\n"
@@ -6076,6 +6077,138 @@ static int media_change(const char *id, const char *drive, const char *image)
 	return exec_in(id, words, 3, 0, 0u);
 }
 
+/* A running pc machine, by its id, or 125 said. */
+static int pc_machine(const char *what, const char *id)
+{
+	char arch[32];
+
+	if (list_machines(id, arch, sizeof arch) != 0) {
+		fprintf(stderr, "hull: %s: no machine %s\n", what, id);
+		return 125;
+	}
+	if (strcmp(listed_engine, "qemu-pc") != 0) {
+		fprintf(stderr, "hull: %s: %s is on %s; a pc machine's keyboard and screen are hull's to "
+		        "reach, anything else's own being a shell\n", what, id, listed_engine);
+		return 125;
+	}
+	return 0;
+}
+
+/* `hull key ID KEY...`: keys pressed on a running pc machine's keyboard,
+ * each a name of qemu's or a chord of them, `ret`, `ctrl-alt-delete`, as a
+ * person at it would: the engine's word, by exec, as `media change` is. */
+static int key_in(const char *id, char **keys, int count)
+{
+	char  joined[4096];
+	char *words[2] = { "key", joined };
+	int   status;
+	size_t at = 0u;
+
+	if ((status = pc_machine("key", id)) != 0)
+		return status;
+	for (int i = 0; i < count; i++) {
+		size_t length = strlen(keys[i]);
+
+		if (length == 0u || strchr(keys[i], ' ') != NULL || at + length + 2u > sizeof joined) {
+			fprintf(stderr, "hull: key: `%s` is not a key\n", keys[i]);
+			return 125;
+		}
+		if (at > 0u)
+			joined[at++] = ' ';
+		memcpy(joined + at, keys[i], length);
+		at += length;
+	}
+	joined[at] = '\0';
+	return exec_in(id, words, 2, 0, 0u);
+}
+
+/* `hull type ID TEXT`: the text spelled as the keys of a US keyboard and
+ * pressed, a newline as Enter. A character no such key gives is refused
+ * before anything is pressed. */
+static int type_in(const char *id, const char *text)
+{
+	static const char plain[] = "-=[]\\;',./`";
+	static const char *const plain_names[] = {
+		"minus", "equal", "bracket_left", "bracket_right", "backslash", "semicolon",
+		"apostrophe", "comma", "dot", "slash", "grave_accent"
+	};
+	static const char shifted[] = "!@#$%^&*()_+{}|:\"<>?~";
+	static const char *const shifted_names[] = {
+		"1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "minus", "equal", "bracket_left",
+		"bracket_right", "backslash", "semicolon", "apostrophe", "comma", "dot", "slash",
+		"grave_accent"
+	};
+	char  joined[16384];
+	char *words[2] = { "key", joined };
+	size_t at = 0u;
+	int   status;
+
+	if ((status = pc_machine("type", id)) != 0)
+		return status;
+	for (const char *c = text; *c != '\0'; c++) {
+		char        key[32];
+		const char *hit;
+
+		if (*c >= 'a' && *c <= 'z')
+			snprintf(key, sizeof key, "%c", *c);
+		else if (*c >= 'A' && *c <= 'Z')
+			snprintf(key, sizeof key, "shift-%c", *c - 'A' + 'a');
+		else if (*c >= '0' && *c <= '9')
+			snprintf(key, sizeof key, "%c", *c);
+		else if (*c == ' ')
+			snprintf(key, sizeof key, "spc");
+		else if (*c == '\n')
+			snprintf(key, sizeof key, "ret");
+		else if (*c == '\t')
+			snprintf(key, sizeof key, "tab");
+		else if ((hit = strchr(plain, *c)) != NULL)
+			snprintf(key, sizeof key, "%s", plain_names[hit - plain]);
+		else if ((hit = strchr(shifted, *c)) != NULL)
+			snprintf(key, sizeof key, "shift-%s", shifted_names[hit - shifted]);
+		else {
+			fprintf(stderr, "hull: type: no key of a US keyboard types `%c` (0x%02x); `hull key` "
+			        "presses any of qemu's by name\n", *c, (unsigned char)*c);
+			return 125;
+		}
+		if (at + strlen(key) + 2u > sizeof joined) {
+			fprintf(stderr, "hull: type: the text is too long to type at once\n");
+			return 125;
+		}
+		at += (size_t)snprintf(joined + at, sizeof joined - at, "%s%s", at > 0u ? " " : "", key);
+	}
+	if (at == 0u)
+		return 0;
+	return exec_in(id, words, 2, 0, 0u);
+}
+
+/* `hull screenshot ID FILE`: the machine's screen, a PNG qemu writes. */
+static int screenshot_of(const char *id, const char *file)
+{
+	char  directory[PATH_MAX];
+	char  path[PATH_MAX + 256];
+	char  copy[PATH_MAX];
+	char *words[2] = { "screen", path };
+	const char *slash;
+	int   status;
+
+	if ((status = pc_machine("screenshot", id)) != 0)
+		return status;
+	snprintf(copy, sizeof copy, "%s", file);
+	slash = strrchr(copy, '/');
+	if (slash == NULL ? realpath(".", directory) == NULL :
+	    (copy[slash - copy] = '\0', realpath(slash == copy ? "/" : copy, directory) == NULL)) {
+		fprintf(stderr, "hull: screenshot: %s: %s\n", file, strerror(errno));
+		return 125;
+	}
+	snprintf(path, sizeof path, "%s/%s", strcmp(directory, "/") == 0 ? "" : directory,
+	         slash == NULL ? file : slash + 1);
+	if (path[strlen(path) - 1u] == '/') {
+		fprintf(stderr, "hull: screenshot: %s names no file\n", file);
+		return 125;
+	}
+	return exec_in(id, words, 2, 0, 0u);
+}
+
 /* `hull media verify DIR`: reassembled and held to the hash of what was
  * imported. */
 static int media_verify(const char *dir)
@@ -8305,6 +8438,12 @@ int main(int argc, char **argv)
 		return media_verify(argv[3]);
 	if (strcmp(command, "media") == 0 && (argc == 5 || argc == 6) && strcmp(argv[2], "change") == 0)
 		return media_change(argv[3], argv[4], argc == 6 ? argv[5] : NULL);
+	if (strcmp(command, "key") == 0 && argc >= 4 && argv[2][0] != '-')
+		return key_in(argv[2], argv + 3, argc - 3);
+	if (strcmp(command, "type") == 0 && argc == 4 && argv[2][0] != '-')
+		return type_in(argv[2], argv[3]);
+	if (strcmp(command, "screenshot") == 0 && argc == 4 && argv[2][0] != '-')
+		return screenshot_of(argv[2], argv[3]);
 	if (strcmp(command, "media") == 0 && argc == 5 && strcmp(argv[2], "export") == 0)
 		return media_export(argv[3], argv[4]);
 	if ((strcmp(command, "media") == 0 && argc == 5 && strcmp(argv[2], "import") == 0) ||
