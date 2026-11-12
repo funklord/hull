@@ -562,10 +562,15 @@ const char *hull_access_devices(const hull_sexpr_doc *doc, const hull_sexpr_form
 		{ "pci", HULL_DEVICE_PCI },
 	};
 	hull_sexpr_form devices;
+	hull_sexpr_form root;
+	int             rooted = 0;
 
 	*count = 0u;
 	if (!hull_access_find(doc, machine, "devices", &devices))
 		return NULL;
+	/* Those of (devices (root ...)), after the rest, of the kinds a path
+	 * names, flagged root mode's (section 7). */
+again:
 	for (size_t k = 0u; k < sizeof kinds / sizeof kinds[0]; k++) {
 		hull_sexpr_form entry;
 		hull_sexpr_form item;
@@ -582,6 +587,7 @@ const char *hull_access_devices(const hull_sexpr_doc *doc, const hull_sexpr_form
 				return "a machine is given at most 16 devices";
 			memset(d, 0, sizeof *d);
 			d->kind = kinds[k].kind;
+			d->root = rooted;
 			if (d->kind == HULL_DEVICE_USB) {
 				if (copy_value(doc, &item, "vendor", d->vendor, sizeof d->vendor) < 0 ||
 				    copy_value(doc, &item, "product", d->product, sizeof d->product) < 0 ||
@@ -600,6 +606,11 @@ const char *hull_access_devices(const hull_sexpr_doc *doc, const hull_sexpr_form
 			}
 			(*count)++;
 		}
+	}
+	if (!rooted && hull_access_find(doc, &devices, "root", &root)) {
+		rooted  = 1;
+		devices = root;
+		goto again;
 	}
 	return NULL;
 }

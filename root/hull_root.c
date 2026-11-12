@@ -18,6 +18,14 @@
  *                                   the relay's sockets after it where
  *                                   asked; not persistent, so it goes when
  *                                   the last descriptor of it closes
+ *   hull-root device HASH NAME      the plan on stdin: each device its
+ *                                   (devices (root ...)) names, a node of
+ *                                   the host's the user may not open, made
+ *                                   again as a node of the user's, of the
+ *                                   same kind and number, in
+ *                                   /run/hull-root/UID/NAME, on a tmpfs of
+ *                                   root mode's own that is not nodev, for
+ *                                   the engine to bind in its place
  *
  * Installed setuid root by `make install-root` and by nothing else; a host
  * without it has no root mode. It does the least root has to: it reads the
@@ -54,13 +62,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
+#include <limits.h>
 #include <linux/if_tun.h>
 
 #include "hostnet.h"
@@ -72,6 +84,10 @@
 #define MAX_LISTING (1 << 20)
 
 #define MAX_PLAN (1 << 20)
+
+/* Where the device op makes its nodes: a tmpfs of its own, mounted here
+ * where it is not yet, nosuid and noexec but not nodev, which /run is. */
+#define DEVICES_PATH "/run/hull-root"
 
 /* --- the plan, canonical ------------------------------------------------- */
 
@@ -508,10 +524,139 @@ static int tap(const uint8_t *plan, size_t length, size_t machine)
 	return failed;
 }
 
+/* --- devices -------------------------------------------------------------- */
+
+/* The device op's root part: under DEVICES_PATH, a tmpfs root mode
+ * mounts once, the user's own directory UID, and in it NAME, made anew;
+ * in that, for each path of the plan's (devices (root ...)), a node of
+ * the same kind and number as the host's, named "c" or "b", its major,
+ * ":" and its minor, as the engine names it, owned by the user, 0600.
+ * Every step is by descriptor and never follows a link, and DEVICES_PATH
+ * is root's, so a step the user could turn lands at most in another
+ * directory of the user's on the same tmpfs; NAME is the user's once its
+ * nodes are in it, for the engine to remove. 0, or 1 said. */
+static int devices(const uint8_t *plan, size_t length, size_t machine, const char *name,
+                   uid_t uid, gid_t gid)
+{
+	size_t      start;
+	size_t      end;
+	size_t      value;
+	size_t      at;
+	struct stat st;
+	struct stat run;
+	char        text[32];
+	int         base;
+	int         mine;
+	int         dir;
+	int         made = 0;
+
+	if (!entry_of(plan, length, machine, "devices", &start, &end, &value) ||
+	    !entry_of(plan, length, start, "root", &start, &end, &value))
+		return fail("the plan's machine names no (devices (root ...))", NULL);
+	if (mkdir(DEVICES_PATH, 0755) != 0 && errno != EEXIST)
+		return fail(DEVICES_PATH, strerror(errno));
+	if ((base = open(DEVICES_PATH, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)) < 0)
+		return fail(DEVICES_PATH, strerror(errno));
+	/* One mount, whoever comes first: two at once would hide the first's
+	 * nodes under the second's tmpfs. */
+	if (flock(base, LOCK_EX) != 0 || fstat(base, &st) != 0 || st.st_uid != 0 ||
+	    (st.st_mode & 022) != 0 || stat("/run", &run) != 0) {
+		close(base);
+		return fail(DEVICES_PATH, "it is not root's alone");
+	}
+	if (st.st_dev == run.st_dev) {
+		close(base);
+		if (mount("hull-root", DEVICES_PATH, "tmpfs", MS_NOSUID | MS_NOEXEC,
+		          "mode=0755,size=1m") != 0)
+			return fail("a tmpfs for root mode's device nodes cannot be mounted",
+			            strerror(errno));
+		if ((base = open(DEVICES_PATH, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)) < 0)
+			return fail(DEVICES_PATH, strerror(errno));
+	}
+	snprintf(text, sizeof text, "%u", (unsigned)uid);
+	if ((mkdirat(base, text, 0700) != 0 && errno != EEXIST) ||
+	    (mine = openat(base, text, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)) < 0) {
+		close(base);
+		return fail("the user's directory of device nodes cannot be made", strerror(errno));
+	}
+	close(base);
+	/* The user's, so that the engine, as the user, removes NAME once its
+	 * machine has gone; DEVICES_PATH above it is root's, so the user can
+	 * neither move it nor point it elsewhere, and the tmpfs holds nothing
+	 * else of anybody's. */
+	if (fstat(mine, &st) != 0 || !S_ISDIR(st.st_mode) ||
+	    (st.st_uid == 0 && uid != 0 && fchown(mine, uid, gid) != 0) ||
+	    fstat(mine, &st) != 0 || st.st_uid != uid) {
+		close(mine);
+		return fail("the user's directory of device nodes is not the user's", NULL);
+	}
+	if (mkdirat(mine, name, 0700) != 0 ||
+	    (dir = openat(mine, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)) < 0) {
+		int error = errno;
+
+		close(mine);
+		return fail(name, strerror(error));
+	}
+	/* (root (node "PATH" ...) (serial ...) (parallel ...)). */
+	at = element_end(plan, length, start + 1u, 0u);
+	while (at != 0u && at < end - 1u) {
+		size_t         next = element_end(plan, length, at, 0u);
+		const uint8_t *bytes;
+		size_t         n;
+		size_t         item;
+
+		if (next == 0u || plan[at] != '(' || !atom_at(plan, length, at + 1u, &bytes, &n) ||
+		    !(atom_is(bytes, n, "node") || atom_is(bytes, n, "serial") ||
+		      atom_is(bytes, n, "parallel")))
+			break;
+		for (item = element_end(plan, length, at + 1u, 0u); item != 0u && item < next - 1u;
+		     item = element_end(plan, length, item, 0u)) {
+			char path[PATH_MAX];
+			char real[PATH_MAX];
+			char node[32];
+
+			if (!atom_at(plan, length, item, &bytes, &n) || n >= sizeof path ||
+			    memchr(bytes, '\0', n) != NULL)
+				break;
+			memcpy(path, bytes, n);
+			path[n] = '\0';
+			if (realpath(path, real) == NULL || strncmp(real, "/dev/", 5u) != 0 ||
+			    stat(real, &st) != 0 || !(S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode))) {
+				close(dir);
+				close(mine);
+				return fail("not a device under /dev", path);
+			}
+			snprintf(node, sizeof node, "%c%u:%u", S_ISCHR(st.st_mode) ? 'c' : 'b',
+			         major(st.st_rdev), minor(st.st_rdev));
+			if ((mknodat(dir, node, (st.st_mode & S_IFMT) | 0600, st.st_rdev) != 0 &&
+			     errno != EEXIST) ||
+			    fchownat(dir, node, uid, gid, AT_SYMLINK_NOFOLLOW) != 0) {
+				int error = errno;
+
+				close(dir);
+				close(mine);
+				return fail(path, strerror(error));
+			}
+			made++;
+		}
+		at = next;
+	}
+	if (made == 0 || fchown(dir, uid, gid) != 0) {
+		close(dir);
+		close(mine);
+		return fail(made == 0 ? "the plan's (devices (root ...)) names no device" : name,
+		            made == 0 ? NULL : strerror(errno));
+	}
+	close(dir);
+	close(mine);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	int             setuid_run = getuid() != geteuid() || getgid() != getegid();
 	uid_t           uid = getuid();
+	gid_t           gid = getgid();
 	const char     *conf_path = CONF_PATH;
 	const char     *log_path = LOG_PATH;
 	const char     *why;
@@ -519,8 +664,10 @@ int main(int argc, char **argv)
 	const char     *op = argc > 1 ? argv[1] : "";
 	int             bridging = strcmp(op, "bridge") == 0;
 	int             tapping = strcmp(op, "tap") == 0;
-	int             planned = bridging || tapping;  /* an op that acts, on its plan */
+	int             deviced = strcmp(op, "device") == 0;
+	int             planned = bridging || tapping || deviced;  /* an op that acts, on its plan */
 	char           *bridge_field[] = { (char *)"network.bridge" };
+	char           *device_field[] = { (char *)"devices.root" };
 	char *const    *fields = argv + 3;
 	int             field_count = argc - 3;
 	static uint8_t  plan[MAX_PLAN + 1];
@@ -540,9 +687,9 @@ int main(int argc, char **argv)
 	if (argc < 3 || (strcmp(op, "start") != 0 && strcmp(op, "exec") != 0 &&
 	                 strcmp(op, "stop") != 0 && !planned) ||
 	    ((strcmp(op, "exec") == 0 || strcmp(op, "stop") == 0 || tapping) && argc != 3) ||
-	    (bridging && argc != 4) || argc > 3 + MAX_FIELDS)
+	    ((bridging || deviced) && argc != 4) || argc > 3 + MAX_FIELDS)
 		return fail("usage", "hull-root start HASH FIELD... | exec HASH | stop HASH | "
-		            "bridge HASH PID < PLAN | tap HASH < PLAN");
+		            "bridge HASH PID < PLAN | tap HASH < PLAN | device HASH NAME < PLAN");
 	if (!is_hash(argv[2]))
 		return fail("not a plan's hash", argv[2]);
 	if (bridging) {
@@ -555,6 +702,12 @@ int main(int argc, char **argv)
 		field_count = 1;
 	} else if (tapping) {
 		fields      = bridge_field;
+		field_count = 1;
+	} else if (deviced) {
+		if (!made_of(argv[3], "abcdefghijklmnopqrstuvwxyz0123456789-", 64u) ||
+		    argv[3][0] == '-')
+			return fail("not a name for a machine's devices", argv[3]);
+		fields      = device_field;
 		field_count = 1;
 	} else {
 		for (int i = 3; i < argc; i++)
@@ -610,6 +763,8 @@ int main(int argc, char **argv)
 		at += snprintf(line + at, sizeof line - (size_t)at, " %s", fields[i]);
 	if (bridging && at > 0 && (size_t)at < sizeof line)
 		at += snprintf(line + at, sizeof line - (size_t)at, " machine=%ld", pid);
+	if (deviced && at > 0 && (size_t)at < sizeof line)
+		at += snprintf(line + at, sizeof line - (size_t)at, " name=%s", argv[3]);
 	if (at <= 0 || (size_t)at >= sizeof line - 1u)
 		return fail("the audit line is too long", NULL);
 	line[at++] = '\n';
@@ -641,5 +796,7 @@ int main(int argc, char **argv)
 	if (setuid_run && (setresgid(0, 0, 0) != 0 || setresuid(0, 0, 0) != 0 || clearenv() != 0 ||
 	                   setenv("PATH", "/usr/sbin:/usr/bin:/sbin:/bin", 1) != 0))
 		return fail("root's own ids and environment cannot be had", strerror(errno));
+	if (deviced)
+		return devices(plan, plan_length, machine, argv[3], uid, gid);
 	return bridging ? bridge(plan, plan_length, machine, pid) : tap(plan, plan_length, machine);
 }

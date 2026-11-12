@@ -13,6 +13,10 @@
 extern "C" {
 #endif
 
+/* Where hull-root's device op makes a machine's nodes: a tmpfs of its
+ * own, its directory UID/NAME the user's once made (section 7). */
+#define HULL_ROOT_DEVICES "/run/hull-root"
+
 /* The helper hull runs: HULL_ROOT_HELPER where the environment names one,
  * as the suites do, else where `make install-root` puts it. */
 const char *hull_root_path(void);

@@ -60,7 +60,18 @@ static const char *usable(const char *node, const struct stat *st, char *why, si
 	return why;
 }
 
+/* hull_hostdev_node, and where `check` is 0, a node the user may not
+ * open taken too, for root mode to give (section 7). */
+static const char *node_of(const char *path, int check, hull_hostdev *found, char *why,
+                           size_t cap);
+
 const char *hull_hostdev_node(const char *path, hull_hostdev *found, char *why, size_t cap)
+{
+	return node_of(path, 1, found, why, cap);
+}
+
+static const char *node_of(const char *path, int check, hull_hostdev *found, char *why,
+                           size_t cap)
 {
 	char        real[PATH_MAX];
 	struct stat st;
@@ -79,7 +90,7 @@ const char *hull_hostdev_node(const char *path, hull_hostdev *found, char *why, 
 		snprintf(why, cap, "%s: the path is too long", path);
 		return why;
 	}
-	if (usable(real, &st, why, cap) != NULL)
+	if (check && usable(real, &st, why, cap) != NULL)
 		return why;
 	memcpy(found->node, real, strlen(real) + 1u);
 	if (strcmp(real, path) != 0)
@@ -311,7 +322,7 @@ const char *hull_hostdev_find(hull_device *device, char *why, size_t cap)
 		return hull_hostdev_pci(HULL_SYSFS_PCI, HULL_SYSFS_GROUPS, device->path, &device->host,
 		                        why, cap);
 	if (device->kind != HULL_DEVICE_USB)
-		return hull_hostdev_node(device->path, &device->host, why, cap);
+		return node_of(device->path, !device->root, &device->host, why, cap);
 	return hull_hostdev_usb(HULL_SYSFS_USB, device->vendor[0] != '\0' ? device->vendor : NULL,
 	                        device->vendor[0] != '\0' ? device->product : NULL,
 	                        device->serial[0] != '\0' ? device->serial : NULL,

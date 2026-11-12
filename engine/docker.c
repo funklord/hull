@@ -1207,6 +1207,9 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	if ((reason = hull_access_devices(doc, machine, device, &device_count)) != NULL)
 		return reason;
 	for (unsigned i = 0u; i < device_count; i++)
+		if (device[i].root)
+			return "(devices (root ...)) is root mode's on chroot alone";
+	for (unsigned i = 0u; i < device_count; i++)
 		if (hull_hostdev_find(&device[i], create_detail, sizeof create_detail) != NULL)
 			return create_detail;
 	if (hull_hostdev_claim(m, device, device_count, create_detail, sizeof create_detail) != NULL)

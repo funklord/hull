@@ -470,12 +470,22 @@ static const schema usb_device = TABLE_ACROSS(usb_keys, usb_across);
 #define USB_SERIAL  2u
 #define USB_PORT    3u
 
+/* (devices (root ...)): devices the user may not open, which root mode
+ * alone gives (section 7), named as their kinds are. */
+static const key root_device_keys[] = {
+	{ .name = "serial",   .type = STRINGS, .nonempty = 1, .value = absolute },
+	{ .name = "parallel", .type = STRINGS, .nonempty = 1, .value = absolute },
+	{ .name = "node",     .type = STRINGS, .nonempty = 1, .value = absolute },
+};
+static const schema root_devices = TABLE(root_device_keys);
+
 static const key device_keys[] = {
 	{ .name = "usb",      .type = ENTRIES, .nonempty = 1, .record = &usb_device, .entry = "device" },
 	{ .name = "serial",   .type = STRINGS, .nonempty = 1, .value = absolute },
 	{ .name = "parallel", .type = STRINGS, .nonempty = 1, .value = absolute },
 	{ .name = "node",     .type = STRINGS, .nonempty = 1, .value = absolute },
 	{ .name = "pci",      .type = STRINGS, .nonempty = 1, .value = pci_address },
+	{ .name = "root",     .type = RECORD, .record = &root_devices },
 };
 static const schema devices = TABLE(device_keys);
 

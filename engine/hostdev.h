@@ -40,6 +40,7 @@ typedef struct hull_hostdev {
 	unsigned bus;         /* USB: its bus number */
 	char     ids[12];     /* USB: "0403:6001", as sysfs has them */
 	int      isochronous; /* USB: an endpoint of an interface's is, audio or video */
+	char     granted[320]; /* root mode's node of it, the user's, bound in its place, or "" */
 } hull_hostdev;
 
 /* One device of (devices ...): what the spec names, and once the machine
@@ -51,6 +52,7 @@ typedef struct hull_device {
 	char             serial[128];
 	char             port[32];
 	char             path[256];  /* serial, parallel, node: the path given; pci: the address */
+	int              root;       /* named under (devices (root ...)): root mode's to give */
 	hull_hostdev     host;
 } hull_device;
 

@@ -809,6 +809,8 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		if (why != NULL)
 			return why;
 		for (unsigned i = 0u; i < m->device_count; i++) {
+			if (m->device[i].root)
+				return "(devices (root ...)) is root mode's on chroot alone";
 			serial += m->device[i].kind == HULL_DEVICE_SERIAL;
 			parallel += m->device[i].kind == HULL_DEVICE_PARALLEL;
 		}

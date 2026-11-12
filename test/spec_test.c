@@ -205,6 +205,11 @@ static void test_values(void)
 	NO(M("(devices (pci \"01:00.0\"))"), VALUE, "\"01:00.0\"", "machine.devices.pci");
 	NO(M("(devices (pci \"0000:01:00.A\"))"), VALUE, "\"0000:01:00.A\"", "machine.devices.pci");
 	NO(M("(devices (gpio \"/dev/gpiochip0\"))"), UNKNOWN, "gpio", "machine.devices.gpio");
+	/* Root mode's (section 7): the kinds a path names, and no other. */
+	OK(M("(devices (root (node \"/dev/mem\") (serial \"/dev/ttyS0\")))"));
+	NO(M("(devices (root (usb (device (port \"1-2\")))))"), UNKNOWN, "usb",
+	   "machine.devices.root.usb");
+	NO(M("(devices (root (node \"mem\")))"), VALUE, "\"mem\"", "machine.devices.root.node");
 	NO(M("(restart)"), SHAPE, "(restart)", "machine.restart");
 
 	/* Booleans. */

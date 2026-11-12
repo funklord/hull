@@ -69,7 +69,7 @@ place() { # FROM TO: a binary, and every library it links
 	done
 }
 missing=""
-for tool in sh cp chown chmod mkdir cat sed mount setpriv ip env unshare sleep tr head grep \
+for tool in sh cp chown chmod mkdir mknod cat sed mount setpriv ip env unshare sleep tr head grep \
 	qemu-system-x86_64; do
 	at=$(command -v "$tool" 2> /dev/null || ls /usr/sbin/$tool /sbin/$tool 2> /dev/null | head -1)
 	case $at in
@@ -165,6 +165,27 @@ echo "== relayed"
 as /bin/hull run --accept "\$relayed" -f /tmp/r.conf 2>&1
 echo "status=\$?"
 printf 'nameserver 10.0.2.3\n' > /etc/resolv.conf
+# A device the user may not open, /dev/zero's number in a node root's
+# alone: refused rootless naming its owner, refused unlisted in root
+# mode, and listed, made again as the user's by hull-root and bound in,
+# the machine writing it; its node gone with the machine.
+mknod /dev/hullzero c 1 5 && chmod 600 /dev/hullzero
+printf '(machine (source "dir:/tmp/mroot") (backend chroot) (mutable overlay) (network none) (devices (node "/dev/hullzero")) (command "/probe" "write" "/dev/hullzero"))\n' > /tmp/n.conf
+printf '(machine (source "dir:/tmp/mroot") (backend chroot) (mutable overlay) (network none) (devices (root (node "/dev/hullzero"))) (command "/probe" "kind" "/dev/hullzero" "write" "/dev/hullzero"))\n' > /tmp/d.conf
+chown 1000:1000 /tmp/n.conf /tmp/d.conf
+echo "== rootless device"
+as /bin/hull run -f /tmp/n.conf 2>&1
+echo "status=\$?"
+dtoken=\$(as /bin/hull plan --root-hash -f /tmp/d.conf 2> /dev/null | sed -n 's/.*: --accept //p')
+echo "dtoken=\$dtoken"
+echo "== device unlisted"
+as /bin/hull run --accept "\$dtoken" -f /tmp/d.conf 2>&1
+echo "status=\$?"
+printf 'tester %s devices.root\n' "\${dtoken#root:}" >> /etc/hull/root.conf
+echo "== device listed"
+as /bin/hull run --accept "\$dtoken" -f /tmp/d.conf 2>&1
+echo "status=\$?"
+echo "== nodes=\$(cd /run/hull-root/1000 2> /dev/null && echo *)"
 echo "== listing not root's"
 chown 1000:1000 /etc/hull/root.conf
 as /bin/hull run --accept "\$token" -f /tmp/b.conf 2>&1
@@ -232,6 +253,23 @@ printf '%s\n' "$relayed" | grep -qx 'read=nameserver 172.31.0.1' &&
 	printf '%s\n' "$relayed" | grep -qx 'dns=anything.example rcode 0' &&
 	printf '%s\n' "$relayed" | grep -qx 'status=0' ||
 	fail "a root mode machine on hull0 was not answered through the relay" "$relayed"
+# A device the user may not open: refused rootless with its owner, and
+# in root mode unlisted; listed, the machine writes it through the node
+# hull-root made, which is gone once the machine is.
+cases=$((cases + 1))
+rootless=$(printf '%s\n' "$out" | sed -n '/^== rootless device/,/^status=/p')
+dtoken=$(printf '%s\n' "$out" | sed -n 's/^dtoken=root://p')
+unlisted=$(printf '%s\n' "$out" | sed -n '/^== device unlisted/,/^status=/p')
+listed=$(printf '%s\n' "$out" | sed -n '/^== device listed/,/^status=/p')
+printf '%s\n' "$rootless" | grep -q 'hullzero' &&
+	printf '%s\n' "$rootless" | grep -qx 'status=125' &&
+	printf '%s\n' "$unlisted" | grep -qx "tester $dtoken devices.root" &&
+	printf '%s\n' "$unlisted" | grep -qx 'status=125' &&
+	printf '%s\n' "$listed" | grep -qx 'kind=chr 1:5' &&
+	printf '%s\n' "$listed" | grep -qx 'write=ok' &&
+	printf '%s\n' "$listed" | grep -qx 'status=0' &&
+	printf '%s\n' "$out" | grep -qx '== nodes=\*' ||
+	fail "a device the user may not open was not given by root mode alone, or its node was left" "$out"
 # A vm on hull0 in root mode, nested: its tap hull-root's, the guest
 # addressed on hull0 and its gateway answering, and no tap left once its
 # qemu has gone.
@@ -253,7 +291,8 @@ printf '%s\n' "$log" | grep -q " start $token refused network.bridge\$" &&
 	printf '%s\n' "$log" | grep -q " start $token granted network.bridge\$" &&
 	printf '%s\n' "$log" | grep -Eq " bridge $token granted network.bridge machine=[0-9]+\$" &&
 	printf '%s\n' "$log" | grep -Eq " bridge $handmade_hash granted network.bridge machine=[0-9]+\$" &&
-	printf '%s\n' "$log" | grep -q " tap $vtoken granted network.bridge\$" ||
+	printf '%s\n' "$log" | grep -q " tap $vtoken granted network.bridge\$" &&
+	printf '%s\n' "$log" | grep -Eq " device $dtoken granted devices.root name=[0-9]+-[0-9]+\$" ||
 	fail "the audit log is not what was granted and refused" "$log"
 
 case $rootfs in
