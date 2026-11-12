@@ -247,7 +247,7 @@ SYSTEMD_TEST_FILES = $(addprefix $(BUILD_DIR)/test/systemd/, vm.conf run.sh buil
 VFIO_TEST_FILES = $(addprefix $(BUILD_DIR)/test/vfio/, vm.conf run.sh)
 # What check-fuzz writes, but for what it finds, in $(FUZZ_DIR)/found,
 # which is kept: a crash's input is what reproduces it.
-FUZZ_FILES = $(addprefix $(BUILD_DIR)/fuzz/, json_fuzz unpack_fuzz corpus/json/manifest \
+FUZZ_FILES = $(addprefix $(BUILD_DIR)/fuzz/, json_fuzz unpack_fuzz pack_fuzz corpus/json/manifest \
              corpus/json/array corpus/tar/plain corpus/tar/whiteout corpus/tar/long \
              corpus/tar/gnu corpus/tar/escape)
 
@@ -933,6 +933,8 @@ sanitize-run: $(filter-out $(BUILD_DIR)/test/tree_tar,$(TEST_BINS)) $(HULL)
 	ASAN_OPTIONS=detect_leaks=1 BUILD_DIR='$(BUILD_DIR)' $(BUILD_DIR)/test/hostdev_test
 	ASAN_OPTIONS=detect_leaks=1 BUILD_DIR='$(BUILD_DIR)' $(BUILD_DIR)/test/iso_test
 	ASAN_OPTIONS=detect_leaks=0 BUILD_DIR='$(BUILD_DIR)' sh test/store_test.sh '$(HULL)' '$(SITU_MARK)'
+	ASAN_OPTIONS=detect_leaks=0 BUILD_DIR='$(BUILD_DIR)' sh test/media_test.sh '$(HULL)' \
+		'$(SANITIZE_PROBE)'
 	ASAN_OPTIONS=detect_leaks=0 BUILD_DIR='$(BUILD_DIR)' sh test/pull_test.sh '$(HULL)' \
 		'$(SANITIZE_PROBE)' '$(SITU_MARK)'
 	ASAN_OPTIONS=detect_leaks=0 BUILD_DIR='$(BUILD_DIR)' sh test/broker_test.sh '$(HULL)' '$(SANITIZE_PROBE)'
@@ -962,6 +964,12 @@ $(FUZZ_DIR)/media_fuzz: test/fuzz/media_fuzz.c engine/media.c engine/media.h eng
 	@mkdir -p $(dir $@)
 	$(FUZZ_CC) $(FUZZ_FLAGS) -Iengine -o $@ $(filter %.c,$^)
 
+$(FUZZ_DIR)/pack_fuzz: test/fuzz/pack_fuzz.c store/pack.c $(wildcard store/*.h) \
+                       $(BUILD_DIR)/store/store.o $(BUILD_DIR)/engine/sha256.o \
+                       $(BUILD_DIR)/engine/verity.o $(BUILD_DIR)/engine/tree.o $(SEXPR_OBJS)
+	@mkdir -p '$(@D)'
+	$(FUZZ_CC) $(FUZZ_FLAGS) $(CPPFLAGS) -o $@ $(filter %.c %.o,$^) -lzstd -lz
+
 $(FUZZ_DIR)/import_fuzz: test/fuzz/import_fuzz.c cli/import.c cli/import.h engine/user.c engine/user.h
 	@mkdir -p $(dir $@)
 	$(FUZZ_CC) $(FUZZ_FLAGS) -Icli -Iengine -o $@ $(filter %.c,$^)
@@ -972,8 +980,8 @@ $(FUZZ_DIR)/spec_fuzz: test/fuzz/spec_fuzz.c spec/spec.c spec/spec.h sexpr/sexpr
 	$(FUZZ_CC) $(FUZZ_FLAGS) $(CPPFLAGS) -o $@ $(filter %.c,$^)
 
 check-fuzz: $(FUZZ_DIR)/json_fuzz $(FUZZ_DIR)/unpack_fuzz $(FUZZ_DIR)/media_fuzz $(FUZZ_DIR)/import_fuzz \
-            $(FUZZ_DIR)/spec_fuzz
-	$(PYTHON) test/fuzz/seeds.py '$(FUZZ_DIR)/corpus'
+            $(FUZZ_DIR)/spec_fuzz $(FUZZ_DIR)/pack_fuzz $(HULL)
+	$(PYTHON) test/fuzz/seeds.py '$(FUZZ_DIR)/corpus' '$(HULL)'
 	mkdir -p '$(FUZZ_DIR)/work' '$(FUZZ_DIR)/found'
 	cd '$(FUZZ_DIR)/found' && ../json_fuzz -max_total_time=$(FUZZ_TIME) -max_len=4096 \
 		../corpus/json
@@ -985,6 +993,8 @@ check-fuzz: $(FUZZ_DIR)/json_fuzz $(FUZZ_DIR)/unpack_fuzz $(FUZZ_DIR)/media_fuzz
 		-max_total_time=$(FUZZ_TIME) -max_len=8192 -timeout=10 ../corpus/import
 	cd '$(FUZZ_DIR)/found' && ../spec_fuzz -max_total_time=$(FUZZ_TIME) -max_len=8192 -timeout=10 \
 		../corpus/spec
+	cd '$(FUZZ_DIR)/found' && ../pack_fuzz -max_total_time=$(FUZZ_TIME) -max_len=8192 -timeout=10 \
+		../corpus/pack
 
 # Root mode's native grants with hull-root really setuid root, inside a vm
 # whose guest root is the only root it needs (project.md section 7). Not

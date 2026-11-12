@@ -1,7 +1,9 @@
 """seeds.py -- the corpora check-fuzz starts from, written into the
 directory it is given: JSON a registry sends, and tar layers of each kind
 the unpacker meets -- files, directories, links, whiteouts, long names in
-pax and GNU form, gzip, and paths that try to leave the tree."""
+pax and GNU form, gzip, and paths that try to leave the tree; discs and
+disks for the media importer, a Rock Ridge disc among them; and, where
+hull is named as the second argument, packs it writes, whole and cut."""
 
 import gzip
 import io
@@ -64,6 +66,12 @@ image = os.path.join(disc, 'whole.iso')
 subprocess.check_call([sys.executable, '-I', os.path.join(os.path.dirname(__file__), '..', 'iso.py'),
                        image, 'README.TXT', 'on a disc'])
 with open(image, 'rb') as whole, open(os.path.join(disc, 'seed'), 'wb') as seed:
+	seed.write(whole.read()[16 * 2048:])
+os.unlink(image)
+# The same with a Rock Ridge PX entry naming its file's owner.
+subprocess.check_call([sys.executable, '-I', os.path.join(os.path.dirname(__file__), '..', 'iso.py'),
+                       image, 'README.TXT', 'owned on a disc', '33', '44'])
+with open(image, 'rb') as whole, open(os.path.join(disc, 'rockridge'), 'wb') as seed:
 	seed.write(whole.read()[16 * 2048:])
 os.unlink(image)
 
@@ -193,3 +201,31 @@ with open(os.path.join(spec, 'kinds'), 'w') as f:
 # opens every input as as well.
 with open(os.path.join(spec, 'canonical'), 'wb') as f:
 	f.write(b'(8:manifest(7:version1:1)(5:entry(4:path5:a/b c)(4:kind3:reg)(4:size2:12)))')
+
+# Packs, as `hull pack` writes them, from a tree of a file, an executable
+# and a directory, in a store of their own made and removed here; and one
+# cut inside its index.
+if len(sys.argv) > 2:
+	import shutil
+	import tempfile
+	packs = os.path.join(out, 'pack')
+	os.makedirs(packs, exist_ok=True)
+	work = tempfile.mkdtemp(prefix='hull-seeds-')
+	try:
+		tree = os.path.join(work, 'tree')
+		os.makedirs(os.path.join(tree, 'd'))
+		with open(os.path.join(tree, 'a'), 'w') as f:
+			f.write('hello\n')
+		with open(os.path.join(tree, 'd', 'x'), 'w') as f:
+			f.write('#!/bin/sh\n')
+		os.chmod(os.path.join(tree, 'd', 'x'), 0o755)
+		env = dict(os.environ, XDG_DATA_HOME=os.path.join(work, 'data'),
+		           XDG_RUNTIME_DIR=os.path.join(work, 'run'), HULL_CORE_IDLE='1')
+		os.makedirs(env['XDG_RUNTIME_DIR'], mode=0o700)
+		whole = os.path.join(packs, 'whole')
+		subprocess.check_call([sys.argv[2], 'pack', tree, whole], env=env, timeout=60,
+		                      stdout=subprocess.DEVNULL)
+		with open(whole, 'rb') as f, open(os.path.join(packs, 'cut'), 'wb') as cut:
+			cut.write(f.read()[:60])
+	finally:
+		shutil.rmtree(work)
