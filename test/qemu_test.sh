@@ -1967,8 +1967,15 @@ CHECK
 	cases=$((cases + 1))
 	out=$(XDG_DATA_HOME="$root/cfs/store" timeout 30 "$hull" plan --explain -f "$root/cfsref.conf" \
 		--backend chroot 2>&1)
-	printf '%s\n' "$out" | grep -q 'source\.dir\.overlay' ||
-		fail "a stored source on chroot was not a checkout" "$out"
+	# chroot serves the same tree by FUSE where /dev/fuse opens, its
+	# checkout where not (engine/storefs.c).
+	if [ -r /dev/fuse ] && [ -w /dev/fuse ]; then
+		printf '%s\n' "$out" | grep -q 'source\.composefs\.overlay: emulated' ||
+			fail "a stored source on chroot was not served by FUSE" "$out"
+	else
+		printf '%s\n' "$out" | grep -q 'source\.dir\.overlay' ||
+			fail "a stored source on chroot was not a checkout" "$out"
+	fi
 	out=$(cd / && XDG_DATA_HOME="$root/cfs/store" timeout 90 "$hull" run -f "$root/cfsref.conf" 2>&1)
 	cases=$((cases + 1))
 	printf '%s\n' "$out" | grep -q '^overlay / overlay .*lowerdir=/hull/meta::/hull/objects' &&

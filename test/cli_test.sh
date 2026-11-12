@@ -808,25 +808,45 @@ conf pid '(command "/probe" "pid" "orphan" "procs")'
 from_root 0 '^pid=2$' -f "$root/pid.conf"
 from_root 0 '^procs=2$' -f "$root/pid.conf"
 
-# A bare ref the store holds runs that tree, J.1's image ref in the store:
-# a dir source on its checkout, made once in the store under an overlay,
-# so that a write reaches neither the checkout nor the tree committed. A
-# plan names the checkout and makes none.
+# A bare ref the store holds runs that tree, J.1's image ref in the store.
+# Where the user may open /dev/fuse it is served by FUSE from its manifest
+# and the store's objects, composefs's tree with no checkout made, under an
+# overlay (engine/storefs.c); a read-only root, and a host without FUSE,
+# run on its checkout, made once in the store. Either way a write reaches
+# neither the store nor the tree committed, and a plan makes nothing.
 expect 0 '^stored/root:1 sha256:[0-9a-f]{64}$' "$hull" commit "$root/rootfs" stored/root:1
 stored_hex=$(printf '%s\n' "$out" | sed -n 's/^stored\/root:1 sha256://p')
 checkout=$XDG_DATA_HOME/hull/store/checkouts/sha256/$stored_hex
 printf '(machine (source "stored/root:1") (backend chroot) (hostname "stored") %s)\n' \
 	'(command "/probe" "write" "/srv/stored" "cwd")' > "$root/stored.conf"
-expect 0 "\\(source \"dir:$checkout\"\\) \\(mutable overlay\\)" \
-	"$hull" plan --resolved -f "$root/stored.conf"
+if [ -r /dev/fuse ] && [ -w /dev/fuse ]; then
+	expect 0 "\\(source \"composefs:$XDG_DATA_HOME/hull/store/mounts/$stored_hex\\.[0-9.]*erofs\"\\) \\(mutable overlay\\)" \
+		"$hull" plan --resolved -f "$root/stored.conf"
+else
+	expect 0 "\\(source \"dir:$checkout\"\\) \\(mutable overlay\\)" \
+		"$hull" plan --resolved -f "$root/stored.conf"
+fi
 cases=$((cases + 1))
 [ ! -e "$checkout" ] || fail "a plan made the checkout it names" ""
 from_root 0 '^write=ok$' -f "$root/stored.conf"
-cases=$((cases + 1))
-[ -d "$checkout/srv" ] && [ ! -e "$checkout/srv/stored" ] && [ ! -e "$root/rootfs/srv/stored" ] ||
-	fail "a machine on a stored tree wrote its checkout or the tree" "$(ls "$checkout/srv" 2>&1)"
-inode=$(stat -c %i "$checkout")
 from_root 0 '^cwd=/$' -f "$root/stored.conf"
+cases=$((cases + 1))
+[ ! -e "$checkout/srv/stored" ] && [ ! -e "$root/rootfs/srv/stored" ] ||
+	fail "a machine on a stored tree wrote its checkout or the tree" "$(ls "$checkout/srv" 2>&1)"
+if [ -r /dev/fuse ] && [ -w /dev/fuse ]; then
+	cases=$((cases + 1))
+	[ ! -e "$checkout" ] || fail "a machine served by FUSE checked its tree out" ""
+fi
+# A read-only root has no overlay to lie over a FUSE tree, so it runs on
+# the checkout, made once and kept.
+printf '(machine (source "stored/root:1") (backend chroot) (hostname "stored") %s %s)\n' \
+	'(security (readonly_root true))' '(command "/probe" "cwd")' > "$root/stored-ro.conf"
+expect 0 "\\(source \"dir:$checkout\"\\)" "$hull" plan --resolved -f "$root/stored-ro.conf"
+from_root 0 '^cwd=/$' -f "$root/stored-ro.conf"
+cases=$((cases + 1))
+[ -d "$checkout/srv" ] || fail "a read-only stored machine made no checkout" ""
+inode=$(stat -c %i "$checkout")
+from_root 0 '^cwd=/$' -f "$root/stored-ro.conf"
 cases=$((cases + 1))
 [ "$(stat -c %i "$checkout")" = "$inode" ] || fail "a second run checked the tree out again" ""
 printf '(machine (source "stored/root:1") (backend chroot) (mutable direct) %s)\n' \

@@ -796,6 +796,26 @@ static int pack_ref(const char *file, const char *given, char *ref, size_t cap)
 	return 0;
 }
 
+/* Whether the machine asks `(security (readonly_root true))`. */
+static int readonly_root(const hull_spec *spec, const hull_sexpr_form *machine)
+{
+	hull_sexpr_form security;
+	hull_sexpr_form item;
+	hull_sexpr_form head;
+	hull_sexpr_form value;
+
+	if (!hull_spec_find(spec, machine, "security", &security) ||
+	    !hull_sexpr_child(&spec->doc, &security, &item))
+		return 0;
+	do {
+		if (item.kind == HULL_SEXPR_LIST && hull_sexpr_child(&spec->doc, &item, &head) &&
+		    hull_sexpr_is(&spec->doc, &head, "readonly_root") &&
+		    hull_sexpr_next(&spec->doc, &head, &value) && hull_sexpr_is(&spec->doc, &value, "true"))
+			return 1;
+	} while (hull_sexpr_next(&spec->doc, &item, &item));
+	return 0;
+}
+
 /* Whether a stored source on this machine is mounted as a composefs image
  * rather than checked out (section 3.2): where every backend it may run
  * on is the qemu engine's, vm or emu, whose guest mounts the image as
@@ -834,19 +854,33 @@ static int composefs_machine(const hull_spec *spec, const hull_sexpr_form *machi
 				return 0;
 	}
 	if (backend_count == 0u) {
-		if (!hull_spec_find(spec, machine, "backend", &entry) ||
-		    !hull_sexpr_child(&spec->doc, &entry, &head) ||
-		    !hull_sexpr_next(&spec->doc, &head, &value) || value.content_length >= sizeof own)
+		/* No backend named: ns's, chroot's. */
+		if (!hull_spec_find(spec, machine, "backend", &entry)) {
+			snprintf(own, sizeof own, "ns");
+		} else if (!hull_sexpr_child(&spec->doc, &entry, &head) ||
+		           !hull_sexpr_next(&spec->doc, &head, &value) ||
+		           value.content_length >= sizeof own) {
 			return 0;
-		memcpy(own, spec->doc.data + value.content, value.content_length);
+		} else {
+			memcpy(own, spec->doc.data + value.content, value.content_length);
+		}
 		given[0] = own;
 		backends = given;
 		backend_count = 1u;
 	}
-	for (unsigned i = 0u; i < backend_count; i++)
-		if (strcmp(backends[i], "vm") != 0 && strcmp(backends[i], "emu") != 0 &&
-		    strcmp(backends[i], "qemu") != 0)
+	for (unsigned i = 0u; i < backend_count; i++) {
+		int qemu = strcmp(backends[i], "vm") == 0 || strcmp(backends[i], "emu") == 0 ||
+		           strcmp(backends[i], "qemu") == 0;
+		int chroot = strcmp(backends[i], "ns") == 0 || strcmp(backends[i], "chroot") == 0;
+
+		/* chroot serves the tree by FUSE (engine/storefs.c), as the
+		 * holder chose 2026-11-12 over a helper with root: where the
+		 * user may open /dev/fuse, under an overlay; else its checkout. */
+		if (chroot && (access("/dev/fuse", R_OK | W_OK) != 0 || readonly_root(spec, machine)))
 			return 0;
+		if (!qemu && !chroot)
+			return 0;
+	}
 	return 1;
 }
 

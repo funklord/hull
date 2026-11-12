@@ -72,6 +72,7 @@
 #include "hostnet.h"
 #include "rootmode.h"
 #include "tree.h"
+#include "storefs.h"
 #include "builtin.h"
 #include "usage.h"
 #include "stack.h"
@@ -118,7 +119,11 @@ typedef struct frame {
 
 struct hull_machine {
 	hull_core       *core;       /* what create() was given, for the callbacks */
-	char            *root;       /* the dir source, without "dir:" */
+	char            *root;       /* the dir source, without "dir:"; a composefs one's staging */
+	char            *composefs;  /* a stored tree's image, served by FUSE (storefs.h), or NULL */
+	char             cfs_store[4096];  /* its store, and its manifest's hex */
+	char             cfs_hex[65];
+	char             lookup[4200];  /* where /etc/passwd and /etc/group are read for (user ...) */
 	char            *workdir;
 	char            *user;     /* (user ...), or NULL for the machine's root */
 	char             shm_options[64];  /* /dev/shm's mount options */
@@ -210,6 +215,7 @@ static void release(hull_machine *m)
 {
 	hull_hostdev_unclaim(m);
 	free(m->root);
+	free(m->composefs);
 	free(m->workdir);
 	free(m->user);
 	for (unsigned i = 0u; i < m->limit_count; i++)
@@ -314,10 +320,16 @@ static const char *read_names(hull_machine *m, const hull_sexpr_doc *doc,
 	} else {
 		FILE *file;
 
-		snprintf(path, sizeof path, "%s/etc/hosts", m->root);
-		if ((file = fopen(path, "r")) != NULL) {
-			base[fread(base, 1u, sizeof base - 1u, file)] = '\0';
-			fclose(file);
+		if (m->composefs != NULL) {
+			/* A stored tree's own, read from the store. */
+			if (hull_storefs_read(m->cfs_store, m->cfs_hex, "etc/hosts", base, sizeof base) < 0)
+				snprintf(base, sizeof base, "127.0.0.1\tlocalhost\n");
+		} else {
+			snprintf(path, sizeof path, "%s/etc/hosts", m->root);
+			if ((file = fopen(path, "r")) != NULL) {
+				base[fread(base, 1u, sizeof base - 1u, file)] = '\0';
+				fclose(file);
+			}
 		}
 	}
 	hosts = hull_access_extra_hosts(doc, machine, base, &wrong);
@@ -369,12 +381,23 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	    !hull_access_find(doc, &machine, "machine", &machine))
 		return "the plan holds no machine";
 	source = hull_access_value(doc, &machine, "source");
-	if (source == NULL || strncmp(source, "dir:", 4u) != 0 || source[4] == '\0') {
+	/* A composefs source, a stored tree's image the frontend wrote to the
+	 * store's mounts/ (section 3.2): served by FUSE from its manifest and
+	 * the store's objects, no checkout made. Its root is staged in the
+	 * machine's directory, which the start makes. */
+	if (source != NULL && strncmp(source, "composefs:", 10u) == 0 && source[10] != '\0') {
+		m->composefs = hull_access_path(doc, source + 10);
 		free(source);
-		return "chroot runs only a dir source";
+		if (m->composefs == NULL ||
+		    hull_storefs_parts(m->composefs, m->cfs_store, sizeof m->cfs_store, m->cfs_hex) != 0)
+			return "a composefs source is a store's mounts/HEX.erofs";
+	} else if (source == NULL || strncmp(source, "dir:", 4u) != 0 || source[4] == '\0') {
+		free(source);
+		return "chroot runs only a dir or a composefs source";
+	} else {
+		m->root = hull_access_path(doc, source + 4);
+		free(source);
 	}
-	m->root = hull_access_path(doc, source + 4);
-	free(source);
 	m->workdir  = hull_access_value(doc, &machine, "workdir");
 	m->hostname = hull_access_value(doc, &machine, "hostname");
 	m->init = hull_access_value(doc, &machine, "init");
@@ -386,7 +409,11 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		         size != NULL ? ",size=" : "", size != NULL ? size : "");
 		free(size);
 	}
-	if (m->root == NULL || m->workdir == NULL)
+	/* A stored tree's runtime may give none, as a ref's: the plan's own
+	 * default, then. */
+	if (m->workdir == NULL && m->composefs != NULL)
+		m->workdir = strdup("/");
+	if ((m->root == NULL && m->composefs == NULL) || m->workdir == NULL)
 		return "the plan is missing its source or workdir";
 	if (m->user != NULL && m->init != NULL)
 		return "(user ...) is whom a command runs as; an (init ...) starts its own";
@@ -577,6 +604,16 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			return "owners are given above an overlay: (owners ...) needs (mutable overlay) and "
 			       "a root that is not read-only";
 	}
+	/* A composefs tree is read-only, served by FUSE, so it lies under an
+	 * overlay of the machine's; its owners are its manifest's, and layers,
+	 * an upper and an export are a directory's. */
+	if (m->composefs != NULL && !m->overlay)
+		return "a composefs root is served read-only by FUSE: it needs (mutable overlay) and "
+		       "a root that is not read-only";
+	if (m->composefs != NULL &&
+	    (m->layer_count != 0u || m->upper != NULL || m->owners != NULL || m->export != NULL))
+		return "a composefs root is the store's tree as it is: layers, an upper, owners and an "
+		       "export are a directory's";
 
 	{
 		const char *reason = hull_access_devices(doc, &machine, m->device, &m->device_count);
@@ -1320,10 +1357,13 @@ static void stage_upper(const hull_machine *m, const char *upper, const char *pa
  * one the namespace does not map cannot be, and the change fails with
  * EOVERFLOW where in place it would have worked.
  */
+static void serve_composefs(const hull_machine *m, int report);
+
 static void layer(const hull_machine *m, int report)
 {
-	struct stat lower;
-	int         tree = open_tree(AT_FDCWD, m->root, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+	struct stat lower = { .st_mode = S_IFDIR | 0755 };
+	int         tree = m->composefs != NULL ? -1 :
+	                   open_tree(AT_FDCWD, m->root, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
 	int         layers[MAX_VOLUMES];
 	int         kept = -1;
 	char        options[8800u + 16u * MAX_VOLUMES];
@@ -1331,7 +1371,7 @@ static void layer(const hull_machine *m, int report)
 	char        work_dir[4200] = "work";
 	size_t      at;
 
-	if (tree < 0 || fstat(tree, &lower) != 0)
+	if (m->composefs == NULL && (tree < 0 || fstat(tree, &lower) != 0))
 		child_fail(report, "the overlay's lower layer");
 	/* Every layer cloned while its path is still the host's, before the
 	 * tmpfs goes over the directory's. */
@@ -1362,13 +1402,20 @@ static void layer(const hull_machine *m, int report)
 		    (kept = open_tree(AT_FDCWD, parent, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC)) < 0)
 			child_fail(report, "the overlay's upper layer, kept");
 	}
+	/* A composefs root's place is in the machine's directory, which a
+	 * staging tmpfs may since have covered: made again there. */
+	if (m->composefs != NULL && mkdir(m->root, 0700) != 0 && errno != EEXIST)
+		child_fail(report, "the composefs root's place");
 	if (mount("tmpfs", m->root, "tmpfs", 0u, "mode=0700") != 0 || chdir(m->root) != 0 ||
 	    mkdir("lower", 0700) != 0 || mkdir("upper", 0700) != 0 ||
 	    mkdir("work", 0700) != 0 || mkdir("merged", 0700) != 0)
 		child_fail(report, "the overlay's tmpfs");
-	if (move_mount(tree, "", AT_FDCWD, "lower", MOVE_MOUNT_F_EMPTY_PATH) != 0)
+	if (m->composefs != NULL)
+		serve_composefs(m, report);
+	else if (move_mount(tree, "", AT_FDCWD, "lower", MOVE_MOUNT_F_EMPTY_PATH) != 0)
 		child_fail(report, "the overlay's lower layer");
-	close(tree);
+	if (tree >= 0)
+		close(tree);
 	for (unsigned i = 0u; i < m->layer_count; i++) {
 		char name[32];
 
@@ -1436,6 +1483,65 @@ static void close_others(int *keep, unsigned n)
 		from = (unsigned)keep[i] + 1u;
 	}
 	close_range(from, ~0u, 0);
+}
+
+static void composefs_ready(void *context)
+{
+	const int *fd = context;
+
+	if (write(*fd, "\001", 1u) != 1)
+		_exit(127);
+}
+
+/*
+ * A composefs tree's FUSE mount at lower/, in the init's own user and
+ * mount namespaces, which may mount FUSE as no namespace may EROFS: the
+ * init mounts /dev/fuse there, and a child of it serves the tree from the
+ * store (storefs.h) for as long as the mount lasts -- through the pivot,
+ * the overlay holding it -- dying with the init where it outlives it.
+ * The child keeps the FUSE descriptor and the pipe it says it is ready
+ * on, and nothing else of the init's, so its report reaches EOF.
+ */
+static void serve_composefs(const hull_machine *m, int report)
+{
+	int     fuse = open("/dev/fuse", O_RDWR | O_CLOEXEC);
+	int     ready[2];
+	char    options[160];
+	char    said[300];
+	ssize_t n;
+	pid_t   server;
+
+	if (fuse < 0)
+		child_fail(report, "a composefs root is served by FUSE, and /dev/fuse");
+	snprintf(options, sizeof options,
+	         "fd=%d,rootmode=40755,user_id=0,group_id=0,allow_other,default_permissions", fuse);
+	if (mount("hull", "lower", "fuse.hull", MS_RDONLY | MS_NOSUID | MS_NODEV, options) != 0)
+		child_fail(report, "mounting the stored tree by FUSE");
+	if (pipe2(ready, O_CLOEXEC) != 0)
+		child_fail(report, "the stored tree's server");
+	if ((server = bare_fork()) < 0)
+		child_fail(report, "the stored tree's server");
+	if (server == 0) {
+		int keep[2] = { fuse, ready[1] };
+
+		close_others(keep, 2u);
+		prctl(PR_SET_PDEATHSIG, SIGKILL);
+		if (hull_storefs_serve(m->cfs_store, m->cfs_hex, fuse, composefs_ready, &ready[1], said,
+		                       sizeof said) != 0) {
+			if (write(ready[1], said, strlen(said)) < 0)
+				_exit(127);
+			_exit(127);
+		}
+		_exit(0);
+	}
+	close(ready[1]);
+	close(fuse);
+	n = read(ready[0], said, sizeof said - 1u);
+	close(ready[0]);
+	if (n != 1 || said[0] != '\001') {
+		said[n > 0 ? n : 0] = '\0';
+		child_refuse(report, n > 0 ? said : "the stored tree's server did not start");
+	}
 }
 
 static volatile sig_atomic_t pending;
@@ -1908,7 +2014,9 @@ static void owner_notice(const hull_machine *m, uid_t uid, gid_t gid, char *out,
 	out[0] = '\0';
 	if (!m->overlay)
 		return;
-	trees[count++] = m->root;
+	/* A composefs tree's owners are its manifest's, served as they are. */
+	if (m->composefs == NULL)
+		trees[count++] = m->root;
 	for (unsigned i = 0u; i < m->layer_count; i++)
 		trees[count++] = m->layer_path[i];
 	for (unsigned i = 0u; i < count; i++) {
@@ -2147,7 +2255,8 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 			 * capabilities last to the exec, as root's do. */
 			hull_user   inner = { .uid = 0u, .gid = 0u };
 			const char *wrong = m->user != NULL ?
-			                    hull_user_resolve(m->root, m->user, &inner) : NULL;
+			                    hull_user_resolve(m->composefs != NULL ? m->lookup : m->root,
+			                                      m->user, &inner) : NULL;
 
 			if (wrong != NULL)
 				child_refuse(report, wrong);
@@ -2676,10 +2785,20 @@ static int is_adopted(const char *dir)
 
 static void remove_dir(const char *dir)
 {
-	char path[4200];
+	/* What it may hold, by name: a kept machine's socket, and a composefs
+	 * root's staging (stage_composefs()). */
+	static const char *const files[] = { "init.sock", "view/etc/passwd", "view/etc/group" };
+	static const char *const dirs[] = { "view/etc", "view", "root" };
+	char                     path[4200];
 
-	snprintf(path, sizeof path, "%s/init.sock", dir);
-	unlink(path);
+	for (unsigned i = 0u; i < sizeof files / sizeof files[0]; i++) {
+		snprintf(path, sizeof path, "%s/%s", dir, files[i]);
+		unlink(path);
+	}
+	for (unsigned i = 0u; i < sizeof dirs / sizeof dirs[0]; i++) {
+		snprintf(path, sizeof path, "%s/%s", dir, dirs[i]);
+		rmdir(path);
+	}
 	rmdir(dir);
 }
 
@@ -3129,6 +3248,36 @@ static hull_status chroot_create(hull_core *core, hull_buf plan, hull_machine **
 	return HULL_OK;
 }
 
+/* A composefs machine's root, staged in its directory: root/, which the
+ * init covers with its tmpfs and mounts the tree's FUSE under, and view/,
+ * the tree's /etc/passwd and /etc/group read from the store, for (user
+ * ...) to be resolved before the tree is mounted. */
+static const char *stage_composefs(hull_machine *m)
+{
+	static const char *const files[] = { "etc/passwd", "etc/group" };
+	char                     path[4400];
+	char                     why[300];
+
+	free(m->root);
+	if ((m->root = malloc(strlen(m->dir) + sizeof "/root")) == NULL)
+		return "out of memory";
+	sprintf(m->root, "%s/root", m->dir);
+	snprintf(m->lookup, sizeof m->lookup, "%s/view", m->dir);
+	snprintf(path, sizeof path, "%s/etc", m->lookup);
+	if (mkdir(m->root, 0700) != 0 || mkdir(m->lookup, 0700) != 0 || mkdir(path, 0700) != 0)
+		return "the composefs root's staging cannot be made";
+	for (unsigned i = 0u; i < sizeof files / sizeof files[0]; i++) {
+		snprintf(path, sizeof path, "%s/%s", m->lookup, files[i]);
+		if (hull_storefs_extract(m->cfs_store, m->cfs_hex, files[i], path, why, sizeof why) < 0) {
+			static char said[400];
+
+			snprintf(said, sizeof said, "the stored tree: %s", why);
+			return said;
+		}
+	}
+	return NULL;
+}
+
 static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *error)
 {
 	int         pair[2];
@@ -3160,14 +3309,22 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	}
 	if (hull_hostdev_claim(m, m->device, m->device_count, m->detail, sizeof m->detail) != NULL)
 		return fail(error, HULL_ERR_RUNTIME, m->detail);
-	/* A kept machine's directory, for its init.sock. */
-	if ((m->keep || m->staged || m->hosts != NULL || m->resolver != NULL) &&
+	/* A kept machine's directory, for its init.sock; a composefs one's,
+	 * for its root's staging and what (user ...) reads. */
+	if ((m->keep || m->staged || m->hosts != NULL || m->resolver != NULL ||
+	     m->composefs != NULL) &&
 	    ((reason = make_dir(m)) != NULL ||
 	     (m->keep && (dir_fd = open(m->dir, O_PATH | O_DIRECTORY | O_CLOEXEC)) < 0))) {
 		snprintf(m->detail, sizeof m->detail, "%s",
 		         reason != NULL ? reason : "the machine's directory cannot be opened");
 		if (m->dir[0] != '\0')
 			remove_dir(m->dir);
+		m->dir[0] = '\0';
+		return fail(error, HULL_ERR_RUNTIME, m->detail);
+	}
+	if (m->composefs != NULL && (reason = stage_composefs(m)) != NULL) {
+		snprintf(m->detail, sizeof m->detail, "%s", reason);
+		remove_dir(m->dir);
 		m->dir[0] = '\0';
 		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	}
@@ -4378,6 +4535,9 @@ static const hull_cap_entry entries[] = {
 	{ "source.dir.overlay",     HULL_SUP_EMULATED,
 	  "an overlayfs in the machine's mount namespace; writes are held in memory and go with it",
 	  NULL },
+	{ "source.composefs.overlay", HULL_SUP_EMULATED,
+	  "a stored tree served read-only by FUSE from its manifest and the store's objects, no "
+	  "tree copied, under an overlayfs whose writes are held in memory", NULL },
 	{ "projection.bind",        HULL_SUP_NATIVE,   NULL, NULL },
 	{ "writeback.none",         HULL_SUP_NATIVE,   NULL, NULL },
 	{ "command",                HULL_SUP_NATIVE,   NULL, NULL },
