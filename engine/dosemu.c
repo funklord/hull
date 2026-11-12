@@ -158,8 +158,11 @@ static const hull_cap_entry entries[] = {
 	{ "source.dir.overlay", HULL_SUP_EMULATED,
 	  "a copy of the tree in the machine's directory, made as it starts, its writes thrown "
 	  "away with it", NULL },
+	/* A stored tree reaches the plan as a dir, checked out by the
+	 * frontend; an image ref reaches it only where the store has none. */
 	{ "source.ref.overlay", HULL_SUP_REJECTED,
-	  "not yet: a stored tree would be checked out to a directory first", NULL },
+	  "an image runs from the store, checked out to a directory, and this one is not in it: "
+	  "`hull pull` it first", NULL },
 	{ "projection.bind",    HULL_SUP_NATIVE,   "the directory mounted as a drive", NULL },
 	{ "writeback.none",     HULL_SUP_NATIVE,   NULL, NULL },
 
