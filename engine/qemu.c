@@ -4225,8 +4225,10 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	if (m->hosted)
 		return hosted_start(core, m, error);
 	if (uname(&name) != 0 ||
-	    (strcmp(name.machine, "x86_64") != 0 && strcmp(name.machine, "aarch64") != 0))
-		return fail(error, HULL_ERR_RUNTIME, "the qemu engine boots on x86_64 and aarch64 hosts");
+	    (strcmp(name.machine, "x86_64") != 0 && strcmp(name.machine, "aarch64") != 0 &&
+	     strcmp(name.machine, "riscv64") != 0))
+		return fail(error, HULL_ERR_RUNTIME, "the qemu engine boots on x86_64, aarch64 and "
+		            "riscv64 hosts");
 	if (!m->emu && access("/dev/kvm", R_OK | W_OK) != 0)
 		return fail(error, HULL_ERR_RUNTIME, "/dev/kvm is not open to this user");
 	if (m->transport == 1 && access("/dev/vhost-vsock", R_OK | W_OK) != 0)
@@ -4344,9 +4346,13 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		 * another /boot, for the test of that. */
 		const char *boot = getenv("HULL_BOOT_DIR");
 		char        fetched[4096];
+		/* Debian names riscv64's boot/vmlinux-RELEASE, an Image, where
+		 * the others' are vmlinuz (engine/kernel.h). */
+		const hull_kernel_pin *own = hull_kernel_pin_of(host_arch());
+		const char            *image = own != NULL ? own->image : "vmlinuz";
 
-		snprintf(kbuf, sizeof kbuf, "%s/vmlinuz-%s",
-		         boot != NULL && boot[0] == '/' ? boot : "/boot", name.release);
+		snprintf(kbuf, sizeof kbuf, "%s/%s-%s",
+		         boot != NULL && boot[0] == '/' ? boot : "/boot", image, name.release);
 		snprintf(mbuf, sizeof mbuf, "/lib/modules/%s", name.release);
 		/* (kernel fetched) asks for that one wherever the host's can be
 		 * read: the same kernel on every host, Appendix F's aim. */
@@ -4357,7 +4363,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 
 			if (hull_kernel_dir_of(guest_arch(m), fetched, sizeof fetched) != 0)
 				fetched[0] = '\0';
-			snprintf(kbuf, sizeof kbuf, "%s/boot/vmlinuz-%s", fetched, release);
+			snprintf(kbuf, sizeof kbuf, "%s/boot/%s-%s", fetched, image, release);
 			snprintf(mbuf, sizeof mbuf, "%s/lib/modules/%s", fetched, release);
 			if (fetched[0] == '\0' || access(kbuf, R_OK) != 0)
 				return fail(error, HULL_ERR_RUNTIME, m->kernel_fetched ?

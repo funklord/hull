@@ -76,7 +76,7 @@ static inline int hull_kernel_dir_of(const char *arch, char *out, size_t cap)
 {
 	const char *cache = getenv("XDG_CACHE_HOME");
 	const char *home = getenv("HOME");
-	char        name[64];
+	char        name[96];
 	int         host = arch[0] == 'a' && arch[1] == 'm' && arch[2] == 'd' && arch[3] == '6' &&
 	                   arch[4] == '4' && arch[5] == '\0';
 

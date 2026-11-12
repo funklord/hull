@@ -267,22 +267,29 @@ static void device(const char *path, const char *what, const char *name, const c
  * `hull kernel fetch` put in the cache (Appendix F). Not root's to fix. */
 static void vm_kernel(void)
 {
-	struct utsname host;
-	const char    *boot = getenv("HULL_BOOT_DIR");
-	char           path[4400];
-	char           fetched[4096];
+	struct utsname         host;
+	const char            *boot = getenv("HULL_BOOT_DIR");
+	const char            *arch;
+	const hull_kernel_pin *pin;
+	char                   path[4400];
+	char                   fetched[4096];
 
 	if (uname(&host) != 0)
 		return;
+	/* The host's arch's pin: its kernel's name in /boot, vmlinux on
+	 * riscv64 and vmlinuz elsewhere, and the cache it is fetched to. */
+	arch = strcmp(host.machine, "x86_64") == 0 ? "amd64" :
+	       strcmp(host.machine, "aarch64") == 0 ? "arm64" : host.machine;
+	pin  = hull_kernel_pin_of(arch);
 	/* HULL_BOOT_DIR names another /boot, as the engine reads it. */
-	snprintf(path, sizeof path, "%s/vmlinuz-%s",
-	         boot != NULL && boot[0] == '/' ? boot : "/boot", host.release);
+	snprintf(path, sizeof path, "%s/%s-%s", boot != NULL && boot[0] == '/' ? boot : "/boot",
+	         pin != NULL ? pin->image : "vmlinuz", host.release);
 	if (access(path, R_OK) == 0) {
 		line("ok", "a vm's kernel, the host's", path);
 		return;
 	}
-	if (hull_kernel_dir(fetched, sizeof fetched) == 0) {
-		snprintf(path, sizeof path, "%s/boot/vmlinuz-%s", fetched, HULL_KERNEL_RELEASE);
+	if (pin != NULL && hull_kernel_dir_of(arch, fetched, sizeof fetched) == 0) {
+		snprintf(path, sizeof path, "%s/boot/%s-%s", fetched, pin->image, pin->release);
 		if (access(path, R_OK) == 0) {
 			line("ok", "a vm's kernel, fetched", path);
 			return;

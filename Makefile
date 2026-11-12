@@ -314,10 +314,11 @@ AGENT_ARM64 := $(if $(shell command -v $(ARM64_CC) 2>/dev/null),$(BUILD_DIR)/hul
 RISCV64_CC    ?= riscv64-linux-gnu-gcc
 RISCV64_PROBE := $(if $(shell command -v $(RISCV64_CC) 2>/dev/null),$(BUILD_DIR)/test/riscv64/rootfs/probe)
 AGENT_RISCV64 := $(if $(shell command -v $(RISCV64_CC) 2>/dev/null),$(BUILD_DIR)/hull-agent-riscv64)
-# And on an arm64 host, the agent for an amd64 machine under emu, where
-# x86_64's cross compiler is installed; on an x86_64 host hull-agent is it.
+# And on a host that is not x86_64, arm64's or riscv64's, the agent for an
+# amd64 machine under emu, where x86_64's cross compiler is installed; on
+# an x86_64 host hull-agent is it.
 AMD64_CC    ?= x86_64-linux-gnu-gcc
-AGENT_AMD64 := $(if $(filter aarch64,$(shell uname -m)),$(if $(shell command -v $(AMD64_CC) 2>/dev/null),$(BUILD_DIR)/hull-agent-amd64))
+AGENT_AMD64 := $(if $(filter-out x86_64,$(shell uname -m)),$(if $(shell command -v $(AMD64_CC) 2>/dev/null),$(BUILD_DIR)/hull-agent-amd64))
 KERNEL_ARM64 := $(if $(shell command -v $(ARM64_CC) 2>/dev/null),$(KERNEL_A64_BIN) $(KERNEL_A64_MOD)/modules.dep)
 
 TEST_SPEC_OBJS    = $(BUILD_DIR)/test/spec_test.o
@@ -348,7 +349,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-arm64-host check-root check-systemd check-vfio check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-arm64-host check-riscv64-host check-root check-systemd check-vfio check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -455,6 +456,7 @@ help:
 	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
 	@echo '  check-qemu    hull run on the qemu engine, as the user, with KVM'
 	@echo '  check-arm64-host  hull built and make test run on arm64, under emu'
+	@echo '  check-riscv64-host  hull built and make test run on riscv64, under emu'
 	@echo '  check-pc      a whole PC booting its own media, as the user'
 	@echo '  check-legacy  FreeDOS, fetched and pinned, on a pc: screen and ssh door'
 	@echo '  check-images  published images and a compose project, on chroot and a vm'
@@ -896,6 +898,11 @@ check-qemu: $(HULL) $(AGENT_BIN) $(PROBE) $(AGENT_ARM64) $(ARM64_PROBE) $(AGENT_
 # test run there. Needs the network the first time, and qemu-system-aarch64.
 check-arm64-host: $(HULL) $(AGENT_ARM64)
 	BUILD_DIR='$(BUILD_DIR)' sh test/arm64_host_test.sh '$(HULL)'
+
+# hull on a riscv64 host, the same way: a riscv64 Debian under emu with
+# the H extension, hull built and tested there. Needs qemu-system-riscv64.
+check-riscv64-host: $(HULL) $(AGENT_RISCV64)
+	BUILD_DIR='$(BUILD_DIR)' sh test/riscv64_host_test.sh '$(HULL)'
 
 # The unit tests, and the store and pull suites, built and run with
 # AddressSanitizer and UndefinedBehaviorSanitizer, in a build directory
