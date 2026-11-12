@@ -9,6 +9,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "hostdev.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -32,6 +34,22 @@ const char *hull_root_path(void);
  */
 int hull_root_call(const char *const *args, const uint8_t *input, size_t length, int *fds,
                    unsigned fd_count, char *why, size_t cap);
+
+/*
+ * Root mode's devices, (devices (root ...)) (section 7): hull-root, from
+ * `plan`, whose root hash is `hash`, makes each device it names again as
+ * a node of the user's, of the same kind and number, in a directory of
+ * its own under HULL_ROOT_DEVICES/UID, named here; the node of each of
+ * `devices` flagged root, found already, into its host.granted, and the
+ * directory into `dir`. NULL, or why in `why`, nothing then left made.
+ */
+const char *hull_root_grant(const char *hash, const uint8_t *plan, size_t length,
+                            hull_device *devices, unsigned count, char *dir, size_t dir_cap,
+                            char *why, size_t cap);
+
+/* What hull_root_grant made, the user's: its nodes and `dir`, removed,
+ * and `dir` emptied. */
+void hull_root_ungrant(hull_device *devices, unsigned count, char *dir);
 
 #ifdef __cplusplus
 }

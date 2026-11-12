@@ -197,6 +197,8 @@ struct hull_machine {
 	char             bridge_address[16];   /* its address on HULL_BRIDGE, or "" */
 	char             tap[16];      /* the tap's name on the bridge, once made, or "" */
 	char             bridge_root[72];  /* root mode's hash, hull-root handing the tap over */
+	char             devices_root[72]; /* root mode's hash, hull-root giving (devices (root ...)) */
+	char             devices_dir[128]; /* where hull-root made their nodes, or "" */
 	uint8_t         *plan;         /* the plan, whole, for hull-root to check, in root mode */
 	size_t           plan_length;
 	int              bridge_relay; /* asking hull0's DNS relay, the host's resolvers loopback */
@@ -438,6 +440,7 @@ static const char *read_secrets(hull_machine *m, const hull_sexpr_doc *doc,
 
 static void release(hull_machine *m)
 {
+	hull_root_ungrant(m->device, m->device_count, m->devices_dir);
 	hull_hostdev_unclaim(m);
 	/* A bridge's tap is persistent, so it goes with the machine here. */
 	if (m->bridge && m->tap[0] != '\0' && if_nametoindex(m->tap) != 0) {
@@ -820,12 +823,24 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 
 		if (why != NULL)
 			return why;
+		int         rooted = 0;
+
 		for (unsigned i = 0u; i < m->device_count; i++) {
-			if (m->device[i].root)
-				return "(devices (root ...)) is root mode's on chroot alone";
+			/* A port the user may not open, which hull-root makes again as
+			 * the user's for qemu to open (section 7); a node has no
+			 * device of a guest's to be, as without root. */
+			if (m->device[i].root && m->device[i].kind == HULL_DEVICE_NODE)
+				return "(devices (root (node ...))) has no device of a guest's to be: (serial ...) "
+				       "or (parallel ...) under it gives one";
+			rooted = rooted || m->device[i].root;
 			serial += m->device[i].kind == HULL_DEVICE_SERIAL;
 			parallel += m->device[i].kind == HULL_DEVICE_PARALLEL;
 		}
+		if (rooted && getuid() != 0 &&
+		    !hull_access_root(doc, "devices.root", m->devices_root, sizeof m->devices_root))
+			return "(devices (root ...)) needs root: hull's core run as root, or root mode "
+			       "(--accept root:HASH, hull plan --root-hash); a udev rule or a group the "
+			       "user is in gives a port rootless, under (devices ...)";
 		if (serial > MAX_SERIAL)
 			return "a vm has four serial ports: (devices (serial ...)) names more";
 		if (parallel > MAX_PARALLEL)
@@ -2468,7 +2483,8 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		const hull_device *d = &m->device[i];
 		char               node[520];
 
-		escaped(node, sizeof node, d->host.node);
+		/* A port root mode gave is the node hull-root made, the user's. */
+		escaped(node, sizeof node, d->host.granted[0] != '\0' ? d->host.granted : d->host.node);
 		if (d->kind == HULL_DEVICE_USB) {
 			const char *ports = strchr(d->host.port, '-');
 
@@ -3712,9 +3728,9 @@ static hull_status qemu_create(hull_core *core, hull_buf plan, hull_machine **ou
 		release(m);
 		return fail(error, HULL_ERR_UNSUPPORTED, reason);
 	}
-	/* Root mode's tap is hull-root's, which checks the plan it is given
-	 * against the hash it was granted for. */
-	if (m->bridge_root[0] != '\0') {
+	/* Root mode's tap and devices are hull-root's, which checks the plan
+	 * it is given against the hash it was granted for. */
+	if (m->bridge_root[0] != '\0' || m->devices_root[0] != '\0') {
 		if ((m->plan = malloc(plan.len)) == NULL) {
 			release(m);
 			return fail(error, HULL_ERR_INTERNAL, "out of memory");
@@ -4372,6 +4388,10 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	for (unsigned i = 0u; i < m->device_count; i++)
 		if (hull_hostdev_find(&m->device[i], m->detail, sizeof m->detail) != NULL)
 			return fail(error, HULL_ERR_RUNTIME, m->detail);
+	if (m->devices_root[0] != '\0' &&
+	    hull_root_grant(m->devices_root, m->plan, m->plan_length, m->device, m->device_count,
+	                    m->devices_dir, sizeof m->devices_dir, m->detail, sizeof m->detail) != NULL)
+		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	if (hull_hostdev_claim(m, m->device, m->device_count, m->detail, sizeof m->detail) != NULL)
 		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	/* VFIO pins every page of the guest's memory for its device's DMA,
@@ -5612,6 +5632,9 @@ static const hull_cap_entry entries[] = {
 	  "a bit-banged device, a JTAG cable, may not work; chroot reaches ppdev directly", NULL },
 	{ "devices.pci",        HULL_SUP_NATIVE,
 	  "vfio-pci: the device itself, its own timing, the guest's memory pinned for its DMA", NULL },
+	{ "devices.root",       HULL_SUP_REJECTED,
+	  "a serial or parallel port the user may not open: hull run as root, or root mode's "
+	  "hull-root, which makes it again as the user's node for qemu to open", "root" },
 	{ "devices.node",       HULL_SUP_REJECTED,
 	  "a host's device node has no device of a guest's to be: (usb ...), (serial ...) or "
 	  "(parallel ...) gives one", NULL },

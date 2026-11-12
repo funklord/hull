@@ -205,6 +205,22 @@ echo "== vm"
 as /bin/hull run --accept "\$vtoken" -f /tmp/v.conf 2>&1
 echo "status=\$?"
 echo "== taps=\$(ip -br link | sed -n 's/^\(hullt[0-9]*\)[ @].*/\1/p' | head -1)"
+# A serial port the user may not open, /dev/null's number in a node root's
+# alone, given to the nested vm's ttyS0 by root mode: unlisted refused,
+# listed written by the guest at the host's path, its node gone after.
+mknod /dev/hullserial c 1 3 && chmod 600 /dev/hullserial
+printf '(machine (source "dir:/tmp/mroot") (backend vm) (mutable overlay) (network none) (devices (root (serial "/dev/hullserial"))) (command "/probe" "tell" "/dev/hullserial" "hello"))\n' > /tmp/s.conf
+chown 1000:1000 /tmp/s.conf
+stoken=\$(as /bin/hull plan --root-hash -f /tmp/s.conf 2> /dev/null | sed -n 's/.*: --accept //p')
+echo "stoken=\$stoken"
+echo "== serial unlisted"
+as /bin/hull run --accept "\$stoken" -f /tmp/s.conf 2>&1
+echo "status=\$?"
+printf 'tester %s devices.root\n' "\${stoken#root:}" >> /etc/hull/root.conf
+echo "== serial listed"
+as /bin/hull run --accept "\$stoken" -f /tmp/s.conf 2>&1
+echo "status=\$?"
+echo "== snodes=\$(cd /run/hull-root/1000 2> /dev/null && echo *)"
 echo "== log"
 cat /var/log/hull/root.log
 EOF
@@ -282,6 +298,17 @@ printf '%s\n' "$out" | grep -qx 'kvm=ok' &&
 	printf '%s\n' "$vm" | grep -qx 'status=0' &&
 	printf '%s\n' "$out" | grep -qx '== taps=' ||
 	fail "a root mode vm was not put on hull0 by its tap, or its tap was left" "$out"
+# A serial port the user may not open, given to a vm by root mode alone.
+cases=$((cases + 1))
+stoken=$(printf '%s\n' "$out" | sed -n 's/^stoken=root://p')
+sunlisted=$(printf '%s\n' "$out" | sed -n '/^== serial unlisted/,/^status=/p')
+slisted=$(printf '%s\n' "$out" | sed -n '/^== serial listed/,/^status=/p')
+printf '%s\n' "$sunlisted" | grep -qx "tester $stoken devices.root" &&
+	printf '%s\n' "$sunlisted" | grep -qx 'status=125' &&
+	printf '%s\n' "$slisted" | grep -qx 'tell=ok' &&
+	printf '%s\n' "$slisted" | grep -qx 'status=0' &&
+	printf '%s\n' "$out" | grep -qx '== snodes=\*' ||
+	fail "a serial port the user may not open was not given to a vm by root mode alone" "$out"
 # The log: every grant and refusal it acted on, the bridge with its
 # machine; a refusal for another plan's bytes or another's process comes
 # before the listing is read, and is not a line.

@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -164,4 +166,52 @@ int hull_root_call(const char *const *args, const uint8_t *input, size_t length,
 	if (why[0] == '\0')
 		snprintf(why, cap, "hull-root refused, saying nothing");
 	return -1;
+}
+
+void hull_root_ungrant(hull_device *devices, unsigned count, char *dir)
+{
+	if (dir[0] == '\0')
+		return;
+	for (unsigned i = 0u; i < count; i++)
+		if (devices[i].host.granted[0] != '\0') {
+			unlink(devices[i].host.granted);
+			devices[i].host.granted[0] = '\0';
+		}
+	rmdir(dir);
+	dir[0] = '\0';
+}
+
+const char *hull_root_grant(const char *hash, const uint8_t *plan, size_t length,
+                            hull_device *devices, unsigned count, char *dir, size_t dir_cap,
+                            char *why, size_t cap)
+{
+	static unsigned counter;
+	char            name[48];
+	const char     *args[] = { "device", hash, name, NULL };
+
+	snprintf(name, sizeof name, "%ld-%u", (long)getpid(),
+	         __atomic_add_fetch(&counter, 1u, __ATOMIC_RELAXED));
+	if (hull_root_call(args, plan, length, NULL, 0u, why, cap) != 0)
+		return why;
+	snprintf(dir, dir_cap, "%s/%u/%s", HULL_ROOT_DEVICES, (unsigned)getuid(), name);
+	for (unsigned i = 0u; i < count; i++) {
+		hull_hostdev *h = &devices[i].host;
+		struct stat   st;
+
+		if (!devices[i].root)
+			continue;
+		if (stat(h->node, &st) != 0) {
+			snprintf(why, cap, "%s: %s", h->node, strerror(errno));
+			hull_root_ungrant(devices, count, dir);
+			return why;
+		}
+		snprintf(h->granted, sizeof h->granted, "%s/%c%u:%u", dir, S_ISCHR(st.st_mode) ? 'c' : 'b',
+		         major(st.st_rdev), minor(st.st_rdev));
+		if (stat(h->granted, &st) != 0) {
+			snprintf(why, cap, "hull-root made no node for %s", h->node);
+			hull_root_ungrant(devices, count, dir);
+			return why;
+		}
+	}
+	return NULL;
 }

@@ -216,19 +216,6 @@ static const hull_host_ops *host;
 
 /* --- reading the plan ---------------------------------------------------- */
 
-/* The nodes hull-root made for the machine's (devices (root ...)), and
- * their directory, the user's: gone with the machine. */
-static void remove_granted(hull_machine *m)
-{
-	if (m->devices_dir[0] == '\0')
-		return;
-	for (unsigned i = 0u; i < m->device_count; i++)
-		if (m->device[i].host.granted[0] != '\0')
-			unlink(m->device[i].host.granted);
-	rmdir(m->devices_dir);
-	m->devices_dir[0] = '\0';
-}
-
 /* The cgroup start_cgroup() made, and every one below it its init made,
  * deepest first; a cgroup goes by rmdir once nothing is in it, its
  * processes' going a moment behind their reaping, so each is tried a few
@@ -260,7 +247,7 @@ static void release(hull_machine *m)
 	if (m->cgroup[0] != '\0')
 		remove_cgroup_tree(m->cgroup, 0u);
 	m->cgroup[0] = '\0';
-	remove_granted(m);
+	hull_root_ungrant(m->device, m->device_count, m->devices_dir);
 	hull_hostdev_unclaim(m);
 	free(m->root);
 	free(m->composefs);
@@ -2902,48 +2889,6 @@ static void sweep(const char *parent)
 }
 
 /*
- * Root mode's devices, (devices (root ...)): hull-root, from the plan it
- * checks, makes each again as a node of the user's, of the same kind and
- * number, in a directory of its tmpfs named for this machine, and the
- * engine binds that node at the host's path in the machine's /dev; a node
- * of the host's the user may not open stays unopenable to it in a user
- * namespace, its owner unmapped. NULL, or why in `why`.
- */
-static const char *grant_devices(hull_machine *m, char *why, size_t cap)
-{
-	static unsigned counter;
-	char            name[48];
-	const char     *args[] = { "device", m->devices_root, name, NULL };
-
-	snprintf(name, sizeof name, "%ld-%u", (long)getpid(),
-	         __atomic_add_fetch(&counter, 1u, __ATOMIC_RELAXED));
-	if (hull_root_call(args, (const uint8_t *)m->plan, m->plan_length, NULL, 0u, why, cap) != 0)
-		return why;
-	snprintf(m->devices_dir, sizeof m->devices_dir, "%s/%u/%s", HULL_ROOT_DEVICES,
-	         (unsigned)getuid(), name);
-	for (unsigned i = 0u; i < m->device_count; i++) {
-		hull_hostdev *h = &m->device[i].host;
-		struct stat   st;
-
-		if (!m->device[i].root)
-			continue;
-		if (stat(h->node, &st) != 0) {
-			snprintf(why, cap, "%s: %s", h->node, strerror(errno));
-			remove_granted(m);
-			return why;
-		}
-		snprintf(h->granted, sizeof h->granted, "%s/%c%u:%u", m->devices_dir,
-		         S_ISCHR(st.st_mode) ? 'c' : 'b', major(st.st_rdev), minor(st.st_rdev));
-		if (stat(h->granted, &st) != 0) {
-			snprintf(why, cap, "hull-root made no node for %s", h->node);
-			remove_granted(m);
-			return why;
-		}
-	}
-	return NULL;
-}
-
-/*
  * The machine's network on a bridge, as the root core: hull0 made first
  * where it is its (hostnet.c), then a veth whose far end is the machine's
  * eth0, moved into the init's namespace, and whose near end is on the
@@ -3481,10 +3426,15 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 			return fail(error, HULL_ERR_RUNTIME, m->detail);
 		}
 	}
-	if (m->devices_root[0] != '\0' && grant_devices(m, m->detail, sizeof m->detail) != NULL)
+	/* Root mode's devices: hull-root makes each again as the user's node,
+	 * bound at the host's path in its place (section 7). */
+	if (m->devices_root[0] != '\0' &&
+	    hull_root_grant(m->devices_root, (const uint8_t *)m->plan, m->plan_length, m->device,
+	                    m->device_count, m->devices_dir, sizeof m->devices_dir, m->detail,
+	                    sizeof m->detail) != NULL)
 		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	if (hull_hostdev_claim(m, m->device, m->device_count, m->detail, sizeof m->detail) != NULL) {
-		remove_granted(m);
+		hull_root_ungrant(m->device, m->device_count, m->devices_dir);
 		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	}
 	/* A kept machine's directory, for its init.sock; a composefs one's,
