@@ -822,7 +822,9 @@ static int readonly_root(const hull_spec *spec, const hull_sexpr_form *machine)
  * on is the qemu engine's, vm or emu, whose guest mounts the image as
  * root, and it names nothing a composefs root refuses -- layers, an
  * upper, an export, the image's own kernel. The backends are the
- * command's where it names any, else the machine's own. */
+ * command's where it names any, else the machine's own. 0 for a checkout;
+ * 1 where chroot's FUSE serves it alone; 2 where a backend is qemu's,
+ * whose guest a verity machine gives an objects disk. */
 static int composefs_machine(const hull_spec *spec, const hull_sexpr_form *machine,
                              const char *const *backends, unsigned backend_count)
 {
@@ -832,6 +834,7 @@ static int composefs_machine(const hull_spec *spec, const hull_sexpr_form *machi
 	hull_sexpr_form          value;
 	const char              *given[1];
 	char                     own[32] = "";
+	int                      any_qemu = 0;
 
 	for (unsigned i = 0u; refused[i] != NULL; i++)
 		if (hull_spec_find(spec, machine, refused[i], &entry))
@@ -881,8 +884,9 @@ static int composefs_machine(const hull_spec *spec, const hull_sexpr_form *machi
 			return 0;
 		if (!qemu && !chroot)
 			return 0;
+		any_qemu = any_qemu || qemu;
 	}
-	return 1;
+	return any_qemu ? 2 : 1;
 }
 
 /* Whether the machine asks `(security (verity true))`. */
@@ -1140,9 +1144,11 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 			}
 		}
 		cfs = composefs_machine(&spec, &machines[i], backends, backend_count);
+		/* The objects disk is the guest's; chroot's FUSE server checks
+		 * the objects themselves. */
 		if (cfs ? hull_store_composefs_image(&store, name, create, path, sizeof path, why,
 		                                     sizeof why) != 0 ||
-		          (create && wants_verity(&spec, &machines[i]) &&
+		          (create && cfs == 2 && wants_verity(&spec, &machines[i]) &&
 		           verity_disk(&store, name, path, why, sizeof why) != 0) :
 		          create && hull_store_checkout(&store, name, 1, path, sizeof path, &skipped, why,
 		                                        sizeof why) != 0) {

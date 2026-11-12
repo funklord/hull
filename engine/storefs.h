@@ -30,8 +30,15 @@ int hull_storefs_parts(const char *image, char *store, size_t store_cap, char he
  * /dev/fuse descriptor already mounted, until it is unmounted. Writes
  * why it could not start into `why`, and returns -1, before serving;
  * returns 0 once the mount has gone. `ready` is called, once the
- * manifest is read, before the first request is taken. */
-int hull_storefs_serve(const char *store, const char *hex, int fuse,
+ * manifest is read, before the first request is taken.
+ *
+ * With `verity`, (security (verity true)), each file's bytes are checked
+ * as fs-verity checks them, against a tree of hashes anchored in what the
+ * manifest names it by: an open reads its object whole, hashing each
+ * 4096-byte block and the whole, and fails EIO where the whole is not its
+ * sha256; each read then hashes the blocks it returns against those, and
+ * fails EIO where one has changed since. */
+int hull_storefs_serve(const char *store, const char *hex, int fuse, int verity,
                        void (*ready)(void *context), void *context, char *why, size_t cap);
 
 /* The bytes of `path` in the manifest `hex` under `store`, a regular

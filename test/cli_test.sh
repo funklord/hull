@@ -814,6 +814,8 @@ from_root 0 '^procs=2$' -f "$root/pid.conf"
 # overlay (engine/storefs.c); a read-only root, and a host without FUSE,
 # run on its checkout, made once in the store. Either way a write reaches
 # neither the store nor the tree committed, and a plan makes nothing.
+mkdir -p "$root/rootfs/srv"
+printf 'checked by verity\n' > "$root/rootfs/srv/verity"
 expect 0 '^stored/root:1 sha256:[0-9a-f]{64}$' "$hull" commit "$root/rootfs" stored/root:1
 stored_hex=$(printf '%s\n' "$out" | sed -n 's/^stored\/root:1 sha256://p')
 checkout=$XDG_DATA_HOME/hull/store/checkouts/sha256/$stored_hex
@@ -836,6 +838,31 @@ cases=$((cases + 1))
 if [ -r /dev/fuse ] && [ -w /dev/fuse ]; then
 	cases=$((cases + 1))
 	[ ! -e "$checkout" ] || fail "a machine served by FUSE checked its tree out" ""
+fi
+# fs-verity on chroot, (security (verity true)): the FUSE server checks
+# each file as it is read against what the manifest names it by, so an
+# object changed in the store by a byte, its size kept, reads as an I/O
+# error and never the changed byte; put back, it reads again.
+if [ -r /dev/fuse ] && [ -w /dev/fuse ]; then
+	printf '(machine (source "stored/root:1") (backend chroot) (security (verity true)) %s)\n' \
+		'(command "/probe" "read" "/srv/verity")' > "$root/stored-verity.conf"
+	from_root 0 '^read=checked by verity$' -f "$root/stored-verity.conf"
+	sum=$(sha256sum < "$root/rootfs/srv/verity" | cut -c1-64)
+	object=$XDG_DATA_HOME/hull/store/objects/sha256/$(printf '%s' "$sum" | cut -c1-2)/$sum
+	cases=$((cases + 1))
+	if [ -f "$object" ]; then
+		chmod u+w "$object"
+		printf 'checked by verify\n' > "$object"
+		from_root 0 '^read=Input/output error$' -f "$root/stored-verity.conf"
+		printf 'checked by verity\n' > "$object"
+		chmod 444 "$object"
+		from_root 0 '^read=checked by verity$' -f "$root/stored-verity.conf"
+	else
+		fail "the store holds no object for /srv/verity" "$object"
+	fi
+	printf '(machine (source "dir:%s") (backend chroot) (security (verity true)) %s)\n' \
+		"$root/rootfs" '(command "/probe")' > "$root/dir-verity.conf"
+	from_root 125 'checks a stored tree.s files as they are read' -f "$root/dir-verity.conf"
 fi
 # A read-only root has no overlay to lie over a FUSE tree, so it runs on
 # the checkout, made once and kept.

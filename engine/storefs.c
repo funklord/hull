@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "sexpr.h"
+#include "sha256.h"
 
 /* A tree's entry, the root at index 0: offsets are into the manifest's
  * bytes, which stay mapped while the tree is served. */
@@ -345,12 +346,125 @@ static int open_object(const tree *t, const node *e)
 
 /* --- the FUSE protocol, read-only -------------------------------------- */
 
+#define BLOCK   4096u
+#define HANDLES 4096u   /* files open at once under verity */
+
+/* A file open under verity: its object, and each block's sha256, checked
+ * at the open against the whole's. */
+typedef struct open_file {
+	int      fd;      /* -1 where the slot is free */
+	uint64_t size;
+	uint64_t blocks;
+	uint8_t *hashes;  /* 32 bytes a block, mapped; NULL for an empty file */
+} open_file;
+
 typedef struct server {
-	tree    t;
-	int     fuse;
+	tree     t;
+	int      fuse;
+	int      verity;
 	uint8_t *in;
-	uint8_t *out;    /* a reply's payload, up to a read's most */
+	uint8_t *out;     /* a reply's payload, up to a read's most */
+	uint8_t *span;    /* under verity, a read's blocks whole: a read's most and a block */
+	open_file *handles; /* under verity, HANDLES of them */
 } server;
+
+/* Under verity, the object of `e` read whole: each block hashed into a
+ * new handle, the whole hashed and held to the digest the manifest names
+ * it by. The handle's index, or -1 where it is not the object's bytes or
+ * cannot be read. */
+static int64_t verity_open(server *s, const node *e)
+{
+	hull_sha256 whole;
+	uint8_t     digest[32];
+	struct stat st;
+	uint64_t    at = 0u;
+	uint32_t    slot;
+	open_file  *h;
+
+	/* An empty file has no bytes to check, and no handle. */
+	if (e->size == 0u)
+		return -2;
+	for (slot = 0u; slot < HANDLES && s->handles[slot].fd >= 0; slot++)
+		;
+	if (slot == HANDLES)
+		return -1;
+	h = &s->handles[slot];
+	h->size   = e->size;
+	h->blocks = (e->size + BLOCK - 1u) / BLOCK;
+	h->hashes = NULL;
+	if ((h->fd = open_object(&s->t, e)) < 0) {
+		h->fd = -1;
+		return -1;
+	}
+	if (fstat(h->fd, &st) != 0 || (uint64_t)st.st_size != e->size ||
+	    (h->blocks != 0u && (h->hashes = map((size_t)h->blocks * 32u)) == NULL)) {
+		close(h->fd);
+		h->fd = -1;
+		return -1;
+	}
+	hull_sha256_init(&whole);
+	while (at < h->size) {
+		size_t  want = h->size - at < PAGES * BLOCK ? (size_t)(h->size - at) : PAGES * BLOCK;
+		ssize_t got = pread(h->fd, s->out, want, (off_t)at);
+
+		if (got <= 0 || (size_t)got != want)
+			break;
+		hull_sha256_update(&whole, s->out, want);
+		for (size_t b = 0u; b < want; b += BLOCK) {
+			hull_sha256 block;
+
+			hull_sha256_init(&block);
+			hull_sha256_update(&block, s->out + b, want - b < BLOCK ? want - b : BLOCK);
+			hull_sha256_final(&block, h->hashes + ((at + b) / BLOCK) * 32u);
+		}
+		at += want;
+	}
+	hull_sha256_final(&whole, digest);
+	if (at != h->size || memcmp(digest, e->digest, 32u) != 0) {
+		close(h->fd);
+		if (h->hashes != NULL)
+			munmap(h->hashes, (size_t)h->blocks * 32u);
+		h->fd = -1;
+		return -1;
+	}
+	return (int64_t)slot;
+}
+
+/* Under verity, `length` bytes at `offset` of the open file `h` into
+ * `*data`: the blocks they lie in read whole and each held to its hash.
+ * How many, or -1 where a block is not what the open hashed. */
+static ssize_t verity_read(server *s, const open_file *h, uint64_t offset, size_t length,
+                           const uint8_t **data)
+{
+	uint64_t first;
+	uint64_t end;
+	size_t   span;
+	ssize_t  got;
+
+	if (offset >= h->size)
+		return 0;
+	end   = offset + length < h->size ? offset + length : h->size;
+	first = offset / BLOCK * BLOCK;
+	span  = (size_t)((end + BLOCK - 1u) / BLOCK * BLOCK - first);
+	if (first + span > h->size)
+		span = (size_t)(h->size - first);
+	while ((got = pread(h->fd, s->span, span, (off_t)first)) < 0 && errno == EINTR)
+		;
+	if (got < 0 || (size_t)got != span)
+		return -1;
+	for (size_t b = 0u; b < span; b += BLOCK) {
+		hull_sha256 block;
+		uint8_t     digest[32];
+
+		hull_sha256_init(&block);
+		hull_sha256_update(&block, s->span + b, span - b < BLOCK ? span - b : BLOCK);
+		hull_sha256_final(&block, digest);
+		if (memcmp(digest, h->hashes + ((first + b) / BLOCK) * 32u, 32u) != 0)
+			return -1;
+	}
+	*data = s->span + (offset - first);
+	return (ssize_t)(end - offset);
+}
 
 static void reply(server *s, uint64_t unique, int error, const void *data, size_t length)
 {
@@ -605,6 +719,19 @@ static void handle(server *s, const struct fuse_in_header *h, const uint8_t *arg
 			reply(s, h->unique, -EROFS, NULL, 0u);
 			return;
 		}
+		if (s->verity) {
+			int64_t slot = verity_open(s, &s->t.nodes[i]);
+
+			if (slot == -1) {
+				reply(s, h->unique, -EIO, NULL, 0u);
+				return;
+			}
+			memset(&out, 0, sizeof out);
+			out.fh = (uint64_t)slot;
+			out.open_flags = FOPEN_KEEP_CACHE;
+			reply(s, h->unique, 0, &out, sizeof out);
+			return;
+		}
 		fd = open_object(&s->t, &s->t.nodes[i]);
 		if (fd < 0 && s->t.nodes[i].size != 0u) {
 			reply(s, h->unique, -EIO, NULL, 0u);
@@ -622,6 +749,18 @@ static void handle(server *s, const struct fuse_in_header *h, const uint8_t *arg
 		size_t                     want = in->size < PAGES * 4096u ? in->size : PAGES * 4096u;
 		ssize_t                    got = 0;
 
+		if (s->verity) {
+			const uint8_t *data = s->out;
+			int64_t        slot = (int64_t)in->fh;
+
+			if (slot >= 0 && slot < (int64_t)HANDLES && s->handles[slot].fd >= 0)
+				got = verity_read(s, &s->handles[slot], in->offset, want, &data);
+			if (got < 0)
+				reply(s, h->unique, -EIO, NULL, 0u);
+			else
+				reply(s, h->unique, 0, data, (size_t)got);
+			return;
+		}
 		if (fd >= 0)
 			while ((got = pread(fd, s->out, want, (off_t)in->offset)) < 0 && errno == EINTR)
 				;
@@ -634,8 +773,21 @@ static void handle(server *s, const struct fuse_in_header *h, const uint8_t *arg
 	case FUSE_RELEASE: {
 		const struct fuse_release_in *in = (const void *)arg;
 
-		if ((int64_t)in->fh >= 0)
+		if (s->verity) {
+			int64_t slot = (int64_t)in->fh;
+
+			if (slot >= 0 && slot < (int64_t)HANDLES && s->handles[slot].fd >= 0) {
+				open_file *f = &s->handles[slot];
+
+				close(f->fd);
+				if (f->hashes != NULL)
+					munmap(f->hashes, (size_t)f->blocks * 32u);
+				f->fd = -1;
+				f->hashes = NULL;
+			}
+		} else if ((int64_t)in->fh >= 0) {
 			close((int)(int64_t)in->fh);
+		}
 		reply(s, h->unique, 0, NULL, 0u);
 		return;
 	}
@@ -699,19 +851,24 @@ static void handle(server *s, const struct fuse_in_header *h, const uint8_t *arg
 	}
 }
 
-int hull_storefs_serve(const char *store, const char *hex, int fuse,
+int hull_storefs_serve(const char *store, const char *hex, int fuse, int verity,
                        void (*ready)(void *context), void *context, char *why, size_t cap)
 {
 	server      s;
 	const char *wrong;
 
 	memset(&s, 0, sizeof s);
-	s.fuse = fuse;
+	s.fuse   = fuse;
+	s.verity = verity;
 	if ((wrong = load(&s.t, store, hex)) != NULL ||
-	    (s.in = map(REQUEST)) == NULL || (s.out = map(PAGES * 4096u)) == NULL) {
+	    (s.in = map(REQUEST)) == NULL || (s.out = map(PAGES * 4096u)) == NULL ||
+	    (verity && ((s.span = map((PAGES + 1u) * BLOCK)) == NULL ||
+	                (s.handles = map(HANDLES * sizeof *s.handles)) == NULL))) {
 		snprintf(why, cap, "%s", wrong != NULL ? wrong : "out of memory");
 		return -1;
 	}
+	for (uint32_t k = 0u; verity && k < HANDLES; k++)
+		s.handles[k].fd = -1;
 	if (ready != NULL)
 		ready(context);
 	for (;;) {

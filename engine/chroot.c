@@ -141,6 +141,7 @@ struct hull_machine {
 	char            *argv[MAX_ARGS + 1u];
 	char            *envp[MAX_ENV + 1u];
 	int              readonly_root;
+	int              verity;     /* (security (verity true)): a stored tree's files checked as read */
 	int              overlay;    /* (mutable overlay), and the root not read-only */
 	int              many;       /* the user's subordinate range mapped, not one uid */
 	int              no_new_privs;
@@ -566,6 +567,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	if (hull_access_find(doc, &machine, "security", &entry)) {
 		m->readonly_root = hull_access_true(doc, &entry, "readonly_root");
 		m->no_new_privs  = hull_access_true(doc, &entry, "no_new_privs");
+		m->verity        = hull_access_true(doc, &entry, "verity");
 	}
 	/* A read-only root has nothing for an overlay to hold, so it is the
 	 * directory itself, read-only, either way. */
@@ -657,6 +659,12 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	if (m->composefs != NULL && !m->overlay)
 		return "a composefs root is served read-only by FUSE: it needs (mutable overlay) and "
 		       "a root that is not read-only";
+	/* fs-verity's check is the FUSE server's, against the manifest's
+	 * names: a dir has none, nor a checkout the store made. */
+	if (m->verity && m->composefs == NULL)
+		return "(security (verity true)) checks a stored tree's files as they are read, which on "
+		       "chroot its FUSE server does: a stored source, under (mutable overlay), where the "
+		       "user may open /dev/fuse";
 	if (m->composefs != NULL &&
 	    (m->layer_count != 0u || m->upper != NULL || m->owners != NULL || m->export != NULL))
 		return "a composefs root is the store's tree as it is: layers, an upper, owners and an "
@@ -1585,7 +1593,7 @@ static void serve_composefs(const hull_machine *m, int report)
 
 		close_others(keep, 2u);
 		prctl(PR_SET_PDEATHSIG, SIGKILL);
-		if (hull_storefs_serve(m->cfs_store, m->cfs_hex, fuse, composefs_ready, &ready[1], said,
+		if (hull_storefs_serve(m->cfs_store, m->cfs_hex, fuse, m->verity, composefs_ready, &ready[1], said,
 		                       sizeof said) != 0) {
 			if (write(ready[1], said, strlen(said)) < 0)
 				_exit(127);
@@ -4739,6 +4747,10 @@ static const hull_cap_entry entries[] = {
 	  "in the env of the workload and of every exec", NULL },
 	{ "security.readonly_root", HULL_SUP_NATIVE,   NULL, NULL },
 	{ "security.no_new_privs",  HULL_SUP_NATIVE,   NULL, NULL },
+	{ "security.verity",        HULL_SUP_NATIVE,
+	  "each file of a stored tree checked as it is read by hull's FUSE server, against a "
+	  "tree of block hashes made at its open and held to the sha256 its manifest names it by",
+	  NULL },
 	{ "on_disconnect.stop",     HULL_SUP_NATIVE,   NULL, NULL },
 	{ "on_disconnect.keep",     HULL_SUP_NATIVE,
 	  "kept, and taken back by a core that comes after one that went; its init holds "

@@ -2080,10 +2080,12 @@ open(sys.argv[1], "wb").write(b)
 			fail "a changed object read under (verity true)" "$out"
 	fi
 	cases=$((cases + 1))
+	# docker's daemon keeps its own storage, with nothing to check a file
+	# by; chroot's FUSE server checks it, held in cli_test.sh.
 	out=$(XDG_DATA_HOME="$root/cfs/store" timeout 30 "$hull" plan -f "$root/cfsverity.conf" \
-		--backend chroot 2>&1)
+		--backend docker 2>&1)
 	[ $? -ne 0 ] && printf '%s\n' "$out" | grep -q 'security\.verity' ||
-		fail "(verity true) was planned on chroot" "$out"
+		fail "(verity true) was planned on docker" "$out"
 	cases=$((cases + 1))
 	printf '(machine (source "dir:%s") (backend vm) (security (verity true)) %s)\n' "$r" \
 		'(command "/bin/true")' > "$root/dirverity.conf"
