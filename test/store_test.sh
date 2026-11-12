@@ -626,6 +626,40 @@ expect 1 'unpack: an object of the pack is cut or not what its index says' "$hul
 expect 1 'unpack: it is not a Hull pack' "$hull" unpack "$root/owned.tar" "$root/cutout"
 expect 1 'unpack: [0-9a-f]{64}: the object.s bytes are not the object its name says' \
 	"$hull" unpack "$root/renamed.hull" "$root/cutout"
+# Goal 1 for a pack: said as text by `hull inspect` -- its index, the
+# manifest's hash the one the pack printed, the manifest in A.1's
+# readable view -- and its bytes held to store/pack.situ by situc, apart
+# from the code that wrote them; a pack cut short said as one, not as
+# its index says.
+packhash=$(timeout 30 "$hull" pack one/tree:1 "$root/inspect.hull" 2>&1 | sed -n 's/.* sha256://p')
+expect 0 "^manifest sha256:$packhash [0-9]+ bytes, frame [0-9]+\$" "$hull" inspect "$root/one.hull"
+expect 0 '^object sha256:[0-9a-f]{64} (plain|executable) [0-9]+ bytes, frame [0-9]+ at 0$' "$hull" inspect "$root/one.hull"
+expect 0 '^data [0-9]+ bytes compressed of [0-9]+, as the index says$' "$hull" inspect "$root/one.hull"
+expect 0 '^\(manifest$' "$hull" inspect "$root/one.hull"
+expect 1 'NOT as the index says' "$hull" inspect "$root/cut.hull"
+timeout 30 python3 -c '
+import sys
+data = open(sys.argv[1], "rb").read()
+count = int.from_bytes(data[12:16], "big")
+out = open(sys.argv[2], "w")
+out.write("pack whole %s\n" % data.hex())
+for i in range(count):
+	at = 32 + i * 57
+	out.write("index_entry e%d %s\n" % (i, data[at:at + 57].hex()))
+' "$root/one.hull" "$root/pack.vectors"
+verified=$(timeout 300 python3 "$situc" verify store/pack.situ "$root/pack.vectors" 2>&1)
+cases=$((cases + 1))
+printf '%s\n' "$verified" | grep -q "^situc: $(grep -c '' "$root/pack.vectors") vectors conform to store/pack.situ" ||
+	fail "a pack, or an entry of its index, is not store/pack.situ's" "$verified"
+timeout 30 python3 -c '
+import sys
+data = bytearray(open(sys.argv[1], "rb").read())
+data[11] = 2
+open(sys.argv[2], "w").write("pack whole %s\n" % data.hex())' "$root/one.hull" "$root/pack2.vectors"
+verified=$(timeout 300 python3 "$situc" verify store/pack.situ "$root/pack2.vectors" 2>&1)
+cases=$((cases + 1))
+! printf '%s\n' "$verified" | grep -q 'vectors conform' ||
+	fail "a pack of version 2 conformed to store/pack.situ" "$verified"
 # A pack against a base: a second version of the tree, one file changed
 # and one added, packed without the objects the first names, for a store
 # that holds the first -- what a new version moves to a host with the old.

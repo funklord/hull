@@ -2120,6 +2120,19 @@ int hull_store_runtime(hull_store *store, const char *name, uint8_t **out, size_
 	return 0;
 }
 
+int hull_manifest_print(const uint8_t *data, size_t length, FILE *out)
+{
+	hull_sexpr_doc  doc;
+	hull_sexpr_form top;
+
+	if (hull_sexpr_open(&doc, data, length, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
+	    !hull_sexpr_first(&doc, &top))
+		return -1;
+	show_form(out, &doc, &top, 0);
+	fputc('\n', out);
+	return 0;
+}
+
 int hull_store_show(hull_store *store, const char *name, FILE *out, char *why, size_t cap)
 {
 	char            hex[65];

@@ -528,3 +528,89 @@ done:
 	free(objects);
 	return result;
 }
+
+int hull_pack_inspect(int in, FILE *out, char *why, size_t cap)
+{
+	uint8_t     head[8 + 4 + 4 + 8 + 8];
+	uint8_t     entry[INDEX_ENTRY];
+	uint32_t    count;
+	uint64_t    manifest_length;
+	uint64_t    frame_length;
+	uint64_t    data = 0u;
+	uint64_t    total = 0u;
+	uint64_t    end = 0u;
+	uint8_t    *frame = NULL;
+	uint8_t    *manifest = NULL;
+	uint8_t     digest[32];
+	char        hex[65];
+	hull_sha256 h;
+	ssize_t     got;
+	uint8_t     buffer[65536];
+	int         result = -1;
+
+	if (read_all(in, head, sizeof head) != 0 || memcmp(head, PACK_MAGIC, 8u) != 0)
+		return say(why, cap, "it is not a Hull pack", NULL);
+	count = (uint32_t)head[12] << 24 | (uint32_t)head[13] << 16 | (uint32_t)head[14] << 8 |
+	        head[15];
+	manifest_length = get64(head + 16);
+	frame_length    = get64(head + 24);
+	fprintf(out, "version %u\n", (unsigned)head[8] << 24 | (unsigned)head[9] << 16 |
+	        (unsigned)head[10] << 8 | head[11]);
+	if (head[8] != 0u || head[9] != 0u || head[10] != 0u || head[11] != PACK_VERSION)
+		return say(why, cap, "a pack of a version this hull does not read", NULL);
+	if (count > MAX_OBJECTS || manifest_length > (256u << 20) || frame_length > (256u << 20))
+		return say(why, cap, "the pack's header is not one hull reads", NULL);
+	fprintf(out, "objects %u\n", count);
+	for (uint32_t i = 0u; i < count; i++) {
+		uint64_t length;
+		uint64_t offset;
+		uint64_t compressed;
+
+		if (read_all(in, entry, sizeof entry) != 0)
+			return say(why, cap, "the pack ends in its index", NULL);
+		hull_sha256_hex(entry, hex);
+		length     = get64(entry + 33);
+		offset     = get64(entry + 41);
+		compressed = get64(entry + 49);
+		fprintf(out, "object sha256:%s %s %llu bytes, frame %llu at %llu\n", hex,
+		        entry[32] & 1u ? "executable" : "plain", (unsigned long long)length,
+		        (unsigned long long)compressed, (unsigned long long)offset);
+		total += length;
+		if (offset + compressed > end)
+			end = offset + compressed;
+	}
+	if ((frame = malloc(frame_length > 0u ? frame_length : 1u)) == NULL ||
+	    (manifest = malloc(manifest_length > 0u ? manifest_length : 1u)) == NULL) {
+		say(why, cap, "out of memory", NULL);
+		goto done;
+	}
+	if (read_all(in, frame, frame_length) != 0) {
+		say(why, cap, "the pack ends in its manifest", NULL);
+		goto done;
+	}
+	if (ZSTD_decompress(manifest, manifest_length, frame, frame_length) != manifest_length) {
+		say(why, cap, "the pack's manifest does not decompress to its length", NULL);
+		goto done;
+	}
+	while ((got = read(in, buffer, sizeof buffer)) > 0 || (got < 0 && errno == EINTR))
+		if (got > 0)
+			data += (uint64_t)got;
+	hull_sha256_init(&h);
+	hull_sha256_update(&h, manifest, manifest_length);
+	hull_sha256_final(&h, digest);
+	hull_sha256_hex(digest, hex);
+	fprintf(out, "manifest sha256:%s %llu bytes, frame %llu\n", hex,
+	        (unsigned long long)manifest_length, (unsigned long long)frame_length);
+	fprintf(out, "data %llu bytes compressed of %llu, %s\n", (unsigned long long)data,
+	        (unsigned long long)total, data == end ? "as the index says" :
+	        "NOT as the index says: the pack is cut short or has more");
+	if (hull_manifest_print(manifest, manifest_length, out) != 0) {
+		say(why, cap, "the pack's manifest is not one", NULL);
+		goto done;
+	}
+	result = data == end ? 0 : say(why, cap, "the pack's data is not where its index says", NULL);
+done:
+	free(frame);
+	free(manifest);
+	return result;
+}

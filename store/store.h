@@ -116,6 +116,18 @@ int hull_store_manifest_put(hull_store *store, const uint8_t *data, size_t lengt
  * -1 with why. */
 int hull_store_pack(hull_store *store, const char *name, const char *against, int out,
                     char hex[65], char *why, size_t cap);
+/* A pack read from `in` and said on `out` as text, for a person
+ * (`hull inspect`, goal 1): its header, each object of its index -- digest,
+ * executable or not, length and frame -- whether its data runs to where the
+ * index says, and its manifest in A.1's readable view, checked against the
+ * hash the pack is known by. Nothing is written to a store. 0, or -1 with
+ * why. */
+int hull_pack_inspect(int in, FILE *out, char *why, size_t cap);
+
+/* A manifest's canonical bytes in A.1's readable view, as `hull manifest
+ * show` gives a stored one. 0, or -1 where they are not one. */
+int hull_manifest_print(const uint8_t *data, size_t length, FILE *out);
+
 int hull_store_unpack(hull_store *store, int in, const char *ref, char hex[65], char *why,
                       size_t cap);
 

@@ -154,6 +154,7 @@ static void usage(FILE *out)
 	      "       hull materialize REF DIR | hull images\n"
 	      "       hull diff REF REF | hull tag REF NEW | hull tag -d REF\n"
 	      "       hull manifest show REF | hull manifest compile [REF]\n"
+	      "       hull inspect FILE|-\n"
 	      "       hull manifest composefs REF FILE\n"
 	      "       hull pull [--arch A] IMAGE [REF] | hull push REF IMAGE | hull load FILE [REF]\n"
 	      "       hull import [--build-arg N=V]... [--target STAGE] DOCKERFILE\n"
@@ -6735,6 +6736,28 @@ static int untag(const char *ref)
 	return 0;
 }
 
+/* `hull inspect FILE`: a pack said as text (goal 1), its header, index
+ * and readable manifest, read from FILE or stdin as `-`, nothing stored. */
+static int inspect(const char *file)
+{
+	char why[4400] = "";
+	int  fd = strcmp(file, "-") == 0 ? 0 : open(file, O_RDONLY | O_CLOEXEC);
+	int  status;
+
+	if (fd < 0) {
+		fprintf(stderr, "hull: inspect: %s: %s\n", file, strerror(errno));
+		return 1;
+	}
+	status = hull_pack_inspect(fd, stdout, why, sizeof why);
+	if (fd != 0)
+		close(fd);
+	if (status != 0) {
+		fprintf(stderr, "hull: inspect: %s: %s\n", file, why);
+		return 1;
+	}
+	return 0;
+}
+
 static int show_manifest(const char *name)
 {
 	hull_store store;
@@ -8383,6 +8406,8 @@ int main(int argc, char **argv)
 		return export_bootable(argv[3], argv[4], NULL, argv[6]);
 	if (strcmp(command, "pack") == 0 && argc == 6 && strcmp(argv[2], "--against") == 0)
 		return pack(argv[4], argv[3], argv[5]);
+	if (strcmp(command, "inspect") == 0 && argc == 3)
+		return inspect(argv[2]);
 	if (strcmp(command, "pack") == 0 && argc == 4)
 		return pack(argv[2], NULL, argv[3]);
 	if (strcmp(command, "unpack") == 0 && argc == 4)
