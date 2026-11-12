@@ -19,6 +19,16 @@
  *   the data: each object's frame, in the index's order, the objects'
  *   digests ascending and each once
  *
+ * A pack made against a base (`hull pack --against`) may hold an object
+ * as a recipe against the base's object at the same path, flag 2 in the
+ * index, its frame then the recipe compressed: the base object's digest,
+ * and ops, each a kind byte -- 0 copy (u64 offset in the base object, u64
+ * length), 1 literal (u64 length, then the bytes) -- ended by 0xFF. The
+ * ops are found by content-defined chunking (Appendix C): both objects cut
+ * where a rolling gear hash of their bytes says, so a byte changed moves
+ * one chunk and not the file. A pack holding any recipe is version 2, one
+ * holding none version 1, as it always was.
+ *
  * Its identity is its manifest's hash, which unpacking checks the
  * manifest against, as each object against its digest. Compressed at a
  * fixed level by one thread, the same tree gives the same bytes under one
@@ -33,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -44,6 +55,12 @@
 
 #define PACK_MAGIC   "HULLPACK"
 #define PACK_VERSION 1u
+#define PACK_DELTAS  2u    /* the version of a pack holding a recipe */
+#define FLAG_DELTA   2u
+#define DELTA_FLOOR  (64u << 10)  /* an object smaller is sent whole */
+#define CHUNK_MIN    (8u << 10)
+#define CHUNK_MASK   ((1u << 15) - 1u)  /* about 32 KiB a chunk */
+#define CHUNK_MAX    (128u << 10)
 #define PACK_LEVEL   9
 #define INDEX_ENTRY  (32u + 1u + 8u + 8u + 8u)
 #define MAX_OBJECTS  (1u << 22)
@@ -205,6 +222,300 @@ static int objects_of(const uint8_t *manifest, size_t length, object **objects, 
 	return 0;
 }
 
+/* A path and the object it names, from a manifest's entries. */
+typedef struct named {
+	uint8_t     digest[32];
+	const char *path;      /* into the manifest's bytes */
+	size_t      length;
+} named;
+
+static int by_path(const void *a, const void *b)
+{
+	const named *x = a;
+	const named *y = b;
+	size_t       n = x->length < y->length ? x->length : y->length;
+	int          c = memcmp(x->path, y->path, n);
+
+	return c != 0 ? c : (x->length > y->length) - (x->length < y->length);
+}
+
+static int named_by_digest(const void *a, const void *b)
+{
+	return memcmp(((const named *)a)->digest, ((const named *)b)->digest, 32u);
+}
+
+/* Each regular file's path and object, into `*list` (pointing into
+ * `manifest`, which must outlive it); sorted by `order`. */
+static int paths_of(const uint8_t *manifest, size_t length, named **list, uint32_t *count,
+                    int (*order)(const void *, const void *))
+{
+	hull_sexpr_doc  doc;
+	hull_sexpr_form top;
+	hull_sexpr_form item;
+	uint32_t        n = 0u;
+	uint32_t        room = 64u;
+	named          *out = malloc(room * sizeof *out);
+
+	if (out == NULL)
+		return -1;
+	if (hull_sexpr_open(&doc, manifest, length, HULL_SEXPR_CANONICAL, NULL) != HULL_SEXPR_OK ||
+	    !hull_sexpr_first(&doc, &top) || !hull_sexpr_child(&doc, &top, &item)) {
+		free(out);
+		return -1;
+	}
+	while (hull_sexpr_next(&doc, &item, &item)) {
+		hull_sexpr_form head;
+		hull_sexpr_form entry;
+
+		if (item.kind != HULL_SEXPR_LIST || !hull_sexpr_child(&doc, &item, &head) ||
+		    !hull_sexpr_is(&doc, &head, "entries"))
+			continue;
+		entry = head;
+		while (hull_sexpr_next(&doc, &entry, &entry)) {
+			hull_sexpr_form field;
+			named           one = { .path = NULL };
+			int             object = 0;
+
+			if (entry.kind != HULL_SEXPR_LIST || !hull_sexpr_child(&doc, &entry, &field))
+				continue;
+			while (hull_sexpr_next(&doc, &field, &field)) {
+				hull_sexpr_form key;
+				hull_sexpr_form value;
+
+				if (field.kind != HULL_SEXPR_LIST || !hull_sexpr_child(&doc, &field, &key) ||
+				    !hull_sexpr_next(&doc, &key, &value))
+					continue;
+				if (hull_sexpr_is(&doc, &key, "object") && value.content_length == 32u) {
+					memcpy(one.digest, doc.data + value.content, 32u);
+					object = 1;
+				} else if (hull_sexpr_is(&doc, &key, "path")) {
+					one.path   = (const char *)doc.data + value.content;
+					one.length = value.content_length;
+				}
+			}
+			if (!object || one.path == NULL)
+				continue;
+			if (n == room) {
+				named *grown = room < MAX_OBJECTS ? realloc(out, (size_t)room * 2u * sizeof *out) :
+				               NULL;
+
+				if (grown == NULL) {
+					free(out);
+					return -1;
+				}
+				out = grown;
+				room *= 2u;
+			}
+			out[n++] = one;
+		}
+	}
+	if (n > 1u)
+		qsort(out, n, sizeof *out, order);
+	*list = out;
+	*count = n;
+	return 0;
+}
+
+/* --- content-defined chunking -------------------------------------------- */
+
+/* The gear table: 256 words of splitmix64 from a fixed seed, the same in
+ * every hull, since writer and reader need not agree on it -- a recipe
+ * says its copies by offset -- but two writers making the same pack
+ * should. */
+static uint64_t gear[256];
+
+static void gear_init(void)
+{
+	uint64_t x = 0x68756c6c67656172ull;  /* "hullgear" */
+
+	if (gear[255] != 0u)
+		return;
+	for (unsigned i = 0u; i < 256u; i++) {
+		uint64_t z = (x += 0x9e3779b97f4a7c15ull);
+
+		z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+		z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+		gear[i] = z ^ (z >> 31);
+	}
+}
+
+/* The length of the chunk at `data`, of `left` bytes left: cut where the
+ * rolling hash's low bits are zero, between CHUNK_MIN and CHUNK_MAX. */
+static size_t chunk_length(const uint8_t *data, size_t left)
+{
+	uint64_t h = 0u;
+	size_t   i;
+
+	if (left <= CHUNK_MIN)
+		return left;
+	for (i = 0u; i < left && i < CHUNK_MAX; i++) {
+		h = (h << 1) + gear[data[i]];
+		if (i >= CHUNK_MIN && (h & CHUNK_MASK) == 0u)
+			return i + 1u;
+	}
+	return i;
+}
+
+typedef struct chunk {
+	uint8_t  digest[32];
+	uint64_t offset;
+	uint64_t length;
+} chunk;
+
+static int chunk_order(const void *a, const void *b)
+{
+	return memcmp(((const chunk *)a)->digest, ((const chunk *)b)->digest, 32u);
+}
+
+/* Write the recipe for `new` against `base` to `out`: copies where a
+ * chunk of `new` is one of `base`'s, literals where it is not, adjacent
+ * copies and literals merged. 0, or -1. */
+static int write_recipe(const uint8_t base_digest[32], const uint8_t *base, size_t base_length,
+                        const uint8_t *new, size_t new_length, FILE *out)
+{
+	chunk   *chunks = NULL;
+	size_t   count = 0u;
+	size_t   room = 0u;
+	size_t   at;
+	uint64_t copy_at = 0u;
+	uint64_t copy_length = 0u;
+	size_t   literal_at = 0u;
+	size_t   literal_length = 0u;
+	uint8_t  op[17];
+	int      result = -1;
+
+	gear_init();
+	for (at = 0u; at < base_length;) {
+		size_t n = chunk_length(base + at, base_length - at);
+
+		if (count == room) {
+			chunk *grown = realloc(chunks, (room = room != 0u ? room * 2u : 1024u) * sizeof *chunks);
+
+			if (grown == NULL)
+				goto done;
+			chunks = grown;
+		}
+		{
+			hull_sha256 h;
+
+			hull_sha256_init(&h);
+			hull_sha256_update(&h, base + at, n);
+			hull_sha256_final(&h, chunks[count].digest);
+		}
+		chunks[count].offset = at;
+		chunks[count].length = n;
+		count++;
+		at += n;
+	}
+	if (count > 1u)
+		qsort(chunks, count, sizeof *chunks, chunk_order);
+	if (fwrite(base_digest, 1u, 32u, out) != 32u)
+		goto done;
+	for (at = 0u; at <= new_length;) {
+		size_t       n = at < new_length ? chunk_length(new + at, new_length - at) : 0u;
+		const chunk *found = NULL;
+		chunk        key;
+
+		if (n > 0u) {
+			hull_sha256 h;
+
+			hull_sha256_init(&h);
+			hull_sha256_update(&h, new + at, n);
+			hull_sha256_final(&h, key.digest);
+			found = count > 0u ? bsearch(&key, chunks, count, sizeof *chunks, chunk_order) : NULL;
+			if (found != NULL && memcmp(base + found->offset, new + at, n) != 0)
+				found = NULL;
+		}
+		/* What is pending goes out where the next chunk does not extend it. */
+		if (literal_length > 0u && (found != NULL || n == 0u)) {
+			op[0] = 1u;
+			put64(op + 1, literal_length);
+			if (fwrite(op, 1u, 9u, out) != 9u ||
+			    fwrite(new + literal_at, 1u, literal_length, out) != literal_length)
+				goto done;
+			literal_length = 0u;
+		}
+		if (copy_length > 0u && (found == NULL || found->offset != copy_at + copy_length)) {
+			op[0] = 0u;
+			put64(op + 1, copy_at);
+			put64(op + 9, copy_length);
+			if (fwrite(op, 1u, 17u, out) != 17u)
+				goto done;
+			copy_length = 0u;
+		}
+		if (n == 0u)
+			break;
+		if (found != NULL) {
+			if (copy_length == 0u)
+				copy_at = found->offset;
+			copy_length += n;
+		} else {
+			if (literal_length == 0u)
+				literal_at = at;
+			literal_length += n;
+		}
+		at += n;
+	}
+	op[0] = 0xFFu;
+	result = fwrite(op, 1u, 1u, out) == 1u ? 0 : -1;
+done:
+	free(chunks);
+	return result;
+}
+
+/* An object rebuilt from its recipe, `recipe` of `length` bytes, against
+ * the base object it names, which the store holds, into `out`. 0, or -1
+ * with why. */
+static int apply_recipe(hull_store *store, const uint8_t *recipe, size_t length, int out,
+                        char *why, size_t cap)
+{
+	int         executable;
+	int         fd;
+	struct stat st;
+	uint8_t    *base = NULL;
+	size_t      at = 32u;
+	int         result = -1;
+
+	if (length < 33u)
+		return say(why, cap, "a recipe of the pack is cut", NULL);
+	if ((fd = hull_store_object_open(store, recipe, &executable)) < 0)
+		return say(why, cap, "a recipe of the pack names a base object this store does not "
+		           "hold: a pack made against a base wants that base unpacked first", NULL);
+	if (fstat(fd, &st) != 0 ||
+	    (st.st_size > 0 && (base = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0)) ==
+	                       MAP_FAILED)) {
+		close(fd);
+		return say(why, cap, "a base object could not be read", strerror(errno));
+	}
+	close(fd);
+	while (at < length && recipe[at] != 0xFFu) {
+		if (recipe[at] == 0u && length - at >= 17u) {
+			uint64_t from = get64(recipe + at + 1);
+			uint64_t n = get64(recipe + at + 9);
+
+			if (from > (uint64_t)st.st_size || n > (uint64_t)st.st_size - from ||
+			    write_all(out, base + from, (size_t)n) != 0)
+				break;
+			at += 17u;
+		} else if (recipe[at] == 1u && length - at >= 9u) {
+			uint64_t n = get64(recipe + at + 1);
+
+			if (n > length - at - 9u || write_all(out, recipe + at + 9, (size_t)n) != 0)
+				break;
+			at += 9u + (size_t)n;
+		} else {
+			break;
+		}
+	}
+	if (at < length && recipe[at] == 0xFFu && at + 1u == length)
+		result = 0;
+	else
+		say(why, cap, "a recipe of the pack is not one", NULL);
+	if (base != NULL)
+		munmap(base, (size_t)st.st_size);
+	return result;
+}
+
 /* `in`'s next `length` bytes as one zstd frame to `out`; its length into
  * `*frame`. */
 static int compress_into(ZSTD_CCtx *cctx, int in, uint64_t length, int out, uint64_t *frame)
@@ -258,6 +569,13 @@ int hull_store_pack(hull_store *store, const char *name, const char *against, in
 	size_t     frame_length;
 	uint8_t    head[8 + 4 + 4 + 8 + 8];
 	int        result = -1;
+	uint8_t   *base = NULL;          /* the base's manifest, against one */
+	size_t     base_length = 0u;
+	named     *base_paths = NULL;    /* its files by path */
+	uint32_t   base_count = 0u;
+	named     *new_paths = NULL;     /* this tree's files by object */
+	uint32_t   new_count = 0u;
+	int        deltas = 0;
 
 	if (hull_store_manifest_of(store, name, hex, &manifest, &manifest_length, why, cap) != 0)
 		return -1;
@@ -266,8 +584,6 @@ int hull_store_pack(hull_store *store, const char *name, const char *against, in
 	/* Against a base: only what the base does not name, both lists in
 	 * digest order, for a store that holds the base already. */
 	if (against != NULL) {
-		uint8_t *base = NULL;
-		size_t   base_length = 0u;
 		object  *held = NULL;
 		uint32_t held_count = 0u;
 		uint32_t kept = 0u;
@@ -275,17 +591,21 @@ int hull_store_pack(hull_store *store, const char *name, const char *against, in
 
 		if (hull_store_manifest_of(store, against, base_hex, &base, &base_length, why, cap) != 0)
 			goto done;
-		if (objects_of(base, base_length, &held, &held_count, why, cap) != 0) {
-			free(base);
+		if (objects_of(base, base_length, &held, &held_count, why, cap) != 0)
 			goto done;
-		}
 		for (uint32_t i = 0u; i < count; i++)
 			if (held_count == 0u ||
 			    bsearch(&objects[i], held, held_count, sizeof *held, by_digest) == NULL)
 				objects[kept++] = objects[i];
 		count = kept;
 		free(held);
-		free(base);
+		/* And which file each is, and which object the base had there,
+		 * for a recipe against it (Appendix C). */
+		if (paths_of(base, base_length, &base_paths, &base_count, by_path) != 0 ||
+		    paths_of(manifest, manifest_length, &new_paths, &new_count, named_by_digest) != 0) {
+			say(why, cap, "a manifest's paths could not be read", NULL);
+			goto done;
+		}
 	}
 	if ((cctx = ZSTD_createCCtx()) == NULL ||
 	    ZSTD_isError(ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, PACK_LEVEL)) ||
@@ -312,6 +632,74 @@ int hull_store_pack(hull_store *store, const char *name, const char *against, in
 		objects[i].flags  = executable ? 1u : 0u;
 		objects[i].length = (uint64_t)st.st_size;
 		objects[i].offset = (uint64_t)at;
+		/* A large file the base had at its path: a recipe against the
+		 * base's object, where that is smaller than the object. */
+		if (base_paths != NULL && objects[i].length >= DELTA_FLOOR) {
+			named        key;
+			const named *mine;
+			const named *theirs = NULL;
+
+			memcpy(key.digest, objects[i].digest, 32u);
+			mine = new_count > 0u ? bsearch(&key, new_paths, new_count, sizeof *new_paths,
+			                                named_by_digest) : NULL;
+			if (mine != NULL && base_count > 0u)
+				theirs = bsearch(mine, base_paths, base_count, sizeof *base_paths, by_path);
+			if (theirs != NULL) {
+				int         base_executable;
+				int         base_fd = hull_store_object_open(store, theirs->digest,
+				                                             &base_executable);
+				struct stat base_st;
+				uint8_t    *old = NULL;
+				uint8_t    *now = NULL;
+				FILE       *recipe = NULL;
+				long        recipe_length = 0L;
+
+				if (base_fd >= 0 && fstat(base_fd, &base_st) == 0 && base_st.st_size > 0 &&
+				    (old = mmap(NULL, (size_t)base_st.st_size, PROT_READ, MAP_PRIVATE, base_fd,
+				                0)) != MAP_FAILED &&
+				    (now = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0)) !=
+				        MAP_FAILED &&
+				    (recipe = store_temp(store)) != NULL &&
+				    write_recipe(theirs->digest, old, (size_t)base_st.st_size, now,
+				                 (size_t)st.st_size, recipe) == 0 &&
+				    fflush(recipe) == 0 && (recipe_length = ftell(recipe)) > 0 &&
+				    (uint64_t)recipe_length < objects[i].length) {
+					rewind(recipe);
+					if (compress_into(cctx, fileno(recipe), (uint64_t)recipe_length,
+					                  fileno(data), &objects[i].frame) != 0) {
+						say(why, cap, "a recipe could not be packed", strerror(errno));
+						recipe_length = -1L;
+					} else {
+						objects[i].flags |= FLAG_DELTA;
+						deltas = 1;
+					}
+				}
+				if (old != NULL && old != MAP_FAILED)
+					munmap(old, (size_t)base_st.st_size);
+				if (now != NULL && now != MAP_FAILED)
+					munmap(now, (size_t)st.st_size);
+				if (recipe != NULL)
+					fclose(recipe);
+				if (base_fd >= 0)
+					close(base_fd);
+				if (recipe_length < 0L) {
+					close(fd);
+					goto done;
+				}
+				if (objects[i].flags & FLAG_DELTA) {
+					close(fd);
+					fseek(data, 0L, SEEK_END);
+					continue;
+				}
+				/* No recipe: the object whole, from its start. */
+				if (lseek(fd, 0, SEEK_SET) != 0) {
+					close(fd);
+					say(why, cap, "an object could not be packed", strerror(errno));
+					goto done;
+				}
+				fseek(data, at, SEEK_SET);
+			}
+		}
 		if (compress_into(cctx, fd, objects[i].length, fileno(data), &objects[i].frame) != 0) {
 			close(fd);
 			say(why, cap, "an object could not be packed", strerror(errno));
@@ -332,7 +720,8 @@ int hull_store_pack(hull_store *store, const char *name, const char *against, in
 		goto done;
 	}
 	memcpy(head, PACK_MAGIC, 8u);
-	head[8] = 0u, head[9] = 0u, head[10] = 0u, head[11] = (uint8_t)PACK_VERSION;
+	head[8] = 0u, head[9] = 0u, head[10] = 0u;
+	head[11] = (uint8_t)(deltas ? PACK_DELTAS : PACK_VERSION);
 	head[12] = (uint8_t)(count >> 24), head[13] = (uint8_t)(count >> 16);
 	head[14] = (uint8_t)(count >> 8), head[15] = (uint8_t)count;
 	put64(head + 16, manifest_length);
@@ -373,6 +762,9 @@ done:
 	ZSTD_freeCCtx(cctx);
 	free(frame);
 	free(objects);
+	free(base_paths);
+	free(new_paths);
+	free(base);
 	free(manifest);
 	return result;
 }
@@ -409,6 +801,39 @@ static int decompress_into(ZSTD_DCtx *dctx, int in, uint64_t length, uint64_t ex
 	return last == 0u && made == expected ? 0 : -1;
 }
 
+/* As decompress_into, for a frame whose length is not known before: at
+ * most `most` bytes, how many into `*got`. */
+static int decompress_up_to(ZSTD_DCtx *dctx, int in, uint64_t length, uint64_t most, int out,
+                            uint64_t *got)
+{
+	static uint8_t from[1 << 17];
+	static uint8_t to[1 << 17];
+	uint64_t       left = length;
+	size_t         last = 1u;
+
+	*got = 0u;
+	ZSTD_DCtx_reset(dctx, ZSTD_reset_session_only);
+	while (left > 0u) {
+		size_t        n = left < sizeof from ? (size_t)left : sizeof from;
+		ZSTD_inBuffer input;
+
+		if (read_all(in, from, n) != 0)
+			return -1;
+		left -= n;
+		input = (ZSTD_inBuffer){ from, n, 0u };
+		while (input.pos < input.size) {
+			ZSTD_outBuffer output = { to, sizeof to, 0u };
+
+			last = ZSTD_decompressStream(dctx, &output, &input);
+			if (ZSTD_isError(last) || *got + output.pos > most ||
+			    write_all(out, to, output.pos) != 0)
+				return -1;
+			*got += output.pos;
+		}
+	}
+	return last == 0u ? 0 : -1;
+}
+
 int hull_store_unpack(hull_store *store, int in, const char *ref, char hex[65], char *why,
                       size_t cap)
 {
@@ -426,7 +851,8 @@ int hull_store_unpack(hull_store *store, int in, const char *ref, char hex[65], 
 
 	if (read_all(in, head, sizeof head) != 0 || memcmp(head, PACK_MAGIC, 8u) != 0)
 		return say(why, cap, "it is not a Hull pack", NULL);
-	if (head[8] != 0u || head[9] != 0u || head[10] != 0u || head[11] != PACK_VERSION)
+	if (head[8] != 0u || head[9] != 0u || head[10] != 0u ||
+	    (head[11] != PACK_VERSION && head[11] != PACK_DELTAS))
 		return say(why, cap, "a pack of a version this hull does not read", NULL);
 	count = (uint32_t)head[12] << 24 | (uint32_t)head[13] << 16 | (uint32_t)head[14] << 8 |
 	        head[15];
@@ -477,7 +903,33 @@ int hull_store_unpack(hull_store *store, int in, const char *ref, char hex[65], 
 	/* Each object through a file of its own, into the store, checked
 	 * against its digest there. */
 	for (uint32_t i = 0u; i < count; i++) {
-		if ((made = store_temp(store)) == NULL ||
+		/* A recipe (Appendix C): decompressed, then applied to the base
+		 * object it names into the object's own file. A recipe is never
+		 * longer than its object, which the writer holds it to. */
+		if ((objects[i].flags & FLAG_DELTA) != 0u) {
+			FILE    *recipe = head[11] == PACK_DELTAS ? store_temp(store) : NULL;
+			uint8_t *bytes = MAP_FAILED;
+			uint64_t got = 0u;
+			int      said = 0;
+
+			if (recipe != NULL &&
+			    decompress_up_to(dctx, in, objects[i].frame, objects[i].length, fileno(recipe),
+			                     &got) == 0 && got > 0u &&
+			    (bytes = mmap(NULL, (size_t)got, PROT_READ, MAP_PRIVATE, fileno(recipe), 0)) !=
+			        MAP_FAILED && (made = store_temp(store)) != NULL)
+				said = apply_recipe(store, bytes, (size_t)got, fileno(made), why, cap) == 0 ? 2 : 1;
+			if (said != 2) {
+				if (said == 0)
+					say(why, cap, "a recipe of the pack is cut or not what its index says", NULL);
+				if (bytes != MAP_FAILED)
+					munmap(bytes, (size_t)got);
+				if (recipe != NULL)
+					fclose(recipe);
+				goto done;
+			}
+			munmap(bytes, (size_t)got);
+			fclose(recipe);
+		} else if ((made = store_temp(store)) == NULL ||
 		    decompress_into(dctx, in, objects[i].frame, objects[i].length, fileno(made)) != 0) {
 			say(why, cap, "an object of the pack is cut or not what its index says", NULL);
 			goto done;
@@ -556,7 +1008,8 @@ int hull_pack_inspect(int in, FILE *out, char *why, size_t cap)
 	frame_length    = get64(head + 24);
 	fprintf(out, "version %u\n", (unsigned)head[8] << 24 | (unsigned)head[9] << 16 |
 	        (unsigned)head[10] << 8 | head[11]);
-	if (head[8] != 0u || head[9] != 0u || head[10] != 0u || head[11] != PACK_VERSION)
+	if (head[8] != 0u || head[9] != 0u || head[10] != 0u ||
+	    (head[11] != PACK_VERSION && head[11] != PACK_DELTAS))
 		return say(why, cap, "a pack of a version this hull does not read", NULL);
 	if (count > MAX_OBJECTS || manifest_length > (256u << 20) || frame_length > (256u << 20))
 		return say(why, cap, "the pack's header is not one hull reads", NULL);
@@ -572,8 +1025,10 @@ int hull_pack_inspect(int in, FILE *out, char *why, size_t cap)
 		length     = get64(entry + 33);
 		offset     = get64(entry + 41);
 		compressed = get64(entry + 49);
-		fprintf(out, "object sha256:%s %s %llu bytes, frame %llu at %llu\n", hex,
-		        entry[32] & 1u ? "executable" : "plain", (unsigned long long)length,
+		fprintf(out, "object sha256:%s %s%s %llu bytes, frame %llu at %llu\n", hex,
+		        entry[32] & 1u ? "executable" : "plain",
+		        entry[32] & FLAG_DELTA ? ", a recipe against the base's" : "",
+		        (unsigned long long)length,
 		        (unsigned long long)compressed, (unsigned long long)offset);
 		total += length;
 		if (offset + compressed > end)

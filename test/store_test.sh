@@ -654,12 +654,12 @@ printf '%s\n' "$verified" | grep -q "^situc: $(grep -c '' "$root/pack.vectors") 
 timeout 30 python3 -c '
 import sys
 data = bytearray(open(sys.argv[1], "rb").read())
-data[11] = 2
+data[11] = 3
 open(sys.argv[2], "w").write("pack whole %s\n" % data.hex())' "$root/one.hull" "$root/pack2.vectors"
 verified=$(timeout 300 python3 "$situc" verify store/pack.situ "$root/pack2.vectors" 2>&1)
 cases=$((cases + 1))
 ! printf '%s\n' "$verified" | grep -q 'vectors conform' ||
-	fail "a pack of version 2 conformed to store/pack.situ" "$verified"
+	fail "a pack of version 3 conformed to store/pack.situ" "$verified"
 # A pack against a base: a second version of the tree, one file changed
 # and one added, packed without the objects the first names, for a store
 # that holds the first -- what a new version moves to a host with the old.
@@ -690,6 +690,49 @@ cmp -s "$root/second.list" "$root/fromdelta.list" ||
 	fail "a pack against a base, unpacked after it, is not the tree" \
 		"$(diff "$root/second.list" "$root/fromdelta.list" 2>&1 | head)"
 expect 1 'pack: no/such:1: no such ref' "$hull" pack --against no/such:1 second/tree:1 "$root/none.hull"
+# Within a file (Appendix C): a large file of the base's, a byte of it
+# changed, packed as a recipe against the base's object -- the pack
+# version 2, its object said a recipe, and much smaller than the file --
+# and unpacked after the base, byte for byte; without the base, refused
+# naming it.
+timeout 30 python3 -c '
+import os, sys
+data = bytearray(os.urandom(1 << 20))
+open(sys.argv[1], "wb").write(data)
+data[600000] ^= 0xff
+open(sys.argv[2], "wb").write(data)' "$root/second/big" "$root/big2"
+expect 0 '^second/tree:2 sha256:' "$hull" commit "$root/second" second/tree:2
+cp "$root/big2" "$root/second/big"
+expect 0 '^second/tree:3 sha256:' "$hull" commit "$root/second" second/tree:3
+expect 0 '' "$hull" pack --against second/tree:2 second/tree:3 "$root/chunked.hull"
+expect 0 '^version 2$' "$hull" inspect "$root/chunked.hull"
+expect 0 '^object sha256:[0-9a-f]{64} plain, a recipe against the base.s 1048576 bytes' \
+	"$hull" inspect "$root/chunked.hull"
+cases=$((cases + 1))
+[ "$(stat -c %s "$root/chunked.hull")" -lt 262144 ] ||
+	fail "a byte changed in a 1 MiB file packed $(stat -c %s "$root/chunked.hull") bytes" ""
+expect 0 '' "$hull" pack second/tree:2 "$root/second2.hull"
+rm -rf "${root:?}/otherhost2" "${root:?}/fromchunked"
+mkdir -p "$root/otherhost2"
+expect 1 'unpack: a recipe of the pack names a base object this store does not hold' \
+	env XDG_DATA_HOME="$root/otherhost2" "$hull" unpack "$root/chunked.hull" "$root/fromchunked"
+expect 0 '' env XDG_DATA_HOME="$root/otherhost2" "$hull" unpack "$root/second2.hull" "$root/otherhost2/base"
+expect 0 '' env XDG_DATA_HOME="$root/otherhost2" "$hull" unpack "$root/chunked.hull" "$root/fromchunked"
+cases=$((cases + 1))
+cmp -s "$root/big2" "$root/fromchunked/big" ||
+	fail "a file unpacked from its recipe is not the file" "$(cmp "$root/big2" "$root/fromchunked/big" 2>&1)"
+timeout 30 python3 -c '
+import sys
+data = open(sys.argv[1], "rb").read()
+open(sys.argv[2], "w").write("pack whole %s\n" % data.hex())' "$root/chunked.hull" "$root/chunked.vectors"
+verified=$(timeout 300 python3 "$situc" verify store/pack.situ "$root/chunked.vectors" 2>&1)
+cases=$((cases + 1))
+printf '%s\n' "$verified" | grep -q '^situc: 1 vectors conform to store/pack.situ' ||
+	fail "a pack of recipes is not store/pack.situ's" "$verified"
+rm -f "$root/chunked.vectors"
+chmod -R u+w "$root/otherhost2" "$root/fromchunked" 2>/dev/null
+rm -rf "${root:?}/otherhost2" "${root:?}/fromchunked"
+rm -f "$root/big2" "$root/chunked.hull" "$root/second2.hull" "$root/second/big"
 chmod -R u+w "$root/second" "$root/otherhost" "$root/fromdelta" 2>/dev/null
 rm -rf "${root:?}/second" "${root:?}/otherhost" "${root:?}/fromdelta"
 rm -f "$root/second.hull" "$root/delta.hull" "$root/second.list" "$root/fromdelta.list" "$root/none.hull"

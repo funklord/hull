@@ -4,6 +4,11 @@
 // one object is found and read without the rest. Every number is
 // big-endian. The manifest, once decompressed, is manifest/manifest.situ's.
 //
+// A pack made against a base may hold an object as a recipe against the
+// base's object at the same path, its flags' bit 2 set and its frame the
+// recipe compressed (store/pack.c says the recipe); such a pack is
+// version 2, any other version 1.
+//
 // WHAT THIS SCHEMA DOES NOT SAY, and hull checks instead (store/pack.c):
 // - that the index's digests ascend, each once, and each frame lies inside
 //   the data, its offset counted from the data's start;
@@ -14,11 +19,11 @@
 target buffer;
 endian big;
 
-// One object: its sha256, whether it is executable, its length once
-// decompressed, and where its frame lies in the data and how long it is.
+// One object: its sha256, whether it is executable (1) and whether it is
+// a recipe (2), its length once decompressed, and where its frame lies in the data and how long it is.
 struct index_entry {
 	u8  digest[32];
-	u8  flags   [max = 1];
+	u8  flags   [max = 3];
 	u64 length;
 	u64 offset;
 	u64 frame;
@@ -26,7 +31,7 @@ struct index_entry {
 
 struct pack {
 	preamble u8[8] = "HULLPACK";
-	u32 version          [must_eq = 1];
+	u32 version          [min = 1, max = 2];
 	u32 count;
 	u64 manifest_length;
 	u64 manifest_frame;
