@@ -243,6 +243,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
 # What test/root_test.sh writes.
 ROOT_TEST_FILES = $(addprefix $(BUILD_DIR)/test/root/, root.conf root.log cap.conf changed.conf)
 ROOTVM_TEST_FILES = $(BUILD_DIR)/test/rootvm/vm.conf
+SYSTEMD_TEST_FILES = $(addprefix $(BUILD_DIR)/test/systemd/, vm.conf run.sh build.conf)
 # What check-fuzz writes, but for what it finds, in $(FUZZ_DIR)/found,
 # which is kept: a crash's input is what reproduces it.
 FUZZ_FILES = $(addprefix $(BUILD_DIR)/fuzz/, json_fuzz unpack_fuzz corpus/json/manifest \
@@ -346,7 +347,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-arm64-host check-root check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-arm64-host check-root check-systemd check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -461,6 +462,7 @@ help:
 	@echo '  check-broker  a pool between two users, over a real sshd'
 	@echo '  check-virtualbox  hull run on VirtualBox, inside a vm, as the user'
 	@echo '  check-root    root mode'"'"'s native grants, hull-root setuid, inside a vm'
+	@echo '  check-systemd systemd as a chroot machine'"'"'s init in a delegated cgroup, inside a vm'
 	@echo '  check-sanitize  the unit tests, store and pull under ASan and UBSan'
 	@echo '  check-fuzz    libFuzzer over the JSON and layer readers, FUZZ_TIME s each'
 	@echo '  check-gui     hull-gui as text, and its requests, against a core of its own'
@@ -981,6 +983,9 @@ check-fuzz: $(FUZZ_DIR)/json_fuzz $(FUZZ_DIR)/unpack_fuzz $(FUZZ_DIR)/media_fuzz
 check-root: $(HULL) $(AGENT_BIN) $(PROBE) $(ROOT_BIN)
 	BUILD_DIR='$(BUILD_DIR)' sh test/rootvm_test.sh '$(HULL)' '$(ROOT_BIN)' '$(PROBE)'
 
+check-systemd: $(HULL) $(AGENT_BIN)
+	BUILD_DIR='$(BUILD_DIR)' sh test/systemd_test.sh '$(HULL)'
+
 # The indentation and whitespace gate, shared verbatim with the sibling
 # projects; `docs` additionally holds project.md to the tree it describes.
 style: style-tool style-source style-docs
@@ -1040,7 +1045,7 @@ clean:
 	        $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(BUILD_DIR)/test/arm64/rootfs/probe \
 	        $(BUILD_DIR)/test/riscv64/rootfs/probe \
-	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) $(FUZZ_FILES) \
+	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) $(SYSTEMD_TEST_FILES) $(FUZZ_FILES) \
 	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor $(CLIENT_LIB) $(GUI_BIN) \
 	        $(GUI_TEST_FILES)
 	@# qmake's builds, each cleaned by its own Makefile, which names its files.

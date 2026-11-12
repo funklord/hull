@@ -174,6 +174,7 @@ struct hull_machine {
 	char             bridge_root[72];  /* root mode's hash, hull-root putting it on the bridge */
 	char             devices_root[72]; /* root mode's hash, hull-root giving (devices (root ...)) */
 	char             devices_dir[128]; /* where hull-root made their nodes, or "" */
+	char             cgroup[4200];     /* the image's init's own cgroup, made below the core's, or "" */
 	unsigned         cpus;       /* (cpus N): N CPUs' time a second, by its scope, or 0 */
 	unsigned long long memory;   /* (memory SIZE): its scope's ceiling in bytes, or 0 */
 	hull_device      device[HULL_MAX_DEVICES];  /* (devices ...), found on the host at start */
@@ -227,8 +228,37 @@ static void remove_granted(hull_machine *m)
 	m->devices_dir[0] = '\0';
 }
 
+/* The cgroup start_cgroup() made, and every one below it its init made,
+ * deepest first; a cgroup goes by rmdir once nothing is in it, its
+ * processes' going a moment behind their reaping, so each is tried a few
+ * times. */
+static void remove_cgroup_tree(const char *path, unsigned depth)
+{
+	DIR           *list = depth < 16u ? opendir(path) : NULL;
+	struct dirent *entry;
+
+	while (list != NULL && (entry = readdir(list)) != NULL) {
+		char below[4300];
+
+		if (entry->d_type != DT_DIR || entry->d_name[0] == '.')
+			continue;
+		if ((size_t)snprintf(below, sizeof below, "%s/%s", path, entry->d_name) < sizeof below)
+			remove_cgroup_tree(below, depth + 1u);
+	}
+	if (list != NULL)
+		closedir(list);
+	for (int tries = 0; tries < 50 && rmdir(path) != 0 && errno == EBUSY; tries++) {
+		struct timespec step = { 0, 20000000L };
+
+		nanosleep(&step, NULL);
+	}
+}
+
 static void release(hull_machine *m)
 {
+	if (m->cgroup[0] != '\0')
+		remove_cgroup_tree(m->cgroup, 0u);
+	m->cgroup[0] = '\0';
 	remove_granted(m);
 	hull_hostdev_unclaim(m);
 	free(m->root);
@@ -1719,13 +1749,16 @@ static void hand_over(const hull_machine *m, int report)
 		child_fail(report, "fork");
 	if (agent > 0) {
 		char *const argv[] = { m->init, NULL };
+		/* systemd's container interface, which it and OpenRC read to know
+		 * they are not a host's: no kernel of their own to set up. */
+		char *const envp[] = { (char *)"container=hull", NULL };
 		sigset_t    none;
 
 		close(execed[0]);
 		sigemptyset(&none);
 		sigprocmask(SIG_SETMASK, &none, NULL);
 		syscall(SYS_close_range, 3u, ~0u, CLOSE_RANGE_CLOEXEC);
-		execv(m->init, argv);
+		execve(m->init, argv, envp);
 		if (write(execed[1], "x", 1u) != 1) {
 			/* hull's init reads the pipe's end alone, and goes on */
 		}
@@ -2298,6 +2331,11 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 				child_fail(report, "gid_map");
 		}
 	}
+	/* An image's init, its cgroup moved into by now (start_cgroup), has a
+	 * cgroup namespace whose root is that cgroup, as a container manager
+	 * gives one, so that systemd makes its own below it. */
+	if (m->init != NULL && unshare(CLONE_NEWCGROUP) != 0)
+		child_fail(report, "a cgroup namespace for the image's init");
 	if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
 		child_fail(report, "making mounts private");
 	if (!m->overlay && mount(m->root, m->root, NULL, MS_BIND | MS_REC, NULL) != 0)
@@ -2972,7 +3010,7 @@ static const char *start_limits(const hull_machine *m, char *why, size_t cap)
 	char        quota[24];
 	char        memory[24];
 	char        said[160];
-	const char *argv[24];
+	const char *argv[28];
 	unsigned    n = 0u;
 	unsigned    properties = 1u;
 
@@ -3007,6 +3045,14 @@ static const char *start_limits(const hull_machine *m, char *why, size_t cap)
 		argv[n++] = memory;
 		properties++;
 	}
+	/* An image's init gets the scope delegated, its cgroups its own to
+	 * make below it (start_cgroup). */
+	if (m->init != NULL) {
+		argv[n++] = "Delegate";
+		argv[n++] = "b";
+		argv[n++] = "true";
+		properties++;
+	}
 	argv[n++] = "0";
 	argv[n] = NULL;
 	snprintf(count, sizeof count, "%u", properties);
@@ -3038,6 +3084,55 @@ static const char *start_limits(const hull_machine *m, char *why, size_t cap)
 	snprintf(why, cap, "cpus and memory: the scope %s did not take the machine's init in %d s",
 	         unit, LIMITS_TRIES / 100);
 	return why;
+}
+
+/*
+ * A cgroup of the machine's own for an image's init, (init PATH): systemd
+ * as PID 1 makes its own cgroups below its cgroup namespace's root, and
+ * stops where it may not. Where the core's own cgroup is the user's to
+ * write -- delegated, as systemd's Delegate= gives user@.service and a CI
+ * runner may give its jobs -- the machine gets hull-PID below it, which
+ * the user makes; else the user's manager is asked for a delegated scope,
+ * as for limits; and where neither is had, the machine goes on without,
+ * as an init that needs no cgroup of its own does. The init makes a cgroup
+ * namespace once it is there (run_init), so its own cgroup is its root.
+ */
+static void start_cgroup(hull_machine *m)
+{
+	char  line[4096];
+	char  own[4200];
+	char  procs[4300];
+	char  pid_text[24];
+	char  ignored[160];
+	FILE *file = fopen("/proc/self/cgroup", "re");
+	int   found = 0;
+	int   fd;
+
+	while (file != NULL && !found && fgets(line, sizeof line, file) != NULL)
+		found = strncmp(line, "0::/", 4u) == 0;
+	if (file != NULL)
+		fclose(file);
+	if (found) {
+		line[strcspn(line, "\n")] = '\0';
+		snprintf(own, sizeof own, "/sys/fs/cgroup%s", strcmp(line + 3, "/") == 0 ? "" : line + 3);
+		snprintf(procs, sizeof procs, "%s/cgroup.procs", own);
+		if (access(own, W_OK) == 0 && access(procs, W_OK) == 0 &&
+		    (size_t)snprintf(m->cgroup, sizeof m->cgroup, "%s/hull-%ld", own, (long)m->pid) <
+		        sizeof m->cgroup &&
+		    mkdir(m->cgroup, 0755) == 0) {
+			snprintf(procs, sizeof procs, "%s/cgroup.procs", m->cgroup);
+			snprintf(pid_text, sizeof pid_text, "%ld", (long)m->pid);
+			if ((fd = open(procs, O_WRONLY | O_CLOEXEC)) >= 0 &&
+			    write(fd, pid_text, strlen(pid_text)) == (ssize_t)strlen(pid_text) &&
+			    close(fd) == 0)
+				return;
+			if (fd >= 0)
+				close(fd);
+			rmdir(m->cgroup);
+		}
+		m->cgroup[0] = '\0';
+	}
+	(void)start_limits(m, ignored, sizeof ignored);
 }
 
 /*
@@ -3480,6 +3575,8 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	if (net == NULL && (m->cpus != 0u || m->memory != 0u) &&
 	    (net = start_limits(m, net_why, sizeof net_why)) != NULL)
 		kill(m->pid, SIGKILL);
+	else if (net == NULL && m->init != NULL && m->cpus == 0u && m->memory == 0u)
+		start_cgroup(m);
 	if (write(mapped[1], m->many ? "M" : wanted ? "O" : "S", 1u) != 1) {
 		/* The child reads its end closed and says so on the report. */
 	}
