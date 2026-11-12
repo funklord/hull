@@ -3721,11 +3721,16 @@ static hull_status chroot_destroy(hull_core *core, hull_machine *m, hull_error *
 static hull_status chroot_persist(hull_core *core, hull_machine *m, hull_buf *out,
                                   hull_error *error)
 {
-	char   head[4200];
+	char   head[8500];
 	int    n;
 
 	(void)core;
-	n = snprintf(head, sizeof head, "pid %ld\ndir %s\nplan\n", (long)m->pid, m->dir);
+	/* The cgroup start_cgroup() made, where it made one, so that the core
+	 * taking the machine back removes it when the machine ends. */
+	n = m->cgroup[0] != '\0' ?
+	    snprintf(head, sizeof head, "pid %ld\ndir %s\ncgroup %s\nplan\n", (long)m->pid, m->dir,
+	             m->cgroup) :
+	    snprintf(head, sizeof head, "pid %ld\ndir %s\nplan\n", (long)m->pid, m->dir);
 	if (m->plan == NULL || n < 0 || (size_t)n >= sizeof head)
 		return fail(error, HULL_ERR_INTERNAL, "the state does not fit");
 	free(m->persisted);
@@ -3797,6 +3802,22 @@ static hull_status chroot_adopt(hull_core *core, hull_buf state, hull_machine **
 	}
 	close(dir_fd);
 	snprintf(m->dir, sizeof m->dir, "%s", dir);
+	/* Its cgroup, where it has one of hull's: only a hull-PID cgroup
+	 * under cgroup2's mount, the machine's own init's, is taken. */
+	{
+		const char *line = memmem(text, (size_t)(plan_at - text), "\ncgroup ", 8u);
+		char        cgroup[sizeof m->cgroup];
+		char        own[32];
+		struct stat st;
+
+		snprintf(own, sizeof own, "/hull-%ld", pid);
+		if (line != NULL && sscanf(line + 8, "%4199[^\n]", cgroup) == 1 &&
+		    strncmp(cgroup, "/sys/fs/cgroup/", 15u) == 0 && strstr(cgroup, "/../") == NULL &&
+		    strlen(cgroup) > strlen(own) &&
+		    strcmp(cgroup + strlen(cgroup) - strlen(own), own) == 0 &&
+		    stat(cgroup, &st) == 0 && S_ISDIR(st.st_mode))
+			snprintf(m->cgroup, sizeof m->cgroup, "%s", cgroup);
+	}
 	m->adopted = 1;
 	mark_adopted(m->dir, 1);
 	if (pthread_create(&m->reader, NULL, read_workload, m) != 0) {

@@ -94,6 +94,28 @@ echo "== delegated"
 as timeout -k 2 120 $hull run -f /tmp/s.conf 2>&1
 echo "status=\$?"
 echo "== left=\$(cd /sys/fs/cgroup/delegated && ls -d */ 2> /dev/null)"
+# Kept, its core killed, taken back by the next and stopped: the next
+# core removes the machine's cgroup, which only the first made.
+mkdir -p /tmp/run4 && chown $uid:$gid /tmp/run4 && chmod 700 /tmp/run4
+cat > /tmp/k.conf <<CONF
+(machine (source "dir:$tree") (backend chroot) (mutable overlay) (network none) (init "/sbin/init")
+  (hostname "kept") (on_disconnect keep) (command "/bin/sleep" "600"))
+CONF
+chmod 644 /tmp/k.conf
+(as env XDG_RUNTIME_DIR=/tmp/run4 timeout -k 2 60 $hull run -f /tmp/k.conf > /dev/null 2>&1) &
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+	as env XDG_RUNTIME_DIR=/tmp/run4 $hull ps 2> /dev/null | grep -q '^kept .*running' && break
+	sleep 1
+done
+kill -KILL \$(head -1 /tmp/run4/hull/core.lock)
+sleep 2
+echo "== kept"
+as env XDG_RUNTIME_DIR=/tmp/run4 $hull ps 2>&1 | grep '^kept'
+echo "keptcgroups=\$(cd /sys/fs/cgroup/delegated && ls -d hull-*/ 2> /dev/null | wc -l)"
+as env XDG_RUNTIME_DIR=/tmp/run4 timeout -k 2 60 $hull stop --timeout 30 kept 2>&1
+echo "status=\$?"
+sleep 2
+echo "== keptleft=\$(cd /sys/fs/cgroup/delegated && ls -d */ 2> /dev/null)"
 echo \$\$ > /sys/fs/cgroup/cgroup.procs
 mkdir -p /tmp/run2 && chown $uid:$gid /tmp/run2 && chmod 700 /tmp/run2
 echo "== undelegated"
@@ -126,6 +148,14 @@ printf '%s\n' "$delegated" | grep -qx 'pid1=systemd' &&
 cases=$((cases + 1))
 printf '%s\n' "$out" | grep -qx '== left=' ||
 	fail "the machine's cgroup was left" "$out"
+# A kept machine taken back by a later core, its cgroup removed by that
+# core when the machine is stopped.
+cases=$((cases + 1))
+kept=$(printf '%s\n' "$out" | sed -n '/^== kept$/,/^status=/p')
+printf '%s\n' "$kept" | grep -q '^kept .*running' &&
+	printf '%s\n' "$kept" | grep -qx 'keptcgroups=1' &&
+	printf '%s\n' "$out" | grep -qx '== keptleft=' ||
+	fail "a kept systemd machine's cgroup was left when a later core stopped it" "$out"
 # The control: with no cgroup the user may write, systemd never comes up
 # -- as PID 1 it gives up, ending the machine -- which is what the
 # delegation buys.
