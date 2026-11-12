@@ -1153,6 +1153,12 @@ static hull_spec_status check_value(walk *w, const hull_sexpr_form *entry,
 		return status;
 	case COUNT:
 	case PORT:
+		/* A number in quotes, as (memory "8G") beside it is: the first
+		 * thing fmake wrote, 2026-11-12. Said so, where the shape alone
+		 * left it to guess. */
+		if (hull_sexpr_next(w->doc, head, &value) && value.kind == HULL_SEXPR_STRING)
+			return fail(w, HULL_SPEC_ERR_SHAPE, value.offset,
+			            "takes a number written bare, 4 and not \"4\"");
 		status = one_value(w, entry, head, HULL_SEXPR_SYMBOL, &value, "takes one number");
 		if (status == HULL_SPEC_OK && !whole(w->doc, &value, k->type == PORT ? 65535u : UINT32_MAX))
 			return fail(w, HULL_SPEC_ERR_VALUE, value.offset, k->type == PORT ?
