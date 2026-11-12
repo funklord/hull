@@ -532,9 +532,11 @@ static const char *const pc_machine_values[] = { "pc", "q35", "isapc", NULL };
 static const char *const pc_vga_values[]     = { "std", "cirrus", "vmware", "none", NULL };
 
 static const char *const pc_nic_values[]     = { "ne2k_pci", "ne2k_isa", "pcnet", "rtl8139",
-                                                 "e1000", "virtio", NULL };
+                                                 "e1000", "e1000e", "virtio", NULL };
+static const char *const pc_cpu_values[]     = { "host", "max", "qemu64", "486", "pentium",
+                                                 "pentium3", "core2duo", "skylake", NULL };
 
-static const char *const pc_firmware_values[] = { "bios", "uefi", NULL };
+static const char *const pc_firmware_values[] = { "bios", "uefi", "uefi-secure", NULL };
 
 static const char *const pc_sound_values[] = { "none", "sb16", "adlib", "gus", "es1370", "ac97",
                                                "hda", NULL };
@@ -546,6 +548,9 @@ static const key pc_keys[] = {
 	{ .name = "machine", .type = CHOICE, .choices = pc_machine_values },
 	{ .name = "vga",     .type = CHOICE, .choices = pc_vga_values },
 	{ .name = "accel",   .type = CHOICE, .choices = accel_values },
+	{ .name = "cpu",     .type = CHOICE, .choices = pc_cpu_values },
+	{ .name = "tpm",     .type = BOOLEAN },
+	{ .name = "state",   .type = STRING, .value = nonempty },
 };
 static const schema pc = TABLE(pc_keys);
 

@@ -415,6 +415,43 @@ INIT
 	says 'a client at its address reached it' "$(cat "$root/linux.out")" 'from the host'
 	says 'proxy-ssh reached the guest'"'"'s own port 22' "$(cat "$root/linux.out")" 'through proxy-ssh'
 
+	# What Windows 11 asks of a PC (fmake, 2026-11-12): a TPM 2.0 of
+	# swtpm's, which the guest's own kernel finds, its state kept in
+	# (state DIR) under (mutable direct) as the disk is; a CPU of the
+	# host's, qemu's qemu64 lacking SSE4.2; and Secure Boot with
+	# Microsoft's keys, which refuses this export's unsigned loader that
+	# (firmware uefi) boots.
+	cat > "$tree/init.sh" <<'INIT'
+#!/bin/busybox sh
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sys /sys
+echo "tpm=$(/bin/busybox cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null)"
+echo "sse42=$(/bin/busybox grep -c sse4_2 /proc/cpuinfo)"
+/bin/busybox poweroff -f
+INIT
+	out=$(timeout 120 "$hull" export --bootable "$tree" "$root/tpm.img" --init /init.sh 2>&1)
+	status 'a bootable export for the TPM' "$?" 0 "$out"
+	rm -rf "${root:?}/tpmstate"
+	conf '(source "image:./tpm.img") (memory "512M") (mutable direct)' \
+		'(tuning (pc (machine q35) (firmware uefi) (tpm true) (cpu host) (state "./tpmstate")))'
+	out=$(timeout 120 "$hull" run -f "$root/hull.conf" 2>&1)
+	status 'a machine with a TPM' "$?" 0 "$out"
+	says 'its kernel found a TPM 2.0' "$out" 'tpm=2'
+	says 'its CPU the host'"'"'s, SSE4.2 and all' "$out" 'sse42=1'
+	cases=$((cases + 1))
+	[ -f "$root/tpmstate/tpm/tpm2-00.permall" ] ||
+		fail "the TPM's state was not kept in (state DIR)" "$(ls -R "$root/tpmstate" 2>&1)"
+	conf '(source "image:./tpm.img") (memory "512M")' \
+		'(tuning (pc (machine q35) (firmware uefi-secure)))'
+	out=$(timeout 40 "$hull" run -f "$root/hull.conf" 2>&1)
+	says 'Secure Boot refused an unsigned loader' "$out" 'Access Denied'
+	cases=$((cases + 1))
+	! printf '%s\n' "$out" | grep -q 'tpm=' || fail "an unsigned loader ran under Secure Boot" "$out"
+	conf '(source "image:./tpm.img") (memory "512M") (tuning (pc (firmware uefi-secure)))'
+	out=$(timeout 30 "$hull" run -f "$root/hull.conf" 2>&1)
+	status 'Secure Boot on the older machine is refused' "$?" 125 "$out"
+	says 'and said to be q35'"'"'s' "$out" '(machine q35)'
+
 	# The serial bridge: a shell on COM1, driven from the host through
 	# `hull exec ... console`, with nothing of hull's in the guest.
 	cat > "$tree/init.sh" <<'INIT'

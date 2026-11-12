@@ -68,7 +68,9 @@
 #include "usage.h"
 
 #define PC_MAX_MEDIA 6u    /* four on IDE, two floppy drives */
-#define PC_MAX_ARGS  80u
+#define PC_MAX_ARGS  120u
+#define SECURE_CODE  "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"
+#define SECURE_VARS  "/usr/share/OVMF/OVMF_VARS_4M.ms.fd"
 #define PC_MAX_SEGMENTS 4u
 #define PC_MAX_PORTS 32u
 
@@ -101,9 +103,16 @@ struct hull_machine {
 	char           *cpus;
 	char           *machine_type;
 	char           *vga;
+	char           *cpu;        /* (tuning (pc (cpu ...))), or NULL for qemu's own */
 	char           *accel;
 	char           *sound;          /* (tuning (pc (sound ...))), or NULL */
 	char           *firmware;       /* OVMF's path, for (firmware uefi), or NULL for SeaBIOS */
+	int             secure;         /* (firmware uefi-secure): OVMF's secure boot, Microsoft's keys */
+	int             tpm;            /* (tpm true): a TPM 2.0 of swtpm's */
+	char           *state;          /* (state DIR): its firmware variables and TPM, or NULL */
+	char            run_state[4300];  /* where they are this run: DIR, or a copy in the cache */
+	int             run_state_made;   /* the copy, removed at the end */
+	pid_t           swtpm;
 	char           *nic;            /* (tuning (pc (nic ...))), or NULL for ne2k_pci */
 	char           *name;
 	int             network;        /* (network nat) */
@@ -170,6 +179,8 @@ static void release(hull_machine *m)
 	free(m->cpus);
 	free(m->machine_type);
 	free(m->vga);
+	free(m->cpu);
+	free(m->state);
 	free(m->accel);
 	free(m->sound);
 	free(m->firmware);
@@ -210,6 +221,173 @@ static const char *make_cache(hull_machine *m)
 	    (mkdir(m->cache, 0700) != 0 && errno != EEXIST))
 		return "the cache directory for the machine's disks cannot be made";
 	return NULL;
+}
+
+/* A file of this run's directory. */
+static const char *run_file(const hull_machine *m, const char *name)
+{
+	static char path[4400];
+
+	snprintf(path, sizeof path, "%s/%s", m->run_state, name);
+	return path;
+}
+
+/* A file of the machine's state: its (state DIR) where it writes in place,
+ * (mutable direct), as its disk is written; else the run's copy, which
+ * goes with it as a disk's snapshot does. */
+static const char *state_file(const hull_machine *m, const char *name)
+{
+	static char path[4400];
+
+	snprintf(path, sizeof path, "%s/%s", m->state != NULL && m->direct ? m->state : m->run_state,
+	         name);
+	return path;
+}
+
+static int copy_file(const char *from, const char *to)
+{
+	char    buffer[65536];
+	ssize_t n;
+	int     in = open(from, O_RDONLY | O_CLOEXEC);
+	int     out = in >= 0 ? open(to, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600) : -1;
+	int     good = in >= 0 && out >= 0;
+
+	while (good && (n = read(in, buffer, sizeof buffer)) > 0)
+		good = write(out, buffer, (size_t)n) == n;
+	if (in >= 0)
+		close(in);
+	if (out >= 0 && close(out) != 0)
+		good = 0;
+	return good ? 0 : -1;
+}
+
+/* The files swtpm keeps in its state directory, by name, for copying and
+ * removing them. */
+static const char *const tpm_files[] = { "tpm2-00.permall", ".lock" };
+
+/*
+ * The firmware's variables and the TPM's state for this run, the machine's
+ * identity as its disk is, (state DIR) holding them across runs: a run
+ * directory in the cache, and in it, or in DIR under (mutable direct),
+ * OVMF_VARS.fd -- the DIR's, else a copy of Microsoft's enrolled store --
+ * and tpm/; then swtpm, started on them. 0, or -1 with m->why.
+ */
+static int prepare_state(hull_machine *m)
+{
+	char template[4200];
+	char from[4400];
+	char to[4400];
+
+	if (!m->secure && !m->tpm)
+		return 0;
+	if (m->cache[0] == '\0' && make_cache(m) != NULL) {
+		snprintf(m->why, sizeof m->why, "the cache directory for the machine's state cannot be made\n");
+		return -1;
+	}
+	snprintf(template, sizeof template, "%s/pc-XXXXXX", m->cache);
+	if (mkdtemp(template) == NULL || strlen(template) > 90u) {
+		snprintf(m->why, sizeof m->why, "the machine's run directory cannot be made%s\n",
+		         strlen(template) > 90u ? ": the cache's path is too long for a socket in it" : "");
+		return -1;
+	}
+	snprintf(m->run_state, sizeof m->run_state, "%s", template);
+	m->run_state_made = 1;
+	if (m->state != NULL && m->direct && mkdir(m->state, 0700) != 0 && errno != EEXIST) {
+		snprintf(m->why, sizeof m->why, "%s: %s\n", m->state, strerror(errno));
+		return -1;
+	}
+	if (mkdir(state_file(m, "tpm"), 0700) != 0 && errno != EEXIST) {
+		snprintf(m->why, sizeof m->why, "the TPM's state directory: %s\n", strerror(errno));
+		return -1;
+	}
+	/* The run's copy of what (state DIR) holds, where it is not used in
+	 * place: the variables, and swtpm's files. */
+	if (m->state != NULL && !m->direct) {
+		snprintf(from, sizeof from, "%s/OVMF_VARS.fd", m->state);
+		if (access(from, R_OK) == 0 && copy_file(from, run_file(m, "OVMF_VARS.fd")) != 0) {
+			snprintf(m->why, sizeof m->why, "%.600s could not be copied\n", from);
+			return -1;
+		}
+		for (unsigned i = 0u; i < sizeof tpm_files / sizeof tpm_files[0]; i++) {
+			snprintf(from, sizeof from, "%s/tpm/%s", m->state, tpm_files[i]);
+			snprintf(to, sizeof to, "%s/tpm/%s", m->run_state, tpm_files[i]);
+			if (access(from, R_OK) == 0 && copy_file(from, to) != 0) {
+				snprintf(m->why, sizeof m->why, "%.600s could not be copied\n", from);
+				return -1;
+			}
+		}
+	}
+	if (m->secure) {
+		snprintf(to, sizeof to, "%s", state_file(m, "OVMF_VARS.fd"));
+		if (access(to, F_OK) != 0 && copy_file(SECURE_VARS, to) != 0) {
+			snprintf(m->why, sizeof m->why, "the variables could not be made from %s\n",
+			         SECURE_VARS);
+			return -1;
+		}
+	}
+	if (m->tpm) {
+		char  dir[4500];
+		char  ctrl[4500];
+		pid_t child;
+
+		snprintf(dir, sizeof dir, "dir=%s", state_file(m, "tpm"));
+		snprintf(ctrl, sizeof ctrl, "type=unixio,path=%s", run_file(m, "swtpm.sock"));
+		if ((child = fork()) < 0) {
+			snprintf(m->why, sizeof m->why, "swtpm could not be started\n");
+			return -1;
+		}
+		if (child == 0) {
+			const char *argv[] = { "swtpm", "socket", "--tpm2", "--tpmstate", dir, "--ctrl", ctrl,
+			                       "--terminate", NULL };
+			int         null = open("/dev/null", O_RDWR | O_CLOEXEC);
+
+			if (null < 0 || dup2(null, 0) < 0 || dup2(null, 1) < 0 ||
+			    prctl(PR_SET_PDEATHSIG, SIGKILL, 0L, 0L, 0L) != 0)
+				_exit(126);
+			close_range(3u, ~0u, CLOSE_RANGE_CLOEXEC);
+			execvp(argv[0], (char *const *)argv);
+			dprintf(2, "swtpm, which (tpm true) needs: %s\n", strerror(errno));
+			_exit(127);
+		}
+		m->swtpm = child;
+		/* Its socket made before qemu dials it: five seconds at most. */
+		for (int tries = 0; access(run_file(m, "swtpm.sock"), F_OK) != 0; tries++) {
+			struct timespec pause = { 0, 50000000L };
+
+			if (tries >= 100 || waitpid(child, NULL, WNOHANG) == child) {
+				m->swtpm = 0;
+				snprintf(m->why, sizeof m->why, "swtpm did not start: is it installed "
+				         "(Debian's swtpm)?\n");
+				return -1;
+			}
+			nanosleep(&pause, NULL);
+		}
+	}
+	return 0;
+}
+
+/* The run's directory gone, by name, and swtpm with it: it ends when qemu
+ * goes, --terminate, and is reaped here. */
+static void release_state(hull_machine *m)
+{
+	char path[4400];
+
+	if (m->swtpm > 0) {
+		kill(m->swtpm, SIGTERM);
+		waitpid(m->swtpm, NULL, 0);
+		m->swtpm = 0;
+	}
+	if (!m->run_state_made)
+		return;
+	unlink(run_file(m, "swtpm.sock"));
+	unlink(run_file(m, "OVMF_VARS.fd"));
+	for (unsigned i = 0u; i < sizeof tpm_files / sizeof tpm_files[0]; i++) {
+		snprintf(path, sizeof path, "%s/tpm/%s", m->run_state, tpm_files[i]);
+		unlink(path);
+	}
+	rmdir(run_file(m, "tpm"));
+	rmdir(m->run_state);
+	m->run_state_made = 0;
 }
 
 /* The container an image is by its first bytes, for qemu to read it by:
@@ -363,8 +541,22 @@ static const char *read_firmware(hull_machine *m, const hull_sexpr_doc *doc,
 	                                      "/usr/share/OVMF/OVMF.fd", NULL };
 	char *firmware = hull_access_value(doc, pc, "firmware");
 	int   uefi = firmware != NULL && strcmp(firmware, "uefi") == 0;
+	int   secure = firmware != NULL && strcmp(firmware, "uefi-secure") == 0;
 
 	free(firmware);
+	/* Secure boot, as Windows 11 asks: OVMF's secure-boot build, which
+	 * needs SMM and so q35, and a variable store enrolled with Microsoft's
+	 * keys, the machine's own copy (prepare_state()). */
+	if (secure) {
+		if (m->machine_type == NULL || strcmp(m->machine_type, "q35") != 0)
+			return "(firmware uefi-secure) is q35's, SMM being what keeps its variables: "
+			       "(machine q35)";
+		if (access(SECURE_CODE, R_OK) != 0 || access(SECURE_VARS, R_OK) != 0)
+			return "(firmware uefi-secure) needs OVMF's secure-boot build and Microsoft's keys, "
+			       SECURE_CODE " and " SECURE_VARS ": Debian's package is ovmf";
+		m->secure = 1;
+		return NULL;
+	}
 	if (!uefi)
 		return NULL;
 	for (const char *const *place = places; *place != NULL; place++)
@@ -557,6 +749,18 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 		if (hull_access_find(doc, &entry, "pc", &pc)) {
 			m->machine_type = hull_access_value(doc, &pc, "machine");
 			m->vga          = hull_access_value(doc, &pc, "vga");
+			m->cpu          = hull_access_value(doc, &pc, "cpu");
+			m->tpm          = hull_access_true(doc, &pc, "tpm");
+			{
+				char *state = hull_access_value(doc, &pc, "state");
+
+				if (state != NULL) {
+					m->state = hull_access_path(doc, state);
+					free(state);
+					if (m->state == NULL)
+						return "the state's path cannot be read";
+				}
+			}
 			m->accel        = hull_access_value(doc, &pc, "accel");
 			m->nic          = hull_access_value(doc, &pc, "nic");
 			m->sound        = hull_access_value(doc, &pc, "sound");
@@ -612,8 +816,8 @@ static void exec_qemu(const hull_machine *m)
 
 	if (strcmp(accel, "auto") == 0)
 		accel = access("/dev/kvm", R_OK | W_OK) == 0 ? "kvm" : "tcg";
-	snprintf(machine, sizeof machine, "%s,accel=%s", m->machine_type != NULL ? m->machine_type : "pc",
-	         accel);
+	snprintf(machine, sizeof machine, "%s,accel=%s%s",
+	         m->machine_type != NULL ? m->machine_type : "pc", accel, m->secure ? ",smm=on" : "");
 	snprintf(boot, sizeof boot, "order=%c", m->boot);
 	argv[n++] = "qemu-system-x86_64";
 	argv[n++] = "-nodefaults";
@@ -631,6 +835,15 @@ static void exec_qemu(const hull_machine *m)
 	argv[n++] = monitor;
 	argv[n++] = "-mon";
 	argv[n++] = "chardev=monitor,mode=control";
+	/* (cpu ...): a model a system needs, Windows 11's SSE4.2 and POPCNT
+	 * that qemu's own qemu64 lacks, or an old one an old system expects;
+	 * none, qemu's default, as a system was installed under before the
+	 * key. host is KVM's alone: under TCG, max. */
+	if (m->cpu != NULL) {
+		argv[n++] = "-cpu";
+		argv[n++] = strcmp(m->cpu, "host") == 0 ? (strcmp(accel, "kvm") == 0 ? "host" : "max") :
+		            strcmp(m->cpu, "skylake") == 0 ? "Skylake-Client" : m->cpu;
+	}
 	argv[n++] = "-vga";
 	argv[n++] = m->vga != NULL ? m->vga : "std";
 	/* VNC's display 0 is port 5900, at the machine's own address. */
@@ -660,6 +873,34 @@ static void exec_qemu(const hull_machine *m)
 	if (m->firmware != NULL) {
 		argv[n++] = "-bios";
 		argv[n++] = m->firmware;
+	}
+	if (m->secure) {
+		static char code[64 + sizeof SECURE_CODE];
+		static char vars[4400];
+
+		snprintf(code, sizeof code, "if=pflash,format=raw,unit=0,readonly=on,file=%s", SECURE_CODE);
+		snprintf(vars, sizeof vars, "if=pflash,format=raw,unit=1,file=%s",
+		         option("", state_file(m, "OVMF_VARS.fd")));
+		argv[n++] = "-global";
+		argv[n++] = "driver=cfi.pflash01,property=secure,value=on";
+		argv[n++] = "-drive";
+		argv[n++] = code;
+		argv[n++] = "-drive";
+		argv[n++] = vars;
+	}
+	/* A TPM 2.0, swtpm's, its control socket the run directory's: CRB on
+	 * q35, as a PC of Windows 11's era has it, TIS on the older machine. */
+	if (m->tpm) {
+		static char chardev[4400];
+
+		snprintf(chardev, sizeof chardev, "socket,id=chrtpm,path=%s", run_file(m, "swtpm.sock"));
+		argv[n++] = "-chardev";
+		argv[n++] = chardev;
+		argv[n++] = "-tpmdev";
+		argv[n++] = "emulator,id=tpm0,chardev=chrtpm";
+		argv[n++] = "-device";
+		argv[n++] = m->machine_type != NULL && strcmp(m->machine_type, "q35") == 0 ?
+		            "tpm-crb,tpmdev=tpm0" : "tpm-tis,tpmdev=tpm0";
 	}
 	if (m->name != NULL) {
 		argv[n++] = "-name";
@@ -923,12 +1164,14 @@ static void *run_machine(void *arg)
 		finish(m, -1, SIGTERM);
 		return NULL;
 	}
-	if (failed || launch(m) != 0) {
+	if (failed || prepare_state(m) != 0 || launch(m) != 0) {
 		host->on_data(m->core, NULL, 2, (const uint8_t *)m->why, strlen(m->why));
+		release_state(m);
 		finish(m, 125, 0);
 		return NULL;
 	}
 	read_machine(m);
+	release_state(m);
 	return NULL;
 }
 
@@ -1579,6 +1822,14 @@ static const hull_cap_entry entries[] = {
 	{ "pc.sound.hda",   HULL_SUP_NATIVE, "Intel HD Audio", NULL },
 	{ "pc.firmware.bios", HULL_SUP_NATIVE, "qemu's SeaBIOS", NULL },
 	{ "pc.firmware.uefi", HULL_SUP_NATIVE, "OVMF, with no variable store", NULL },
+	{ "pc.firmware.uefi-secure", HULL_SUP_NATIVE,
+	  "OVMF's secure-boot build under SMM, its variables enrolled with Microsoft's keys, the "
+	  "machine's own copy", NULL },
+	{ "pc.tpm", HULL_SUP_EMULATED,
+	  "a TPM 2.0 in software, swtpm's, CRB on q35 and TIS on pc", NULL },
+	{ "pc.state.path", HULL_SUP_NATIVE,
+	  "its firmware's variables and its TPM's state, kept there across runs under (mutable "
+	  "direct) as its disk is, and copied for the run under an overlay", NULL },
 	{ "pc.machine.pc", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.machine.q35", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.machine.isapc", HULL_SUP_NATIVE, NULL, NULL },
@@ -1594,6 +1845,15 @@ static const hull_cap_entry entries[] = {
 	{ "pc.nic.pcnet", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.nic.rtl8139", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.nic.e1000", HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.nic.e1000e", HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.cpu.host", HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.cpu.max", HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.cpu.qemu64", HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.cpu.486", HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.cpu.pentium", HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.cpu.pentium3", HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.cpu.core2duo", HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.cpu.skylake", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.nic.virtio", HULL_SUP_NATIVE, NULL, NULL },
 	{ "security.no_new_privs", HULL_SUP_NATIVE, "set on the qemu process", NULL },
 	{ "on_disconnect.stop", HULL_SUP_NATIVE,   NULL, NULL },
