@@ -146,6 +146,7 @@ struct hull_machine {
 	int              block_root;   /* (projection block): the root a disk image of the tree */
 	int              writeback;    /* (writeback sync-on-stop): its tree the directory's again */
 	int              sleep;        /* (sleep true): the guest may suspend, ACPI S3 and s2idle */
+	int              iommu;        /* (tuning (qemu (iommu true))): an intel-iommu in the guest */
 	long             boot_limit;   /* seconds for the agent to answer: BOOT_LIMIT, or emu's */
 	char            *composefs;    /* a composefs: source, its image; root is then the objects */
 	char            *verity_disk;  /* (security (verity true)): its objects as ext4, beside it */
@@ -779,6 +780,17 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		m->transport = strcmp(text, "vsock") == 0 ? 1 : strcmp(text, "serial") == 0 ? 2 :
 		               strcmp(text, "uart") == 0 ? 3 : 0;
 		free(text);
+	}
+	/* (tuning (qemu (iommu true))): an IOMMU the guest's kernel drives,
+	 * q35's intel-iommu, so that its root may give a device to vfio-pci
+	 * -- to a program in user space or a vm nested in it -- as a host's
+	 * would, which software that drives devices so is tested against. */
+	if (hull_access_find(doc, &machine, "tuning", &entry) &&
+	    hull_access_find(doc, &entry, "qemu", &item) && hull_access_true(doc, &item, "iommu")) {
+		if (m->arm64 || m->riscv64)
+			return "(iommu true) is q35's intel-iommu: an arm64 or riscv64 machine, qemu's virt, "
+			       "has none of hull's";
+		m->iommu = 1;
 	}
 	/* (tuning (qemu (share ...))): how a tree reaches the guest. The key's
 	 * absence is auto, which follows hull's default and is settled at the
@@ -2287,7 +2299,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        shared_memory[96];
 	char        mmio[MICROVM_TRANSPORTS][128];
 	unsigned    mmio_count = 0u;
-	const char *argv[80 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS + 4u * HULL_MAX_DEVICES + 2u];
+	const char *argv[82 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS + 4u * HULL_MAX_DEVICES + 2u];
 	unsigned    serial = 0u;
 	unsigned    parallel = 0u;
 	int         usb = 0;
@@ -2347,8 +2359,15 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	/* virt under KVM takes the host's interrupt controller, a GICv3 where
 	 * qemu's default GICv2 is one KVM cannot give. */
 	/* riscv64's virt boots OpenSBI, qemu's own, before the kernel. */
+	/* intel-iommu remaps interrupts, which under KVM wants the irqchip
+	 * split; caching mode lets a vm nested in the guest have a device. */
 	argv[n++] = m->arm64 ? (m->emu ? "virt,virtualization=on" : "virt,gic-version=host") :
-	            m->riscv64 ? "virt" : m->micro ? MICROVM_OPTIONS : "q35";
+	            m->riscv64 ? "virt" : m->micro ? MICROVM_OPTIONS :
+	            m->iommu && !m->emu ? "q35,kernel-irqchip=split" : "q35";
+	if (m->iommu) {
+		argv[n++] = "-device";
+		argv[n++] = "intel-iommu,intremap=on,caching-mode=on";
+	}
 	argv[n++] = "-accel";
 	argv[n++] = m->emu ? "tcg" : "kvm";
 	argv[n++] = "-cpu";
@@ -2420,6 +2439,9 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	if (m->sleep)
 		snprintf(m->append + strlen(m->append), sizeof m->append - strlen(m->append),
 		         m->resuming ? " hull.swap=1 hull.resume=1" : " hull.swap=1");
+	if (m->iommu)
+		snprintf(m->append + strlen(m->append), sizeof m->append - strlen(m->append),
+		         " intel_iommu=on");
 	argv[n++] = m->append;
 	argv[n++] = "-device";
 	argv[n++] = "virtio-serial-pci";
@@ -2912,7 +2934,8 @@ static int micro_fits(const hull_machine *m, char *kernel, size_t cap)
 	char       *slash;
 	unsigned    transports = MICROVM_FIXED + m->volume_count + m->segment_count;
 
-	if (m->profile_full || m->sleep || m->arm64 || m->riscv64 || m->emu || m->device_count != 0u ||
+	if (m->profile_full || m->sleep || m->iommu || m->arm64 || m->riscv64 || m->emu ||
+	    m->device_count != 0u ||
 	    m->transport == 3 ||
 	    transports > MICROVM_TRANSPORTS || !qemu_has_microvm())
 		return 0;
@@ -5686,6 +5709,9 @@ static const hull_cap_entry entries[] = {
 	{ "qemu.share.auto",       HULL_SUP_NATIVE, "virtiofs where virtiofsd is installed and the kernel is known to have it, else 9p", NULL },
 	{ "qemu.share.9p",         HULL_SUP_NATIVE, NULL, NULL },
 	{ "qemu.share.virtiofs",   HULL_SUP_NATIVE, "needs virtiofsd installed", NULL },
+	{ "qemu.iommu",            HULL_SUP_NATIVE,
+	  "q35's intel-iommu, with interrupt remapping and caching mode, the guest booted "
+	  "intel_iommu=on: its root may give a device to vfio-pci; x86 alone", NULL },
 	{ "qemu.transport.auto",   HULL_SUP_NATIVE, NULL, NULL },
 	{ "qemu.transport.vsock",  HULL_SUP_NATIVE, "needs /dev/vhost-vsock open to the user", NULL },
 	{ "qemu.transport.serial", HULL_SUP_NATIVE, "a virtio-serial port, its socket in the "

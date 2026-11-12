@@ -535,6 +535,7 @@ static const key qemu_keys[] = {
 	{ .name = "accel", .type = CHOICE, .choices = accel_values },
 	{ .name = "transport", .type = CHOICE, .choices = transport_values },
 	{ .name = "share", .type = CHOICE, .choices = share_values },
+	{ .name = "iommu", .type = BOOLEAN },
 };
 static const schema qemu = TABLE(qemu_keys);
 

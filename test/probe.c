@@ -20,6 +20,9 @@
  *   kind PATH   PATH's kind, and a character device's major:minor
  *   read PATH   PATH's first line
  *   load PATH   whether the module PATH, under /lib/modules/RELEASE, loads
+ *   vfio GROUP ADDRESS  whether VFIO gives the PCI device ADDRESS of the
+ *               group node GROUP to user space: its group viable, a
+ *               container set, and the device's regions
  * Run as PID 1 with no arguments it is an init that reaps for ever; run as
  * `poweroff` it powers the machine off. Steps:
  *
@@ -130,6 +133,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <linux/vfio.h>
 #include <sys/socket.h>
 #include <sys/prctl.h>
 #include <sys/reboot.h>
@@ -1243,6 +1247,41 @@ int main(int argc, char **argv)
 				close(fd);
 			}
 			printf("tell=%s\n", put > 0 ? "ok" : strerror(errno));
+			i += 2;
+		} else if (strcmp(step, "vfio") == 0 && i + 2 < argc) {
+			/* As a driver in user space starts: the container, the
+			 * group in it under type 1, and the device from it. */
+			struct vfio_group_status status = { .argsz = sizeof status };
+			struct vfio_device_info  info = { .argsz = sizeof info };
+			int container = open("/dev/vfio/vfio", O_RDWR | O_CLOEXEC);
+			int group = open(arg, O_RDWR | O_CLOEXEC);
+			int device = -1;
+			const char *wrong = NULL;
+
+			if (container < 0 || group < 0)
+				wrong = strerror(errno);
+			else if (ioctl(container, VFIO_GET_API_VERSION) != VFIO_API_VERSION)
+				wrong = "api version";
+			else if (ioctl(group, VFIO_GROUP_GET_STATUS, &status) != 0 ||
+			         !(status.flags & VFIO_GROUP_FLAGS_VIABLE))
+				wrong = "group not viable";
+			else if (ioctl(group, VFIO_GROUP_SET_CONTAINER, &container) != 0 ||
+			         ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU) != 0)
+				wrong = strerror(errno);
+			else if ((device = ioctl(group, VFIO_GROUP_GET_DEVICE_FD, argv[i + 2])) < 0 ||
+			         ioctl(device, VFIO_DEVICE_GET_INFO, &info) != 0)
+				wrong = strerror(errno);
+			if (wrong != NULL)
+				printf("vfio=%s\n", wrong);
+			else
+				printf("vfio=ok pci=%u regions=%u\n", (info.flags & VFIO_DEVICE_FLAGS_PCI) != 0,
+				       info.num_regions);
+			if (device >= 0)
+				close(device);
+			if (group >= 0)
+				close(group);
+			if (container >= 0)
+				close(container);
 			i += 2;
 		} else if (strcmp(step, "remove") == 0) {
 			printf("remove=%s\n", unlink(arg) == 0 ? "ok" : strerror(errno));
