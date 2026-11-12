@@ -33,6 +33,9 @@ typedef struct writer {
 	const hull_tree_owner *owners;  /* given over the disk's, sorted by path */
 	size_t                 owner_count;
 	int                    overlay; /* an overlay's whiteouts as docker's .wh. entries */
+	int                    as_root; /* the user's own uid and gid written as root's */
+	uid_t                  user_uid;
+	gid_t                  user_gid;
 	uint8_t        buffer[65536];
 } writer;
 
@@ -198,6 +201,18 @@ static int header(writer *w, int dir, const char *at, const char *name, char typ
 	int             status;
 	int             fd = dir >= 0 ? openat(dir, at, O_PATH | O_NOFOLLOW | O_CLOEXEC) : -1;
 
+	/* The user's own file as the machine's root sees it, root's, its
+	 * group too, as a store's commit takes it whatever group it had: a
+	 * tree in a directory setgid to a shared group would otherwise come
+	 * in that group's. */
+	if (w->as_root) {
+		if (e.uid == (unsigned long long)w->user_uid) {
+			e.uid = 0u;
+			e.gid = 0u;
+		} else if (e.gid == (unsigned long long)w->user_gid) {
+			e.gid = 0u;
+		}
+	}
 	/* An owner given for it, by its name without a directory's slash. */
 	if (w->owner_count != 0u && length < sizeof key) {
 		const hull_tree_owner *given;
@@ -471,6 +486,12 @@ int hull_tree_tar_layer(const char *root, const hull_tree_owner *owners, size_t 
 	return tar_tree(root, 0, owners, count, 1, sink, context, detail, detail_cap);
 }
 
+int hull_tree_tar_rooted(const char *root, const hull_tree_owner *owners, size_t count,
+                         hull_tree_sink sink, void *context, char *detail, size_t detail_cap)
+{
+	return tar_tree(root, 0, owners, count, 2, sink, context, detail, detail_cap);
+}
+
 int hull_tree_tar_fs(const char *root, int one_fs, hull_tree_sink sink, void *context,
                      char *detail, size_t detail_cap)
 {
@@ -589,7 +610,10 @@ static int tar_tree(const char *root, int one_fs, const hull_tree_owner *owners,
 	w->device      = top.st_dev;
 	w->owners      = owners;
 	w->owner_count = count;
-	w->overlay     = overlay;
+	w->overlay     = overlay == 1;
+	w->as_root     = overlay == 2;
+	w->user_uid    = getuid();
+	w->user_gid    = getgid();
 	{
 		struct statx root_mount;
 
@@ -645,4 +669,70 @@ int hull_tar_end(hull_tree_sink sink, void *context, char *detail, size_t detail
 
 	bare_writer(&w, sink, context, detail, detail_cap);
 	return put(&w, end, sizeof end);
+}
+
+/* (owners PATH)'s list, as engine/idmap.c reads it -- UID, GID and a path
+ * of the tree, each ended by a NUL -- into `list`, sorted by path, its
+ * text held in `*data`, for a tar of the tree to give each its owner: a
+ * docker import, a block projection's image. Moved here from the docker
+ * engine. A reason, or NULL. */
+const char *hull_tree_owners_read(const char *path, char **data, hull_tree_owner **list,
+                                  size_t *count)
+{
+	FILE  *f = fopen(path, "re");
+	size_t length = 0u;
+	size_t cap = 0u;
+	size_t n;
+
+	*data  = NULL;
+	*list  = NULL;
+	*count = 0u;
+	if (f == NULL)
+		return "the owners' file cannot be read";
+	for (;;) {
+		char *more;
+
+		if (length == cap) {
+			if (cap >= (64u << 20) || (more = realloc(*data, cap + 65536u)) == NULL) {
+				fclose(f);
+				return "the owners' file is too large";
+			}
+			*data = more;
+			cap += 65536u;
+		}
+		n = fread(*data + length, 1u, cap - length, f);
+		length += n;
+		if (n == 0u)
+			break;
+	}
+	fclose(f);
+	for (size_t at = 0u; at < length;) {
+		const char      *fields[3];
+		unsigned         k = 0u;
+		hull_tree_owner *grown;
+
+		for (; k < 3u && at < length; k++) {
+			fields[k] = *data + at;
+			while (at < length && (*data)[at] != '\0')
+				at++;
+			if (at == length)
+				break;
+			at++;
+		}
+		if (k < 3u)
+			break;
+		if ((*count & 1023u) == 0u) {
+			grown = realloc(*list, (*count + 1024u) * sizeof **list);
+			if (grown == NULL)
+				return "out of memory";
+			*list = grown;
+		}
+		(*list)[*count].path = fields[2];
+		(*list)[*count].uid  = strtoull(fields[0], NULL, 10);
+		(*list)[*count].gid  = strtoull(fields[1], NULL, 10);
+		(*count)++;
+	}
+	if (*count > 1u)
+		qsort(*list, *count, sizeof **list, owner_order);
+	return NULL;
 }

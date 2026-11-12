@@ -68,6 +68,19 @@ int hull_tree_tar_owned(const char *root, const hull_tree_owner *owners, size_t 
 int hull_tree_tar_layer(const char *root, const hull_tree_owner *owners, size_t count,
                         hull_tree_sink sink, void *context, char *detail, size_t detail_cap);
 
+/* hull_tree_tar_owned, the tree as a rootless machine sees it: an entry
+ * of the running user's uid or gid written as root's, 0, before `owners`
+ * gives its own. What a block projection's image is made from, so its
+ * files are root's in the guest as a shared tree's are. */
+int hull_tree_tar_rooted(const char *root, const hull_tree_owner *owners, size_t count,
+                         hull_tree_sink sink, void *context, char *detail, size_t detail_cap);
+
+/* (owners PATH)'s list -- UID, GID and a path, each ended by a NUL --
+ * into `*list`, sorted by path for the writers above, its text held in
+ * `*data`; both freed by the caller. NULL, or why not. */
+const char *hull_tree_owners_read(const char *path, char **data, hull_tree_owner **list,
+                                  size_t *count);
+
 /* A directory above a tree written beneath a prefix: its metadata. */
 typedef struct hull_tree_dir {
 	unsigned           mode;

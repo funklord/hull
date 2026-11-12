@@ -114,11 +114,6 @@ typedef struct text {
 	int     failed;
 } text;
 
-static int owner_order(const void *a, const void *b)
-{
-	return strcmp(((const hull_tree_owner *)a)->path, ((const hull_tree_owner *)b)->path);
-}
-
 static void add(text *t, const char *bytes, size_t n)
 {
 	if (t->failed)
@@ -2563,73 +2558,6 @@ static void remove_container(const char *id)
 }
 
 
-/* (owners PATH)'s list, as engine/idmap.c reads it -- UID, GID and a path
- * of the tree, each ended by a NUL -- into `list`, sorted by path, its
- * text held in `*data`, for the import's tar to give each its owner, as
- * chroot gives them in its namespace: the workload runs as the user, so
- * a docker import is where an owner can be given without root. A
- * reason, or NULL. */
-static const char *read_owners(const char *path, char **data, hull_tree_owner **list,
-                               size_t *count)
-{
-	FILE  *f = fopen(path, "re");
-	size_t length = 0u;
-	size_t cap = 0u;
-	size_t n;
-
-	*data  = NULL;
-	*list  = NULL;
-	*count = 0u;
-	if (f == NULL)
-		return "the owners' file cannot be read";
-	for (;;) {
-		char *more;
-
-		if (length == cap) {
-			if (cap >= (64u << 20) || (more = realloc(*data, cap + 65536u)) == NULL) {
-				fclose(f);
-				return "the owners' file is too large";
-			}
-			*data = more;
-			cap += 65536u;
-		}
-		n = fread(*data + length, 1u, cap - length, f);
-		length += n;
-		if (n == 0u)
-			break;
-	}
-	fclose(f);
-	for (size_t at = 0u; at < length;) {
-		const char      *fields[3];
-		unsigned         k = 0u;
-		hull_tree_owner *grown;
-
-		for (; k < 3u && at < length; k++) {
-			fields[k] = *data + at;
-			while (at < length && (*data)[at] != '\0')
-				at++;
-			if (at == length)
-				break;
-			at++;
-		}
-		if (k < 3u)
-			break;
-		if ((*count & 1023u) == 0u) {
-			grown = realloc(*list, (*count + 1024u) * sizeof **list);
-			if (grown == NULL)
-				return "out of memory";
-			*list = grown;
-		}
-		(*list)[*count].path = fields[2];
-		(*list)[*count].uid  = strtoull(fields[0], NULL, 10);
-		(*list)[*count].gid  = strtoull(fields[1], NULL, 10);
-		(*count)++;
-	}
-	if (*count > 1u)
-		qsort(*list, *count, sizeof **list, owner_order);
-	return NULL;
-}
-
 /* The image the machine runs: its ref, or its dir's import, with the
  * owners (owners PATH) gives. A reason, or NULL. */
 /* --- a directory in place ---------------------------------------------- */
@@ -3139,7 +3067,7 @@ static const char *source_image(hull_machine *m, const hull_sexpr_doc *doc,
 	if (given != NULL) {
 		char *at = hull_access_path(doc, given);
 
-		reason = at == NULL ? "out of memory" : read_owners(at, &data, &owners, &count);
+		reason = at == NULL ? "out of memory" : hull_tree_owners_read(at, &data, &owners, &count);
 		free(at);
 	}
 	/* (layers "dir:..." ...): each above the source, the last on top. */

@@ -711,9 +711,13 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	text = hull_access_value(doc, &machine, "projection");
 	m->block_root = text != NULL && strcmp(text, "block") == 0;
 	free(text);
-	if (m->block_root && (m->host_overlay || m->owners != NULL))
-		return "a block projection's root is built from the directory alone: layers, an upper, "
-		       "owners and an export are a host-side overlay's";
+	if (m->block_root && (m->layer_count != 0u || m->upper != NULL || m->export != NULL))
+		return "a block projection's root is built from the directory and its owners: layers, "
+		       "an upper and an export are a host-side overlay's";
+	/* Owners go into its image (build_root_image), not a host-side
+	 * overlay's tmpfs. */
+	if (m->block_root)
+		m->host_overlay = 0;
 	if (m->arm64 && m->block_root)
 		return "an arm64 machine's root is a share: a block projection is x86's so far";
 	if (m->composefs != NULL && (m->block_root || m->host_overlay || m->owners != NULL))
@@ -1322,6 +1326,8 @@ static int hibernated(const hull_machine *m)
  * bytes (section 3.9's rule 1), measured on two copies made in opposite
  * orders. Sized for the tree and a quarter again, and 256 MiB for what
  * the machine writes, sparse. NULL, or why in m->detail. */
+static int export_sink(void *context, const uint8_t *data, size_t n);
+
 static const char *build_root_image(hull_machine *m)
 {
 	static const char *const uuid = "68756c6c-726f-6f74-0000-000000000001";
@@ -1329,6 +1335,7 @@ static const char *build_root_image(hull_machine *m)
 	                            access("/sbin/mke2fs", X_OK) == 0 ? "/sbin/mke2fs" : NULL;
 	unsigned long long bytes = tree_bytes(m->root, 0u);
 	char               image[4300];
+	char               tar[4300];
 	char               size[32];
 	char               seed[80];
 
@@ -1338,14 +1345,49 @@ static const char *build_root_image(hull_machine *m)
 		return m->detail;
 	}
 	snprintf(image, sizeof image, "%s/root.img", m->dir);
+	snprintf(tar, sizeof tar, "%s/root.tar", m->dir);
 	snprintf(size, sizeof size, "%lluk", (bytes + bytes / 4u + (256ull << 20)) / 1024u);
 	snprintf(seed, sizeof seed, "hash_seed=%s", uuid);
+	/* From a tar of the tree as the machine sees it, not the directory:
+	 * mke2fs -d of a directory keeps the disk's owners, the user's uid,
+	 * where a shared tree shows the guest the user's files as root's;
+	 * and a stored tree's (owners ...) go into the tar, which mke2fs
+	 * takes since e2fsprogs 1.47.1, setuid bits and all. A file, beside
+	 * the image and gone once it is built: mke2fs takes a FIFO for a
+	 * directory, measured, so the tree is held twice for that while. */
+	{
+		char            *data = NULL;
+		hull_tree_owner *owners = NULL;
+		size_t           count = 0u;
+		const char      *why = m->owners != NULL ?
+		                       hull_tree_owners_read(m->owners, &data, &owners, &count) : NULL;
+		int              fd = why == NULL ?
+		                      open(tar, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600) : -1;
+		int              made;
+
+		if (why == NULL && fd < 0)
+			why = strerror(errno);
+		made = fd >= 0 && hull_tree_tar_rooted(m->root, owners, count, export_sink, &fd, m->detail,
+		                                       sizeof m->detail) == 0;
+		if (fd >= 0 && close(fd) != 0)
+			made = 0;
+		free(owners);
+		free(data);
+		if (!made) {
+			if (why != NULL)
+				snprintf(m->detail, sizeof m->detail, "the root's tar: %s", why);
+			unlink(tar);
+			return m->detail;
+		}
+	}
 	{
 		const char *argv[] = { "env", "E2FSPROGS_FAKE_TIME=1", mke2fs, "-q", "-F", "-t", "ext4",
-		                       "-U", uuid, "-E", seed, "-d", m->root, image, size, NULL };
+		                       "-U", uuid, "-E", seed, "-d", tar, image, size, NULL };
 		char        said[400];
+		int         status = hull_hostnet_run(argv, said, sizeof said);
 
-		if (hull_hostnet_run(argv, said, sizeof said) != 0) {
+		unlink(tar);
+		if (status != 0) {
 			said[strcspn(said, "\n")] = '\0';
 			snprintf(m->detail, sizeof m->detail, "the root's image could not be built: %s",
 			         said);

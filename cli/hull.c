@@ -815,6 +815,13 @@ static int composefs_machine(const hull_spec *spec, const hull_sexpr_form *machi
 	for (unsigned i = 0u; refused[i] != NULL; i++)
 		if (hull_spec_find(spec, machine, refused[i], &entry))
 			return 0;
+	/* (projection block) builds the root's image from the checkout and
+	 * its owners, which a composefs root is not: netcfgd's (sleep true)
+	 * machine of a stored image was refused for it (cc-inbox, 2026-11-11). */
+	if (hull_spec_find(spec, machine, "projection", &entry) &&
+	    hull_sexpr_child(&spec->doc, &entry, &head) && hull_sexpr_next(&spec->doc, &head, &value) &&
+	    hull_sexpr_is(&spec->doc, &value, "block"))
+		return 0;
 	if (hull_spec_find(spec, machine, "tuning", &entry)) {
 		hull_sexpr_form vm;
 		hull_sexpr_form item;

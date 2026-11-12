@@ -971,6 +971,21 @@ printf '(machine (source "dir:%s/vowntmpl") (backend vm) %s)\n' "$root" \
 name=vownedno
 boot vownedno
 has 125 "owners are given in the overlay.s tmpfs"
+# Under (projection block) the owners go into the root's image, which
+# mke2fs makes from a tar of the tree as the machine sees it, so they need
+# no range of the host's: given 101:102 on any host, the rest root's, and
+# still the user's on disk. A stored image's owners come this way, which
+# (sleep true) needs (netcfgd, cc-inbox 2026-11-11).
+printf '(machine (source "dir:%s/vowntmpl") (backend vm) (mutable overlay) (projection block) %s %s)\n' \
+	"$root" "(owners \"$root/vowners.list\")" \
+	'(command "/probe" "owner" "/given" "owner" "/probe")' > "$root/vownblock.conf"
+name=vownblock
+boot vownblock
+has 0 '^owner=101:102 0[0-7]{3}$'
+has 0 '^owner=0:0 0[0-7]{3}$'
+cases=$((cases + 1))
+[ "$(stat -c %u "$root/vowntmpl/given")" = "$(id -u)" ] ||
+	fail "an owner given in a block root reached the user's disk" "$(ls -ln "$root/vowntmpl/given")"
 rm -rf "${root:?}/vowntmpl"
 # (export PATH) on a vm, by a build whose steps run on one: each step an
 # overlay qemu mounts host-side, the guest writing through to it, its tree
@@ -1136,10 +1151,13 @@ wait "$vlive"
 # agent mounts; the machine's write the image's, and not the directory's.
 # (mutable direct) under it, with no writeback, refused at plan.
 conf vblock '(backend vm) (mutable overlay) (projection block)' \
-	'(command "/probe" "write" "/made-on-block" "read" "/proc/mounts")'
+	'(command "/probe" "write" "/made-on-block" "read" "/proc/mounts" "owner" "/probe")'
 name=vblock
 boot vblock 120
 has 0 '^read=/dev/vda / ext4 rw'
+# The user's files root's in the image, as a shared tree shows them, where
+# mke2fs -d of the directory had kept the user's uid.
+has 0 '^owner=0:0 0[0-7]{3}$'
 has 0 '^write=ok$'
 cases=$((cases + 1))
 [ ! -e "$root/rootfs/made-on-block" ] ||
