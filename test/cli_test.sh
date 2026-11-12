@@ -4508,6 +4508,35 @@ else
 	expect 0 '/tmp/sent' sh -c 'printf "ls /tmp\n" | sftp -F "$1" -b - cdb.hull' sh "$root/cdb.ssh"
 	env XDG_RUNTIME_DIR="$dbshm" "$hull" stop cdb > /dev/null 2>&1
 	wait "$cdber" 2>/dev/null
+	# (ssh dropbear): the fetched one chosen over the image's own sshd,
+	# here one that serves nothing, which (ssh true) would have run.
+	mkdir -p "$root/dbroot/usr/sbin"
+	printf '#!/bin/sh\nexit 1\n' > "$root/dbroot/usr/sbin/sshd"
+	chmod 755 "$root/dbroot/usr/sbin/sshd"
+	printf '(machine (source "dir:./dbroot") (backend chroot) (mutable overlay) (hostname "cdbx") %s %s)\n' \
+		'(ssh dropbear)' '(command "/bin/sh" "-c" "echo ready; exec sleep 60")' > "$root/cdbx.conf"
+	sed 's/cdb\.hull/cdbx.hull/; s/cdb\.known/cdbx.known/' "$root/cdb.ssh" > "$root/cdbx.ssh"
+	rm -f "$root/cdbx.out"
+	(cd / && exec env XDG_RUNTIME_DIR="$dbshm" XDG_CACHE_HOME="$root/cache" timeout -k 2 60 \
+		"$hull_abs" run -f "$root/cdbx.conf" > "$root/cdbx.out" 2>&1) &
+	cdber=$!
+	tries=0
+	until grep -q '^ready$' "$root/cdbx.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+	printf 'cdbx.hull %s\n' "$(cut -d' ' -f1,2 "$XDG_DATA_HOME/hull/machines/cdbx/host_key.pub" 2>&1)" \
+		> "$root/cdbx.known"
+	tries=0
+	until timeout 10 ssh -F "$root/cdbx.ssh" cdbx.hull true < /dev/null 2>/dev/null ||
+	      [ "$tries" -ge 20 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+	expect 0 '^dropbear served$' ssh -F "$root/cdbx.ssh" cdbx.hull 'echo dropbear served'
+	env XDG_RUNTIME_DIR="$dbshm" "$hull" stop cdbx > /dev/null 2>&1
+	wait "$cdber" 2>/dev/null
+	rm -f "$root/dbroot/usr/sbin/sshd"
 	rm -f "$root/home/.ssh/dbkey" "$root/home/.ssh/dbkey.pub"
 fi
 rm -rf "${dbshm:?}"

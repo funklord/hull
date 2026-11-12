@@ -76,6 +76,16 @@ int hull_access_true(const hull_sexpr_doc *doc, const hull_sexpr_form *record, c
 	return yes;
 }
 
+int hull_access_ssh(const hull_sexpr_doc *doc, const hull_sexpr_form *machine)
+{
+	char *value = hull_access_value(doc, machine, "ssh");
+	int   which = value == NULL ? 0 : strcmp(value, "true") == 0 ? 1 :
+	              strcmp(value, "dropbear") == 0 ? 2 : 0;
+
+	free(value);
+	return which;
+}
+
 int hull_access_terminal(const hull_sexpr_doc *doc, const hull_sexpr_form *exec, int *cols,
                          int *rows)
 {

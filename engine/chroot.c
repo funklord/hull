@@ -865,7 +865,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	 * network, and under NAT bound in the machine and forwarded there by
 	 * pasta. The address is where hull reaches it, so (network none) --
 	 * which has no host-reachable address -- is refused. */
-	m->ssh = hull_access_true(doc, &machine, "ssh");
+	m->ssh = hull_access_ssh(doc, &machine);
 	if (m->ssh) {
 		hull_sexpr_form top;
 		char           *addr;
@@ -2647,7 +2647,7 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		    (mkdir(HULL_SSHD_GUEST, 0755) != 0 ||
 		     move_mount(sshd_tree, "", AT_FDCWD, HULL_SSHD_GUEST, MOVE_MOUNT_F_EMPTY_PATH) != 0))
 			child_fail(report, "the fetched sshd");
-		if ((reason = hull_sshd_choose(&ssh_bin)) != NULL)
+		if ((reason = hull_sshd_choose(&ssh_bin, m->ssh == 2)) != NULL)
 			child_refuse(report, reason);
 		if (ssh_bin == NULL) {
 			snprintf(ssh_listen, sizeof ssh_listen, "%s:%d",
@@ -4763,6 +4763,8 @@ static const hull_cap_entry entries[] = {
 	  "supervised at a high port on the machine's 127.107 address, bound there on the host "
 	  "network and forwarded there by pasta under NAT; refused with (network none) and at "
 	  "start where there is neither", NULL },
+	{ "ssh.dropbear",           HULL_SUP_NATIVE,
+	  "the dropbear `hull sshd fetch` keeps, whatever sshd the image has", NULL },
 	{ "segments",               HULL_SUP_NATIVE,
 	  "a tap each in the machine's own network namespace, relayed to the core's switch: eth1 "
 	  "on after pasta's eth0 under NAT, eth0 on with (network none); refused with (network "

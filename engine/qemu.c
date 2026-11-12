@@ -5650,6 +5650,8 @@ static const hull_cap_entry entries[] = {
 	  "the agent supervises the image's own sshd on the guest's port 22, or where it has "
 	  "none the dropbear `hull sshd fetch` keeps, with a host key and the user's "
 	  "authorized_keys the core delivers; refused at start where there is neither", NULL },
+	{ "ssh.dropbear",       HULL_SUP_NATIVE,
+	  "the dropbear `hull sshd fetch` keeps, whatever sshd the image has", NULL },
 	{ "sleep",              HULL_SUP_NATIVE,
 	  "the guest's own suspend to RAM (ACPI S3) on q35, its kernel freezing tasks and "
 	  "suspending every driver, and its hibernation to a swap disk hull gives it, resumed "
@@ -5979,6 +5981,8 @@ static const hull_cap_entry vbox_entries[] = {
 	{ "ssh",                HULL_SUP_NATIVE,
 	  "the agent supervises the image's own sshd on the guest's port 22, or the dropbear "
 	  "`hull sshd fetch` keeps, on a disk of its own, reached over the UART", NULL },
+	{ "ssh.dropbear",       HULL_SUP_NATIVE,
+	  "the dropbear `hull sshd fetch` keeps, whatever sshd the image has", NULL },
 	{ "security.readonly_root", HULL_SUP_NATIVE, NULL, NULL },
 	{ "security.no_new_privs",  HULL_SUP_NATIVE, "set by the agent on the workload", NULL },
 	{ "on_disconnect.stop", HULL_SUP_NATIVE, NULL, NULL },

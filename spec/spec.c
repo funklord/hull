@@ -404,6 +404,8 @@ static const char *const writeback_values[]  = { "none", "sync-on-stop", NULL };
 static const char *const projection_values[] = { "auto", "bind", "passthrough", "block", NULL };
 static const char *const restart_values[]    = { "no", "on-failure", "always", NULL };
 static const char *const disconnect_values[] = { "stop", "keep", NULL };
+/* (ssh dropbear): hull's fetched dropbear, chosen over the image's own. */
+static const char *const ssh_values[] = { "true", "false", "dropbear", NULL };
 static const char *const network_values[]    = { "bridge", "host", "nat", "none", NULL };
 static const char *const display_values[]    = { "window", "vnc", NULL };
 static const char *const distribution_values[] = { "uniform", "normal", "pareto", NULL };
@@ -769,7 +771,7 @@ static const key machine_keys[] = {
 	{ .name = "cpus",          .type = COUNT },
 	{ .name = "memory",        .type = STRING, .value = size },
 	{ .name = "backend",       .type = SYMBOL, .value = identifier },
-	{ .name = "ssh",           .type = BOOLEAN },
+	{ .name = "ssh",           .type = CHOICE, .choices = ssh_values },
 	{ .name = "restart",       .type = CHOICE, .choices = restart_values },
 	{ .name = "on_disconnect", .type = CHOICE, .choices = disconnect_values },
 	{ .name = "network",       .type = CHOICE, .choices = network_values },

@@ -1332,7 +1332,7 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 		hull_sexpr_form allow;
 		hull_sexpr_form item;
 		int             first = 1;
-		int             ssh = hull_access_true(doc, machine, "ssh");
+		int             ssh = hull_access_ssh(doc, machine) != 0;
 		int             allowed = root_granted(doc, "security.allow") &&
 		                          hull_access_find(doc, machine, "security", &entry) &&
 		                          hull_access_find(doc, &entry, "allow", &allow);
@@ -1458,7 +1458,7 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	 * image: that material is root's in the container, to satisfy
 	 * dropbear, and a directory used in place would take root's files into
 	 * the user's tree. */
-	if (reason == NULL && hull_access_true(doc, machine, "ssh")) {
+	if (reason == NULL && hull_access_ssh(doc, machine) != 0) {
 		char dir[4096];
 		char dropbear[4200];
 
@@ -4205,6 +4205,8 @@ static const hull_cap_entry entries[] = {
 	  "the dropbear `hull sshd fetch` keeps, run as the container's root on its port 22, "
 	  "with the machine's host key and the user's authorized_keys; for a machine of an "
 	  "image, refused at start with (mutable direct) or where none is fetched", NULL },
+	{ "ssh.dropbear",       HULL_SUP_NATIVE,
+	  "the dropbear `hull sshd fetch` keeps, which is (ssh true)'s here too", NULL },
 	{ "hostname",           HULL_SUP_NATIVE,   NULL, NULL },
 
 	/* ns: cgroups, memory a ceiling (6). */

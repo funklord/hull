@@ -200,13 +200,14 @@ static inline int hull_sshd_dir(char *out, size_t cap)
 /*
  * In the machine, after its root is in place: the image's own sshd, the
  * first of the usual two paths that is executable, into `found` (NULL
- * where it has none and the fetched dropbear will serve); or a reason the
+ * where it has none, or `dropbear` asks for it, and the fetched dropbear
+ * will serve); or a reason the
  * machine cannot have one. dropbear logs in as the image's root, so a
  * passwd that does not name root, or a / that others may write, which
  * dropbear holds against every key, is refused rather than given an sshd
  * no key can log in to. System calls alone, as below.
  */
-static inline const char *hull_sshd_choose(const char **found)
+static inline const char *hull_sshd_choose(const char **found, int dropbear)
 {
 	static const char *const where[] = { "/usr/sbin/sshd", "/usr/bin/sshd", NULL };
 	static char              text[65536];
@@ -216,13 +217,17 @@ static inline const char *hull_sshd_choose(const char **found)
 	int                      fd;
 
 	*found = NULL;
-	for (unsigned i = 0u; where[i] != NULL; i++)
+	/* (ssh dropbear): the fetched one whatever the image has. */
+	for (unsigned i = 0u; !dropbear && where[i] != NULL; i++)
 		if (access(where[i], X_OK) == 0) {
 			*found = where[i];
 			return NULL;
 		}
 	if (access(HULL_SSHD_GUEST "/" HULL_SSHD_DROPBEAR, R_OK) != 0)
-		return "(ssh true): the image has no sshd at /usr/sbin/sshd or /usr/bin/sshd, and "
+		return dropbear ?
+		       "(ssh dropbear) runs the dropbear `hull sshd fetch" HULL_SSHD_FETCH_ARCH "` "
+		       "downloads, and none has been fetched" :
+		       "(ssh true): the image has no sshd at /usr/sbin/sshd or /usr/bin/sshd, and "
 		       "none has been fetched: `hull sshd fetch" HULL_SSHD_FETCH_ARCH "` downloads "
 		       "dropbear, once";
 	/* Read by the system calls alone, as hull_sshd_exec_dropbear is run:
@@ -235,12 +240,12 @@ static inline const char *hull_sshd_choose(const char **found)
 	for (ssize_t at = 0; got > 0 && at + 5 <= got && !named; at++)
 		named = (at == 0 || text[at - 1] == '\n') && memcmp(text + at, "root:", 5u) == 0;
 	if (!named)
-		return "(ssh true): the image has no sshd, and the fetched dropbear logs in as root, "
-		       "whom its /etc/passwd does not name";
+		return "(ssh): the fetched dropbear logs in as root, whom the image's /etc/passwd "
+		       "does not name";
 	if (stat("/", &root) != 0 || (root.st_mode & 022) != 0)
-		return "(ssh true): the image has no sshd, and the fetched dropbear takes no key where "
-		       "the machine's / may be written by group or others, as OpenSSH's StrictModes "
-		       "takes none: `chmod go-w` the directory the machine is of";
+		return "(ssh): the fetched dropbear takes no key where the machine's / may be "
+		       "written by group or others, as OpenSSH's StrictModes takes none: `chmod go-w` "
+		       "the directory the machine is of";
 	return NULL;
 }
 

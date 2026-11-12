@@ -39,6 +39,11 @@ const char *hull_access_devices(const hull_sexpr_doc *doc, const hull_sexpr_form
 /* Whether `(key true)` is in `record`. */
 int hull_access_true(const hull_sexpr_doc *doc, const hull_sexpr_form *record, const char *key);
 
+/* The machine's (ssh ...) (section 8.1): 0 for none or false, 1 for true,
+ * the image's own sshd where it has one, 2 for dropbear, the one `hull
+ * sshd fetch` keeps, chosen over the image's. */
+int hull_access_ssh(const hull_sexpr_doc *doc, const hull_sexpr_form *machine);
+
 /* Whether an exec, `(exec ... (tty ...))`, asks for a terminal: 1 with
  * its size from `(tty (cols n) (rows n))`, else 0. The core has checked
  * both are 1 to 65535. */

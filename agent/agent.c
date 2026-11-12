@@ -1696,7 +1696,7 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	}
 	if (secrets != NULL && (reason = place_secrets(doc, machine, secrets, &n)) != NULL)
 		return reason;
-	ssh_enabled = hull_access_true(doc, machine, "ssh");
+	ssh_enabled = hull_access_ssh(doc, machine);
 	if (ssh_enabled) {
 		char named_root[256];
 
@@ -1776,7 +1776,7 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	if (ssh_enabled) {
 		const char *found;
 
-		if ((reason = hull_sshd_choose(&found)) != NULL)
+		if ((reason = hull_sshd_choose(&found, ssh_enabled == 2)) != NULL)
 			return reason;
 		if (found != NULL)
 			snprintf(ssh_bin, sizeof ssh_bin, "%s", found);

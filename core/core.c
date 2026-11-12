@@ -3480,7 +3480,7 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	}
 	/* A board's sshd and its key are its own, the holder's word: there is
 	 * nothing of the machine's to make for it (section 8.1). */
-	if (hull_access_true(&plan_doc, &machine, "ssh") &&
+	if (hull_access_ssh(&plan_doc, &machine) != 0 &&
 	    strcmp(engine->caps->engine_name, "board") != 0) {
 		char        dir[4300];
 		const char *why = write_ssh(id, dir, sizeof dir);
