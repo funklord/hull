@@ -56,6 +56,7 @@ typedef struct walk {
 	unsigned unit;            /* the bytes a sector of the layout is */
 	int      sparse;          /* its digest is hash_sparse's */
 	int      owners;          /* the open owners list of the tree being read, or -1 */
+	int      devices;         /* the open devices list of the tree being read, or -1 */
 } walk;
 
 static int fail(char *detail, size_t cap, const char *what, const char *why)
@@ -958,6 +959,45 @@ static int ext_file(walk *w, const ext *e, const uint8_t inode[128], ext_run *ru
 	return close(fd);
 }
 
+/*
+ * An ext device, FIFO or socket, which a tree the user owns cannot hold,
+ * listed as text beside the tree for a person to read (goal 1), the
+ * patch carrying its bytes on the disk: `devices`, or `devices.pN` for a
+ * partition, a line each, its kind -- c, b, p or s -- its major:minor,
+ * its mode in octal and its path. A device's number is i_block's, the old
+ * 16-bit form in its first word or the new in its second, as the kernel
+ * reads it.
+ */
+static int ext_device(walk *w, const ext *e, const uint8_t inode[128], const char *relative)
+{
+	unsigned kind = le16(inode) & 0xF000u;
+	size_t   skip = e->prefix[0] != '\0' ? strlen(e->prefix) + 1u : 0u;
+	uint32_t old = le32(inode + 40);
+	uint32_t now = le32(inode + 44);
+	unsigned major = old != 0u ? (old >> 8) & 0xFFu : (now & 0xFFF00u) >> 8;
+	unsigned minor = old != 0u ? old & 0xFFu : (now & 0xFFu) | ((now >> 12) & 0xFFF00u);
+	char     line[4300];
+	int      n;
+
+	if (w->devices < 0) {
+		char   list[4400];
+		size_t length = strlen(w->root);
+
+		snprintf(list, sizeof list, "%.*s/devices%s%s", (int)(length - 6u), w->root,
+		         e->prefix[0] != '\0' ? "." : "", e->prefix);
+		if ((w->devices = open(list, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0)
+			return -1;
+	}
+	n = snprintf(line, sizeof line, "%c %u:%u %04o %s\n",
+	             kind == 0x2000u ? 'c' : kind == 0x6000u ? 'b' : kind == 0x1000u ? 'p' : 's',
+	             kind == 0x2000u || kind == 0x6000u ? major : 0u,
+	             kind == 0x2000u || kind == 0x6000u ? minor : 0u, le16(inode) & 07777u,
+	             relative + skip);
+	if (n < 0 || (size_t)n >= sizeof line)
+		return 0;
+	return write_all(w->devices, line, (size_t)n, (uint64_t)lseek(w->devices, 0, SEEK_END));
+}
+
 /* An ext file's owner, its inode's, for owner_record. */
 static int ext_owner(walk *w, const ext *e, const uint8_t inode[128], const char *relative)
 {
@@ -1028,6 +1068,9 @@ static int ext_directory(walk *w, const ext *e, uint64_t number, const char *rel
 				status = ext_file(w, e, child, runs, path, next);
 			} else if (kind == 0xA000u) {
 				ext_link(w, e, child, runs, path);
+			} else if (kind == 0x2000u || kind == 0x6000u || kind == 0x1000u ||
+			           kind == 0xC000u) {
+				status = ext_device(w, e, child, next);
 			}
 			if (status == 0 && lstat(path, &made) == 0 && ext_owner(w, e, child, next) != 0)
 				status = -1;
@@ -1083,6 +1126,9 @@ static int read_ext(walk *w, uint64_t base, const char *prefix, int *found, char
 	if (w->owners >= 0 && close(w->owners) != 0)
 		status = -1;
 	w->owners = -1;
+	if (w->devices >= 0 && close(w->devices) != 0)
+		status = -1;
+	w->devices = -1;
 	return status;
 }
 
@@ -2264,6 +2310,7 @@ static int import_cue(const char *cue, const char *dir, hull_media_report *repor
 		goto done;
 	}
 	w->owners = -1;
+	w->devices = -1;
 	w->image = cooked;
 	w->bytes = disc->data_sectors * SECTOR;
 	w->extra = extra;
@@ -2383,6 +2430,7 @@ int hull_media_import(const char *image, const char *dir, hull_media_report *rep
 	if (w == NULL)
 		return fail(detail, cap, "out of memory", NULL);
 	w->owners = -1;
+	w->devices = -1;
 	if ((w->image = open(image, O_RDONLY | O_CLOEXEC)) < 0 || fstat(w->image, &st) != 0 ||
 	    !S_ISREG(st.st_mode)) {
 		fail(detail, cap, image, w->image < 0 ? strerror(errno) : "not a file");

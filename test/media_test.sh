@@ -337,6 +337,12 @@ with tarfile.open(out, 'w') as t:
     add('home/user', 'd', 0, 5)
     add('home/user/note', 'f', 101, 102, b'n\n')
     add('home/user/ln', 'l', 101, 102, link='note')
+    i = tarfile.TarInfo('dev/null2')
+    i.type, i.mode, i.devmajor, i.devminor = tarfile.CHRTYPE, 0o666, 1, 3
+    t.addfile(i)
+    i = tarfile.TarInfo('dev/pipe')
+    i.type, i.mode = tarfile.FIFOTYPE, 0o600
+    t.addfile(i)
 TAR
 	if "$mke2fs" -q -F -t ext4 -d "$dir/owned.tar" "$dir/owned.img" 16M 2> /dev/null; then
 		media import "$dir/owned.img" "$dir/ownedcol"
@@ -344,8 +350,11 @@ TAR
 		owners=$(tr '\0' ' ' < "$dir/ownedcol/owners" 2>&1)
 		[ "$owners" = '101 102 home/user/note 101 102 home/user/ln 0 5 home/user ' ]
 		check 'its owners are listed, root'"'"'s files not' "$?" 0 "$owners"
+		devices=$(cat "$dir/ownedcol/devices" 2>&1)
+		[ "$devices" = "$(printf 'c 1:3 0666 dev/null2\np 0:0 0600 dev/pipe')" ]
+		check 'its device and FIFO are listed as text' "$?" 0 "$devices"
 		media verify "$dir/ownedcol"
-		check 'the list is no part of the disk' "$got" 0 "$out"
+		check 'the lists are no part of the disk' "$got" 0 "$out"
 		# The import's tree in the user's own group: a build directory
 		# here is setgid to a group the machine need not map, and an owner
 		# is given only where the tree is the machine's to chown.
