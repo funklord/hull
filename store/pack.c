@@ -1069,3 +1069,25 @@ done:
 	free(manifest);
 	return result;
 }
+
+int hull_manifest_objects(const uint8_t *data, size_t length, uint8_t (**digests)[32],
+                          uint32_t *count)
+{
+	object  *objects = NULL;
+	uint32_t n = 0u;
+	char     why[200];
+
+	*digests = NULL;
+	*count = 0u;
+	if (objects_of(data, length, &objects, &n, why, sizeof why) != 0)
+		return -1;
+	if ((*digests = malloc((n > 0u ? n : 1u) * sizeof **digests)) == NULL) {
+		free(objects);
+		return -1;
+	}
+	for (uint32_t i = 0u; i < n; i++)
+		memcpy((*digests)[i], objects[i].digest, 32u);
+	*count = n;
+	free(objects);
+	return 0;
+}

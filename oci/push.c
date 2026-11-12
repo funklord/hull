@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <zlib.h>
 
@@ -434,6 +435,109 @@ done:
 	free(l);
 	free(runtime);
 	free(config.data);
+	free(manifest.data);
+	return result;
+}
+
+int hull_push_objects(hull_store *store, const char *name, const char *image, unsigned *sent,
+                      unsigned *total, char *why, size_t cap)
+{
+	static const char *const manifest_type[] = { "Content-Type: " OCI_MANIFEST, NULL };
+	hull_remote              r = { 0 };
+	text                     manifest = { 0 };
+	uint8_t                 *tree = NULL;
+	size_t                   tree_length = 0u;
+	uint8_t                (*digests)[32] = NULL;
+	uint32_t                 count = 0u;
+	char                     hex[65];
+	char                     config_digest[80];
+	char                     text_size[48];
+	hull_https_upload        tree_body = { .fd = -1 };
+	hull_https_upload        manifest_body = { .fd = -1 };
+	int                      result = -1;
+
+	*sent = 0u;
+	*total = 0u;
+	hull_https_allow_loopback();
+	if (hull_remote_parse(image, &r.img, why, cap) != 0)
+		return -1;
+	if (r.img.by_digest)
+		return say(why, cap, image, "a push names a tag, which the image is put under");
+	if (strlen(r.img.reference) + sizeof HULL_OBJECTS_SUFFIX > sizeof r.img.reference)
+		return say(why, cap, image, "its tag is too long to have .hull added");
+	strcat(r.img.reference, HULL_OBJECTS_SUFFIX);
+	if (hull_store_manifest_of(store, name, hex, &tree, &tree_length, why, cap) != 0)
+		return -1;
+	if (hull_manifest_objects(tree, tree_length, &digests, &count) != 0) {
+		say(why, cap, name, "its manifest is not one");
+		goto done;
+	}
+	snprintf(config_digest, sizeof config_digest, "sha256:%s", hex);
+	tree_body.data = tree;
+	tree_body.length = (long long)tree_length;
+	if (upload_blob(&r, config_digest, &tree_body, why, cap) < 0)
+		goto done;
+	add_text(&manifest, "{\"schemaVersion\":2,\"mediaType\":\"" OCI_MANIFEST "\","
+	                    "\"artifactType\":\"" HULL_TREE_TYPE "\","
+	                    "\"config\":{\"mediaType\":\"" HULL_MANIFEST_TYPE "\",\"digest\":\"");
+	add_text(&manifest, config_digest);
+	snprintf(text_size, sizeof text_size, "\",\"size\":%zu},\"layers\":[", tree_length);
+	add_text(&manifest, text_size);
+	for (uint32_t i = 0u; i < count; i++) {
+		int               executable = 0;
+		int               fd = hull_store_object_open(store, digests[i], &executable);
+		struct stat       st;
+		char              digest[80];
+		char              object_hex[65];
+		hull_https_upload body = { .fd = fd };
+		int               was;
+
+		if (fd < 0 || fstat(fd, &st) != 0) {
+			if (fd >= 0)
+				close(fd);
+			say(why, cap, name, "an object its manifest names is not in the store");
+			goto done;
+		}
+		hull_sha256_hex(digests[i], object_hex);
+		snprintf(digest, sizeof digest, "sha256:%s", object_hex);
+		body.length = (long long)st.st_size;
+		was = upload_blob(&r, digest, &body, why, cap);
+		close(fd);
+		if (was < 0)
+			goto done;
+		*sent += (unsigned)was;
+		add_text(&manifest, i == 0u ? "{\"mediaType\":\"" : ",{\"mediaType\":\"");
+		add_text(&manifest, executable ? HULL_EXECUTABLE_TYPE : HULL_OBJECT_TYPE);
+		add_text(&manifest, "\",\"digest\":\"");
+		add_text(&manifest, digest);
+		snprintf(text_size, sizeof text_size, "\",\"size\":%lld}", (long long)st.st_size);
+		add_text(&manifest, text_size);
+	}
+	add_text(&manifest, "]}");
+	*total = count;
+	if (manifest.failed) {
+		say(why, cap, "out of memory", NULL);
+		goto done;
+	}
+	{
+		uint8_t             small[4096];
+		hull_remote_sink    into = { .data = small, .cap = sizeof small, .fd = -1 };
+		hull_https_response got;
+		char                url[8192];
+
+		snprintf(url, sizeof url, "https://%s/v2/%s/manifests/%s", r.img.host, r.img.repository,
+		         r.img.reference);
+		manifest_body.data = (const uint8_t *)manifest.data;
+		manifest_body.length = (long long)manifest.length;
+		if (hull_remote_request(&r, "PUT", url, manifest_type, &manifest_body, &into, &got, why,
+		                        cap) != 0 ||
+		    expect(&got, 201, "the objects' manifest", why, cap) != 0)
+			goto done;
+	}
+	result = 0;
+done:
+	free(digests);
+	free(tree);
 	free(manifest.data);
 	return result;
 }

@@ -124,6 +124,12 @@ int hull_store_pack(hull_store *store, const char *name, const char *against, in
  * why. */
 int hull_pack_inspect(int in, FILE *out, char *why, size_t cap);
 
+/* Every object a manifest's canonical bytes name, each once, in digest
+ * order, into a new array of `*count` digests of 32 bytes. 0, or -1
+ * where they are not a manifest. */
+int hull_manifest_objects(const uint8_t *data, size_t length, uint8_t (**digests)[32],
+                          uint32_t *count);
+
 /* A manifest's canonical bytes in A.1's readable view, as `hull manifest
  * show` gives a stored one. 0, or -1 where they are not one. */
 int hull_manifest_print(const uint8_t *data, size_t length, FILE *out);

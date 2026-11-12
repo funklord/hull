@@ -39,6 +39,18 @@ int hull_load(hull_store *store, const char *path, const char *ref, const char *
               const char *builder, hull_commit *out, char *ref_out, size_t ref_cap, char *why,
               size_t cap);
 
+/*
+ * The tree hull_push_objects() published beside `image`, under its tag
+ * with .hull added (Appendix C): its manifest, held to its digest, and
+ * each object the store has not, each held to its digest, then the
+ * manifest stored, named `ref`, its hash into `hex`. How many objects
+ * were fetched into `*fetched`, of `*total`. 0; 1 where the registry has
+ * no such tag, for the caller to pull the image instead; or -1 with
+ * `why`.
+ */
+int hull_pull_objects(hull_store *store, const char *image, const char *ref, char hex[65],
+                      unsigned *fetched, unsigned *total, char *why, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

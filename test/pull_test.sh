@@ -253,6 +253,41 @@ expect 0 'the registry has the layer already' "$hull" push "$image" "$pushed"
 cases=$((cases + 1))
 printf '%s\n' "$out" | grep -q " $push_digest\$" && [ "$(wc -l < "$root/registry/uploads")" = "$uploads" ] ||
 	fail "a second push was another image, or sent a blob again" "$out; $uploads then $(wc -l < "$root/registry/uploads")"
+# push --objects and pull --objects (Appendix C): the tree beside its
+# image, object by object under TAG.hull, each object a blob named by its
+# own hash. A second version, one file changed, sends that file alone; a
+# store that has the first fetches that file alone, and the tree it gets
+# is the second, its manifest's hash the one committed. An image with no
+# .hull tag is pulled as an image.
+rm -rf "${root:?}/ov1" "${root:?}/ov2" "${root:?}/objhost" "${root:?}/objtree"
+cp -a "$root/out" "$root/ov1"
+cp -a "$root/out" "$root/ov2"
+chmod -R u+w "$root/ov1" "$root/ov2"
+printf 'second version\n' > "$root/ov2/etc/version-file"
+printf 'first version\n' > "$root/ov1/etc/version-file"
+expect 0 '' "$hull" commit "$root/ov1" obj/v:1
+expect 0 '^obj/v:2 sha256:' "$hull" commit "$root/ov2" obj/v:2
+v2hash=$(printf '%s\n' "$out" | sed -n 's/^obj\/v:2 sha256://p')
+expect 0 '^hull: push: ([0-9]+) of \1 objects sent, under 127\.0\.0\.1:'"$port"'/test/objs:1\.hull$' \
+	"$hull" push --objects obj/v:1 "127.0.0.1:$port/test/objs:1"
+expect 0 '^hull: push: 1 of [0-9]+ objects sent' \
+	"$hull" push --objects obj/v:2 "127.0.0.1:$port/test/objs:2"
+mkdir -p "$root/objhost"
+expect 0 '^hull: pull: ([0-9]+) of \1 objects fetched' \
+	env XDG_DATA_HOME="$root/objhost" "$hull" pull --objects "127.0.0.1:$port/test/objs:1" obj/v:1
+expect 0 '^hull: pull: 1 of [0-9]+ objects fetched' \
+	env XDG_DATA_HOME="$root/objhost" "$hull" pull --objects "127.0.0.1:$port/test/objs:2" obj/v:2
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -qx "obj/v:2 sha256:$v2hash" ||
+	fail "a tree pulled by its objects is not the tree pushed" "$out"
+expect 0 '' env XDG_DATA_HOME="$root/objhost" "$hull" materialize obj/v:2 "$root/objtree"
+cases=$((cases + 1))
+diff -r --no-dereference "$root/ov2" "$root/objtree" > /dev/null 2>&1 ||
+	fail "the tree materialized from its objects differs" "$(diff -r --no-dereference "$root/ov2" "$root/objtree" 2>&1 | head)"
+expect 0 'has no .*test/pushed:1\.hull, so the image is pulled' \
+	env XDG_DATA_HOME="$root/objhost" "$hull" pull --objects "$pushed" back/objs
+chmod -R u+w "$root/ov1" "$root/ov2" "$root/objhost" "$root/objtree" 2>/dev/null
+rm -rf "${root:?}/ov1" "${root:?}/ov2" "${root:?}/objhost" "${root:?}/objtree"
 # A tree with no runtime pushes with an empty config, and comes back with
 # the workdir a pull gives.
 expect 0 '' "$hull" push again/1 "127.0.0.1:$port/test/plain:1"

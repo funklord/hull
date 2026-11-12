@@ -156,7 +156,8 @@ static void usage(FILE *out)
 	      "       hull manifest show REF | hull manifest compile [REF]\n"
 	      "       hull inspect FILE|-\n"
 	      "       hull manifest composefs REF FILE\n"
-	      "       hull pull [--arch A] IMAGE [REF] | hull push REF IMAGE | hull load FILE [REF]\n"
+	      "       hull pull [--arch A | --objects] IMAGE [REF] | hull push [--objects] REF IMAGE\n"
+	      "       hull load FILE [REF]\n"
 	      "       hull import [--build-arg N=V]... [--target STAGE] DOCKERFILE\n"
 	      "       hull import COMPOSE-FILE | hull import IMAGE DIR\n"
 	      "       hull media import IMAGE DIR | verify DIR | export DIR IMAGE\n"
@@ -6615,7 +6616,7 @@ static int images(void)
 /* `arch` is the platform an index is narrowed to, the host's where NULL:
  * another's tree runs on chroot translated, taking its arch from the
  * manifest (section 4.4). */
-static int pull(const char *name, const char *ref, const char *arch)
+static int pull(const char *name, const char *ref, const char *arch, int objects)
 {
 	hull_store  store;
 	hull_commit made;
@@ -6630,6 +6631,29 @@ static int pull(const char *name, const char *ref, const char *arch)
 	}
 	if ((status = open_store(&store, 1)) != 0)
 		return status;
+	/* Object by object where the tree was published so: only those the
+	 * store lacks are fetched; else the image, as without. */
+	if (objects) {
+		char     hex[65];
+		unsigned fetched;
+		unsigned total;
+
+		status = hull_pull_objects(&store, name, ref, hex, &fetched, &total, why, sizeof why);
+		if (status == 0) {
+			hull_store_close(&store);
+			printf("%s sha256:%s\n", ref, hex);
+			fprintf(stderr, "hull: pull: %u of %u objects fetched, from %s%s\n", fetched, total,
+			        name, HULL_OBJECTS_SUFFIX);
+			return 0;
+		}
+		if (status < 0) {
+			hull_store_close(&store);
+			fprintf(stderr, "hull: pull: %s\n", why);
+			return 1;
+		}
+		fprintf(stderr, "hull: pull: %s has no %s%s, so the image is pulled\n", name, name,
+		        HULL_OBJECTS_SUFFIX);
+	}
 	status = hull_pull(&store, name, ref, arch, HULL_BUILDER, &made, why, sizeof why);
 	hull_store_close(&store);
 	if (status != 0) {
@@ -6671,8 +6695,9 @@ static int load(const char *path, const char *ref)
 	return 0;
 }
 
-/* A stored tree to its registry, as a single-layer image. */
-static int push(const char *name, const char *image)
+/* A stored tree to its registry, as a single-layer image, and with
+ * `objects` object by object beside it. */
+static int push(const char *name, const char *image, int objects)
 {
 	hull_store store;
 	char       digest[80];
@@ -6685,6 +6710,16 @@ static int push(const char *name, const char *image)
 		return 1;
 	}
 	status = hull_push(&store, name, image, digest, why, sizeof why);
+	/* And its objects, beside the image, under TAG.hull (Appendix C). */
+	if (status == 0 && objects) {
+		unsigned sent;
+		unsigned total;
+
+		status = hull_push_objects(&store, name, image, &sent, &total, why, sizeof why);
+		if (status == 0)
+			fprintf(stderr, "hull: push: %u of %u objects sent, under %s%s\n", sent, total,
+			        image, HULL_OBJECTS_SUFFIX);
+	}
 	hull_store_close(&store);
 	if (status != 0) {
 		fprintf(stderr, "hull: push: %s\n", why);
@@ -8441,14 +8476,19 @@ int main(int argc, char **argv)
 	if (strcmp(command, "tag") == 0 && argc == 4)
 		return tag(argv[2], argv[3]);
 	if (strcmp(command, "push") == 0 && argc == 4)
-		return push(argv[2], argv[3]);
+		return push(argv[2], argv[3], 0);
+	if (strcmp(command, "push") == 0 && argc == 5 && strcmp(argv[2], "--objects") == 0)
+		return push(argv[3], argv[4], 1);
+	if (strcmp(command, "pull") == 0 && (argc == 4 || argc == 5) &&
+	    strcmp(argv[2], "--objects") == 0)
+		return pull(argv[3], argc == 5 ? argv[4] : argv[3], NULL, 1);
 	if (strcmp(command, "pull") == 0 && argc >= 5 && strcmp(argv[2], "--arch") == 0 &&
 	    argc <= 6)
-		return pull(argv[4], argc == 6 ? argv[5] : argv[4], argv[3]);
+		return pull(argv[4], argc == 6 ? argv[5] : argv[4], argv[3], 0);
 	if (strcmp(command, "load") == 0 && (argc == 3 || argc == 4))
 		return load(argv[2], argc == 4 ? argv[3] : NULL);
 	if (strcmp(command, "pull") == 0 && (argc == 3 || argc == 4))
-		return pull(argv[2], argc == 4 ? argv[3] : argv[2], NULL);
+		return pull(argv[2], argc == 4 ? argv[3] : argv[2], NULL, 0);
 	if (strcmp(command, "manifest") == 0 && argc == 4 && strcmp(argv[2], "show") == 0)
 		return show_manifest(argv[3]);
 	if (strcmp(command, "manifest") == 0 && argc == 5 && strcmp(argv[2], "composefs") == 0)

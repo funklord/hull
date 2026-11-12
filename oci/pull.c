@@ -26,6 +26,7 @@
 #include "json.h"
 #include "pull.h"
 #include "remote.h"
+#include "push.h"
 #include "sha256.h"
 
 #define MAX_DOCUMENT  HULL_REMOTE_DOCUMENT
@@ -955,5 +956,173 @@ done:
 	free(runtime.data);
 	free(digests.data);
 	free(provenance.data);
+	return result;
+}
+
+int hull_pull_objects(hull_store *store, const char *image, const char *ref, char hex[65],
+                      unsigned *fetched, unsigned *total, char *why, size_t cap)
+{
+	static const char *const accept[] = { "Accept: application/vnd.oci.image.manifest.v1+json",
+	                                      NULL };
+	hull_remote         s = { 0 };
+	uint8_t            *data = malloc(MAX_DOCUMENT);
+	hull_remote_sink    body = { .data = data, .cap = MAX_DOCUMENT, .fd = -1 };
+	hull_https_response got;
+	hull_json           doc;
+	hull_json_value     root;
+	hull_json_value     config;
+	hull_json_value     layers;
+	hull_json_value     layer;
+	const char         *bad;
+	char                url[8192];
+	char                tree_digest[80];
+	char                artifact[128] = "";
+	uint8_t            *tree = NULL;
+	uint8_t           (*named)[32] = NULL;
+	uint32_t            named_count = 0u;
+	int                 first = 1;
+	int                 result = -1;
+
+	*fetched = 0u;
+	*total = 0u;
+	if (data == NULL)
+		return say(why, cap, "out of memory", NULL);
+	hull_https_allow_loopback();
+	if (hull_remote_parse(image, &s.img, why, cap) != 0)
+		goto done;
+	if (s.img.by_digest) {
+		say(why, cap, image, "objects are published under a tag");
+		goto done;
+	}
+	if (strlen(s.img.reference) + sizeof HULL_OBJECTS_SUFFIX > sizeof s.img.reference) {
+		say(why, cap, image, "its tag is too long to have .hull added");
+		goto done;
+	}
+	strcat(s.img.reference, HULL_OBJECTS_SUFFIX);
+	snprintf(url, sizeof url, "https://%s/v2/%s/manifests/%s", s.img.host, s.img.repository,
+	         s.img.reference);
+	if (hull_remote_request(&s, "GET", url, accept, NULL, &body, &got, why, cap) != 0)
+		goto done;
+	if (got.status == 404) {
+		result = 1;
+		goto done;
+	}
+	if (got.status != 200) {
+		say(why, cap, s.img.reference, "the registry did not give its manifest");
+		goto done;
+	}
+	if (hull_json_open(&doc, (const char *)data, body.length, &root, &bad) != 0) {
+		say(why, cap, s.img.reference, bad);
+		goto done;
+	}
+	hull_json_member_string(&doc, &root, "artifactType", artifact, sizeof artifact);
+	if (strcmp(artifact, HULL_TREE_TYPE) != 0 || !hull_json_member(&doc, &root, "config", &config) ||
+	    hull_json_member_string(&doc, &config, "digest", tree_digest, sizeof tree_digest) < 0 ||
+	    !hull_remote_is_digest(tree_digest) || !hull_json_member(&doc, &root, "layers", &layers)) {
+		say(why, cap, s.img.reference, "it is not a tree hull published");
+		goto done;
+	}
+	/* The store's lock, shared, while objects are written under tmp/. */
+	flock(store->lock, LOCK_SH);
+	/* The tree's manifest, which names every object: by its digest. */
+	{
+		char             tmp[4400];
+		struct stat      st;
+		hull_remote_sink into = { .fd = -1 };
+
+		snprintf(tmp, sizeof tmp, "%s/tmp", store->root);
+		if ((into.fd = open(tmp, O_TMPFILE | O_RDWR | O_CLOEXEC, 0600)) < 0) {
+			say(why, cap, tmp, strerror(errno));
+			goto done;
+		}
+		snprintf(url, sizeof url, "https://%s/v2/%s/blobs/%s", s.img.host, s.img.repository,
+		         tree_digest);
+		if (hull_remote_fetch(&s, url, NULL, &into, why, cap) != 0 ||
+		    hull_remote_verify(&into, tree_digest, "the tree's manifest", why, cap) != 0 ||
+		    fstat(into.fd, &st) != 0 || st.st_size <= 0 || st.st_size > (256 << 20) ||
+		    (tree = malloc((size_t)st.st_size)) == NULL ||
+		    pread(into.fd, tree, (size_t)st.st_size, 0) != st.st_size) {
+			if (why[0] == '\0')
+				say(why, cap, "the tree's manifest", "it could not be read");
+			close(into.fd);
+			goto done;
+		}
+		close(into.fd);
+		if (hull_manifest_objects(tree, (size_t)st.st_size, &named, &named_count) != 0) {
+			say(why, cap, "the tree's manifest", "it is not a manifest");
+			goto done;
+		}
+		/* Each object the store lacks, by its digest, which is its name. */
+		while (hull_json_element(&doc, &layers, first, &layer)) {
+			char        digest[80];
+			char        media[128] = "";
+			uint8_t     raw[32];
+			int         executable;
+			int         fd;
+			struct stat object;
+
+			first = 0;
+			if (hull_json_member_string(&doc, &layer, "digest", digest, sizeof digest) < 0 ||
+			    !hull_remote_is_digest(digest) ||
+			    hull_json_member_string(&doc, &layer, "mediaType", media, sizeof media) < 0) {
+				say(why, cap, s.img.reference, "a layer of it names no object");
+				goto done;
+			}
+			for (unsigned i = 0u; i < 32u; i++) {
+				unsigned byte;
+
+				sscanf(digest + 7 + 2u * i, "%2x", &byte);
+				raw[i] = (uint8_t)byte;
+			}
+			(*total)++;
+			if ((fd = hull_store_object_open(store, raw, &executable)) >= 0) {
+				close(fd);
+				continue;
+			}
+			{
+				hull_remote_sink blob = { .fd = open(tmp, O_TMPFILE | O_RDWR | O_CLOEXEC, 0600) };
+
+				if (blob.fd < 0) {
+					say(why, cap, tmp, strerror(errno));
+					goto done;
+				}
+				snprintf(url, sizeof url, "https://%s/v2/%s/blobs/%s", s.img.host,
+				         s.img.repository, digest);
+				if (hull_remote_fetch(&s, url, NULL, &blob, why, cap) != 0 ||
+				    hull_remote_verify(&blob, digest, "an object", why, cap) != 0 ||
+				    fstat(blob.fd, &object) != 0 || lseek(blob.fd, 0, SEEK_SET) != 0 ||
+				    hull_store_object_put(store, blob.fd, (uint64_t)object.st_size,
+				                          strcmp(media, HULL_EXECUTABLE_TYPE) == 0, raw, why,
+				                          cap) != 0) {
+					close(blob.fd);
+					goto done;
+				}
+				close(blob.fd);
+				(*fetched)++;
+			}
+		}
+		/* Every object the manifest names in the store now, whatever the
+		 * layers said. */
+		for (uint32_t i = 0u; i < named_count; i++) {
+			int executable;
+			int fd = hull_store_object_open(store, named[i], &executable);
+
+			if (fd < 0) {
+				say(why, cap, s.img.reference, "its manifest names an object it does not hold");
+				goto done;
+			}
+			close(fd);
+		}
+		result = hull_store_manifest_put(store, tree, (size_t)st.st_size, ref, hex, why, cap);
+		if (result == 0 && strcmp(tree_digest + 7, hex) != 0) {
+			say(why, cap, "the tree's manifest", "it is not the hash it was stored by");
+			result = -1;
+		}
+	}
+done:
+	flock(store->lock, LOCK_UN);
+	free(named);
+	free(tree);
+	free(data);
 	return result;
 }
