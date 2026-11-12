@@ -50,6 +50,21 @@ media export "$dir/disc" "$dir/again.iso"
 check 'the collection exports' "$got" 0 "$out"
 cmp -s "$dir/disc.iso" "$dir/again.iso"
 check 'the export is the disc, byte for byte' "$?" 0 "$(cmp "$dir/disc.iso" "$dir/again.iso" 2>&1)"
+# A disc with no Rock Ridge has no owners; one whose PX entry names an
+# owner lists it for (owners PATH), as an ext disk's are, and the list is
+# no part of the disc it gives back.
+cases=$((cases + 1))
+[ ! -e "$dir/disc/owners" ] ||
+	{ failures=$((failures + 1)); printf 'FAIL: a disc with no Rock Ridge listed owners\n'; }
+python3 -I "$here/iso.py" "$dir/rr.iso" README.TXT 'owned on a disc' 33 44
+media import "$dir/rr.iso" "$dir/rr"
+check 'a Rock Ridge disc imported' "$got" 0 "$out"
+owners=$(tr '\0' ' ' < "$dir/rr/owners" 2>&1)
+[ "$owners" = '33 44 README.TXT ' ]
+check 'its owner, by its PX entry, is listed' "$?" 0 "$owners"
+media export "$dir/rr" "$dir/rr-again.iso"
+cmp -s "$dir/rr.iso" "$dir/rr-again.iso"
+check 'and the disc given back byte for byte' "$?" 0 "$(cmp "$dir/rr.iso" "$dir/rr-again.iso" 2>&1)"
 
 # An edit is seen, a file changed in place or grown past its size alike.
 cp "$dir/disc/files/README.TXT" "$dir/kept"

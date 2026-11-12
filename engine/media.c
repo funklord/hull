@@ -197,6 +197,65 @@ static int place(walk *w, uint64_t sector, uint64_t size, const char *relative)
 	return place_piece(w, sector, size, 0u, size, relative);
 }
 
+/*
+ * A file's owner, where it is not root's, recorded for (owners PATH):
+ * the tree is the user's, which a machine sees as root's, so a file root
+ * owned needs no record and any other one does. The list is the
+ * collection's, beside the tree it names -- `owners`, or `owners.SUFFIX`
+ * for a disk's partition, `owners.pN` -- its paths the tree's own, each
+ * entry UID, GID and path, NUL-ended, as hull_give_owners reads it.
+ * Opened on the first owner and closed with the tree.
+ */
+static int owner_record(walk *w, const char *suffix, unsigned long uid, unsigned long gid,
+                        const char *path)
+{
+	char entry[4200];
+	int  n;
+
+	if (uid == 0u && gid == 0u)
+		return 0;
+	if (w->owners < 0) {
+		char   list[4400];
+		size_t length = strlen(w->root);
+
+		/* w->root is the collection's files/, the list beside it. */
+		snprintf(list, sizeof list, "%.*s/owners%s%s", (int)(length - 6u), w->root,
+		         suffix[0] != '\0' ? "." : "", suffix);
+		if ((w->owners = open(list, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0)
+			return -1;
+	}
+	n = snprintf(entry, sizeof entry, "%lu%c%lu%c%s%c", uid, '\0', gid, '\0', path, '\0');
+	if (n < 0 || (size_t)n >= sizeof entry)
+		return 0;
+	return write_all(w->owners, entry, (size_t)n, (uint64_t)lseek(w->owners, 0, SEEK_END));
+}
+
+/*
+ * A record's owner from Rock Ridge (IEEE P1282), where the disc has it:
+ * the System Use entries after the name, padded to an even length, each
+ * a signature, its length and a version, and among them PX, POSIX's
+ * attributes, its uid at 20 and gid at 28, each both-endian and read
+ * little. Recorded as an ext file's owner is (owner_record); a disc
+ * without Rock Ridge, or an entry that does not fit its record, gives
+ * none. The names stay the volume's plain ones, as files/ shows them.
+ */
+static int rock_ridge_owner(walk *w, const uint8_t *record, size_t length, const char *relative)
+{
+	size_t at = 33u + record[32] + (record[32] % 2u == 0u ? 1u : 0u);
+
+	while (at + 4u <= length) {
+		size_t size = record[at + 2u];
+
+		if (size < 4u || at + size > length)
+			break;
+		if (record[at] == 'P' && record[at + 1u] == 'X' && size >= 36u)
+			return owner_record(w, "", (unsigned long)le32(record + at + 20u),
+			                    (unsigned long)le32(record + at + 28u), relative);
+		at += size;
+	}
+	return 0;
+}
+
 /* The directory of `size` bytes at `sector`, `relative` its path under
  * files/ ("" for the root). A record that does not make sense is passed
  * over and left to the diff. -1 only where this host fails. */
@@ -256,13 +315,14 @@ static int read_directory(walk *w, uint64_t sector, uint64_t size, const char *r
 			continue;
 		snprintf(path, sizeof path, "%s/%s", w->root, next);
 		if ((flags & 0x02u) != 0u) {
-			if (mkdir(path, 0755) == 0)
+			if (mkdir(path, 0755) == 0 && (status = rock_ridge_owner(w, record, length, next)) == 0)
 				status = read_directory(w, extent, bytes_of, next, depth + 1u);
 			continue;
 		}
 		if (w->count >= MAX_FILES || extent * SECTOR + bytes_of > w->bytes)
 			continue;
-		if (copy_out(w, extent, bytes_of, path) == 0)
+		if (copy_out(w, extent, bytes_of, path) == 0 &&
+		    (status = rock_ridge_owner(w, record, length, next)) == 0)
 			status = place(w, extent, bytes_of, next);
 	}
 	free(bytes);
@@ -290,8 +350,15 @@ static int read_iso(walk *w, char *volume, size_t cap)
 		volume[i]     = c >= ' ' && c <= '~' && strchr("\"\\()", c) == NULL ? c : '_';
 		volume[i + 1] = '\0';
 	}
-	return read_directory(w, (uint64_t)le32(pvd + 156 + 2) + pvd[156 + 1], le32(pvd + 156 + 10),
-	                      "", 0u);
+	{
+		int status = read_directory(w, (uint64_t)le32(pvd + 156 + 2) + pvd[156 + 1],
+		                            le32(pvd + 156 + 10), "", 0u);
+
+		if (w->owners >= 0 && close(w->owners) != 0 && status == 0)
+			status = -1;
+		w->owners = -1;
+		return status;
+	}
 }
 
 /* --- FAT ------------------------------------------------------------------ */
@@ -891,40 +958,14 @@ static int ext_file(walk *w, const ext *e, const uint8_t inode[128], ext_run *ru
 	return close(fd);
 }
 
-/*
- * An ext file's owner, where it is not root's, recorded for (owners
- * PATH): the tree is the user's, which a machine sees as root's, so a
- * file root owned needs no record and any other one does. The list is
- * the collection's, beside the tree it names -- `owners` for a disk that
- * is one filesystem, `owners.pN` for partition N, its paths the tree's
- * own -- each entry UID, GID and path, NUL-ended, as hull_give_owners
- * reads it. Opened on the first owner and closed with the tree.
- */
+/* An ext file's owner, its inode's, for owner_record. */
 static int ext_owner(walk *w, const ext *e, const uint8_t inode[128], const char *relative)
 {
 	unsigned long uid = (unsigned long)le16(inode + 2) | (unsigned long)le16(inode + 120) << 16;
 	unsigned long gid = (unsigned long)le16(inode + 24) | (unsigned long)le16(inode + 122) << 16;
 	size_t        skip = e->prefix[0] != '\0' ? strlen(e->prefix) + 1u : 0u;
-	char          entry[4200];
-	int           n;
 
-	if (uid == 0u && gid == 0u)
-		return 0;
-	if (w->owners < 0) {
-		char   path[4400];
-		size_t length = strlen(w->root);
-
-		/* w->root is the collection's files/, the list beside it. */
-		snprintf(path, sizeof path, "%.*s/owners%s%s", (int)(length - 6u), w->root,
-		         e->prefix[0] != '\0' ? "." : "", e->prefix);
-		if ((w->owners = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0)
-			return -1;
-	}
-	n = snprintf(entry, sizeof entry, "%lu%c%lu%c%s%c", uid, '\0', gid, '\0', relative + skip,
-	             '\0');
-	if (n < 0 || (size_t)n >= sizeof entry)
-		return 0;
-	return write_all(w->owners, entry, (size_t)n, (uint64_t)lseek(w->owners, 0, SEEK_END));
+	return owner_record(w, e->prefix, uid, gid, relative + skip);
 }
 
 static int ext_directory(walk *w, const ext *e, uint64_t number, const char *relative,
