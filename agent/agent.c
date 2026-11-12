@@ -1384,6 +1384,7 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	int             readonly_root = 0;
 	int             verity = 0;
 	int             layered;
+	int             direct;     /* (mutable direct), a block root then written back */
 	int             more;
 
 	if (!hull_access_find(doc, machine, "command", &entry))
@@ -1474,6 +1475,7 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 	layered    = mutability != NULL && strcmp(mutability, "overlay") == 0 &&
 	             !hull_access_find(doc, machine, "upper", &entry) &&
 	             !hull_access_find(doc, machine, "export", &entry);
+	direct     = mutability != NULL && strcmp(mutability, "direct") == 0;
 	free(mutability);
 
 	/* A read-only root has nothing for an overlay to hold, so it is the
@@ -1516,7 +1518,10 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 				say("the root's image", strerror(errno));
 				return "the machine's root image could not be mounted";
 			}
-			layered = 1;
+			/* Scratch, unless (writeback sync-on-stop) is to write it
+			 * back over the user's directory: then nothing is made in
+			 * it unasked, as in a directory used in place. */
+			layered = !direct;
 		} else if (layered && !readonly_root) {
 			if ((reason = overlay()) != NULL)
 				return reason;

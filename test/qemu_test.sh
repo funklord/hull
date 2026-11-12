@@ -1168,6 +1168,43 @@ cases=$((cases + 1))
 out=$(cd / && timeout 20 "$hull" plan -f "$root/vblockdirect.conf" 2>&1)
 [ $? = 1 ] && printf '%s\n' "$out" | grep -q 'writeback: rejected: (mutable direct) under a block projection needs' ||
 	fail "(mutable direct) under a block projection was not refused" "$out"
+# (writeback sync-on-stop), section 3.9's rule 2: the image's tree made
+# the directory's once the guest has powered off clean -- a file stamped,
+# a directory and a file made, a file and a directory removed -- with a
+# file the run did not touch left as it was, its inode the same, and a
+# FIFO, which the dump cannot carry, kept; nothing the agent would make
+# in a scratch root (lost+found, /etc) made in the user's tree. Without
+# a block projection, refused at start.
+rm -rf "$root/wbroot"
+mkdir -p "$root/wbroot/proc" "$root/wbroot/dev" "$root/wbroot/sys" "$root/wbroot/olddir"
+cp "$probe" "$root/wbroot/probe"
+printf 'keep\n' > "$root/wbroot/keep.txt"
+printf 'gone\n' > "$root/wbroot/gone.txt"
+printf 'in\n' > "$root/wbroot/olddir/inner"
+mkfifo "$root/wbroot/fifo"
+wbinode=$(ls -i "$root/wbroot/keep.txt" | cut -d' ' -f1)
+printf '(machine (source "dir:./wbroot") (backend vm) (projection block) (mutable direct) %s %s)\n' \
+	'(writeback sync-on-stop)' \
+	'(command "/probe" "stamp" "/stamped" "mkdir" "/newdir" "write" "/newdir/empty" "remove" "/gone.txt" "remove" "/olddir/inner" "rmdir" "/olddir")' \
+	> "$root/vwriteback.conf"
+name=vwriteback
+boot vwriteback 120
+has 0 '^rmdir=ok$'
+cases=$((cases + 1))
+[ -s "$root/wbroot/stamped" ] && [ -f "$root/wbroot/newdir/empty" ] &&
+	[ ! -e "$root/wbroot/gone.txt" ] && [ ! -e "$root/wbroot/olddir" ] ||
+	fail "the run's writes did not reach the directory" "$(ls -lR "$root/wbroot" 2>&1)"
+cases=$((cases + 1))
+[ "$(cat "$root/wbroot/keep.txt")" = keep ] &&
+	[ "$(ls -i "$root/wbroot/keep.txt" | cut -d' ' -f1)" = "$wbinode" ] && [ -p "$root/wbroot/fifo" ] &&
+	[ ! -e "$root/wbroot/lost+found" ] && [ ! -e "$root/wbroot/etc" ] ||
+	fail "writeback touched what the run did not" "$(ls -liR "$root/wbroot" 2>&1)"
+printf '(machine (source "dir:./wbroot") (backend vm) (mutable direct) (writeback sync-on-stop) (command "/probe"))\n' \
+	> "$root/vwbshare.conf"
+name='(writeback sync-on-stop) without a block projection'
+boot vwbshare 60
+has 125 'needs \(projection block\) and \(mutable direct\)'
+rm -rf "$root/wbroot"
 
 # (sleep true): the guest's own suspend to RAM, ACPI S3 on q35, woken by
 # its RTC's alarm. CLOCK_BOOTTIME runs ahead of CLOCK_MONOTONIC only across

@@ -89,6 +89,7 @@
 #include "sshd.h"
 #include "tree.h"
 #include "vbox.h"
+#include "writeback.h"
 
 #define VIRTIOFS_ID_RANGES 16u  /* options of one id map: a namespace has a few lines */
 #define VIRTIOFS_FILES 524288u  /* the hard limit systemd gives: section 4.11 */
@@ -143,6 +144,7 @@ struct hull_machine {
 	int              readonly_root;
 	int              overlay;      /* (mutable overlay): the share is read-only */
 	int              block_root;   /* (projection block): the root a disk image of the tree */
+	int              writeback;    /* (writeback sync-on-stop): its tree the directory's again */
 	int              sleep;        /* (sleep true): the guest may suspend, ACPI S3 and s2idle */
 	long             boot_limit;   /* seconds for the agent to answer: BOOT_LIMIT, or emu's */
 	char            *composefs;    /* a composefs: source, its image; root is then the objects */
@@ -722,6 +724,16 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	 * overlay's tmpfs. */
 	if (m->block_root)
 		m->host_overlay = 0;
+	/* (writeback sync-on-stop), section 3.9's rule 2: the image's tree
+	 * written back over the directory once the guest has powered off
+	 * clean (write_back()), which is what lets a block projection's
+	 * machine write its directory in place. */
+	text = hull_access_value(doc, &machine, "writeback");
+	m->writeback = text != NULL && strcmp(text, "sync-on-stop") == 0;
+	free(text);
+	if (m->writeback && (!m->block_root || m->overlay || m->composefs != NULL))
+		return "(writeback sync-on-stop) writes a block projection's image back to its "
+		       "directory: it needs (projection block) and (mutable direct)";
 	if ((m->arm64 || m->riscv64) && m->block_root)
 		return "an arm64 or riscv64 machine's root is a share: a block projection is x86's so far";
 	if (m->composefs != NULL && (m->block_root || m->host_overlay || m->owners != NULL))
@@ -3257,6 +3269,87 @@ static int export_sink(void *context, const uint8_t *data, size_t n)
 	return 0;
 }
 
+/* `argv` run in `dir`, its output thrown away: its exit status, or -1. */
+static int run_in(const char *dir, const char *const *argv)
+{
+	pid_t child = fork();
+	int   status;
+
+	if (child == 0) {
+		int null = open("/dev/null", O_RDWR | O_CLOEXEC);
+
+		if (null < 0 || chdir(dir) != 0 || dup2(null, 0) < 0 || dup2(null, 1) < 0 ||
+		    dup2(null, 2) < 0)
+			_exit(126);
+		execv(argv[0], (char *const *)argv);
+		_exit(127);
+	}
+	if (child < 0)
+		return -1;
+	while (waitpid(child, &status, 0) < 0)
+		if (errno != EINTR)
+			return -1;
+	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/*
+ * (writeback sync-on-stop): once the guest has powered off clean, its
+ * root image's tree made the directory's (section 3.9's rule 2). The
+ * agent syncs before it powers off but does not unmount, so the journal
+ * is replayed first, by e2fsck with nothing else checked; then debugfs,
+ * e2fsprogs' as mke2fs is, dumps the tree as the user into writeback/
+ * in the machine's directory, and engine/writeback.c mirrors it over the
+ * directory. Before the machine's end is said, so a `hull run` that has
+ * returned has its directory written. A failure says why on the
+ * workload's stderr and makes the end 125; the directory may then be
+ * part written, the crash window the rule names.
+ */
+static void write_back(hull_machine *m)
+{
+	const char *e2fsck = access("/usr/sbin/e2fsck", X_OK) == 0 ? "/usr/sbin/e2fsck" :
+	                     access("/sbin/e2fsck", X_OK) == 0 ? "/sbin/e2fsck" : NULL;
+	const char *debugfs = access("/usr/sbin/debugfs", X_OK) == 0 ? "/usr/sbin/debugfs" :
+	                      access("/sbin/debugfs", X_OK) == 0 ? "/sbin/debugfs" : NULL;
+	char        detail[600] = "";
+	char        stage[4300];
+	int         status;
+
+	snprintf(stage, sizeof stage, "%s/writeback", m->dir);
+	if (e2fsck == NULL || debugfs == NULL) {
+		snprintf(detail, sizeof detail, "e2fsck and debugfs read the image back, and e2fsprogs "
+		         "is not installed");
+	} else {
+		const char *const replay[] = { e2fsck, "-y", "-E", "journal_only", "root.img", NULL };
+		const char *const dump[] = { debugfs, "-R", "rdump / writeback", "root.img", NULL };
+		int               parent = open(m->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+		if (parent >= 0) {
+			hull_writeback_remove(parent, "writeback");
+			close(parent);
+		}
+		/* e2fsck's 1 is a journal replayed, which is what was asked. */
+		if ((status = run_in(m->dir, replay)) < 0 || status > 1)
+			snprintf(detail, sizeof detail, "e2fsck could not replay the image's journal: "
+			         "exit %d", status);
+		else if (mkdir(stage, 0700) != 0 || run_in(m->dir, dump) != 0)
+			snprintf(detail, sizeof detail, "debugfs could not dump the image's tree");
+		else
+			(void)hull_writeback_mirror(stage, m->root, detail, sizeof detail);
+		if ((parent = open(m->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) >= 0) {
+			hull_writeback_remove(parent, "writeback");
+			close(parent);
+		}
+	}
+	if (detail[0] != '\0') {
+		char line[700];
+		int  n = snprintf(line, sizeof line, "hull: writeback: %s\n", detail);
+
+		host->on_data(m->core, NULL, 2, (const uint8_t *)line, (size_t)n);
+		m->code   = 125;
+		m->signal = 0;
+	}
+}
+
 /*
  * (export PATH): the merged tree as engine/tree.c's tar, taken once the
  * workload has ended and before the guest powers off, the agent waiting
@@ -3531,6 +3624,14 @@ static void *read_agent(void *arg)
 	}
 	pthread_mutex_unlock(&m->lock);
 	reap(m);
+	if (m->writeback && m->exited) {
+		write_back(m);
+	} else if (m->writeback) {
+		static const char said[] = "hull: writeback: the machine did not stop clean, so its "
+		                           "directory is as it was\n";
+
+		host->on_data(m->core, NULL, 2, (const uint8_t *)said, sizeof said - 1u);
+	}
 	if (m->wake >= 0 && eventfd_write(m->wake, 1u) != 0)
 		host->log(m->core, 3, "the machine's forwarder could not be woken");
 	if (m->exited && m->signal != 0) {
@@ -5537,6 +5638,11 @@ static const hull_cap_entry entries[] = {
 	  "an ext4 image of the directory, built by mke2fs -d as it starts, a virtio disk the "
 	  "agent mounts; the machine's writes the image's, gone with it", NULL },
 	{ "writeback.none",         HULL_SUP_NATIVE, NULL, NULL },
+	{ "writeback.sync-on-stop", HULL_SUP_EMULATED,
+	  "the root image's tree written back over the directory once the guest powers off clean, "
+	  "read by e2fsprogs' e2fsck and debugfs: files, directories and symlinks with their modes "
+	  "and times, the user's; other owners, device nodes, FIFOs and hard links not carried; a "
+	  "machine killed, or a crash part-way, leaves the directory as it was or part written", NULL },
 
 	/* Kept while the core runs; qemu dies with it, as a chroot machine
 	 * does, until adopt() is written. */
