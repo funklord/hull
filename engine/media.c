@@ -55,6 +55,7 @@ typedef struct walk {
 	const char *extra;        /* more of media.conf, a raw dump's */
 	unsigned unit;            /* the bytes a sector of the layout is */
 	int      sparse;          /* its digest is hash_sparse's */
+	int      owners;          /* the open owners list of the tree being read, or -1 */
 } walk;
 
 static int fail(char *detail, size_t cap, const char *what, const char *why)
@@ -620,6 +621,7 @@ typedef struct ext {
 	uint64_t descriptor_size;
 	uint64_t groups;
 	int      wide;         /* 64bit */
+	const char *prefix;    /* the tree's place under files/: "", or pN */
 } ext;
 
 static int ext_read_block(walk *w, const ext *e, uint64_t number, uint8_t *to)
@@ -889,6 +891,42 @@ static int ext_file(walk *w, const ext *e, const uint8_t inode[128], ext_run *ru
 	return close(fd);
 }
 
+/*
+ * An ext file's owner, where it is not root's, recorded for (owners
+ * PATH): the tree is the user's, which a machine sees as root's, so a
+ * file root owned needs no record and any other one does. The list is
+ * the collection's, beside the tree it names -- `owners` for a disk that
+ * is one filesystem, `owners.pN` for partition N, its paths the tree's
+ * own -- each entry UID, GID and path, NUL-ended, as hull_give_owners
+ * reads it. Opened on the first owner and closed with the tree.
+ */
+static int ext_owner(walk *w, const ext *e, const uint8_t inode[128], const char *relative)
+{
+	unsigned long uid = (unsigned long)le16(inode + 2) | (unsigned long)le16(inode + 120) << 16;
+	unsigned long gid = (unsigned long)le16(inode + 24) | (unsigned long)le16(inode + 122) << 16;
+	size_t        skip = e->prefix[0] != '\0' ? strlen(e->prefix) + 1u : 0u;
+	char          entry[4200];
+	int           n;
+
+	if (uid == 0u && gid == 0u)
+		return 0;
+	if (w->owners < 0) {
+		char   path[4400];
+		size_t length = strlen(w->root);
+
+		/* w->root is the collection's files/, the list beside it. */
+		snprintf(path, sizeof path, "%.*s/owners%s%s", (int)(length - 6u), w->root,
+		         e->prefix[0] != '\0' ? "." : "", e->prefix);
+		if ((w->owners = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0)
+			return -1;
+	}
+	n = snprintf(entry, sizeof entry, "%lu%c%lu%c%s%c", uid, '\0', gid, '\0', relative + skip,
+	             '\0');
+	if (n < 0 || (size_t)n >= sizeof entry)
+		return 0;
+	return write_all(w->owners, entry, (size_t)n, (uint64_t)lseek(w->owners, 0, SEEK_END));
+}
+
 static int ext_directory(walk *w, const ext *e, uint64_t number, const char *relative,
                          unsigned depth, ext_run *runs)
 {
@@ -939,6 +977,8 @@ static int ext_directory(walk *w, const ext *e, uint64_t number, const char *rel
 		    ext_inode(w, e, entry, child) == 0) {
 			unsigned kind = le16(child) & 0xF000u;
 
+			struct stat made;
+
 			snprintf(path, sizeof path, "%s/%s", w->root, next);
 			if (kind == 0x4000u) {
 				if (mkdir(path, 0755) == 0)
@@ -948,6 +988,8 @@ static int ext_directory(walk *w, const ext *e, uint64_t number, const char *rel
 			} else if (kind == 0xA000u) {
 				ext_link(w, e, child, runs, path);
 			}
+			if (status == 0 && lstat(path, &made) == 0 && ext_owner(w, e, child, next) != 0)
+				status = -1;
 		}
 		at += length;
 	}
@@ -994,8 +1036,12 @@ static int read_ext(walk *w, uint64_t base, const char *prefix, int *found, char
 			volume[i]     = c >= ' ' && c <= '~' && strchr("\"\\()", c) == NULL ? c : '_';
 			volume[i + 1] = '\0';
 		}
+	e.prefix = prefix;
 	status = ext_directory(w, &e, 2u, prefix, 0u, runs);
 	free(runs);
+	if (w->owners >= 0 && close(w->owners) != 0)
+		status = -1;
+	w->owners = -1;
 	return status;
 }
 
@@ -2176,6 +2222,7 @@ static int import_cue(const char *cue, const char *dir, hull_media_report *repor
 		fail(detail, cap, "out of memory", NULL);
 		goto done;
 	}
+	w->owners = -1;
 	w->image = cooked;
 	w->bytes = disc->data_sectors * SECTOR;
 	w->extra = extra;
@@ -2294,6 +2341,7 @@ int hull_media_import(const char *image, const char *dir, hull_media_report *rep
 	w = calloc(1u, sizeof *w);
 	if (w == NULL)
 		return fail(detail, cap, "out of memory", NULL);
+	w->owners = -1;
 	if ((w->image = open(image, O_RDONLY | O_CLOEXEC)) < 0 || fstat(w->image, &st) != 0 ||
 	    !S_ISREG(st.st_mode)) {
 		fail(detail, cap, image, w->image < 0 ? strerror(errno) : "not a file");

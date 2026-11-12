@@ -298,6 +298,58 @@ if [ -n "$mke2fs" ]; then
 	check 'it runs as a machine' "$got" 0 "$out"
 	printf '%s\n' "$out" | grep -q '^from a disk image$'
 	check 'and says so' "$?" 0 "$out"
+	# A disk's owners, which a tree the user owns cannot hold: listed for
+	# (owners PATH) beside it, the root's files needing no line, and given
+	# back in the machine. The image from a tar whose owners are set,
+	# which mke2fs takes since 1.47.1.
+	python3 -I - "$dir/owned.tar" "$probe" <<'TAR'
+import io, sys, tarfile
+out, probe = sys.argv[1], sys.argv[2]
+with tarfile.open(out, 'w') as t:
+    def add(name, kind, uid, gid, data=b'', mode=0o644, link=''):
+        i = tarfile.TarInfo(name)
+        i.uid, i.gid, i.mode = uid, gid, mode
+        if kind == 'd':
+            i.type, i.mode = tarfile.DIRTYPE, 0o755
+        elif kind == 'l':
+            i.type, i.linkname = tarfile.SYMTYPE, link
+        else:
+            i.size = len(data)
+        t.addfile(i, io.BytesIO(data) if kind == 'f' else None)
+    for d in ('proc', 'dev', 'sys', 'home'):
+        add(d, 'd', 0, 0)
+    add('probe', 'f', 0, 0, open(probe, 'rb').read(), 0o755)
+    add('home/user', 'd', 0, 5)
+    add('home/user/note', 'f', 101, 102, b'n\n')
+    add('home/user/ln', 'l', 101, 102, link='note')
+TAR
+	if "$mke2fs" -q -F -t ext4 -d "$dir/owned.tar" "$dir/owned.img" 16M 2> /dev/null; then
+		media import "$dir/owned.img" "$dir/ownedcol"
+		check 'a disk with owners imported' "$got" 0 "$out"
+		owners=$(tr '\0' ' ' < "$dir/ownedcol/owners" 2>&1)
+		[ "$owners" = '101 102 home/user/note 101 102 home/user/ln 0 5 home/user ' ]
+		check 'its owners are listed, root'"'"'s files not' "$?" 0 "$owners"
+		media verify "$dir/ownedcol"
+		check 'the list is no part of the disk' "$got" 0 "$out"
+		# The import's tree in the user's own group: a build directory
+		# here is setgid to a group the machine need not map, and an owner
+		# is given only where the tree is the machine's to chown.
+		chgrp -R "$(id -g)" "$dir/ownedcol/files"
+		printf '(machine (backend chroot) (source "dir:%s/ownedcol/files") (mutable overlay) (network none) (owners "%s/ownedcol/owners") (command "/probe" "owner" "/home/user/note" "owner" "/home/user"))\n' \
+			"$(cd "$dir" && pwd)" "$(cd "$dir" && pwd)" > "$dir/owned.conf"
+		out=$(XDG_RUNTIME_DIR=$(cd "$dir" && pwd)/run HULL_CORE_IDLE=1 timeout 60 "$hull" run -f "$dir/owned.conf" 2>&1)
+		got=$?
+		if printf '%s\n' "$out" | grep -q 'maps one uid'; then
+			printf 'media: owners in the machine not measured: the machine maps one uid\n'
+		else
+			check 'the owned disk runs' "$got" 0 "$out"
+			printf '%s\n' "$out" | grep -q '^owner=101:102 0644$' &&
+				printf '%s\n' "$out" | grep -Eq '^owner=0:5 2?755$'
+			check 'and its owners are the disk'"'"'s' "$?" 0 "$out"
+		fi
+	else
+		printf 'media: owners not measured: mke2fs takes no tar before 1.47.1\n'
+	fi
 	cases=$((cases + 1))
 	patch=$(find "$dir/ext4/quirks" -type f -printf '%s\n' | awk '{ n += $1 } END { print n + 0 }')
 	[ "$patch" -lt 1000000 ] ||
