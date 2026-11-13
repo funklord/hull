@@ -3476,14 +3476,43 @@ printf '(machine (source "tar:./rootfs.tar") (backend chroot) (command "/probe" 
 from_root 0 '^from a tar$' -f "$root/fromtar.conf"
 expect 0 '^tar/[0-9a-f]{32} ' "$hull" images
 rm -f "$root/rootfs.tar"
-# And a pack: source, the same tree packed by hull pack, read into the
-# store as pack/HASH and run.
+# And a pack: source, the same tree packed by hull pack. On chroot it is
+# served from the pack itself, by FUSE, nothing read into the store
+# (section 3.13); where chroot cannot serve it so -- a read-only root here
+# -- it is read into the store as pack/HASH and run as that stored tree.
+# A pack a byte of whose data has changed is refused the file it holds,
+# its object held to its digest as it is opened.
 expect 0 '' "$hull" pack "$root/rootfs" "$root/rootfs.hull"
 printf '(machine (source "pack:./rootfs.hull") (backend chroot) (command "/probe" "say" "from a pack"))\n' \
 	> "$root/frompack.conf"
 from_root 0 '^from a pack$' -f "$root/frompack.conf"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q 'source.pack.overlay: emulated: a pack served read-only by FUSE' ||
+	fail "a pack on chroot was not served from the pack itself" "$out"
+refute '^pack/' "$hull" images
+printf '(machine (source "pack:./rootfs.hull") (backend chroot) (security (readonly_root true)) (command "/probe" "say" "from a pack"))\n' \
+	> "$root/frompackro.conf"
+from_root 0 '^from a pack$' -f "$root/frompackro.conf"
 expect 0 '^pack/[0-9a-f]{32} ' "$hull" images
-rm -f "$root/rootfs.hull"
+cp "$root/rootfs.hull" "$root/flipped.hull"
+python3 -I - "$root/flipped.hull" <<'PY'
+import struct, sys
+path = sys.argv[1]
+data = bytearray(open(path, "rb").read())
+count = struct.unpack(">I", data[12:16])[0]
+frame = struct.unpack(">Q", data[24:32])[0]
+start = 32 + count * 57 + frame
+for i in range(count):
+	entry = data[32 + i * 57:32 + (i + 1) * 57]
+	if entry[32] & 1:
+		offset, length = struct.unpack(">QQ", entry[41:57])
+		data[start + offset + length // 2] ^= 0xff
+open(path, "wb").write(data)
+PY
+printf '(machine (source "pack:./flipped.hull") (backend chroot) (command "/probe" "say" "from a pack"))\n' \
+	> "$root/flippedpack.conf"
+from_root 125 '/probe: Input/output error' -f "$root/flippedpack.conf"
+rm -f "$root/rootfs.hull" "$root/flipped.hull"
 # policy.conf (section 4.5): the engine a class means on this host, the
 # spec's class unchanged; and a file that cannot be meant stops the command
 # rather than leaving the machine on an engine nobody chose.

@@ -26,7 +26,12 @@
  * one. */
 int hull_storefs_parts(const char *image, char *store, size_t store_cap, char hex[65]);
 
-/* Serve the tree of the manifest `hex` under `store` on `fuse`, a
+/* Each of the functions below takes, with `hex` NULL, `store` as the path
+ * of a pack of version 1 (section 3.13): its tree is its manifest and its
+ * files are its objects' frames, each decompressed as it is opened into a
+ * memfd and held to its digest, the pack read into no store.
+ *
+ * Serve the tree of the manifest `hex` under `store` on `fuse`, a
  * /dev/fuse descriptor already mounted, until it is unmounted. Writes
  * why it could not start into `why`, and returns -1, before serving;
  * returns 0 once the mount has gone. `ready` is called, once the

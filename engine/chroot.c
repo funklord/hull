@@ -124,8 +124,9 @@ struct hull_machine {
 	hull_core       *core;       /* what create() was given, for the callbacks */
 	char            *root;       /* the dir source, without "dir:"; a composefs one's staging */
 	char            *composefs;  /* a stored tree's image, served by FUSE (storefs.h), or NULL */
-	char             cfs_store[4096];  /* its store, and its manifest's hex */
+	char             cfs_store[4096];  /* its store, and its manifest's hex; or a pack */
 	char             cfs_hex[65];
+	int              cfs_pack;   /* a pack: source, its tree served from the pack itself */
 	char             lookup[4200];  /* where /etc/passwd and /etc/group are read for (user ...) */
 	char            *workdir;
 	char            *user;     /* (user ...), or NULL for the machine's root */
@@ -364,7 +365,8 @@ static const char *read_names(hull_machine *m, const hull_sexpr_doc *doc,
 
 		if (m->composefs != NULL) {
 			/* A stored tree's own, read from the store. */
-			if (hull_storefs_read(m->cfs_store, m->cfs_hex, "etc/hosts", base, sizeof base) < 0)
+			if (hull_storefs_read(m->cfs_store, m->cfs_pack ? NULL : m->cfs_hex, "etc/hosts", base,
+			                      sizeof base) < 0)
 				snprintf(base, sizeof base, "127.0.0.1\tlocalhost\n");
 		} else {
 			snprintf(path, sizeof path, "%s/etc/hosts", m->root);
@@ -433,9 +435,20 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		if (m->composefs == NULL ||
 		    hull_storefs_parts(m->composefs, m->cfs_store, sizeof m->cfs_store, m->cfs_hex) != 0)
 			return "a composefs source is a store's mounts/HEX.erofs";
+	} else if (source != NULL && strncmp(source, "pack:", 5u) == 0 && source[5] != '\0') {
+		/* A pack (section 3.13), served by FUSE from the pack itself as
+		 * a composefs source is from the store, nothing read into it:
+		 * each object decompressed as it is opened, and held to its
+		 * digest. */
+		m->composefs = hull_access_path(doc, source + 5);
+		free(source);
+		if (m->composefs == NULL || strlen(m->composefs) >= sizeof m->cfs_store)
+			return "a pack source names a pack";
+		snprintf(m->cfs_store, sizeof m->cfs_store, "%s", m->composefs);
+		m->cfs_pack = 1;
 	} else if (source == NULL || strncmp(source, "dir:", 4u) != 0 || source[4] == '\0') {
 		free(source);
-		return "chroot runs only a dir or a composefs source";
+		return "chroot runs only a dir, a composefs or a pack source";
 	} else {
 		m->root = hull_access_path(doc, source + 4);
 		free(source);
@@ -1669,7 +1682,8 @@ static void serve_composefs(const hull_machine *m, int report)
 
 		close_others(keep, 2u);
 		prctl(PR_SET_PDEATHSIG, SIGKILL);
-		if (hull_storefs_serve(m->cfs_store, m->cfs_hex, fuse, m->verity, composefs_ready, &ready[1], said,
+		if (hull_storefs_serve(m->cfs_store, m->cfs_pack ? NULL : m->cfs_hex, fuse, m->verity,
+		                       composefs_ready, &ready[1], said,
 		                       sizeof said) != 0) {
 			if (write(ready[1], said, strlen(said)) < 0)
 				_exit(127);
@@ -3369,7 +3383,8 @@ static const char *stage_composefs(hull_machine *m)
 		return "the composefs root's staging cannot be made";
 	for (unsigned i = 0u; i < sizeof files / sizeof files[0]; i++) {
 		snprintf(path, sizeof path, "%s/%s", m->lookup, files[i]);
-		if (hull_storefs_extract(m->cfs_store, m->cfs_hex, files[i], path, why, sizeof why) < 0) {
+		if (hull_storefs_extract(m->cfs_store, m->cfs_pack ? NULL : m->cfs_hex, files[i], path, why,
+		                         sizeof why) < 0) {
 			static char said[400];
 
 			snprintf(said, sizeof said, "the stored tree: %s", why);
@@ -4771,6 +4786,10 @@ static const hull_cap_entry entries[] = {
 	{ "source.composefs.overlay", HULL_SUP_EMULATED,
 	  "a stored tree served read-only by FUSE from its manifest and the store's objects, no "
 	  "tree copied, under an overlayfs whose writes are held in memory", NULL },
+	{ "source.pack.overlay",    HULL_SUP_EMULATED,
+	  "a pack served read-only by FUSE from the pack itself, nothing read into the store, each "
+	  "file decompressed into memory as it is opened and held to its digest, under an overlayfs "
+	  "whose writes are held in memory", NULL },
 	{ "projection.bind",        HULL_SUP_NATIVE,   NULL, NULL },
 	{ "writeback.none",         HULL_SUP_NATIVE,   NULL, NULL },
 	{ "command",                HULL_SUP_NATIVE,   NULL, NULL },

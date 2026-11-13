@@ -17,6 +17,9 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+#define ZSTD_STATIC_LINKING_ONLY  /* a decoder in a workspace of its own, mapped */
+#include <zstd.h>
+
 #include "sexpr.h"
 #include "sha256.h"
 
@@ -49,8 +52,20 @@ typedef struct tree {
 	node           *nodes;
 	uint32_t        count;
 	size_t          nodes_size;  /* their mapping's length */
-	int             objects;     /* objects/sha256, opened */
+	int             objects;     /* objects/sha256, opened; -1 for a pack */
+	/* A pack's tree (store/pack.c), served from the pack itself: */
+	const uint8_t  *pack;        /* the file, mapped */
+	size_t          pack_length;
+	const uint8_t  *index;       /* its index, `pack_count` entries of PACK_ENTRY */
+	uint32_t        pack_count;
+	uint64_t        pack_data;   /* where its objects' frames begin */
+	ZSTD_DCtx      *dctx;        /* in `dctx_space`, mapped, so that nothing mallocs */
+	void           *dctx_space;
+	size_t          dctx_size;
 } tree;
+
+#define PACK_HEADER 32u
+#define PACK_ENTRY  57u   /* digest 32, flags 1, length 8, frame's offset 8 and length 8 */
 
 #define TTL     (365u * 86400u)  /* a stored tree does not change: cached a year */
 #define PAGES   256u             /* a read's most, 1 MiB */
@@ -245,6 +260,70 @@ static const char *entry_of(const tree *t, const hull_sexpr_form *entry, node *e
 }
 
 /* The manifest `hex` under `store`, read and its entries made nodes. */
+static uint64_t big(const uint8_t *at, unsigned n)
+{
+	uint64_t v = 0u;
+
+	for (unsigned i = 0u; i < n; i++)
+		v = v << 8 | at[i];
+	return v;
+}
+
+/* A pack's header and index read, its manifest decompressed into a
+ * mapping of its own: the tree's bytes, as a store's manifest is. Only a
+ * pack of version 1: one holding a recipe against a base (version 2) is
+ * unpacked into a store that has the base. */
+static const char *load_pack(tree *t, const char *path)
+{
+	struct stat st;
+	int         fd = open(path, O_RDONLY | O_CLOEXEC);
+	uint64_t    manifest_length;
+	uint64_t    frame;
+	uint64_t    at;
+
+	if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < (off_t)PACK_HEADER) {
+		if (fd >= 0)
+			close(fd);
+		return "the pack cannot be read";
+	}
+	t->pack_length = (size_t)st.st_size;
+	t->pack = mmap(NULL, t->pack_length, PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);
+	if (t->pack == MAP_FAILED) {
+		t->pack = NULL;
+		return "the pack cannot be mapped";
+	}
+	if (memcmp(t->pack, "HULLPACK", 8u) != 0)
+		return "it is not a pack";
+	if (big(t->pack + 8, 4u) == 2u)
+		return "a pack against a base holds recipes of the base's objects: `hull unpack` it into "
+		       "a store that has the base, and run that";
+	if (big(t->pack + 8, 4u) != 1u)
+		return "the pack is of a version this hull does not know";
+	t->pack_count = (uint32_t)big(t->pack + 12, 4u);
+	manifest_length = big(t->pack + 16, 8u);
+	frame = big(t->pack + 24, 8u);
+	at = PACK_HEADER + (uint64_t)t->pack_count * PACK_ENTRY;
+	if (t->pack_count > (1u << 22) || manifest_length == 0u || manifest_length > (1u << 30) ||
+	    at > t->pack_length || frame > t->pack_length - at)
+		return "the pack's header is not its own";
+	t->index = t->pack + PACK_HEADER;
+	t->pack_data = at + frame;
+	t->dctx_size = ZSTD_estimateDCtxSize();
+	if ((t->dctx_space = map(t->dctx_size)) == NULL ||
+	    (t->dctx = ZSTD_initStaticDCtx(t->dctx_space, t->dctx_size)) == NULL)
+		return "out of memory";
+	t->length = (size_t)manifest_length;
+	if ((t->data = map(t->length)) == NULL) {
+		t->length = 0u;
+		return "out of memory";
+	}
+	if (ZSTD_decompressDCtx(t->dctx, (void *)t->data, t->length, t->pack + at, (size_t)frame) !=
+	    t->length)
+		return "the pack's manifest cannot be decompressed";
+	return NULL;
+}
+
 static const char *load(tree *t, const char *store, const char *hex)
 {
 	char            path[4300];
@@ -255,9 +334,15 @@ static const char *load(tree *t, const char *store, const char *hex)
 	int             fd;
 	int             any;
 	uint32_t        n = 0u;
+	const char     *wrong;
 
 	memset(t, 0, sizeof *t);
 	t->objects = -1;
+	if (hex == NULL) {
+		if ((wrong = load_pack(t, store)) != NULL)
+			return wrong;
+		goto parse;
+	}
 	snprintf(path, sizeof path, "%s/manifests/sha256/%s", store, hex);
 	if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0 || fstat(fd, &st) != 0 ||
 	    st.st_size <= 0 || st.st_size > (off_t)(1u << 30)) {
@@ -275,6 +360,7 @@ static const char *load(tree *t, const char *store, const char *hex)
 	snprintf(path, sizeof path, "%s/objects/sha256", store);
 	if ((t->objects = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) < 0)
 		return "the store's objects cannot be opened";
+parse:
 	{
 		hull_sexpr_form head;
 
@@ -325,6 +411,62 @@ static const char *load(tree *t, const char *store, const char *hex)
 	return NULL;
 }
 
+/* A pack's object, by its digest in the index, which is sorted by it:
+ * decompressed into a memfd and held to its digest, the descriptor at its
+ * start; or -1. The bytes are memory while the file is open. */
+static int open_packed(const tree *t, const node *e)
+{
+	uint32_t low = 0u;
+	uint32_t high = t->pack_count;
+	int      fd;
+
+	while (low < high) {
+		uint32_t       mid = low + (high - low) / 2u;
+		const uint8_t *entry = t->index + (size_t)mid * PACK_ENTRY;
+		int            c = memcmp(entry, e->digest, 32u);
+
+		if (c == 0) {
+			uint64_t    length = big(entry + 33, 8u);
+			uint64_t    offset = big(entry + 41, 8u);
+			uint64_t    frame = big(entry + 49, 8u);
+			uint8_t    *bytes = NULL;
+			hull_sha256 h;
+			uint8_t     digest[32];
+
+			if ((entry[32] & 2u) != 0u || offset > t->pack_length - t->pack_data ||
+			    frame > t->pack_length - t->pack_data - offset ||
+			    (fd = memfd_create("hull-object", MFD_CLOEXEC)) < 0)
+				return -1;
+			if (length > 0u &&
+			    (ftruncate(fd, (off_t)length) != 0 ||
+			     (bytes = mmap(NULL, (size_t)length, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+			                   0)) == MAP_FAILED ||
+			     ZSTD_decompressDCtx(t->dctx, bytes, (size_t)length,
+			                         t->pack + t->pack_data + offset, (size_t)frame) != length)) {
+				if (bytes != NULL && bytes != MAP_FAILED)
+					munmap(bytes, (size_t)length);
+				close(fd);
+				return -1;
+			}
+			hull_sha256_init(&h);
+			hull_sha256_update(&h, bytes, (size_t)length);
+			hull_sha256_final(&h, digest);
+			if (bytes != NULL)
+				munmap(bytes, (size_t)length);
+			if (memcmp(digest, e->digest, 32u) != 0) {
+				close(fd);
+				return -1;
+			}
+			return fd;
+		}
+		if (c < 0)
+			low = mid + 1u;
+		else
+			high = mid;
+	}
+	return -1;
+}
+
 /* The object of a regular file, opened, or -1: objects/sha256/ab/abcdef... */
 static int open_object(const tree *t, const node *e)
 {
@@ -333,6 +475,8 @@ static int open_object(const tree *t, const node *e)
 
 	if (!e->has_object)
 		return -1;
+	if (t->pack != NULL)
+		return open_packed(t, e);
 	for (unsigned i = 0u; i < 32u; i++) {
 		name[3u + 2u * i] = digits[e->digest[i] >> 4];
 		name[3u + 2u * i + 1u] = digits[e->digest[i] & 15u];
@@ -885,6 +1029,21 @@ int hull_storefs_serve(const char *store, const char *hex, int fuse, int verity,
 	}
 }
 
+/* What load() mapped and opened, let go. */
+static void unload(tree *t)
+{
+	if (t->objects >= 0)
+		close(t->objects);
+	if (t->data != NULL)
+		munmap((void *)t->data, t->length);
+	if (t->nodes != NULL)
+		munmap(t->nodes, t->nodes_size);
+	if (t->pack != NULL)
+		munmap((void *)t->pack, t->pack_length);
+	if (t->dctx_space != NULL)
+		munmap(t->dctx_space, t->dctx_size);
+}
+
 int hull_storefs_extract(const char *store, const char *hex, const char *path, const char *dest,
                          char *why, size_t cap)
 {
@@ -932,12 +1091,7 @@ int hull_storefs_extract(const char *store, const char *hex, const char *path, c
 		status = -1;
 	}
 done:
-	if (t.objects >= 0)
-		close(t.objects);
-	if (t.data != NULL)
-		munmap((void *)t.data, t.length);
-	if (t.nodes != NULL)
-		munmap(t.nodes, t.nodes_size);
+	unload(&t);
 	return status;
 }
 
@@ -967,11 +1121,6 @@ long hull_storefs_read(const char *store, const char *hex, const char *path, cha
 			n = 0;
 		}
 	}
-	if (t.objects >= 0)
-		close(t.objects);
-	if (t.data != NULL)
-		munmap((void *)t.data, t.length);
-	if (t.nodes != NULL)
-		munmap(t.nodes, t.nodes_size);
+	unload(&t);
 	return n;
 }

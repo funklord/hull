@@ -1112,3 +1112,67 @@ const hull_manifest_file *hull_manifest_file_at(const hull_manifest_file *list, 
 
 	return count > 0u ? bsearch(&key, list, count, sizeof *list, by_path) : NULL;
 }
+
+int hull_pack_describe(int in, unsigned *version, char arch[64], uint8_t **runtime,
+                       size_t *runtime_length, char *why, size_t cap)
+{
+	uint8_t         head[8 + 4 + 4 + 8 + 8];
+	uint32_t        count;
+	uint64_t        manifest_length;
+	uint64_t        frame_length;
+	uint8_t        *frame = NULL;
+	uint8_t        *manifest = NULL;
+	hull_sexpr_doc  doc;
+	hull_sexpr_form top;
+	hull_sexpr_form item;
+	int             result = -1;
+
+	snprintf(arch, 64u, "none");
+	*runtime = NULL;
+	*runtime_length = 0u;
+	if (read_all(in, head, sizeof head) != 0 || memcmp(head, PACK_MAGIC, 8u) != 0)
+		return say(why, cap, "it is not a Hull pack", NULL);
+	*version = (unsigned)head[8] << 24 | (unsigned)head[9] << 16 | (unsigned)head[10] << 8 |
+	           head[11];
+	count = (uint32_t)head[12] << 24 | (uint32_t)head[13] << 16 | (uint32_t)head[14] << 8 |
+	        head[15];
+	manifest_length = get64(head + 16);
+	frame_length    = get64(head + 24);
+	if (count > MAX_OBJECTS || manifest_length == 0u || manifest_length > (256u << 20) ||
+	    frame_length > (256u << 20))
+		return say(why, cap, "the pack's header is not one hull reads", NULL);
+	if (lseek(in, (off_t)(sizeof head + (uint64_t)count * INDEX_ENTRY), SEEK_SET) < 0 ||
+	    (frame = malloc(frame_length > 0u ? frame_length : 1u)) == NULL ||
+	    (manifest = malloc(manifest_length)) == NULL || read_all(in, frame, frame_length) != 0 ||
+	    ZSTD_decompress(manifest, manifest_length, frame, frame_length) != manifest_length ||
+	    hull_sexpr_open(&doc, manifest, manifest_length, HULL_SEXPR_CANONICAL, NULL) !=
+	        HULL_SEXPR_OK ||
+	    !hull_sexpr_first(&doc, &top) || !hull_sexpr_child(&doc, &top, &item)) {
+		say(why, cap, "the pack's manifest cannot be read", NULL);
+		goto done;
+	}
+	while (hull_sexpr_next(&doc, &item, &item)) {
+		hull_sexpr_form key;
+		hull_sexpr_form value;
+
+		if (item.kind != HULL_SEXPR_LIST || !hull_sexpr_child(&doc, &item, &key))
+			continue;
+		if (hull_sexpr_is(&doc, &key, "arch") && hull_sexpr_next(&doc, &key, &value) &&
+		    value.content_length > 0u && value.content_length < 64u) {
+			memcpy(arch, doc.data + value.content, value.content_length);
+			arch[value.content_length] = '\0';
+		} else if (hull_sexpr_is(&doc, &key, "runtime") && *runtime == NULL) {
+			if ((*runtime = malloc(item.extent)) == NULL) {
+				say(why, cap, "out of memory", NULL);
+				goto done;
+			}
+			memcpy(*runtime, doc.data + item.offset, item.extent);
+			*runtime_length = item.extent;
+		}
+	}
+	result = 0;
+done:
+	free(frame);
+	free(manifest);
+	return result;
+}

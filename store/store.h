@@ -124,6 +124,14 @@ int hull_store_pack(hull_store *store, const char *name, const char *against, in
  * why. */
 int hull_pack_inspect(int in, FILE *out, char *why, size_t cap);
 
+/* A pack's version, its manifest's arch and its (runtime ...) form as
+ * hull_store_runtime() gives a stored tree's, read from `in` at its
+ * start, nothing written anywhere: for a machine served from the pack
+ * itself (section 3.13). "none" where the manifest records no arch, NULL
+ * where no runtime. 0, or -1 with why. */
+int hull_pack_describe(int in, unsigned *version, char arch[64], uint8_t **runtime,
+                       size_t *runtime_length, char *why, size_t cap);
+
 /* Every object a manifest's canonical bytes name, each once, in digest
  * order, into a new array of `*count` digests of 32 bytes. 0, or -1
  * where they are not a manifest. */

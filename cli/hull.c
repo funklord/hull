@@ -891,6 +891,106 @@ static int composefs_machine(const hull_spec *spec, const hull_sexpr_form *machi
 	return any_qemu ? 2 : 1;
 }
 
+/*
+ * A pack: source of a machine only chroot runs (composefs_machine() 1):
+ * served by FUSE from the pack itself (engine/storefs.c), nothing read
+ * into the store, its source rewritten to the pack's absolute path, under
+ * an overlay, with its manifest's arch and runtime defaults as a stored
+ * tree's are given. 0 done; 1 where the pack is to be read into the store
+ * instead, one against a base; -1 having said why.
+ */
+static int pack_direct(const char *file, const hull_spec *spec, const hull_sexpr_form *machine,
+                       const char *given, const hull_sexpr_form *entry,
+                       const hull_sexpr_form *value, rewrite *rewrites, unsigned *count)
+{
+	char            path[4400];
+	char            absolute[PATH_MAX];
+	char            tree_arch[64];
+	char            asked[64] = "";
+	char            why[4400] = "";
+	uint8_t        *runtime = NULL;
+	size_t          runtime_length = 0u;
+	unsigned        version = 0u;
+	text_buf        source = { 0 };
+	hull_sexpr_form found;
+	hull_sexpr_form head;
+	hull_sexpr_form word;
+	int             fd;
+	int             status;
+
+	if (given[0] == '/') {
+		snprintf(path, sizeof path, "%s", given);
+	} else {
+		const char *slash = strrchr(file, '/');
+
+		snprintf(path, sizeof path, "%.*s%s", slash != NULL ? (int)(slash - file + 1) : 0, file,
+		         given);
+	}
+	if (realpath(path, absolute) == NULL || (fd = open(absolute, O_RDONLY | O_CLOEXEC)) < 0) {
+		fprintf(stderr, "%s: pack:%s: %s\n", file, given, strerror(errno));
+		return -1;
+	}
+	status = hull_pack_describe(fd, &version, tree_arch, &runtime, &runtime_length, why,
+	                            sizeof why);
+	close(fd);
+	if (status != 0) {
+		fprintf(stderr, "%s: pack:%s: %s\n", file, given, why);
+		return -1;
+	}
+	if (version != 1u) {
+		free(runtime);
+		return 1;
+	}
+	if (strpbrk(absolute, "\"\\") != NULL) {
+		free(runtime);
+		fprintf(stderr, "%s: pack:%s: its path cannot be written as a source\n", file, given);
+		return -1;
+	}
+	if (hull_spec_find(spec, machine, "mutable", &found) &&
+	    hull_sexpr_child(&spec->doc, &found, &head) && hull_sexpr_next(&spec->doc, &head, &word) &&
+	    hull_sexpr_is(&spec->doc, &word, "direct")) {
+		free(runtime);
+		fprintf(stderr, "%s: pack:%s is a tree nothing writes: (mutable direct) needs a dir "
+		        "source\n", file, given);
+		return -1;
+	}
+	add_text(&source, "\"pack:");
+	add_text(&source, absolute);
+	add_text(&source, "\")");
+	if (!hull_spec_find(spec, machine, "mutable", &found))
+		add_text(&source, " (mutable overlay)");
+	/* A tree of a foreign arch is run as one, as a stored tree is. */
+	if (hull_spec_find(spec, machine, "arch", &found) &&
+	    hull_sexpr_child(&spec->doc, &found, &head) && hull_sexpr_next(&spec->doc, &head, &word) &&
+	    word.content_length < sizeof asked) {
+		memcpy(asked, spec->doc.data + word.content, word.content_length);
+		asked[word.content_length] = '\0';
+		if (strcmp(asked, "host") == 0)
+			snprintf(asked, sizeof asked, "%s", host_arch());
+	}
+	if (strcmp(tree_arch, "none") != 0 && asked[0] != '\0' && strcmp(asked, tree_arch) != 0) {
+		free(runtime);
+		fprintf(stderr, "%s: pack:%s is a tree of %s, and the machine says (arch %s)\n", file,
+		        given, tree_arch, asked);
+		return -1;
+	}
+	if (strcmp(tree_arch, "none") != 0 && asked[0] == '\0' && strcmp(tree_arch, host_arch()) != 0) {
+		add_text(&source, " (arch ");
+		add_text(&source, tree_arch);
+		add_text(&source, ")");
+	}
+	if (add_rewrite(rewrites, count, value->offset, entry->offset + entry->extent - value->offset,
+	                &source) != 0) {
+		free(runtime);
+		fprintf(stderr, "%s: too many machines on stored trees\n", file);
+		return -1;
+	}
+	status = runtime != NULL ? runtime_defaults(file, given, spec, machine, runtime,
+	                                            runtime_length, rewrites, count) : 0;
+	free(runtime);
+	return status != 0 ? -1 : 0;
+}
+
 /* Whether the machine asks `(security (verity true))`. */
 static int wants_verity(const hull_spec *spec, const hull_sexpr_form *machine)
 {
@@ -1107,6 +1207,20 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 				result = -1;
 				break;
 			}
+		}
+		/* A pack: source of a machine only chroot runs, served from the
+		 * pack itself where it is of version 1 (pack_direct()). */
+		if (strncmp(name, "pack:", 5u) == 0 && name[5] != '\0' &&
+		    composefs_machine(&spec, &machines[i], backends, backend_count) == 1) {
+			int direct = pack_direct(file, &spec, &machines[i], name + 5, &entry, &value,
+			                         rewrites, &count);
+
+			if (direct < 0) {
+				result = -1;
+				break;
+			}
+			if (direct == 0)
+				continue;
 		}
 		/* A pack: source (section 3.13), read into the store as
 		 * pack/HASH, its manifest's, each object checked, and run as the
