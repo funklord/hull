@@ -6,7 +6,8 @@
  * library's character-set converters left out, dropbear's sftp-server and
  * loader paths rewritten to hull's, and the script and the link those
  * paths name made beside them. amd64's for the host's machines, and
- * arm64's, `--arch arm64`, for an arm64 machine under emu.
+ * another arch's, `--arch ARCH` -- arm64, riscv64, s390x or arm -- for a
+ * machine of that arch under emu.
  * Nothing in it is run on the host.
  */
 #define _GNU_SOURCE

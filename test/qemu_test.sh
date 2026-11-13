@@ -3367,7 +3367,7 @@ else
 	# 32-bit arm, armhf, the same way, 2026-11-13: qemu-system-arm's virt
 	# below 4 GiB booting Debian's armmp kernel, the agent cross-built.
 	# hull builds no arm kernel of its own, so (kernel hull) is refused,
-	# naming the fetch; no dropbear is fetched for arm, so no ssh case.
+	# naming the fetch. Its dropbear, armhf's, is fetched as the others'.
 	arm_probe=${BUILD_DIR:?}/test/arm/rootfs/probe
 	if ! command -v qemu-system-arm > /dev/null ||
 	   [ ! -x "$(dirname "$hull")/hull-agent-arm" ] || [ ! -x "$arm_probe" ]; then
@@ -3407,6 +3407,69 @@ else
 			has 5 '^from arm$'
 			has 5 '^host=qa32$'
 			has 5 '^read=armv7l$'
+			# (ssh true) with no sshd in the image: arm's dropbear, real ssh
+			# logging in as root against the machine's own host key.
+			name='hull sshd fetch --arch arm'
+			out=$(XDG_CACHE_HOME="$root/cache" timeout 120 "$hull" sshd fetch --arch arm 2>&1)
+			got=$?
+			has 0 'dropbear-arm-'
+			a32dbrt=$(mktemp -d /dev/shm/hull-qa32d.XXXXXX 2>/dev/null)
+			if [ "$got" = 0 ] && [ -n "$a32dbrt" ]; then
+				chmod 700 "$a32dbrt"
+				rm -rf "$root/a32db"
+				mkdir -p "$root/a32db/bin" "$root/a32db/etc" "$root/a32db/run" "$root/a32db/tmp" \
+					"$root/a32db/proc" "$root/a32db/dev" "$root/a32db/sys" "$root/a32db/root"
+				cp "$arm_probe" "$root/a32db/bin/sh"
+				printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/a32db/etc/passwd"
+				chmod 755 "$root/a32db"
+				printf '(machine (source "dir:./a32db") (backend emu) (arch arm) %s %s)\n' \
+					'(mutable overlay) (hostname "qa32db") (ssh true)' \
+					'(command "/bin/sh" "-c" "probe say ready sleep 600")' > "$root/a32db.conf"
+				rm -f "$root/home/.ssh/a32key" "$root/home/.ssh/a32key.pub"
+				ssh-keygen -q -t ed25519 -N '' -C hull-test-a32 -f "$root/home/.ssh/a32key"
+				{
+					printf 'Host qa32db.hull\n'
+					printf '  ProxyCommand env XDG_RUNTIME_DIR=%s %s proxy-ssh %%h\n' "$a32dbrt" "$hull"
+					printf '  User root\n  IdentityFile %s\n  IdentitiesOnly yes\n' "$root/home/.ssh/a32key"
+					printf '  BatchMode yes\n  ConnectTimeout 20\n  LogLevel error\n'
+					printf '  StrictHostKeyChecking yes\n  UserKnownHostsFile %s\n' "$root/a32db.known"
+				} > "$root/a32db.ssh"
+				rm -f "$root/a32db.out" "$root/a32db.known"
+				(cd / && exec env XDG_RUNTIME_DIR="$a32dbrt" XDG_CACHE_HOME="$root/cache" timeout -k 2 400 \
+					"$hull" run -f "$root/a32db.conf" > "$root/a32db.out" 2>&1) &
+				runner=$!
+				tries=0
+				until grep -q '^ready$' "$root/a32db.out" 2>/dev/null || [ "$tries" -ge 240 ]; do
+					tries=$((tries + 1))
+					sleep 0.5
+				done
+				printf 'qa32db.hull %s\n' \
+					"$(cut -d' ' -f1,2 "$root/data/hull/machines/qa32db/host_key.pub" 2>&1)" \
+					> "$root/a32db.known"
+				tries=0
+				until timeout 20 ssh -F "$root/a32db.ssh" qa32db.hull 'probe say up' < /dev/null 2>/dev/null |
+				      grep -q '^up$' || [ "$tries" -ge 60 ]; do
+					tries=$((tries + 1))
+					sleep 1
+				done
+				who=$(timeout 20 ssh -F "$root/a32db.ssh" qa32db.hull 'probe uid host' < /dev/null 2>&1)
+				XDG_RUNTIME_DIR="$a32dbrt" timeout 30 "$hull" stop qa32db > /dev/null 2>&1
+				wait "$runner"
+				cases=$((cases + 1))
+				[ "$who" = "$(printf 'uid=0\nhost=qa32db')" ] ||
+					fail "ssh did not log in as root to an arm machine through arm's dropbear" \
+						"$who; $(cat "$root/a32db.out")"
+				rm -f "$root/home/.ssh/a32key" "$root/home/.ssh/a32key.pub"
+				rm -rf "${root:?}/a32db"
+			fi
+			if [ -n "$a32dbrt" ]; then
+				tries=0
+				while [ -S "$a32dbrt/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+					tries=$((tries + 1))
+					sleep 0.25
+				done
+				rm -rf "${a32dbrt:?}"
+			fi
 		fi
 		for run in "$a32none" "$a32run"; do
 			tries=0

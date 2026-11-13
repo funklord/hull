@@ -116,6 +116,27 @@ static const hull_sshd_package hull_sshd_packages_s390x[] = {
 	  "ba4cc40012eb44163c6c750e621806274a3df6f35177ef5b01e97e91b76c512a" },
 };
 
+/* 32-bit arm's, armhf's, the same versions, each sha256 from the armhf
+ * Packages index of the snapshot, 2026-11-13. */
+static const hull_sshd_package hull_sshd_packages_arm[] = {
+	{ "d/dropbear/dropbear-bin_2025.89-1~deb13u1_armhf.deb",
+	  "afef10179f2a9403e1f98c22a40fe5d4f2d394fdadcac2c1ac0acddf9454494b" },
+	{ "libt/libtomcrypt/libtomcrypt1_1.18.2+dfsg-7+b2_armhf.deb",
+	  "2b76b7fa88ac363588007bd8bfc5b7a7154fcad5c0d3a9270fce6fe2492ff70a" },
+	{ "libt/libtommath/libtommath1_1.3.0-1_armhf.deb",
+	  "ef6dfd8afc4437c832ca28483ef19cc572d18a40a15fc4bebdba4bb415e1403c" },
+	{ "g/gmp/libgmp10_6.3.0+dfsg-3_armhf.deb",
+	  "b74d0fa0aa9d1e2f7addae5d3c235fc881e1507d98559ab158362bef56877a56" },
+	{ "z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+b1_armhf.deb",
+	  "81c55a59e1570477ecef6a449bf6dce44dad67ba4ce9e04760451d4cfe200534" },
+	{ "libx/libxcrypt/libcrypt1_4.4.38-1_armhf.deb",
+	  "42cb49bb5dbc41d8f2df55b60f4d3fb7c08b1146f59b3584d498c4858bdc9ade" },
+	{ "g/glibc/libc6_2.41-12+deb13u4_armhf.deb",
+	  "4fc6fed8d77d01c0dacb5fda8b880a8c8a669575936de5761b693077a6f6c2ec" },
+	{ "o/openssh/openssh-sftp-server_10.0p1-7+deb13u4_armhf.deb",
+	  "7337db5cadb267f4d6966af138d529bd611a3298a9aa5f4e7e557dfe9a746494" },
+};
+
 /* What differs between the two: dropbear as Debian builds it and as hull
  * runs it, its two paths rewritten (above); the loader it names; where
  * the libraries are. */
@@ -171,6 +192,11 @@ static const hull_sshd_arch hull_sshd_arches[] = {
 	  "2c7ba1d34b50f27b3a9654af0e737f321a8e4887649d88822e8ad195ad39246c",
 	  "5eb0c27243c09af179bebc475a87086392a7b2eff84112e62509b594fb3bb103",
 	  "/lib/ld64.so.1", HULL_SSHD_LIBS_S390X, HULL_SSHD_LOADER_S390X, HULL_SSHD_INTERP_SHORT },
+	{ "arm", hull_sshd_packages_arm,
+	  sizeof hull_sshd_packages_arm / sizeof hull_sshd_packages_arm[0],
+	  "c2e8b7809508725b31a3549ca65685de16a82b0bd1baf76d08c68f0fc74dfd17",
+	  "e93c8e520ee55e27b67900c67ff72e0eac20da2f5cd6e4eab79bfd77e81fe008",
+	  "/lib/ld-linux-armhf.so.3", HULL_SSHD_LIBS_ARM, HULL_SSHD_LOADER_ARM, HULL_SSHD_INTERP_TO },
 };
 
 /* `arch`'s, or NULL where hull fetches none for it. */
