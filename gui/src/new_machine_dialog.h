@@ -40,6 +40,8 @@ private:
 	QSpinBox  *cpus;
 	QCheckBox *overlay;
 	QCheckBox *ssh;
+	QComboBox *screen;
+	QComboBox *gpu;
 	QLabel    *problem;
 	QString    file;
 };

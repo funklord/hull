@@ -57,6 +57,8 @@ struct new_machine {
 	int         cpus = 0;
 	bool        overlay = false;
 	bool        ssh = false;
+	QString     display;   /* "", window, vnc or local: (display ...) */
+	QString     gpu;       /* "", virgl or venus: (tuning (qemu (gpu ...))) */
 };
 
 /*

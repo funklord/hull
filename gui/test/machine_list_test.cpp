@@ -87,6 +87,7 @@ int main(int argc, char **argv)
 	/* Written, then read back by the real planner. */
 	QDir().mkpath(scratch + QStringLiteral("/plain/rootfs"));
 	QDir().mkpath(scratch + QStringLiteral("/vm/rootfs"));
+	QDir().mkpath(scratch + QStringLiteral("/screen/rootfs"));
 	{
 		new_machine m;
 		int         code = 0;
@@ -120,6 +121,21 @@ int main(int argc, char **argv)
 		                           "(ssh true)" })
 			check(said.contains(QString::fromLatin1(entry)), entry, said);
 	}
+	/* A screen for hull-gui, with 3D: what New's Screen and 3D write. */
+	{
+		new_machine m;
+		int         code = 0;
+
+		m.source = QStringLiteral("dir:./rootfs");
+		m.backend = QStringLiteral("vm");
+		m.display = QStringLiteral("local");
+		m.gpu = QStringLiteral("virgl");
+		const QString said = written(scratch + QStringLiteral("/screen"), m, &code, hull);
+
+		check(code == 0, "a written vm with a local 3D screen plans", said);
+		for (const char *entry : { "(display local)", "(gpu virgl)" })
+			check(said.contains(QString::fromLatin1(entry)), entry, said);
+	}
 
 	/* What the writer refuses, each with a reason. */
 	{
@@ -137,6 +153,10 @@ int main(int argc, char **argv)
 		check(spec_text(m, &why).isEmpty() && !why.isEmpty(), "a backend not a word refused",
 		      why);
 		m.backend.clear();
+		m.gpu = QStringLiteral("virgl");
+		why.clear();
+		check(spec_text(m, &why).isEmpty() && !why.isEmpty(), "3D with no screen refused", why);
+		m.gpu.clear();
 		m.command = { QStringLiteral("a\x01") };
 		why.clear();
 		check(spec_text(m, &why).isEmpty() && !why.isEmpty(),

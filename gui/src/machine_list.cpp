@@ -113,6 +113,14 @@ QString spec_text(const new_machine &machine, QString *why)
 		*why = QStringLiteral("a backend is a word: ns, vm, emu, pc, dos, or an engine's name");
 		return QString();
 	}
+	if (!machine.display.isEmpty() && !word.match(machine.display).hasMatch()) {
+		*why = QStringLiteral("a screen is a word: window, vnc or local");
+		return QString();
+	}
+	if (!machine.gpu.isEmpty() && (!word.match(machine.gpu).hasMatch() || machine.display.isEmpty())) {
+		*why = QStringLiteral("3D is a screen's: choose one, in hull-gui (local) for 3D shown here");
+		return QString();
+	}
 	if (!machine.memory.isEmpty() && !size.match(machine.memory).hasMatch()) {
 		*why = QStringLiteral("memory is a size such as 512M or 2G");
 		return QString();
@@ -137,6 +145,10 @@ QString spec_text(const new_machine &machine, QString *why)
 		text += QStringLiteral("  (cpus %1)\n").arg(machine.cpus);
 	if (machine.ssh)
 		text += QStringLiteral("  (ssh true)\n");
+	if (!machine.display.isEmpty())
+		text += QStringLiteral("  (display %1)\n").arg(machine.display);
+	if (!machine.gpu.isEmpty())
+		text += QStringLiteral("  (tuning (qemu (gpu %1)))\n").arg(machine.gpu);
 	if (!ok) {
 		*why = QStringLiteral("a field holds a control character the spec cannot carry");
 		return QString();

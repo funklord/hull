@@ -50,6 +50,19 @@ new_machine_dialog::new_machine_dialog(const QStringList &images, const QString 
 	cpus->setSpecialValueText(QStringLiteral("the engine's default"));
 	overlay = new QCheckBox(QStringLiteral("&Keep the source as it is (overlay)"));
 	ssh = new QCheckBox(QStringLiteral("&SSH into it (hull ssh)"));
+	/* A screen, as VirtualBox's machines have: hull-gui's own window
+	 * first, which is near native and the only one with 3D shown here. */
+	screen = new QComboBox;
+	screen->addItem(QStringLiteral("none"), QString());
+	screen->addItem(QStringLiteral("in hull-gui (local)"), QStringLiteral("local"));
+	screen->addItem(QStringLiteral("by VNC, at its address"), QStringLiteral("vnc"));
+	screen->addItem(QStringLiteral("qemu's own window"), QStringLiteral("window"));
+	gpu = new QComboBox;
+	gpu->addItem(QStringLiteral("none"), QString());
+	gpu->addItem(QStringLiteral("OpenGL on this host's GPU (virgl)"), QStringLiteral("virgl"));
+	gpu->addItem(QStringLiteral("Vulkan on this host's GPU (Venus)"), QStringLiteral("venus"));
+	gpu->setToolTip(QStringLiteral("A vm's 3D, the guest needing Mesa's driver; Venus needs "
+	                               "/dev/udmabuf open to the user"));
 	problem = new QLabel;
 	problem->setWordWrap(true);
 
@@ -61,6 +74,8 @@ new_machine_dialog::new_machine_dialog(const QStringList &images, const QString 
 	form->addRow(QStringLiteral("&Command:"), command);
 	form->addRow(QStringLiteral("&Memory:"), memory);
 	form->addRow(QStringLiteral("C&PUs:"), cpus);
+	form->addRow(QStringLiteral("Sc&reen:"), screen);
+	form->addRow(QStringLiteral("&3D:"), gpu);
 	form->addRow(QString(), overlay);
 	form->addRow(QString(), ssh);
 
@@ -90,6 +105,8 @@ void new_machine_dialog::accept()
 	machine.cpus = cpus->value();
 	machine.overlay = overlay->isChecked();
 	machine.ssh = ssh->isChecked();
+	machine.display = screen->currentData().toString();
+	machine.gpu = gpu->currentData().toString();
 
 	const QString text = spec_text(machine, &why);
 
