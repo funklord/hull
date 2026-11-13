@@ -198,6 +198,7 @@ struct hull_machine {
 	int              vnc;          /* (display vnc): its screen by VNC at its address */
 	char            *x_display;    /* (display window): the run's X display */
 	char            *xauthority;   /* and its authority, or NULL */
+	int              gpu;          /* (tuning (qemu (gpu ...))): 0 2d, 1 virgl, 2 venus */
 	int              bridge;       /* (network bridge): a tap on a host bridge, its core root */
 	int              bridge_own;   /* on HULL_BRIDGE, hull addressing it, not (bridge NAME) */
 	char             bridge_name[16];
@@ -980,6 +981,23 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			m->xauthority = hull_access_value(doc, &screen, "xauthority");
 		if (m->s390x)
 			return "(display ...) is a virtio-gpu, which an s390x machine has none of here";
+	}
+	/* (tuning (qemu (gpu virgl|venus))): its GPU's 3D, the host's own GPU
+	 * shared: virgl forwards OpenGL, Venus Vulkan, through virglrenderer
+	 * to the host's driver; the guest needs Mesa's virgl or Venus driver. */
+	{
+		hull_sexpr_form tuning;
+		hull_sexpr_form qemu_tuning;
+
+		if (hull_access_find(doc, &machine, "tuning", &tuning) &&
+		    hull_access_find(doc, &tuning, "qemu", &qemu_tuning) &&
+		    (text = hull_access_value(doc, &qemu_tuning, "gpu")) != NULL) {
+			m->gpu = strcmp(text, "venus") == 0 ? 2 : strcmp(text, "virgl") == 0 ? 1 : 0;
+			free(text);
+			if (m->gpu != 0 && !m->screen)
+				return "(gpu virgl) and (gpu venus) are a screen's 3D: the machine needs "
+				       "(display window) or (display vnc)";
+		}
 	}
 	text = hull_access_value(doc, &machine, "network");
 	m->no_network = text != NULL && strcmp(text, "none") == 0;
@@ -2426,7 +2444,15 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	argv[n++] = "-display";
 	/* VNC's display 0 is port 5900, at the machine's own address. */
 	snprintf(vnc, sizeof vnc, "vnc=%s:0", m->address_text);
-	argv[n++] = m->vnc ? vnc : m->screen ? "sdl" : "none";
+	/* With 3D, the window renders by OpenGL, and VNC's frames are rendered
+	 * headless by EGL on the host's render node and served by -vnc. */
+	argv[n++] = m->gpu != 0 ? (m->vnc ? "egl-headless" : "sdl,gl=on") :
+	            m->vnc ? vnc : m->screen ? "sdl" : "none";
+	if (m->gpu != 0 && m->vnc) {
+		snprintf(vnc, sizeof vnc, "%s:0", m->address_text);
+		argv[n++] = "-vnc";
+		argv[n++] = vnc;
+	}
 	argv[n++] = "-no-reboot";
 	argv[n++] = "-M";
 	/* virt under KVM takes the host's interrupt controller, a GICv3 where
@@ -2450,9 +2476,10 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	argv[n++] = m->emu ? "max" : "host";
 	argv[n++] = "-m";
 	argv[n++] = memory;
-	if (m->virtiofsd != NULL) {
+	if (m->virtiofsd != NULL || m->gpu == 2) {
 		/* The daemon reads and writes the guest's buffers itself, so its
-		 * memory has to be shareable. */
+		 * memory has to be shareable; so does Venus, whose blobs are the
+		 * guest's memory mapped by the host. */
 		snprintf(shared_memory, sizeof shared_memory, "memory-backend-memfd,id=mem,size=%luM,share=on",
 		         m->memory_mib);
 		argv[n++] = "-object";
@@ -2732,7 +2759,8 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	}
 	if (m->screen) {
 		argv[n++] = "-device";
-		argv[n++] = "virtio-gpu-pci";
+		argv[n++] = m->gpu == 2 ? "virtio-gpu-gl-pci,venus=on,blob=on,hostmem=4G" :
+		            m->gpu == 1 ? "virtio-gpu-gl-pci" : "virtio-gpu-pci";
 		argv[n++] = "-device";
 		argv[n++] = "virtio-keyboard-pci";
 		argv[n++] = "-device";
@@ -3239,6 +3267,51 @@ static int expect(hull_machine *m, const char *type)
 	return 0;
 }
 
+/*
+ * Every process left in the session qemu led, killed: what qemu forked and
+ * did not end with it. virglrenderer's Venus render server is one, a fork
+ * of qemu in a process group of its own, which went on spinning under init
+ * after its machine had ended, measured 2026-11-13 on an RTX 3060 with
+ * NVIDIA's 615 driver. Called while qemu is a zombie not yet reaped, so
+ * its pid, the session's id, cannot have been given to another.
+ */
+static void end_session(pid_t leader)
+{
+	DIR           *proc = opendir("/proc");
+	struct dirent *entry;
+
+	if (proc == NULL)
+		return;
+	while ((entry = readdir(proc)) != NULL) {
+		char  path[300];
+		char  stat[1024];
+		char *close_paren;
+		long  pid = strtol(entry->d_name, NULL, 10);
+		int   fd;
+		ssize_t got;
+		long  ppid, pgrp, session;
+		char  state;
+
+		if (pid <= 0 || pid == leader)
+			continue;
+		snprintf(path, sizeof path, "/proc/%ld/stat", pid);
+		if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0)
+			continue;
+		got = read(fd, stat, sizeof stat - 1u);
+		close(fd);
+		if (got <= 0)
+			continue;
+		stat[got] = '\0';
+		/* After the command's name, which may hold anything, its ')'. */
+		if ((close_paren = strrchr(stat, ')')) == NULL ||
+		    sscanf(close_paren + 1, " %c %ld %ld %ld", &state, &ppid, &pgrp, &session) != 4)
+			continue;
+		if (session == (long)leader)
+			kill((pid_t)pid, SIGKILL);
+	}
+	closedir(proc);
+}
+
 static void reap(hull_machine *m)
 {
 	siginfo_t info;
@@ -3257,6 +3330,7 @@ static void reap(hull_machine *m)
 	}
 	while (waitid(P_PID, (id_t)m->qemu, &info, WEXITED | WNOWAIT) < 0 && errno == EINTR)
 		;
+	end_session(m->qemu);
 	pthread_mutex_lock(&m->lock);
 	waitpid(m->qemu, NULL, 0);
 	m->done = 1;
@@ -4319,6 +4393,15 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		            "riscv64 and s390x hosts");
 	if (!m->emu && access("/dev/kvm", R_OK | W_OK) != 0)
 		return fail(error, HULL_ERR_RUNTIME, "/dev/kvm is not open to this user");
+	/* Venus's blobs are the guest's memory handed to the host's GPU as
+	 * dma-bufs, which qemu makes through /dev/udmabuf: without it every
+	 * blob is refused and the guest's Vulkan fails with
+	 * ERROR_OUT_OF_HOST_MEMORY, measured 2026-11-13. */
+	if (m->gpu == 2 && access("/dev/udmabuf", R_OK | W_OK) != 0)
+		return fail(error, HULL_ERR_RUNTIME, "(gpu venus) hands the guest's memory to the host's "
+		            "GPU through /dev/udmabuf, which is not open to this user: on Debian it is "
+		            "the kvm group's, mode 660, where /dev/kvm is 666 -- the kvm group, or a udev "
+		            "rule opening it as /dev/kvm is; (gpu virgl) needs neither");
 	if (m->transport == 1 && access("/dev/vhost-vsock", R_OK | W_OK) != 0)
 		return fail(error, HULL_ERR_RUNTIME, "(transport vsock), and /dev/vhost-vsock is not "
 		            "open to this user: (transport auto) takes a serial port instead");
@@ -5840,6 +5923,13 @@ static const hull_cap_entry entries[] = {
 	{ "qemu.share.auto",       HULL_SUP_NATIVE, "virtiofs where virtiofsd is installed and the kernel is known to have it, else 9p", NULL },
 	{ "qemu.share.9p",         HULL_SUP_NATIVE, NULL, NULL },
 	{ "qemu.share.virtiofs",   HULL_SUP_NATIVE, "needs virtiofsd installed", NULL },
+	{ "qemu.gpu.2d",           HULL_SUP_NATIVE, NULL, NULL },
+	{ "qemu.gpu.virgl",        HULL_SUP_NATIVE,
+	  "OpenGL forwarded by virglrenderer to the host's GPU, shared; the guest needs Mesa's "
+	  "virgl driver", NULL },
+	{ "qemu.gpu.venus",        HULL_SUP_NATIVE,
+	  "Vulkan forwarded by Venus to the host's GPU and driver, shared, near native; the guest "
+	  "needs Mesa's Venus driver, and its memory is a shared memfd", NULL },
 	{ "qemu.iommu",            HULL_SUP_NATIVE,
 	  "q35's intel-iommu, with interrupt remapping and caching mode, the guest booted "
 	  "intel_iommu=on: its root may give a device to vfio-pci; x86 alone", NULL },
