@@ -3364,6 +3364,60 @@ else
 		done
 		rm -rf "${root:?}/szroot"
 	fi
+	# 32-bit arm, armhf, the same way, 2026-11-13: qemu-system-arm's virt
+	# below 4 GiB booting Debian's armmp kernel, the agent cross-built.
+	# hull builds no arm kernel of its own, so (kernel hull) is refused,
+	# naming the fetch; no dropbear is fetched for arm, so no ssh case.
+	arm_probe=${BUILD_DIR:?}/test/arm/rootfs/probe
+	if ! command -v qemu-system-arm > /dev/null ||
+	   [ ! -x "$(dirname "$hull")/hull-agent-arm" ] || [ ! -x "$arm_probe" ]; then
+		printf 'qemu: arm under emu not tried: no qemu-system-arm, hull-agent-arm or arm probe\n'
+	else
+		rm -rf "$root/a32root"
+		mkdir -p "$root/a32root/proc" "$root/a32root/dev" "$root/a32root/sys"
+		cp "$arm_probe" "$root/a32root/probe"
+		printf '(machine (source "dir:./a32root") (backend emu) (arch arm) (hostname "qa32") %s)\n' \
+			'(command "/probe" "say" "from arm" "host" "read" "/proc/sys/kernel/arch" "exit" "5")' \
+			> "$root/a32.conf"
+		printf '(machine (source "dir:./a32root") (backend emu) (arch arm) %s %s)\n' \
+			'(tuning (vm (kernel hull)))' '(command "/probe")' > "$root/a32hull.conf"
+		a32none=$(mktemp -d "$root/run-a32none.XXXXXX")
+		a32run=$(mktemp -d "$root/run-a32.XXXXXX")
+		name='an arm machine with no arm kernel fetched'
+		out=$(cd / && XDG_RUNTIME_DIR=$a32none XDG_CACHE_HOME="$root/cache-empty" timeout 60 \
+			"$hull" run -f "$root/a32.conf" 2>&1)
+		got=$?
+		has 125 '`hull kernel fetch --arch arm` downloads it'
+		name='(kernel hull) on arm'
+		out=$(cd / && XDG_RUNTIME_DIR=$a32none XDG_CACHE_HOME="$root/cache-empty" timeout 60 \
+			"$hull" run -f "$root/a32hull.conf" 2>&1)
+		got=$?
+		has 125 'is built for amd64 and arm64'
+		name='kernel fetch --arch arm'
+		out=$(XDG_CACHE_HOME="$root/cache" timeout 300 "$hull" kernel fetch --arch arm 2>&1)
+		got=$?
+		if [ "$got" -ne 0 ] && printf '%s\n' "$out" | grep -q 'answered\|could not\|resolve\|connect'; then
+			printf 'qemu: arm under emu not tried: %s\n' "$out"
+		else
+			has 0 "^$root/cache/hull/kernel-arm-[0-9]"
+			name='an arm machine under emu'
+			out=$(cd / && XDG_RUNTIME_DIR=$a32run XDG_CACHE_HOME="$root/cache" timeout 300 \
+				"$hull" run -f "$root/a32.conf" 2>&1)
+			got=$?
+			has 5 '^from arm$'
+			has 5 '^host=qa32$'
+			has 5 '^read=armv7l$'
+		fi
+		for run in "$a32none" "$a32run"; do
+			tries=0
+			while [ -S "$run/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+				tries=$((tries + 1))
+				sleep 0.25
+			done
+			rm -rf "${run:?}"
+		done
+		rm -rf "${root:?}/a32root"
+	fi
 	# Only emu runs another arch: on vm, refused at plan.
 	printf '(machine (source "dir:./a64root") (backend vm) (arch arm64) (command "/probe"))\n' \
 		> "$root/a64vm.conf"

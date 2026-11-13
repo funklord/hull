@@ -139,6 +139,7 @@ struct hull_machine {
 	int              emu;          /* TCG, else KVM */
 	int              arm64;        /* an arm64 guest: qemu-system-aarch64's virt */
 	int              riscv64;      /* a riscv64 guest: qemu-system-riscv64's virt, emu alone */
+	int              arm;          /* a 32-bit arm guest, armhf: qemu-system-arm's virt, emu alone */
 	int              s390x;        /* an s390x guest: qemu-system-s390x's s390-ccw-virtio,
 	                                * emu alone, big-endian */
 	char             arch[16];     /* the guest's, amd64 or arm64, as the spec spells it */
@@ -531,8 +532,8 @@ static const char *read_sleep(hull_machine *m, const hull_sexpr_doc *doc,
 	m->sleep = hull_access_true(doc, machine, "sleep");
 	if (!m->sleep)
 		return NULL;
-	if (m->arm64 || m->riscv64 || m->s390x)
-		return "(sleep true) is q35's ACPI S3: an arm64, riscv64 or s390x machine has no "
+	if (m->arm64 || m->riscv64 || m->s390x || m->arm)
+		return "(sleep true) is q35's ACPI S3: an arm64, riscv64, s390x or arm machine has no "
 		       "sleep state";
 	if (!m->block_root)
 		return "(sleep true) wants (projection block): Linux's 9p and virtiofs cannot suspend, "
@@ -579,10 +580,12 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	         text == NULL || strcmp(text, "host") == 0 ? host_arch() : text);
 	free(text);
 	if (strcmp(m->arch, "amd64") != 0 && strcmp(m->arch, "arm64") != 0 &&
-	    strcmp(m->arch, "riscv64") != 0 && strcmp(m->arch, "s390x") != 0)
-		return "the qemu engine runs an amd64, an arm64, a riscv64 or an s390x machine";
+	    strcmp(m->arch, "riscv64") != 0 && strcmp(m->arch, "s390x") != 0 &&
+	    strcmp(m->arch, "arm") != 0)
+		return "the qemu engine runs an amd64, an arm64, a riscv64, an s390x or an arm machine";
 	m->arm64 = strcmp(m->arch, "arm64") == 0;
 	m->riscv64 = strcmp(m->arch, "riscv64") == 0;
+	m->arm = strcmp(m->arch, "arm") == 0;
 	m->s390x = strcmp(m->arch, "s390x") == 0;
 	if (strcmp(m->arch, host_arch()) != 0 && !m->emu)
 		return "a machine of another arch than the host's is emulated: it runs under emu";
@@ -741,8 +744,8 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	if (m->writeback && (!m->block_root || m->overlay || m->composefs != NULL))
 		return "(writeback sync-on-stop) writes a block projection's image back to its "
 		       "directory: it needs (projection block) and (mutable direct)";
-	if ((m->arm64 || m->riscv64 || m->s390x) && m->block_root)
-		return "an arm64, riscv64 or s390x machine's root is a share: a block projection is "
+	if ((m->arm64 || m->riscv64 || m->s390x || m->arm) && m->block_root)
+		return "an arm64, riscv64, s390x or arm machine's root is a share: a block projection is "
 		       "x86's so far";
 	if (m->composefs != NULL && (m->block_root || m->host_overlay || m->owners != NULL))
 		return "a composefs root is the image over the store's objects: a block projection, "
@@ -789,8 +792,8 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		free(text);
 		/* The UART is the PC's, an ISA 16550 at ttyS0, which qemu's virt
 		 * and s390-ccw-virtio have none of. */
-		if (m->transport == 3 && (m->arm64 || m->riscv64 || m->s390x))
-			return "(transport uart) is a PC's ISA serial port: an arm64, riscv64 or s390x "
+		if (m->transport == 3 && (m->arm64 || m->riscv64 || m->s390x || m->arm))
+			return "(transport uart) is a PC's ISA serial port: an arm64, riscv64, s390x or arm "
 			       "machine has none, so its agent is reached by vsock or a virtio-serial port";
 	}
 	/* (tuning (qemu (iommu true))): an IOMMU the guest's kernel drives,
@@ -799,8 +802,8 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	 * would, which software that drives devices so is tested against. */
 	if (hull_access_find(doc, &machine, "tuning", &entry) &&
 	    hull_access_find(doc, &entry, "qemu", &item) && hull_access_true(doc, &item, "iommu")) {
-		if (m->arm64 || m->riscv64 || m->s390x)
-			return "(iommu true) is q35's intel-iommu: an arm64, riscv64 or s390x machine "
+		if (m->arm64 || m->riscv64 || m->s390x || m->arm)
+			return "(iommu true) is q35's intel-iommu: an arm64, riscv64, s390x or arm machine "
 			       "has none of hull's";
 		m->iommu = 1;
 	}
@@ -860,8 +863,8 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			return "a vm has four serial ports: (devices (serial ...)) names more";
 		if (parallel > MAX_PARALLEL)
 			return "a vm has three parallel ports: (devices (parallel ...)) names more";
-		if ((m->arm64 || m->riscv64 || m->s390x) && m->device_count > 0u)
-			return "an arm64, riscv64 or s390x machine has no host devices passed to it yet";
+		if ((m->arm64 || m->riscv64 || m->s390x || m->arm) && m->device_count > 0u)
+			return "an arm64, riscv64, s390x or arm machine has no host devices passed to it yet";
 	}
 	m->memory_mib = 512u;
 	if ((text = hull_access_value(doc, &machine, "memory")) != NULL) {
@@ -1506,6 +1509,8 @@ static const char *write_initramfs(const hull_machine *m, const char *modules, i
 		                    "read: it is built where riscv64-linux-gnu-gcc is installed" :
 		       m->s390x ? "the s390x guest agent, hull-agent-s390x beside hull, cannot be read: "
 		                  "it is built where s390x-linux-gnu-gcc is installed" :
+		       m->arm ? "the arm guest agent, hull-agent-arm beside hull, cannot be read: it is "
+		                "built where arm-linux-gnueabihf-gcc is installed" :
 		                  "the amd64 guest agent, hull-agent-amd64 beside hull, cannot be read: "
 		                  "it is built where x86_64-linux-gnu-gcc is installed";
 	/* A path kernel whose modules the host does not have is taken to have
@@ -2381,7 +2386,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	         ",readonly=on" : "");
 
 	argv[n++] = m->arm64 ? "qemu-system-aarch64" : m->riscv64 ? "qemu-system-riscv64" :
-	            m->s390x ? "qemu-system-s390x" : "qemu-system-x86_64";
+	            m->s390x ? "qemu-system-s390x" : m->arm ? "qemu-system-arm" : "qemu-system-x86_64";
 	argv[n++] = "-nodefaults";
 	argv[n++] = "-no-user-config";
 	argv[n++] = "-display";
@@ -2391,10 +2396,13 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	/* virt under KVM takes the host's interrupt controller, a GICv3 where
 	 * qemu's default GICv2 is one KVM cannot give. */
 	/* riscv64's virt boots OpenSBI, qemu's own, before the kernel. */
+	/* A 32-bit arm guest's virt keeps its devices below 4 GiB: Debian's
+	 * armmp kernel has no LPAE to reach the PCI window above it. */
 	/* intel-iommu remaps interrupts, which under KVM wants the irqchip
 	 * split; caching mode lets a vm nested in the guest have a device. */
 	argv[n++] = m->arm64 ? (m->emu ? "virt,virtualization=on" : "virt,gic-version=host") :
-	            m->riscv64 ? "virt" : m->s390x ? "s390-ccw-virtio" : m->micro ? MICROVM_OPTIONS :
+	            m->riscv64 ? "virt" : m->arm ? "virt,highmem=off" :
+	            m->s390x ? "s390-ccw-virtio" : m->micro ? MICROVM_OPTIONS :
 	            m->iommu && !m->emu ? "q35,kernel-irqchip=split" : "q35";
 	if (m->iommu) {
 		argv[n++] = "-device";
@@ -2972,7 +2980,8 @@ static int micro_fits(const hull_machine *m, char *kernel, size_t cap)
 	char       *slash;
 	unsigned    transports = MICROVM_FIXED + m->volume_count + m->segment_count;
 
-	if (m->profile_full || m->sleep || m->iommu || m->arm64 || m->riscv64 || m->s390x || m->emu ||
+	if (m->profile_full || m->sleep || m->iommu || m->arm64 || m->riscv64 || m->s390x || m->arm ||
+	    m->emu ||
 	    m->device_count != 0u ||
 	    m->transport == 3 ||
 	    transports > MICROVM_TRANSPORTS || !qemu_has_microvm())
@@ -4278,7 +4287,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	 * distribution's kernel: a workload wanting a module outside hull's
 	 * set is a full machine's. */
 	if (!m->kernel_hull && !m->kernel_fetched && m->kernel_path == NULL && !m->kernel_image &&
-	    !m->profile_full && !m->sleep && !m->riscv64 && !m->s390x &&
+	    !m->profile_full && !m->sleep && !m->riscv64 && !m->s390x && !m->arm &&
 	    agent_path(kbuf, sizeof kbuf, host_arch()) && strrchr(kbuf, '/') != NULL) {
 		snprintf(strrchr(kbuf, '/'), sizeof kbuf - (size_t)(strrchr(kbuf, '/') - kbuf),
 		         "/vmlinuz-hull%s", m->arm64 ? "-arm64" : "");
@@ -4296,10 +4305,12 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		const char *arch = m->arm64 ? "-arm64" : "";
 		char        dep[4400];
 
-		if (m->riscv64 || m->s390x)
+		if (m->riscv64 || m->s390x || m->arm)
 			return fail(error, HULL_ERR_RUNTIME, m->s390x ?
 			            "(kernel hull) is built for amd64 and arm64: an s390x machine boots "
-			            "Debian's, `hull kernel fetch --arch s390x`'s" :
+			            "Debian's, `hull kernel fetch --arch s390x`'s" : m->arm ?
+			            "(kernel hull) is built for amd64 and arm64: an arm machine boots "
+			            "Debian's, `hull kernel fetch --arch arm`'s" :
 			            "(kernel hull) is built for amd64 and arm64: a "
 			            "riscv64 machine boots Debian's, `hull kernel fetch --arch riscv64`'s");
 		if (!agent_path(kbuf, sizeof kbuf, host_arch()) || strrchr(kbuf, '/') == NULL)
@@ -5740,16 +5751,16 @@ static const hull_cap_entry entries[] = {
 	 * micro profile and Appendix F's bundled kernel. */
 	{ "vm.profile.micro",    HULL_SUP_EMULATED,
 	  "a q35 machine, about a second to boot, on every kernel but hull's own, which under KVM is "
-	  "a microvm where the machine has no device of the host's; an arm64 or riscv64 machine "
-	  "is qemu's virt under emu, an s390x one s390-ccw-virtio", NULL },
+	  "a microvm where the machine has no device of the host's; an arm64, riscv64 or arm "
+	  "machine is qemu's virt under emu, an s390x one s390-ccw-virtio", NULL },
 	{ "vm.profile.full",     HULL_SUP_NATIVE,
-	  "a q35 machine, whatever the kernel; an arm64 or riscv64 machine is qemu's virt, an "
+	  "a q35 machine, whatever the kernel; an arm64, riscv64 or arm machine is qemu's virt, an "
 	  "s390x one s390-ccw-virtio", NULL },
 	{ "vm.kernel.bundled",   HULL_SUP_EMULATED,
 	  "hull's own kernel, as (kernel hull), where `make kernel` built it beside hull; else, and "
 	  "under (profile full), the host's own kernel and modules, or for a machine of another "
-	  "arch Debian's kernel of that arch, `hull kernel fetch --arch ARCH`'s; riscv64 and s390x "
-	  "have no kernel of hull's", NULL },
+	  "arch Debian's kernel of that arch, `hull kernel fetch --arch ARCH`'s; riscv64, s390x and "
+	  "arm have no kernel of hull's", NULL },
 	{ "vm.kernel.path",      HULL_SUP_NATIVE,
 	  "the kernel at the given path, booted as given; its modules are the host's for its "
 	  "release where it has them, else it must have its guest drivers built in", NULL },
@@ -5789,7 +5800,7 @@ static const hull_cap_entry entries[] = {
 static const char *const classes[] = { "vm", "emu", NULL };
 
 /* What emu runs besides the host's own arch (section 5.3). */
-static const char *const qemu_arches[] = { "amd64", "arm64", "riscv64", "s390x", NULL };
+static const char *const qemu_arches[] = { "amd64", "arm64", "riscv64", "s390x", "arm", NULL };
 
 static const hull_capabilities caps = {
 	.struct_size    = sizeof (hull_capabilities),

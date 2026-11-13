@@ -145,6 +145,8 @@ typedef struct hull_sshd_arch {
 #define HULL_SSHD_LOADER_S390X HULL_SSHD_LIBS_S390X "/ld64.so.1"
 #define HULL_SSHD_LIBS_RISCV64   "usr/lib/riscv64-linux-gnu"
 #define HULL_SSHD_LOADER_RISCV64 HULL_SSHD_LIBS_RISCV64 "/ld-linux-riscv64-lp64d.so.1"
+#define HULL_SSHD_LIBS_ARM     "usr/lib/arm-linux-gnueabihf"
+#define HULL_SSHD_LOADER_ARM   HULL_SSHD_LIBS_ARM "/ld-linux-armhf.so.3"
 
 static const hull_sshd_arch hull_sshd_arches[] = {
 	{ "amd64", hull_sshd_packages, sizeof hull_sshd_packages / sizeof hull_sshd_packages[0],
@@ -198,12 +200,16 @@ static inline const hull_sshd_arch *hull_sshd_arch_of(const char *arch)
 #define HULL_SSHD_LIBS        HULL_SSHD_LIBS_S390X
 #define HULL_SSHD_LOADER      HULL_SSHD_LOADER_S390X
 #define HULL_SSHD_FETCH_ARCH  " --arch s390x"
+#elif defined(__arm__)
+#define HULL_SSHD_LIBS        HULL_SSHD_LIBS_ARM
+#define HULL_SSHD_LOADER      HULL_SSHD_LOADER_ARM
+#define HULL_SSHD_FETCH_ARCH  " --arch arm"
 #elif defined(__x86_64__)
 #define HULL_SSHD_LIBS        HULL_SSHD_LIBS_AMD64
 #define HULL_SSHD_LOADER      HULL_SSHD_LOADER_AMD64
 #define HULL_SSHD_FETCH_ARCH  ""
 #else
-#error "hull knows the libraries of amd64, arm64, riscv64 and s390x alone"
+#error "hull knows the libraries of amd64, arm64, riscv64, s390x and arm alone"
 #endif
 #define HULL_SSHD_DROPBEAR    "usr/sbin/dropbear"
 #define HULL_SSHD_CONVERT     "usr/bin/dropbearconvert"
