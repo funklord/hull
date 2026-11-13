@@ -1260,8 +1260,31 @@ static void compose_volume(svc *s, char *spec)
 	int   ro;
 	int   named = 0;
 
+	/* An anonymous volume, a guest path alone: compose keeps one across
+	 * `up` by taking the last container's, so it is the service's own
+	 * named volume, SERVICE-PATH with its slashes made dashes, filled from
+	 * the image as compose fills it. */
 	if (c1 == NULL) {
-		svc_note(s, "anonymous volume not translated", p);
+		char anonymous[300];
+		int  n = snprintf(anonymous, sizeof anonymous, "%s%s", s->name, trim(p));
+
+		for (char *c = anonymous; n > 0 && *c != '\0'; c++)
+			if (*c == '/')
+				*c = '-';
+		while (n > 0 && anonymous[n - 1] == '-')
+			anonymous[--n] = '\0';
+		if (n <= 0 || (size_t)n >= sizeof anonymous || trim(p)[0] != '/' ||
+		    !named_volume(anonymous, kept, sizeof kept)) {
+			svc_note(s, "anonymous volume not translated", p);
+			return;
+		}
+		svc_note(s, "anonymous volume kept as the service's own, filled from the image when "
+		         "empty, at", kept);
+		sb_str(&s->volumes, " (volume (host ");
+		sb_quoted(&s->volumes, kept);
+		sb_str(&s->volumes, ") (guest ");
+		sb_quoted(&s->volumes, trim(p));
+		sb_str(&s->volumes, ") (fill image))");
 		return;
 	}
 	*c1 = '\0';

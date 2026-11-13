@@ -391,6 +391,12 @@ cases=$((cases + 1))
 expect 1 'named volume kept' env XDG_DATA_HOME="$dir/vdata" "$hull" plan -f "$dir/vars/named.yaml" --backend chroot
 cases=$((cases + 1))
 [ -d "$dir/vdata/hull/compose/vars/data" ] || fail 'the dialect makes it' ''
+# An anonymous volume, a guest path alone, is the service's own named
+# volume, kept across runs as compose keeps one, filled from the image.
+printf 'services:\n  db:\n    image: alpine\n    volumes:\n      - /var/lib/anon/\n' \
+	> "$dir/vars/anon.yaml"
+expect 0 'compose/vars/db-var-lib-anon"\) \(guest "/var/lib/anon/"\) \(fill image\)' \
+	env XDG_DATA_HOME="$dir/vdata" "$hull" import "$dir/vars/anon.yaml"
 # hull import of a compose file (by its .yml name) to a (machines ...) form.
 # Section 4.8 plans a file's machines at once with no ordering, so
 # depends_on is (after ...); each network is an addressed segment
