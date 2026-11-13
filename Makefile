@@ -255,6 +255,8 @@ SDCC         ?= sdcc
 BOARD_AVR  := $(if $(shell command -v $(BOARD_AVR_CC) 2>/dev/null),$(BUILD_DIR)/test/board-fw/echo_avr.elf)
 BOARD_ARM  := $(if $(and $(shell command -v $(BOARD_ARM_CC) 2>/dev/null),$(BOARD_ARM_LD)),$(BUILD_DIR)/test/board-fw/echo_stm32.elf)
 BOARD_8051 := $(if $(shell command -v $(SDCC) 2>/dev/null),$(BUILD_DIR)/test/board-fw/echo_8051.ihx)
+LM3S_NETS   = nat wire-a wire-b
+BOARD_LM3S := $(if $(BOARD_ARM),$(foreach w,$(LM3S_NETS),$(BUILD_DIR)/test/board-fw/lm3s-net-$(w).elf))
 # Espressif's chips: each NAME:LOAD:CHIP-ID:BOOT-OFFSET:UART0, the RISC-V
 # ones by clang and lld, the Xtensa ones by llvm-mc, into flash images by
 # test/board/esp_image.py; run on Espressif's qemu where `hull esp fetch`
@@ -281,7 +283,8 @@ ESP_ALL     = $(foreach c,$(ESP_RV_CHIPS) $(ESP_XT_CHIPS),$(call esp_name,$(c)))
 BOARD_TEST_FILES = $(addprefix $(BUILD_DIR)/test/board-fw/, echo_avr.elf echo_stm32.o echo_stm32.elf \
                    echo_8051.ihx echo_8051.rel echo_8051.lk echo_8051.map echo_8051.mem \
                    echo_8051.lst echo_8051.rst echo_8051.sym echo_8051.asm \
-                   $(foreach n,$(ESP_ALL),$(n).flash $(n).o $(n).elf $(n).bin $(n).s))
+                   $(foreach n,$(ESP_ALL),$(n).flash $(n).o $(n).elf $(n).bin $(n).s) \
+                   $(foreach w,$(LM3S_NETS),lm3s-net-$(w).elf lm3s-net-$(w).o))
 # What check-fuzz writes, but for what it finds, in $(FUZZ_DIR)/found,
 # which is kept: a crash's input is what reproduces it.
 FUZZ_FILES = $(addprefix $(BUILD_DIR)/fuzz/, json_fuzz unpack_fuzz pack_fuzz corpus/json/manifest \
@@ -1066,8 +1069,9 @@ check-usb: $(HULL) $(AGENT_BIN) $(PROBE)
 # Microcontroller boards as pc machines: firmware of test/board's, run on
 # qemu's Uno and STM32VLDISCOVERY, SDCC's s51 and Espressif's qemu's
 # ESP32s, no KVM.
-check-board: $(HULL) $(BOARD_AVR) $(BOARD_ARM) $(BOARD_8051) $(BOARD_ESP)
-	BUILD_DIR='$(BUILD_DIR)' sh test/board_test.sh '$(HULL)' '$(BOARD_AVR)' '$(BOARD_ARM)' \
+check-board: $(HULL) $(BOARD_AVR) $(BOARD_ARM) $(BOARD_8051) $(BOARD_ESP) $(BOARD_LM3S)
+	BUILD_DIR='$(BUILD_DIR)' LM3S_NET='$(if $(BOARD_LM3S),$(BUILD_DIR)/test/board-fw)' \
+		sh test/board_test.sh '$(HULL)' '$(BOARD_AVR)' '$(BOARD_ARM)' \
 		'$(BOARD_8051)' $(strip $(BOARD_ESP))
 
 $(BUILD_DIR)/test/board-fw/echo_avr.elf: test/board/echo_avr.c
@@ -1103,6 +1107,15 @@ $$(BUILD_DIR)/test/board-fw/$(1).flash: test/board/echo_esp_xt.S test/board/esp_
 	$$(BOARD_OBJCOPY) -O binary -j .text $$(@D)/$(1).o $$(@D)/$(1).bin
 	$$(PYTHON) test/board/esp_image.py $$(@D)/$(1).bin $(2) $(3) $(4) $$@
 endef
+# The LM3S6965's network firmware, as the ESP32-C3's: NAT and a wire.
+define lm3s_net_rule
+$$(BUILD_DIR)/test/board-fw/lm3s-net-$(1).elf: test/board/lm3s_net.c test/board/lm3s6965.ld
+	@mkdir -p '$$(@D)'
+	$$(BOARD_ARM_CC) --target=thumbv7m-none-eabi -mcpu=cortex-m3 -mthumb -ffreestanding -nostdlib \
+		-Os -Wall -Wextra $$(ESP_NET_$(1)) -c -o $$(@D)/lm3s-net-$(1).o $$<
+	$$(BOARD_ARM_LD) -T test/board/lm3s6965.ld --entry=reset -o $$@ $$(@D)/lm3s-net-$(1).o
+endef
+$(foreach w,$(LM3S_NETS),$(eval $(call lm3s_net_rule,$(w))))
 define esp_net_rule
 $$(BUILD_DIR)/test/board-fw/esp32c3-net-$(1).flash: test/board/echo_esp_net.c test/board/esp_image.py
 	@mkdir -p '$$(@D)'

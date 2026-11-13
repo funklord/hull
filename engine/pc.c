@@ -164,32 +164,36 @@ typedef struct board {
 	const char *chip;    /* qemu's machine, where it is not the board's name */
 	unsigned    flash;   /* an ESP32's flash in MB; 0, the smallest of 4, 8 and 16 to hold it */
 	unsigned    boot;    /* an ESP32's: where its ROM reads the bootloader in flash */
+	const char *nic;     /* its Ethernet, qemu's model, where it has one */
 } board;
 
 /* An ESP32: Espressif's qemu (engine/esp.h), the firmware a whole flash
  * image, as `esptool.py merge_bin` makes, given to the chip's SPI flash. */
 #define ESP_LOAD "flash"
-#define ESP32(name, chip, flash) { name, "qemu-system-xtensa", ESP_LOAD, chip, flash, 0x1000u }
-#define ESP_XT(name, chip, flash) { name, "qemu-system-xtensa", ESP_LOAD, chip, flash, 0u }
-#define ESP_RV(name, chip, flash, boot) { name, "qemu-system-riscv32", ESP_LOAD, chip, flash, boot }
+#define ESP32(name, chip, flash) \
+	{ name, "qemu-system-xtensa", ESP_LOAD, chip, flash, 0x1000u, "open_eth" }
+#define ESP_XT(name, chip, flash) \
+	{ name, "qemu-system-xtensa", ESP_LOAD, chip, flash, 0u, "open_eth" }
+#define ESP_RV(name, chip, flash, boot) \
+	{ name, "qemu-system-riscv32", ESP_LOAD, chip, flash, boot, "open_eth" }
 
 static const board boards[] = {
-	{ "arduino-uno",          "qemu-system-avr", "-bios", NULL, 0u, 0u },
-	{ "arduino-duemilanove",  "qemu-system-avr", "-bios", NULL, 0u, 0u },
-	{ "arduino-mega",         "qemu-system-avr", "-bios", NULL, 0u, 0u },
-	{ "arduino-mega-2560-v3", "qemu-system-avr", "-bios", NULL, 0u, 0u },
-	{ "stm32vldiscovery",     "qemu-system-arm", "-kernel", NULL, 0u, 0u },
-	{ "netduino2",            "qemu-system-arm", "-kernel", NULL, 0u, 0u },
-	{ "netduinoplus2",        "qemu-system-arm", "-kernel", NULL, 0u, 0u },
-	{ "olimex-stm32-h405",    "qemu-system-arm", "-kernel", NULL, 0u, 0u },
-	{ "lm3s6965evb",          "qemu-system-arm", "-kernel", NULL, 0u, 0u },
-	{ "lm3s811evb",           "qemu-system-arm", "-kernel", NULL, 0u, 0u },
-	{ "microbit",             "qemu-system-arm", "-kernel", NULL, 0u, 0u },
-	{ "mps2-an385",           "qemu-system-arm", "-kernel", NULL, 0u, 0u },
-	{ "b-l475e-iot01a",       "qemu-system-arm", "-kernel", NULL, 0u, 0u },
+	{ "arduino-uno",          "qemu-system-avr", "-bios", NULL, 0u, 0u, NULL },
+	{ "arduino-duemilanove",  "qemu-system-avr", "-bios", NULL, 0u, 0u, NULL },
+	{ "arduino-mega",         "qemu-system-avr", "-bios", NULL, 0u, 0u, NULL },
+	{ "arduino-mega-2560-v3", "qemu-system-avr", "-bios", NULL, 0u, 0u, NULL },
+	{ "stm32vldiscovery",     "qemu-system-arm", "-kernel", NULL, 0u, 0u, NULL },
+	{ "netduino2",            "qemu-system-arm", "-kernel", NULL, 0u, 0u, NULL },
+	{ "netduinoplus2",        "qemu-system-arm", "-kernel", NULL, 0u, 0u, NULL },
+	{ "olimex-stm32-h405",    "qemu-system-arm", "-kernel", NULL, 0u, 0u, NULL },
+	{ "lm3s6965evb",          "qemu-system-arm", "-kernel", NULL, 0u, 0u, "stellaris_enet" },
+	{ "lm3s811evb",           "qemu-system-arm", "-kernel", NULL, 0u, 0u, NULL },
+	{ "microbit",             "qemu-system-arm", "-kernel", NULL, 0u, 0u, NULL },
+	{ "mps2-an385",           "qemu-system-arm", "-kernel", NULL, 0u, 0u, NULL },
+	{ "b-l475e-iot01a",       "qemu-system-arm", "-kernel", NULL, 0u, 0u, NULL },
 	/* An 8051, by SDCC's simulator, s51: its 8052 core, which the AT89
 	 * parts share, at the 11.0592 MHz crystal a UART's rates divide. */
-	{ "at89c51ed2",           "ucsim_51",        "-g", NULL, 0u, 0u },
+	{ "at89c51ed2",           "ucsim_51",        "-g", NULL, 0u, 0u, NULL },
 	/* Espressif's chips, by their own names, and boards built on them,
 	 * each with the flash it ships with. qemu has none of a board's other
 	 * parts: a Heltec's OLED and LoRa radio are not there. */
@@ -977,14 +981,15 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 			return "a board boots its firmware, an image: source: (source \"image:FIRMWARE\")";
 		if (hull_access_find(doc, machine, "media", &entry))
 			return "a board has no drives: its firmware is its image: source alone";
-		/* An ESP32 has one Ethernet, Espressif's open_eth: on (network
-		 * nat), with its ports, or on one segment. Any other board's
-		 * serial port is all it has. */
-		if (is_esp(board_named(m->machine_type))) {
+		/* A board with Ethernet has one card, its chip's -- an ESP32's
+		 * open_eth, the LM3S6965's own MAC: on (network nat), with its
+		 * ports, or on one segment. Any other board's serial port is all
+		 * it has. */
+		if (board_named(m->machine_type)->nic != NULL) {
 			if ((m->network ? 1u : 0u) + m->segment_count > 1u)
-				return "an ESP32 has one Ethernet: (network nat) or one segment, not both";
+				return "a board has one Ethernet: (network nat) or one segment, not both";
 			if (m->nic != NULL)
-				return "an ESP32's Ethernet is its chip's, open_eth: no (nic …)";
+				return "a board's Ethernet is its chip's: no (nic …)";
 		} else if (m->network || m->segment_count != 0u || m->port_count != 0u) {
 			return "a board's serial port is its one way in: no network, segments or ports";
 		}
@@ -1048,6 +1053,7 @@ static void exec_board(const hull_machine *m, const board *b)
 		int   console[2];
 		int   serial[2];
 		int   null = open("/dev/null", O_WRONLY);
+		int   saved;
 		pid_t copier;
 
 		/* The input is a socket, which s51 cannot open by a path: a pipe
@@ -1091,7 +1097,15 @@ static void exec_board(const hull_machine *m, const board *b)
 		argv[n++] = (char *)run_file(m, "firmware.ihx");
 		argv[n] = NULL;
 		setenv("HOME", "/nonexistent", 1);
+		/* What s51 says on stderr is only that its serial files are no
+		 * terminals, written as it starts, so into the firmware's first
+		 * line under load: "re", two warnings, "ady". Thrown away, and
+		 * stderr given back for this process's own word where it
+		 * cannot be started. */
+		if ((saved = fcntl(2, F_DUPFD_CLOEXEC, 5)) < 0 || dup2(null, 2) != 2)
+			return;
 		execvp(argv[0], argv);
+		dup2(saved, 2);
 		return;
 	}
 	if ((monitor_fd = fcntl(m->monitor_peer, F_DUPFD, 3)) < 0)
@@ -1117,39 +1131,39 @@ static void exec_board(const hull_machine *m, const board *b)
 		if (esp_emulator(b, emulator, sizeof emulator) != 0)
 			return;
 		argv[0] = emulator;
-		/* Its Ethernet: slirp's NAT with the ports forwarded to it, as a
-		 * PC's card is, or the segment's wire, by the old -net form, as
-		 * open_eth is the machine's own and no -device. */
-		if (m->network) {
-			size_t at = (size_t)snprintf(nic, sizeof nic, "user,model=open_eth");
-
-			for (unsigned i = 0u; i < m->port_count && at < sizeof nic; i++)
-				at += (size_t)snprintf(nic + at, sizeof nic - at, ",hostfwd=%s:%s:%u-:%u",
-				                       m->port_udp[i] ? "udp" : "tcp", m->address,
-				                       m->port_host[i], m->port_guest[i]);
-			if (at >= sizeof nic)
-				return;
-			argv[n++] = "-nic";
-			argv[n++] = nic;
-		} else if (m->segment_count == 1u) {
-			unsigned char mac[6];
-			int           fd = fcntl(m->segment_fd[0], F_DUPFD, 3);
-
-			if (fd < 0)
-				return;
-			hull_access_segment_mac(m->address, m->segment[0], 0u, mac);
-			snprintf(netdev, sizeof netdev, "stream,id=s0,addr.type=fd,addr.str=%d", fd);
-			snprintf(nic, sizeof nic, "nic,model=open_eth,netdev=s0,"
-			         "macaddr=%02x:%02x:%02x:%02x:%02x:%02x",
-			         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-			argv[n++] = "-netdev";
-			argv[n++] = netdev;
-			argv[n++] = "-net";
-			argv[n++] = nic;
-		}
 	} else {
 		argv[n++] = (char *)b->load;
 		argv[n++] = (char *)m->media[0].path;
+	}
+	/* Its card: slirp's NAT with the ports forwarded to it, as a PC's
+	 * card is, or the segment's wire, by the old -net form, as the card
+	 * is the machine's own and no -device. */
+	if (b->nic != NULL && m->network) {
+		size_t at = (size_t)snprintf(nic, sizeof nic, "user,model=%s", b->nic);
+
+		for (unsigned i = 0u; i < m->port_count && at < sizeof nic; i++)
+			at += (size_t)snprintf(nic + at, sizeof nic - at, ",hostfwd=%s:%s:%u-:%u",
+			                       m->port_udp[i] ? "udp" : "tcp", m->address,
+			                       m->port_host[i], m->port_guest[i]);
+		if (at >= sizeof nic)
+			return;
+		argv[n++] = "-nic";
+		argv[n++] = nic;
+	} else if (b->nic != NULL && m->segment_count == 1u) {
+		unsigned char mac[6];
+		int           fd = fcntl(m->segment_fd[0], F_DUPFD, 3);
+
+		if (fd < 0)
+			return;
+		hull_access_segment_mac(m->address, m->segment[0], 0u, mac);
+		snprintf(netdev, sizeof netdev, "stream,id=s0,addr.type=fd,addr.str=%d", fd);
+		snprintf(nic, sizeof nic, "nic,model=%s,netdev=s0,"
+		         "macaddr=%02x:%02x:%02x:%02x:%02x:%02x", b->nic,
+		         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+		argv[n++] = "-netdev";
+		argv[n++] = netdev;
+		argv[n++] = "-net";
+		argv[n++] = nic;
 	}
 	argv[n] = NULL;
 	setenv("HOME", "/nonexistent", 1);

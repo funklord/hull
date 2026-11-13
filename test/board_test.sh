@@ -92,6 +92,38 @@ PY
 $(cat "$root/$name.out")"
 }
 
+# on_nat NAME MACHINE FIRMWARE: a board with Ethernet on slirp's NAT,
+# the gateway answering the ARP its firmware asks.
+on_nat() {
+	board "$1" "$2" "$3" '(network nat) '
+	cases=$((cases + 1))
+	grep -q '^peer answered' "$root/$1.out" ||
+		fail "the $2 board on (network nat) heard no gateway" "$(cat "$root/$1.out")"
+}
+
+# on_wire MACHINE-A MACHINE-B FIRMWARE-A FIRMWARE-B: two boards on one
+# segment, each asking the other's address and answering for its own.
+on_wire() {
+	cp "$3" "$root/wa.fw"
+	cp "$4" "$root/wb.fw"
+	printf '(machines\n  (wa (backend pc) (source "image:./wa.fw") (segments "%s") (tuning (pc (machine %s))))\n  (wb (backend pc) (source "image:./wb.fw") (segments "%s") (tuning (pc (machine %s)))))\n' \
+		"wire-$1" "$1" "wire-$1" "$2" > "$root/wire.conf"
+	(cd "$root" && exec timeout -k 2 60 "$hull" run -f "$root/wire.conf" > "$root/wire.out" 2>&1) &
+	runner=$!
+	tries=0
+	until [ "$(grep -c 'peer answered' "$root/wire.out" 2> /dev/null)" = 2 ] ||
+	      [ "$tries" -ge 60 ]; do
+		tries=$((tries + 1))
+		sleep 0.5
+	done
+	timeout 30 "$hull" stop wa > /dev/null 2>&1
+	timeout 30 "$hull" stop wb > /dev/null 2>&1
+	wait "$runner"
+	cases=$((cases + 1))
+	[ "$(grep -c 'peer answered' "$root/wire.out")" = 2 ] ||
+		fail "a $1 and a $2 on a segment did not each hear the other" "$(cat "$root/wire.out")"
+}
+
 if [ -n "${2:-}" ] && command -v qemu-system-avr > /dev/null; then
 	board uno arduino-uno "$2"
 else
@@ -101,6 +133,14 @@ if [ -n "${3:-}" ] && command -v qemu-system-arm > /dev/null; then
 	board stm stm32vldiscovery "$3"
 else
 	printf 'board: the STM32VLDISCOVERY not tried: no clang and lld or qemu-system-arm\n'
+fi
+# The LM3S6965's own MAC, qemu's stellaris_enet: firmware of the same
+# protocol as the ESP32-C3's, test/board/lm3s_net.c, in LM3S_NET.
+if [ -n "${LM3S_NET:-}" ] && command -v qemu-system-arm > /dev/null; then
+	on_nat natlm lm3s6965evb "$LM3S_NET/lm3s-net-nat.elf"
+	on_wire lm3s6965evb lm3s6965evb "$LM3S_NET/lm3s-net-wire-a.elf" "$LM3S_NET/lm3s-net-wire-b.elf"
+else
+	printf 'board: the LM3S6965 not tried on a network: no clang and lld or qemu-system-arm\n'
 fi
 if [ -n "${4:-}" ] && command -v ucsim_51 > /dev/null; then
 	board at89 at89c51ed2 "$4"
@@ -114,7 +154,8 @@ fi
 # the user's own cache where it is not there yet -- and each booted; the
 # ESP32's image on a Heltec WiFi LoRa 32 too, a board by its name; an
 # application's .bin alone refused. Then its Ethernet: an ESP32-C3 on
-# (network nat), two on one segment, and one on both refused.
+# (network nat), two on one segment, and one on both refused. The
+# LM3S6965's Ethernet the same way, by its own MAC.
 shift 4 2> /dev/null || set --
 if [ $# -gt 0 ]; then
 	first=$1
@@ -148,35 +189,9 @@ if [ $# -gt 0 ]; then
 			*/esp32.flash) board heltec heltec-wifi-lora-32 "$image" ;;
 			esac
 		done
-		# Its Ethernet on slirp's NAT: the gateway answering its ARP.
-		if [ -n "$nat" ]; then
-			board natc3 esp32c3 "$nat" '(network nat) '
-			cases=$((cases + 1))
-			grep -q '^peer answered' "$root/natc3.out" ||
-				fail "an ESP32-C3 on (network nat) heard no gateway" "$(cat "$root/natc3.out")"
-		fi
-		# Two on one segment, each asking the other's address and
-		# answering for its own.
-		if [ -n "$wire_a" ] && [ -n "$wire_b" ]; then
-			cp "$wire_a" "$root/wa.fw"
-			cp "$wire_b" "$root/wb.fw"
-			printf '(machines\n  (wa (backend pc) (source "image:./wa.fw") (segments "espwire") (tuning (pc (machine esp32c3))))\n  (wb (backend pc) (source "image:./wb.fw") (segments "espwire") (tuning (pc (machine xiao-esp32c3)))))\n' \
-				> "$root/wire.conf"
-			(cd "$root" && exec timeout -k 2 60 "$hull" run -f "$root/wire.conf" > "$root/wire.out" 2>&1) &
-			runner=$!
-			tries=0
-			until [ "$(grep -c 'peer answered' "$root/wire.out" 2> /dev/null)" = 2 ] ||
-			      [ "$tries" -ge 60 ]; do
-				tries=$((tries + 1))
-				sleep 0.5
-			done
-			timeout 30 "$hull" stop wa > /dev/null 2>&1
-			timeout 30 "$hull" stop wb > /dev/null 2>&1
-			wait "$runner"
-			cases=$((cases + 1))
-			[ "$(grep -c 'peer answered' "$root/wire.out")" = 2 ] ||
-				fail "two ESP32-C3s on a segment did not each hear the other" "$(cat "$root/wire.out")"
-		fi
+		[ -n "$nat" ] && on_nat natc3 esp32c3 "$nat"
+		[ -n "$wire_a" ] && [ -n "$wire_b" ] &&
+			on_wire esp32c3 xiao-esp32c3 "$wire_a" "$wire_b"
 		printf '(machine (source "image:fetch.fw") (backend pc) (network nat) (segments "espwire") (tuning (pc (machine esp32c3))))\n' \
 			> "$root/two.conf"
 		cases=$((cases + 1))
