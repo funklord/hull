@@ -67,6 +67,7 @@
 #include "vagrant.h"
 #include "vbox_fetch.h"
 #include "vbox_host.h"
+#include "esp_fetch.h"
 #include "import.h"
 #include "dial.h"
 #include "matrix.h"
@@ -137,6 +138,7 @@ static void usage(FILE *out)
 	      "       hull kernel fetch [--arch ARCH]\n"
 	      "       hull sshd fetch [--arch ARCH]\n"
 	      "       hull virtualbox fetch\n"
+	      "       hull esp fetch\n"
 	      "       hull export --bootable -f FILE [NAME] IMAGE\n"
 	      "       hull build [-f FILE] [--check] REF\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
@@ -8687,6 +8689,15 @@ int main(int argc, char **argv)
 
 		if (hull_vbox_fetch(why, sizeof why) != 0) {
 			fprintf(stderr, "hull: virtualbox fetch: %s\n", why);
+			return 1;
+		}
+		return 0;
+	}
+	if (strcmp(command, "esp") == 0 && argc == 3 && strcmp(argv[2], "fetch") == 0) {
+		char why[4400] = "";
+
+		if (hull_esp_fetch(why, sizeof why) != 0) {
+			fprintf(stderr, "hull: esp fetch: %s\n", why);
 			return 1;
 		}
 		return 0;

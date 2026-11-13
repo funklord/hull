@@ -483,6 +483,7 @@ and installing from a disc then booting the disk is one changed line.
 | Sound | `(tuning (pc (sound sb16)))`, or `adlib`, `gus`, `es1370`, `ac97`, `hda`; heard with a window |
 | Network | none unless `(network nat)`; ports on the machine's own address |
 | Tuning | `(tuning (pc (machine pc\|q35\|isapc) (firmware bios\|uefi) (vga …) (nic …) (accel …)))` |
+| Microcontrollers | `(tuning (pc (machine arduino-uno)))`, an STM32, an 8051, or an ESP32 such as `heltec-wifi-lora-32` (`hull esp fetch` once) boots its firmware, the `image:`, its UART the console; an ESP32's Ethernet joins `(network nat)` or a segment |
 
 **When you want it:** a system that is not Linux and not DOS, or an old
 VM's disk, run from a plain file with no VM manager around it.

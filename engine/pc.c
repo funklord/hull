@@ -63,6 +63,7 @@
 
 #include "access.h"
 #include "builtin.h"
+#include "esp.h"
 #include "iso.h"
 #include "media.h"
 #include "usage.h"
@@ -159,26 +160,69 @@ struct hull_machine {
 typedef struct board {
 	const char *name;
 	const char *emulator;
-	const char *load;   /* how it takes the firmware: -bios on the AVR, -kernel on ARM */
+	const char *load;    /* how it takes the firmware: -bios on the AVR, -kernel on ARM */
+	const char *chip;    /* qemu's machine, where it is not the board's name */
+	unsigned    flash;   /* an ESP32's flash in MB; 0, the smallest of 4, 8 and 16 to hold it */
+	unsigned    boot;    /* an ESP32's: where its ROM reads the bootloader in flash */
 } board;
 
+/* An ESP32: Espressif's qemu (engine/esp.h), the firmware a whole flash
+ * image, as `esptool.py merge_bin` makes, given to the chip's SPI flash. */
+#define ESP_LOAD "flash"
+#define ESP32(name, chip, flash) { name, "qemu-system-xtensa", ESP_LOAD, chip, flash, 0x1000u }
+#define ESP_XT(name, chip, flash) { name, "qemu-system-xtensa", ESP_LOAD, chip, flash, 0u }
+#define ESP_RV(name, chip, flash, boot) { name, "qemu-system-riscv32", ESP_LOAD, chip, flash, boot }
+
 static const board boards[] = {
-	{ "arduino-uno",          "qemu-system-avr", "-bios" },
-	{ "arduino-duemilanove",  "qemu-system-avr", "-bios" },
-	{ "arduino-mega",         "qemu-system-avr", "-bios" },
-	{ "arduino-mega-2560-v3", "qemu-system-avr", "-bios" },
-	{ "stm32vldiscovery",     "qemu-system-arm", "-kernel" },
-	{ "netduino2",            "qemu-system-arm", "-kernel" },
-	{ "netduinoplus2",        "qemu-system-arm", "-kernel" },
-	{ "olimex-stm32-h405",    "qemu-system-arm", "-kernel" },
-	{ "lm3s6965evb",          "qemu-system-arm", "-kernel" },
-	{ "lm3s811evb",           "qemu-system-arm", "-kernel" },
-	{ "microbit",             "qemu-system-arm", "-kernel" },
-	{ "mps2-an385",           "qemu-system-arm", "-kernel" },
+	{ "arduino-uno",          "qemu-system-avr", "-bios", NULL, 0u, 0u },
+	{ "arduino-duemilanove",  "qemu-system-avr", "-bios", NULL, 0u, 0u },
+	{ "arduino-mega",         "qemu-system-avr", "-bios", NULL, 0u, 0u },
+	{ "arduino-mega-2560-v3", "qemu-system-avr", "-bios", NULL, 0u, 0u },
+	{ "stm32vldiscovery",     "qemu-system-arm", "-kernel", NULL, 0u, 0u },
+	{ "netduino2",            "qemu-system-arm", "-kernel", NULL, 0u, 0u },
+	{ "netduinoplus2",        "qemu-system-arm", "-kernel", NULL, 0u, 0u },
+	{ "olimex-stm32-h405",    "qemu-system-arm", "-kernel", NULL, 0u, 0u },
+	{ "lm3s6965evb",          "qemu-system-arm", "-kernel", NULL, 0u, 0u },
+	{ "lm3s811evb",           "qemu-system-arm", "-kernel", NULL, 0u, 0u },
+	{ "microbit",             "qemu-system-arm", "-kernel", NULL, 0u, 0u },
+	{ "mps2-an385",           "qemu-system-arm", "-kernel", NULL, 0u, 0u },
+	{ "b-l475e-iot01a",       "qemu-system-arm", "-kernel", NULL, 0u, 0u },
 	/* An 8051, by SDCC's simulator, s51: its 8052 core, which the AT89
 	 * parts share, at the 11.0592 MHz crystal a UART's rates divide. */
-	{ "at89c51ed2",           "ucsim_51",        "-g" },
+	{ "at89c51ed2",           "ucsim_51",        "-g", NULL, 0u, 0u },
+	/* Espressif's chips, by their own names, and boards built on them,
+	 * each with the flash it ships with. qemu has none of a board's other
+	 * parts: a Heltec's OLED and LoRa radio are not there. */
+	ESP32("esp32", "esp32", 0u),
+	ESP32("esp32-devkitc", "esp32", 4u),
+	ESP32("esp32-cam", "esp32", 4u),
+	ESP32("heltec-wifi-lora-32", "esp32", 4u),
+	ESP32("heltec-wifi-lora-32-v2", "esp32", 8u),
+	ESP32("ttgo-lora32", "esp32", 4u),
+	ESP32("m5stack-core", "esp32", 16u),
+	ESP_XT("esp32s3", "esp32s3", 0u),
+	ESP_XT("esp32-s3-devkitc-1", "esp32s3", 8u),
+	ESP_XT("heltec-wifi-lora-32-v3", "esp32s3", 8u),
+	ESP_XT("xiao-esp32s3", "esp32s3", 8u),
+	ESP_XT("lilygo-t-display-s3", "esp32s3", 16u),
+	ESP_RV("esp32c3", "esp32c3", 0u, 0u),
+	ESP_RV("esp32-c3-devkitm-1", "esp32c3", 4u, 0u),
+	ESP_RV("xiao-esp32c3", "esp32c3", 4u, 0u),
+	ESP_RV("esp32c5", "esp32c5", 0u, 0x2000u),
+	ESP_RV("esp32c6", "esp32c6", 0u, 0u),
+	ESP_RV("esp32-c6-devkitc-1", "esp32c6", 8u, 0u),
+	ESP_RV("xiao-esp32c6", "esp32c6", 4u, 0u),
+	ESP_RV("esp32c61", "esp32c61", 0u, 0u),
+	ESP_RV("esp32h2", "esp32h2", 0u, 0u),
+	ESP_RV("esp32-h2-devkitm-1", "esp32h2", 4u, 0u),
+	ESP_RV("esp32p4", "esp32p4", 0u, 0x2000u),
+	ESP_RV("esp32-p4-function-ev-board", "esp32p4", 16u, 0x2000u),
 };
+
+static int is_esp(const board *b)
+{
+	return b != NULL && strcmp(b->load, ESP_LOAD) == 0;
+}
 
 /* The board `name` names, or NULL for a PC's machine type. */
 static const board *board_named(const char *name)
@@ -301,6 +345,88 @@ static int copy_file(const char *from, const char *to)
 	return good ? 0 : -1;
 }
 
+/* Espressif's qemu for board `b`, the fetched one's path into `out`. 0, or
+ * -1 where it is not fetched. */
+static int esp_emulator(const board *b, char *out, size_t cap)
+{
+	char dir[4096];
+
+	if (hull_esp_dir(dir, sizeof dir) != 0)
+		return -1;
+	snprintf(out, cap, "%.4096s/qemu/bin/%s", dir, b->emulator);
+	return access(out, X_OK);
+}
+
+/*
+ * An ESP32's flash for this run: the firmware, a whole flash image, copied
+ * into the run directory and filled out with erased flash, 0xff, to the
+ * board's size, or for a bare chip to the smallest of 4, 8 and 16 MB that
+ * holds it -- qemu takes those sizes alone, and the firmware writes to its
+ * flash, which must not be the user's file. Refused where the image is no
+ * whole flash, its bootloader's 0xe9 not where the chip's ROM reads it: an
+ * application's .bin alone, the commonest mistake. 0, or -1 with m->why.
+ */
+static int esp_flash(hull_machine *m, const board *b)
+{
+	static uint8_t buffer[65536];
+	unsigned       mb = b->flash;
+	struct stat    is;
+	uint8_t        magic = 0u;
+	off_t          size;
+	int            in;
+	int            out;
+	int            good = 0;
+
+	if ((in = open(m->media[0].path, O_RDONLY | O_CLOEXEC)) < 0 || fstat(in, &is) != 0) {
+		snprintf(m->why, sizeof m->why, "the firmware cannot be read: %s\n", strerror(errno));
+		if (in >= 0)
+			close(in);
+		return -1;
+	}
+	if (pread(in, &magic, 1u, (off_t)b->boot) != 1 || magic != 0xe9u) {
+		close(in);
+		snprintf(m->why, sizeof m->why, "the firmware is not a whole flash image for %s: its "
+		         "bootloader is read at 0x%x, which holds no image; esptool.py merge_bin makes "
+		         "one from the bootloader, partition table and application\n", b->chip, b->boot);
+		return -1;
+	}
+	if (mb == 0u)
+		for (mb = 4u; mb < 16u && is.st_size > (off_t)mb << 20; mb *= 2u)
+			;
+	size = (off_t)mb << 20;
+	if (is.st_size > size) {
+		close(in);
+		snprintf(m->why, sizeof m->why, "the firmware is larger than the %u MB flash of %s\n",
+		         mb, b->name);
+		return -1;
+	}
+	if ((out = open(run_file(m, "flash.bin"), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) >= 0) {
+		ssize_t got;
+		off_t   at = 0;
+
+		while ((got = read(in, buffer, sizeof buffer)) > 0 && write(out, buffer, (size_t)got) == got)
+			at += got;
+		memset(buffer, 0xff, sizeof buffer);
+		while (got == 0 && at < size) {
+			size_t n = size - at < (off_t)sizeof buffer ? (size_t)(size - at) : sizeof buffer;
+
+			if (write(out, buffer, n) != (ssize_t)n)
+				break;
+			at += (off_t)n;
+		}
+		good = got == 0 && at == size;
+		if (close(out) != 0)
+			good = 0;
+	}
+	close(in);
+	if (!good) {
+		snprintf(m->why, sizeof m->why, "the board's flash could not be made in the run "
+		         "directory\n");
+		return -1;
+	}
+	return 0;
+}
+
 /* The files swtpm keeps in its state directory, by name, for copying and
  * removing them. */
 static const char *const tpm_files[] = { "tpm2-00.permall", ".lock" };
@@ -320,7 +446,12 @@ static int prepare_state(hull_machine *m)
 	char         from[4400];
 	char         to[4400];
 
-	if (!m->secure && !m->tpm && !s51)
+	if (is_esp(b) && esp_emulator(b, from, sizeof from) != 0) {
+		snprintf(m->why, sizeof m->why, "%s runs on Espressif's qemu, which is not fetched: "
+		         "hull esp fetch\n", b->name);
+		return -1;
+	}
+	if (!m->secure && !m->tpm && !s51 && !is_esp(b))
 		return 0;
 	if (m->cache[0] == '\0' && make_cache(m) != NULL) {
 		snprintf(m->why, sizeof m->why, "the cache directory for the machine's state cannot be made\n");
@@ -350,6 +481,8 @@ static int prepare_state(hull_machine *m)
 		}
 		return 0;
 	}
+	if (is_esp(b))
+		return esp_flash(m, b);
 	if (m->state != NULL && m->direct && mkdir(m->state, 0700) != 0 && errno != EEXIST) {
 		snprintf(m->why, sizeof m->why, "%s: %s\n", m->state, strerror(errno));
 		return -1;
@@ -440,6 +573,7 @@ static void release_state(hull_machine *m)
 	unlink(run_file(m, "swtpm.sock"));
 	unlink(run_file(m, "OVMF_VARS.fd"));
 	unlink(run_file(m, "firmware.ihx"));
+	unlink(run_file(m, "flash.bin"));
 	for (unsigned i = 0u; i < sizeof tpm_files / sizeof tpm_files[0]; i++) {
 		snprintf(path, sizeof path, "%s/tpm/%s", m->run_state, tpm_files[i]);
 		unlink(path);
@@ -843,8 +977,17 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 			return "a board boots its firmware, an image: source: (source \"image:FIRMWARE\")";
 		if (hull_access_find(doc, machine, "media", &entry))
 			return "a board has no drives: its firmware is its image: source alone";
-		if (m->network || m->segment_count != 0u || m->port_count != 0u)
+		/* An ESP32 has one Ethernet, Espressif's open_eth: on (network
+		 * nat), with its ports, or on one segment. Any other board's
+		 * serial port is all it has. */
+		if (is_esp(board_named(m->machine_type))) {
+			if ((m->network ? 1u : 0u) + m->segment_count > 1u)
+				return "an ESP32 has one Ethernet: (network nat) or one segment, not both";
+			if (m->nic != NULL)
+				return "an ESP32's Ethernet is its chip's, open_eth: no (nic …)";
+		} else if (m->network || m->segment_count != 0u || m->port_count != 0u) {
 			return "a board's serial port is its one way in: no network, segments or ports";
+		}
 		if (m->vnc || m->display != NULL || m->vga != NULL || m->sound != NULL)
 			return "a board has no screen or sound of qemu's: its serial port is what it says";
 		if (m->memory != NULL || m->cpus != NULL || m->cpu != NULL)
@@ -888,6 +1031,10 @@ static char *option(const char *prefix, const char *text)
  * nothing of a PC's. */
 static void exec_board(const hull_machine *m, const board *b)
 {
+	char  drive[4500];
+	char  emulator[4200];
+	char  nic[96u + PC_MAX_PORTS * 64u];
+	char  netdev[64];
 	char  monitor[48];
 	char *argv[20];
 	int   n = 0;
@@ -954,7 +1101,7 @@ static void exec_board(const hull_machine *m, const board *b)
 	argv[n++] = "-nodefaults";
 	argv[n++] = "-no-user-config";
 	argv[n++] = "-machine";
-	argv[n++] = (char *)b->name;
+	argv[n++] = (char *)(b->chip != NULL ? b->chip : b->name);
 	argv[n++] = "-display";
 	argv[n++] = "none";
 	argv[n++] = "-serial";
@@ -963,8 +1110,47 @@ static void exec_board(const hull_machine *m, const board *b)
 	argv[n++] = monitor;
 	argv[n++] = "-mon";
 	argv[n++] = "chardev=monitor,mode=control";
-	argv[n++] = (char *)b->load;
-	argv[n++] = (char *)m->media[0].path;
+	if (is_esp(b)) {
+		argv[n++] = "-drive";
+		snprintf(drive, sizeof drive, "file=%.4400s,if=mtd,format=raw", run_file(m, "flash.bin"));
+		argv[n++] = drive;
+		if (esp_emulator(b, emulator, sizeof emulator) != 0)
+			return;
+		argv[0] = emulator;
+		/* Its Ethernet: slirp's NAT with the ports forwarded to it, as a
+		 * PC's card is, or the segment's wire, by the old -net form, as
+		 * open_eth is the machine's own and no -device. */
+		if (m->network) {
+			size_t at = (size_t)snprintf(nic, sizeof nic, "user,model=open_eth");
+
+			for (unsigned i = 0u; i < m->port_count && at < sizeof nic; i++)
+				at += (size_t)snprintf(nic + at, sizeof nic - at, ",hostfwd=%s:%s:%u-:%u",
+				                       m->port_udp[i] ? "udp" : "tcp", m->address,
+				                       m->port_host[i], m->port_guest[i]);
+			if (at >= sizeof nic)
+				return;
+			argv[n++] = "-nic";
+			argv[n++] = nic;
+		} else if (m->segment_count == 1u) {
+			unsigned char mac[6];
+			int           fd = fcntl(m->segment_fd[0], F_DUPFD, 3);
+
+			if (fd < 0)
+				return;
+			hull_access_segment_mac(m->address, m->segment[0], 0u, mac);
+			snprintf(netdev, sizeof netdev, "stream,id=s0,addr.type=fd,addr.str=%d", fd);
+			snprintf(nic, sizeof nic, "nic,model=open_eth,netdev=s0,"
+			         "macaddr=%02x:%02x:%02x:%02x:%02x:%02x",
+			         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+			argv[n++] = "-netdev";
+			argv[n++] = netdev;
+			argv[n++] = "-net";
+			argv[n++] = nic;
+		}
+	} else {
+		argv[n++] = (char *)b->load;
+		argv[n++] = (char *)m->media[0].path;
+	}
 	argv[n] = NULL;
 	setenv("HOME", "/nonexistent", 1);
 	execvp(argv[0], argv);
@@ -2105,6 +2291,9 @@ static hull_status pc_stats(hull_core *core, hull_machine *m, hull_buf *out, hul
 
 #define BOARD_NOTE "a microcontroller board, booted from its firmware, the image: source; " \
                    "its first UART the machine's serial port, its console"
+#define ESP_NOTE "an Espressif chip on Espressif's qemu (hull esp fetch), booted from its " \
+                 "firmware, the image: source, a whole flash image; its UART0 the machine's " \
+                 "serial port, its console; no radio"
 
 static const hull_cap_entry entries[] = {
 	{ "source.media.overlay", HULL_SUP_NATIVE,
@@ -2195,6 +2384,31 @@ static const hull_cap_entry entries[] = {
 	  "an 8051 by SDCC's simulator, s51, its 8052 core at 11.0592 MHz, booted from its firmware, "
 	  "the image: source, an Intel hex; its UART the machine's serial port, its console", NULL },
 	{ "pc.machine.mps2-an385", HULL_SUP_NATIVE, BOARD_NOTE, NULL },
+	{ "pc.machine.b-l475e-iot01a", HULL_SUP_NATIVE, BOARD_NOTE, NULL },
+	{ "pc.machine.esp32", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.esp32-devkitc", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.esp32-cam", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.heltec-wifi-lora-32", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.heltec-wifi-lora-32-v2", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.ttgo-lora32", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.m5stack-core", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.esp32s3", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.esp32-s3-devkitc-1", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.heltec-wifi-lora-32-v3", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.xiao-esp32s3", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.lilygo-t-display-s3", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.esp32c3", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.esp32-c3-devkitm-1", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.xiao-esp32c3", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.esp32c5", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.esp32c6", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.esp32-c6-devkitc-1", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.xiao-esp32c6", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.esp32c61", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.esp32h2", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.esp32-h2-devkitm-1", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.esp32p4", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.esp32-p4-function-ev-board", HULL_SUP_NATIVE, ESP_NOTE, NULL },
 	{ "pc.vga.std", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.vga.cirrus", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.vga.vmware", HULL_SUP_NATIVE, NULL, NULL },

@@ -1,14 +1,16 @@
 #!/bin/sh
 # board_test.sh -- microcontroller boards as pc machines (project.md
-# section 5.0): qemu's Arduino Uno and STM32VLDISCOVERY, and an 8051 by
-# SDCC's s51 where ucsim_51 is installed, each booted from its firmware,
+# section 5.0): qemu's Arduino Uno and STM32VLDISCOVERY, an 8051 by
+# SDCC's s51 where ucsim_51 is installed, and Espressif's chips on
+# Espressif's qemu, each booted from its firmware,
 # the image: source, its UART the machine's serial port. The firmware is
 # test/board's: "ready" at boot, then each line typed said back as "said
 # LINE", through `hull exec -t ID -- console` on a pty. Not part of `make
 # check`, which needs no compiler for a board: `make check-board` runs it.
 #
 # Its arguments are build/hull, the AVR firmware, the STM32 one and the
-# 8051 one, any of the three "" where its compiler is not installed. Each
+# 8051 one, any of the three "" where its compiler is not installed, then
+# any number of ESP32 flash images, each named for its chip. Each
 # machine runs under `timeout`, each console session too, and every wait
 # is a bounded count; everything is under $BUILD_DIR/test/board, removed
 # at the start.
@@ -39,15 +41,15 @@ fail() {
 	printf '%s\n' "$2" | sed 's/^/    /'
 }
 
-# board NAME MACHINE FIRMWARE: the board run, a line typed into its
+# board NAME MACHINE FIRMWARE [SPEC]: the board run, SPEC's forms added, a line typed into its
 # console, its answer and its boot read back, the machine stopped.
 board() {
 	name=$1
 	machine=$2
 	firmware=$3
 	cp "$firmware" "$root/$name.fw"
-	printf '(machine (source "image:%s.fw") (backend pc) (hostname "%s") (tuning (pc (machine %s))))\n' \
-		"$name" "$name" "$machine" > "$root/$name.conf"
+	printf '(machine (source "image:%s.fw") (backend pc) (hostname "%s") %s(tuning (pc (machine %s))))\n' \
+		"$name" "$name" "${4:-}" "$machine" > "$root/$name.conf"
 	(cd "$root" && exec timeout -k 2 60 "$hull" run -f "$root/$name.conf" > "$root/$name.out" 2>&1) &
 	runner=$!
 	tries=0
@@ -104,6 +106,96 @@ if [ -n "${4:-}" ] && command -v ucsim_51 > /dev/null; then
 	board at89 at89c51ed2 "$4"
 else
 	printf 'board: the AT89C51ED2 not tried: no sdcc or ucsim_51\n'
+fi
+
+# Espressif's chips, on Espressif's qemu, each image NAME.flash for the chip
+# NAME: refused naming the fetch while it is not in this run's cache, then
+# the user's fetched copy linked in -- fetched by `hull esp fetch` under
+# the user's own cache where it is not there yet -- and each booted; the
+# ESP32's image on a Heltec WiFi LoRa 32 too, a board by its name; an
+# application's .bin alone refused. Then its Ethernet: an ESP32-C3 on
+# (network nat), two on one segment, and one on both refused.
+shift 4 2> /dev/null || set --
+if [ $# -gt 0 ]; then
+	first=$1
+	name=${first##*/}
+	name=${name%.flash}
+	cp "$first" "$root/fetch.fw"
+	printf '(machine (source "image:fetch.fw") (backend pc) (tuning (pc (machine %s))))\n' "$name" \
+		> "$root/fetch.conf"
+	cases=$((cases + 1))
+	out=$(cd "$root" && timeout 30 "$hull" run -f "$root/fetch.conf" 2>&1)
+	printf '%s\n' "$out" | grep -q "hull esp fetch" ||
+		fail "an ESP32 with nothing fetched was not refused naming the fetch" "$out"
+	if esp=$(XDG_CACHE_HOME=${HULL_TEST_CACHE:-$HOME/.cache} timeout 600 "$hull" esp fetch); then
+		mkdir -p "$root/cache/hull"
+		ln -s "$esp" "$root/cache/hull/${esp##*/}"
+		nat=
+		wire_a=
+		wire_b=
+		for image in "$@"; do
+			name=${image##*/}
+			name=${name%.flash}
+			case $name in
+			*-net-nat) nat=$image ;;
+			*-net-wire-a) wire_a=$image ;;
+			*-net-wire-b) wire_b=$image ;;
+			*) board "$name" "$name" "$image" ;;
+			esac
+		done
+		for image in "$@"; do
+			case $image in
+			*/esp32.flash) board heltec heltec-wifi-lora-32 "$image" ;;
+			esac
+		done
+		# Its Ethernet on slirp's NAT: the gateway answering its ARP.
+		if [ -n "$nat" ]; then
+			board natc3 esp32c3 "$nat" '(network nat) '
+			cases=$((cases + 1))
+			grep -q '^peer answered' "$root/natc3.out" ||
+				fail "an ESP32-C3 on (network nat) heard no gateway" "$(cat "$root/natc3.out")"
+		fi
+		# Two on one segment, each asking the other's address and
+		# answering for its own.
+		if [ -n "$wire_a" ] && [ -n "$wire_b" ]; then
+			cp "$wire_a" "$root/wa.fw"
+			cp "$wire_b" "$root/wb.fw"
+			printf '(machines\n  (wa (backend pc) (source "image:./wa.fw") (segments "espwire") (tuning (pc (machine esp32c3))))\n  (wb (backend pc) (source "image:./wb.fw") (segments "espwire") (tuning (pc (machine xiao-esp32c3)))))\n' \
+				> "$root/wire.conf"
+			(cd "$root" && exec timeout -k 2 60 "$hull" run -f "$root/wire.conf" > "$root/wire.out" 2>&1) &
+			runner=$!
+			tries=0
+			until [ "$(grep -c 'peer answered' "$root/wire.out" 2> /dev/null)" = 2 ] ||
+			      [ "$tries" -ge 60 ]; do
+				tries=$((tries + 1))
+				sleep 0.5
+			done
+			timeout 30 "$hull" stop wa > /dev/null 2>&1
+			timeout 30 "$hull" stop wb > /dev/null 2>&1
+			wait "$runner"
+			cases=$((cases + 1))
+			[ "$(grep -c 'peer answered' "$root/wire.out")" = 2 ] ||
+				fail "two ESP32-C3s on a segment did not each hear the other" "$(cat "$root/wire.out")"
+		fi
+		printf '(machine (source "image:fetch.fw") (backend pc) (network nat) (segments "espwire") (tuning (pc (machine esp32c3))))\n' \
+			> "$root/two.conf"
+		cases=$((cases + 1))
+		out=$(cd "$root" && timeout 30 "$hull" run -f "$root/two.conf" 2>&1)
+		printf '%s\n' "$out" | grep -q "one Ethernet" ||
+			fail "an ESP32 on both a NAT and a segment was not refused" "$out"
+		head -c 5000 /dev/zero > "$root/app.fw"
+		printf '(machine (source "image:app.fw") (backend pc) (tuning (pc (machine esp32c3))))\n' \
+			> "$root/app.conf"
+		cases=$((cases + 1))
+		out=$(cd "$root" && timeout 30 "$hull" run -f "$root/app.conf" 2>&1)
+		printf '%s\n' "$out" | grep -q "not a whole flash image" ||
+			fail "an ESP32-C3 given no flash image was not refused" "$out"
+	else
+		cases=$((cases + 1))
+		fail "hull esp fetch failed" "$esp"
+	fi
+else
+	printf 'board: no ESP32 tried: no clang, lld, llvm-mc and llvm-objcopy\n'
 fi
 
 # What a board does not have, refused at its start: a network and drives.

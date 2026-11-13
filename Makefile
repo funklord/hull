@@ -110,7 +110,7 @@ ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/hostdev.o $(BUILD_DIR)/engine/rootmode.o \
               $(BUILD_DIR)/engine/storefs.o $(BUILD_DIR)/engine/writeback.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o $(BUILD_DIR)/cli/runtime.o $(BUILD_DIR)/cli/doctor.o \
-              $(BUILD_DIR)/cli/import.o $(BUILD_DIR)/cli/export.o $(BUILD_DIR)/cli/kernel_fetch.o $(BUILD_DIR)/cli/vbox_fetch.o $(BUILD_DIR)/cli/vbox_host.o $(BUILD_DIR)/cli/vagrant.o $(BUILD_DIR)/cli/dial.o \
+              $(BUILD_DIR)/cli/import.o $(BUILD_DIR)/cli/export.o $(BUILD_DIR)/cli/kernel_fetch.o $(BUILD_DIR)/cli/vbox_fetch.o $(BUILD_DIR)/cli/esp_fetch.o $(BUILD_DIR)/cli/vbox_host.o $(BUILD_DIR)/cli/vagrant.o $(BUILD_DIR)/cli/dial.o \
               $(BUILD_DIR)/cli/sshd_fetch.o
 # Section 3's optional store, which only the commands that name it use.
 STORE_OBJS  = $(BUILD_DIR)/store/store.o $(BUILD_DIR)/store/unpack.o $(BUILD_DIR)/store/pack.o
@@ -255,9 +255,33 @@ SDCC         ?= sdcc
 BOARD_AVR  := $(if $(shell command -v $(BOARD_AVR_CC) 2>/dev/null),$(BUILD_DIR)/test/board-fw/echo_avr.elf)
 BOARD_ARM  := $(if $(and $(shell command -v $(BOARD_ARM_CC) 2>/dev/null),$(BOARD_ARM_LD)),$(BUILD_DIR)/test/board-fw/echo_stm32.elf)
 BOARD_8051 := $(if $(shell command -v $(SDCC) 2>/dev/null),$(BUILD_DIR)/test/board-fw/echo_8051.ihx)
+# Espressif's chips: each NAME:LOAD:CHIP-ID:BOOT-OFFSET:UART0, the RISC-V
+# ones by clang and lld, the Xtensa ones by llvm-mc, into flash images by
+# test/board/esp_image.py; run on Espressif's qemu where `hull esp fetch`
+# has put it.
+BOARD_MC      ?= llvm-mc
+BOARD_OBJCOPY ?= llvm-objcopy
+ESP_RV_CHIPS = esp32c3:0x40380000:5:0x0:0x60000000 esp32c5:0x40810000:23:0x2000:0x60000000 \
+               esp32c6:0x40810000:13:0x0:0x60000000 esp32c61:0x40810000:20:0x0:0x60000000 \
+               esp32h2:0x40810000:16:0x0:0x60000000 esp32p4:0x4ff10000:18:0x2000:0x500ca000
+ESP_XT_CHIPS = esp32:0x40080400:0:0x1000: esp32s3:0x40380000:9:0x0:-DS3
+ESP_RV_OK  := $(and $(shell command -v $(BOARD_ARM_CC) 2>/dev/null),$(BOARD_ARM_LD),$(shell command -v $(BOARD_OBJCOPY) 2>/dev/null))
+ESP_XT_OK  := $(and $(shell command -v $(BOARD_ARM_CC) 2>/dev/null),$(shell command -v $(BOARD_MC) 2>/dev/null),$(shell command -v $(BOARD_OBJCOPY) 2>/dev/null))
+esp_name    = $(word 1,$(subst :, ,$(1)))
+BOARD_ESP  := $(if $(ESP_RV_OK),$(foreach c,$(ESP_RV_CHIPS),$(BUILD_DIR)/test/board-fw/$(call esp_name,$(c)).flash)) \
+              $(if $(ESP_XT_OK),$(foreach c,$(ESP_XT_CHIPS),$(BUILD_DIR)/test/board-fw/$(call esp_name,$(c)).flash))
+# An ESP32-C3 on a network: on slirp's NAT, and the two ends of a wire.
+ESP_NETS    = nat wire-a wire-b
+ESP_NET_nat    =
+ESP_NET_wire-a = -DIP=0x0a4d0001u -DPEER=0x0a4d0002u -DMAC=0x01u
+ESP_NET_wire-b = -DIP=0x0a4d0002u -DPEER=0x0a4d0001u -DMAC=0x02u
+BOARD_ESP  += $(if $(ESP_RV_OK),$(foreach w,$(ESP_NETS),$(BUILD_DIR)/test/board-fw/esp32c3-net-$(w).flash))
+ESP_ALL     = $(foreach c,$(ESP_RV_CHIPS) $(ESP_XT_CHIPS),$(call esp_name,$(c))) \
+              $(foreach w,$(ESP_NETS),esp32c3-net-$(w))
 BOARD_TEST_FILES = $(addprefix $(BUILD_DIR)/test/board-fw/, echo_avr.elf echo_stm32.o echo_stm32.elf \
                    echo_8051.ihx echo_8051.rel echo_8051.lk echo_8051.map echo_8051.mem \
-                   echo_8051.lst echo_8051.rst echo_8051.sym echo_8051.asm)
+                   echo_8051.lst echo_8051.rst echo_8051.sym echo_8051.asm \
+                   $(foreach n,$(ESP_ALL),$(n).flash $(n).o $(n).elf $(n).bin $(n).s))
 # What check-fuzz writes, but for what it finds, in $(FUZZ_DIR)/found,
 # which is kept: a crash's input is what reproduces it.
 FUZZ_FILES = $(addprefix $(BUILD_DIR)/fuzz/, json_fuzz unpack_fuzz pack_fuzz corpus/json/manifest \
@@ -485,7 +509,7 @@ help:
 	@echo '  check-systemd systemd as a chroot machine'"'"'s init in a delegated cgroup, inside a vm'
 	@echo '  check-vfio    a PCI device by VFIO, to chroot and a nested vm, inside a vm with an IOMMU'
 	@echo '  check-usb     a USB device followed by chroot as it re-enumerates, inside a vm'
-	@echo '  check-board   microcontroller boards (Uno, STM32, 8051) booted from firmware as pc machines'
+	@echo '  check-board   microcontroller boards (Uno, STM32, 8051, ESP32s) booted from firmware as pc machines'
 	@echo '  check-sanitize  the unit tests, store and pull under ASan and UBSan'
 	@echo '  check-fuzz    libFuzzer over the JSON and layer readers, FUZZ_TIME s each'
 	@echo '  check-gui     hull-gui as text, and its requests, against a core of its own'
@@ -1040,10 +1064,11 @@ check-usb: $(HULL) $(AGENT_BIN) $(PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/usb_test.sh '$(HULL)' '$(PROBE)'
 
 # Microcontroller boards as pc machines: firmware of test/board's, run on
-# qemu's Uno and STM32VLDISCOVERY and SDCC's s51, no KVM.
-check-board: $(HULL) $(BOARD_AVR) $(BOARD_ARM) $(BOARD_8051)
+# qemu's Uno and STM32VLDISCOVERY, SDCC's s51 and Espressif's qemu's
+# ESP32s, no KVM.
+check-board: $(HULL) $(BOARD_AVR) $(BOARD_ARM) $(BOARD_8051) $(BOARD_ESP)
 	BUILD_DIR='$(BUILD_DIR)' sh test/board_test.sh '$(HULL)' '$(BOARD_AVR)' '$(BOARD_ARM)' \
-		'$(BOARD_8051)'
+		'$(BOARD_8051)' $(strip $(BOARD_ESP))
 
 $(BUILD_DIR)/test/board-fw/echo_avr.elf: test/board/echo_avr.c
 	@mkdir -p '$(@D)'
@@ -1058,6 +1083,41 @@ $(BUILD_DIR)/test/board-fw/echo_stm32.elf: test/board/echo_stm32.c test/board/st
 $(BUILD_DIR)/test/board-fw/echo_8051.ihx: test/board/echo_8051.c
 	@mkdir -p '$(@D)'
 	$(SDCC) -mmcs51 -o $(@D)/ $<
+
+# An ESP32 test image: NAME, LOAD, CHIP-ID, BOOT-OFFSET, and UART0 for
+# the RISC-V ones or the assembler's define for the Xtensa ones.
+define esp_rv_rule
+$$(BUILD_DIR)/test/board-fw/$(1).flash: test/board/echo_esp_rv.c test/board/esp_image.py
+	@mkdir -p '$$(@D)'
+	$$(BOARD_ARM_CC) --target=riscv32 -march=rv32imc -mabi=ilp32 -ffreestanding -nostdlib -fno-pic \
+		-Os -Wall -Wextra -DUART=$(5)u -c -o $$(@D)/$(1).o $$<
+	$$(BOARD_ARM_LD) -Ttext=$(2) --entry=start -o $$(@D)/$(1).elf $$(@D)/$(1).o
+	$$(BOARD_OBJCOPY) -O binary $$(@D)/$(1).elf $$(@D)/$(1).bin
+	$$(PYTHON) test/board/esp_image.py $$(@D)/$(1).bin $(2) $(3) $(4) $$@
+endef
+define esp_xt_rule
+$$(BUILD_DIR)/test/board-fw/$(1).flash: test/board/echo_esp_xt.S test/board/esp_image.py
+	@mkdir -p '$$(@D)'
+	$$(BOARD_ARM_CC) -E -P -x assembler-with-cpp $(5) -o $$(@D)/$(1).s $$<
+	$$(BOARD_MC) -triple=xtensa -filetype=obj -o $$(@D)/$(1).o $$(@D)/$(1).s
+	$$(BOARD_OBJCOPY) -O binary -j .text $$(@D)/$(1).o $$(@D)/$(1).bin
+	$$(PYTHON) test/board/esp_image.py $$(@D)/$(1).bin $(2) $(3) $(4) $$@
+endef
+define esp_net_rule
+$$(BUILD_DIR)/test/board-fw/esp32c3-net-$(1).flash: test/board/echo_esp_net.c test/board/esp_image.py
+	@mkdir -p '$$(@D)'
+	$$(BOARD_ARM_CC) --target=riscv32 -march=rv32imc -mabi=ilp32 -ffreestanding -nostdlib -fno-pic \
+		-Os -Wall -Wextra $$(ESP_NET_$(1)) -c -o $$(@D)/esp32c3-net-$(1).o $$<
+	$$(BOARD_ARM_LD) -Ttext=0x40380000 --entry=start -o $$(@D)/esp32c3-net-$(1).elf \
+		$$(@D)/esp32c3-net-$(1).o
+	$$(BOARD_OBJCOPY) -O binary $$(@D)/esp32c3-net-$(1).elf $$(@D)/esp32c3-net-$(1).bin
+	$$(PYTHON) test/board/esp_image.py $$(@D)/esp32c3-net-$(1).bin 0x40380000 5 0x0 $$@
+endef
+$(foreach w,$(ESP_NETS),$(eval $(call esp_net_rule,$(w))))
+esp_field   = $(word $(2),$(subst :, ,$(1)))
+esp_rule    = $(eval $(call $(2),$(call esp_field,$(1),1),$(call esp_field,$(1),2),$(call esp_field,$(1),3),$(call esp_field,$(1),4),$(call esp_field,$(1),5)))
+$(foreach c,$(ESP_RV_CHIPS),$(call esp_rule,$(c),esp_rv_rule))
+$(foreach c,$(ESP_XT_CHIPS),$(call esp_rule,$(c),esp_xt_rule))
 
 # The indentation and whitespace gate, shared verbatim with the sibling
 # projects; `docs` additionally holds project.md to the tree it describes.
