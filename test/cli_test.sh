@@ -384,7 +384,7 @@ expect 1 'the variable UNSETHERE is not set' "$hull" plan -f "$dir/vars/unset.ya
 rm -rf "$dir/vdata"
 printf 'services:\n  db:\n    image: alpine\n    volumes:\n      - data:/var/lib/db\nvolumes:\n  data:\n' \
 	> "$dir/vars/named.yaml"
-expect 0 'compose/vars/data"\) \(guest "/var/lib/db"\)' env XDG_DATA_HOME="$dir/vdata" \
+expect 0 'compose/vars/data"\) \(guest "/var/lib/db"\) \(fill image\)' env XDG_DATA_HOME="$dir/vdata" \
 	"$hull" import "$dir/vars/named.yaml"
 cases=$((cases + 1))
 [ ! -e "$dir/vdata" ] || fail 'hull import makes nothing' "$(ls -R "$dir/vdata")"
@@ -3476,6 +3476,29 @@ printf '(machine (source "tar:./rootfs.tar") (backend chroot) (command "/probe" 
 from_root 0 '^from a tar$' -f "$root/fromtar.conf"
 expect 0 '^tar/[0-9a-f]{32} ' "$hull" images
 rm -f "$root/rootfs.tar"
+# (fill image): a volume whose host directory is empty, or not there, is
+# first made what the stored tree holds at the guest path, as compose
+# fills a named volume; one with anything in it is used as it is.
+rm -rf "$root/filltree" "$root/fillvol"
+mkdir -p "$root/filltree/proc" "$root/filltree/dev" "$root/filltree/etc/app/sub"
+cp "$root/rootfs/probe" "$root/filltree/probe"
+printf 'from the image\n' > "$root/filltree/etc/app/conf"
+printf 'deeper\n' > "$root/filltree/etc/app/sub/more"
+tar -C "$root/filltree" -cf "$root/filltree.tar" .
+printf '(machine (source "tar:./filltree.tar") (backend chroot) %s %s)\n' \
+	'(volumes (volume (host "./fillvol") (guest "/etc/app") (fill image)))' \
+	'(command "/probe" "read" "/etc/app/conf" "read" "/etc/app/sub/more")' > "$root/fill.conf"
+from_root 0 '^read=from the image$' -f "$root/fill.conf"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^read=deeper$' && [ -f "$root/fillvol/sub/more" ] &&
+	printf '%s\n' "$out" | grep -q 'volume .*fillvol filled from tar/' ||
+	fail "an empty volume was not filled from the image" "$out"
+printf 'mine\n' > "$root/fillvol/conf"
+from_root 0 '^read=mine$' -f "$root/fill.conf"
+refute 'filled from' sh -c 'cd / && exec "$0" run -f "$1"' \
+	"$(cd "$(dirname "$hull")" && pwd)/$(basename "$hull")" "$root/fill.conf"
+chmod -R u+w "$root/fillvol" 2>/dev/null
+rm -rf "$root/filltree" "$root/fillvol" "$root/filltree.tar"
 # And a pack: source, the same tree packed by hull pack. On chroot it is
 # served from the pack itself, by FUSE, nothing read into the store
 # (section 3.13); where chroot cannot serve it so -- a read-only root here

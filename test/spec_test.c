@@ -270,6 +270,13 @@ static void test_records(void)
 	   "machine.ports.port.proto");
 	OK(M("(ports (port (host 65535) (guest 1)))"));
 	OK(M("(volumes (volume (host \"./data\") (guest \"/var/data\") (mode ro)))"));
+	/* A host directory filled from the image when empty, as compose's
+	 * named volume is; nothing else is filled, and image is the one source. */
+	OK(M("(volumes (volume (host \"./data\") (guest \"/var/data\") (fill image)))"));
+	NO(M("(volumes (volume (guest \"/etc\") (layers \"dir:./t\") (fill image)))"), SHAPE,
+	   "(fill", "machine.volumes.volume.fill");
+	NO(M("(volumes (volume (host \"./data\") (guest \"/var/data\") (fill dir)))"), VALUE,
+	   "dir)", "machine.volumes.volume.fill");
 	NO(M("(volumes (volume (host \"./data\") (guest \"data\")))"), VALUE, "\"data\"",
 	   "machine.volumes.volume.guest");
 	/* A machine's links to its segments impaired, in netem's terms

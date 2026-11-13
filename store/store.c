@@ -1235,9 +1235,10 @@ static int copy_object(hull_store *store, const uint8_t digest[32], int dir, con
 }
 
 /* As hull_store_materialize(), under a lock the caller holds. */
-static int materialize_locked(hull_store *store, const char *ref, const char *dir,
-                              uint64_t *skipped, char *why, size_t cap)
+static int materialize_locked(hull_store *store, const char *ref, const char *under,
+                              const char *dir, uint64_t *skipped, char *why, size_t cap)
 {
+	size_t          under_length = under != NULL ? strlen(under) : 0u;
 	char            hex[65];
 	uint8_t        *data;
 	size_t          length;
@@ -1301,6 +1302,13 @@ static int materialize_locked(hull_store *store, const char *ref, const char *di
 		path[value.content_length] = '\0';
 		if (!is_relative(path) || memchr(path, '\0', value.content_length) != NULL)
 			goto bad;
+		/* Only what lies beneath `under`, made relative to it: the
+		 * directory itself is `dir`. */
+		if (under_length > 0u) {
+			if (strncmp(path, under, under_length) != 0 || path[under_length] != '/')
+				continue;
+			memmove(path, path + under_length + 1u, strlen(path + under_length + 1u) + 1u);
+		}
 		if (field(&doc, &entry, "kind", &value) && value.content_length < sizeof kind)
 			memcpy(kind, doc.data + value.content, value.content_length);
 		mode = field(&doc, &entry, "mode", &value) ? (mode_t)(number(&doc, &value) & 07777) : 0644;
@@ -1455,7 +1463,20 @@ int hull_store_materialize(hull_store *store, const char *ref, const char *dir,
 	int result;
 
 	flock(store->lock, LOCK_SH);
-	result = materialize_locked(store, ref, dir, skipped, why, cap);
+	result = materialize_locked(store, ref, NULL, dir, skipped, why, cap);
+	flock(store->lock, LOCK_UN);
+	return result;
+}
+
+int hull_store_materialize_under(hull_store *store, const char *ref, const char *under,
+                                 const char *dir, uint64_t *skipped, char *why, size_t cap)
+{
+	int result;
+
+	if (under[0] == '\0' || under[0] == '/' || under[strlen(under) - 1u] == '/')
+		return say(why, cap, under, "is not a path within the tree");
+	flock(store->lock, LOCK_SH);
+	result = materialize_locked(store, ref, under, dir, skipped, why, cap);
 	flock(store->lock, LOCK_UN);
 	return result;
 }
@@ -1519,7 +1540,7 @@ int hull_store_checkout(hull_store *store, const char *name, int create, char *p
 		goto done;
 	}
 	snprintf(named, sizeof named, "sha256:%s", hex);
-	if (materialize_locked(store, named, made, skipped, why, cap) != 0) {
+	if (materialize_locked(store, named, NULL, made, skipped, why, cap) != 0) {
 		hull_store_remove_tree(AT_FDCWD, made);
 		goto done;
 	}

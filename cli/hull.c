@@ -991,6 +991,115 @@ static int pack_direct(const char *file, const hull_spec *spec, const hull_sexpr
 	return status != 0 ? -1 : 0;
 }
 
+/* A key's first value in a record of the user's file, as text, or NULL. */
+static char *spec_text_of(const hull_spec *spec, const hull_sexpr_form *record, const char *key)
+{
+	hull_sexpr_form found;
+	hull_sexpr_form head;
+	hull_sexpr_form value;
+
+	char           *text;
+
+	if (!hull_spec_find(spec, record, key, &found) ||
+	    !hull_sexpr_child(&spec->doc, &found, &head) || !hull_sexpr_next(&spec->doc, &head, &value) ||
+	    value.content_length == 0u ||
+	    memchr(spec->doc.data + value.content, '\0', value.content_length) != NULL ||
+	    (text = malloc(value.content_length + 1u)) == NULL)
+		return NULL;
+	memcpy(text, spec->doc.data + value.content, value.content_length);
+	text[value.content_length] = '\0';
+	return text;
+}
+
+/*
+ * Each `(volume (host H) (guest G) (fill image))` of a machine on the
+ * stored tree `name`, at a run: where H is not there or empty, it is
+ * first made what the tree holds beneath G, as compose fills a named
+ * volume from its image the first time it is used (section 3.7); a
+ * directory with anything in it is left as it is, whoever wrote it. H is
+ * relative to the file. 0, or -1 having said why.
+ */
+static int fill_volumes(const char *file, const hull_spec *spec, const hull_sexpr_form *machine,
+                        hull_store *store, const char *name)
+{
+	hull_sexpr_form volumes;
+	hull_sexpr_form item;
+
+	if (!hull_spec_find(spec, machine, "volumes", &volumes) ||
+	    !hull_sexpr_child(&spec->doc, &volumes, &item))
+		return 0;
+	while (hull_sexpr_next(&spec->doc, &item, &item)) {
+		hull_sexpr_form fill_entry;
+		hull_sexpr_form fill_head;
+		hull_sexpr_form fill_value;
+		int      fill = hull_spec_find(spec, &item, "fill", &fill_entry) &&
+		                hull_sexpr_child(&spec->doc, &fill_entry, &fill_head) &&
+		                hull_sexpr_next(&spec->doc, &fill_head, &fill_value) &&
+		                hull_sexpr_is(&spec->doc, &fill_value, "image");
+		char    *host = NULL;
+		char    *guest = NULL;
+		char     path[4400];
+		char     under[4096];
+		char     why[4400] = "";
+		uint64_t skipped = 0u;
+		DIR     *dir;
+		int      empty = 1;
+
+		if (!fill || (host = spec_text_of(spec, &item, "host")) == NULL ||
+		    (guest = spec_text_of(spec, &item, "guest")) == NULL) {
+			free(host);
+			free(guest);
+			continue;
+		}
+		if (host[0] == '/') {
+			snprintf(path, sizeof path, "%s", host);
+		} else {
+			const char *slash = strrchr(file, '/');
+
+			snprintf(path, sizeof path, "%.*s%s", slash != NULL ? (int)(slash - file + 1) : 0,
+			         file, host);
+		}
+		snprintf(under, sizeof under, "%s", guest + strspn(guest, "/"));
+		while (under[0] != '\0' && under[strlen(under) - 1u] == '/')
+			under[strlen(under) - 1u] = '\0';
+		free(host);
+		free(guest);
+		if ((dir = opendir(path)) != NULL) {
+			struct dirent *entry;
+
+			while ((entry = readdir(dir)) != NULL && empty)
+				empty = strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0;
+			closedir(dir);
+		} else if (errno != ENOENT) {
+			fprintf(stderr, "%s: volume %s: %s\n", file, path, strerror(errno));
+			return -1;
+		}
+		if (!empty)
+			continue;
+		/* Its parents made as compose makes a named volume's place. */
+		for (char *slash = strchr(path + 1, '/'); slash != NULL; slash = strchr(slash + 1, '/')) {
+			*slash = '\0';
+			if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+				fprintf(stderr, "%s: volume %s: %s\n", file, path, strerror(errno));
+				return -1;
+			}
+			*slash = '/';
+		}
+		if (under[0] == '\0') {
+			fprintf(stderr, "%s: volume %s: (fill image) at / would be the whole tree: a volume "
+			        "is filled from a path within it\n", file, path);
+			return -1;
+		}
+		if (hull_store_materialize_under(store, name, under, path, &skipped, why,
+		                                 sizeof why) != 0) {
+			fprintf(stderr, "%s: volume %s: %s\n", file, path, why);
+			return -1;
+		}
+		fprintf(stderr, "hull: volume %s filled from %s's /%s, being empty\n", path, name, under);
+	}
+	return 0;
+}
+
 /* Whether the machine asks `(security (verity true))`. */
 static int wants_verity(const hull_spec *spec, const hull_sexpr_form *machine)
 {
@@ -1233,8 +1342,19 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 		}
 		for (unsigned k = 0u; k < sizeof schemes / sizeof schemes[0]; k++)
 			schemed |= strncmp(name, schemes[k], strlen(schemes[k])) == 0;
-		if (schemed)
+		if (schemed) {
+			/* A directory is no image to fill a volume from. */
+			hull_sexpr_form volumes;
+			hull_sexpr_form volume;
+
+			if (create && hull_spec_find(&spec, &machines[i], "volumes", &volumes) &&
+			    hull_sexpr_child(&spec.doc, &volumes, &volume))
+				while (hull_sexpr_next(&spec.doc, &volume, &volume))
+					if (hull_spec_find(&spec, &volume, "fill", &head))
+						fprintf(stderr, "%s: (fill image) fills a volume from a stored image, "
+						        "and %s is none: the volume is used as it is\n", file, name);
 			continue;
+		}
 		if (opened == -2) {
 			opened = hull_store_open(&store, 0, why, sizeof why);
 			if (opened < 0) {
@@ -1373,6 +1493,10 @@ static int store_sources(const char *file, uint8_t *data, size_t *length, int cr
 		if (add_rewrite(rewrites, &count, value.offset, entry.offset + entry.extent - value.offset,
 		                &source) != 0) {
 			fprintf(stderr, "%s: too many machines on stored trees\n", file);
+			result = -1;
+			break;
+		}
+		if (create && fill_volumes(file, &spec, &machines[i], &store, name) != 0) {
 			result = -1;
 			break;
 		}

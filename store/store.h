@@ -205,6 +205,13 @@ int hull_store_arch(hull_store *store, const char *name, char arch[64], char *wh
 int hull_store_materialize(hull_store *store, const char *ref, const char *dir,
                            uint64_t *skipped, char *why, size_t cap);
 
+/* What the tree `ref` holds beneath `under`, a path within it with no
+ * leading or trailing slash, made at `dir` as hull_store_materialize()
+ * makes a whole tree: what a volume of (fill image) starts with (section
+ * 3.7). 0, or -1 with `why`. */
+int hull_store_materialize_under(hull_store *store, const char *ref, const char *under,
+                                 const char *dir, uint64_t *skipped, char *why, size_t cap);
+
 /* What differs from the tree `from` names to the tree `to` names, each a
  * ref or sha256:HEX: each path added, '+', removed, '-', or changed, '~',
  * in path order, through `each`, whose `what` says what changed in a

@@ -417,6 +417,7 @@ static const char *const cpu_values[]        = { "host", "migratable", NULL };
 static const char *const accel_values[]      = { "auto", "kvm", "tcg", NULL };
 static const char *const transport_values[]  = { "auto", "vsock", "serial", "uart", NULL };
 static const char *const share_values[]      = { "auto", "9p", "virtiofs", NULL };
+static const char *const fill_values[]       = { "image", NULL };
 
 #define TABLE(keys) { keys, (unsigned)(sizeof keys / sizeof keys[0]), NULL }
 #define TABLE_ACROSS(keys, across) { keys, (unsigned)(sizeof keys / sizeof keys[0]), across }
@@ -432,7 +433,8 @@ static const schema port = TABLE(port_keys);
 static hull_spec_status volume_across(walk *w, const hull_sexpr_form *record,
                                       const hull_sexpr_form *found, uint64_t present);
 
-/* (volume (host "./data") (guest "/var/data") (mode rw)), or a stack of
+/* (volume (host "./data") (guest "/var/data") (mode rw) (fill image)), the
+ * last filling an empty host directory from the image (3.7); or a stack of
  * directories in place of the one: (volume (guest "/etc") (layers
  * "dir:./etc-template" "dir:./etc-site") (upper "./etc-data")), or a
  * filesystem image the guest mounts: (volume (block "disk.img") (guest
@@ -444,6 +446,7 @@ static const key volume_keys[] = {
 	{ .name = "layers", .type = STRINGS, .nonempty = 1, .value = nonempty },
 	{ .name = "upper",  .type = STRING, .value = nonempty },
 	{ .name = "block",  .type = STRING, .value = nonempty },
+	{ .name = "fill",   .type = CHOICE, .choices = fill_values },
 };
 static const schema volume = TABLE_ACROSS(volume_keys, volume_across);
 
@@ -453,6 +456,7 @@ static const schema volume = TABLE_ACROSS(volume_keys, volume_across);
 #define VOLUME_LAYERS 3u
 #define VOLUME_UPPER  4u
 #define VOLUME_BLOCK  5u
+#define VOLUME_FILL   6u
 
 /* Devices passed through (section 4.13): one USB device, by its ids, by
  * the port it is plugged into, or both. */
@@ -1518,6 +1522,9 @@ static hull_spec_status volume_across(walk *w, const hull_sexpr_form *record,
 		why = "cannot stand beside host or layers: a volume is one of the three";
 	} else if ((present & ((uint64_t)1 << VOLUME_HOST)) && (present & ((uint64_t)1 << VOLUME_LAYERS))) {
 		why = "cannot stand beside host: a volume is one directory or a stack of them";
+	} else if ((present & ((uint64_t)1 << VOLUME_FILL)) && !(present & ((uint64_t)1 << VOLUME_HOST))) {
+		at = VOLUME_FILL;
+		why = "fills a host directory, as compose fills a named volume: it needs host";
 	} else if ((present & ((uint64_t)1 << VOLUME_UPPER)) && !(present & ((uint64_t)1 << VOLUME_LAYERS))) {
 		at = VOLUME_UPPER;
 		why = "is a stack's: it needs layers";

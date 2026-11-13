@@ -1258,6 +1258,7 @@ static void compose_volume(svc *s, char *spec)
 	char *c2;
 	char  kept[4400];
 	int   ro;
+	int   named = 0;
 
 	if (c1 == NULL) {
 		svc_note(s, "anonymous volume not translated", p);
@@ -1272,8 +1273,9 @@ static void compose_volume(svc *s, char *spec)
 			svc_note(s, "named volume not translated", p);
 			return;
 		}
-		svc_note(s, "named volume kept, starting empty, not from the image, at", kept);
+		svc_note(s, "named volume kept, filled from the image when empty, at", kept);
 		p = kept;
+		named = 1;
 	}
 	c2 = strchr(c1 + 1, ':');
 	ro = c2 != NULL && strstr(c2, "ro") != NULL;
@@ -1286,6 +1288,10 @@ static void compose_volume(svc *s, char *spec)
 	sb_str(&s->volumes, ")");
 	if (ro)
 		sb_str(&s->volumes, " (mode ro)");
+	/* Compose fills a named volume from the image the first time it is
+	 * used, as (fill image) does. */
+	if (named)
+		sb_str(&s->volumes, " (fill image)");
 	sb_str(&s->volumes, ")");
 }
 
