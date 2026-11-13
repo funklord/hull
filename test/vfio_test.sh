@@ -79,6 +79,22 @@ echo "== locked"
 (ulimit -l 8192; as env XDG_RUNTIME_DIR=/tmp/r2 timeout -k 2 60 $hull run -f /tmp/v.conf 2>&1; echo "status=\$?")
 echo "== nested"
 (ulimit -l unlimited; as env XDG_RUNTIME_DIR=/tmp/r3 timeout -k 2 120 $hull run -f /tmp/v.conf 2>&1; echo "status=\$?")
+echo "== pc"
+mkdir -p /tmp/r4 && chown $uid:$gid /tmp/r4 && chmod 700 /tmp/r4
+truncate -s 1M /tmp/blank.img && chmod 644 /tmp/blank.img
+printf '(machine (backend pc) (source "image:/tmp/blank.img") (memory "256M") (devices (pci "%s")))\n' "\$pci" > /tmp/p.conf
+chmod 644 /tmp/p.conf
+(ulimit -l unlimited; as env XDG_RUNTIME_DIR=/tmp/r4 timeout -k 2 60 $hull run -f /tmp/p.conf > /tmp/p.out 2>&1) &
+sleep 8
+for p in \$(pgrep -x qemu-system-x86); do
+	grep -q "vfio-pci,host=\$pci" /proc/\$p/cmdline && ls -l /proc/\$p/fd | grep -q "/dev/vfio/\$group" && echo pc=has-card
+done
+for id in \$(as env XDG_RUNTIME_DIR=/tmp/r4 $hull ps | awk '\$5 == "running" { print \$1 }'); do
+	as env XDG_RUNTIME_DIR=/tmp/r4 timeout 30 $hull stop "\$id" > /dev/null 2>&1
+done
+wait
+cat /tmp/p.out
+echo "status=done"
 EOF
 
 printf '(machine (source "dir:/") (backend vm) (mutable overlay) (memory "2G") (cpus 2) (tuning (qemu (iommu true))) (command "/bin/sh" "%s/run.sh"))\n' \
@@ -110,6 +126,11 @@ nested=$(printf '%s\n' "$out" | sed -n '/^== nested/,/^status=/p')
 printf '%s\n' "$nested" | grep -qx 'nic=seen' &&
 	printf '%s\n' "$nested" | grep -qx 'status=0' ||
 	fail "a nested vm was not given the device" "$out"
+# A pc machine, Windows' kind, given it: its qemu holding the group.
+cases=$((cases + 1))
+pc=$(printf '%s\n' "$out" | sed -n '/^== pc/,/^status=/p')
+printf '%s\n' "$pc" | grep -qx 'pc=has-card' ||
+	fail "a pc machine was not given the device" "$out"
 
 case $tree in
 */test/vfio/tree) rm -rf -- "$tree" ;;

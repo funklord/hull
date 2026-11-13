@@ -55,6 +55,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -68,9 +69,12 @@
 #include "media.h"
 #include "usage.h"
 #include "display.h"
+#include "hostdev.h"
+#include "hw.h"
 
 #define PC_MAX_MEDIA 6u    /* four on IDE, two floppy drives */
 #define PC_MAX_ARGS  120u
+#define PC_MAX_CARDS 4u    /* (devices (pci ...)), within PC_MAX_ARGS */
 #define SECURE_CODE  "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"
 #define SECURE_VARS  "/usr/share/OVMF/OVMF_VARS_4M.ms.fd"
 #define PC_MAX_SEGMENTS 4u
@@ -137,6 +141,8 @@ struct hull_machine {
 	int             local_display;  /* and qemu's D-Bus display, by display.qmp */
 	char            display_link[4400]; /* hull/display/ADDRESS, linked to it, or "" */
 	char            cache[4096];    /* where qemu's snapshots and made images are */
+	hull_device     device[HULL_MAX_DEVICES]; /* (devices (pci ...)), found at start */
+	unsigned        device_count;
 	pid_t           pid;
 	int             out;            /* the first serial port */
 	int             err;            /* qemu's stderr */
@@ -296,6 +302,7 @@ static void release(hull_machine *m)
 	free(m->lora);
 	if (m->lora_fd >= 0)
 		close(m->lora_fd);
+	hull_hostdev_unclaim(m);
 	free(m->name);
 	free(m->display);
 	free(m->xauthority);
@@ -972,6 +979,35 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 		}
 		m->xauthority = hull_access_value(doc, &screen, "xauthority");
 	}
+	/* (devices (pci ...)): a card of the host's given whole by VFIO, as a
+	 * vm's are (section 4.13) -- a GPU being Windows' one route to native
+	 * 3D (section 5.2). A PC's alone, a board having no PCI bus. */
+	{
+		const char *why = hull_access_devices(doc, machine, m->device, &m->device_count);
+
+		if (why != NULL) {
+			free(source);
+			free(display);
+			return why;
+		}
+		for (unsigned i = 0u; i < m->device_count; i++)
+			if (m->device[i].kind != HULL_DEVICE_PCI || m->device[i].root) {
+				free(source);
+				free(display);
+				return "a pc machine takes a card of the host's by (devices (pci ADDRESS)); "
+				       "its USB, serial and parallel ports are not given it yet";
+			}
+		if (m->device_count > PC_MAX_CARDS) {
+			free(source);
+			free(display);
+			return "a pc machine takes four cards of the host's at most";
+		}
+		if (m->device_count > 0u && board_named(m->machine_type) != NULL) {
+			free(source);
+			free(display);
+			return "a board has no PCI bus for (devices (pci ...))";
+		}
+	}
 	m->vnc = display != NULL && strcmp(display, "vnc") == 0;
 	m->local = display != NULL && strcmp(display, "local") == 0;
 	free(display);
@@ -1297,6 +1333,13 @@ static void exec_pc(const hull_machine *m)
 	}
 	argv[n++] = "-vga";
 	argv[n++] = m->vga != NULL ? m->vga : "std";
+	for (unsigned i = 0u; i < m->device_count; i++) {
+		static __thread char card[PC_MAX_CARDS][96];
+
+		snprintf(card[i], sizeof card[i], "vfio-pci,host=%s", m->device[i].host.port);
+		argv[n++] = "-device";
+		argv[n++] = card[i];
+	}
 	/* VNC's display 0 is port 5900, at the machine's own address. */
 	snprintf(vnc, sizeof vnc, "vnc=%s:0", m->address);
 	/* A screen by VNC is qemu's D-Bus display as well, for hull-gui to
@@ -1584,6 +1627,43 @@ static int launch(hull_machine *m)
 		snprintf(m->why, sizeof m->why, "a pipe for the machine could not be made\n");
 		close_all(fds, 8u);
 		return -1;
+	}
+	/* Its cards as the host has them now, each bound to vfio-pci with its
+	 * whole group and one machine's at a time; and the guest's memory,
+	 * which VFIO pins for their DMA, within what the user may lock --
+	 * refused saying so rather than left to fail in qemu's log. */
+	for (unsigned i = 0u; i < m->device_count; i++)
+		if (hull_hostdev_find(&m->device[i], m->why, sizeof m->why - 1u) != NULL) {
+			strcat(m->why, "\n");
+			close_all(fds, 8u);
+			return -1;
+		}
+	if (m->device_count > 0u) {
+		struct rlimit      locked;
+		unsigned long long wanted = ((unsigned long long)(m->memory != NULL ?
+		                             hull_size_mib(m->memory) : 128u) + 64ull) << 20;
+
+		if (hull_hostdev_claim(m, m->device, m->device_count, m->why, sizeof m->why - 1u) != NULL) {
+			strcat(m->why, "\n");
+			close_all(fds, 8u);
+			return -1;
+		}
+		if (getrlimit(RLIMIT_MEMLOCK, &locked) != 0)
+			locked.rlim_cur = locked.rlim_max = 0;
+		if (locked.rlim_cur != RLIM_INFINITY && locked.rlim_cur < wanted) {
+			if (locked.rlim_max == RLIM_INFINITY || locked.rlim_max >= wanted) {
+				locked.rlim_cur = wanted;
+				setrlimit(RLIMIT_MEMLOCK, &locked);
+			} else {
+				snprintf(m->why, sizeof m->why, "a PCI device by VFIO pins the guest's %llu "
+				         "MiB, and the user may lock %llu MiB: memlock in limits.conf, or "
+				         "LimitMEMLOCK for the user's manager, raises it\n",
+				         (wanted >> 20) - 64ull, (unsigned long long)(locked.rlim_max >> 20));
+				hull_hostdev_unclaim(m);
+				close_all(fds, 8u);
+				return -1;
+			}
+		}
 	}
 	m->monitor_peer = monitor[1];
 	m->local_display = (m->vnc || m->local) && m->run_state_made &&
@@ -2485,6 +2565,9 @@ static const hull_cap_entry entries[] = {
 	{ "display.vnc",        HULL_SUP_NATIVE,
 	  "the screen, keyboard and mouse by VNC at the machine's address, port 5900, with no "
 	  "password: any local user can connect, as to its ports", NULL },
+	{ "devices.pci",        HULL_SUP_NATIVE,
+	  "vfio-pci: a card of the host's itself, a GPU among them, bound to vfio-pci with its whole "
+	  "group; the guest's memory pinned for its DMA", NULL },
 	{ "display.local",      HULL_SUP_NATIVE,
 	  "the screen, keyboard and mouse in hull-gui by qemu's D-Bus display, this host only, "
 	  "its frames shared", NULL },
