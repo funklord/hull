@@ -54,7 +54,7 @@ static int patch_dropbear(const hull_sshd_arch *arch, const char *path, char *wh
 		const char *to;
 	} rewrites[] = {
 		{ HULL_SSHD_SFTP_FROM, HULL_SSHD_GUEST "/" HULL_SSHD_SFTP },
-		{ arch->interp_from, HULL_SSHD_GUEST "/" HULL_SSHD_INTERP },
+		{ arch->interp_from, arch->interp_to },
 	};
 	uint8_t    *data = NULL;
 	char        hex[65];
@@ -172,9 +172,8 @@ int hull_sshd_fetch(const char *arch_name, char *why, size_t cap)
 	int          status = -1;
 
 	if (arch == NULL) {
-		snprintf(why, cap, "hull fetches no sshd for %s: amd64, arm64 and riscv64%s", arch_name,
-		         strcmp(arch_name, "s390x") == 0 ?
-		         "; s390x's loader path is too short to rewrite, so its image's sshd serves" : "");
+		snprintf(why, cap, "hull fetches no sshd for %s: amd64, arm64, riscv64 and s390x",
+		         arch_name);
 		return -1;
 	}
 	if (hull_sshd_dir_of(arch->name, dir, sizeof dir) != 0) {

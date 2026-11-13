@@ -3238,9 +3238,9 @@ else
 	fi
 	# s390x the same way, 2026-11-13, a big-endian machine: qemu-system-
 	# s390x's s390-ccw-virtio booting Debian's s390x kernel, its root by
-	# 9p, virtiofs speaking FUSE in the guest's byte order. hull fetches no
-	# dropbear for it, its loader's path too short to rewrite, and the PC's
-	# UART is refused.
+	# 9p, virtiofs speaking FUSE in the guest's byte order; and the PC's
+	# UART refused. Its dropbear's loader, /lib/ld64.so.1, is too short for
+	# the tree's path, so it names /run/hull/ld, a link the agent makes.
 	s390x_probe=${BUILD_DIR:?}/test/s390x/rootfs/probe
 	if ! command -v qemu-system-s390x > /dev/null ||
 	   [ ! -x "$(dirname "$hull")/hull-agent-s390x" ] || [ ! -x "$s390x_probe" ]; then
@@ -3266,10 +3266,6 @@ else
 			"$hull" run -f "$root/szuart.conf" 2>&1)
 		got=$?
 		has 125 'is a PC.s ISA serial port'
-		name='hull sshd fetch --arch s390x'
-		out=$(XDG_CACHE_HOME="$root/cache-empty" timeout 60 "$hull" sshd fetch --arch s390x 2>&1)
-		got=$?
-		has 1 'loader path is too short to rewrite'
 		name='kernel fetch --arch s390x'
 		out=$(XDG_CACHE_HOME="$root/cache" timeout 300 "$hull" kernel fetch --arch s390x 2>&1)
 		got=$?
@@ -3284,6 +3280,69 @@ else
 			has 5 '^from s390x$'
 			has 5 '^host=qsz$'
 			has 5 '^read=s390x$'
+			# (ssh true) with no sshd in the image: s390x's dropbear, real ssh
+			# logging in as root against the machine's own host key.
+			name='hull sshd fetch --arch s390x'
+			out=$(XDG_CACHE_HOME="$root/cache" timeout 120 "$hull" sshd fetch --arch s390x 2>&1)
+			got=$?
+			has 0 'dropbear-s390x-'
+			szdbrt=$(mktemp -d /dev/shm/hull-qszd.XXXXXX 2>/dev/null)
+			if [ "$got" = 0 ] && [ -n "$szdbrt" ]; then
+				chmod 700 "$szdbrt"
+				rm -rf "$root/szdb"
+				mkdir -p "$root/szdb/bin" "$root/szdb/etc" "$root/szdb/run" "$root/szdb/tmp" \
+					"$root/szdb/proc" "$root/szdb/dev" "$root/szdb/sys" "$root/szdb/root"
+				cp "$s390x_probe" "$root/szdb/bin/sh"
+				printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/szdb/etc/passwd"
+				chmod 755 "$root/szdb"
+				printf '(machine (source "dir:./szdb") (backend emu) (arch s390x) %s %s)\n' \
+					'(mutable overlay) (hostname "qszdb") (ssh true)' \
+					'(command "/bin/sh" "-c" "probe say ready sleep 600")' > "$root/szdb.conf"
+				rm -f "$root/home/.ssh/szkey" "$root/home/.ssh/szkey.pub"
+				ssh-keygen -q -t ed25519 -N '' -C hull-test-sz -f "$root/home/.ssh/szkey"
+				{
+					printf 'Host qszdb.hull\n'
+					printf '  ProxyCommand env XDG_RUNTIME_DIR=%s %s proxy-ssh %%h\n' "$szdbrt" "$hull"
+					printf '  User root\n  IdentityFile %s\n  IdentitiesOnly yes\n' "$root/home/.ssh/szkey"
+					printf '  BatchMode yes\n  ConnectTimeout 20\n  LogLevel error\n'
+					printf '  StrictHostKeyChecking yes\n  UserKnownHostsFile %s\n' "$root/szdb.known"
+				} > "$root/szdb.ssh"
+				rm -f "$root/szdb.out" "$root/szdb.known"
+				(cd / && exec env XDG_RUNTIME_DIR="$szdbrt" XDG_CACHE_HOME="$root/cache" timeout -k 2 400 \
+					"$hull" run -f "$root/szdb.conf" > "$root/szdb.out" 2>&1) &
+				runner=$!
+				tries=0
+				until grep -q '^ready$' "$root/szdb.out" 2>/dev/null || [ "$tries" -ge 240 ]; do
+					tries=$((tries + 1))
+					sleep 0.5
+				done
+				printf 'qszdb.hull %s\n' \
+					"$(cut -d' ' -f1,2 "$root/data/hull/machines/qszdb/host_key.pub" 2>&1)" \
+					> "$root/szdb.known"
+				tries=0
+				until timeout 20 ssh -F "$root/szdb.ssh" qszdb.hull 'probe say up' < /dev/null 2>/dev/null |
+				      grep -q '^up$' || [ "$tries" -ge 60 ]; do
+					tries=$((tries + 1))
+					sleep 1
+				done
+				who=$(timeout 20 ssh -F "$root/szdb.ssh" qszdb.hull 'probe uid host' < /dev/null 2>&1)
+				XDG_RUNTIME_DIR="$szdbrt" timeout 30 "$hull" stop qszdb > /dev/null 2>&1
+				wait "$runner"
+				cases=$((cases + 1))
+				[ "$who" = "$(printf 'uid=0\nhost=qszdb')" ] ||
+					fail "ssh did not log in as root to an s390x machine through s390x's dropbear" \
+						"$who; $(cat "$root/szdb.out")"
+				rm -f "$root/home/.ssh/szkey" "$root/home/.ssh/szkey.pub"
+				rm -rf "${root:?}/szdb"
+			fi
+			if [ -n "$szdbrt" ]; then
+				tries=0
+				while [ -S "$szdbrt/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+					tries=$((tries + 1))
+					sleep 0.25
+				done
+				rm -rf "${szdbrt:?}"
+			fi
 		fi
 		for run in "$sznone" "$szrun"; do
 			tries=0

@@ -95,6 +95,27 @@ static const hull_sshd_package hull_sshd_packages_riscv64[] = {
 	  "9aa7e12ac1e9b76237f6cf230fa2d794f5ac6fac1ea80259ed28ae828c8fbff8" },
 };
 
+/* s390x's, for an s390x machine under emu, the same versions, each sha256
+ * from the snapshot's s390x Packages index, 2026-11-13. */
+static const hull_sshd_package hull_sshd_packages_s390x[] = {
+	{ "d/dropbear/dropbear-bin_2025.89-1~deb13u1_s390x.deb",
+	  "f0bf2d95e4b2da7014e2760688c34410f8c54f5c45811d34ae0a28f8a522eca5" },
+	{ "libt/libtomcrypt/libtomcrypt1_1.18.2+dfsg-7+b2_s390x.deb",
+	  "bf80bdf13ae2c6b62701ff3992eb42b2297146fd340025fc7dd501d7bb915cee" },
+	{ "libt/libtommath/libtommath1_1.3.0-1_s390x.deb",
+	  "79bf598745e50146d59f0f67886a7b83fec359ceed7cfb987437a54ed5bd35b5" },
+	{ "g/gmp/libgmp10_6.3.0+dfsg-3_s390x.deb",
+	  "a161f385adc4853d726add97a2ff0a5ab04f9167b3bd0dc8a9daf12be7d48bd4" },
+	{ "z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+b1_s390x.deb",
+	  "e38a94c60e944dfcf1937a12b02785afbbb2bedf356da18984c4dac0acc47ed9" },
+	{ "libx/libxcrypt/libcrypt1_4.4.38-1_s390x.deb",
+	  "c8c4cd4f66171c7607665141e2f8a8c60c8f9309ce62b6ac2eeeb0edbab2fe40" },
+	{ "g/glibc/libc6_2.41-12+deb13u4_s390x.deb",
+	  "c6e658d8e17d885c831ad1275501ef1abdadc6c93e9ac7758cfd1e5cde2d608b" },
+	{ "o/openssh/openssh-sftp-server_10.0p1-7+deb13u4_s390x.deb",
+	  "ba4cc40012eb44163c6c750e621806274a3df6f35177ef5b01e97e91b76c512a" },
+};
+
 /* What differs between the two: dropbear as Debian builds it and as hull
  * runs it, its two paths rewritten (above); the loader it names; where
  * the libraries are. */
@@ -107,12 +128,21 @@ typedef struct hull_sshd_arch {
 	const char              *interp_from;
 	const char              *libs;
 	const char              *loader;
+	const char              *interp_to;   /* what dropbear's interpreter is rewritten to */
 } hull_sshd_arch;
+
+/* Where dropbear's interpreter is rewritten to point: the loader in the
+ * fetched tree; or, for s390x, whose own /lib/ld64.so.1 is too short to
+ * hold that path, a link the agent makes beside it in the machine's /run. */
+#define HULL_SSHD_INTERP_TO    "/run/hull/sshd/ld.so"
+#define HULL_SSHD_INTERP_SHORT "/run/hull/ld"
 
 #define HULL_SSHD_LIBS_AMD64   "usr/lib/x86_64-linux-gnu"
 #define HULL_SSHD_LOADER_AMD64 HULL_SSHD_LIBS_AMD64 "/ld-linux-x86-64.so.2"
 #define HULL_SSHD_LIBS_ARM64   "usr/lib/aarch64-linux-gnu"
 #define HULL_SSHD_LOADER_ARM64 HULL_SSHD_LIBS_ARM64 "/ld-linux-aarch64.so.1"
+#define HULL_SSHD_LIBS_S390X   "usr/lib/s390x-linux-gnu"
+#define HULL_SSHD_LOADER_S390X HULL_SSHD_LIBS_S390X "/ld64.so.1"
 #define HULL_SSHD_LIBS_RISCV64   "usr/lib/riscv64-linux-gnu"
 #define HULL_SSHD_LOADER_RISCV64 HULL_SSHD_LIBS_RISCV64 "/ld-linux-riscv64-lp64d.so.1"
 
@@ -120,17 +150,25 @@ static const hull_sshd_arch hull_sshd_arches[] = {
 	{ "amd64", hull_sshd_packages, sizeof hull_sshd_packages / sizeof hull_sshd_packages[0],
 	  "7896833aa1d4eb0d4edf7cbefe91dce6dd0a9795a1610032a9ef7d01dac13c75",
 	  "1454240f4e25f28cf4050fc006d38c9be4d37d10fc896d599a3c4d1c75261a3f",
-	  "/lib64/ld-linux-x86-64.so.2", HULL_SSHD_LIBS_AMD64, HULL_SSHD_LOADER_AMD64 },
+	  "/lib64/ld-linux-x86-64.so.2", HULL_SSHD_LIBS_AMD64, HULL_SSHD_LOADER_AMD64,
+	  HULL_SSHD_INTERP_TO },
 	{ "arm64", hull_sshd_packages_arm64,
 	  sizeof hull_sshd_packages_arm64 / sizeof hull_sshd_packages_arm64[0],
 	  "800a3be86c192a94008853f033f66bf505ca457fdc20d4cdb703d021afcb7750",
 	  "c7403dbc89a3f536682f19b5f64ba0a6b9f5575dda8d4713d2f90a7f91556a93",
-	  "/lib/ld-linux-aarch64.so.1", HULL_SSHD_LIBS_ARM64, HULL_SSHD_LOADER_ARM64 },
+	  "/lib/ld-linux-aarch64.so.1", HULL_SSHD_LIBS_ARM64, HULL_SSHD_LOADER_ARM64,
+	  HULL_SSHD_INTERP_TO },
 	{ "riscv64", hull_sshd_packages_riscv64,
 	  sizeof hull_sshd_packages_riscv64 / sizeof hull_sshd_packages_riscv64[0],
 	  "f6a2cf1619813ee3314c5d41ce37ab4f05c3395a89758df289920c40889a9bc5",
 	  "f8a48b40781c430344fb521204c6fa433f77356f5177b2cdc9e6df5e4702c943",
-	  "/lib/ld-linux-riscv64-lp64d.so.1", HULL_SSHD_LIBS_RISCV64, HULL_SSHD_LOADER_RISCV64 },
+	  "/lib/ld-linux-riscv64-lp64d.so.1", HULL_SSHD_LIBS_RISCV64, HULL_SSHD_LOADER_RISCV64,
+	  HULL_SSHD_INTERP_TO },
+	{ "s390x", hull_sshd_packages_s390x,
+	  sizeof hull_sshd_packages_s390x / sizeof hull_sshd_packages_s390x[0],
+	  "2c7ba1d34b50f27b3a9654af0e737f321a8e4887649d88822e8ad195ad39246c",
+	  "5eb0c27243c09af179bebc475a87086392a7b2eff84112e62509b594fb3bb103",
+	  "/lib/ld64.so.1", HULL_SSHD_LIBS_S390X, HULL_SSHD_LOADER_S390X, HULL_SSHD_INTERP_SHORT },
 };
 
 /* `arch`'s, or NULL where hull fetches none for it. */
@@ -157,11 +195,8 @@ static inline const hull_sshd_arch *hull_sshd_arch_of(const char *arch)
 #define HULL_SSHD_LOADER      HULL_SSHD_LOADER_RISCV64
 #define HULL_SSHD_FETCH_ARCH  " --arch riscv64"
 #elif defined(__s390x__)
-/* s390x's loader is /lib/ld64.so.1, shorter than the path hull would
- * rewrite it to, so hull fetches no dropbear for it: an s390x machine's
- * sshd is its image's own. */
-#define HULL_SSHD_LIBS        "usr/lib/s390x-linux-gnu"
-#define HULL_SSHD_LOADER      HULL_SSHD_LIBS "/ld64.so.1"
+#define HULL_SSHD_LIBS        HULL_SSHD_LIBS_S390X
+#define HULL_SSHD_LOADER      HULL_SSHD_LOADER_S390X
 #define HULL_SSHD_FETCH_ARCH  " --arch s390x"
 #elif defined(__x86_64__)
 #define HULL_SSHD_LIBS        HULL_SSHD_LIBS_AMD64
@@ -270,6 +305,17 @@ static inline const char *hull_sshd_choose(const char **found, int dropbear)
  * bare_fork).
  */
 #define HULL_SSHD_AT(file) HULL_SSHD_GUEST "/" file
+
+/* clone(2) as the system call, no stack given, as fork() is without
+ * glibc's locks. s390's takes its stack first and its flags second, every
+ * other arch's the other way round: called the common way, an s390x
+ * guest's child had flags of 0, no SIGCHLD to be waited for, and the
+ * fetched dropbear's key was never converted. */
+#if defined(__s390x__) || defined(__s390__)
+#define HULL_RAW_CLONE(flags) syscall(SYS_clone, 0L, (long)(flags), NULL, NULL, 0L)
+#else
+#define HULL_RAW_CLONE(flags) syscall(SYS_clone, (long)(flags), 0L, NULL, NULL, 0L)
+#endif
 static inline void hull_sshd_exec_dropbear(const char *listen)
 {
 	static const char key[] = "/run/hull/dropbear_host_key";
@@ -282,7 +328,7 @@ static inline void hull_sshd_exec_dropbear(const char *listen)
 
 	umask(077);
 	unlink(key);
-	convert = (pid_t)syscall(SYS_clone, SIGCHLD, NULL, NULL, NULL, 0L);
+	convert = (pid_t)HULL_RAW_CLONE(SIGCHLD);
 	if (convert == 0) {
 		/* Through the fetched loader, which dropbear's own interpreter
 		 * names and dropbearconvert's does not: it names the image's,

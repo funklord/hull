@@ -1120,7 +1120,7 @@ static char *const *as_user(const hull_machine *m, int report)
  * malloc: the first machine's init stuck in __malloc_fork_lock_parent. */
 static pid_t bare_fork(void)
 {
-	return (pid_t)syscall(SYS_clone, SIGCHLD, NULL, NULL, NULL, 0L);
+	return (pid_t)HULL_RAW_CLONE(SIGCHLD);
 }
 
 /* `text` as `name` in `dir`, the machine's staging tmpfs, cloned as a
@@ -3483,9 +3483,9 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 	/* clone with no stack is fork into new namespaces: the child is PID 1
 	 * of its own. The ids are read first, since in the child's new user
 	 * namespace they are unmapped until it maps them. */
-	m->pid = (pid_t)syscall(SYS_clone, CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWUTS |
-	                        CLONE_NEWPID | (m->no_network || m->nat || m->bridge ? CLONE_NEWNET : 0) | SIGCHLD, NULL,
-	                        NULL, NULL, 0L);
+	m->pid = (pid_t)HULL_RAW_CLONE(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWPID |
+	                               (m->no_network || m->nat || m->bridge ? CLONE_NEWNET : 0) |
+	                               SIGCHLD);
 	if (m->pid < 0)
 		return fail(error, HULL_ERR_RUNTIME, "clone");
 	if (m->pid == 0) {

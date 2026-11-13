@@ -1711,6 +1711,13 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 		    (cmdline_value("hull.root", named_root, sizeof named_root) ?
 		     hosted_sshd() : share("sshd", "/machine/run/hull/sshd", 1)) != 0)
 			rmdir("/machine/run/hull/sshd");
+#if defined(__s390x__)
+		/* s390x's dropbear names its loader by this shorter link, its own
+		 * /lib/ld64.so.1 having no room for the tree's path (sshd.h). */
+		else if (symlink(HULL_SSHD_INTERP_TO, "/machine" HULL_SSHD_INTERP_SHORT) != 0 &&
+		         errno != EEXIST)
+			say("the sshd's loader", strerror(errno));
+#endif
 	}
 	/* The kernel's filesystems inside, where the machine has a place for
 	 * them; then the directory becomes /. */
