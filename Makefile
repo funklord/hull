@@ -408,7 +408,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: esp-qemu-lora
+.PHONY: esp-qemu-lora check-tsan
 .PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-usb check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
@@ -530,6 +530,7 @@ help:
 	@echo '  check-vfio    a PCI device by VFIO, to chroot and a nested vm, inside a vm with an IOMMU'
 	@echo '  check-usb     a USB device followed by chroot as it re-enumerates, inside a vm'
 	@echo '  check-board   microcontroller boards (Uno, STM32, 8051, ESP32s) booted from firmware as pc machines'
+	@echo '  check-tsan    the pc and board suites under ThreadSanitizer, failing on any report'
 	@echo '  esp-qemu-lora Espressif'"'"'s qemu with hull'"'"'s SX1276, for a board'"'"'s LoRa radio (fetches its source)'
 	@echo '  check-sanitize  the unit tests, store and pull under ASan and UBSan'
 	@echo '  check-fuzz    libFuzzer over the JSON and layer readers, FUZZ_TIME s each'
@@ -996,6 +997,39 @@ check-s390x-host: $(HULL) $(AGENT_S390X)
 # the sanitizers cannot be, so the suites get this build's own.
 SANITIZE_FLAGS = -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
                  -fno-sanitize-recover=undefined
+# ThreadSanitizer over the suites whose machines start, run and stop on
+# threads of their own at once: the pc suite's (two machines with media
+# collections together, among them) and the boards' (two ESP32s on a wire,
+# two Heltecs on one air where make esp-qemu-lora has built its qemu). Its
+# report goes to a file, a core's own exit being nobody's to see, and any
+# file there fails the target. It found three races on 2026-11-13: media
+# copies through shared buffers, an ESP32 flash copy's, and a stop thread
+# using a machine the loop had freed. hull alone is built with it, in a
+# build directory of its own: the agent and the probes are -static, which
+# TSan cannot be, and they link objects hull shares. The suites run that
+# hull with this build's firmware.
+TSAN_FLAGS = -O1 -g -fsanitize=thread -fno-omit-frame-pointer
+check-tsan: $(AGENT_BIN) $(BOARD_AVR) $(BOARD_ARM) $(BOARD_8051) $(BOARD_ESP) $(BOARD_LM3S) \
+            $(BOARD_LORA)
+	test -n '$(BUILD_DIR)'
+	$(MAKE) BUILD_DIR='$(BUILD_DIR)/tsan' CFLAGS='$(TSAN_FLAGS)' '$(BUILD_DIR)/tsan/hull'
+	ln -sf '$(abspath $(AGENT_BIN))' '$(BUILD_DIR)/tsan/hull-agent'
+	rm -rf '$(BUILD_DIR)/tsan-report'
+	mkdir -p '$(BUILD_DIR)/tsan-report'
+	TSAN_OPTIONS='halt_on_error=0 log_path=$(abspath $(BUILD_DIR))/tsan-report/tsan' \
+		BUILD_DIR='$(BUILD_DIR)' sh test/pc_test.sh '$(BUILD_DIR)/tsan/hull'
+	TSAN_OPTIONS='halt_on_error=0 log_path=$(abspath $(BUILD_DIR))/tsan-report/tsan' \
+		BUILD_DIR='$(BUILD_DIR)' LM3S_NET='$(if $(BOARD_LM3S),$(BUILD_DIR)/test/board-fw)' \
+		LORA_FW='$(if $(BOARD_LORA),$(BUILD_DIR)/test/board-fw)' \
+		LORA_QEMU='$(if $(wildcard $(ESP_QEMU_LORA)),$(abspath $(ESP_QEMU_LORA)))' \
+		sh test/board_test.sh '$(BUILD_DIR)/tsan/hull' '$(BOARD_AVR)' '$(BOARD_ARM)' \
+		'$(BOARD_8051)' $(strip $(BOARD_ESP))
+	@if ls '$(BUILD_DIR)/tsan-report' | grep -q .; then \
+		grep -h -A12 'WARNING: ThreadSanitizer' '$(BUILD_DIR)/tsan-report'/* | head -60; \
+		echo 'check-tsan: ThreadSanitizer reported, in $(BUILD_DIR)/tsan-report'; exit 1; \
+	fi
+	@echo 'check-tsan: no report'
+
 check-sanitize: $(PROBE)
 	$(MAKE) BUILD_DIR='$(BUILD_DIR)/sanitize' CFLAGS='$(SANITIZE_FLAGS)' \
 		SANITIZE_PROBE='$(abspath $(PROBE))' sanitize-run
