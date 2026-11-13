@@ -573,7 +573,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 	free(text);
 	/* The guest's arch: (arch ...), or the host's. One not the host's is
 	 * emulated, which the planner gives only to emu (section 5.3); the
-	 * host's own runs under KVM as a vm, on an x86_64 host or an arm64 one. */
+	 * host's own runs under KVM as a vm, on any host the engine boots on. */
 	text = hull_access_value(doc, &machine, "arch");
 	snprintf(m->arch, sizeof m->arch, "%s",
 	         text == NULL || strcmp(text, "host") == 0 ? host_arch() : text);
@@ -2690,7 +2690,11 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		argv[n++] = "-netdev";
 		argv[n++] = netdev;
 		argv[n++] = "-device";
-		argv[n++] = "virtio-net-pci,netdev=net";
+		/* An s390x guest's PCI is zPCI, which loads no option ROM, and
+		 * s390x Debian's qemu ships none: without romfile= qemu looked
+		 * for efi-virtio.rom and would not start (the s390x host's own
+		 * machine, 2026-11-13). */
+		argv[n++] = m->s390x ? "virtio-net-pci,netdev=net,romfile=" : "virtio-net-pci,netdev=net";
 	}
 	/* After passt's, so that eth0 is its, and each segment the next. */
 	for (unsigned i = 0u; i < m->segment_count; i++) {
@@ -2699,8 +2703,8 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		segment_mac(m, i, mac, sizeof mac);
 		snprintf(segment_netdev[i], sizeof segment_netdev[i],
 		         "stream,id=s%u,addr.type=fd,addr.str=%u", i, SEGMENT_FD + i);
-		snprintf(segment_device[i], sizeof segment_device[i], "virtio-net-pci,netdev=s%u,mac=%s",
-		         i, mac);
+		snprintf(segment_device[i], sizeof segment_device[i], "virtio-net-pci,netdev=s%u,mac=%s%s",
+		         i, mac, m->s390x ? ",romfile=" : "");
 		argv[n++] = "-netdev";
 		argv[n++] = segment_netdev[i];
 		argv[n++] = "-device";
@@ -4244,9 +4248,9 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		return hosted_start(core, m, error);
 	if (uname(&name) != 0 ||
 	    (strcmp(name.machine, "x86_64") != 0 && strcmp(name.machine, "aarch64") != 0 &&
-	     strcmp(name.machine, "riscv64") != 0))
-		return fail(error, HULL_ERR_RUNTIME, "the qemu engine boots on x86_64, aarch64 and "
-		            "riscv64 hosts");
+	     strcmp(name.machine, "riscv64") != 0 && strcmp(name.machine, "s390x") != 0))
+		return fail(error, HULL_ERR_RUNTIME, "the qemu engine boots on x86_64, aarch64, "
+		            "riscv64 and s390x hosts");
 	if (!m->emu && access("/dev/kvm", R_OK | W_OK) != 0)
 		return fail(error, HULL_ERR_RUNTIME, "/dev/kvm is not open to this user");
 	if (m->transport == 1 && access("/dev/vhost-vsock", R_OK | W_OK) != 0)

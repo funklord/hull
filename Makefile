@@ -405,7 +405,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: esp-qemu-lora
-.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-arm64-host check-riscv64-host check-root check-systemd check-vfio check-usb check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-usb check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -513,6 +513,7 @@ help:
 	@echo '  check-qemu    hull run on the qemu engine, as the user, with KVM'
 	@echo '  check-arm64-host  hull built and make test run on arm64, under emu'
 	@echo '  check-riscv64-host  hull built and make test run on riscv64, under emu'
+	@echo '  check-s390x-host  hull built and make test run on s390x, big-endian, under emu'
 	@echo '  check-pc      a whole PC booting its own media, as the user'
 	@echo '  check-legacy  FreeDOS, fetched and pinned, on a pc: screen and ssh door'
 	@echo '  check-images  published images and a compose project, on chroot and a vm'
@@ -969,6 +970,12 @@ check-arm64-host: $(HULL) $(AGENT_ARM64)
 # the H extension, hull built and tested there. Needs qemu-system-riscv64.
 check-riscv64-host: $(HULL) $(AGENT_RISCV64)
 	BUILD_DIR='$(BUILD_DIR)' sh test/riscv64_host_test.sh '$(HULL)'
+
+# hull on an s390x host, big-endian, the same way: an s390x Debian under
+# emu, hull built and tested there. Needs qemu-system-s390x, and the agent
+# s390x-linux-gnu-gcc builds.
+check-s390x-host: $(HULL) $(AGENT_S390X)
+	BUILD_DIR='$(BUILD_DIR)' sh test/s390x_host_test.sh '$(HULL)'
 
 # The unit tests, and the store and pull suites, built and run with
 # AddressSanitizer and UndefinedBehaviorSanitizer, in a build directory
