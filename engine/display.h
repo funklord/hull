@@ -19,6 +19,11 @@ int hull_display_fits(const char *monitor);
  * VNC's. */
 void hull_display_link(const char *monitor, const char *address, char *link, size_t cap);
 
+/* The link of a machine a later core takes back: `link` names
+ * hull/display/`address` where it still names `monitor`, else "", so
+ * that the core which ends the machine removes it. */
+void hull_display_adopt(const char *monitor, const char *address, char *link, size_t cap);
+
 /* Remove `link` where it still names `monitor`, a later machine at the
  * same address having replaced it otherwise; `link` becomes "". */
 void hull_display_unlink(char *link, const char *monitor);

@@ -2469,8 +2469,9 @@ wait "$runner" 2>/dev/null
 # listens on for the real one. The workload writes `during` two seconds
 # in, while no core holds it, as the test waits four after the kill; it
 # then waits up to 20 s to be served on its port, and 12 s more, for an
-# exec and a second machine's boot.
-conf adopt '(backend vm) (hostname "qadopt") (on_disconnect keep)' \
+# exec and a second machine's boot. It has a screen, whose link the core
+# that takes it back removes at its end.
+conf adopt '(backend vm) (hostname "qadopt") (on_disconnect keep) (display vnc)' \
 	'(ports (port (host 18097) (guest 97)))' \
 	'(command "/probe" "say" "before" "sleep" "2" "say" "during" "serve" "tcp" "97" "say" "after" "sleep" "12" "exit" "5")'
 (cd / && exec timeout -k 2 90 "$hull" run -f "$root/adopt.conf" > /dev/null 2>&1) &
@@ -2570,6 +2571,11 @@ sleep 2
 left=$(pgrep -f "^qemu-system-x86_64 .*$XDG_RUNTIME_DIR/hull/qemu-")
 [ ! -e "$kept_file" ] && [ -z "$left" ] ||
 	fail "a taken-back vm's file or qemu is left" "$(ls "$XDG_RUNTIME_DIR/hull/machines") $left"
+# Its screen's link, made by the core that started it, removed by the one
+# that took it back.
+cases=$((cases + 1))
+[ -n "$at" ] && [ ! -L "$XDG_RUNTIME_DIR/hull/display/$at" ] ||
+	fail "a taken-back vm's display link is left" "$(ls -l "$XDG_RUNTIME_DIR/hull/display" 2>&1)"
 # The same over (transport serial), the agent's channel a virtio-serial
 # port behind agent.sock in the machine's directory, as where vhost-vsock
 # is not open to the user: a kept vm outliving its core; a host on the

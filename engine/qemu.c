@@ -4915,6 +4915,10 @@ static hull_status qemu_adopt(hull_core *core, hull_buf state, hull_machine **ou
 	}
 	m->adopted = 1;
 	mark_adopted_dir(m->dir, 1);
+	/* Its screen's link, the starting core's, so that this one, which
+	 * ends the machine, removes it. */
+	hull_display_adopt(display_monitor(m), m->address_text, m->display_link,
+	                   sizeof m->display_link);
 	fd = dial(m, m->cid);
 	if (fd >= 0 && hull_wire_open(&m->wire, fd, HULL_WIRE_FROM_AGENT) != 0) {
 		close(fd);

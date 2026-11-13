@@ -42,6 +42,23 @@ void hull_display_link(const char *monitor, const char *address, char *link, siz
 	}
 }
 
+void hull_display_adopt(const char *monitor, const char *address, char *link, size_t cap)
+{
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	char        target[4400];
+	ssize_t     length;
+
+	link[0] = '\0';
+	if (runtime == NULL || runtime[0] != '/' || address[0] == '\0' || strchr(address, '/') != NULL ||
+	    (size_t)snprintf(link, cap, "%s/hull/display/%s", runtime, address) >= cap) {
+		link[0] = '\0';
+		return;
+	}
+	length = readlink(link, target, sizeof target - 1u);
+	if (length <= 0 || (target[length] = '\0', strcmp(target, monitor) != 0))
+		link[0] = '\0';
+}
+
 void hull_display_unlink(char *link, const char *monitor)
 {
 	char    target[4400];
