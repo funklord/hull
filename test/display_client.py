@@ -8,7 +8,7 @@ its first frame awaited.
 Usage: display_client.py LINK SECONDS. Prints `console WIDTHxHEIGHT`, then
 `frame WIDTHxHEIGHT` for the first Scanout, then `dmabuf FOURCC` where it
 was a GPU's buffer (a 3D machine's), else `lit N` -- how many of
-its pixels are not black -- and exits 0; exits 1, saying why, otherwise.
+its bytes are not zero -- and exits 0; exits 1, saying why, otherwise.
 Bounded: every wait ends at SECONDS."""
 import socket
 import sys
@@ -96,10 +96,12 @@ def main():
 			got['frame'] = (w, h, None, fourcc)
 			loop.quit()
 		if method == 'Scanout' and 'frame' not in got:
-			w, h, stride, _format, data = params.unpack()
-			lit = sum(1 for i in range(0, min(len(data), stride * h), 4)
-			          if data[i] or data[i + 1] or data[i + 2])
-			got['frame'] = (w, h, lit)
+			# The pixels as one buffer, looked at by bytes' own C: a
+			# frame is megabytes, which a loop in Python takes longer
+			# over than the waits allow, blocking the loop they run on.
+			w, h, stride, _format = (params.get_child_value(i).unpack() for i in range(4))
+			data = params.get_child_value(4).get_data_as_bytes().get_data()[:stride * h]
+			got['frame'] = (w, h, len(data) - data.count(0))
 			loop.quit()
 		invocation.return_value(None)
 
