@@ -35,7 +35,9 @@
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -45,6 +47,7 @@
 #include "access.h"
 #include "builtin.h"
 #include "hw.h"
+#include "nic.h"
 
 #define MAX_ENV        64u
 #define MAX_ARGS       64u
@@ -94,7 +97,20 @@ struct hull_machine {
 	int             done;
 	pthread_mutex_t lock;
 	pthread_cond_t  done_cond;
+	/* (segments ...): the workload in a network namespace of its own on
+	 * the board, each NIC made there by hull-agent, its frames over a
+	 * session of their own to the segment's port on the core's switch. */
+	char           *segment[HULL_NICS_MAX];
+	hull_nic        nic[HULL_NICS_MAX];
+	unsigned        segment_count;
+	char           *hosts;        /* /etc/hosts on addressed segments, or NULL */
+	char           *resolver;     /* /etc/resolv.conf naming hull at .1, or NULL */
+	char            arch[72];     /* the machine's, whose hull-agent the board is given */
+	pid_t           wire[HULL_NICS_MAX];
 };
+
+/* hull-agent, in a machine's tree on the board where it is on segments. */
+#define AGENT_IN_TREE ".hull-agent"
 
 static const hull_host_ops *host;
 static pthread_mutex_t      busy_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -708,11 +724,34 @@ static int enter_script(const hull_machine *m, char *const *argv, unsigned argc,
 	for (unsigned i = 0u; i < m->env_count; i++)
 		if (quote(script, cap, &at, m->env[i]) != 0 || add(script, cap, &at, " ") != 0)
 			return -1;
-	/* A login that is not root enters by a user namespace of its own. */
-	if (add(script, cap, &at, "unshare $(test \"$(id -u)\" = 0 || echo -r) --root=") != 0 ||
+	/* An exec into a machine on segments joins the workload's network
+	 * namespace, and its user namespace with it where the login is not
+	 * root, which leaves it root there and able to enter the tree. */
+	if (m->segment_count != 0u && pid_file == NULL) {
+		char workload_pid[700];
+
+		snprintf(workload_pid, sizeof workload_pid, "%s.pid", m->tree);
+		if (add(script, cap, &at, "nsenter -t \"$(cat ") != 0 ||
+		    quote(script, cap, &at, workload_pid) != 0 ||
+		    add(script, cap, &at, ")\" $(test \"$(id -u)\" = 0 || echo -U --preserve-credentials) -n -- unshare ") != 0)
+			return -1;
+	} else if (add(script, cap, &at, "unshare $(test \"$(id -u)\" = 0 || echo -r) ") != 0) {
+		return -1;
+	}
+	/* A login that is not root enters by a user namespace of its own; on a
+	 * segment, a network namespace of its own too, its NICs waited for. */
+	if ((m->segment_count != 0u && pid_file != NULL && add(script, cap, &at, "-n ") != 0) ||
+	    add(script, cap, &at, "--root=") != 0 ||
 	    quote(script, cap, &at, m->tree) != 0 || add(script, cap, &at, " --wd=") != 0 ||
 	    quote(script, cap, &at, m->workdir) != 0 || add(script, cap, &at, " --") != 0)
 		return -1;
+	if (m->segment_count != 0u && pid_file != NULL) {
+		char wait[64];
+
+		snprintf(wait, sizeof wait, " /" AGENT_IN_TREE " wait-nics 0 %u --", m->segment_count);
+		if (add(script, cap, &at, wait) != 0)
+			return -1;
+	}
 	for (unsigned i = 0u; i < argc; i++)
 		if (add(script, cap, &at, " ") != 0 || quote(script, cap, &at, argv[i]) != 0)
 			return -1;
@@ -877,6 +916,166 @@ static void end_ports(hull_machine *m)
 	}
 }
 
+/* --- segments ------------------------------------------------------------ */
+
+/* `fd`'s bytes from its start to `path` on the board, mode `mode`: 0, or
+ * -1. */
+static int board_put(hull_machine *m, int fd, const char *path, const char *mode)
+{
+	const char *argv[12];
+	char        port[16];
+	char        target[256];
+	char        script[1600];
+	size_t      at = 0u;
+	int         null = open("/dev/null", O_RDWR | O_CLOEXEC);
+	int         status = -1;
+	pid_t       pid;
+
+	if (null < 0 || lseek(fd, 0, SEEK_SET) != 0 ||
+	    add(script, sizeof script, &at, "cat > ") != 0 ||
+	    quote(script, sizeof script, &at, path) != 0 ||
+	    add(script, sizeof script, &at, " && chmod ") != 0 ||
+	    add(script, sizeof script, &at, mode) != 0 || add(script, sizeof script, &at, " ") != 0 ||
+	    quote(script, sizeof script, &at, path) != 0) {
+		if (null >= 0)
+			close(null);
+		return -1;
+	}
+	ssh_words(&m->board, script, argv, port, sizeof port, target, sizeof target);
+	pid = spawn(argv, fd, null, null);
+	close(null);
+	if (pid > 0 && waitpid(pid, &status, 0) == pid)
+		return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+	return -1;
+}
+
+/* `text` to `path` on the board. */
+static int board_write(hull_machine *m, const char *text, const char *path)
+{
+	int fd = memfd_create("hull-board", MFD_CLOEXEC);
+	int result = -1;
+
+	if (fd >= 0 && write(fd, text, strlen(text)) == (ssize_t)strlen(text))
+		result = board_put(m, fd, path, "644");
+	if (fd >= 0)
+		close(fd);
+	return result;
+}
+
+/* What a machine on segments wants in its tree once it is deployed: the
+ * hull-agent of its arch, which waits for its NICs and makes them, and
+ * the siblings' names and hull at .1 where the segments are addressed. */
+static int prepare_segments(hull_machine *m)
+{
+	char    self[PATH_MAX];
+	char    agent[PATH_MAX + 96];
+	char    path[800];
+	ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1u);
+	int     fd;
+	int     result;
+
+	if (m->segment_count == 0u)
+		return 0;
+	if (n <= 0)
+		return -1;
+	self[n] = '\0';
+	if (strrchr(self, '/') != NULL)
+		*strrchr(self, '/') = '\0';
+	snprintf(agent, sizeof agent, "%s/hull-agent", self);
+	{
+		struct utsname here;
+		const char    *host_arch = uname(&here) != 0 ? "" :
+		                           strcmp(here.machine, "x86_64") == 0 ? "amd64" :
+		                           strcmp(here.machine, "aarch64") == 0 ? "arm64" : here.machine;
+
+		if (strcmp(m->arch, host_arch) != 0)
+			snprintf(agent, sizeof agent, "%s/hull-agent-%s", self, m->arch);
+	}
+	if ((fd = open(agent, O_RDONLY | O_CLOEXEC)) < 0) {
+		say(m, "hull: board %s: a machine on a segment runs hull-agent of its arch, and %s "
+		    "cannot be read\n", m->board.name, agent);
+		return -1;
+	}
+	snprintf(path, sizeof path, "%s/" AGENT_IN_TREE, m->tree);
+	result = board_put(m, fd, path, "755");
+	close(fd);
+	if (result == 0 && m->hosts != NULL) {
+		snprintf(path, sizeof path, "%s/etc", m->tree);
+		{
+			char   mk[900];
+			size_t at = 0u;
+
+			if (add(mk, sizeof mk, &at, "mkdir -p ") != 0 || quote(mk, sizeof mk, &at, path) != 0 ||
+			    board_ssh(m, mk, 15) != 0)
+				result = -1;
+		}
+		snprintf(path, sizeof path, "%s/etc/hosts", m->tree);
+		if (result == 0)
+			result = board_write(m, m->hosts, path);
+		snprintf(path, sizeof path, "%s/etc/resolv.conf", m->tree);
+		if (result == 0 && m->resolver != NULL)
+			result = board_write(m, m->resolver, path);
+	}
+	return result;
+}
+
+/* Each segment's NIC: a session of its own that waits until the
+ * workload's network namespace is its own, enters it, and runs hull-agent
+ * there, its stdin and stdout the segment's port on the core's switch. */
+static void start_wires(hull_machine *m, const char *pid_file)
+{
+	for (unsigned i = 0u; i < m->segment_count; i++) {
+		const hull_nic *nic = &m->nic[i];
+		const char     *argv[12];
+		char            ssh_port[16];
+		char            target[256];
+		char            spec[200];
+		char            script[2400];
+		char            why[200];
+		size_t          at = 0u;
+		int             null = open("/dev/null", O_RDWR | O_CLOEXEC);
+		int             port = host->segment(m->core, m->segment[i], why, sizeof why);
+
+		m->wire[i] = 0;
+		snprintf(spec, sizeof spec, "%s,%02x:%02x:%02x:%02x:%02x:%02x,%s,%u,%s,%u,%d", nic->name,
+		         nic->mac[0], nic->mac[1], nic->mac[2], nic->mac[3], nic->mac[4], nic->mac[5],
+		         nic->address, nic->prefix, nic->address6, nic->prefix6, nic->gateway);
+		if (port < 0 || null < 0 ||
+		    add(script, sizeof script, &at, "f=") != 0 ||
+		    quote(script, sizeof script, &at, pid_file) != 0 ||
+		    add(script, sizeof script, &at, "; i=0; while :; do p=$(cat \"$f\" 2>/dev/null); "
+		        "[ -n \"$p\" ] && [ \"$(readlink /proc/$p/ns/net 2>/dev/null)\" != "
+		        "\"$(readlink /proc/self/ns/net)\" ] && [ -n \"$(readlink /proc/$p/ns/net "
+		        "2>/dev/null)\" ] && break; i=$((i+1)); [ $i -ge 300 ] && exit 1; sleep 0.1; done; "
+		        "exec nsenter -t \"$p\" $(test \"$(id -u)\" = 0 || echo -U --preserve-credentials) -n ") != 0 ||
+		    quote(script, sizeof script, &at, m->tree) != 0 ||
+		    add(script, sizeof script, &at, "/" AGENT_IN_TREE " nic-stdio 0 ") != 0 ||
+		    quote(script, sizeof script, &at, spec) != 0) {
+			say(m, "hull: board %s: a segment could not be joined: %s\n", m->board.name,
+			    port < 0 ? why : "the session could not be written");
+			if (port >= 0)
+				close(port);
+			if (null >= 0)
+				close(null);
+			continue;
+		}
+		ssh_words(&m->board, script, argv, ssh_port, sizeof ssh_port, target, sizeof target);
+		m->wire[i] = spawn(argv, port, port, null);
+		close(port);
+		close(null);
+	}
+}
+
+static void end_wires(hull_machine *m)
+{
+	for (unsigned i = 0u; i < m->segment_count; i++)
+		if (m->wire[i] > 0) {
+			kill(m->wire[i], SIGTERM);
+			waitpid(m->wire[i], NULL, 0);
+			m->wire[i] = 0;
+		}
+}
+
 /* The workload to its end: its exit status, 125 for a failure of hull's. */
 static int run_workload(hull_machine *m)
 {
@@ -920,10 +1119,12 @@ static int run_workload(hull_machine *m)
 	pthread_mutex_lock(&m->lock);
 	m->workload = pid;
 	pthread_mutex_unlock(&m->lock);
+	start_wires(m, pid_file);
 	read_output(m, NULL, out[0], err[0]);
 	close(out[0]);
 	close(err[0]);
 	waitpid(pid, &status, 0);
+	end_wires(m);
 	pthread_mutex_lock(&m->lock);
 	m->workload = 0;
 	pthread_mutex_unlock(&m->lock);
@@ -960,6 +1161,9 @@ static void *run_machine(void *arg)
 			say(m, "hull: board %s: marked broken: the tree could not be deployed to %s\n",
 			    m->board.name, m->tree);
 			mark_broken(m->board.name, "a deploy failed after a power cycle");
+		} else if (prepare_segments(m) != 0) {
+			say(m, "hull: board %s: what its segments want could not be put in the tree%s\n",
+			    m->board.name, "");
 		} else {
 			if (start_ports(m) != 0)
 				say(m, "hull: board %s: its ports could not be forwarded%s\n", m->board.name, "");
@@ -1098,6 +1302,56 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 				return "a board's ports are ssh's forwards, which are TCP";
 		}
 	}
+	if (hull_access_find(doc, &machine, "segments", &entry)) {
+		hull_sexpr_form top;
+		char           *network = hull_access_value(doc, &machine, "network");
+		char           *address = NULL;
+		int             none = network != NULL && strcmp(network, "none") == 0;
+
+		free(network);
+		if (!none)
+			return "a board on a segment is given its segments alone, its workload in a "
+			       "network namespace of its own: (network none) beside (segments ...)";
+		hull_sexpr_child(doc, &entry, &item);
+		for (more = hull_sexpr_next(doc, &item, &item); more;
+		     more = hull_sexpr_next(doc, &item, &item)) {
+			if (m->segment_count == HULL_NICS_MAX)
+				return "there are too many segments";
+			if ((m->segment[m->segment_count++] = hull_access_segment_name(doc, &item)) == NULL)
+				return "a segment's name is not text";
+		}
+		if (hull_sexpr_first(doc, &top))
+			address = hull_access_value(doc, &top, "address");
+		if (address == NULL)
+			return "the plan gives its segments no address to draw a MAC from";
+		for (unsigned i = 0u; i < m->segment_count; i++) {
+			snprintf(m->nic[i].name, sizeof m->nic[i].name, "eth%u", i);
+			hull_access_segment_mac(address, m->segment[i], i, m->nic[i].mac);
+		}
+		free(address);
+		if (hull_access_find(doc, &top, "names", &entry)) {
+			for (unsigned i = 0u; i < m->segment_count; i++) {
+				hull_access_named(doc, &entry, m->segment[i], m->nic[i].address,
+				                  &m->nic[i].prefix);
+				hull_access_named6(doc, &entry, m->segment[i], m->nic[i].address6,
+				                   &m->nic[i].prefix6);
+				m->nic[i].gateway = hull_access_gateway(doc, &entry, m->segment[i]);
+			}
+			m->hosts = hull_access_hosts(doc, &entry);
+			m->resolver = hull_access_resolver(doc, &entry);
+		}
+		name = hull_access_value(doc, &machine, "arch");
+		if (name != NULL && strcmp(name, "host") != 0) {
+			snprintf(m->arch, sizeof m->arch, "%s", name);
+		} else {
+			struct utsname here;
+
+			snprintf(m->arch, sizeof m->arch, "%s", uname(&here) != 0 ? "" :
+			         strcmp(here.machine, "x86_64") == 0 ? "amd64" :
+			         strcmp(here.machine, "aarch64") == 0 ? "arm64" : here.machine);
+		}
+		free(name);
+	}
 	name = hull_access_value(doc, &machine, "stop_signal");
 	m->stop_signal = name != NULL ? hull_access_signal(name) : SIGTERM;
 	free(name);
@@ -1115,6 +1369,10 @@ static void release(hull_machine *m)
 	free(m->pool);
 	free(m->source);
 	free(m->workdir);
+	for (unsigned i = 0u; i < m->segment_count; i++)
+		free(m->segment[i]);
+	free(m->hosts);
+	free(m->resolver);
 	pthread_mutex_destroy(&m->lock);
 	pthread_cond_destroy(&m->done_cond);
 	free(m);
@@ -1475,6 +1733,11 @@ static const hull_cap_entry entries[] = {
 	{ "network.none",       HULL_SUP_EMULATED, "the board's own network, whatever that is", NULL },
 	{ "network.nat",        HULL_SUP_EMULATED, "the board's own network, whatever that is", NULL },
 	{ "network.host",       HULL_SUP_NATIVE,   "the board's own network", NULL },
+	{ "segments",           HULL_SUP_NATIVE,
+	  "under (network none), a tap each in the workload's network namespace on the board, made "
+	  "by hull-agent of the machine's arch, its frames over a session of its own", NULL },
+	{ "impair",             HULL_SUP_NATIVE,   NULL, NULL },
+	{ "tamper",             HULL_SUP_NATIVE,   NULL, NULL },
 	{ "security.no_new_privs", HULL_SUP_EMULATED,
 	  "not set: what the command may do is the board's login's", NULL },
 	{ "on_disconnect.stop", HULL_SUP_NATIVE,   NULL, NULL },

@@ -100,7 +100,7 @@ const char *hull_nic_join(const hull_nic *nics, unsigned n, int routed, int rout
  * core's switch: in a process of the machine's own, which goes with its
  * namespace. Returns when a port closes.
  */
-void hull_nic_relay(const int *tap, const int *port, unsigned n)
+void hull_nic_relay_io(const int *tap, const int *in, const int *out, unsigned n)
 {
 	static uint8_t from_port[HULL_NICS_MAX][4u + 65536u];
 	size_t         held[HULL_NICS_MAX] = { 0u };
@@ -109,7 +109,7 @@ void hull_nic_relay(const int *tap, const int *port, unsigned n)
 
 	for (unsigned i = 0u; i < n; i++) {
 		fds[2u * i]      = (struct pollfd){ .fd = tap[i], .events = POLLIN };
-		fds[2u * i + 1u] = (struct pollfd){ .fd = port[i], .events = POLLIN };
+		fds[2u * i + 1u] = (struct pollfd){ .fd = in[i], .events = POLLIN };
 	}
 	for (;;) {
 		if (poll(fds, 2u * n, -1) < 0) {
@@ -129,7 +129,7 @@ void hull_nic_relay(const int *tap, const int *port, unsigned n)
 					frame[2] = (uint8_t)((size_t)got >> 8);
 					frame[3] = (uint8_t)got;
 					while (at < (size_t)got + 4u) {
-						ssize_t put = write(port[i], frame + at, (size_t)got + 4u - at);
+						ssize_t put = write(out[i], frame + at, (size_t)got + 4u - at);
 
 						if (put <= 0)
 							return;
@@ -138,7 +138,7 @@ void hull_nic_relay(const int *tap, const int *port, unsigned n)
 				}
 			}
 			if (fds[2u * i + 1u].revents & (POLLIN | POLLHUP | POLLERR)) {
-				ssize_t got = read(port[i], from_port[i] + held[i],
+				ssize_t got = read(in[i], from_port[i] + held[i],
 				                   sizeof from_port[i] - held[i]);
 
 				if (got <= 0)
@@ -165,4 +165,9 @@ void hull_nic_relay(const int *tap, const int *port, unsigned n)
 			}
 		}
 	}
+}
+
+void hull_nic_relay(const int *tap, const int *port, unsigned n)
+{
+	hull_nic_relay_io(tap, port, port, n);
 }

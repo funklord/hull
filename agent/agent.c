@@ -3119,6 +3119,32 @@ static int nics(const char *path, const char *routed, int count, char **specs)
 	return 0;
 }
 
+/* `hull-agent nic-stdio ROUTED NIC`, in a board's machine (the hw
+ * engine), entered by nsenter from a session of its own: the NIC made as
+ * `nics` makes one, its frames relayed over stdin and stdout, which the
+ * core joins to the segment's port on its switch; until either ends. */
+static int nic_stdio(const char *routed, const char *spec)
+{
+	hull_nic    nic;
+	int         tap;
+	int         in = 0;
+	int         out = 1;
+	const char *failed;
+
+	signal(SIGPIPE, SIG_IGN);
+	if (nic_of(spec, &nic) != 0) {
+		fprintf(stderr, "hull agent: nic-stdio: %s is not a NIC\n", spec);
+		return 2;
+	}
+	if ((failed = hull_nic_join(&nic, 1u, strcmp(routed, "1") == 0, strcmp(routed, "1") == 0,
+	                            &tap)) != NULL) {
+		fprintf(stderr, "hull agent: nic-stdio: %s: %s\n", failed, strerror(errno));
+		return 1;
+	}
+	hull_nic_relay_io(&tap, &in, &out, 1u);
+	return 0;
+}
+
 /* `hull-agent wait-nics FIRST COUNT -- COMMAND...`, a container's
  * entrypoint ahead of its own, as its user: ethFIRST and the COUNT-1
  * after it waited for, which `hull-agent nics` makes as its root, so that
@@ -3132,11 +3158,13 @@ static int wait_nics(const char *first, const char *count, char **command)
 	for (int tries = 0;; tries++) {
 		unsigned there = 0u;
 
+		/* By the kernel's own index, which needs no /sys: a board's tree,
+		 * entered by unshare --root, has none mounted. */
 		for (unsigned i = 0u; i < n; i++) {
-			char path[64];
+			char name[IF_NAMESIZE];
 
-			snprintf(path, sizeof path, "/sys/class/net/eth%u", from + i);
-			there += access(path, F_OK) == 0;
+			snprintf(name, sizeof name, "eth%u", from + i);
+			there += if_nametoindex(name) != 0u;
 		}
 		if (there == n)
 			break;
@@ -3174,6 +3202,8 @@ int main(int argc, char **argv)
 	}
 	if (argc == 3 && strcmp(argv[1], "relay") == 0)
 		return relay(argv[2]);
+	if (argc == 4 && strcmp(argv[1], "nic-stdio") == 0)
+		return nic_stdio(argv[2], argv[3]);
 	if (argc >= 5 && strcmp(argv[1], "nics") == 0)
 		return nics(argv[2], argv[3], argc - 4, argv + 4);
 	if (argc >= 5 && strcmp(argv[1], "wait-nics") == 0 && strcmp(argv[4], "--") == 0)

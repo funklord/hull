@@ -157,6 +157,9 @@ cat > "$XDG_CONFIG_HOME/hull/pools.conf" <<CONF
            (power "$root/power ax $((port + 10))"))
     (board "rv" (arch "riscv64") (address "127.0.0.1") (port $((port + 11))) (root "$root/on-b")
            (power "$root/power rv $((port + 11))"))))
+  (wired (members
+    (board "w" (address "127.0.0.1") (port $((port + 12))) (root "$root/on-b")
+           (power "$root/power w $((port + 12))"))))
   (lab (members
     (board "kept" (by_name true) (address "127.0.0.1") (port $((port + 6))) (root "$root/on-a")
            (power "$root/power kept $((port + 6))")))))
@@ -403,6 +406,44 @@ lease=$(timeout 20 "$hull" reserve arches --member rv)
 expect 125 "board rv of lease $lease is riscv64, and the machine arm64" \
 	"$hull" run --lease "$lease" -f "$root/project/onarm.conf"
 expect 0 '' "$hull" release "$lease"
+
+# --- a board on a segment, beside a machine of another engine ----------------
+# Under (network none) the workload is in a network namespace of its own
+# on the board, its NIC made there by hull-agent from a session of its
+# own entering it, the frames over that session to the core's switch: the
+# board's machine asks a chroot machine by name over the wire and is
+# answered. A board on a segment with the board's own network is refused.
+printf '(machines (b %s) (c %s))\n' \
+	'(source "dir:./tree") (backend hw) (pool "wired") (network none) (segments (wseg (subnet "10.82.0.0/24"))) (command "/probe" "addr" "eth0" "hosts" "c" "ask" "c" "7000" "sleep" "3")' \
+	'(source "dir:./tree") (backend chroot) (mutable overlay) (network none) (segments (wseg (subnet "10.82.0.0/24"))) (command "/probe" "addr" "eth0" "answer" "7000" "sleep" "10")' \
+	> "$root/project/wired.conf"
+cases=$((cases + 1))
+out=$(cd "$root/project" && timeout -k 2 120 "$hull" run -f "$root/project/wired.conf" 2>&1)
+got=$?
+b_at=$(printf '%s\n' "$out" | sed -n 's#^b *| addr=eth0 \(10\.82\.0\.[0-9]*\)/24 up$#\1#p')
+c_at=$(printf '%s\n' "$out" | sed -n 's#^c *| addr=eth0 \(10\.82\.0\.[0-9]*\)/24 up$#\1#p')
+[ "$got" = 0 ] && [ -n "$b_at" ] && [ -n "$c_at" ] &&
+	printf '%s\n' "$out" | grep -q "^b *| hosts=c $c_at\$" &&
+	printf '%s\n' "$out" | grep -q "^b *| ask=c at $c_at: c\$" &&
+	printf '%s\n' "$out" | grep -q "^c *| answer=from $b_at\$" ||
+	fail "a board's machine and a chroot machine on one segment did not reach each other" "exit $got
+$out"
+# An exec into the board's machine enters its network namespace: the NIC
+# is there for it too.
+conf wiredx '(backend hw) (pool "wired") (hostname "wx") (network none) (segments (wsegx (subnet "10.83.0.0/24"))) (command "/probe" "say" "ready" "sleep" "40")'
+rm -f "$root/wiredx.out"
+(cd "$root/project" && timeout -k 2 90 "$hull" run -f "$root/project/wiredx.conf" > "$root/wiredx.out" 2>&1) &
+runner=$!
+tries=0
+until grep -q '^ready$' "$root/wiredx.out" 2> /dev/null || [ "$tries" -ge 120 ]; do
+	tries=$((tries + 1))
+	sleep 0.5
+done
+expect 0 '^addr=eth0 10\.83\.0\.[0-9]+/24 up$' "$hull" exec wx -- /probe addr eth0
+timeout 30 "$hull" stop --timeout 2 wx > /dev/null 2>&1
+wait "$runner"
+conf wirednet '(backend hw) (pool "wired") (segments "wseg") (command "/probe")'
+expect 125 'is given its segments alone' "$hull" run -f "$root/project/wirednet.conf"
 
 # --- a deploy of the board's own: an image flashed, a netboot served ----------
 

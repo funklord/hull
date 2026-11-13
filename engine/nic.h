@@ -34,4 +34,8 @@ const char *hull_nic_join(const hull_nic *nics, unsigned n, int routed, int rout
  * port closes. Allocates nothing. */
 void hull_nic_relay(const int *tap, const int *port, unsigned n);
 
+/* The same with each port read from `in` and written to `out`, a pipe's
+ * two ends or a session's stdin and stdout. */
+void hull_nic_relay_io(const int *tap, const int *in, const int *out, unsigned n);
+
 #endif /* HULL_ENGINE_NIC_H */
