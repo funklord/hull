@@ -27,9 +27,9 @@
 #define HULL_KERNEL_SHA256  "7d13cd82a1d377e40826c313f5dbbdb2edf1b48c713a375e4cfe5e207749cb4e"
 
 /* Each arch's kernel, the same Debian version: the host's own, amd64,
- * and arm64 and riscv64 for an emu machine of that arch (section 5.3),
- * which boots under qemu-system-aarch64's or qemu-system-riscv64's virt
- * machine. Debian names riscv64's boot/vmlinux-RELEASE, an uncompressed
+ * and arm64, riscv64 and s390x for an emu machine of that arch (section
+ * 5.3), which boots under qemu-system-aarch64's or qemu-system-riscv64's
+ * virt machine, or qemu-system-s390x's s390-ccw-virtio. Debian names riscv64's boot/vmlinux-RELEASE, an uncompressed
  * Image, where the others are vmlinuz. */
 typedef struct hull_kernel_pin {
 	const char *arch;
@@ -51,6 +51,11 @@ static const hull_kernel_pin hull_kernel_pins[] = {
 	{ "riscv64", "6.12.107+deb13-riscv64",
 	  "l/linux/linux-image-6.12.107+deb13-riscv64_6.12.107-1_riscv64.deb",
 	  "abe9f65d74b434692149482b031db7a2aaf832921e09f69f775293c0e0c5799c", 112u, "vmlinux" },
+	/* s390x's, likewise unsigned by nobody, the sha256 checked against the
+	 * snapshot's s390x Packages index, 2026-11-13. */
+	{ "s390x", "6.12.107+deb13-s390x",
+	  "l/linux/linux-image-6.12.107+deb13-s390x_6.12.107-1_s390x.deb",
+	  "72f968758d4ffbb07ad0887d968beec650f961fdc9d3fabcf87a678626ddfd26", 50u, "vmlinuz" },
 };
 
 /* `arch`'s pin, or NULL where hull fetches no kernel for it. */

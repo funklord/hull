@@ -3236,6 +3236,65 @@ else
 		done
 		rm -rf "${root:?}/rvroot"
 	fi
+	# s390x the same way, 2026-11-13, a big-endian machine: qemu-system-
+	# s390x's s390-ccw-virtio booting Debian's s390x kernel, its root by
+	# 9p, virtiofs speaking FUSE in the guest's byte order. hull fetches no
+	# dropbear for it, its loader's path too short to rewrite, and the PC's
+	# UART is refused.
+	s390x_probe=${BUILD_DIR:?}/test/s390x/rootfs/probe
+	if ! command -v qemu-system-s390x > /dev/null ||
+	   [ ! -x "$(dirname "$hull")/hull-agent-s390x" ] || [ ! -x "$s390x_probe" ]; then
+		printf 'qemu: s390x under emu not tried: no qemu-system-s390x, hull-agent-s390x or s390x probe\n'
+	else
+		rm -rf "$root/szroot"
+		mkdir -p "$root/szroot/proc" "$root/szroot/dev" "$root/szroot/sys"
+		cp "$s390x_probe" "$root/szroot/probe"
+		printf '(machine (source "dir:./szroot") (backend emu) (arch s390x) (hostname "qsz") %s)\n' \
+			'(command "/probe" "say" "from s390x" "host" "read" "/proc/sys/kernel/arch" "exit" "5")' \
+			> "$root/sz.conf"
+		printf '(machine (source "dir:./szroot") (backend emu) (arch s390x) %s %s)\n' \
+			'(tuning (qemu (transport uart)))' '(command "/probe")' > "$root/szuart.conf"
+		sznone=$(mktemp -d "$root/run-sznone.XXXXXX")
+		szrun=$(mktemp -d "$root/run-sz.XXXXXX")
+		name='an s390x machine with no s390x kernel fetched'
+		out=$(cd / && XDG_RUNTIME_DIR=$sznone XDG_CACHE_HOME="$root/cache-empty" timeout 60 \
+			"$hull" run -f "$root/sz.conf" 2>&1)
+		got=$?
+		has 125 '`hull kernel fetch --arch s390x` downloads it'
+		name='(transport uart) on s390x'
+		out=$(cd / && XDG_RUNTIME_DIR=$sznone XDG_CACHE_HOME="$root/cache-empty" timeout 60 \
+			"$hull" run -f "$root/szuart.conf" 2>&1)
+		got=$?
+		has 125 'is a PC.s ISA serial port'
+		name='hull sshd fetch --arch s390x'
+		out=$(XDG_CACHE_HOME="$root/cache-empty" timeout 60 "$hull" sshd fetch --arch s390x 2>&1)
+		got=$?
+		has 1 'loader path is too short to rewrite'
+		name='kernel fetch --arch s390x'
+		out=$(XDG_CACHE_HOME="$root/cache" timeout 300 "$hull" kernel fetch --arch s390x 2>&1)
+		got=$?
+		if [ "$got" -ne 0 ] && printf '%s\n' "$out" | grep -q 'answered\|could not\|resolve\|connect'; then
+			printf 'qemu: s390x under emu not tried: %s\n' "$out"
+		else
+			has 0 "^$root/cache/hull/kernel-s390x-[0-9]"
+			name='an s390x machine under emu'
+			out=$(cd / && XDG_RUNTIME_DIR=$szrun XDG_CACHE_HOME="$root/cache" timeout 300 \
+				"$hull" run -f "$root/sz.conf" 2>&1)
+			got=$?
+			has 5 '^from s390x$'
+			has 5 '^host=qsz$'
+			has 5 '^read=s390x$'
+		fi
+		for run in "$sznone" "$szrun"; do
+			tries=0
+			while [ -S "$run/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+				tries=$((tries + 1))
+				sleep 0.25
+			done
+			rm -rf "${run:?}"
+		done
+		rm -rf "${root:?}/szroot"
+	fi
 	# Only emu runs another arch: on vm, refused at plan.
 	printf '(machine (source "dir:./a64root") (backend vm) (arch arm64) (command "/probe"))\n' \
 		> "$root/a64vm.conf"

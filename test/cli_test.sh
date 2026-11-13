@@ -77,7 +77,7 @@ printf '%s\n' '(machine (source "debian:13") (ports (port (host 8080) (guest 80)
 	> "$dir/ref.conf"
 printf '%s\n' '(machine (source "dir:./rootfs"))' > "$dir/dir.conf"
 printf '%s\n' '(machine (source "dir:.") (fidelity inotify))' > "$dir/inotify.conf"
-printf '%s\n' '(machine (source "debian:13") (arch s390x))' > "$dir/foreign.conf"
+printf '%s\n' '(machine (source "debian:13") (arch ppc64le))' > "$dir/foreign.conf"
 printf '%s\n' '(machines (web (source "debian:13")) (db (source "dir:./db") (init "/sbin/init")))' \
 	> "$dir/machines.conf"
 printf '%s\n' '(build (base "debian:13"))' > "$dir/build.conf"
@@ -652,7 +652,7 @@ expect 0 'machine on qemu \(emu\): ok$' "$hull" check -f "$dir/dir.conf" --backe
 expect 1 'machine on qemu \(vm\): arch: rejected: only the emu class' \
 	"$hull" check -f "$dir/foreign.conf" --backend vm,emu
 # A foreign arch is emu's to run, and qemu chooses emu for it; but it
-# runs amd64, arm64 and riscv64 alone, s390x not among them.
+# runs amd64, arm64, riscv64 and s390x alone, ppc64le not among them.
 expect 1 'machine on qemu \(emu\): arch: rejected: the engine does not run this arch$' \
 	"$hull" check -f "$dir/foreign.conf" --backend vm,emu
 expect 1 'machine on qemu \(emu\): arch: rejected' "$hull" plan -f "$dir/foreign.conf" --backend qemu

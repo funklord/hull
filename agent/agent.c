@@ -1749,8 +1749,10 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 		}
 	}
 	if (chdir("/machine") != 0 || mount(".", "/", NULL, MS_MOVE, NULL) != 0 ||
-	    chroot(".") != 0 || chdir("/") != 0)
+	    chroot(".") != 0 || chdir("/") != 0) {
+		say("the root", strerror(errno));
 		return "the machine's directory could not become its root";
+	}
 	/* Its (sysctls ...), the guest's kernel being its own. */
 	for (unsigned i = 0u; i < sysctl_count; i++) {
 		char        path[4200];

@@ -172,7 +172,9 @@ int hull_sshd_fetch(const char *arch_name, char *why, size_t cap)
 	int          status = -1;
 
 	if (arch == NULL) {
-		snprintf(why, cap, "hull fetches no sshd for %s: amd64, arm64 and riscv64", arch_name);
+		snprintf(why, cap, "hull fetches no sshd for %s: amd64, arm64 and riscv64%s", arch_name,
+		         strcmp(arch_name, "s390x") == 0 ?
+		         "; s390x's loader path is too short to rewrite, so its image's sshd serves" : "");
 		return -1;
 	}
 	if (hull_sshd_dir_of(arch->name, dir, sizeof dir) != 0) {

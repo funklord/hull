@@ -314,6 +314,10 @@ AGENT_ARM64 := $(if $(shell command -v $(ARM64_CC) 2>/dev/null),$(BUILD_DIR)/hul
 RISCV64_CC    ?= riscv64-linux-gnu-gcc
 RISCV64_PROBE := $(if $(shell command -v $(RISCV64_CC) 2>/dev/null),$(BUILD_DIR)/test/riscv64/rootfs/probe)
 AGENT_RISCV64 := $(if $(shell command -v $(RISCV64_CC) 2>/dev/null),$(BUILD_DIR)/hull-agent-riscv64)
+# And s390x's, a big-endian machine under emu, the probe for its root.
+S390X_CC    ?= s390x-linux-gnu-gcc
+S390X_PROBE := $(if $(shell command -v $(S390X_CC) 2>/dev/null),$(BUILD_DIR)/test/s390x/rootfs/probe)
+AGENT_S390X := $(if $(shell command -v $(S390X_CC) 2>/dev/null),$(BUILD_DIR)/hull-agent-s390x)
 # And on a host that is not x86_64, arm64's or riscv64's, the agent for an
 # amd64 machine under emu, where x86_64's cross compiler is installed; on
 # an x86_64 host hull-agent is it.
@@ -355,7 +359,7 @@ CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icor
 # module is a helper beside it, which nothing in hull needs to run and
 # which is installed apart, as root: `make nss`, or `make install-nss`.
 all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL) $(AGENT_BIN) $(AGENT_ARM64) \
-     $(AGENT_AMD64) $(AGENT_RISCV64)
+     $(AGENT_AMD64) $(AGENT_RISCV64) $(AGENT_S390X)
 
 nss: $(NSS_LIB)
 
@@ -591,6 +595,10 @@ $(BUILD_DIR)/test/riscv64/rootfs/probe: test/probe.c
 	@mkdir -p '$(@D)/proc' '$(@D)/dev'
 	$(RISCV64_CC) -static $(CFLAGS) -o $@ $<
 
+$(BUILD_DIR)/test/s390x/rootfs/probe: test/probe.c
+	@mkdir -p '$(@D)/proc' '$(@D)/dev'
+	$(S390X_CC) -static $(CFLAGS) -o $@ $<
+
 $(HULL): $(CLI_OBJS) $(CORE_OBJS) $(ENGINE_OBJS) $(STORE_OBJS) $(OCI_OBJS) $(PLAN_OBJS) \
          $(SPEC_OBJS) $(SEXPR_OBJS)
 	$(CC) $(CFLAGS) -pthread -o $@ $^ $(PULL_LIBS)
@@ -678,6 +686,9 @@ $(BUILD_DIR)/hull-agent-arm64: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
 
 $(BUILD_DIR)/hull-agent-riscv64: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
 	$(RISCV64_CC) -static $(CPPFLAGS) $(CFLAGS) -o $@ $(AGENT_SOURCES)
+
+$(BUILD_DIR)/hull-agent-s390x: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
+	$(S390X_CC) -static $(CPPFLAGS) $(CFLAGS) -o $@ $(AGENT_SOURCES)
 
 $(BUILD_DIR)/hull-agent-amd64: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
 	$(AMD64_CC) -static $(CPPFLAGS) $(CFLAGS) -o $@ $(AGENT_SOURCES)
@@ -890,7 +901,7 @@ check-legacy: $(HULL) $(AGENT_BIN)
 	BUILD_DIR='$(BUILD_DIR)' sh test/legacy_test.sh '$(HULL)'
 
 check-qemu: $(HULL) $(AGENT_BIN) $(PROBE) $(AGENT_ARM64) $(ARM64_PROBE) $(AGENT_RISCV64) \
-            $(RISCV64_PROBE)
+            $(RISCV64_PROBE) $(AGENT_S390X) $(S390X_PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/qemu_test.sh '$(HULL)' '$(PROBE)'
 
 # hull on an arm64 host, which needs no arm64 hardware: an arm64 Debian
@@ -1063,10 +1074,11 @@ clean:
 	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(STORE_OBJS) $(STORE_OBJS:.o=.d) $(OCI_OBJS) $(OCI_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) $(ROOT_BIN) \
 	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) $(DISC_GEN) $(FRAME_GEN) \
 	        $(AGENT_BIN) $(BUILD_DIR)/hull-agent-arm64 $(BUILD_DIR)/hull-agent-amd64 \
-	        $(BUILD_DIR)/hull-agent-riscv64 $(KERNEL_BIN) $(LIMINE_FILES) \
+	        $(BUILD_DIR)/hull-agent-riscv64 $(BUILD_DIR)/hull-agent-s390x $(KERNEL_BIN) \
+	        $(LIMINE_FILES) \
 	        $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(BUILD_DIR)/test/arm64/rootfs/probe \
-	        $(BUILD_DIR)/test/riscv64/rootfs/probe \
+	        $(BUILD_DIR)/test/riscv64/rootfs/probe $(BUILD_DIR)/test/s390x/rootfs/probe \
 	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) $(SYSTEMD_TEST_FILES) $(VFIO_TEST_FILES) \
 	        $(FUZZ_FILES) \
 	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor $(CLIENT_LIB) $(GUI_BIN) \

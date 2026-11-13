@@ -156,12 +156,19 @@ static inline const hull_sshd_arch *hull_sshd_arch_of(const char *arch)
 #define HULL_SSHD_LIBS        HULL_SSHD_LIBS_RISCV64
 #define HULL_SSHD_LOADER      HULL_SSHD_LOADER_RISCV64
 #define HULL_SSHD_FETCH_ARCH  " --arch riscv64"
+#elif defined(__s390x__)
+/* s390x's loader is /lib/ld64.so.1, shorter than the path hull would
+ * rewrite it to, so hull fetches no dropbear for it: an s390x machine's
+ * sshd is its image's own. */
+#define HULL_SSHD_LIBS        "usr/lib/s390x-linux-gnu"
+#define HULL_SSHD_LOADER      HULL_SSHD_LIBS "/ld64.so.1"
+#define HULL_SSHD_FETCH_ARCH  " --arch s390x"
 #elif defined(__x86_64__)
 #define HULL_SSHD_LIBS        HULL_SSHD_LIBS_AMD64
 #define HULL_SSHD_LOADER      HULL_SSHD_LOADER_AMD64
 #define HULL_SSHD_FETCH_ARCH  ""
 #else
-#error "hull fetches dropbear for amd64, arm64 and riscv64 alone"
+#error "hull knows the libraries of amd64, arm64, riscv64 and s390x alone"
 #endif
 #define HULL_SSHD_DROPBEAR    "usr/sbin/dropbear"
 #define HULL_SSHD_CONVERT     "usr/bin/dropbearconvert"
