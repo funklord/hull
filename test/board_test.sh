@@ -134,13 +134,16 @@ if [ -n "${3:-}" ] && command -v qemu-system-arm > /dev/null; then
 else
 	printf 'board: the STM32VLDISCOVERY not tried: no clang and lld or qemu-system-arm\n'
 fi
-# The LM3S6965's own MAC, qemu's stellaris_enet: firmware of the same
-# protocol as the ESP32-C3's, test/board/lm3s_net.c, in LM3S_NET.
+# The LM3S6965's own MAC, qemu's stellaris_enet, and the MPS2 AN385's
+# LAN9118: firmware of the same protocol as the ESP32-C3's,
+# test/board/lm3s_net.c and mps2_net.c, in LM3S_NET.
 if [ -n "${LM3S_NET:-}" ] && command -v qemu-system-arm > /dev/null; then
 	on_nat natlm lm3s6965evb "$LM3S_NET/lm3s-net-nat.elf"
 	on_wire lm3s6965evb lm3s6965evb "$LM3S_NET/lm3s-net-wire-a.elf" "$LM3S_NET/lm3s-net-wire-b.elf"
+	on_nat natmps mps2-an385 "$LM3S_NET/mps2-net-nat.elf"
+	on_wire mps2-an385 mps2-an385 "$LM3S_NET/mps2-net-wire-a.elf" "$LM3S_NET/mps2-net-wire-b.elf"
 else
-	printf 'board: the LM3S6965 not tried on a network: no clang and lld or qemu-system-arm\n'
+	printf 'board: the LM3S6965 and MPS2 not tried on a network: no clang and lld or qemu-system-arm\n'
 fi
 if [ -n "${4:-}" ] && command -v ucsim_51 > /dev/null; then
 	board at89 at89c51ed2 "$4"

@@ -189,7 +189,7 @@ static const board boards[] = {
 	{ "lm3s6965evb",          "qemu-system-arm", "-kernel", NULL, 0u, 0u, "stellaris_enet" },
 	{ "lm3s811evb",           "qemu-system-arm", "-kernel", NULL, 0u, 0u, NULL },
 	{ "microbit",             "qemu-system-arm", "-kernel", NULL, 0u, 0u, NULL },
-	{ "mps2-an385",           "qemu-system-arm", "-kernel", NULL, 0u, 0u, NULL },
+	{ "mps2-an385",           "qemu-system-arm", "-kernel", NULL, 0u, 0u, "lan9118" },
 	{ "b-l475e-iot01a",       "qemu-system-arm", "-kernel", NULL, 0u, 0u, NULL },
 	/* An 8051, by SDCC's simulator, s51: its 8052 core, which the AT89
 	 * parts share, at the 11.0592 MHz crystal a UART's rates divide. */
@@ -982,7 +982,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 		if (hull_access_find(doc, machine, "media", &entry))
 			return "a board has no drives: its firmware is its image: source alone";
 		/* A board with Ethernet has one card, its chip's -- an ESP32's
-		 * open_eth, the LM3S6965's own MAC: on (network nat), with its
+		 * open_eth, the LM3S6965's own MAC, the MPS2's LAN9118: on (network nat), with its
 		 * ports, or on one segment. Any other board's serial port is all
 		 * it has. */
 		if (board_named(m->machine_type)->nic != NULL) {
