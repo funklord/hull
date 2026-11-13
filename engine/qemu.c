@@ -90,6 +90,7 @@
 #include "tree.h"
 #include "vbox.h"
 #include "writeback.h"
+#include "display.h"
 
 #define VIRTIOFS_ID_RANGES 16u  /* options of one id map: a namespace has a few lines */
 #define VIRTIOFS_FILES 524288u  /* the hard limit systemd gives: section 4.11 */
@@ -196,9 +197,12 @@ struct hull_machine {
 	int              no_network;   /* (network none): no NIC, no passt */
 	int              screen;       /* (display window|vnc): a virtio GPU, keyboard and tablet */
 	int              vnc;          /* (display vnc): its screen by VNC at its address */
+	int              local;        /* (display local): by qemu's D-Bus display alone */
 	char            *x_display;    /* (display window): the run's X display */
 	char            *xauthority;   /* and its authority, or NULL */
 	int              gpu;          /* (tuning (qemu (gpu ...))): 0 2d, 1 virgl, 2 venus */
+	int              local_display; /* qemu's D-Bus display too, by display.qmp */
+	char             display_link[4200]; /* hull/display/ADDRESS, linked to it, or "" */
 	int              bridge;       /* (network bridge): a tap on a host bridge, its core root */
 	int              bridge_own;   /* on HULL_BRIDGE, hull addressing it, not (bridge NAME) */
 	char             bridge_name[16];
@@ -971,13 +975,14 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 
 		m->screen = 1;
 		m->vnc = strcmp(text, "vnc") == 0;
+		m->local = strcmp(text, "local") == 0;
 		free(text);
-		if (!m->vnc && (!hull_sexpr_first(doc, &top) ||
+		if (!m->vnc && !m->local && (!hull_sexpr_first(doc, &top) ||
 		                !hull_access_find(doc, &top, "screen", &screen) ||
 		                (m->x_display = hull_access_value(doc, &screen, "display")) == NULL))
 			return "(display window) needs an X display, and the run gave none: DISPLAY is not "
 			       "set where hull ran";
-		if (!m->vnc)
+		if (!m->vnc && !m->local)
 			m->xauthority = hull_access_value(doc, &screen, "xauthority");
 		if (m->s390x)
 			return "(display ...) is a virtio-gpu, which an s390x machine has none of here";
@@ -1618,10 +1623,14 @@ static const char *write_initramfs(const hull_machine *m, const char *modules, i
 		}
 	}
 	/* A screen: the guest's virtio-gpu, and its virtio-input keyboard and
-	 * tablet, where the kernel has them as modules. */
-	if (m->screen && load_modules && extra_count + 2u <= MAX_MODULES) {
+	 * tablet, where the kernel has them as modules; and evdev, without
+	 * which they have no /dev/input/event node for a guest's X, Wayland or
+	 * anything else to read -- Debian builds it as a module, and a key
+	 * typed into the screen reached nothing until it was loaded. */
+	if (m->screen && load_modules && extra_count + 3u <= MAX_MODULES) {
 		extra[extra_count++] = "virtio_gpu";
 		extra[extra_count++] = "?virtio_input";
+		extra[extra_count++] = "?evdev";
 	}
 	/* A composefs root: erofs for its image, the crc32c erofs's
 	 * libcrc32c asks for, and overlay, which is loaded already. */
@@ -2352,6 +2361,8 @@ static int write_map(const char *path, const char *format, unsigned id)
 
 /* Fork qemu for `m`, with `cid` for its vsock device. Its stdout and
  * stderr go to qemu.log. */
+static const char *display_monitor(const hull_machine *m);
+
 static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir, int share_modules,
                    uint32_t cid)
 {
@@ -2368,6 +2379,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        vsock[64];
 	char        agent_chardev[4500];
 	char        monitor_chardev[64];
+	char        display_chardev[4300];
 	char        swap[9000];
 	char        netdev[64];
 	char        root[9000];
@@ -2446,9 +2458,24 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	snprintf(vnc, sizeof vnc, "vnc=%s:0", m->address_text);
 	/* With 3D, the window renders by OpenGL, and VNC's frames are rendered
 	 * headless by EGL on the host's render node and served by -vnc. */
-	argv[n++] = m->gpu != 0 ? (m->vnc ? "egl-headless" : "sdl,gl=on") :
+	/* A 2D screen by VNC is qemu's D-Bus display as well, for hull-gui to
+	 * show without VNC's copies (section 5.2): no bus, each client handed
+	 * to qemu by its monitor, display.qmp in the machine's directory,
+	 * linked as hull/display/ADDRESS. 3D shares no context with VNC, so
+	 * it keeps egl-headless. */
+	argv[n++] = m->local ? (m->gpu != 0 ? "dbus,p2p=yes,gl=on" : "dbus,p2p=yes") :
+	            m->gpu != 0 ? (m->vnc ? "egl-headless" : "sdl,gl=on") :
+	            m->local_display ? "dbus,p2p=yes" :
 	            m->vnc ? vnc : m->screen ? "sdl" : "none";
-	if (m->gpu != 0 && m->vnc) {
+	if (m->local_display) {
+		snprintf(display_chardev, sizeof display_chardev,
+		         "socket,id=display,path=%s,server=on,wait=off", display_monitor(m));
+		argv[n++] = "-chardev";
+		argv[n++] = display_chardev;
+		argv[n++] = "-mon";
+		argv[n++] = "chardev=display,mode=control";
+	}
+	if ((m->gpu != 0 || m->local_display) && m->vnc) {
 		snprintf(vnc, sizeof vnc, "%s:0", m->address_text);
 		argv[n++] = "-vnc";
 		argv[n++] = vnc;
@@ -4065,9 +4092,19 @@ static void close_listeners(hull_machine *m)
 
 /* The machine's directory, and its listeners, which a failed start and
  * destroy() both end with. */
+/* The machine's display monitor, display.qmp in its directory. */
+static const char *display_monitor(const hull_machine *m)
+{
+	static __thread char path[4200];
+
+	snprintf(path, sizeof path, "%s/display.qmp", m->dir);
+	return path;
+}
+
 static void remove_dir(hull_machine *m)
 {
 	close_listeners(m);
+	hull_display_unlink(m->display_link, display_monitor(m));
 	if (m->dir[0] != '\0') {
 		mark_adopted_dir(m->dir, 0);
 		remove_files(m->dir);
@@ -4352,7 +4389,14 @@ static int launch(hull_machine *m, const char *kernel, const char *mbuf, int sha
 			m->monitor_peer = pair[1];
 		}
 	}
+	/* A 2D screen by VNC is qemu's D-Bus display too, where its monitor's
+	 * path fits a socket's. */
+	m->local_display = ((m->vnc && m->gpu == 0) || m->local) &&
+	                   hull_display_fits(display_monitor(m));
 	m->qemu = spawn(m, kernel, mbuf, share_modules, cid);
+	if (m->qemu > 0 && m->local_display)
+		hull_display_link(display_monitor(m), m->address_text, m->display_link,
+		                  sizeof m->display_link);
 	if (cid == 0u) {
 		close(m->agent_listen);
 		m->agent_listen = -1;
@@ -5802,6 +5846,9 @@ static const hull_cap_entry entries[] = {
 	{ "display.vnc",        HULL_SUP_NATIVE,
 	  "a virtio GPU, keyboard and tablet shown by VNC at the machine's address, port 5900, "
 	  "with no password: any local user can connect, as to its ports", NULL },
+	{ "display.local",      HULL_SUP_NATIVE,
+	  "a virtio GPU, keyboard and tablet shown in hull-gui by qemu's D-Bus display, this "
+	  "host only, its frames shared, with 3D where (gpu ...) gives it", NULL },
 	/* Section 6's host forwarder: the engine's, over vsock to the agent. */
 	{ "ports",              HULL_SUP_EMULATED,
 	  "tcp and udp, forwarded over vsock from the machine's address", NULL },

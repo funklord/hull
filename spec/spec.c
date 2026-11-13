@@ -407,7 +407,7 @@ static const char *const disconnect_values[] = { "stop", "keep", NULL };
 /* (ssh dropbear): hull's fetched dropbear, chosen over the image's own. */
 static const char *const ssh_values[] = { "true", "false", "dropbear", NULL };
 static const char *const network_values[]    = { "bridge", "host", "nat", "none", NULL };
-static const char *const display_values[]    = { "window", "vnc", NULL };
+static const char *const display_values[]    = { "window", "vnc", "local", NULL };
 static const char *const distribution_values[] = { "uniform", "normal", "pareto", NULL };
 static const char *const proto_values[]      = { "tcp", "udp", NULL };
 static const char *const mode_values[]       = { "rw", "ro", NULL };

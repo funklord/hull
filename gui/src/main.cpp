@@ -83,6 +83,10 @@ int main(int argc, char **argv)
 		return 2;
 	}
 #endif
+	/* A 3D machine's frames are dmabufs imported by EGL (dmabuf_view.cpp),
+	 * which Qt's GL on X is only where asked; Wayland's already is. */
+	if (qEnvironmentVariableIsEmpty("QT_XCB_GL_INTEGRATION"))
+		qputenv("QT_XCB_GL_INTEGRATION", "xcb_egl");
 	QApplication application(argc, argv);
 #ifdef HULL_QTTY
 	/* And a terminal's habits: Enter on the focused control, Up and Down

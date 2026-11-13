@@ -364,9 +364,21 @@ sleep 2
 address=$("$hull" ps | awk '$5 == "running" { print $2 }')
 out=$(timeout 5 nc -w 2 "$address" 5900 < /dev/null | head -c 12)
 says 'the screen answers at the machine'"'"'s address' "$out" 'RFB 003'
+# And by qemu's D-Bus display, hull-gui's (project.md section 5.2): its
+# monitor linked by the address, a frame read through it, the link gone
+# with the machine.
+link=${XDG_RUNTIME_DIR:-/nonexistent}/hull/display/$address
+cases=$((cases + 1))
+[ -S "$link" ] || fail "a pc with (display vnc) linked no D-Bus display monitor" "$(ls -l "$link" 2>&1)"
+if python3 -c 'import gi; gi.require_version("Gio", "2.0")' 2> /dev/null; then
+	out=$(timeout 30 python3 "$(dirname "$0")/display_client.py" "$link" 15 2>&1)
+	says 'the screen is read by its D-Bus display' "$out" 'frame '
+fi
 id=$("$hull" ps | awk '$5 == "running" { print $1 }')
 timeout 30 "$hull" stop "$id" > /dev/null 2>&1
 wait "$pid"
+cases=$((cases + 1))
+[ ! -L "$link" ] || fail "a pc's display link outlived it" "$(ls -l "$link" 2>&1)"
 
 # --- a real system, its port at the machine's address ------------------------
 

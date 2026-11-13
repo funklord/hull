@@ -15,6 +15,7 @@
 #include "images_dialog.h"
 #include "pools_dialog.h"
 #include "new_machine_dialog.h"
+#include "screen_window.h"
 
 #include <QAction>
 #include <QApplication>
@@ -1275,9 +1276,12 @@ static bool answers(const QString &address, quint16 port)
 /*
  * The selected machine's screen: `(display vnc)` serves it on port 5900
  * of the machine's address (section 5.0's pc), for any VNC client. On the
- * desktop the first client found is started on it; under qtty there is no
- * screen to show one on, so the address is said. A machine with no screen
- * says so rather than a client that fails to connect.
+ * desktop, a vm's is shown here first, by qemu's D-Bus display where the
+ * machine is this host's and has one (section 5.2), its link at
+ * hull/display/ADDRESS; otherwise the first VNC client found is started
+ * on it. Under qtty there is no screen to show one on, so the address is
+ * said. A machine with no screen says so rather than a client that fails
+ * to connect.
  */
 void main_window::open_screen()
 {
@@ -1289,8 +1293,24 @@ void main_window::open_screen()
 	const QString address = rows[i].held.address;
 	const QString at = address + QStringLiteral(":5900");
 
+	/* Here first: (display local) has no VNC at all. */
+	const QString runtime = QString::fromLocal8Bit(qgetenv("XDG_RUNTIME_DIR"));
+	const QString local = runtime + QStringLiteral("/hull/display/") + address;
+	if (!on_terminal() && !runtime.isEmpty() && QFileInfo::exists(local)) {
+		auto   *window = new screen_window(id, local);
+		QString why;
+
+		if (window->open(&why)) {
+			window->show();
+			say(QStringLiteral("%1's screen, here").arg(id));
+			return;
+		}
+		delete window;
+		say(QStringLiteral("%1's screen is not shown here (%2); by VNC instead").arg(id, why));
+	}
 	if (!answers(address, 5900)) {
-		say(QStringLiteral("%1 shows no screen at %2: a machine gives one with (display vnc)")
+		say(QStringLiteral("%1 shows no screen at %2: a machine gives one with (display vnc), "
+		                   "or with (display local) here only")
 		        .arg(id, at));
 		return;
 	}

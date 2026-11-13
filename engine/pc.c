@@ -67,6 +67,7 @@
 #include "iso.h"
 #include "media.h"
 #include "usage.h"
+#include "display.h"
 
 #define PC_MAX_MEDIA 6u    /* four on IDE, two floppy drives */
 #define PC_MAX_ARGS  120u
@@ -132,6 +133,9 @@ struct hull_machine {
 	char           *display;        /* the run's X display, or NULL */
 	char           *xauthority;
 	int             vnc;            /* (display vnc): the screen at the machine's address */
+	int             local;          /* (display local): by qemu's D-Bus display alone */
+	int             local_display;  /* and qemu's D-Bus display, by display.qmp */
+	char            display_link[4400]; /* hull/display/ADDRESS, linked to it, or "" */
 	char            cache[4096];    /* where qemu's snapshots and made images are */
 	pid_t           pid;
 	int             out;            /* the first serial port */
@@ -500,7 +504,8 @@ static int prepare_state(hull_machine *m)
 		         "SX1276, `make esp-qemu-lora`, and HULL_ESP_LORA_QEMU naming it\n");
 		return -1;
 	}
-	if (!m->secure && !m->tpm && !s51 && !is_esp(b))
+	/* A screen by VNC has its D-Bus display's monitor here too. */
+	if (!m->secure && !m->tpm && !s51 && !is_esp(b) && !m->vnc && !m->local)
 		return 0;
 	if (m->cache[0] == '\0' && make_cache(m) != NULL) {
 		snprintf(m->why, sizeof m->why, "the cache directory for the machine's state cannot be made\n");
@@ -623,6 +628,7 @@ static void release_state(hull_machine *m)
 	unlink(run_file(m, "OVMF_VARS.fd"));
 	unlink(run_file(m, "firmware.ihx"));
 	unlink(run_file(m, "flash.bin"));
+	unlink(run_file(m, "display.qmp"));
 	for (unsigned i = 0u; i < sizeof tpm_files / sizeof tpm_files[0]; i++) {
 		snprintf(path, sizeof path, "%s/tpm/%s", m->run_state, tpm_files[i]);
 		unlink(path);
@@ -967,6 +973,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 		m->xauthority = hull_access_value(doc, &screen, "xauthority");
 	}
 	m->vnc = display != NULL && strcmp(display, "vnc") == 0;
+	m->local = display != NULL && strcmp(display, "local") == 0;
 	free(display);
 	/* An image: source is the first disk, before any (media ...). */
 	if (source[0] == 'i') {
@@ -1249,6 +1256,7 @@ static void exec_pc(const hull_machine *m)
 	char     smp[64];
 	char     vnc[48];
 	char     monitor[48];
+	char     display_monitor[4500];
 	int      monitor_fd;
 	unsigned n = 0u;
 	unsigned ide = 0u;
@@ -1291,8 +1299,24 @@ static void exec_pc(const hull_machine *m)
 	argv[n++] = m->vga != NULL ? m->vga : "std";
 	/* VNC's display 0 is port 5900, at the machine's own address. */
 	snprintf(vnc, sizeof vnc, "vnc=%s:0", m->address);
+	/* A screen by VNC is qemu's D-Bus display as well, for hull-gui to
+	 * show without VNC's copies (section 5.2): its monitor display.qmp in
+	 * the run's directory, linked as hull/display/ADDRESS. */
 	argv[n++] = "-display";
-	argv[n++] = m->vnc ? vnc : m->display != NULL ? "sdl" : "none";
+	argv[n++] = m->local_display ? "dbus,p2p=yes" : m->vnc ? vnc : m->display != NULL ? "sdl" : "none";
+	if (m->local_display) {
+		if (m->vnc) {
+			snprintf(vnc, sizeof vnc, "%s:0", m->address);
+			argv[n++] = "-vnc";
+			argv[n++] = vnc;
+		}
+		snprintf(display_monitor, sizeof display_monitor,
+		         "socket,id=display,path=%s,server=on,wait=off", run_file(m, "display.qmp"));
+		argv[n++] = "-chardev";
+		argv[n++] = display_monitor;
+		argv[n++] = "-mon";
+		argv[n++] = "chardev=display,mode=control";
+	}
 	argv[n++] = "-boot";
 	argv[n++] = boot;
 	/* A card, heard where there is a window, SDL's audio beside its
@@ -1562,6 +1586,15 @@ static int launch(hull_machine *m)
 		return -1;
 	}
 	m->monitor_peer = monitor[1];
+	m->local_display = (m->vnc || m->local) && m->run_state_made &&
+	                   hull_display_fits(run_file(m, "display.qmp"));
+	if (m->local && !m->local_display) {
+		snprintf(m->why, sizeof m->why, "(display local) needs its monitor's socket in the "
+		         "machine's run directory, whose path is too long for one\n");
+		m->monitor_peer = -1;
+		close_all(fds, 8u);
+		return -1;
+	}
 	child = fork();
 	if (child < 0) {
 		snprintf(m->why, sizeof m->why, "qemu could not be started\n");
@@ -1593,6 +1626,9 @@ static int launch(hull_machine *m)
 		close(m->lora_fd);
 		m->lora_fd = -1;
 	}
+	if (m->local_display)
+		hull_display_link(run_file(m, "display.qmp"), m->address, m->display_link,
+		                  sizeof m->display_link);
 	pthread_mutex_lock(&m->lock);
 	m->pid   = child;
 	m->input = in[0];
@@ -1793,6 +1829,7 @@ static hull_status pc_destroy(hull_core *core, hull_machine *m, hull_error *erro
 		pc_stop(core, m, 0, error);
 		pthread_join(m->reader, NULL);
 	}
+	hull_display_unlink(m->display_link, run_file(m, "display.qmp"));
 	release(m);
 	return HULL_OK;
 }
@@ -2448,6 +2485,9 @@ static const hull_cap_entry entries[] = {
 	{ "display.vnc",        HULL_SUP_NATIVE,
 	  "the screen, keyboard and mouse by VNC at the machine's address, port 5900, with no "
 	  "password: any local user can connect, as to its ports", NULL },
+	{ "display.local",      HULL_SUP_NATIVE,
+	  "the screen, keyboard and mouse in hull-gui by qemu's D-Bus display, this host only, "
+	  "its frames shared", NULL },
 	{ "memory",             HULL_SUP_NATIVE,   NULL, NULL },
 	{ "cpus",               HULL_SUP_NATIVE,   NULL, NULL },
 	{ "pc.sound.none",  HULL_SUP_NATIVE, NULL, NULL },

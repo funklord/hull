@@ -26,6 +26,14 @@ QMAKE_CXXFLAGS_RELEASE += -Os
 QMAKE_CXXFLAGS += -ffunction-sections -fdata-sections -Wall -Wextra
 QMAKE_LFLAGS += -Wl,--gc-sections
 
+# GIO, for a machine's screen by qemu's D-Bus display (screen_window.cpp):
+# no bus, a peer connection over a socket pair, which QtDBus cannot make.
+# EGL and Qt's GL widget for a 3D machine's frames, qemu's dmabufs
+# imported where they are (dmabuf_view.cpp).
+CONFIG += link_pkgconfig
+PKGCONFIG += gio-unix-2.0 egl
+QT += openglwidgets
+
 ROOT = $$PWD/..
 INCLUDEPATH += $$ROOT/core $$ROOT/agent $$ROOT/sexpr $$HULL_BUILD/gen $$ROOT/vendor/situ/runtime/c
 LIBS += $$HULL_BUILD/libhull_client.a
@@ -49,7 +57,9 @@ SOURCES += \
 	src/main.cpp \
 	src/main_window.cpp \
 	src/new_machine_dialog.cpp \
-	src/pools_dialog.cpp
+	src/pools_dialog.cpp \
+	src/screen_window.cpp \
+	src/dmabuf_view.cpp
 
 HEADERS += \
 	src/core_link.h \
@@ -57,4 +67,6 @@ HEADERS += \
 	src/machine_list.h \
 	src/main_window.h \
 	src/new_machine_dialog.h \
-	src/pools_dialog.h
+	src/pools_dialog.h \
+	src/screen_window.h \
+	src/dmabuf_view.h

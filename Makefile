@@ -108,7 +108,8 @@ ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/ip6.o $(BUILD_DIR)/engine/idmap.o \
               $(BUILD_DIR)/engine/tree.o $(BUILD_DIR)/engine/user.o $(BUILD_DIR)/engine/hostnet.o \
               $(BUILD_DIR)/engine/hostdev.o $(BUILD_DIR)/engine/rootmode.o \
-              $(BUILD_DIR)/engine/storefs.o $(BUILD_DIR)/engine/writeback.o
+              $(BUILD_DIR)/engine/storefs.o $(BUILD_DIR)/engine/writeback.o \
+              $(BUILD_DIR)/engine/display.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o $(BUILD_DIR)/cli/runtime.o $(BUILD_DIR)/cli/doctor.o \
               $(BUILD_DIR)/cli/import.o $(BUILD_DIR)/cli/export.o $(BUILD_DIR)/cli/kernel_fetch.o $(BUILD_DIR)/cli/vbox_fetch.o $(BUILD_DIR)/cli/esp_fetch.o $(BUILD_DIR)/cli/vbox_host.o $(BUILD_DIR)/cli/vagrant.o $(BUILD_DIR)/cli/dial.o \
               $(BUILD_DIR)/cli/sshd_fetch.o
@@ -409,7 +410,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: esp-qemu-lora check-tsan
-.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-gpu check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-usb check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-screen check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-usb check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -515,7 +516,7 @@ help:
 	@echo '  check     style, the situ contracts, then the tests'
 	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
 	@echo '  check-qemu    hull run on the qemu engine, as the user, with KVM'
-	@echo '  check-gpu     a vm'"'"'s OpenGL and Vulkan on the host'"'"'s GPU, by virgl and Venus'
+	@echo '  check-screen  a vm'"'"'s screen in hull-gui by qemu'"'"'s D-Bus display, and its 3D by virgl and Venus'
 	@echo '  check-arm64-host  hull built and make test run on arm64, under emu'
 	@echo '  check-riscv64-host  hull built and make test run on riscv64, under emu'
 	@echo '  check-s390x-host  hull built and make test run on s390x, big-endian, under emu'
@@ -973,11 +974,23 @@ check-qemu: $(HULL) $(AGENT_BIN) $(PROBE) $(AGENT_ARM64) $(ARM64_PROBE) $(AGENT_
             $(RISCV64_PROBE) $(AGENT_S390X) $(S390X_PROBE) $(AGENT_ARM) $(ARM_PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/qemu_test.sh '$(HULL)' '$(PROBE)'
 
-# A vm's 3D on the host's own GPU: virgl's OpenGL, Venus's Vulkan where
-# /dev/udmabuf is open to the user. Needs KVM, a render node, and the
-# network the first time, for Debian and Mesa.
-check-gpu: $(HULL) $(AGENT_BIN)
-	BUILD_DIR='$(BUILD_DIR)' sh test/gpu_test.sh '$(HULL)'
+# A vm's screen shown on this host: its local D-Bus display, read by a
+# GIO client and by hull-gui's screen window, and its 3D -- virgl's
+# OpenGL, Venus's Vulkan where /dev/udmabuf is open to the user. Needs
+# KVM, a render node, and the network the first time, for Debian and Mesa.
+SCREEN_TEST = $(BUILD_DIR)/test/screen-build/screen_window_test
+
+$(BUILD_DIR)/test/screen-build/Makefile: gui/test/screen_window_test.pro
+	@mkdir -p '$(@D)'
+	cd '$(@D)' && $(QMAKE) '$(CURDIR)/gui/test/screen_window_test.pro' \
+	    HULL_BUILD='$(abspath $(BUILD_DIR))'
+
+$(SCREEN_TEST): $(BUILD_DIR)/test/screen-build/Makefile gui/test/screen_window_test.cpp \
+                gui/src/screen_window.cpp gui/src/screen_window.h
+	$(MAKE) -C '$(BUILD_DIR)/test/screen-build'
+
+check-screen: $(HULL) $(AGENT_BIN) $(SCREEN_TEST)
+	BUILD_DIR='$(BUILD_DIR)' sh test/screen_test.sh '$(HULL)' '$(SCREEN_TEST)'
 
 # hull on an arm64 host, which needs no arm64 hardware: an arm64 Debian
 # under hull's own emu, hull built there from this source and its make
