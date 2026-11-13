@@ -152,6 +152,43 @@ struct hull_machine {
 	char            why[800];       /* the thread's own word for its failure */
 };
 
+/* A microcontroller board, on qemu or s51, run as a pc machine is: booted
+ * from its firmware, the image: source, its first UART the machine's
+ * serial port, so its output is the machine's and `hull exec ID --
+ * console` writes to it. The boards hal9001 tests on are among them. */
+typedef struct board {
+	const char *name;
+	const char *emulator;
+	const char *load;   /* how it takes the firmware: -bios on the AVR, -kernel on ARM */
+} board;
+
+static const board boards[] = {
+	{ "arduino-uno",          "qemu-system-avr", "-bios" },
+	{ "arduino-duemilanove",  "qemu-system-avr", "-bios" },
+	{ "arduino-mega",         "qemu-system-avr", "-bios" },
+	{ "arduino-mega-2560-v3", "qemu-system-avr", "-bios" },
+	{ "stm32vldiscovery",     "qemu-system-arm", "-kernel" },
+	{ "netduino2",            "qemu-system-arm", "-kernel" },
+	{ "netduinoplus2",        "qemu-system-arm", "-kernel" },
+	{ "olimex-stm32-h405",    "qemu-system-arm", "-kernel" },
+	{ "lm3s6965evb",          "qemu-system-arm", "-kernel" },
+	{ "lm3s811evb",           "qemu-system-arm", "-kernel" },
+	{ "microbit",             "qemu-system-arm", "-kernel" },
+	{ "mps2-an385",           "qemu-system-arm", "-kernel" },
+	/* An 8051, by SDCC's simulator, s51: its 8052 core, which the AT89
+	 * parts share, at the 11.0592 MHz crystal a UART's rates divide. */
+	{ "at89c51ed2",           "ucsim_51",        "-g" },
+};
+
+/* The board `name` names, or NULL for a PC's machine type. */
+static const board *board_named(const char *name)
+{
+	for (size_t i = 0u; name != NULL && i < sizeof boards / sizeof boards[0]; i++)
+		if (strcmp(boards[i].name, name) == 0)
+			return &boards[i];
+	return NULL;
+}
+
 static const hull_host_ops *host;
 
 static hull_status fail(hull_error *error, hull_status code, const char *detail)
@@ -277,24 +314,42 @@ static const char *const tpm_files[] = { "tpm2-00.permall", ".lock" };
  */
 static int prepare_state(hull_machine *m)
 {
-	char template[4200];
-	char from[4400];
-	char to[4400];
+	const board *b = board_named(m->machine_type);
+	int          s51 = b != NULL && strcmp(b->emulator, "ucsim_51") == 0;
+	char         template[4200];
+	char         from[4400];
+	char         to[4400];
 
-	if (!m->secure && !m->tpm)
+	if (!m->secure && !m->tpm && !s51)
 		return 0;
 	if (m->cache[0] == '\0' && make_cache(m) != NULL) {
 		snprintf(m->why, sizeof m->why, "the cache directory for the machine's state cannot be made\n");
 		return -1;
 	}
 	snprintf(template, sizeof template, "%s/pc-XXXXXX", m->cache);
-	if (mkdtemp(template) == NULL || strlen(template) > 90u) {
-		snprintf(m->why, sizeof m->why, "the machine's run directory cannot be made%s\n",
-		         strlen(template) > 90u ? ": the cache's path is too long for a socket in it" : "");
+	if (mkdtemp(template) == NULL) {
+		snprintf(m->why, sizeof m->why, "the machine's run directory cannot be made\n");
+		return -1;
+	}
+	if (m->tpm && strlen(template) > 90u) {
+		rmdir(template);
+		snprintf(m->why, sizeof m->why, "the machine's run directory cannot be made: the "
+		         "cache's path is too long for a socket in it\n");
 		return -1;
 	}
 	snprintf(m->run_state, sizeof m->run_state, "%s", template);
 	m->run_state_made = 1;
+	/* s51 reads Intel hex only from a file named .ihx, .hex or .ihex, and
+	 * from any other name loads nothing and says nothing: the firmware is
+	 * linked into the run directory by a name it reads. */
+	if (s51) {
+		if (m->media[0].path[0] != '/' ||
+		    symlink(m->media[0].path, run_file(m, "firmware.ihx")) != 0) {
+			snprintf(m->why, sizeof m->why, "the firmware could not be linked for s51\n");
+			return -1;
+		}
+		return 0;
+	}
 	if (m->state != NULL && m->direct && mkdir(m->state, 0700) != 0 && errno != EEXIST) {
 		snprintf(m->why, sizeof m->why, "%s: %s\n", m->state, strerror(errno));
 		return -1;
@@ -384,6 +439,7 @@ static void release_state(hull_machine *m)
 		return;
 	unlink(run_file(m, "swtpm.sock"));
 	unlink(run_file(m, "OVMF_VARS.fd"));
+	unlink(run_file(m, "firmware.ihx"));
 	for (unsigned i = 0u; i < sizeof tpm_files / sizeof tpm_files[0]; i++) {
 		snprintf(path, sizeof path, "%s/tpm/%s", m->run_state, tpm_files[i]);
 		unlink(path);
@@ -781,6 +837,22 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 				return wrong;
 		}
 	}
+	/* A board: its firmware, the image: source, and none of a PC's parts. */
+	if (board_named(m->machine_type) != NULL) {
+		if (m->media_count != 1u || m->media[0].path == NULL)
+			return "a board boots its firmware, an image: source: (source \"image:FIRMWARE\")";
+		if (hull_access_find(doc, machine, "media", &entry))
+			return "a board has no drives: its firmware is its image: source alone";
+		if (m->network || m->segment_count != 0u || m->port_count != 0u)
+			return "a board's serial port is its one way in: no network, segments or ports";
+		if (m->vnc || m->display != NULL || m->vga != NULL || m->sound != NULL)
+			return "a board has no screen or sound of qemu's: its serial port is what it says";
+		if (m->memory != NULL || m->cpus != NULL || m->cpu != NULL)
+			return "a board's memory and CPU are its microcontroller's";
+		if (m->tpm || m->firmware != NULL || m->secure || m->state != NULL || m->boot_key != 0)
+			return "a board's firmware is its image: no BIOS, TPM, state or boot key";
+		return NULL;
+	}
 	if (m->vnc && m->address[0] == '\0')
 		return "the plan gives (display vnc) no address";
 	if ((wrong = read_media(m, doc, machine)) != NULL)
@@ -811,8 +883,96 @@ static char *option(const char *prefix, const char *text)
 	return out;
 }
 
-/* In the child: the drives and the rest, and exec. Returns to fail. */
-static void exec_qemu(const hull_machine *m)
+/* In the child: a board's emulator, exec'd. Returns to fail. On qemu, its
+ * machine, its firmware, its first UART on stdio and the monitor beside it,
+ * nothing of a PC's. */
+static void exec_board(const hull_machine *m, const board *b)
+{
+	char  monitor[48];
+	char *argv[20];
+	int   n = 0;
+	int   monitor_fd;
+
+	/* s51: the UART on descriptors 3 and 4, the machine's stdin and
+	 * stdout; its command console on a pipe whose writing end it holds
+	 * itself, so that it never reads an end and quits, what it says
+	 * thrown away. No monitor: what needs qemu's says so. */
+	if (strcmp(b->emulator, "ucsim_51") == 0) {
+		int   console[2];
+		int   serial[2];
+		int   null = open("/dev/null", O_WRONLY);
+		pid_t copier;
+
+		/* The input is a socket, which s51 cannot open by a path: a pipe
+		 * between, a copier of this process's own feeding it. */
+		if (null < 0 || pipe(console) != 0 || pipe(serial) != 0 || (copier = fork()) < 0)
+			return;
+		if (copier == 0) {
+			char    buffer[512];
+			ssize_t got;
+
+			/* Nothing of the machine's held but its input, so that the
+			 * engine reads its output's end; gone with s51. */
+			close(serial[0]);
+			close(console[0]);
+			close(console[1]);
+			if (dup2(null, 1) != 1 || dup2(null, 2) != 2 ||
+			    (serial[1] != 3 && dup2(serial[1], 3) != 3))
+				_exit(1);
+			serial[1] = 3;
+			close_range(4u, ~0u, 0);
+			if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0L, 0L, 0L) != 0 || getppid() == 1)
+				_exit(1);
+			while ((got = read(0, buffer, sizeof buffer)) > 0 || (got < 0 && errno == EINTR))
+				if (got > 0 && write(serial[1], buffer, (size_t)got) != got)
+					break;
+			_exit(0);
+		}
+		close(serial[1]);
+		if (dup2(serial[0], 3) != 3 || dup2(1, 4) != 4 || dup2(console[0], 0) != 0 ||
+		    dup2(null, 1) != 1)
+			return;
+		argv[n++] = "ucsim_51";
+		argv[n++] = "-q";
+		argv[n++] = "-t";
+		argv[n++] = "C52";
+		argv[n++] = "-X";
+		argv[n++] = "11.0592M";
+		argv[n++] = "-S";
+		argv[n++] = "in=/dev/fd/3,out=/dev/fd/4";
+		argv[n++] = "-g";
+		argv[n++] = (char *)run_file(m, "firmware.ihx");
+		argv[n] = NULL;
+		setenv("HOME", "/nonexistent", 1);
+		execvp(argv[0], argv);
+		return;
+	}
+	if ((monitor_fd = fcntl(m->monitor_peer, F_DUPFD, 3)) < 0)
+		return;
+	snprintf(monitor, sizeof monitor, "socket,id=monitor,fd=%d", monitor_fd);
+	argv[n++] = (char *)b->emulator;
+	argv[n++] = "-nodefaults";
+	argv[n++] = "-no-user-config";
+	argv[n++] = "-machine";
+	argv[n++] = (char *)b->name;
+	argv[n++] = "-display";
+	argv[n++] = "none";
+	argv[n++] = "-serial";
+	argv[n++] = "stdio";
+	argv[n++] = "-chardev";
+	argv[n++] = monitor;
+	argv[n++] = "-mon";
+	argv[n++] = "chardev=monitor,mode=control";
+	argv[n++] = (char *)b->load;
+	argv[n++] = (char *)m->media[0].path;
+	argv[n] = NULL;
+	setenv("HOME", "/nonexistent", 1);
+	execvp(argv[0], argv);
+}
+
+/* In the child: a PC's qemu, the drives and the rest, exec'd. Returns to
+ * fail. */
+static void exec_pc(const hull_machine *m)
 {
 	char    *argv[PC_MAX_ARGS];
 	char     machine[128];
@@ -1021,6 +1181,15 @@ static void exec_qemu(const hull_machine *m)
 	if (m->cache[0] != '\0')
 		setenv("TMPDIR", m->cache, 1);
 	execvp(argv[0], argv);
+}
+
+/* In the child: the machine's emulator, a board's or a PC's. */
+static void exec_qemu(const hull_machine *m)
+{
+	if (board_named(m->machine_type) != NULL)
+		exec_board(m, board_named(m->machine_type));
+	else
+		exec_pc(m);
 }
 
 /* What COM1 said, to the console where one is joined. */
@@ -1816,6 +1985,34 @@ static hull_status pc_dial(hull_core *core, hull_machine *m, uint16_t port, hull
 	return HULL_OK;
 }
 
+/* After input for a qemu board's UART, its main loop woken by a word to
+ * QMP. qemu stops watching the serial port's descriptor while the UART
+ * cannot take a byte -- before the firmware has turned its receiver on --
+ * and looks again only when something wakes the loop; the AVR's USART
+ * does not, on its receiver turned on. So a firmware that polls, rather
+ * than reading the data register once at its start, heard nothing typed
+ * on qemu 10.0 with -nodefaults, which takes away the user network whose
+ * timers woke the loop otherwise. Measured by test/board/echo_avr.c:
+ * nothing received, and every byte once the monitor was spoken to. */
+static void wake_board(hull_machine *m)
+{
+	static const char command[] = "{\"execute\":\"query-status\"}\n";
+	const board      *b = board_named(m->machine_type);
+	char              why[256];
+	int               ready;
+
+	if (b == NULL || strncmp(b->emulator, "qemu-", 5u) != 0)
+		return;
+	pthread_mutex_lock(&m->lock);
+	ready = !m->done && m->monitor >= 0;
+	pthread_mutex_unlock(&m->lock);
+	if (!ready)
+		return;
+	pthread_mutex_lock(&m->monitor_lock);
+	(void)monitor_say(m, command, why, sizeof why);
+	pthread_mutex_unlock(&m->monitor_lock);
+}
+
 /* Input for COM1: it goes to qemu's stdin, which the port reads. */
 static hull_status pc_stream_write(hull_core *core, hull_stream *st, const uint8_t *data,
                                    size_t length, hull_error *error)
@@ -1833,6 +2030,8 @@ static hull_status pc_stream_write(hull_core *core, hull_stream *st, const uint8
 		data += n;
 		length -= (size_t)n;
 	}
+	if (st->socket < 0)
+		wake_board(st->machine);
 	return HULL_OK;
 }
 
@@ -1903,6 +2102,9 @@ static hull_status pc_stats(hull_core *core, hull_machine *m, hull_buf *out, hul
 	out->len  = hull_usage_encode(&usage, encoded, sizeof encoded);
 	return out->len == 0u ? fail(error, HULL_ERR_INTERNAL, "stats do not fit") : HULL_OK;
 }
+
+#define BOARD_NOTE "a microcontroller board, booted from its firmware, the image: source; " \
+                   "its first UART the machine's serial port, its console"
 
 static const hull_cap_entry entries[] = {
 	{ "source.media.overlay", HULL_SUP_NATIVE,
@@ -1978,6 +2180,21 @@ static const hull_cap_entry entries[] = {
 	{ "pc.machine.pc", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.machine.q35", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.machine.isapc", HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.machine.arduino-uno", HULL_SUP_NATIVE, BOARD_NOTE, NULL },
+	{ "pc.machine.arduino-duemilanove", HULL_SUP_NATIVE, BOARD_NOTE, NULL },
+	{ "pc.machine.arduino-mega", HULL_SUP_NATIVE, BOARD_NOTE, NULL },
+	{ "pc.machine.arduino-mega-2560-v3", HULL_SUP_NATIVE, BOARD_NOTE, NULL },
+	{ "pc.machine.stm32vldiscovery", HULL_SUP_NATIVE, BOARD_NOTE, NULL },
+	{ "pc.machine.netduino2", HULL_SUP_NATIVE, BOARD_NOTE, NULL },
+	{ "pc.machine.netduinoplus2", HULL_SUP_NATIVE, BOARD_NOTE, NULL },
+	{ "pc.machine.olimex-stm32-h405", HULL_SUP_NATIVE, BOARD_NOTE, NULL },
+	{ "pc.machine.lm3s6965evb", HULL_SUP_NATIVE, BOARD_NOTE, NULL },
+	{ "pc.machine.lm3s811evb", HULL_SUP_NATIVE, BOARD_NOTE, NULL },
+	{ "pc.machine.microbit", HULL_SUP_NATIVE, BOARD_NOTE, NULL },
+	{ "pc.machine.at89c51ed2", HULL_SUP_NATIVE,
+	  "an 8051 by SDCC's simulator, s51, its 8052 core at 11.0592 MHz, booted from its firmware, "
+	  "the image: source, an Intel hex; its UART the machine's serial port, its console", NULL },
+	{ "pc.machine.mps2-an385", HULL_SUP_NATIVE, BOARD_NOTE, NULL },
 	{ "pc.vga.std", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.vga.cirrus", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.vga.vmware", HULL_SUP_NATIVE, NULL, NULL },

@@ -545,7 +545,14 @@ static const key qemu_keys[] = {
 };
 static const schema qemu = TABLE(qemu_keys);
 
-static const char *const pc_machine_values[] = { "pc", "q35", "isapc", NULL };
+/* A PC's machine type, or a microcontroller board booted from its
+ * firmware, on qemu or s51 (engine/pc.c's boards). */
+static const char *const pc_machine_values[] = {
+	"pc", "q35", "isapc",
+	"arduino-uno", "arduino-duemilanove", "arduino-mega", "arduino-mega-2560-v3",
+	"stm32vldiscovery", "netduino2", "netduinoplus2", "olimex-stm32-h405", "lm3s6965evb",
+	"lm3s811evb", "microbit", "mps2-an385", "at89c51ed2", NULL
+};
 static const char *const pc_vga_values[]     = { "std", "cirrus", "vmware", "none", NULL };
 
 static const char *const pc_nic_values[]     = { "ne2k_pci", "ne2k_isa", "pcnet", "rtl8139",

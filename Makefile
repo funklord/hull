@@ -246,6 +246,18 @@ ROOTVM_TEST_FILES = $(BUILD_DIR)/test/rootvm/vm.conf
 SYSTEMD_TEST_FILES = $(addprefix $(BUILD_DIR)/test/systemd/, vm.conf run.sh build.conf)
 VFIO_TEST_FILES = $(addprefix $(BUILD_DIR)/test/vfio/, vm.conf run.sh)
 USB_TEST_FILES  = $(addprefix $(BUILD_DIR)/test/usb/, vm.conf run.sh)
+# Firmware for the boards check-board boots as pc machines, each built
+# where its compiler is: avr-gcc, clang with lld, SDCC.
+BOARD_AVR_CC ?= avr-gcc
+BOARD_ARM_CC ?= clang
+BOARD_ARM_LD ?= $(firstword $(foreach l,ld.lld ld.lld-19,$(shell command -v $(l) 2>/dev/null)))
+SDCC         ?= sdcc
+BOARD_AVR  := $(if $(shell command -v $(BOARD_AVR_CC) 2>/dev/null),$(BUILD_DIR)/test/board-fw/echo_avr.elf)
+BOARD_ARM  := $(if $(and $(shell command -v $(BOARD_ARM_CC) 2>/dev/null),$(BOARD_ARM_LD)),$(BUILD_DIR)/test/board-fw/echo_stm32.elf)
+BOARD_8051 := $(if $(shell command -v $(SDCC) 2>/dev/null),$(BUILD_DIR)/test/board-fw/echo_8051.ihx)
+BOARD_TEST_FILES = $(addprefix $(BUILD_DIR)/test/board-fw/, echo_avr.elf echo_stm32.o echo_stm32.elf \
+                   echo_8051.ihx echo_8051.rel echo_8051.lk echo_8051.map echo_8051.mem \
+                   echo_8051.lst echo_8051.rst echo_8051.sym echo_8051.asm)
 # What check-fuzz writes, but for what it finds, in $(FUZZ_DIR)/found,
 # which is kept: a crash's input is what reproduces it.
 FUZZ_FILES = $(addprefix $(BUILD_DIR)/fuzz/, json_fuzz unpack_fuzz pack_fuzz corpus/json/manifest \
@@ -354,7 +366,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-arm64-host check-riscv64-host check-root check-systemd check-vfio check-usb check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-arm64-host check-riscv64-host check-root check-systemd check-vfio check-usb check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -473,6 +485,7 @@ help:
 	@echo '  check-systemd systemd as a chroot machine'"'"'s init in a delegated cgroup, inside a vm'
 	@echo '  check-vfio    a PCI device by VFIO, to chroot and a nested vm, inside a vm with an IOMMU'
 	@echo '  check-usb     a USB device followed by chroot as it re-enumerates, inside a vm'
+	@echo '  check-board   microcontroller boards (Uno, STM32, 8051) booted from firmware as pc machines'
 	@echo '  check-sanitize  the unit tests, store and pull under ASan and UBSan'
 	@echo '  check-fuzz    libFuzzer over the JSON and layer readers, FUZZ_TIME s each'
 	@echo '  check-gui     hull-gui as text, and its requests, against a core of its own'
@@ -1026,6 +1039,26 @@ check-vfio: $(HULL) $(AGENT_BIN) $(PROBE)
 check-usb: $(HULL) $(AGENT_BIN) $(PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/usb_test.sh '$(HULL)' '$(PROBE)'
 
+# Microcontroller boards as pc machines: firmware of test/board's, run on
+# qemu's Uno and STM32VLDISCOVERY and SDCC's s51, no KVM.
+check-board: $(HULL) $(BOARD_AVR) $(BOARD_ARM) $(BOARD_8051)
+	BUILD_DIR='$(BUILD_DIR)' sh test/board_test.sh '$(HULL)' '$(BOARD_AVR)' '$(BOARD_ARM)' \
+		'$(BOARD_8051)'
+
+$(BUILD_DIR)/test/board-fw/echo_avr.elf: test/board/echo_avr.c
+	@mkdir -p '$(@D)'
+	$(BOARD_AVR_CC) -mmcu=atmega328p -Os -Wall -Wextra -o $@ $<
+
+$(BUILD_DIR)/test/board-fw/echo_stm32.elf: test/board/echo_stm32.c test/board/stm32f100.ld
+	@mkdir -p '$(@D)'
+	$(BOARD_ARM_CC) --target=thumbv7m-none-eabi -mcpu=cortex-m3 -mthumb -ffreestanding -nostdlib \
+		-Os -Wall -Wextra -c -o $(@D)/echo_stm32.o $<
+	$(BOARD_ARM_LD) -T test/board/stm32f100.ld --entry=reset -o $@ $(@D)/echo_stm32.o
+
+$(BUILD_DIR)/test/board-fw/echo_8051.ihx: test/board/echo_8051.c
+	@mkdir -p '$(@D)'
+	$(SDCC) -mmcs51 -o $(@D)/ $<
+
 # The indentation and whitespace gate, shared verbatim with the sibling
 # projects; `docs` additionally holds project.md to the tree it describes.
 style: style-tool style-source style-docs
@@ -1086,7 +1119,7 @@ clean:
 	        $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(BUILD_DIR)/test/arm64/rootfs/probe \
 	        $(BUILD_DIR)/test/riscv64/rootfs/probe $(BUILD_DIR)/test/s390x/rootfs/probe \
-	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) $(SYSTEMD_TEST_FILES) $(VFIO_TEST_FILES) $(USB_TEST_FILES) \
+	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) $(SYSTEMD_TEST_FILES) $(VFIO_TEST_FILES) $(USB_TEST_FILES) $(BOARD_TEST_FILES) \
 	        $(FUZZ_FILES) \
 	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor $(CLIENT_LIB) $(GUI_BIN) \
 	        $(GUI_TEST_FILES)
