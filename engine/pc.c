@@ -126,6 +126,8 @@ struct hull_machine {
 	unsigned        port_count;
 	char           *segment[PC_MAX_SEGMENTS];  /* Appendix D's wires, by name */
 	int             segment_fd[PC_MAX_SEGMENTS];
+	char           *lora;           /* (tuning (pc (lora NAME))): the air its radio is on */
+	int             lora_fd;        /* the air's port on the core's switch */
 	unsigned        segment_count;
 	char           *display;        /* the run's X display, or NULL */
 	char           *xauthority;
@@ -228,6 +230,20 @@ static int is_esp(const board *b)
 	return b != NULL && strcmp(b->load, ESP_LOAD) == 0;
 }
 
+/* The boards with an SX1276 on VSPI, NSS on GPIO 18, NRESET on 14 and DIO0
+ * on 26: a Heltec WiFi LoRa 32 (V1 and V2) and a TTGO LoRa32. A V3's
+ * radio is an SX1262, which is not modelled. */
+static int has_sx1276(const board *b)
+{
+	static const char *const names[] = { "heltec-wifi-lora-32", "heltec-wifi-lora-32-v2",
+	                                     "ttgo-lora32" };
+
+	for (unsigned i = 0u; b != NULL && i < sizeof names / sizeof names[0]; i++)
+		if (strcmp(b->name, names[i]) == 0)
+			return 1;
+	return 0;
+}
+
 /* The board `name` names, or NULL for a PC's machine type. */
 static const board *board_named(const char *name)
 {
@@ -273,6 +289,9 @@ static void release(hull_machine *m)
 	free(m->sound);
 	free(m->firmware);
 	free(m->nic);
+	free(m->lora);
+	if (m->lora_fd >= 0)
+		close(m->lora_fd);
 	free(m->name);
 	free(m->display);
 	free(m->xauthority);
@@ -362,6 +381,20 @@ static int esp_emulator(const board *b, char *out, size_t cap)
 	if (hull_esp_dir(dir, sizeof dir) != 0)
 		return -1;
 	snprintf(out, cap, "%.4096s/qemu/bin/%s", dir, b->emulator);
+	return access(out, X_OK);
+}
+
+/* The qemu an ESP32 with a LoRa radio runs on: Espressif's, built from its
+ * source with hull's engine/esp-lora.patch by `make esp-qemu-lora`, named
+ * by HULL_ESP_LORA_QEMU. Its ROMs are the fetched release's. 0, or -1
+ * where it is not there. */
+static int esp_lora_emulator(char *out, size_t cap)
+{
+	const char *named = getenv("HULL_ESP_LORA_QEMU");
+
+	if (named == NULL || named[0] != '/')
+		return -1;
+	snprintf(out, cap, "%s", named);
 	return access(out, X_OK);
 }
 
@@ -460,6 +493,11 @@ static int prepare_state(hull_machine *m)
 	if (is_esp(b) && esp_emulator(b, from, sizeof from) != 0) {
 		snprintf(m->why, sizeof m->why, "%s runs on Espressif's qemu, which is not fetched: "
 		         "hull esp fetch\n", b->name);
+		return -1;
+	}
+	if (m->lora != NULL && esp_lora_emulator(from, sizeof from) != 0) {
+		snprintf(m->why, sizeof m->why, "a LoRa radio needs Espressif's qemu built with hull's "
+		         "SX1276, `make esp-qemu-lora`, and HULL_ESP_LORA_QEMU naming it\n");
 		return -1;
 	}
 	if (!m->secure && !m->tpm && !s51 && !is_esp(b))
@@ -978,10 +1016,18 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 			m->accel        = hull_access_value(doc, &pc, "accel");
 			m->nic          = hull_access_value(doc, &pc, "nic");
 			m->sound        = hull_access_value(doc, &pc, "sound");
+			m->lora         = hull_access_value(doc, &pc, "lora");
 			if ((wrong = read_firmware(m, doc, &pc)) != NULL)
 				return wrong;
 		}
 	}
+	/* A LoRa radio, on the boards that carry an SX1276 as a Heltec's is
+	 * wired, and a name for its air. */
+	if (m->lora != NULL && !has_sx1276(board_named(m->machine_type)))
+		return "a LoRa radio is on heltec-wifi-lora-32, heltec-wifi-lora-32-v2 and "
+		       "ttgo-lora32 alone, an SX1276 as hull models it";
+	if (m->lora != NULL && (strlen(m->lora) > 64u || strchr(m->lora, '/') != NULL))
+		return "a LoRa air's name is at most 64 characters and has no /";
 	/* A board: its firmware, the image: source, and none of a PC's parts. */
 	if (board_named(m->machine_type) != NULL) {
 		if (m->media_count != 1u || m->media[0].path == NULL)
@@ -1045,10 +1091,13 @@ static void exec_board(const hull_machine *m, const board *b)
 {
 	char  drive[4500];
 	char  emulator[4200];
+	char  lora_emulator[4200];
+	char  rom[4200];
+	char  air[64];
 	char  nic[96u + PC_MAX_PORTS * 64u];
 	char  netdev[64];
 	char  monitor[48];
-	char *argv[20];
+	char *argv[28];
 	int   n = 0;
 	int   monitor_fd;
 
@@ -1123,6 +1172,20 @@ static void exec_board(const hull_machine *m, const board *b)
 	argv[n++] = "-no-user-config";
 	argv[n++] = "-machine";
 	argv[n++] = (char *)(b->chip != NULL ? b->chip : b->name);
+	if (m->lora != NULL) {
+		int fd = fcntl(m->lora_fd, F_DUPFD, 3);
+
+		if (fd < 0 || esp_lora_emulator(lora_emulator, sizeof lora_emulator) != 0 ||
+		    hull_esp_dir(rom, sizeof rom) != 0)
+			return;
+		snprintf(air, sizeof air, "socket,id=air,fd=%d", fd);
+		strncat(rom, "/qemu/share/qemu", sizeof rom - strlen(rom) - 1u);
+		argv[n - 1] = "esp32,lora=air";
+		argv[n++] = "-chardev";
+		argv[n++] = air;
+		argv[n++] = "-L";
+		argv[n++] = rom;
+	}
 	argv[n++] = "-display";
 	argv[n++] = "none";
 	argv[n++] = "-serial";
@@ -1137,7 +1200,7 @@ static void exec_board(const hull_machine *m, const board *b)
 		argv[n++] = drive;
 		if (esp_emulator(b, emulator, sizeof emulator) != 0)
 			return;
-		argv[0] = emulator;
+		argv[0] = m->lora != NULL ? lora_emulator : emulator;
 	} else {
 		argv[n++] = (char *)b->load;
 		argv[n++] = (char *)m->media[0].path;
@@ -1526,6 +1589,10 @@ static int launch(hull_machine *m)
 		close(m->segment_fd[i]);
 		m->segment_fd[i] = -1;
 	}
+	if (m->lora_fd >= 0) {
+		close(m->lora_fd);
+		m->lora_fd = -1;
+	}
 	pthread_mutex_lock(&m->lock);
 	m->pid   = child;
 	m->input = in[0];
@@ -1622,6 +1689,7 @@ static hull_status pc_create(hull_core *core, hull_buf plan, hull_machine **out,
 	m->err  = -1;
 	m->input = -1;
 	m->monitor = -1;
+	m->lora_fd = -1;
 	pthread_mutex_init(&m->lock, NULL);
 	pthread_mutex_init(&m->monitor_lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
@@ -1649,6 +1717,20 @@ static hull_status pc_start(hull_core *core, hull_machine *m, hull_error *error)
 			return fail(error, HULL_ERR_RUNTIME, "the core has no switch for a segment");
 		m->segment_fd[i] = host->segment(m->core, m->segment[i], detail, sizeof detail);
 		if (m->segment_fd[i] < 0)
+			return fail(error, HULL_ERR_RUNTIME, detail);
+	}
+	/* The radio's air: a segment of the core's switch of its own, lora-NAME,
+	 * which no Ethernet segment's name can be, carrying its packets as
+	 * frames of type 0x88b5 to every other radio on it. */
+	if (m->lora != NULL) {
+		static char detail[256];
+		char        key[80];
+
+		if (host->struct_size < offsetof(hull_host_ops, segment) + sizeof host->segment ||
+		    host->segment == NULL)
+			return fail(error, HULL_ERR_RUNTIME, "the core has no switch for a LoRa air");
+		snprintf(key, sizeof key, "lora-%s", m->lora);
+		if ((m->lora_fd = host->segment(m->core, key, detail, sizeof detail)) < 0)
 			return fail(error, HULL_ERR_RUNTIME, detail);
 	}
 	if (pthread_create(&m->reader, NULL, run_machine, m) != 0)
@@ -2382,6 +2464,10 @@ static const hull_cap_entry entries[] = {
 	  "machine's own copy", NULL },
 	{ "pc.tpm", HULL_SUP_EMULATED,
 	  "a TPM 2.0 in software, swtpm's, CRB on q35 and TIS on pc", NULL },
+	{ "pc.lora.path", HULL_SUP_EMULATED,
+	  "an SX1276 LoRa radio on a Heltec WiFi LoRa 32 or a TTGO LoRa32, on the named air with "
+	  "every other radio on it: no range, loss or collisions, its time on air kept; DIO0 read, "
+	  "not an interrupt; on Espressif's qemu built with hull's patch (make esp-qemu-lora)", NULL },
 	{ "pc.boot_key", HULL_SUP_NATIVE,
 	  "Enter pressed by qemu's monitor once a second for the seconds given, from the start", NULL },
 	{ "pc.state.path", HULL_SUP_NATIVE,

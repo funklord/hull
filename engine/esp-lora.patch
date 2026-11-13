@@ -1,0 +1,723 @@
+diff --git a/hw/gpio/esp32_gpio.c b/hw/gpio/esp32_gpio.c
+index 5e25782..2b2496b 100644
+--- a/hw/gpio/esp32_gpio.c
++++ b/hw/gpio/esp32_gpio.c
+@@ -35,12 +35,40 @@ static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
+     } else if (s->in_off && addr == s->in_off) {
+         /* Output-enabled pins loop back; undriven pins reflect pull-up state */
+         r = (s->gpio_out & s->gpio_enable) |
+-            (s->gpio_pullup & ~s->gpio_enable);
++            (s->in_level & s->in_driven & ~s->gpio_enable) |
++            (s->gpio_pullup & ~s->gpio_enable & ~s->in_driven);
+     }
+ 
+     return r;
+ }
+ 
++/* A pin's output level, where it is an output, to its "out" line; a pin
++ * that is no output is left high, as its pull-up would leave it. */
++static void esp32_gpio_update_out(Esp32GpioState *s)
++{
++    uint32_t level = (s->gpio_out & s->gpio_enable) | ~s->gpio_enable;
++    uint32_t changed = level ^ s->out_seen;
++
++    s->out_seen = level;
++    for (int pin = 0; pin < 32; pin++) {
++        if (changed & (1u << pin)) {
++            qemu_set_irq(s->out[pin], (level >> pin) & 1);
++        }
++    }
++}
++
++static void esp32_gpio_in(void *opaque, int pin, int level)
++{
++    Esp32GpioState *s = ESP32_GPIO(opaque);
++
++    s->in_driven |= 1u << pin;
++    if (level) {
++        s->in_level |= 1u << pin;
++    } else {
++        s->in_level &= ~(1u << pin);
++    }
++}
++
+ static void esp32_gpio_write(void *opaque, hwaddr addr,
+                        uint64_t value, unsigned int size)
+ {
+@@ -59,6 +87,7 @@ static void esp32_gpio_write(void *opaque, hwaddr addr,
+     } else if (s->enable_w1tc_off && addr == s->enable_w1tc_off) {
+         s->gpio_enable &= ~(uint32_t)value;
+     }
++    esp32_gpio_update_out(s);
+ }
+ 
+ static const MemoryRegionOps gpio_ops = {
+@@ -124,6 +153,9 @@ static void esp32_gpio_init(Object *obj)
+     sysbus_init_mmio(sbd, &s->iomux);
+ 
+     sysbus_init_irq(sbd, &s->irq);
++    s->out_seen = 0xffffffffu;
++    qdev_init_gpio_out_named(DEVICE(obj), s->out, "out", 32);
++    qdev_init_gpio_in_named(DEVICE(obj), esp32_gpio_in, "in", 32);
+ }
+ 
+ static Property esp32_gpio_properties[] = {
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index dc9ff35..72cea62 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -145,7 +145,8 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
+   'esp32_aes.c',
+   'esp32_ledc.c',
+   'esp32_flash_enc.c',
+-  'ssi_psram.c'
++  'ssi_psram.c',
++  'sx127x.c'
+ ))
+ 
+ system_ss.add(when: 'CONFIG_RISCV_ESP32C3', if_true: files(
+diff --git a/hw/misc/sx127x.c b/hw/misc/sx127x.c
+new file mode 100644
+index 0000000..6c31fb6
+--- /dev/null
++++ b/hw/misc/sx127x.c
+@@ -0,0 +1,473 @@
++/*
++ * Semtech SX1276/77/78/79 LoRa transceiver, as hull's ESP32 boards carry
++ * it (a Heltec WiFi LoRa 32, a TTGO LoRa32): its SPI register file and
++ * FIFO in LoRa mode, transmit and receive, the DIO0 line, and the air.
++ *
++ * The air is a character device speaking the length-prefixed frames of
++ * qemu's stream netdev, each LoRa packet an Ethernet frame to the
++ * broadcast address of type 0x88b5, so that a switch that carries a
++ * stream netdev's frames carries radios too. A packet is heard by every
++ * other radio on that air in a receive mode on the same frequency,
++ * spreading factor, bandwidth, sync word and IQ polarity -- no range, no
++ * collisions, no loss, a fixed RSSI and SNR. Its time on air is kept: the
++ * sender's TxDone comes when the packet would have ended, and the packet
++ * is sent then.
++ *
++ * FSK/OOK mode is not modelled; its registers read back what was written.
++ */
++
++#include "qemu/osdep.h"
++#include <math.h>
++#include "qemu/log.h"
++#include "qemu/timer.h"
++#include "qemu/module.h"
++#include "qapi/error.h"
++#include "hw/ssi/ssi.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "hw/qdev-properties-system.h"
++#include "chardev/char-fe.h"
++#include "qom/object.h"
++
++#define TYPE_SX127X "sx127x"
++OBJECT_DECLARE_SIMPLE_TYPE(Sx127xState, SX127X)
++
++enum {
++    REG_FIFO = 0x00,
++    REG_OP_MODE = 0x01,
++    REG_FRF_MSB = 0x06,
++    REG_FRF_MID = 0x07,
++    REG_FRF_LSB = 0x08,
++    REG_FIFO_ADDR_PTR = 0x0d,
++    REG_FIFO_TX_BASE = 0x0e,
++    REG_FIFO_RX_BASE = 0x0f,
++    REG_FIFO_RX_CURRENT = 0x10,
++    REG_IRQ_FLAGS_MASK = 0x11,
++    REG_IRQ_FLAGS = 0x12,
++    REG_RX_NB_BYTES = 0x13,
++    REG_MODEM_STAT = 0x18,
++    REG_PKT_SNR = 0x19,
++    REG_PKT_RSSI = 0x1a,
++    REG_RSSI = 0x1b,
++    REG_MODEM_CONFIG1 = 0x1d,
++    REG_MODEM_CONFIG2 = 0x1e,
++    REG_PREAMBLE_MSB = 0x20,
++    REG_PREAMBLE_LSB = 0x21,
++    REG_PAYLOAD_LENGTH = 0x22,
++    REG_MODEM_CONFIG3 = 0x26,
++    REG_RSSI_WIDEBAND = 0x2c,
++    REG_INVERT_IQ = 0x33,
++    REG_SYNC_WORD = 0x39,
++    REG_DIO_MAPPING1 = 0x40,
++    REG_VERSION = 0x42,
++};
++
++#define MODE_LORA       0x80
++#define MODE_MASK       0x07
++#define MODE_SLEEP      0
++#define MODE_STDBY      1
++#define MODE_TX         3
++#define MODE_RX_CONT    5
++#define MODE_RX_SINGLE  6
++#define MODE_CAD        7
++
++#define IRQ_CAD_DETECTED 0x01
++#define IRQ_CAD_DONE     0x04
++#define IRQ_TX_DONE      0x08
++#define IRQ_VALID_HEADER 0x10
++#define IRQ_RX_DONE      0x40
++
++#define AIR_TYPE    0x88b5
++#define AIR_HEAD    (14 + 12)
++#define AIR_MAX     (4 + AIR_HEAD + 256)
++
++struct Sx127xState {
++    SSIPeripheral parent_obj;
++
++    CharBackend air;
++    qemu_irq dio0;
++    QEMUTimer *timer;
++    uint8_t reg[128];
++    uint8_t fifo[256];
++    uint8_t address;      /* the access under way, 0xff before its address */
++    bool writing;
++    bool in_reset;
++    uint16_t id;          /* this radio's, in its frames' source */
++    uint8_t in[AIR_MAX];  /* a frame from the air, being gathered */
++    uint32_t in_length;
++    uint8_t out[AIR_MAX]; /* the packet being sent, until its airtime ends */
++    uint32_t out_length;
++};
++
++static const uint32_t bandwidth_hz[] = {
++    7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000, 500000,
++};
++
++static void sx127x_reset_registers(Sx127xState *s)
++{
++    memset(s->reg, 0, sizeof(s->reg));
++    memset(s->fifo, 0, sizeof(s->fifo));
++    s->reg[REG_OP_MODE] = 0x09;
++    s->reg[REG_FRF_MSB] = 0x6c;
++    s->reg[REG_FRF_MID] = 0x80;
++    s->reg[0x09] = 0x4f;
++    s->reg[0x0a] = 0x09;
++    s->reg[0x0b] = 0x2b;
++    s->reg[0x0c] = 0x20;
++    s->reg[REG_FIFO_TX_BASE] = 0x80;
++    s->reg[REG_MODEM_CONFIG1] = 0x72;
++    s->reg[REG_MODEM_CONFIG2] = 0x70;
++    s->reg[0x1f] = 0x64;
++    s->reg[REG_PREAMBLE_LSB] = 0x08;
++    s->reg[REG_PAYLOAD_LENGTH] = 0x01;
++    s->reg[0x23] = 0xff;
++    s->reg[0x31] = 0xc3;
++    s->reg[REG_INVERT_IQ] = 0x27;
++    s->reg[0x37] = 0x0a;
++    s->reg[REG_SYNC_WORD] = 0x12;
++    s->reg[REG_VERSION] = 0x12;
++    s->reg[0x4d] = 0x84;
++    s->address = 0xff;
++    s->out_length = 0;
++    timer_del(s->timer);
++}
++
++static unsigned sx127x_mode(Sx127xState *s)
++{
++    return s->reg[REG_OP_MODE] & MODE_MASK;
++}
++
++/* DIO0 by RegDioMapping1's top two bits: RxDone, TxDone or CadDone. */
++static void sx127x_update_dio0(Sx127xState *s)
++{
++    static const uint8_t by_mapping[4] = { IRQ_RX_DONE, IRQ_TX_DONE, IRQ_CAD_DONE, 0 };
++    uint8_t flag = by_mapping[s->reg[REG_DIO_MAPPING1] >> 6];
++
++    qemu_set_irq(s->dio0, (s->reg[REG_IRQ_FLAGS] & flag & ~s->reg[REG_IRQ_FLAGS_MASK]) != 0);
++}
++
++static void sx127x_raise(Sx127xState *s, uint8_t flags)
++{
++    s->reg[REG_IRQ_FLAGS] |= flags;
++    sx127x_update_dio0(s);
++}
++
++/* The packet's time on air in ns, by Semtech's formula (AN1200.13). */
++static int64_t sx127x_airtime(Sx127xState *s, unsigned length)
++{
++    unsigned bw = s->reg[REG_MODEM_CONFIG1] >> 4;
++    unsigned cr = (s->reg[REG_MODEM_CONFIG1] >> 1) & 7;
++    bool implicit = s->reg[REG_MODEM_CONFIG1] & 1;
++    unsigned sf = s->reg[REG_MODEM_CONFIG2] >> 4;
++    bool crc = s->reg[REG_MODEM_CONFIG2] & 4;
++    unsigned preamble = (s->reg[REG_PREAMBLE_MSB] << 8) | s->reg[REG_PREAMBLE_LSB];
++    double hz = bandwidth_hz[bw < 10 ? bw : 7];
++    double symbol, bits, payload;
++    bool low_rate;
++
++    if (sf < 6 || sf > 12) {
++        sf = 7;
++    }
++    if (cr < 1 || cr > 4) {
++        cr = 1;
++    }
++    symbol = (double)(1u << sf) / hz;
++    low_rate = symbol > 0.016;
++    bits = 8.0 * length - 4.0 * sf + 28 + (crc ? 16 : 0) - (implicit ? 20 : 0);
++    payload = 8 + MAX(ceil(bits / (4.0 * (sf - (low_rate ? 2 : 0)))) * (cr + 4), 0);
++    return (int64_t)(((preamble + 4.25) + payload) * symbol * 1e9);
++}
++
++/* The FIFO's payload as a frame on the air, into s->out. */
++static void sx127x_frame(Sx127xState *s)
++{
++    unsigned length = s->reg[REG_PAYLOAD_LENGTH];
++    uint8_t *f = s->out + 4;
++    unsigned frame = AIR_HEAD + length;
++
++    stl_be_p(s->out, frame);
++    memset(f, 0xff, 6);
++    f[6] = 0x02;
++    f[7] = 0x00;
++    f[8] = 'L';
++    f[9] = 'R';
++    stw_be_p(f + 10, s->id);
++    stw_be_p(f + 12, AIR_TYPE);
++    f[14] = 1;                                  /* version */
++    f[15] = s->reg[REG_FRF_MSB];
++    f[16] = s->reg[REG_FRF_MID];
++    f[17] = s->reg[REG_FRF_LSB];
++    f[18] = s->reg[REG_MODEM_CONFIG1];
++    f[19] = s->reg[REG_MODEM_CONFIG2];
++    f[20] = s->reg[REG_SYNC_WORD];
++    /* RegInvertIQ's bit 0 is set for a normal transmission, clear for an
++     * inverted one -- its reset value 0x27 is normal both ways, and
++     * arduino-LoRa's enableInvertIQ() writes 0x66 -- where bit 6 is set
++     * for an inverted reception. */
++    f[21] = !(s->reg[REG_INVERT_IQ] & 1);       /* transmitted inverted */
++    f[22] = 0;
++    f[23] = 0;
++    f[24] = 0;
++    f[25] = length;
++    for (unsigned i = 0; i < length; i++) {
++        f[AIR_HEAD + i] = s->fifo[(uint8_t)(s->reg[REG_FIFO_TX_BASE] + i)];
++    }
++    s->out_length = 4 + frame;
++}
++
++/* The airtime over: the packet on the air, TxDone, and standby. */
++static void sx127x_timer(void *opaque)
++{
++    Sx127xState *s = opaque;
++    unsigned mode = sx127x_mode(s);
++
++    if (mode == MODE_TX && s->out_length != 0) {
++        if (qemu_chr_fe_backend_connected(&s->air)) {
++            qemu_chr_fe_write_all(&s->air, s->out, s->out_length);
++        }
++        s->out_length = 0;
++        s->reg[REG_OP_MODE] = (s->reg[REG_OP_MODE] & ~MODE_MASK) | MODE_STDBY;
++        sx127x_raise(s, IRQ_TX_DONE);
++    } else if (mode == MODE_CAD) {
++        s->reg[REG_OP_MODE] = (s->reg[REG_OP_MODE] & ~MODE_MASK) | MODE_STDBY;
++        sx127x_raise(s, IRQ_CAD_DONE);
++    }
++}
++
++static void sx127x_set_mode(Sx127xState *s, uint8_t value)
++{
++    unsigned before = sx127x_mode(s);
++
++    s->reg[REG_OP_MODE] = value;
++    if (!(value & MODE_LORA) || (value & MODE_MASK) == before) {
++        return;
++    }
++    switch (value & MODE_MASK) {
++    case MODE_TX:
++        sx127x_frame(s);
++        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                  sx127x_airtime(s, s->reg[REG_PAYLOAD_LENGTH]));
++        break;
++    case MODE_CAD:
++        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
++        break;
++    default:
++        timer_del(s->timer);
++        s->out_length = 0;
++        break;
++    }
++}
++
++static uint8_t sx127x_read(Sx127xState *s, uint8_t address)
++{
++    switch (address) {
++    case REG_FIFO:
++        return s->fifo[s->reg[REG_FIFO_ADDR_PTR]++];
++    case REG_RSSI_WIDEBAND:
++        return (uint8_t)g_random_int();
++    case REG_RSSI:
++        return sx127x_mode(s) == MODE_RX_CONT || sx127x_mode(s) == MODE_RX_SINGLE ? 40 : 0;
++    default:
++        return s->reg[address];
++    }
++}
++
++static void sx127x_write(Sx127xState *s, uint8_t address, uint8_t value)
++{
++    switch (address) {
++    case REG_FIFO:
++        s->fifo[s->reg[REG_FIFO_ADDR_PTR]++] = value;
++        break;
++    case REG_OP_MODE:
++        sx127x_set_mode(s, value);
++        break;
++    case REG_IRQ_FLAGS:
++        s->reg[REG_IRQ_FLAGS] &= ~value;
++        sx127x_update_dio0(s);
++        break;
++    case REG_IRQ_FLAGS_MASK:
++    case REG_DIO_MAPPING1:
++        s->reg[address] = value;
++        sx127x_update_dio0(s);
++        break;
++    case REG_VERSION:
++    case REG_RX_NB_BYTES:
++    case REG_FIFO_RX_CURRENT:
++    case REG_MODEM_STAT:
++    case REG_PKT_SNR:
++    case REG_PKT_RSSI:
++        break;
++    default:
++        s->reg[address] = value;
++        break;
++    }
++}
++
++/* A byte on SPI: the first of an access is its address, bit 7 set for a
++ * write; the rest its data, the address moving on but at the FIFO. */
++static uint32_t sx127x_transfer(SSIPeripheral *dev, uint32_t value)
++{
++    Sx127xState *s = SX127X(dev);
++    uint8_t byte = value;
++    uint8_t answer = 0;
++
++    if (s->in_reset) {
++        return 0;
++    }
++    if (s->address == 0xff) {
++        s->address = byte & 0x7f;
++        s->writing = byte & 0x80;
++        return 0;
++    }
++    if (s->writing) {
++        sx127x_write(s, s->address, byte);
++    } else {
++        answer = sx127x_read(s, s->address);
++    }
++    if (s->address != REG_FIFO) {
++        s->address = (s->address + 1) & 0x7f;
++    }
++    return answer;
++}
++
++static int sx127x_set_cs(SSIPeripheral *dev, bool select)
++{
++    Sx127xState *s = SX127X(dev);
++
++    s->address = 0xff;
++    return 0;
++}
++
++/* NRESET, low holding the chip in reset. */
++static void sx127x_reset_line(void *opaque, int line, int level)
++{
++    Sx127xState *s = opaque;
++
++    if (!level) {
++        s->in_reset = true;
++    } else if (s->in_reset) {
++        s->in_reset = false;
++        sx127x_reset_registers(s);
++        sx127x_update_dio0(s);
++    }
++}
++
++/* A packet heard: kept where this radio listens for it alike. */
++static void sx127x_hear(Sx127xState *s, const uint8_t *f, unsigned frame)
++{
++    unsigned mode = sx127x_mode(s);
++    unsigned length;
++    uint8_t base;
++
++    if (frame < AIR_HEAD || lduw_be_p(f + 12) != AIR_TYPE || f[14] != 1 ||
++        lduw_be_p(f + 10) == s->id) {
++        return;
++    }
++    length = f[25];
++    if (frame < AIR_HEAD + length || !(s->reg[REG_OP_MODE] & MODE_LORA) ||
++        (mode != MODE_RX_CONT && mode != MODE_RX_SINGLE) ||
++        f[15] != s->reg[REG_FRF_MSB] || f[16] != s->reg[REG_FRF_MID] ||
++        f[17] != s->reg[REG_FRF_LSB] ||
++        (f[18] & 0xf0) != (s->reg[REG_MODEM_CONFIG1] & 0xf0) ||
++        (f[19] & 0xf0) != (s->reg[REG_MODEM_CONFIG2] & 0xf0) ||
++        f[20] != s->reg[REG_SYNC_WORD] ||
++        (f[21] & 1) != ((s->reg[REG_INVERT_IQ] >> 6) & 1)) {
++        return;
++    }
++    base = s->reg[REG_FIFO_RX_BASE];
++    for (unsigned i = 0; i < length; i++) {
++        s->fifo[(uint8_t)(base + i)] = f[AIR_HEAD + i];
++    }
++    s->reg[REG_FIFO_RX_CURRENT] = base;
++    s->reg[REG_RX_NB_BYTES] = length;
++    s->reg[REG_PKT_SNR] = 40;                   /* 10 dB, in quarters */
++    s->reg[REG_PKT_RSSI] = 97;                  /* -60 dBm on the HF port */
++    if (mode == MODE_RX_SINGLE) {
++        s->reg[REG_OP_MODE] = (s->reg[REG_OP_MODE] & ~MODE_MASK) | MODE_STDBY;
++    }
++    sx127x_raise(s, IRQ_VALID_HEADER | IRQ_RX_DONE);
++}
++
++static int sx127x_can_receive(void *opaque)
++{
++    Sx127xState *s = opaque;
++
++    return sizeof(s->in) - s->in_length;
++}
++
++static void sx127x_receive(void *opaque, const uint8_t *buf, int size)
++{
++    Sx127xState *s = opaque;
++
++    memcpy(s->in + s->in_length, buf, size);
++    s->in_length += size;
++    while (s->in_length >= 4) {
++        uint32_t frame = ldl_be_p(s->in);
++
++        if (frame > sizeof(s->in) - 4) {
++            /* No frame of a radio's: the air's framing is lost, start over. */
++            s->in_length = 0;
++            return;
++        }
++        if (s->in_length < 4 + frame) {
++            return;
++        }
++        sx127x_hear(s, s->in + 4, frame);
++        memmove(s->in, s->in + 4 + frame, s->in_length - 4 - frame);
++        s->in_length -= 4 + frame;
++    }
++}
++
++static void sx127x_realize(SSIPeripheral *dev, Error **errp)
++{
++    Sx127xState *s = SX127X(dev);
++
++    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sx127x_timer, s);
++    s->id = (uint16_t)g_random_int();
++    qdev_init_gpio_out_named(DEVICE(dev), &s->dio0, "dio0", 1);
++    qdev_init_gpio_in_named(DEVICE(dev), sx127x_reset_line, "reset", 1);
++    qemu_chr_fe_set_handlers(&s->air, sx127x_can_receive, sx127x_receive, NULL, NULL, s,
++                             NULL, true);
++    sx127x_reset_registers(s);
++}
++
++static void sx127x_reset(DeviceState *dev)
++{
++    Sx127xState *s = SX127X(dev);
++
++    sx127x_reset_registers(s);
++    s->in_reset = false;
++}
++
++static Property sx127x_properties[] = {
++    DEFINE_PROP_CHR("chardev", Sx127xState, air),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void sx127x_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(klass);
++
++    k->realize = sx127x_realize;
++    k->transfer = sx127x_transfer;
++    k->set_cs = sx127x_set_cs;
++    k->cs_polarity = SSI_CS_LOW;
++    device_class_set_legacy_reset(dc, sx127x_reset);
++    device_class_set_props(dc, sx127x_properties);
++    dc->desc = "Semtech SX1276 LoRa transceiver";
++}
++
++static const TypeInfo sx127x_info = {
++    .name = TYPE_SX127X,
++    .parent = TYPE_SSI_PERIPHERAL,
++    .instance_size = sizeof(Sx127xState),
++    .class_init = sx127x_class_init,
++};
++
++static void sx127x_register_types(void)
++{
++    type_register_static(&sx127x_info);
++}
++
++type_init(sx127x_register_types)
+diff --git a/hw/ssi/esp32_spi.c b/hw/ssi/esp32_spi.c
+index 65ca666..5f24133 100644
+--- a/hw/ssi/esp32_spi.c
++++ b/hw/ssi/esp32_spi.c
+@@ -158,11 +158,11 @@ static void esp32_spi_txrx_buffer(Esp32SpiState *s, void *buf, int tx_bytes, int
+     uint8_t *c_buf = (uint8_t*) buf;
+     for (int i = 0; i < bytes; ++i) {
+         uint8_t byte = 0;
+-        if (byte < tx_bytes) {
++        if (i < tx_bytes) {
+             memcpy(&byte, c_buf + i, 1);
+         }
+         uint32_t res = ssi_transfer(s->spi, byte);
+-        if (byte < rx_bytes) {
++        if (i < rx_bytes) {
+             memcpy(c_buf + i, &res, 1);
+         }
+     }
+diff --git a/hw/xtensa/esp32.c b/hw/xtensa/esp32.c
+index c3cf32e..2a007f9 100644
+--- a/hw/xtensa/esp32.c
++++ b/hw/xtensa/esp32.c
+@@ -26,6 +26,9 @@
+ #include "hw/qdev-properties.h"
+ #include "hw/xtensa/esp32.h"
+ #include "hw/misc/ssi_psram.h"
++#include "chardev/char.h"
++#include "hw/qdev-properties-system.h"
++#include "hw/ssi/ssi.h"
+ #include "hw/sd/dwc_sdmmc.h"
+ #include "core-esp32/core-isa.h"
+ #include "qemu/datadir.h"
+@@ -421,6 +424,16 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
+                                     qdev_get_gpio_in_named(dev, ESP32_RTC_CPU_STALL_GPIO, i));
+     }
+ 
++    /* The ESP32's own GPIO registers, so that a pin's output and input
++     * are modelled for devices on the board: OUT, its W1TS and W1TC,
++     * ENABLE, its W1TS and W1TC, and IN. */
++    s->gpio.out_off = 0x04;
++    s->gpio.out_w1ts_off = 0x08;
++    s->gpio.out_w1tc_off = 0x0c;
++    s->gpio.enable_off = 0x20;
++    s->gpio.enable_w1ts_off = 0x24;
++    s->gpio.enable_w1tc_off = 0x28;
++    s->gpio.in_off = 0x3c;
+     qdev_realize(DEVICE(&s->gpio), &s->periph_bus, &error_fatal);
+     esp32_soc_add_periph_device(sys_mem, &s->gpio, DR_REG_GPIO_BASE);
+ 
+@@ -710,6 +723,8 @@ struct Esp32MachineState {
+ 
+     Esp32SocState esp32;
+     DeviceState *flash_dev;
++    char *lora;        /* the chardev an SX1276 on VSPI talks to the air by */
++    char *lora_pins;   /* its NSS, NRESET and DIO0, as GPIO numbers */
+ };
+ #define TYPE_ESP32_MACHINE MACHINE_TYPE_NAME("esp32")
+ 
+@@ -806,6 +821,65 @@ static void esp32_machine_init_sd(Esp32SocState *ss)
+     }
+ }
+ 
++/*
++ * An SX1276 on the VSPI bus, SPI3, as a Heltec WiFi LoRa 32 and a TTGO
++ * LoRa32 wire one: its NSS on a GPIO the firmware drives, as Arduino's
++ * LoRa libraries do rather than by the controller's own CS, its NRESET on
++ * another, its DIO0 on a third that the firmware reads. Heltec's pins,
++ * 18, 14 and 26, unless lora-pins names others.
++ */
++static void esp32_machine_init_lora(Esp32MachineState *ms, Esp32SocState *ss)
++{
++    unsigned nss = 18, nreset = 14, dio0 = 26;
++    Chardev *air = qemu_chr_find(ms->lora);
++    DeviceState *radio;
++    BusState *bus = qdev_get_child_bus(DEVICE(&ss->spi[3]), "spi");
++
++    if (!air) {
++        error_report("lora: no chardev %s", ms->lora);
++        exit(1);
++    }
++    if (ms->lora_pins &&
++        (sscanf(ms->lora_pins, "%u:%u:%u", &nss, &nreset, &dio0) != 3 ||
++         nss > 31 || nreset > 31 || dio0 > 31)) {
++        error_report("lora-pins: NSS:NRESET:DIO0, each a GPIO below 32");
++        exit(1);
++    }
++    radio = qdev_new("sx127x");
++    qdev_prop_set_chr(radio, "chardev", air);
++    qdev_realize_and_unref(radio, bus, &error_fatal);
++    qdev_connect_gpio_out_named(DEVICE(&ss->gpio), "out", nss,
++                                qdev_get_gpio_in_named(radio, SSI_GPIO_CS, 0));
++    qdev_connect_gpio_out_named(DEVICE(&ss->gpio), "out", nreset,
++                                qdev_get_gpio_in_named(radio, "reset", 0));
++    qdev_connect_gpio_out_named(radio, "dio0", 0,
++                                qdev_get_gpio_in_named(DEVICE(&ss->gpio), "in", dio0));
++    /* NSS high, the radio unselected, until the firmware drives it. */
++    qemu_set_irq(qdev_get_gpio_in_named(radio, SSI_GPIO_CS, 0), 1);
++}
++
++static char *esp32_get_lora(Object *obj, Error **errp)
++{
++    return g_strdup(ESP32_MACHINE(obj)->lora);
++}
++
++static void esp32_set_lora(Object *obj, const char *value, Error **errp)
++{
++    g_free(ESP32_MACHINE(obj)->lora);
++    ESP32_MACHINE(obj)->lora = g_strdup(value);
++}
++
++static char *esp32_get_lora_pins(Object *obj, Error **errp)
++{
++    return g_strdup(ESP32_MACHINE(obj)->lora_pins);
++}
++
++static void esp32_set_lora_pins(Object *obj, const char *value, Error **errp)
++{
++    g_free(ESP32_MACHINE(obj)->lora_pins);
++    ESP32_MACHINE(obj)->lora_pins = g_strdup(value);
++}
++
+ static void esp32_machine_init(MachineState *machine)
+ {
+     BlockBackend* blk = NULL;
+@@ -845,6 +919,10 @@ static void esp32_machine_init(MachineState *machine)
+ 
+     esp32_machine_init_openeth(ss);
+ 
++    if (ms->lora) {
++        esp32_machine_init_lora(ms, ss);
++    }
++
+     esp32_machine_init_sd(ss);
+ 
+     /* Need MMU initialized prior to ELF loading,
+@@ -946,6 +1024,12 @@ static void esp32_machine_class_init(ObjectClass *oc, void *data)
+     mc->default_cpus = 2;
+     mc->default_ram_size = 0;
+     mc->fixup_ram_size = esp32_fixup_ram_size;
++    object_class_property_add_str(oc, "lora", esp32_get_lora, esp32_set_lora);
++    object_class_property_set_description(oc, "lora",
++        "a chardev for an SX1276 LoRa radio on VSPI, its air");
++    object_class_property_add_str(oc, "lora-pins", esp32_get_lora_pins, esp32_set_lora_pins);
++    object_class_property_set_description(oc, "lora-pins",
++        "the radio's NSS:NRESET:DIO0 GPIOs, 18:14:26 as on a Heltec");
+ }
+ 
+ static const TypeInfo esp32_info = {
+diff --git a/include/hw/gpio/esp32_gpio.h b/include/hw/gpio/esp32_gpio.h
+index 39d8733..7c16f0c 100644
+--- a/include/hw/gpio/esp32_gpio.h
++++ b/include/hw/gpio/esp32_gpio.h
+@@ -41,6 +41,13 @@ typedef struct Esp32GpioState {
+     uint32_t enable_w1tc_off;
+     uint32_t in_off;        /* GPIO_IN_REG offset */
+ 
++    /* Pins 0-31 to and from devices on the board: "out" follows a pin's
++     * output, "in" drives a pin from outside where it is no output. */
++    qemu_irq out[32];
++    uint32_t out_seen;      /* the levels "out" last gave */
++    uint32_t in_driven;     /* pins an "in" line has driven */
++    uint32_t in_level;
++
+     /* IO_MUX state */
+     uint32_t iomux_regs[ESP_GPIO_MAX_PINS];
+     uint32_t num_gpios;

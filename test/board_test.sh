@@ -216,6 +216,58 @@ else
 	printf 'board: no ESP32 tried: no clang, lld, llvm-mc and llvm-objcopy\n'
 fi
 
+# Two Heltec WiFi LoRa 32s by radio, on Espressif's qemu built with hull's
+# SX1276 (make esp-qemu-lora, LORA_QEMU) and firmware by Espressif's GCC
+# (LORA_FW): the first sends "ping", the second answers "pong", each
+# saying what it heard. A TTGO LoRa32 is the second, wired alike. Then a
+# radio on a board without one refused at plan, and one with no such qemu
+# refused at its start.
+if [ -n "${LORA_FW:-}" ] && [ -n "${LORA_QEMU:-}" ] && [ -n "${esp:-}" ] && [ -L "$root/cache/hull/${esp##*/}" ]; then
+	cp "$LORA_FW/lora-first.flash" "$root/la.fw"
+	cp "$LORA_FW/lora-second.flash" "$root/lb.fw"
+	printf '(machines\n  (la (backend pc) (source "image:./la.fw") (tuning (pc (machine heltec-wifi-lora-32) (lora "field"))))\n  (lb (backend pc) (source "image:./lb.fw") (tuning (pc (machine ttgo-lora32) (lora "field")))))\n' \
+		> "$root/lora.conf"
+	# A core of its own: the machines are the core's, and it keeps the
+	# environment it was started with, which names the qemu.
+	mkdir -p "$root/run-lora"
+	chmod 700 "$root/run-lora"
+	(cd "$root" && XDG_RUNTIME_DIR=$root/run-lora HULL_ESP_LORA_QEMU=$LORA_QEMU \
+		exec timeout -k 2 60 "$hull" run -f "$root/lora.conf" > "$root/lora.out" 2>&1) &
+	runner=$!
+	tries=0
+	until grep -q 'la | got pong' "$root/lora.out" 2> /dev/null || [ "$tries" -ge 60 ]; do
+		tries=$((tries + 1))
+		sleep 0.5
+	done
+	XDG_RUNTIME_DIR=$root/run-lora timeout 30 "$hull" stop la > /dev/null 2>&1
+	XDG_RUNTIME_DIR=$root/run-lora timeout 30 "$hull" stop lb > /dev/null 2>&1
+	wait "$runner"
+	cases=$((cases + 1))
+	grep -q 'la | radio 12' "$root/lora.out" && grep -q 'lb | radio 12' "$root/lora.out" ||
+		fail "a Heltec's firmware did not read its SX1276" "$(cat "$root/lora.out")"
+	cases=$((cases + 1))
+	grep -q 'lb | got ping' "$root/lora.out" ||
+		fail "the TTGO LoRa32 did not hear the Heltec's ping" "$(cat "$root/lora.out")"
+	cases=$((cases + 1))
+	grep -q 'la | got pong' "$root/lora.out" ||
+		fail "the Heltec did not hear the TTGO's pong" "$(cat "$root/lora.out")"
+	printf '(machine (backend pc) (source "image:./la.fw") (tuning (pc (machine heltec-wifi-lora-32) (lora "field"))))\n' \
+		> "$root/noqemu.conf"
+	cases=$((cases + 1))
+	out=$(cd "$root" && timeout 30 "$hull" run -f "$root/noqemu.conf" 2>&1)
+	printf '%s\n' "$out" | grep -q 'make esp-qemu-lora' ||
+		fail "a radio with no qemu built for it was not refused naming the build" "$out"
+else
+	printf 'board: no LoRa tried: no xtensa-esp32-elf-gcc, no make esp-qemu-lora, or no ESP32 fetched\n'
+fi
+printf '(machine (backend pc) (source "image:none.fw") (tuning (pc (machine esp32c3) (lora "field"))))\n' \
+	> "$root/noradio.conf"
+: > "$root/none.fw"
+cases=$((cases + 1))
+out=$(cd "$root" && timeout 30 "$hull" run -f "$root/noradio.conf" 2>&1)
+printf '%s\n' "$out" | grep -q 'a LoRa radio is on' ||
+	fail "a radio on a board without one was not refused" "$out"
+
 # What a board does not have, refused at its start: a network and drives.
 printf '(machine (source "image:none.fw") (backend pc) (network nat) (tuning (pc (machine arduino-uno))))\n' \
 	> "$root/net.conf"

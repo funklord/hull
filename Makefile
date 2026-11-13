@@ -257,6 +257,16 @@ BOARD_ARM  := $(if $(and $(shell command -v $(BOARD_ARM_CC) 2>/dev/null),$(BOARD
 BOARD_8051 := $(if $(shell command -v $(SDCC) 2>/dev/null),$(BUILD_DIR)/test/board-fw/echo_8051.ihx)
 LM3S_NETS   = nat wire-a wire-b
 BOARD_LM3S := $(if $(BOARD_ARM),$(foreach b,lm3s mps2,$(foreach w,$(LM3S_NETS),$(BUILD_DIR)/test/board-fw/$(b)-net-$(w).elf)))
+# Two Heltec WiFi LoRa 32s talking by radio: firmware by Espressif's GCC
+# where it is installed, on Espressif's qemu built with hull's SX1276 by
+# `make esp-qemu-lora`, which fetches its source at the release hull pins.
+BOARD_XTENSA_CC  ?= xtensa-esp32-elf-gcc
+BOARD_XTENSA_BIN  = $(patsubst %-gcc,%,$(BOARD_XTENSA_CC))
+BOARD_LORA := $(if $(shell command -v $(BOARD_XTENSA_CC) 2>/dev/null),$(foreach r,first second,$(BUILD_DIR)/test/board-fw/lora-$(r).flash))
+ESP_QEMU_TAG    = esp-develop-9.2.2-20261109
+ESP_QEMU_COMMIT = 7411393a2f61e6f0b05af00276d30780769e0839
+ESP_QEMU_LORA   = $(BUILD_DIR)/esp-qemu-lora/build/qemu-system-xtensa
+ESP_QEMU_JOBS  ?= 8
 # Espressif's chips: each NAME:LOAD:CHIP-ID:BOOT-OFFSET:UART0, the RISC-V
 # ones by clang and lld, the Xtensa ones by llvm-mc, into flash images by
 # test/board/esp_image.py; run on Espressif's qemu where `hull esp fetch`
@@ -284,7 +294,8 @@ BOARD_TEST_FILES = $(addprefix $(BUILD_DIR)/test/board-fw/, echo_avr.elf echo_st
                    echo_8051.ihx echo_8051.rel echo_8051.lk echo_8051.map echo_8051.mem \
                    echo_8051.lst echo_8051.rst echo_8051.sym echo_8051.asm \
                    $(foreach n,$(ESP_ALL),$(n).flash $(n).o $(n).elf $(n).bin $(n).s) \
-                   $(foreach b,lm3s mps2,$(foreach w,$(LM3S_NETS),$(b)-net-$(w).elf $(b)-net-$(w).o)))
+                   $(foreach b,lm3s mps2,$(foreach w,$(LM3S_NETS),$(b)-net-$(w).elf $(b)-net-$(w).o)) \
+                   $(foreach r,first second,lora-$(r).flash lora-$(r).elf lora-$(r).text lora-$(r).data))
 # What check-fuzz writes, but for what it finds, in $(FUZZ_DIR)/found,
 # which is kept: a crash's input is what reproduces it.
 FUZZ_FILES = $(addprefix $(BUILD_DIR)/fuzz/, json_fuzz unpack_fuzz pack_fuzz corpus/json/manifest \
@@ -393,6 +404,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
+.PHONY: esp-qemu-lora
 .PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-arm64-host check-riscv64-host check-root check-systemd check-vfio check-usb check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
@@ -513,6 +525,7 @@ help:
 	@echo '  check-vfio    a PCI device by VFIO, to chroot and a nested vm, inside a vm with an IOMMU'
 	@echo '  check-usb     a USB device followed by chroot as it re-enumerates, inside a vm'
 	@echo '  check-board   microcontroller boards (Uno, STM32, 8051, ESP32s) booted from firmware as pc machines'
+	@echo '  esp-qemu-lora Espressif'"'"'s qemu with hull'"'"'s SX1276, for a board'"'"'s LoRa radio (fetches its source)'
 	@echo '  check-sanitize  the unit tests, store and pull under ASan and UBSan'
 	@echo '  check-fuzz    libFuzzer over the JSON and layer readers, FUZZ_TIME s each'
 	@echo '  check-gui     hull-gui as text, and its requests, against a core of its own'
@@ -1069,8 +1082,10 @@ check-usb: $(HULL) $(AGENT_BIN) $(PROBE)
 # Microcontroller boards as pc machines: firmware of test/board's, run on
 # qemu's Uno and STM32VLDISCOVERY, SDCC's s51 and Espressif's qemu's
 # ESP32s, no KVM.
-check-board: $(HULL) $(BOARD_AVR) $(BOARD_ARM) $(BOARD_8051) $(BOARD_ESP) $(BOARD_LM3S)
+check-board: $(HULL) $(BOARD_AVR) $(BOARD_ARM) $(BOARD_8051) $(BOARD_ESP) $(BOARD_LM3S) $(BOARD_LORA)
 	BUILD_DIR='$(BUILD_DIR)' LM3S_NET='$(if $(BOARD_LM3S),$(BUILD_DIR)/test/board-fw)' \
+		LORA_FW='$(if $(BOARD_LORA),$(BUILD_DIR)/test/board-fw)' \
+		LORA_QEMU='$(if $(wildcard $(ESP_QEMU_LORA)),$(abspath $(ESP_QEMU_LORA)))' \
 		sh test/board_test.sh '$(HULL)' '$(BOARD_AVR)' '$(BOARD_ARM)' \
 		'$(BOARD_8051)' $(strip $(BOARD_ESP))
 
@@ -1107,6 +1122,40 @@ $$(BUILD_DIR)/test/board-fw/$(1).flash: test/board/echo_esp_xt.S test/board/esp_
 	$$(BOARD_OBJCOPY) -O binary -j .text $$(@D)/$(1).o $$(@D)/$(1).bin
 	$$(PYTHON) test/board/esp_image.py $$(@D)/$(1).bin $(2) $(3) $(4) $$@
 endef
+# A Heltec's LoRa firmware, FIRST sending the ping, by Espressif's GCC: its
+# code in IRAM, its constants in DRAM, entered at start.
+$(BUILD_DIR)/test/board-fw/lora-%.flash: test/board/lora_esp32.c test/board/esp32_ram.ld test/board/esp_image.py
+	@mkdir -p '$(@D)'
+	$(BOARD_XTENSA_CC) -Os -Wall -Wextra -ffreestanding -nostdlib -nostartfiles -fno-builtin \
+		$(if $(filter first,$*),-DFIRST) -T test/board/esp32_ram.ld -o $(@D)/lora-$*.elf $<
+	$(BOARD_XTENSA_BIN)-objcopy -O binary -j .text $(@D)/lora-$*.elf $(@D)/lora-$*.text
+	$(BOARD_XTENSA_BIN)-objcopy -O binary -j .data $(@D)/lora-$*.elf $(@D)/lora-$*.data
+	$(PYTHON) test/board/esp_image.py $(@D)/lora-$*.text 0x40080400 0 0x1000 $@ \
+		0x$$($(BOARD_XTENSA_BIN)-nm $(@D)/lora-$*.elf | awk '$$3 == "start" { print $$1 }') \
+		$(@D)/lora-$*.data 0x3ffb0000
+
+# Espressif's qemu with hull's SX1276 (engine/esp-lora.patch), for a
+# board's (tuning (pc (lora NAME))): its source at the tag hull's fetch
+# pins, the commit checked, patched and built for xtensa alone, into
+# $(BUILD_DIR)/esp-qemu-lora, where HULL_ESP_LORA_QEMU names it. Not part
+# of any other target: it fetches the source, about 200 MB, and builds
+# for some minutes.
+esp-qemu-lora: $(ESP_QEMU_LORA)
+
+$(ESP_QEMU_LORA): engine/esp-lora.patch
+	@mkdir -p '$(BUILD_DIR)/esp-qemu-lora'
+	test -d '$(BUILD_DIR)/esp-qemu-lora/src' || git clone -q --depth 1 --branch $(ESP_QEMU_TAG) \
+		https://github.com/espressif/qemu.git '$(BUILD_DIR)/esp-qemu-lora/src'
+	test "$$(git -C '$(BUILD_DIR)/esp-qemu-lora/src' rev-parse HEAD)" = $(ESP_QEMU_COMMIT)
+	git -C '$(BUILD_DIR)/esp-qemu-lora/src' checkout -q -- .
+	git -C '$(BUILD_DIR)/esp-qemu-lora/src' clean -q -f -- hw/misc/sx127x.c
+	git -C '$(BUILD_DIR)/esp-qemu-lora/src' apply '$(abspath engine/esp-lora.patch)'
+	mkdir -p '$(BUILD_DIR)/esp-qemu-lora/build'
+	cd '$(BUILD_DIR)/esp-qemu-lora/build' && test -f build.ninja || ../src/configure \
+		--target-list=xtensa-softmmu --without-default-features --enable-slirp \
+		--enable-gcrypt --disable-werror --disable-docs > configure.log
+	ninja -C '$(BUILD_DIR)/esp-qemu-lora/build' -j $(ESP_QEMU_JOBS) qemu-system-xtensa
+
 # The LM3S6965's and the MPS2 AN385's network firmware, as the
 # ESP32-C3's: NAT and a wire. BOARD, then NAT or WIRE-END.
 define lm3s_net_rule
