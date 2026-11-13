@@ -25,6 +25,16 @@ export XDG_RUNTIME_DIR
 XDG_DATA_HOME=$(cd "${BUILD_DIR:?}" && pwd)/test/qemu/data
 export XDG_DATA_HOME
 export HULL_CORE_IDLE=1
+# A BUILD_DIR another account has run this suite in holds its files, which
+# this user can neither clear nor write: a case's run directory left by
+# them failed later as "the core did not start", an hour to trace
+# (2026-11-13). Said at once instead.
+if [ -d "$dir" ] && other=$(find "$dir" "$XDG_RUNTIME_DIR" ! -user "$(id -u)" -print -quit 2> /dev/null) &&
+   [ -n "$other" ]; then
+	printf 'qemu: %s is not this user'"'"'s, left by another account'"'"'s run: use a BUILD_DIR of your own\n' \
+		"$other"
+	exit 1
+fi
 mkdir -p "$XDG_RUNTIME_DIR" "$dir/rootfs/proc" "$dir/rootfs/dev" "$dir/rootfs/sys" \
 	"$dir/rootfs/srv" "$dir/rootfs/etc" "$dir/rootfs/scratch" "$dir/data"
 chmod 700 "$XDG_RUNTIME_DIR"
