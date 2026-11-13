@@ -276,6 +276,11 @@ struct pools_ask {
 struct claim_ask {
 	preamble u8[7] = "5:claim";
 	channel  ch;
+	peek u32  after_ch;
+	variant machine_arch switch (after_ch) {
+		case ARCH_ENTRY:  arch_entry  has_arch;
+		default:          absent      no_arch;
+	}
 	preamble u8[5] = "(2:id";
 	atom  id;
 	preamble u8[8] = ")(4:kind";

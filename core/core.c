@@ -4941,9 +4941,12 @@ static void unheld_back(const client *c)
  * run under it, K board or slot, answered with it and the seconds left. */
 static void handle_claim(client *c, uint32_t ch, const hull_sexpr_doc *body)
 {
+	static hull_pool p;
+	const hull_pool *pool = NULL;
 	hull_sexpr_form value;
 	char            id[24];
 	char            kind[8];
+	char            arch[72] = "";
 	lease          *l;
 	hull_msg        m = { 0 };
 	const char     *member = NULL;
@@ -4956,20 +4959,36 @@ static void handle_claim(client *c, uint32_t ch, const hull_sexpr_doc *body)
 		return;
 	}
 	board = strcmp(kind, "board") == 0;
-	for (unsigned i = 0u; i < l->held_count && member == NULL; i++)
-		if (l->held[i].board == board && !l->claimed[i]) {
+	/* A run's arch, where it says one: a held board of it, a board's
+	 * (arch ...) being what machines it runs (section 4.12). */
+	if (hull_msg_find(body, "arch", &value) &&
+	    (!hull_msg_string(body, &value, arch, sizeof arch) || strpbrk(arch, " \t\r\n,") != NULL)) {
+		send_error(c, ch, "a claim's arch is one word");
+		return;
+	}
+	if (board && arch[0] != '\0' && hull_pool_read(l->pool, &p) == 0)
+		pool = &p;
+	for (unsigned i = 0u; i < l->held_count && member == NULL; i++) {
+		const hull_member *held = pool != NULL ? member_of(pool, l->held[i].name) : NULL;
+
+		if (l->held[i].board == board && !l->claimed[i] &&
+		    (held == NULL || member_fits(held, WANT_BOARD, arch))) {
 			l->claimed[i] = 1;
 			member = l->held[i].name;
 		}
+	}
 	if (member == NULL && !board && l->unnamed_claimed < l->count - l->held_count) {
 		l->unnamed_claimed++;
 		member = "";
 	}
 	if (member == NULL) {
-		char why[120];
+		char why[200];
 
-		snprintf(why, sizeof why, "lease %s holds no %s free", l->id,
-		         board ? "board" : "slot for a software machine");
+		if (pool != NULL)
+			snprintf(why, sizeof why, "lease %s holds no board of arch %s free", l->id, arch);
+		else
+			snprintf(why, sizeof why, "lease %s holds no %s free", l->id,
+			         board ? "board" : "slot for a software machine");
 		send_error(c, ch, why);
 		return;
 	}

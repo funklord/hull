@@ -234,6 +234,14 @@ grep -q '^ready$' "$root/board.out" || fail 'a run on a broker board did not run
 conf onrv '(backend hw) (pool "bench") (arch riscv64) (command "/probe" "say" "never")'
 [ "$host_arch" = riscv64 ] ||
 	as alice 125 'pool bench has no board of arch riscv64' run --no-wait -f "$root/project/onrv.conf"
+# And a run under a lease of a board says its arch in its claim: a lease
+# of the host's board gives a riscv64 run nothing.
+if [ "$host_arch" != riscv64 ]; then
+	held=$(run_as alice timeout 30 "$hull" reserve bench --kind board < /dev/null 2> /dev/null)
+	as alice 125 "lease $held holds no board of arch riscv64 free" run --lease "$held" \
+		-f "$root/project/onrv.conf"
+	run_as alice timeout 20 "$hull" release "$held" < /dev/null > /dev/null 2>&1
+fi
 n=0
 until run_as alice timeout 30 "$hull" pool ls < /dev/null | grep -q '^bench  *4  *0 ' || [ "$n" -ge 40 ]; do
 	n=$((n + 1))

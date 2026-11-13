@@ -5456,6 +5456,7 @@ static int add_broker(hull_plan *plan, const char *pool, const hull_pool *given,
 	hull_msg        entry = { 0 };
 	char            id[64] = "";
 	char            member[64] = "";
+	char            arch[72] = "";
 	long long       left = 0;
 	long long       memory = 0;
 	long long       cpus = 0;
@@ -5471,9 +5472,29 @@ static int add_broker(hull_plan *plan, const char *pool, const hull_pool *given,
 			cpus = strtoll(text, NULL, 10);
 		free(text);
 	}
+	/* A board's run says its machine's arch, its (arch ...) or the host's,
+	 * which a board saying one must be (section 4.12). */
+	if (board) {
+		char          *given = NULL;
+		struct utsname host;
+
+		if (hull_access_machine(&doc, plan->canonical, plan->canonical_length, &machine))
+			given = hull_access_value(&doc, &machine, "arch");
+		snprintf(arch, sizeof arch, "%s",
+		         given != NULL && strcmp(given, "host") != 0 ? given :
+		         uname(&host) != 0 ? "" :
+		         strcmp(host.machine, "x86_64") == 0 ? "amd64" :
+		         strcmp(host.machine, "aarch64") == 0 ? "arm64" : host.machine);
+		free(given);
+	}
 	if (o->lease != NULL) {
 		hull_msg_raw(&m, "(5:claim");
 		hull_msg_channel(&m, 1u);
+		if (arch[0] != '\0') {
+			hull_msg_raw(&m, "(4:arch");
+			hull_msg_text(&m, arch);
+			hull_msg_raw(&m, ")");
+		}
 		hull_msg_raw(&m, "(2:id");
 		hull_msg_text(&m, o->lease);
 		hull_msg_raw(&m, ")(4:kind");
@@ -5482,23 +5503,10 @@ static int add_broker(hull_plan *plan, const char *pool, const hull_pool *given,
 	} else {
 		hull_msg_raw(&m, "(5:lease");
 		hull_msg_channel(&m, 1u);
-		/* A board's run says its machine's arch, its (arch ...) or the
-		 * host's, which a board saying one must be. */
-		if (board) {
-			char          *arch = NULL;
-			struct utsname host;
-
-			if (hull_access_machine(&doc, plan->canonical, plan->canonical_length, &machine))
-				arch = hull_access_value(&doc, &machine, "arch");
+		if (arch[0] != '\0') {
 			hull_msg_raw(&m, "(4:arch");
-			if (arch != NULL && strcmp(arch, "host") != 0)
-				hull_msg_text(&m, arch);
-			else
-				hull_msg_text(&m, uname(&host) != 0 ? "" :
-				                  strcmp(host.machine, "x86_64") == 0 ? "amd64" :
-				                  strcmp(host.machine, "aarch64") == 0 ? "arm64" : host.machine);
+			hull_msg_text(&m, arch);
 			hull_msg_raw(&m, ")");
-			free(arch);
 		}
 		hull_msg_raw(&m, "(5:count1:1)(4:cpus");
 		hull_msg_number(&m, cpus);
