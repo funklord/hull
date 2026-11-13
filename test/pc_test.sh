@@ -186,6 +186,24 @@ run
 status 'a collection changed by a byte is refused' "$got" 125 "$out"
 cp "$root/quirk.saved" "$first"
 
+# Two machines, each with a collection of its own, started from one file:
+# each reassembles its disk on its own thread, and media.c's copies went
+# through static buffers, so the two wrote through each other's and both
+# disks failed their hash -- every time, with 8 MiB of data each. Random
+# bytes past the boot sectors, as zeros are a hole the copy passes over.
+image 16M "$root/pair.img"
+head -c 8M /dev/urandom | dd of="$root/pair.img" bs=1M seek=1 conv=notrunc status=none
+"$hull" media import "$root/pair.img" "$root/pa" > /dev/null 2>&1
+"$hull" media import "$root/pair.img" "$root/pb" > /dev/null 2>&1
+printf '(machines\n  (pa (backend pc) (source "media:disk") (media (medium (type disk) (source "dir:./pa"))))\n  (pb (backend pc) (source "media:disk") (media (medium (type disk) (source "dir:./pb")))))\n' \
+	> "$root/pair.conf"
+out=$(timeout 120 "$hull" run -f "$root/pair.conf" 2>&1)
+got=$?
+status 'two machines with collections start together' "$got" 0 "$out"
+cases=$((cases + 1))
+[ "$(printf '%s\n' "$out" | grep -c 'word: fresh')" = 2 ] ||
+	fail 'and both boot their disks' "$out"
+
 # --- a disc installs, and the disk boots, by one line ------------------------
 
 python3 -I "$here/pc_disc.py" "$root/setup.iso" "$root/boot.bin"

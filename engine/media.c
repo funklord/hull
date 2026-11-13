@@ -15,6 +15,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <ftw.h>
 #include <inttypes.h>
@@ -1794,7 +1795,7 @@ static int apply_raw_quirks(const char *dir, int fd, uint64_t bytes, char *detai
 	return status;
 }
 
-int hull_media_write_raw(const char *dir, int fd, char *detail, size_t cap)
+static int media_write_raw_locked(const char *dir, int fd, char *detail, size_t cap)
 {
 	raw_disc *disc = malloc(sizeof *disc);
 	char      path[4300];
@@ -1850,7 +1851,7 @@ int hull_media_exact(const char *dir)
 	return access(path, R_OK) == 0;
 }
 
-int hull_media_write(const char *dir, int fd, char *detail, size_t cap)
+static int media_write_locked(const char *dir, int fd, char *detail, size_t cap)
 {
 	uint64_t bytes;
 	unsigned unit;
@@ -1875,7 +1876,7 @@ int hull_media_write(const char *dir, int fd, char *detail, size_t cap)
 	return 0;
 }
 
-int hull_media_export(const char *dir, const char *out, char *detail, size_t cap)
+static int media_export_locked(const char *dir, const char *out, char *detail, size_t cap)
 {
 	raw_disc *disc = malloc(sizeof *disc);
 	int       kind = -1;
@@ -2412,8 +2413,8 @@ done:
 	return status;
 }
 
-int hull_media_import(const char *image, const char *dir, hull_media_report *report, char *detail,
-                      size_t cap)
+static int media_import_locked(const char *image, const char *dir, hull_media_report *report,
+                               char *detail, size_t cap)
 {
 	size_t      length = strlen(image);
 	walk       *w;
@@ -2454,5 +2455,55 @@ done:
 		free(w->files[i].path);
 	free(w->files);
 	free(w);
+	return status;
+}
+
+/*
+ * The public calls, one at a time: their copies go through static buffers
+ * of a MiB each, and a pc machine reassembles its collections on its own
+ * thread, so two machines starting together wrote through each other's
+ * buffers. Recursive, as a raw dump's write and an export call the
+ * plain write within.
+ */
+static pthread_mutex_t media_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+
+int hull_media_write(const char *dir, int fd, char *detail, size_t cap)
+{
+	int status;
+
+	pthread_mutex_lock(&media_lock);
+	status = media_write_locked(dir, fd, detail, cap);
+	pthread_mutex_unlock(&media_lock);
+	return status;
+}
+
+int hull_media_write_raw(const char *dir, int fd, char *detail, size_t cap)
+{
+	int status;
+
+	pthread_mutex_lock(&media_lock);
+	status = media_write_raw_locked(dir, fd, detail, cap);
+	pthread_mutex_unlock(&media_lock);
+	return status;
+}
+
+int hull_media_export(const char *dir, const char *out, char *detail, size_t cap)
+{
+	int status;
+
+	pthread_mutex_lock(&media_lock);
+	status = media_export_locked(dir, out, detail, cap);
+	pthread_mutex_unlock(&media_lock);
+	return status;
+}
+
+int hull_media_import(const char *image, const char *dir, hull_media_report *report, char *detail,
+                      size_t cap)
+{
+	int status;
+
+	pthread_mutex_lock(&media_lock);
+	status = media_import_locked(image, dir, report, detail, cap);
+	pthread_mutex_unlock(&media_lock);
 	return status;
 }
