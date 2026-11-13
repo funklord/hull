@@ -1,8 +1,40 @@
 diff --git a/hw/gpio/esp32_gpio.c b/hw/gpio/esp32_gpio.c
-index 5e25782..2b2496b 100644
+index 5e25782..5c2f15a 100644
 --- a/hw/gpio/esp32_gpio.c
 +++ b/hw/gpio/esp32_gpio.c
-@@ -35,12 +35,40 @@ static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
+@@ -21,6 +21,20 @@
+ 
+ 
+ 
++/* The pins enabled for a CPU, bit 13 of a pin's register the APP CPU's,
++ * bit 15 the PRO CPU's. */
++static uint32_t esp32_gpio_enabled(Esp32GpioState *s, uint32_t bit)
++{
++    uint32_t mask = 0;
++
++    for (int pin = 0; pin < 32; pin++) {
++        if (s->pin_regs[pin] & bit) {
++            mask |= 1u << pin;
++        }
++    }
++    return mask;
++}
++
+ static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
+ {
+     Esp32GpioState *s = ESP32_GPIO(opaque);
+@@ -32,15 +46,76 @@ static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
+         r = s->gpio_out;
+     } else if (s->enable_off && addr == s->enable_off) {
+         r = s->gpio_enable;
++    } else if (s->status_off && addr == s->status_off) {
++        r = s->status;
++    } else if (s->acpu_int_off && addr == s->acpu_int_off) {
++        r = s->status & esp32_gpio_enabled(s, 1u << 13);
++    } else if (s->pcpu_int_off && addr == s->pcpu_int_off) {
++        r = s->status & esp32_gpio_enabled(s, 1u << 15);
++    } else if (s->pin_off && addr >= s->pin_off && addr < s->pin_off + 4 * ESP_GPIO_MAX_PINS) {
++        r = s->pin_regs[(addr - s->pin_off) / 4];
      } else if (s->in_off && addr == s->in_off) {
          /* Output-enabled pins loop back; undriven pins reflect pull-up state */
          r = (s->gpio_out & s->gpio_enable) |
@@ -29,9 +61,30 @@ index 5e25782..2b2496b 100644
 +    }
 +}
 +
++/* A level interrupt's status held while its level is; the line to the
++ * interrupt matrix up while either CPU has a pin of its own set. */
++static void esp32_gpio_update_irq(Esp32GpioState *s)
++{
++    if (!s->pin_off) {
++        return;
++    }
++    for (int pin = 0; pin < 32; pin++) {
++        unsigned type = (s->pin_regs[pin] >> 7) & 7;
++        int level = (s->in_level >> pin) & 1;
++
++        if ((s->in_driven & (1u << pin)) && ((type == 4 && !level) || (type == 5 && level))) {
++            s->status |= 1u << pin;
++        }
++    }
++    qemu_set_irq(s->irq, (s->status & (esp32_gpio_enabled(s, 1u << 13) |
++                                       esp32_gpio_enabled(s, 1u << 15))) != 0);
++}
++
 +static void esp32_gpio_in(void *opaque, int pin, int level)
 +{
 +    Esp32GpioState *s = ESP32_GPIO(opaque);
++    int before = (s->in_level >> pin) & 1;
++    unsigned type = (s->pin_regs[pin] >> 7) & 7;
 +
 +    s->in_driven |= 1u << pin;
 +    if (level) {
@@ -39,20 +92,34 @@ index 5e25782..2b2496b 100644
 +    } else {
 +        s->in_level &= ~(1u << pin);
 +    }
++    if (level != before && ((type == 1 && level) || (type == 2 && !level) || type == 3)) {
++        s->status |= 1u << pin;
++    }
++    esp32_gpio_update_irq(s);
 +}
 +
  static void esp32_gpio_write(void *opaque, hwaddr addr,
                         uint64_t value, unsigned int size)
  {
-@@ -59,6 +87,7 @@ static void esp32_gpio_write(void *opaque, hwaddr addr,
+@@ -58,7 +133,17 @@ static void esp32_gpio_write(void *opaque, hwaddr addr,
+         s->gpio_enable |= (uint32_t)value;
      } else if (s->enable_w1tc_off && addr == s->enable_w1tc_off) {
          s->gpio_enable &= ~(uint32_t)value;
++    } else if (s->status_off && addr == s->status_off) {
++        s->status = (uint32_t)value;
++    } else if (s->status_w1ts_off && addr == s->status_w1ts_off) {
++        s->status |= (uint32_t)value;
++    } else if (s->status_w1tc_off && addr == s->status_w1tc_off) {
++        s->status &= ~(uint32_t)value;
++    } else if (s->pin_off && addr >= s->pin_off && addr < s->pin_off + 4 * ESP_GPIO_MAX_PINS) {
++        s->pin_regs[(addr - s->pin_off) / 4] = (uint32_t)value;
      }
 +    esp32_gpio_update_out(s);
++    esp32_gpio_update_irq(s);
  }
  
  static const MemoryRegionOps gpio_ops = {
-@@ -124,6 +153,9 @@ static void esp32_gpio_init(Object *obj)
+@@ -124,6 +209,9 @@ static void esp32_gpio_init(Object *obj)
      sysbus_init_mmio(sbd, &s->iomux);
  
      sysbus_init_irq(sbd, &s->irq);
@@ -574,7 +641,7 @@ index 65ca666..5f24133 100644
          }
      }
 diff --git a/hw/xtensa/esp32.c b/hw/xtensa/esp32.c
-index c3cf32e..2a007f9 100644
+index c3cf32e..eb6b45c 100644
 --- a/hw/xtensa/esp32.c
 +++ b/hw/xtensa/esp32.c
 @@ -26,6 +26,9 @@
@@ -587,7 +654,7 @@ index c3cf32e..2a007f9 100644
  #include "hw/sd/dwc_sdmmc.h"
  #include "core-esp32/core-isa.h"
  #include "qemu/datadir.h"
-@@ -421,6 +424,16 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
+@@ -421,8 +424,28 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                      qdev_get_gpio_in_named(dev, ESP32_RTC_CPU_STALL_GPIO, i));
      }
  
@@ -601,10 +668,22 @@ index c3cf32e..2a007f9 100644
 +    s->gpio.enable_w1ts_off = 0x24;
 +    s->gpio.enable_w1tc_off = 0x28;
 +    s->gpio.in_off = 0x3c;
++    /* And its interrupts: STATUS, its W1TS and W1TC, the APP and PRO
++     * CPUs' views, each pin's register, and the matrix's GPIO source. */
++    s->gpio.status_off = 0x44;
++    s->gpio.status_w1ts_off = 0x48;
++    s->gpio.status_w1tc_off = 0x4c;
++    s->gpio.acpu_int_off = 0x60;
++    s->gpio.pcpu_int_off = 0x68;
++    s->gpio.pin_off = 0x88;
      qdev_realize(DEVICE(&s->gpio), &s->periph_bus, &error_fatal);
      esp32_soc_add_periph_device(sys_mem, &s->gpio, DR_REG_GPIO_BASE);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), 0,
++                       qdev_get_gpio_in(intmatrix_dev, ETS_GPIO_INTR_SOURCE));
  
-@@ -710,6 +723,8 @@ struct Esp32MachineState {
+     for (int i = 0; i < ESP32_UART_COUNT; ++i) {
+         const hwaddr uart_base[] = {DR_REG_UART_BASE, DR_REG_UART1_BASE, DR_REG_UART2_BASE};
+@@ -710,6 +733,8 @@ struct Esp32MachineState {
  
      Esp32SocState esp32;
      DeviceState *flash_dev;
@@ -613,7 +692,7 @@ index c3cf32e..2a007f9 100644
  };
  #define TYPE_ESP32_MACHINE MACHINE_TYPE_NAME("esp32")
  
-@@ -806,6 +821,65 @@ static void esp32_machine_init_sd(Esp32SocState *ss)
+@@ -806,6 +831,65 @@ static void esp32_machine_init_sd(Esp32SocState *ss)
      }
  }
  
@@ -679,7 +758,7 @@ index c3cf32e..2a007f9 100644
  static void esp32_machine_init(MachineState *machine)
  {
      BlockBackend* blk = NULL;
-@@ -845,6 +919,10 @@ static void esp32_machine_init(MachineState *machine)
+@@ -845,6 +929,10 @@ static void esp32_machine_init(MachineState *machine)
  
      esp32_machine_init_openeth(ss);
  
@@ -690,7 +769,7 @@ index c3cf32e..2a007f9 100644
      esp32_machine_init_sd(ss);
  
      /* Need MMU initialized prior to ELF loading,
-@@ -946,6 +1024,12 @@ static void esp32_machine_class_init(ObjectClass *oc, void *data)
+@@ -946,6 +1034,12 @@ static void esp32_machine_class_init(ObjectClass *oc, void *data)
      mc->default_cpus = 2;
      mc->default_ram_size = 0;
      mc->fixup_ram_size = esp32_fixup_ram_size;
@@ -704,10 +783,10 @@ index c3cf32e..2a007f9 100644
  
  static const TypeInfo esp32_info = {
 diff --git a/include/hw/gpio/esp32_gpio.h b/include/hw/gpio/esp32_gpio.h
-index 39d8733..7c16f0c 100644
+index 39d8733..5158717 100644
 --- a/include/hw/gpio/esp32_gpio.h
 +++ b/include/hw/gpio/esp32_gpio.h
-@@ -41,6 +41,13 @@ typedef struct Esp32GpioState {
+@@ -41,6 +41,27 @@ typedef struct Esp32GpioState {
      uint32_t enable_w1tc_off;
      uint32_t in_off;        /* GPIO_IN_REG offset */
  
@@ -717,6 +796,20 @@ index 39d8733..7c16f0c 100644
 +    uint32_t out_seen;      /* the levels "out" last gave */
 +    uint32_t in_driven;     /* pins an "in" line has driven */
 +    uint32_t in_level;
++
++    /* Interrupts on pins 0-31 driven by "in" lines, where the chip's
++     * offsets are given: each pin's register (its type, 1 rising, 2
++     * falling, 3 either, 4 low, 5 high, bits 9:7, and its enable for the
++     * APP CPU, bit 13, and the PRO CPU, bit 15), and the status the edge
++     * or level sets, read per CPU as the pins it enables. */
++    uint32_t pin_regs[ESP_GPIO_MAX_PINS];
++    uint32_t status;
++    uint32_t pin_off;
++    uint32_t status_off;
++    uint32_t status_w1ts_off;
++    uint32_t status_w1tc_off;
++    uint32_t acpu_int_off;
++    uint32_t pcpu_int_off;
 +
      /* IO_MUX state */
      uint32_t iomux_regs[ESP_GPIO_MAX_PINS];

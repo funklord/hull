@@ -219,7 +219,7 @@ fi
 # Two Heltec WiFi LoRa 32s by radio, on Espressif's qemu built with hull's
 # SX1276 (make esp-qemu-lora, LORA_QEMU) and firmware by Espressif's GCC
 # (LORA_FW): the first sends "ping", the second answers "pong", each
-# saying what it heard. A TTGO LoRa32 is the second, wired alike. Then a
+# saying what it heard, the second hearing by DIO0's interrupt. A TTGO LoRa32 is the second, wired alike. Then a
 # radio on a board without one refused at plan, and one with no such qemu
 # refused at its start.
 if [ -n "${LORA_FW:-}" ] && [ -n "${LORA_QEMU:-}" ] && [ -n "${esp:-}" ] && [ -L "$root/cache/hull/${esp##*/}" ]; then
@@ -248,6 +248,9 @@ if [ -n "${LORA_FW:-}" ] && [ -n "${LORA_QEMU:-}" ] && [ -n "${esp:-}" ] && [ -L
 	cases=$((cases + 1))
 	grep -q 'lb | got ping' "$root/lora.out" ||
 		fail "the TTGO LoRa32 did not hear the Heltec's ping" "$(cat "$root/lora.out")"
+	cases=$((cases + 1))
+	grep -q 'lb | heard by interrupt' "$root/lora.out" ||
+		fail "the TTGO's DIO0 did not interrupt its CPU" "$(cat "$root/lora.out")"
 	cases=$((cases + 1))
 	grep -q 'la | got pong' "$root/lora.out" ||
 		fail "the Heltec did not hear the TTGO's pong" "$(cat "$root/lora.out")"

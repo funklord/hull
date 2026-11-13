@@ -5,7 +5,10 @@
  * It says "radio VERSION" once it has read the chip, then FIRST sends
  * "ping" and the other answers what it hears with "pong", each saying
  * "got PAYLOAD" for a packet heard. Bare: SPI by the controller's user
- * command, a byte at a time as Arduino's SPI does, and DIO0 polled.
+ * command, a byte at a time as Arduino's SPI does, and DIO0 polled -- or,
+ * built with IRQ, a packet waited for by DIO0's interrupt, GPIO 26 rising
+ * routed by the ROM's own calls to CPU interrupt 13, as an Arduino
+ * sketch's attachInterrupt() would; "heard by interrupt" the first time.
  */
 #include <stdint.h>
 
@@ -25,6 +28,18 @@
 #define SPI_MOSI    REG(SPI3 + 0x28u)
 #define SPI_MISO    REG(SPI3 + 0x2cu)
 #define SPI_W0      REG(SPI3 + 0x80u)
+
+#define GPIO_W1TC_STATUS REG(GPIO + 0x4cu)
+#define GPIO_PCPU_INT    REG(GPIO + 0x68u)
+#define GPIO_PIN26       REG(GPIO + 0x88u + 4u * 26u)
+
+/* The ESP32 ROM's interrupt calls, by their addresses in ESP-IDF's
+ * esp32.rom.ld. */
+#define ets_isr_attach  ((void (*)(int, void (*)(void *), void *))0x400067ecu)
+#define intr_matrix_set ((void (*)(int, unsigned, unsigned))0x4000681cu)
+#define xtos_ints_on    ((unsigned (*)(unsigned))0x4000bf88u)
+#define GPIO_SOURCE     22u   /* ETS_GPIO_INTR_SOURCE */
+#define CPU_INTERRUPT   13u   /* a level-1 interrupt the ROM leaves free */
 
 #define PIN_NSS   18u
 #define PIN_RESET 14u
@@ -54,6 +69,18 @@ static void pause(unsigned count)
 	for (volatile unsigned i = 0u; i < count; i++)
 		;
 }
+
+#ifdef IRQ
+static volatile unsigned fired;
+
+/* DIO0 rose: its status cleared, and counted. */
+static void dio0_rose(void *arg)
+{
+	(void)arg;
+	GPIO_W1TC_STATUS = GPIO_PCPU_INT;
+	fired++;
+}
+#endif
 
 static uint8_t spi(uint8_t value)
 {
@@ -110,6 +137,9 @@ void start(void)
 {
 	char     got[40];
 	unsigned length;
+#ifdef IRQ
+	int      by_interrupt = 0;
+#endif
 
 	/* By hand: an initialiser would call memset, and there is no libc. */
 	got[0] = 'g';
@@ -136,14 +166,31 @@ void start(void)
 	radio_write(0x1e, 0x74);                   /* SF7, CRC */
 	radio_write(0x40, 0x00);
 	radio_write(0x01, 0x85);
+#ifdef IRQ
+	GPIO_PIN26 = (1u << 7) | (4u << 13);   /* rising, for the PRO CPU */
+	ets_isr_attach((int)CPU_INTERRUPT, dio0_rose, 0);
+	intr_matrix_set(0, GPIO_SOURCE, CPU_INTERRUPT);
+	xtos_ints_on(1u << CPU_INTERRUPT);
+#endif
 	say("listening\r\n");
 #ifdef FIRST
 	pause(3000000u);
 	send("ping");
 #endif
 	for (;;) {
+#ifdef IRQ
+		if (fired == 0u)
+			continue;
+		fired = 0u;
+		if (!(radio_read(0x12) & 0x40u))   /* not RxDone */
+			continue;
+		if (!by_interrupt)
+			say("heard by interrupt\r\n");
+		by_interrupt = 1;
+#else
 		if (!(GPIO_IN & (1u << PIN_DIO0)))
 			continue;
+#endif
 		length = radio_read(0x13);
 		radio_write(0x0d, radio_read(0x10));
 		for (unsigned i = 0u; i < length && i < 32u; i++)

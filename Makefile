@@ -1122,12 +1122,13 @@ $$(BUILD_DIR)/test/board-fw/$(1).flash: test/board/echo_esp_xt.S test/board/esp_
 	$$(BOARD_OBJCOPY) -O binary -j .text $$(@D)/$(1).o $$(@D)/$(1).bin
 	$$(PYTHON) test/board/esp_image.py $$(@D)/$(1).bin $(2) $(3) $(4) $$@
 endef
-# A Heltec's LoRa firmware, FIRST sending the ping, by Espressif's GCC: its
-# code in IRAM, its constants in DRAM, entered at start.
+# A Heltec's LoRa firmware, FIRST sending the ping, the other hearing it by
+# DIO0's interrupt, by Espressif's GCC: its code in IRAM, its constants in
+# DRAM, entered at start.
 $(BUILD_DIR)/test/board-fw/lora-%.flash: test/board/lora_esp32.c test/board/esp32_ram.ld test/board/esp_image.py
 	@mkdir -p '$(@D)'
 	$(BOARD_XTENSA_CC) -Os -Wall -Wextra -ffreestanding -nostdlib -nostartfiles -fno-builtin \
-		$(if $(filter first,$*),-DFIRST) -T test/board/esp32_ram.ld -o $(@D)/lora-$*.elf $<
+		$(if $(filter first,$*),-DFIRST,-DIRQ) -T test/board/esp32_ram.ld -o $(@D)/lora-$*.elf $<
 	$(BOARD_XTENSA_BIN)-objcopy -O binary -j .text $(@D)/lora-$*.elf $(@D)/lora-$*.text
 	$(BOARD_XTENSA_BIN)-objcopy -O binary -j .data $(@D)/lora-$*.elf $(@D)/lora-$*.data
 	$(PYTHON) test/board/esp_image.py $(@D)/lora-$*.text 0x40080400 0 0x1000 $@ \

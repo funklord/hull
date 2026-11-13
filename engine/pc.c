@@ -2466,8 +2466,8 @@ static const hull_cap_entry entries[] = {
 	  "a TPM 2.0 in software, swtpm's, CRB on q35 and TIS on pc", NULL },
 	{ "pc.lora.path", HULL_SUP_EMULATED,
 	  "an SX1276 LoRa radio on a Heltec WiFi LoRa 32 or a TTGO LoRa32, on the named air with "
-	  "every other radio on it: no range, loss or collisions, its time on air kept; DIO0 read, "
-	  "not an interrupt; on Espressif's qemu built with hull's patch (make esp-qemu-lora)", NULL },
+	  "every other radio on it: no range, loss or collisions, its time on air kept, DIO0 read or "
+	  "interrupting; on Espressif's qemu built with hull's patch (make esp-qemu-lora)", NULL },
 	{ "pc.boot_key", HULL_SUP_NATIVE,
 	  "Enter pressed by qemu's monitor once a second for the seconds given, from the start", NULL },
 	{ "pc.state.path", HULL_SUP_NATIVE,
