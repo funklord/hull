@@ -144,6 +144,7 @@ struct hull_core {
 
 struct slot {
 	int              stop_ms;     /* a stop's grace where the caller names none */
+	unsigned         stops_live;  /* stop threads holding its handle, under stop_lock */
 	int                used;
 	unsigned           generation;  /* counts the machines this slot has held */
 	char               id[64];
@@ -900,7 +901,16 @@ typedef struct stop_job {
 	hull_machine      *handle;
 	int                timeout_ms;
 	char               root_hash[72];  /* root mode's, its stop recorded first */
+	slot              *slot;
 } stop_job;
+
+/* A stop runs on a thread of its own, holding the engine's handle, and the
+ * machine's end -- often that very stop's doing -- is the loop's, which
+ * destroys the handle: the loop waits for every stop thread of the slot to
+ * let go first. Without it ThreadSanitizer saw the handle freed under a
+ * stop still in the engine's stop, 2026-11-13. */
+static pthread_mutex_t stop_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  stop_done = PTHREAD_COND_INITIALIZER;
 
 static int root_helper(const char *op, const char *hash, char *const *fields, unsigned count,
                        char *why, size_t cap);
@@ -918,6 +928,10 @@ static void *run_stop(void *arg)
 	                                               sizeof why) != 0)
 		fprintf(stderr, "hull core: a root machine's stop was not recorded: %s\n", why);
 	job->engine->ops->stop(job->core, job->handle, job->timeout_ms, &error);
+	pthread_mutex_lock(&stop_lock);
+	job->slot->stops_live--;
+	pthread_cond_broadcast(&stop_done);
+	pthread_mutex_unlock(&stop_lock);
 	free(job);
 	return NULL;
 }
@@ -973,9 +987,15 @@ static void stop_machine(slot *s, int timeout_ms)
 		free(job);
 		return;
 	}
-	*job = (stop_job){ s->engine, &s->core, s->handle, timeout_ms, "" };
+	*job = (stop_job){ s->engine, &s->core, s->handle, timeout_ms, "", s };
 	snprintf(job->root_hash, sizeof job->root_hash, "%s", s->root_hash);
+	pthread_mutex_lock(&stop_lock);
+	s->stops_live++;
+	pthread_mutex_unlock(&stop_lock);
 	if (pthread_create(&thread, NULL, run_stop, job) != 0) {
+		pthread_mutex_lock(&stop_lock);
+		s->stops_live--;
+		pthread_mutex_unlock(&stop_lock);
 		free(job);
 		return;
 	}
@@ -1009,6 +1029,11 @@ static void machine_exited(slot *s, int code, int signal)
 			close_exec(&execs[i]);
 		}
 	if (s->handle != NULL) {
+		/* Its stop threads first, each returning now that it has ended. */
+		pthread_mutex_lock(&stop_lock);
+		while (s->stops_live > 0u)
+			pthread_cond_wait(&stop_done, &stop_lock);
+		pthread_mutex_unlock(&stop_lock);
 		s->engine->ops->destroy(&s->core, s->handle, &error);
 		s->handle = NULL;
 	}
