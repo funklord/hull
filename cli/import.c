@@ -1219,42 +1219,91 @@ static void compose_env(svc *s, char *item, int map_form)
 	sb_str(&s->env, ")");
 }
 
-/* "[host:]guest[/proto]" -> a (port ...). The ip:host:guest and the
- * host-range forms are noted, not translated. */
+/* "a" or "a-b" into `*low` and `*high`, ports 1 to 65535: 1, or 0. */
+static int port_range(const char *text, unsigned *low, unsigned *high)
+{
+	char *end;
+	unsigned long a = strtoul(text, &end, 10);
+	unsigned long b = a;
+
+	if (end == text)
+		return 0;
+	if (*end == '-') {
+		const char *rest = end + 1;
+
+		b = strtoul(rest, &end, 10);
+		if (end == rest)
+			return 0;
+	}
+	if (*end != '\0' || a < 1u || b > 65535u || b < a)
+		return 0;
+	*low = (unsigned)a;
+	*high = (unsigned)b;
+	return 1;
+}
+
+/* "[ip:][host:]guest[/proto]" -> a (port ...) each. A host ip is left, a
+ * machine's ports being on its own address (goal 7), and said; a range,
+ * "8000-8002:9000-9002" or "8000-8002", is its ports one by one, 64 at
+ * most, the two ranges of one length. */
 static void compose_port(svc *s, char *spec)
 {
-	char *p = scalar(spec);
-	char *slash = strrchr(p, '/');
-	char *colon;
-	char  proto[8] = "";
+	char    *p = scalar(spec);
+	char     given[256];
+	char    *slash;
+	char    *colon;
+	char    *host;
+	char    *guest;
+	char     proto[8] = "";
+	unsigned host_low;
+	unsigned host_high;
+	unsigned guest_low;
+	unsigned guest_high;
 
-	if (strchr(p, ':') != NULL && strchr(p, ':') != strrchr(p, ':')) {
-		svc_note(s, "port with an ip or range not translated", p);
-		return;
-	}
+	snprintf(given, sizeof given, "%s", p);
+	slash = strrchr(p, '/');
 	if (slash != NULL) {
 		*slash = '\0';
 		snprintf(proto, sizeof proto, "%s", slash + 1);
 	}
-	colon = strchr(p, ':');
-	sb_str(&s->ports, " (port (host ");
-	if (colon != NULL) {
+	/* An ip first, [v6] or v4, where there are three parts. */
+	if (p[0] == '[') {
+		char *close = strchr(p, ']');
+
+		if (close == NULL || close[1] != ':') {
+			svc_note(s, "port not translated", p);
+			return;
+		}
+		*close = '\0';
+		svc_note(s, "port's host ip left: it is on the machine's own address", p + 1);
+		p = close + 2;
+	} else if ((colon = strchr(p, ':')) != NULL && strchr(colon + 1, ':') != NULL) {
 		*colon = '\0';
-		sb_str(&s->ports, p);
-		sb_str(&s->ports, ") (guest ");
-		sb_str(&s->ports, colon + 1);
-	} else {
-		sb_str(&s->ports, p);
-		sb_str(&s->ports, ") (guest ");
-		sb_str(&s->ports, p);
+		svc_note(s, "port's host ip left: it is on the machine's own address", p);
+		p = colon + 1;
 	}
-	sb_str(&s->ports, ")");
-	if (proto[0] != '\0' && strcmp(proto, "tcp") != 0) {
-		sb_str(&s->ports, " (proto ");
-		sb_str(&s->ports, proto);
+	colon = strchr(p, ':');
+	host = p;
+	guest = colon != NULL ? colon + 1 : p;
+	if (colon != NULL)
+		*colon = '\0';
+	if (!port_range(host, &host_low, &host_high) || !port_range(guest, &guest_low, &guest_high) ||
+	    host_high - host_low != guest_high - guest_low || host_high - host_low >= 64u) {
+		svc_note(s, "port not translated", given);
+		return;
+	}
+	for (unsigned i = 0u; i <= host_high - host_low; i++) {
+		char text[64];
+
+		snprintf(text, sizeof text, " (port (host %u) (guest %u)", host_low + i, guest_low + i);
+		sb_str(&s->ports, text);
+		if (proto[0] != '\0' && strcmp(proto, "tcp") != 0) {
+			sb_str(&s->ports, " (proto ");
+			sb_str(&s->ports, proto);
+			sb_str(&s->ports, ")");
+		}
 		sb_str(&s->ports, ")");
 	}
-	sb_str(&s->ports, ")");
 }
 
 /* "host:guest[:ro]" -> a (volume ...). A named volume, no leading /, is

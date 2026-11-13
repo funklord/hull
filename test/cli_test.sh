@@ -397,6 +397,16 @@ printf 'services:\n  db:\n    image: alpine\n    volumes:\n      - /var/lib/anon
 	> "$dir/vars/anon.yaml"
 expect 0 'compose/vars/db-var-lib-anon"\) \(guest "/var/lib/anon/"\) \(fill image\)' \
 	env XDG_DATA_HOME="$dir/vdata" "$hull" import "$dir/vars/anon.yaml"
+# A port with a host ip is on the machine's own address, the ip said and
+# left; a range is its ports one by one, 64 at most.
+printf 'services:\n  web:\n    image: alpine\n    ports:\n      - "127.0.0.1:8081:81"\n      - "[::1]:8082:82"\n      - "9000-9002:9100-9102"\n      - "5000-5001/udp"\n      - "1-200"\n' \
+	> "$dir/vars/ports.yaml"
+expect 0 '\(port \(host 8081\) \(guest 81\)\) \(port \(host 8082\) \(guest 82\)\) \(port \(host 9000\) \(guest 9100\)\) \(port \(host 9001\) \(guest 9101\)\) \(port \(host 9002\) \(guest 9102\)\) \(port \(host 5000\) \(guest 5000\) \(proto udp\)\) \(port \(host 5001\) \(guest 5001\) \(proto udp\)\)' \
+	env XDG_DATA_HOME="$dir/vdata" "$hull" import "$dir/vars/ports.yaml"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q "host ip left: it is on the machine's own address: 127.0.0.1" &&
+	printf '%s\n' "$out" | grep -q 'port not translated: 1-200' ||
+	fail "a port's ip or an overlong range was not said" "$out"
 # hull import of a compose file (by its .yml name) to a (machines ...) form.
 # Section 4.8 plans a file's machines at once with no ordering, so
 # depends_on is (after ...); each network is an addressed segment
