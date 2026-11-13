@@ -2542,8 +2542,8 @@ static const hull_cap_entry entries[] = {
 	{ "on_disconnect.stop", HULL_SUP_NATIVE,   NULL, NULL },
 	{ "on_disconnect.keep", HULL_SUP_REJECTED,
 	  "not yet: qemu is a child of the core, and dies with it", NULL },
-	{ "hostname",           HULL_SUP_EMULATED, "the name qemu's window is given; the guest's own "
-	  "name is the guest's", NULL },
+	{ "hostname",           HULL_SUP_EMULATED, "the machine's name to hull, and its window's where "
+	  "it has one; the guest's own name, a board's or a PC's, is its firmware's or system's", NULL },
 
 	{ NULL,                 HULL_SUP_NATIVE,   NULL, NULL },
 };
