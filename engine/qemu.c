@@ -3101,7 +3101,12 @@ static int dial(hull_machine *m, uint32_t cid)
 	}
 	while (time(NULL) < deadline && !qemu_gone(m)) {
 		struct sockaddr_vm address;
-		struct timeval     patience = { 0, 200000 };
+		/* Under TCG the guest's answer to a connect can take longer than
+		 * 200 ms: the connect timed out here, was closed, and the agent,
+		 * which had accepted it, took its host as gone and powered the
+		 * machine off, saying nothing -- a third of an arm machine's
+		 * starts under emu, 2026-11-13. */
+		struct timeval     patience = { m->emu ? 5 : 0, m->emu ? 0 : 200000 };
 		int                fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
 
 		if (fd < 0)
