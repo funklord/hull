@@ -137,7 +137,6 @@ client_message unpause 28 37 3A 75 6E 70 61 75 73 65 28 32 3A 63 68 31 3A 39 29 
 # wake: (4:wake(2:ch1:9)(7:machine3:web))
 client_message wake 28 34 3A 77 61 6B 65 28 32 3A 63 68 31 3A 39 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 29
 
-
 # tamper: (6:tamper(2:ch1:7)(9:direction3:out)(5:fault(4:drop3:0.5)(5:match10:0:deadbeef)(6:replay1:1)(6:copies1:3)(5:every2:20))(7:machine5:alpha)(4:name4:wire))
 client_message tamper 28 36 3A 74 61 6D 70 65 72 28 32 3A 63 68 31 3A 37 29 28 39 3A 64 69 72 65 63 74 69 6F 6E 33 3A 6F 75 74 29 28 35 3A 66 61 75 6C 74 28 34 3A 64 72 6F 70 33 3A 30 2E 35 29 28 35 3A 6D 61 74 63 68 31 30 3A 30 3A 64 65 61 64 62 65 65 66 29 28 36 3A 72 65 70 6C 61 79 31 3A 31 29 28 36 3A 63 6F 70 69 65 73 31 3A 33 29 28 35 3A 65 76 65 72 79 32 3A 32 30 29 29 28 37 3A 6D 61 63 68 69 6E 65 35 3A 61 6C 70 68 61 29 28 34 3A 6E 61 6D 65 34 3A 77 69 72 65 29 29
 
@@ -146,14 +145,6 @@ client_message inject 28 36 3A 69 6E 6A 65 63 74 28 32 3A 63 68 31 3A 37 29 28 3
 
 # capture: (7:capture(2:ch1:7)(6:frames2:10)(7:machine5:alpha)(4:name4:wire)(4:path14:/tmp/wire.pcap)(3:way3:out))
 client_message capture 28 37 3A 63 61 70 74 75 72 65 28 32 3A 63 68 31 3A 37 29 28 36 3A 66 72 61 6D 65 73 32 3A 31 30 29 28 37 3A 6D 61 63 68 69 6E 65 35 3A 61 6C 70 68 61 29 28 34 3A 6E 61 6D 65 34 3A 77 69 72 65 29 28 34 3A 70 61 74 68 31 34 3A 2F 74 6D 70 2F 77 69 72 65 2E 70 63 61 70 29 28 33 3A 77 61 79 33 3A 6F 75 74 29 29
-
-# machine_no_state: (8:machines(2:ch1:6)(7:machine(7:address12:127.107.3.97)(5:class2:ns)(6:engine6:chroot)(2:id3:web)))
-# Conforms though `listed` would refuse it: situ frames a run, not its
-# elements, so a machine entry with no state passes the schema and the
-# CLI prints the column empty. It sat in the refused file until situ
-# 6f807f0, refused only by a framing fault in situ, and is kept here to
-# show where the schema stops; it turns red when situ reads elements.
-core_message machine_no_state 28 38 3A 6D 61 63 68 69 6E 65 73 28 32 3A 63 68 31 3A 36 29 28 37 3A 6D 61 63 68 69 6E 65 28 37 3A 61 64 64 72 65 73 73 31 32 3A 31 32 37 2E 31 30 37 2E 33 2E 39 37 29 28 35 3A 63 6C 61 73 73 32 3A 6E 73 29 28 36 3A 65 6E 67 69 6E 65 36 3A 63 68 72 6F 6F 74 29 28 32 3A 69 64 33 3A 77 65 62 29 29 29
 
 # Pools and leases (project.md section 4.12).
 
@@ -213,3 +204,13 @@ core_message slots 28 35 3A 73 6C 6F 74 73 28 32 3A 63 68 31 3A 37 29 28 34 3A 7
 
 # exec_tree: (4:exec(4:tree4:true)(2:ch1:7)(7:machine3:web)(3:tty5:false))
 client_message exec_tree 28 34 3A 65 78 65 63 28 34 3A 74 72 65 65 34 3A 74 72 75 65 29 28 32 3A 63 68 31 3A 37 29 28 37 3A 6D 61 63 68 69 6E 65 33 3A 77 65 62 29 28 33 3A 74 74 79 35 3A 66 61 6C 73 65 29 29
+
+# One entry of `machines` alone, as situc verifies a run inside a variant
+# arm only so: its optional arch, board and stored root, each as the core
+# writes it (core.c, the `machines` answer). An arm64 machine's arch went
+# unread until situ read a run's elements, and then `hull ps` refused it.
+listed listed_plain 28 37 3A 6D 61 63 68 69 6E 65 28 37 3A 61 64 64 72 65 73 73 31 32 3A 31 32 37 2E 31 30 37 2E 33 2E 39 37 29 28 35 3A 63 6C 61 73 73 32 3A 6E 73 29 28 36 3A 65 6E 67 69 6E 65 36 3A 63 68 72 6F 6F 74 29 28 32 3A 69 64 33 3A 77 65 62 29 28 35 3A 73 74 61 74 65 37 3A 72 75 6E 6E 69 6E 67 29 29
+listed listed_arch 28 37 3A 6D 61 63 68 69 6E 65 28 37 3A 61 64 64 72 65 73 73 31 32 3A 31 32 37 2E 31 30 37 2E 33 2E 39 37 29 28 34 3A 61 72 63 68 35 3A 61 72 6D 36 34 29 28 35 3A 63 6C 61 73 73 32 3A 6E 73 29 28 36 3A 65 6E 67 69 6E 65 36 3A 63 68 72 6F 6F 74 29 28 32 3A 69 64 33 3A 77 65 62 29 28 35 3A 73 74 61 74 65 37 3A 72 75 6E 6E 69 6E 67 29 29
+listed listed_board 28 37 3A 6D 61 63 68 69 6E 65 28 37 3A 61 64 64 72 65 73 73 31 32 3A 31 32 37 2E 31 30 37 2E 33 2E 39 37 29 28 35 3A 62 6F 61 72 64 32 30 3A 72 6F 6F 74 40 31 39 32 2E 31 36 38 2E 37 2E 32 31 20 32 32 29 28 35 3A 63 6C 61 73 73 32 3A 6E 73 29 28 36 3A 65 6E 67 69 6E 65 36 3A 63 68 72 6F 6F 74 29 28 32 3A 69 64 33 3A 77 65 62 29 28 35 3A 73 74 61 74 65 37 3A 72 75 6E 6E 69 6E 67 29 29
+listed listed_root 28 37 3A 6D 61 63 68 69 6E 65 28 37 3A 61 64 64 72 65 73 73 31 32 3A 31 32 37 2E 31 30 37 2E 33 2E 39 37 29 28 35 3A 63 6C 61 73 73 32 3A 6E 73 29 28 36 3A 65 6E 67 69 6E 65 36 3A 63 68 72 6F 6F 74 29 28 32 3A 69 64 33 3A 77 65 62 29 28 34 3A 72 6F 6F 74 34 3A 74 72 75 65 29 28 35 3A 73 74 61 74 65 37 3A 72 75 6E 6E 69 6E 67 29 29
+listed listed_all 28 37 3A 6D 61 63 68 69 6E 65 28 37 3A 61 64 64 72 65 73 73 31 32 3A 31 32 37 2E 31 30 37 2E 33 2E 39 37 29 28 34 3A 61 72 63 68 37 3A 72 69 73 63 76 36 34 29 28 35 3A 62 6F 61 72 64 31 35 3A 31 39 32 2E 31 36 38 2E 37 2E 32 32 20 32 32 29 28 35 3A 63 6C 61 73 73 32 3A 6E 73 29 28 36 3A 65 6E 67 69 6E 65 36 3A 63 68 72 6F 6F 74 29 28 32 3A 69 64 33 3A 77 65 62 29 28 34 3A 72 6F 6F 74 34 3A 74 72 75 65 29 28 35 3A 73 74 61 74 65 37 3A 72 75 6E 6E 69 6E 67 29 29

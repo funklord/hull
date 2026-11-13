@@ -9,9 +9,12 @@
 // recipe compressed (store/pack.c says the recipe); such a pack is
 // version 2, any other version 1.
 //
+// The index's digests ascend, each once, and each frame lies inside the
+// data, its offset counted from the data's start: `room` is the data's
+// length, what remains after the index and the manifest's frame. The
+// manifest and its frame are at most 256 MiB, as store/pack.c reads them.
+//
 // WHAT THIS SCHEMA DOES NOT SAY, and hull checks instead (store/pack.c):
-// - that the index's digests ascend, each once, and each frame lies inside
-//   the data, its offset counted from the data's start;
 // - that a frame decompresses to its object's length and its object to
 //   its digest, and the manifest's frame to the manifest's length and to
 //   the hash the pack is known by.
@@ -22,20 +25,23 @@ endian big;
 // One object: its sha256, whether it is executable (1) and whether it is
 // a recipe (2), its length once decompressed, and where its frame lies in the data and how long it is.
 struct index_entry {
+	parameter i64 room;
 	u8  digest[32];
 	u8  flags   [max = 3];
 	u64 length;
 	u64 offset;
 	u64 frame;
 }
+when index_entry.offset + index_entry.frame > index_entry.room
+	refuse frame_outside_data "a frame lies past the end of the data";
 
 struct pack {
 	preamble u8[8] = "HULLPACK";
 	u32 version          [min = 1, max = 2];
-	u32 count;
-	u64 manifest_length;
-	u64 manifest_frame;
-	index_entry index[count];
+	u32 count            [max = 0x400000];
+	u64 manifest_length  [max = 0x10000000];
+	u64 manifest_frame   [max = 0x10000000];
+	index_entry(room = remaining - count * 57 - manifest_frame) index[count] [ascending = digest];
 	u8  manifest[manifest_frame];
 	u8  data[remaining];
 }

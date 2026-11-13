@@ -701,19 +701,52 @@ struct machines {
 	listed   items[]  until ")";
 }
 
-// One machine of `machines`.
+// One machine of `machines`: its address; its arch where it is not the
+// host's, and a hw machine's board, `[LOGIN@]ADDRESS PORT`, each where
+// the core has one; its class, engine and id; `(root true)` where its
+// root is a stored tree's; its state.
 struct listed {
 	preamble u8[20] = "(7:machine(7:address";
 	atom  address;
-	preamble u8[9] = ")(5:class";
+	u8    close_address  [must_eq = ')'];
+	peek u32  after_address;
+	variant machine_arch switch (after_address) {
+		case ARCH_ENTRY:  arch_entry  has_arch;
+		default:          absent      no_arch;
+	}
+	peek u32  after_arch;
+	variant machine_board switch (after_arch) {
+		case BOARD_ENTRY:  board_entry  has_board;
+		default:           absent       no_board;
+	}
+	preamble u8[8] = "(5:class";
 	atom  class;
 	preamble u8[10] = ")(6:engine";
 	atom  engine;
 	preamble u8[6] = ")(2:id";
 	atom  id;
-	preamble u8[9] = ")(5:state";
+	u8    close_id  [must_eq = ')'];
+	peek u32  after_id;
+	variant stored_root switch (after_id) {
+		case ROOT_ENTRY:  root_entry  has_root;
+		default:          absent      no_root;
+	}
+	preamble u8[8] = "(5:state";
 	atom  state;
 	preamble u8[2] = "))";
+}
+
+const BOARD_ENTRY  = ('(' << 24) | ('5' << 16) | (':' << 8) | 'b';
+const ROOT_ENTRY   = ('(' << 24) | ('4' << 16) | (':' << 8) | 'r';
+
+struct board_entry {
+	preamble u8[8] = "(5:board";
+	atom  board;
+	u8    close  [must_eq = ')'];
+}
+
+struct root_entry {
+	preamble u8[14] = "(4:root4:true)";
 }
 
 // `stats`' answer, as the machine's engine measures it from the host:

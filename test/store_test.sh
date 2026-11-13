@@ -637,20 +637,41 @@ expect 0 '^object sha256:[0-9a-f]{64} (plain|executable) [0-9]+ bytes, frame [0-
 expect 0 '^data [0-9]+ bytes compressed of [0-9]+, as the index says$' "$hull" inspect "$root/one.hull"
 expect 0 '^\(manifest$' "$hull" inspect "$root/one.hull"
 expect 1 'NOT as the index says' "$hull" inspect "$root/cut.hull"
-timeout 30 python3 -c '
+# The pack whole, and each index entry alone given the data's length as
+# its `room`, which situc reads only so: an entry takes an argument, so
+# inside the whole pack it is not read element by element. A frame past
+# that room is refused, and an index with its first two entries swapped.
+room=$(timeout 30 python3 -c '
 import sys
 data = open(sys.argv[1], "rb").read()
 count = int.from_bytes(data[12:16], "big")
-out = open(sys.argv[2], "w")
-out.write("pack whole %s\n" % data.hex())
+frame = int.from_bytes(data[24:32], "big")
+open(sys.argv[2], "w").write("pack whole %s\n" % data.hex())
+out = open(sys.argv[3], "w")
 for i in range(count):
 	at = 32 + i * 57
 	out.write("index_entry e%d %s\n" % (i, data[at:at + 57].hex()))
-' "$root/one.hull" "$root/pack.vectors"
+swapped = bytearray(data)
+swapped[32:89], swapped[89:146] = data[89:146], data[32:89]
+open(sys.argv[4], "w").write("pack swapped %s\n" % swapped.hex())
+print(len(data) - 32 - count * 57 - frame)
+' "$root/one.hull" "$root/pack.vectors" "$root/entries.vectors" "$root/swapped.vectors")
 verified=$(timeout 300 python3 "$situc" verify store/pack.situ "$root/pack.vectors" 2>&1)
 cases=$((cases + 1))
-printf '%s\n' "$verified" | grep -q "^situc: $(grep -c '' "$root/pack.vectors") vectors conform to store/pack.situ" ||
-	fail "a pack, or an entry of its index, is not store/pack.situ's" "$verified"
+printf '%s\n' "$verified" | grep -q "^situc: 1 vectors conform to store/pack.situ" ||
+	fail "a pack is not store/pack.situ's" "$verified"
+verified=$(timeout 300 python3 "$situc" verify --arg "room=$room" store/pack.situ "$root/entries.vectors" 2>&1)
+cases=$((cases + 1))
+printf '%s\n' "$verified" | grep -q "^situc: $(grep -c '' "$root/entries.vectors") vectors conform to store/pack.situ" ||
+	fail "an entry of a pack's index is not store/pack.situ's" "$verified"
+verified=$(timeout 300 python3 "$situc" verify --arg room=1 store/pack.situ "$root/entries.vectors" 2>&1)
+cases=$((cases + 1))
+printf '%s\n' "$verified" | grep -q 'index_entry: frame_outside_data' ||
+	fail "a frame past the data's end conformed to store/pack.situ" "$verified"
+verified=$(timeout 300 python3 "$situc" verify store/pack.situ "$root/swapped.vectors" 2>&1)
+cases=$((cases + 1))
+printf '%s\n' "$verified" | grep -q 'element 1 is not above the one before' ||
+	fail "a pack whose index's digests do not ascend conformed to store/pack.situ" "$verified"
 timeout 30 python3 -c '
 import sys
 data = bytearray(open(sys.argv[1], "rb").read())
