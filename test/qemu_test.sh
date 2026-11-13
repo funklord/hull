@@ -3481,6 +3481,70 @@ else
 		done
 		rm -rf "${root:?}/a32root"
 	fi
+	# A screen on a vm, 2026-11-13: (display vnc) a virtio GPU, keyboard
+	# and tablet, the guest's own drivers -- its DRM output read from the
+	# guest as connected -- and VNC answering at the machine's address;
+	# (display window) qemu's SDL window on a private Xvfb, and refused
+	# where the run gives no X display.
+	printf '(machine (source "dir:./rootfs") (backend vm) (hostname "qvd") (display vnc) %s)\n' \
+		'(command "/probe" "read" "/sys/class/drm/card0-Virtual-1/status" "say" "shown" "sleep" "6")' \
+		> "$root/vdisp.conf"
+	rm -f "$root/vdisp.out"
+	(cd / && exec timeout -k 2 120 "$hull" run -f "$root/vdisp.conf" > "$root/vdisp.out" 2>&1) &
+	runner=$!
+	tries=0
+	until grep -q '^shown$' "$root/vdisp.out" 2> /dev/null || [ "$tries" -ge 200 ]; do
+		tries=$((tries + 1))
+		sleep 0.25
+	done
+	vdat=$("$hull" ps | awk '$1 == "qvd" {print $2}')
+	banner=$(timeout 10 python3 -c '
+import socket, sys
+s = socket.create_connection((sys.argv[1], 5900), 5)
+print(s.recv(12).decode(errors="replace").strip())' "${vdat:-127.0.0.1}" 2>&1)
+	wait "$runner"
+	cases=$((cases + 1))
+	grep -q '^read=connected$' "$root/vdisp.out" ||
+		fail "a vm with (display vnc) had no virtio GPU output of its own" "$(cat "$root/vdisp.out")"
+	cases=$((cases + 1))
+	[ "$banner" = "RFB 003.008" ] ||
+		fail "a vm with (display vnc) answered no VNC at its address" "$banner"
+	printf '(machine (source "dir:./rootfs") (backend vm) (display window) (command "/probe"))\n' \
+		> "$root/vwin.conf"
+	name='(display window) with no X display'
+	out=$(cd / && env -u DISPLAY timeout 60 "$hull" run -f "$root/vwin.conf" 2>&1)
+	got=$?
+	has 125 'needs an X display'
+	winx=""
+	for n in $(seq 140 199); do
+		[ -e "/tmp/.X$n-lock" ] || [ -e "/tmp/.X11-unix/X$n" ] || { winx=$n; break; }
+	done
+	if command -v Xvfb > /dev/null 2>&1 && command -v xwininfo > /dev/null 2>&1 &&
+	   [ -n "$winx" ]; then
+		timeout 120 Xvfb ":$winx" -ac -nolisten tcp > /dev/null 2>&1 &
+		xvfb=$!
+		sleep 2
+		printf '(machine (source "dir:./rootfs") (backend vm) (hostname "qvw") (display window) %s)\n' \
+			'(command "/probe" "say" "up" "sleep" "8")' > "$root/vwin.conf"
+		(cd / && DISPLAY=":$winx" exec timeout -k 2 120 "$hull" run -f "$root/vwin.conf" \
+			> /dev/null 2>&1) &
+		winrun=$!
+		tries=0
+		until xwininfo -display ":$winx" -root -tree 2>/dev/null | grep -qi 'qemu' ||
+		      [ "$tries" -ge 120 ]; do
+			tries=$((tries + 1))
+			sleep 0.25
+		done
+		cases=$((cases + 1))
+		xwininfo -display ":$winx" -root -tree 2>/dev/null | grep -qi 'qemu' ||
+			fail "(display window) gave a vm no window on the run's display" \
+				"$(xwininfo -display ":$winx" -root -tree 2>&1 | head -20)"
+		wait "$winrun" 2>/dev/null
+		kill "$xvfb" 2>/dev/null
+		wait "$xvfb" 2>/dev/null
+	else
+		printf 'qemu: a vm'"'"'s (display window) not measured: no Xvfb or xwininfo, or no free display\n'
+	fi
 	# Only emu runs another arch: on vm, refused at plan.
 	printf '(machine (source "dir:./a64root") (backend vm) (arch arm64) (command "/probe"))\n' \
 		> "$root/a64vm.conf"

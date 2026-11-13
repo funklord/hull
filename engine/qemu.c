@@ -194,6 +194,10 @@ struct hull_machine {
 	char             dir[4096];    /* the machine's files: initrd, console */
 	int              network;      /* qemu's end of passt's socket, or -1 */
 	int              no_network;   /* (network none): no NIC, no passt */
+	int              screen;       /* (display window|vnc): a virtio GPU, keyboard and tablet */
+	int              vnc;          /* (display vnc): its screen by VNC at its address */
+	char            *x_display;    /* (display window): the run's X display */
+	char            *xauthority;   /* and its authority, or NULL */
 	int              bridge;       /* (network bridge): a tap on a host bridge, its core root */
 	int              bridge_own;   /* on HULL_BRIDGE, hull addressing it, not (bridge NAME) */
 	char             bridge_name[16];
@@ -453,6 +457,8 @@ static void release(hull_machine *m)
 		hull_hostnet_run(del, quiet, sizeof quiet);
 	}
 	free(m->root);
+	free(m->x_display);
+	free(m->xauthority);
 	free(m->composefs);
 	free(m->verity_disk);
 	for (unsigned i = 0u; i < m->volume_count; i++)
@@ -954,6 +960,27 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 
 	/* (network none) is a machine with no NIC, lo alone in the guest; a
 	 * vm shares no host network to give (network host). */
+	/* (display window|vnc): a screen, keyboard and mouse, the guest's
+	 * own virtio-gpu and virtio-input, shown by qemu's SDL window on the
+	 * X display the run gave, or by VNC at the machine's address, port
+	 * 5900, as a pc machine's are (section 5.0). */
+	if ((text = hull_access_value(doc, &machine, "display")) != NULL) {
+		hull_sexpr_form top;
+		hull_sexpr_form screen;
+
+		m->screen = 1;
+		m->vnc = strcmp(text, "vnc") == 0;
+		free(text);
+		if (!m->vnc && (!hull_sexpr_first(doc, &top) ||
+		                !hull_access_find(doc, &top, "screen", &screen) ||
+		                (m->x_display = hull_access_value(doc, &screen, "display")) == NULL))
+			return "(display window) needs an X display, and the run gave none: DISPLAY is not "
+			       "set where hull ran";
+		if (!m->vnc)
+			m->xauthority = hull_access_value(doc, &screen, "xauthority");
+		if (m->s390x)
+			return "(display ...) is a virtio-gpu, which an s390x machine has none of here";
+	}
 	text = hull_access_value(doc, &machine, "network");
 	m->no_network = text != NULL && strcmp(text, "none") == 0;
 	m->bridge     = text != NULL && strcmp(text, "bridge") == 0;
@@ -1571,6 +1598,12 @@ static const char *write_initramfs(const hull_machine *m, const char *modules, i
 			if (d->host.named[0] != '\0')
 				snprintf(links + at, sizeof links - at, "%s %s\n", d->host.named, guest);
 		}
+	}
+	/* A screen: the guest's virtio-gpu, and its virtio-input keyboard and
+	 * tablet, where the kernel has them as modules. */
+	if (m->screen && load_modules && extra_count + 2u <= MAX_MODULES) {
+		extra[extra_count++] = "virtio_gpu";
+		extra[extra_count++] = "?virtio_input";
 	}
 	/* A composefs root: erofs for its image, the crc32c erofs's
 	 * libcrc32c asks for, and overlay, which is loaded already. */
@@ -2313,6 +2346,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        log[4200];
 	char        memory[32];
 	char        cpus[16];
+	char        vnc[48];
 	char        vsock[64];
 	char        agent_chardev[4500];
 	char        monitor_chardev[64];
@@ -2336,7 +2370,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        shared_memory[96];
 	char        mmio[MICROVM_TRANSPORTS][128];
 	unsigned    mmio_count = 0u;
-	const char *argv[82 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS + 4u * HULL_MAX_DEVICES + 2u];
+	const char *argv[88 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS + 4u * HULL_MAX_DEVICES + 2u];
 	unsigned    serial = 0u;
 	unsigned    parallel = 0u;
 	int         usb = 0;
@@ -2390,7 +2424,9 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	argv[n++] = "-nodefaults";
 	argv[n++] = "-no-user-config";
 	argv[n++] = "-display";
-	argv[n++] = "none";
+	/* VNC's display 0 is port 5900, at the machine's own address. */
+	snprintf(vnc, sizeof vnc, "vnc=%s:0", m->address_text);
+	argv[n++] = m->vnc ? vnc : m->screen ? "sdl" : "none";
 	argv[n++] = "-no-reboot";
 	argv[n++] = "-M";
 	/* virt under KVM takes the host's interrupt controller, a GICv3 where
@@ -2694,6 +2730,14 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		argv[n++] = m->transport == 3 ? "isa-serial,chardev=agent" :
 		                                "virtserialport,chardev=agent,name=hull.agent";
 	}
+	if (m->screen) {
+		argv[n++] = "-device";
+		argv[n++] = "virtio-gpu-pci";
+		argv[n++] = "-device";
+		argv[n++] = "virtio-keyboard-pci";
+		argv[n++] = "-device";
+		argv[n++] = "virtio-tablet-pci";
+	}
 	if (!m->no_network) {
 		argv[n++] = "-netdev";
 		argv[n++] = netdev;
@@ -2885,6 +2929,14 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		}
 		if (m->virtiofsd != NULL && !virtiofs_daemons(m))
 			_exit(126);
+		if (m->x_display != NULL) {
+			setenv("DISPLAY", m->x_display, 1);
+			if (m->xauthority != NULL)
+				setenv("XAUTHORITY", m->xauthority, 1);
+			/* What SDL and Mesa would otherwise leave behind them. */
+			setenv("DBUS_SESSION_BUS_ADDRESS", "disabled:", 1);
+			setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
+		}
 		execvp(argv[0], (char *const *)argv);
 		fprintf(stderr, "qemu-system-x86_64: %s\n", strerror(errno));
 		_exit(127);
@@ -2981,7 +3033,7 @@ static int micro_fits(const hull_machine *m, char *kernel, size_t cap)
 	unsigned    transports = MICROVM_FIXED + m->volume_count + m->segment_count;
 
 	if (m->profile_full || m->sleep || m->iommu || m->arm64 || m->riscv64 || m->s390x || m->arm ||
-	    m->emu ||
+	    m->emu || m->screen ||
 	    m->device_count != 0u ||
 	    m->transport == 3 ||
 	    transports > MICROVM_TRANSPORTS || !qemu_has_microvm())
@@ -5661,6 +5713,12 @@ static const hull_cap_entry entries[] = {
 	  "have", NULL },
 	{ "cpus",               HULL_SUP_NATIVE,   NULL, NULL },
 	{ "memory",             HULL_SUP_NATIVE,   "a hard allocation", NULL },
+	{ "display.window",     HULL_SUP_NATIVE,
+	  "a virtio GPU, keyboard and tablet, the guest's own drivers, shown by qemu's SDL window "
+	  "on the X display the run was given; not a microvm, nor on s390x", NULL },
+	{ "display.vnc",        HULL_SUP_NATIVE,
+	  "a virtio GPU, keyboard and tablet shown by VNC at the machine's address, port 5900, "
+	  "with no password: any local user can connect, as to its ports", NULL },
 	/* Section 6's host forwarder: the engine's, over vsock to the agent. */
 	{ "ports",              HULL_SUP_EMULATED,
 	  "tcp and udp, forwarded over vsock from the machine's address", NULL },
