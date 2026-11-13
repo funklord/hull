@@ -66,6 +66,8 @@
 #include "tree.h"
 #include "usage.h"
 #include "sshd.h"
+#include "json.h"
+#include "nic.h"
 
 #define API           "/v1.41"
 #define MAX_RESPONSE  (1u << 20)
@@ -99,6 +101,13 @@ struct hull_machine {
 	char            *direct_binds;  /* its entries' binds, frame_direct's, as JSON strings */
 	size_t           direct_binds_length;
 	char            *ssh_dir;    /* (ssh true): the core's material, for the fetched dropbear */
+	/* (segments ...): its NICs on the core's switch, which hull-agent
+	 * makes in the container as its root (join_segments()). */
+	char            *segment[HULL_NICS_MAX];
+	hull_nic         nic[HULL_NICS_MAX];
+	unsigned         segment_count;
+	int              routed;         /* a way out of docker's own, on its bridge */
+	char             nic_dir[4200];  /* where its socket is made, bound at /run/hull/nic */
 	char             detail[512];
 };
 
@@ -1094,14 +1103,20 @@ static const char *add_binds(text *t, const hull_sexpr_doc *doc, const hull_sexp
 	return NULL;
 }
 
-/* (sysctls ...) and (ulimits ...) as docker's Sysctls and Ulimits. */
-static void add_host_settings(text *body, const hull_sexpr_doc *doc, const hull_sexpr_form *machine)
+/* (sysctls ...) and (ulimits ...) as docker's Sysctls and Ulimits; with
+ * `ipv6`, IPv6 on, which docker turns off in a container and a segment's
+ * IPv6 address wants. */
+static void add_host_settings(text *body, const hull_sexpr_doc *doc, const hull_sexpr_form *machine,
+                              int ipv6)
 {
 	char *entries[32];
 	int   count = hull_access_strings(doc, machine, "sysctls", entries, 32u);
 
-	if (count > 0) {
+	if (count > 0 || ipv6) {
 		add_text(body, ",\"Sysctls\":{");
+		if (ipv6)
+			add_text(body, count > 0 ? "\"net.ipv6.conf.all.disable_ipv6\":\"0\"," :
+			                           "\"net.ipv6.conf.all.disable_ipv6\":\"0\"");
 		for (int i = 0; i < count; i++) {
 			char *equals = strchr(entries[i], '=');
 
@@ -1184,6 +1199,178 @@ static int in_place(const hull_sexpr_doc *doc, const hull_sexpr_form *machine)
 	return direct;
 }
 
+/* --- segments ------------------------------------------------------------ */
+
+#define NIC_GUEST   "/run/hull/nic"
+#define AGENT_GUEST "/run/hull/agent"
+
+/* hull-agent beside the hull that is running, the host's arch's, which
+ * makes a container's NICs and waits for them. 0, or -1. */
+static int agent_beside(char *out, size_t cap)
+{
+	char    self[PATH_MAX];
+	ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1u);
+	char   *slash;
+
+	if (n <= 0)
+		return -1;
+	self[n] = '\0';
+	if ((slash = strrchr(self, '/')) == NULL)
+		return -1;
+	*slash = '\0';
+	if (snprintf(out, cap, "%s/hull-agent", self) >= (int)cap || access(out, X_OK) != 0)
+		return -1;
+	return 0;
+}
+
+/* The machine's segments, read as chroot reads them: each NIC's name, its
+ * MAC and the addresses hull gives it. eth0 is docker's on its bridge,
+ * so they follow it, as after pasta's under NAT; under (network none)
+ * they are eth0 on. Returns a reason, or NULL. */
+static const char *read_segments(hull_machine *m, const hull_sexpr_doc *doc,
+                                 const hull_sexpr_form *machine)
+{
+	hull_sexpr_form top;
+	hull_sexpr_form entry;
+	hull_sexpr_form item;
+	char           *network;
+	char           *address;
+	const char     *runtime = getenv("XDG_RUNTIME_DIR");
+
+	if (!hull_access_find(doc, machine, "segments", &entry))
+		return NULL;
+	hull_sexpr_child(doc, &entry, &item);
+	for (int more = hull_sexpr_next(doc, &item, &item); more;
+	     more = hull_sexpr_next(doc, &item, &item)) {
+		if (m->segment_count == HULL_NICS_MAX)
+			return "there are too many segments";
+		if ((m->segment[m->segment_count++] = hull_access_segment_name(doc, &item)) == NULL)
+			return "a segment's name is not text";
+	}
+	if (m->segment_count == 0u)
+		return NULL;
+	network = hull_access_value(doc, machine, "network");
+	m->routed = network == NULL || strcmp(network, "none") != 0;
+	if (network != NULL && strcmp(network, "host") == 0) {
+		free(network);
+		return "a docker machine on a segment needs a network of its own: not (network host) "
+		       "beside (segments ...)";
+	}
+	free(network);
+	network = hull_access_value(doc, machine, "on_disconnect");
+	if (network != NULL && strcmp(network, "keep") == 0) {
+		free(network);
+		return "a machine on a segment cannot outlive the core, whose switch the segment is: "
+		       "(on_disconnect keep) and (segments ...) do not go together";
+	}
+	free(network);
+	hull_sexpr_first(doc, &top);
+	if ((address = hull_access_value(doc, &top, "address")) == NULL)
+		return "the plan gives its segments no address to draw a MAC from";
+	for (unsigned i = 0u; i < m->segment_count; i++) {
+		snprintf(m->nic[i].name, sizeof m->nic[i].name, "eth%u", i + (m->routed ? 1u : 0u));
+		hull_access_segment_mac(address, m->segment[i], i, m->nic[i].mac);
+	}
+	free(address);
+	if (hull_access_find(doc, &top, "names", &entry))
+		for (unsigned i = 0u; i < m->segment_count; i++) {
+			hull_access_named(doc, &entry, m->segment[i], m->nic[i].address, &m->nic[i].prefix);
+			hull_access_named6(doc, &entry, m->segment[i], m->nic[i].address6,
+			                   &m->nic[i].prefix6);
+			m->nic[i].gateway = hull_access_gateway(doc, &entry, m->segment[i]);
+		}
+	if (runtime == NULL || runtime[0] != '/' ||
+	    snprintf(m->nic_dir, sizeof m->nic_dir, "%s/hull/docker-%s", runtime, m->name) >=
+	        (int)sizeof m->nic_dir)
+		return "XDG_RUNTIME_DIR names no place for a segment's socket";
+	/* The container's root, holding no CAP_DAC_OVERRIDE, reaches its
+	 * socket as another user would: the directory is passable and the
+	 * socket open to it, under the runtime directory's hull/, which is the
+	 * user's alone on the host. */
+	if ((mkdir(m->nic_dir, 0711) != 0 && errno != EEXIST) || chmod(m->nic_dir, 0711) != 0)
+		return "a segment's socket's directory cannot be made";
+	return NULL;
+}
+
+/* The image's own Entrypoint and Cmd, each a JSON array's strings as they
+ * go into a create request, into `entry` and `cmd`. 0, or -1. */
+static int image_command(const char *image, text *entry, text *cmd)
+{
+	text            path = { 0 };
+	char           *answer = NULL;
+	int             status = 0;
+	hull_json       doc;
+	hull_json_value root;
+	hull_json_value config;
+	const char     *bad;
+	int             result = -1;
+
+	add_text(&path, "/images/");
+	add_text(&path, image);
+	add_text(&path, "/json");
+	if (path.failed || call("GET", path.data, NULL, &status, &answer) != 0 || status != 200 ||
+	    hull_json_open(&doc, answer, strlen(answer), &root, &bad) != 0 ||
+	    !hull_json_member(&doc, &root, "Config", &config))
+		goto done;
+	for (int which = 0; which < 2; which++) {
+		hull_json_value list;
+		hull_json_value item;
+		text           *into = which == 0 ? entry : cmd;
+
+		if (!hull_json_member(&doc, &config, which == 0 ? "Entrypoint" : "Cmd", &list) ||
+		    list.kind != '[')
+			continue;
+		for (int first = 1; hull_json_element(&doc, &list, first, &item); first = 0) {
+			char value[4096];
+
+			if (hull_json_string(&doc, &item, value, sizeof value) < 0)
+				goto done;
+			if (into->length != 0u)
+				add_text(into, ",");
+			add_json(into, value);
+		}
+	}
+	result = entry->failed || cmd->failed ? -1 : 0;
+done:
+	free(path.data);
+	free(answer);
+	return result;
+}
+
+/* `,"Entrypoint":[...],"Cmd":[...]` for a machine on segments: hull-agent
+ * waiting for its NICs ahead of the image's entrypoint, and its command
+ * or the image's. Docker clears an image's Cmd where the Entrypoint is
+ * set, so the image's is given again. A reason, or NULL. */
+static const char *wrap_command(hull_machine *m, text *body, const hull_sexpr_doc *doc,
+                                const hull_sexpr_form *machine, const char *image)
+{
+	text            entry = { 0 };
+	text            cmd = { 0 };
+	hull_sexpr_form given;
+
+	if (image_command(image, &entry, &cmd) != 0) {
+		free(entry.data);
+		free(cmd.data);
+		return "the image's entrypoint cannot be read from the daemon";
+	}
+	addf(body, ",\"Entrypoint\":[\"" AGENT_GUEST "\",\"wait-nics\",\"%u\",\"%u\",\"--\"",
+	     m->routed ? 1u : 0u, m->segment_count);
+	if (entry.length != 0u) {
+		add_text(body, ",");
+		add_all(body, &entry);
+	}
+	add_text(body, "],\"Cmd\":[");
+	if (hull_access_find(doc, machine, "command", &given))
+		add_strings(body, doc, &given);
+	else
+		add_all(body, &cmd);
+	add_text(body, "]");
+	body->failed |= entry.failed || cmd.failed;
+	free(entry.data);
+	free(cmd.data);
+	return NULL;
+}
+
 /* The create request's body, into `m->body`. Returns a reason, or NULL. */
 static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
                          const hull_sexpr_form *machine, const char *image)
@@ -1214,10 +1401,17 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 			return create_detail;
 	if (hull_hostdev_claim(m, device, device_count, create_detail, sizeof create_detail) != NULL)
 		return create_detail;
+	if ((reason = read_segments(m, doc, machine)) != NULL)
+		return reason;
 	add_text(&body, "{\"Image\":");
 	add_json(&body, image);
 
-	if (hull_access_find(doc, machine, "command", &entry)) {
+	if (m->segment_count != 0u) {
+		if ((reason = wrap_command(m, &body, doc, machine, image)) != NULL) {
+			free(body.data);
+			return reason;
+		}
+	} else if (hull_access_find(doc, machine, "command", &entry)) {
 		add_text(&body, ",\"Cmd\":[");
 		add_strings(&body, doc, &entry);
 		add_text(&body, "]");
@@ -1288,17 +1482,80 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	 * own: PID 1 ignores a signal it has no handler for, so a workload
 	 * there would sit through stop's SIGTERM, and nothing would reap. */
 	add_text(&body, ",\"HostConfig\":{\"Init\":true,\"CapDrop\":[\"ALL\"]");
-	if (hull_access_find(doc, machine, "hosts", &entry)) {
-		add_text(&body, ",\"ExtraHosts\":[");
-		add_strings(&body, doc, &entry);
-		add_text(&body, "]");
+	{
+		text extra = { 0 };
+		text dns = { 0 };
+
+		if (hull_access_find(doc, machine, "hosts", &entry))
+			add_strings(&extra, doc, &entry);
+		if (hull_access_find(doc, machine, "dns", &entry))
+			add_strings(&dns, doc, &entry);
+		/* On addressed segments, every sibling by name, as chroot's
+		 * /etc/hosts has them, and hull at their .1 to ask the rest, as on
+		 * chroot under NAT (Appendix D). */
+		hull_sexpr_first(doc, &top);
+		if (m->segment_count != 0u && hull_access_find(doc, &top, "names", &entry)) {
+			char *hosts = hull_access_hosts(doc, &entry);
+			char *resolver = hull_access_resolver(doc, &entry);
+			char *save = NULL;
+
+			for (char *line = hosts != NULL ? strtok_r(hosts, "\n", &save) : NULL; line != NULL;
+			     line = strtok_r(NULL, "\n", &save)) {
+				char  address[64];
+				int   at = 0;
+				char *names_save = NULL;
+
+				/* Its loopback lines are docker's own already. */
+				if (line[0] == '#' || sscanf(line, "%63s %n", address, &at) != 1 ||
+				    strcmp(address, "127.0.0.1") == 0 || strcmp(address, "::1") == 0)
+					continue;
+				for (char *name = strtok_r(line + at, " \t", &names_save); name != NULL;
+				     name = strtok_r(NULL, " \t", &names_save)) {
+					text one = { 0 };
+
+					addf(&one, "%s:%s", name, address);
+					if (extra.length != 0u)
+						add_text(&extra, ",");
+					add_json(&extra, one.data != NULL ? one.data : "");
+					extra.failed |= one.failed;
+					free(one.data);
+				}
+			}
+			free(hosts);
+			save = NULL;
+			for (char *line = resolver != NULL ? strtok_r(resolver, "\n", &save) : NULL;
+			     line != NULL; line = strtok_r(NULL, "\n", &save)) {
+				char server[64];
+
+				if (sscanf(line, "nameserver %63s", server) != 1)
+					continue;
+				if (dns.length != 0u)
+					add_text(&dns, ",");
+				add_json(&dns, server);
+			}
+			free(resolver);
+		}
+		if (extra.length != 0u) {
+			add_text(&body, ",\"ExtraHosts\":[");
+			add_all(&body, &extra);
+			add_text(&body, "]");
+		}
+		if (dns.length != 0u) {
+			add_text(&body, ",\"Dns\":[");
+			add_all(&body, &dns);
+			add_text(&body, "]");
+		}
+		body.failed |= extra.failed || dns.failed;
+		free(extra.data);
+		free(dns.data);
 	}
-	if (hull_access_find(doc, machine, "dns", &entry)) {
-		add_text(&body, ",\"Dns\":[");
-		add_strings(&body, doc, &entry);
-		add_text(&body, "]");
+	{
+		int ipv6 = 0;
+
+		for (unsigned i = 0u; i < m->segment_count; i++)
+			ipv6 |= m->nic[i].address6[0] != '\0';
+		add_host_settings(&body, doc, machine, ipv6);
 	}
-	add_host_settings(&body, doc, machine);
 	if ((value = hull_access_value(doc, machine, "shm_size")) != NULL) {
 		char              *unit;
 		unsigned long long bytes = strtoull(value, &unit, 10);
@@ -1337,8 +1594,17 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 		                          hull_access_find(doc, machine, "security", &entry) &&
 		                          hull_access_find(doc, &entry, "allow", &allow);
 
-		if (allowed || ssh)
+		int             nics = m->segment_count != 0u;
+
+		if (allowed || ssh || nics)
 			add_text(&body, ",\"CapAdd\":[");
+		/* On segments: NET_ADMIN, for hull-agent as the container's root
+		 * to make its taps; like ssh's two, the bounding set's alone, the
+		 * workload running as the user. */
+		if (nics) {
+			add_text(&body, "\"NET_ADMIN\"");
+			first = 0;
+		}
 		/* (ssh true): the two dropbear needs to take a login to its
 		 * user's groups and id, root's to root's included -- without
 		 * them every session ended "Error changing user group". The
@@ -1347,7 +1613,7 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 		 * no-new-privileges, and cannot raise them; the sshd's execs run
 		 * as the container's root, which does. */
 		if (ssh) {
-			add_text(&body, "\"SETGID\",\"SETUID\"");
+			add_text(&body, first ? "\"SETGID\",\"SETUID\"" : ",\"SETGID\",\"SETUID\"");
 			first = 0;
 		}
 		if (allowed) {
@@ -1370,7 +1636,7 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 				free(name);
 			}
 		}
-		if (allowed || ssh)
+		if (allowed || ssh || nics)
 			add_text(&body, "]");
 	}
 	/* (network none) is docker's none, lo alone; (network host) its host;
@@ -1484,6 +1750,30 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 			free(bind.data);
 		}
 	}
+	/* On segments: hull-agent, which waits for the NICs and makes them,
+	 * and the directory its socket is made in. */
+	if (reason == NULL && m->segment_count != 0u) {
+		char agent[PATH_MAX];
+		text bind = { 0 };
+
+		if (agent_beside(agent, sizeof agent) != 0)
+			reason = "a docker machine on a segment runs hull-agent, beside hull, and there is "
+			         "none: `make` builds it";
+		else {
+			add_text(&bind, agent);
+			add_text(&bind, ":" AGENT_GUEST ":ro");
+			if (binds.length != 0u)
+				add_text(&binds, ",");
+			add_json(&binds, bind.data != NULL ? bind.data : "");
+			bind.length = 0u;
+			add_text(&bind, m->nic_dir);
+			add_text(&bind, ":" NIC_GUEST);
+			add_text(&binds, ",");
+			add_json(&binds, bind.data != NULL ? bind.data : "");
+			binds.failed |= bind.failed;
+			free(bind.data);
+		}
+	}
 	if (binds.length != 0u) {
 		add_text(&body, ",\"Binds\":[");
 		add_all(&body, &binds);
@@ -1506,7 +1796,7 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	/* Each node at its own path, and again at the path the spec gave
 	 * under /dev where that is a link to it, since docker makes nodes and
 	 * not links. */
-	if (device_count != 0u) {
+	if (device_count != 0u || m->segment_count != 0u) {
 		int vfio = 0;
 
 		add_text(&body, ",\"Devices\":[");
@@ -1531,6 +1821,13 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 				add_text(&body, ",\"CgroupPermissions\":\"rwm\"}");
 			}
 		}
+		/* On segments, the tun device hull-agent makes its taps of. */
+		if (m->segment_count != 0u)
+			add_text(&body, device_count != 0u ?
+			                ",{\"PathOnHost\":\"/dev/net/tun\",\"PathInContainer\":\"/dev/net/tun\","
+			                "\"CgroupPermissions\":\"rwm\"}" :
+			                "{\"PathOnHost\":\"/dev/net/tun\",\"PathInContainer\":\"/dev/net/tun\","
+			                "\"CgroupPermissions\":\"rwm\"}");
 		add_text(&body, "]");
 	}
 	/* A read-only stack is its guest path made read-only, ReadonlyPaths,
@@ -2537,6 +2834,10 @@ static void release(hull_machine *m)
 	free(m->direct);
 	free(m->direct_binds);
 	free(m->ssh_dir);
+	for (unsigned i = 0u; i < m->segment_count; i++)
+		free(m->segment[i]);
+	if (m->nic_dir[0] != '\0')
+		rmdir(m->nic_dir);
 	for (unsigned i = 0u; i < m->stack_count; i++) {
 		free(m->stacks[i].guest);
 		hull_stack_release(&m->stacks[i].stack);
@@ -3348,7 +3649,8 @@ static int put_archive(hull_machine *m, const char *path, const text *tar)
 /* `argv` run in the container as its root, with dropbear's libraries on
  * the path, detached; with `wait`, until it ends, and its status. 0, or -1
  * with `detail`. */
-static int exec_root(hull_machine *m, const char *const *argv, int wait, long *code)
+static int exec_root(hull_machine *m, const char *what, const char *const *argv, int wait,
+                     long *code)
 {
 	text  body = { 0 };
 	char  path[200];
@@ -3367,7 +3669,7 @@ static int exec_root(hull_machine *m, const char *const *argv, int wait, long *c
 	snprintf(path, sizeof path, "/containers/%s/exec", m->id);
 	if (body.failed || call("POST", path, body.data, &status, &answer) != 0 || status != 201 ||
 	    !json_string(answer, "Id", id, sizeof id)) {
-		daemon_says(m->detail, sizeof m->detail, "(ssh true): exec", status, answer);
+		daemon_says(m->detail, sizeof m->detail, what, status, answer);
 		free(body.data);
 		free(answer);
 		return -1;
@@ -3376,7 +3678,7 @@ static int exec_root(hull_machine *m, const char *const *argv, int wait, long *c
 	free(answer);
 	snprintf(path, sizeof path, "/exec/%s/start", id);
 	if (call("POST", path, "{\"Detach\":true}", &status, &answer) != 0 || status != 200) {
-		daemon_says(m->detail, sizeof m->detail, "(ssh true): exec start", status, answer);
+		daemon_says(m->detail, sizeof m->detail, what, status, answer);
 		free(answer);
 		return -1;
 	}
@@ -3398,7 +3700,7 @@ static int exec_root(hull_machine *m, const char *const *argv, int wait, long *c
 		nanosleep(&tenth, NULL);
 	}
 	if (wait) {
-		snprintf(m->detail, sizeof m->detail, "(ssh true): %s did not end", argv[0]);
+		snprintf(m->detail, sizeof m->detail, "%s: %s did not end", what, argv[0]);
 		return -1;
 	}
 	return 0;
@@ -3465,17 +3767,124 @@ static int start_sshd(hull_machine *m)
 	}
 	if (tar.failed)
 		snprintf(m->detail, sizeof m->detail, "(ssh true): out of memory");
-	else if (put_archive(m, "/", &tar) == 0 && exec_root(m, convert, 1, &code) == 0) {
+	else if (put_archive(m, "/", &tar) == 0 && exec_root(m, "(ssh true): exec", convert, 1, &code) == 0) {
 		if (code != 0)
 			snprintf(m->detail, sizeof m->detail, "(ssh true): the machine's host key could not "
 			         "be converted for dropbear (%ld)", code);
-		else if (exec_root(m, serve, 0, &code) == 0)
+		else if (exec_root(m, "(ssh true): exec", serve, 0, &code) == 0)
 			result = 0;
 	}
 done:
 	if (tar.data != NULL)
 		explicit_bzero(tar.data, tar.length);
 	free(tar.data);
+	return result;
+}
+
+/*
+ * The machine's NICs on its segments, once the container runs: a port on
+ * the core's switch for each, handed to hull-agent, run as the
+ * container's root, by SCM_RIGHTS over a socket in the machine's own
+ * directory, which the container has bound; it makes the taps as chroot's
+ * init does (engine/nic.c) and says so, then relays their frames for the
+ * container's life. Meanwhile the workload's entrypoint, hull-agent
+ * wait-nics, holds it until they are there. 0, or -1 with `detail`.
+ */
+static int join_segments(hull_machine *m)
+{
+	struct sockaddr_un address = { .sun_family = AF_UNIX };
+	int                dir = -1;
+	char               specs[HULL_NICS_MAX][200];
+	const char        *argv[5u + HULL_NICS_MAX];
+	int                ports[HULL_NICS_MAX];
+	unsigned           have = 0u;
+	int                listener = -1;
+	int                conn = -1;
+	int                result = -1;
+	long               code = 0;
+
+	for (; have < m->segment_count; have++)
+		if ((ports[have] = host->segment(m->core, m->segment[have], m->detail,
+		                                 sizeof m->detail)) < 0)
+			goto done;
+	/* Bound by a descriptor of the directory, a socket's path being 108
+	 * bytes at most wherever the runtime directory is. */
+	if ((dir = open(m->nic_dir, O_PATH | O_DIRECTORY | O_CLOEXEC)) < 0) {
+		snprintf(m->detail, sizeof m->detail, "a segment's socket's directory: %s",
+		         strerror(errno));
+		goto done;
+	}
+	snprintf(address.sun_path, sizeof address.sun_path, "/proc/self/fd/%d/nic.sock", dir);
+	unlinkat(dir, "nic.sock", 0);
+	if ((listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0 ||
+	    bind(listener, (struct sockaddr *)&address, sizeof address) != 0 ||
+	    fchmodat(dir, "nic.sock", 0666, 0) != 0 || listen(listener, 1) != 0) {
+		snprintf(m->detail, sizeof m->detail, "a segment's socket: %s", strerror(errno));
+		goto done;
+	}
+	argv[0] = AGENT_GUEST;
+	argv[1] = "nics";
+	argv[2] = NIC_GUEST "/nic.sock";
+	argv[3] = m->routed ? "1" : "0";
+	for (unsigned i = 0u; i < m->segment_count; i++) {
+		const hull_nic *nic = &m->nic[i];
+
+		snprintf(specs[i], sizeof specs[i], "%s,%02x:%02x:%02x:%02x:%02x:%02x,%s,%u,%s,%u,%d",
+		         nic->name, nic->mac[0], nic->mac[1], nic->mac[2], nic->mac[3], nic->mac[4],
+		         nic->mac[5], nic->address, nic->prefix, nic->address6, nic->prefix6,
+		         nic->gateway);
+		argv[4u + i] = specs[i];
+	}
+	argv[4u + m->segment_count] = NULL;
+	if (exec_root(m, "segments: hull-agent nics", argv, 0, &code) != 0)
+		goto done;
+	{
+		struct pollfd   wait = { .fd = listener, .events = POLLIN };
+		char            control[CMSG_SPACE(sizeof ports)];
+		char            byte = 0;
+		struct iovec    io = { .iov_base = &byte, .iov_len = 1u };
+		struct msghdr   message = { .msg_iov = &io, .msg_iovlen = 1u, .msg_control = control,
+		                            .msg_controllen = CMSG_SPACE(m->segment_count * sizeof(int)) };
+		struct cmsghdr *cm;
+		char            said[200];
+		ssize_t         n;
+
+		memset(control, 0, sizeof control);
+		if (poll(&wait, 1u, 20000) != 1 || (conn = accept4(listener, NULL, NULL, SOCK_CLOEXEC)) < 0) {
+			snprintf(m->detail, sizeof m->detail, "segments: hull-agent nics never came for "
+			         "the ports, in 20 s");
+			goto done;
+		}
+		cm = CMSG_FIRSTHDR(&message);
+		cm->cmsg_level = SOL_SOCKET;
+		cm->cmsg_type  = SCM_RIGHTS;
+		cm->cmsg_len   = CMSG_LEN(m->segment_count * sizeof(int));
+		memcpy(CMSG_DATA(cm), ports, m->segment_count * sizeof(int));
+		wait.fd = conn;
+		if (sendmsg(conn, &message, MSG_NOSIGNAL) != 1 || poll(&wait, 1u, 20000) != 1 ||
+		    (n = read(conn, said, sizeof said - 1u)) <= 0) {
+			snprintf(m->detail, sizeof m->detail, "segments: hull-agent nics said nothing of "
+			         "the NICs");
+			goto done;
+		}
+		said[n] = '\0';
+		if (strcmp(said, "ok") != 0) {
+			snprintf(m->detail, sizeof m->detail, "segments: in the container, %s", said);
+			goto done;
+		}
+	}
+	result = 0;
+done:
+	for (unsigned i = 0u; i < have; i++)
+		close(ports[i]);
+	if (conn >= 0)
+		close(conn);
+	if (listener >= 0)
+		close(listener);
+	if (dir >= 0) {
+		unlinkat(dir, "nic.sock", 0);
+		close(dir);
+	}
 	return result;
 }
 
@@ -3525,6 +3934,8 @@ static hull_status docker_start(hull_core *core, hull_machine *m, hull_error *er
 		return fail(error, HULL_ERR_INTERNAL, "the reader thread could not start");
 	}
 	m->started = 1;
+	if (m->segment_count != 0u && join_segments(m) != 0)
+		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	if (m->ssh_dir != NULL && start_sshd(m) != 0)
 		return fail(error, HULL_ERR_RUNTIME, m->detail);
 	host->on_state(core, m, "running");
@@ -4183,12 +4594,12 @@ static const hull_cap_entry entries[] = {
 	{ "init",               HULL_SUP_REJECTED,
 	  "the workload runs as the user, and an image's init wants root as PID 1, which root "
 	  "mode does not offer, chroot and the vm giving it without root", NULL },
-	{ "segments",           HULL_SUP_REJECTED,
-	  "a container's NIC is the daemon's, never on the core's switch", NULL },
-	{ "impair",             HULL_SUP_REJECTED,
-	  "a link is impaired in the core's switch, which a container is never on", NULL },
-	{ "tamper",             HULL_SUP_REJECTED,
-	  "a fault on a link in the core's switch, which a container is never on", NULL },
+	{ "segments",           HULL_SUP_NATIVE,
+	  "a tap in the container on the core's switch, made by hull-agent as the container's root, "
+	  "the container given NET_ADMIN and /dev/net/tun, which its workload, the user, does not "
+	  "use", NULL },
+	{ "impair",             HULL_SUP_NATIVE,   NULL, NULL },
+	{ "tamper",             HULL_SUP_NATIVE,   NULL, NULL },
 	{ "ports",              HULL_SUP_NATIVE,
 	  "bound on the machine's address", NULL },
 	{ "volumes",            HULL_SUP_NATIVE,   NULL, NULL },

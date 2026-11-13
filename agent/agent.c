@@ -89,6 +89,7 @@
 #include <linux/vm_sockets.h>
 
 #include "ip6.h"
+#include "nic.h"
 #include "sshd.h"
 #include "access.h"
 #include "user.h"
@@ -3016,6 +3017,141 @@ static int relay(const char *path)
 	}
 }
 
+/* One NIC as the docker engine gives it, NAME,MAC,ADDRESS,PREFIX,
+ * ADDRESS6,PREFIX6,GATEWAY, an address empty where hull gives none. 0, or
+ * -1 where it is not one. */
+static int nic_of(const char *text, hull_nic *nic)
+{
+	char     copy[200];
+	char    *field[7];
+	unsigned n = 0u;
+	unsigned mac[6];
+
+	memset(nic, 0, sizeof *nic);
+	if (snprintf(copy, sizeof copy, "%s", text) >= (int)sizeof copy)
+		return -1;
+	field[n++] = copy;
+	for (char *at = copy; *at != '\0' && n < 7u; at++)
+		if (*at == ',') {
+			*at = '\0';
+			field[n++] = at + 1;
+		}
+	if (n != 7u || strchr(field[6], ',') != NULL || field[0][0] == '\0' ||
+	    strlen(field[0]) >= sizeof nic->name || strlen(field[2]) >= sizeof nic->address ||
+	    strlen(field[4]) >= sizeof nic->address6 ||
+	    sscanf(field[1], "%2x:%2x:%2x:%2x:%2x:%2x", &mac[0], &mac[1], &mac[2], &mac[3], &mac[4],
+	           &mac[5]) != 6)
+		return -1;
+	snprintf(nic->name, sizeof nic->name, "%s", field[0]);
+	for (unsigned i = 0u; i < 6u; i++)
+		nic->mac[i] = (uint8_t)mac[i];
+	snprintf(nic->address, sizeof nic->address, "%s", field[2]);
+	nic->prefix = (unsigned)strtoul(field[3], NULL, 10);
+	snprintf(nic->address6, sizeof nic->address6, "%s", field[4]);
+	nic->prefix6 = (unsigned)strtoul(field[5], NULL, 10);
+	nic->gateway = strcmp(field[6], "1") == 0;
+	return (nic->prefix > 32u || nic->prefix6 > 128u) ? -1 : 0;
+}
+
+/* `hull-agent nics PATH ROUTED NIC...`, in a container as its root (the
+ * docker engine, project.md section 8): the ports on the core's switch
+ * taken from the socket PATH, one descriptor each, by SCM_RIGHTS; the
+ * NICs made in the container's namespace as chroot's init makes a
+ * machine's (engine/nic.c), with no route out of their own where ROUTED
+ * is 1; "ok" or what failed said back; then the relay, until a port
+ * closes. */
+static int nics(const char *path, const char *routed, int count, char **specs)
+{
+	struct sockaddr_un address;
+	hull_nic           list[HULL_NICS_MAX];
+	int                ports[HULL_NICS_MAX];
+	int                tap[HULL_NICS_MAX];
+	int                fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	const char        *failed = NULL;
+	char               control[CMSG_SPACE(sizeof ports)];
+	char               byte;
+	struct iovec       io = { .iov_base = &byte, .iov_len = 1u };
+	struct msghdr      message = { .msg_iov = &io, .msg_iovlen = 1u, .msg_control = control,
+	                               .msg_controllen = sizeof control };
+	struct cmsghdr    *cm;
+
+	signal(SIGPIPE, SIG_IGN);
+	if (count <= 0 || (unsigned)count > HULL_NICS_MAX || fd < 0 ||
+	    strlen(path) >= sizeof address.sun_path)
+		return 2;
+	for (int i = 0; i < count; i++)
+		if (nic_of(specs[i], &list[i]) != 0) {
+			fprintf(stderr, "hull agent: nics: %s is not a NIC\n", specs[i]);
+			return 2;
+		}
+	memset(&address, 0, sizeof address);
+	address.sun_family = AF_UNIX;
+	memcpy(address.sun_path, path, strlen(path));
+	if (connect(fd, (struct sockaddr *)&address, sizeof address) != 0 ||
+	    recvmsg(fd, &message, MSG_CMSG_CLOEXEC) != 1 || (cm = CMSG_FIRSTHDR(&message)) == NULL ||
+	    cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS ||
+	    cm->cmsg_len != CMSG_LEN((size_t)count * sizeof(int))) {
+		fprintf(stderr, "hull agent: nics: the ports did not come from %s\n", path);
+		return 1;
+	}
+	memcpy(ports, CMSG_DATA(cm), (size_t)count * sizeof(int));
+	failed = hull_nic_join(list, (unsigned)count, strcmp(routed, "1") == 0,
+	                       strcmp(routed, "1") == 0, tap);
+	{
+		char said[200];
+		int  n = snprintf(said, sizeof said, "%s%s%s", failed == NULL ? "ok" : failed,
+		                  failed == NULL ? "" : ": ", failed == NULL ? "" : strerror(errno));
+
+		if (n > 0 && write(fd, said, (size_t)n) != n)
+			failed = failed != NULL ? failed : "the core";
+	}
+	close(fd);
+	if (failed != NULL)
+		return 1;
+	hull_nic_relay(tap, ports, (unsigned)count);
+	return 0;
+}
+
+/* `hull-agent wait-nics FIRST COUNT -- COMMAND...`, a container's
+ * entrypoint ahead of its own, as its user: ethFIRST and the COUNT-1
+ * after it waited for, which `hull-agent nics` makes as its root, so that
+ * the workload starts on its segments as it does on chroot and a vm; then
+ * the command run in its place. 30 s at most. */
+static int wait_nics(const char *first, const char *count, char **command)
+{
+	unsigned from = (unsigned)strtoul(first, NULL, 10);
+	unsigned n = (unsigned)strtoul(count, NULL, 10);
+
+	for (int tries = 0;; tries++) {
+		unsigned there = 0u;
+
+		for (unsigned i = 0u; i < n; i++) {
+			char path[64];
+
+			snprintf(path, sizeof path, "/sys/class/net/eth%u", from + i);
+			there += access(path, F_OK) == 0;
+		}
+		if (there == n)
+			break;
+		if (tries == 300) {
+			fprintf(stderr, "hull: the machine's NICs on its segments did not come in 30 s\n");
+			return 125;
+		}
+		{
+			struct timespec pause = { 0, 100000000L };
+
+			nanosleep(&pause, NULL);
+		}
+	}
+	if (command[0] == NULL) {
+		fprintf(stderr, "hull: the machine has no command, and its image none\n");
+		return 125;
+	}
+	execvp(command[0], command);
+	fprintf(stderr, "hull: %s: %s\n", command[0], strerror(errno));
+	return errno == ENOENT ? 127 : 126;
+}
+
 int main(int argc, char **argv)
 {
 	sigset_t       mask;
@@ -3031,6 +3167,10 @@ int main(int argc, char **argv)
 	}
 	if (argc == 3 && strcmp(argv[1], "relay") == 0)
 		return relay(argv[2]);
+	if (argc >= 5 && strcmp(argv[1], "nics") == 0)
+		return nics(argv[2], argv[3], argc - 4, argv + 4);
+	if (argc >= 5 && strcmp(argv[1], "wait-nics") == 0 && strcmp(argv[4], "--") == 0)
+		return wait_nics(argv[2], argv[3], argv + 5);
 	if (getpid() != 1) {
 		fprintf(stderr, "hull agent: runs as a machine's init, PID 1\n");
 		return 2;

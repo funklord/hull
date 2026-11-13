@@ -418,9 +418,10 @@ machine on docker with the same machine on chroot or vm.
   file at the top of the tree, or in a directory docker mounts something
   in such as `/etc`, is refused there. An overlay is a `docker import`
   of the tree, kept by its hash.
-- No `(init …)` and no `(segments …)`: an image's init wants root, and a
-  container's network is the root daemon's. chroot gives a machine both
-  without one.
+- No `(init …)`: an image's init wants root, which chroot gives a
+  machine without one. `(segments …)` work, a tap in the container made
+  by hull-agent as its root, the container given `NET_ADMIN` and
+  `/dev/net/tun` that its workload, the user, does not hold.
 
 **Caveats**
 - `/` in a container is root's, as docker makes every image's, while the
@@ -666,9 +667,6 @@ Specs and commands stay as they were: `(pool "bench")`, `hull reserve`,
 - **crun**, ns: crun under user namespaces, with idmapped mounts for
   volume ownership, cgroup v2 limits and pasta networking, starting in
   tens of milliseconds.
-- **A micro vm profile with its own kernel**: a minimal guest kernel
-  bundled with hull, booting in a few hundred milliseconds and making a
-  machine independent of the host's kernel version.
 - **vmware**: a full-profile vm engine for hosts where that hypervisor is
   what is there, through a block image built from the tree.
 - **hyperv**: the Windows-host slot, reserved so that Windows support

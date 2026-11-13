@@ -613,12 +613,13 @@ expect 1 ':1:10: machine on qemu \(vm\): source\.ref\.overlay: rejected: the eng
 # A dir in place, docker's since 2026-10-31, emulated and said so.
 expect 0 ':1:10: machine on docker \(ns\): source\.dir\.direct: emulated: the directory.s entries bound' \
 	"$hull" plan -f "$dir/dir.conf" --backend docker
-# Segments are qemu's and chroot's: docker refuses them, and says why.
+# Segments are every engine's but the boards': docker's a tap made in
+# the container by hull-agent as its root, which the plan says.
 printf '%s\n' '(machine (source "dir:./rootfs") (segments "wire"))' > "$dir/segmented.conf"
 expect 0 'segments: native: a tap each' \
 	"$hull" plan --explain -f "$dir/segmented.conf" --backend chroot
-expect 1 'segments: rejected: a container.s NIC is the daemon.s, never on the core.s switch' \
-	"$hull" plan -f "$dir/segmented.conf" --backend docker
+expect 0 'segments: native: a tap in the container on the core.s switch, made by hull-agent' \
+	"$hull" plan --explain -f "$dir/segmented.conf" --backend docker
 expect 0 'machine on qemu \(vm\): ok|segments: native' \
 	"$hull" plan --explain -f "$dir/segmented.conf" --backend vm
 # Handing PID 1 to the image's init is chroot's and qemu's, not docker's.
@@ -2300,7 +2301,7 @@ cases=$((cases + 1))
 # docker has no link of the core's to impair.
 conf offwire "(network none) (segments \"on-$$\") (impair (off-$$ (out (loss 0.5)))) (command \"/probe\" \"say\" \"ran\")"
 from_root 125 'impair names a segment the machine is not on' -f "$root/offwire.conf"
-expect 1 'impair: rejected: a link is impaired in the core.s switch, which a container is never on' "$hull" plan --backend docker -f "$root/offwire.conf"
+expect 0 'machine on docker \(ns\): ok' "$hull" check --backend docker -f "$root/offwire.conf"
 expect 1 'no machine is on that segment' "$hull" segment "nowhere-$$"
 
 # A capture of the shouter's way out, started by hull segment during the

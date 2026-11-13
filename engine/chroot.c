@@ -72,6 +72,7 @@
 #include "access.h"
 #include "user.h"
 #include "hostnet.h"
+#include "nic.h"
 #include "rootmode.h"
 #include "tree.h"
 #include "storefs.h"
@@ -2018,79 +2019,6 @@ static void relay(int conn, int listener, int out, int err, pid_t workload)
 	}
 }
 
-/*
- * Frames between `tap`, a NIC's, and `port`, its segment's port on the
- * core's switch, which frames each after its length as 32 bits in network
- * order, as qemu's -netdev stream does: in a process of the machine's own,
- * which goes with its namespace. Returns when a port closes.
- */
-static void relay_frames(const int *tap, const int *port, unsigned n)
-{
-	static uint8_t from_port[MAX_SEGMENTS][4u + 65536u];
-	size_t         held[MAX_SEGMENTS] = { 0u };
-	uint8_t        frame[4u + 65536u];
-	struct pollfd  fds[2u * MAX_SEGMENTS];
-
-	for (unsigned i = 0u; i < n; i++) {
-		fds[2u * i]      = (struct pollfd){ .fd = tap[i], .events = POLLIN };
-		fds[2u * i + 1u] = (struct pollfd){ .fd = port[i], .events = POLLIN };
-	}
-	for (;;) {
-		if (poll(fds, 2u * n, -1) < 0) {
-			if (errno == EINTR)
-				continue;
-			return;
-		}
-		for (unsigned i = 0u; i < n; i++) {
-			if (fds[2u * i].revents & POLLIN) {
-				ssize_t got = read(tap[i], frame + 4, 65536u);
-
-				if (got > 0) {
-					size_t at = 0u;
-
-					frame[0] = (uint8_t)((size_t)got >> 24);
-					frame[1] = (uint8_t)((size_t)got >> 16);
-					frame[2] = (uint8_t)((size_t)got >> 8);
-					frame[3] = (uint8_t)got;
-					while (at < (size_t)got + 4u) {
-						ssize_t put = write(port[i], frame + at, (size_t)got + 4u - at);
-
-						if (put <= 0)
-							return;
-						at += (size_t)put;
-					}
-				}
-			}
-			if (fds[2u * i + 1u].revents & (POLLIN | POLLHUP | POLLERR)) {
-				ssize_t got = read(port[i], from_port[i] + held[i],
-				                   sizeof from_port[i] - held[i]);
-
-				if (got <= 0)
-					return;
-				held[i] += (size_t)got;
-				for (;;) {
-					size_t length;
-
-					if (held[i] < 4u)
-						break;
-					length = (size_t)from_port[i][0] << 24 | (size_t)from_port[i][1] << 16 |
-					         (size_t)from_port[i][2] << 8 | from_port[i][3];
-					if (length > 65536u)
-						return;
-					if (held[i] < 4u + length)
-						break;
-					/* A frame the tap refuses, as one while the NIC is down, is
-					 * dropped, as a wire drops it. */
-					if (write(tap[i], from_port[i] + 4, length) < 0) {
-					}
-					memmove(from_port[i], from_port[i] + 4u + length, held[i] - 4u - length);
-					held[i] -= 4u + length;
-				}
-			}
-		}
-	}
-}
-
 /* How deep and how far unmapped_owner() looks: a tree's own top, where
  * its owners are set, without reading a whole distribution's files. */
 #define OWNER_DEPTH   3u
@@ -2213,81 +2141,28 @@ static void owner_notice(const hull_machine *m, uid_t uid, gid_t gid, char *out,
  */
 static void join_segments(const hull_machine *m, int report)
 {
-	int   tap[MAX_SEGMENTS];
-	pid_t relayer;
-	int   routed = m->nat || m->bridge;   /* a default route already, its own */
-	int   routed6 = routed;
+	hull_nic    nics[MAX_SEGMENTS];
+	int         tap[MAX_SEGMENTS];
+	pid_t       relayer;
+	const char *failed;
 
+	/* After pasta's eth0 under NAT, as after passt's on a vm. */
 	for (unsigned i = 0u; i < m->segment_count; i++) {
-		struct ifreq request = { 0 };
-		int          fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+		hull_nic *nic = &nics[i];
 
-		/* After pasta's eth0 under NAT, as after passt's on a vm. */
-		snprintf(request.ifr_name, sizeof request.ifr_name, "eth%u",
-		         i + (m->nat || m->bridge ? 1u : 0u));
-		request.ifr_flags = IFF_TAP | IFF_NO_PI;
-		if (fd < 0 || (tap[i] = open("/dev/net/tun", O_RDWR | O_CLOEXEC)) < 0 ||
-		    ioctl(tap[i], TUNSETIFF, &request) != 0)
-			child_fail(report, "a segment's NIC");
-		request.ifr_hwaddr.sa_family = 1; /* ARPHRD_ETHER */
-		hull_access_segment_mac(m->address_text, m->segment[i], i,
-		                        (unsigned char *)request.ifr_hwaddr.sa_data);
-		if (ioctl(fd, SIOCSIFHWADDR, &request) != 0)
-			child_fail(report, "a segment's NIC's address");
-		/* Hull's address, where it addresses the segment, and the NIC up:
-		 * the segment owns it, as it names it to the siblings. */
-		if (m->segment_address[i][0] != '\0') {
-			struct sockaddr_in *at = (struct sockaddr_in *)&request.ifr_addr;
-			uint32_t            mask = 0xffffffffu << (32u - m->segment_prefix[i]);
-
-			memset(&request.ifr_addr, 0, sizeof request.ifr_addr);
-			at->sin_family = AF_INET;
-			if (inet_pton(AF_INET, m->segment_address[i], &at->sin_addr) != 1 ||
-			    ioctl(fd, SIOCSIFADDR, &request) != 0)
-				child_fail(report, "a segment's NIC's IPv4 address");
-			at->sin_addr.s_addr = htonl(mask);
-			if (ioctl(fd, SIOCSIFNETMASK, &request) != 0)
-				child_fail(report, "a segment's NIC's netmask");
-		}
-		/* Up where hull addresses it, by either family or both. */
-		if (m->segment_address[i][0] != '\0' || m->segment_address6[i][0] != '\0') {
-			if (ioctl(fd, SIOCGIFFLAGS, &request) != 0)
-				child_fail(report, "a segment's NIC's flags");
-			request.ifr_flags |= IFF_UP;
-			if (ioctl(fd, SIOCSIFFLAGS, &request) != 0)
-				child_fail(report, "a segment's NIC up");
-			if (m->segment_address6[i][0] != '\0' &&
-			    hull_ip6_add(request.ifr_name, m->segment_address6[i], m->segment_prefix6[i]) != 0)
-				child_fail(report, "a segment's NIC's IPv6 address");
-		}
-		/* The first segment whose .1 is a gateway is the way out of a
-		 * machine with none of its own (Appendix D), and the first whose
-		 * ::1 is, by IPv6. */
-		if (!routed6 && m->segment_gateway[i] && m->segment_address6[i][0] != '\0') {
-			if (hull_ip6_route(request.ifr_name, m->segment_address6[i],
-			                   m->segment_prefix6[i]) != 0)
-				child_fail(report, "a segment's IPv6 route out through its ::1");
-			routed6 = 1;
-		}
-		if (!routed && m->segment_gateway[i] && m->segment_address[i][0] != '\0') {
-			struct rtentry      route = { 0 };
-			struct sockaddr_in *gateway = (struct sockaddr_in *)&route.rt_gateway;
-			uint32_t            mask = 0xffffffffu << (32u - m->segment_prefix[i]);
-			struct in_addr      address;
-
-			inet_pton(AF_INET, m->segment_address[i], &address);
-			((struct sockaddr_in *)&route.rt_dst)->sin_family     = AF_INET;
-			((struct sockaddr_in *)&route.rt_genmask)->sin_family = AF_INET;
-			gateway->sin_family      = AF_INET;
-			gateway->sin_addr.s_addr = htonl((ntohl(address.s_addr) & mask) + 1u);
-			route.rt_flags = RTF_UP | RTF_GATEWAY;
-			route.rt_dev   = request.ifr_name;
-			if (ioctl(fd, SIOCADDRT, &route) != 0)
-				child_fail(report, "a segment's route out through its .1");
-			routed = 1;
-		}
-		close(fd);
+		memset(nic, 0, sizeof *nic);
+		snprintf(nic->name, sizeof nic->name, "eth%u", i + (m->nat || m->bridge ? 1u : 0u));
+		hull_access_segment_mac(m->address_text, m->segment[i], i, nic->mac);
+		memcpy(nic->address, m->segment_address[i], sizeof nic->address);
+		nic->prefix = m->segment_prefix[i];
+		memcpy(nic->address6, m->segment_address6[i], sizeof nic->address6);
+		nic->prefix6 = m->segment_prefix6[i];
+		nic->gateway = m->segment_gateway[i];
 	}
+	/* A default route already, its own, under NAT or on a bridge. */
+	if ((failed = hull_nic_join(nics, m->segment_count, m->nat || m->bridge, m->nat || m->bridge,
+	                            tap)) != NULL)
+		child_fail(report, failed);
 	relayer = bare_fork();
 	if (relayer < 0)
 		child_fail(report, "the segments' relay");
@@ -2299,7 +2174,7 @@ static void join_segments(const hull_machine *m, int report)
 			keep[2u * i + 1u] = m->segment_fd[i];
 		}
 		close_others(keep, 2u * m->segment_count);
-		relay_frames(tap, m->segment_fd, m->segment_count);
+		hull_nic_relay(tap, m->segment_fd, m->segment_count);
 		_exit(0);
 	}
 	for (unsigned i = 0u; i < m->segment_count; i++) {

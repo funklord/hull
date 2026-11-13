@@ -103,7 +103,7 @@ ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/iso.o \
               $(BUILD_DIR)/engine/media.o \
               $(GEN_DIR)/disc.o \
-              $(BUILD_DIR)/engine/access.o \
+              $(BUILD_DIR)/engine/access.o $(BUILD_DIR)/engine/nic.o \
               $(BUILD_DIR)/engine/usage.o $(BUILD_DIR)/engine/sha256.o $(BUILD_DIR)/engine/verity.o \
               $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/ip6.o $(BUILD_DIR)/engine/idmap.o \
               $(BUILD_DIR)/engine/tree.o $(BUILD_DIR)/engine/user.o $(BUILD_DIR)/engine/hostnet.o \
@@ -145,7 +145,7 @@ HULL        = $(BUILD_DIR)/hull
 # the engine writes holds nothing else, and beside hull, where the engine
 # looks for it.
 AGENT_BIN_OBJS = $(BUILD_DIR)/agent/agent.o $(WIRE_OBJS) $(BUILD_DIR)/engine/access.o \
-                 $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/ip6.o \
+                 $(BUILD_DIR)/engine/stack.o $(BUILD_DIR)/engine/ip6.o $(BUILD_DIR)/engine/nic.o \
                  $(BUILD_DIR)/engine/tree.o $(BUILD_DIR)/engine/user.o
 AGENT_BIN      = $(BUILD_DIR)/hull-agent
 # The same agent for an arm64 machine under emu, beside it, where a cross

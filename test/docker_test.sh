@@ -1146,6 +1146,47 @@ else
 	rm -rf -- "${sshrt:?}" "${root:?}/sshhome/.ssh"
 fi
 
+# Segments on docker, since 2026-11-13: hull-agent, as the container's
+# root, makes a tap on the core's switch for each, from ports the core
+# hands it, while the workload's entrypoint waits for them. A docker
+# machine and a chroot machine on one addressed segment, by name, under
+# (network none), where the segment is eth0; on docker's own network, its
+# eth0, the segment is eth1; the workload holds no capability, NET_ADMIN
+# being the bounding set's; and (on_disconnect keep) is refused.
+segnet="dseg-$$"
+printf '(machines (web %s) (db %s))\n' \
+	"(source \"dir:./rootfs\") (backend docker) (mutable overlay) (network none) (segments ($segnet (subnet \"10.81.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"hosts\" \"db\" \"ask\" \"db\" \"7000\" \"line\" \"/proc/self/status\" \"CapEff:\t0000000000000000\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments ($segnet (subnet \"10.81.0.0/24\"))) (command \"/probe\" \"addr\" \"eth0\" \"answer\" \"7000\" \"sleep\" \"8\")" \
+	> "$root/segs.conf"
+cases=$((cases + 1))
+out=$(cd "$root" && timeout -k 2 120 "$hull" run -f "$root/segs.conf" 2>&1)
+got=$?
+web_at=$(printf '%s\n' "$out" | sed -n 's#^web *| addr=eth0 \(10\.81\.0\.[0-9]*\)/24 up$#\1#p')
+db_at=$(printf '%s\n' "$out" | sed -n 's#^db *| addr=eth0 \(10\.81\.0\.[0-9]*\)/24 up$#\1#p')
+[ "$got" = 0 ] && [ -n "$web_at" ] && [ -n "$db_at" ] &&
+	printf '%s\n' "$out" | grep -q "^web *| hosts=db $db_at\$" &&
+	printf '%s\n' "$out" | grep -q "^web *| ask=db at $db_at: db\$" &&
+	printf '%s\n' "$out" | grep -q "^db *| answer=from $web_at\$" ||
+	fail "a docker machine and a chroot machine on one segment did not reach each other by name" "exit $got
+$out"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^web *| line=yes$' ||
+	fail "the workload of a docker machine on a segment holds a capability" "$out"
+printf '(machines (web %s) (db %s))\n' \
+	"(source \"dir:./rootfs\") (backend docker) (mutable overlay) (segments ($segnet (subnet \"10.81.0.0/24\"))) (command \"/probe\" \"addr\" \"eth1\" \"ask\" \"db\" \"7000\")" \
+	"(source \"dir:./rootfs\") (backend chroot) (mutable overlay) (network none) (segments ($segnet (subnet \"10.81.0.0/24\"))) (command \"/probe\" \"answer\" \"7000\" \"sleep\" \"8\")" \
+	> "$root/segsnat.conf"
+cases=$((cases + 1))
+out=$(cd "$root" && timeout -k 2 120 "$hull" run -f "$root/segsnat.conf" 2>&1)
+got=$?
+[ "$got" = 0 ] && printf '%s\n' "$out" | grep -Eq '^web *\| addr=eth1 10\.81\.0\.[0-9]+/24 up$' &&
+	printf '%s\n' "$out" | grep -Eq '^web *\| ask=db at 10\.81\.0\.[0-9]+: db$' ||
+	fail "a docker machine on its own network did not have its segment as eth1" "exit $got
+$out"
+printf '(machine (source "dir:./rootfs") (backend docker) (mutable overlay) (on_disconnect keep) (segments "%s") (command "/probe"))\n' \
+	"$segnet" > "$root/segkeep.conf"
+expect 125 'cannot outlive the core, whose switch the segment is' segkeep
+
 # Nothing left on the daemon.
 cases=$((cases + 1))
 left=$(timeout 10 docker ps -a --filter name=hull-dtest- --format '{{.Names}}')
