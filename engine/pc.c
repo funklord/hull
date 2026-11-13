@@ -312,9 +312,13 @@ static const char *make_cache(hull_machine *m)
 }
 
 /* A file of this run's directory. */
+/* A file of the run directory, into a buffer of the calling thread's own:
+ * each machine prepares its state on its own thread, and two starting at
+ * once wrote each other's paths into one static buffer, an ESP32's flash
+ * then copied for, or booted from, another machine's directory. */
 static const char *run_file(const hull_machine *m, const char *name)
 {
-	static char path[4400];
+	static __thread char path[4400];
 
 	snprintf(path, sizeof path, "%s/%s", m->run_state, name);
 	return path;
@@ -325,7 +329,7 @@ static const char *run_file(const hull_machine *m, const char *name)
  * goes with it as a disk's snapshot does. */
 static const char *state_file(const hull_machine *m, const char *name)
 {
-	static char path[4400];
+	static __thread char path[4400];
 
 	snprintf(path, sizeof path, "%s/%s", m->state != NULL && m->direct ? m->state : m->run_state,
 	         name);
@@ -372,7 +376,10 @@ static int esp_emulator(const board *b, char *out, size_t cap)
  */
 static int esp_flash(hull_machine *m, const board *b)
 {
-	static uint8_t buffer[65536];
+	/* The thread's own: two boards' flashes are made at once, and one
+	 * buffer filled with 0xff for one board's padding erased the other's
+	 * bootloader as it was copied, "invalid header: 0xffffffff". */
+	static __thread uint8_t buffer[65536];
 	unsigned       mb = b->flash;
 	struct stat    is;
 	uint8_t        magic = 0u;
