@@ -136,6 +136,52 @@ int hull_hostdev_usb_isochronous(const char *sysfs, const char *port)
 	return found;
 }
 
+int hull_hostdev_usb_added(const char *event, size_t length, const char *port, char *node,
+                           size_t cap)
+{
+	const char *at = event;
+	const char *end = event + length;
+	const char *devpath = NULL;
+	const char *devname = NULL;
+	int         usb = 0;
+	int         device = 0;
+	size_t      port_length = strlen(port);
+
+	if (length < 5u || memcmp(event, "add@", 4u) != 0 || port_length == 0u)
+		return 0;
+	while (at < end) {
+		const char *stop = memchr(at, '\0', (size_t)(end - at));
+		size_t      n = stop != NULL ? (size_t)(stop - at) : (size_t)(end - at);
+
+		if (n > 8u && memcmp(at, "DEVPATH=", 8u) == 0)
+			devpath = at + 8;
+		else if (n > 8u && memcmp(at, "DEVNAME=", 8u) == 0)
+			devname = at + 8;
+		else if (n == 13u && memcmp(at, "SUBSYSTEM=usb", 13u) == 0)
+			usb = 1;
+		else if (n == 18u && memcmp(at, "DEVTYPE=usb_device", 18u) == 0)
+			device = 1;
+		if (stop == NULL)
+			return 0;  /* each pair ends with its NUL, the last too */
+		at = stop + 1;
+	}
+	if (!usb || !device || devpath == NULL || devname == NULL)
+		return 0;
+	/* The devpath's last part is the port: ".../usb1/1-4/1-4.2". */
+	{
+		const char *last = strrchr(devpath, '/');
+
+		if (last == NULL || strcmp(last + 1, port) != 0)
+			return 0;
+	}
+	/* DEVNAME is relative to /dev, bus/usb/BBB/DDD, and nothing else. */
+	if (strncmp(devname, "bus/usb/", 8u) != 0 || strlen(devname) != 15u ||
+	    strspn(devname + 8, "0123456789") != 3u || devname[11] != '/' ||
+	    strspn(devname + 12, "0123456789") != 3u)
+		return 0;
+	return snprintf(node, cap, "/dev/%s", devname) < (int)cap;
+}
+
 const char *hull_hostdev_usb(const char *sysfs, const char *vendor, const char *product,
                              const char *serial, const char *port, hull_hostdev *found,
                              char *why, size_t cap)

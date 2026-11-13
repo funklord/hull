@@ -245,6 +245,7 @@ ROOT_TEST_FILES = $(addprefix $(BUILD_DIR)/test/root/, root.conf root.log cap.co
 ROOTVM_TEST_FILES = $(BUILD_DIR)/test/rootvm/vm.conf
 SYSTEMD_TEST_FILES = $(addprefix $(BUILD_DIR)/test/systemd/, vm.conf run.sh build.conf)
 VFIO_TEST_FILES = $(addprefix $(BUILD_DIR)/test/vfio/, vm.conf run.sh)
+USB_TEST_FILES  = $(addprefix $(BUILD_DIR)/test/usb/, vm.conf run.sh)
 # What check-fuzz writes, but for what it finds, in $(FUZZ_DIR)/found,
 # which is kept: a crash's input is what reproduces it.
 FUZZ_FILES = $(addprefix $(BUILD_DIR)/fuzz/, json_fuzz unpack_fuzz pack_fuzz corpus/json/manifest \
@@ -353,7 +354,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
-.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-arm64-host check-riscv64-host check-root check-systemd check-vfio check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-arm64-host check-riscv64-host check-root check-systemd check-vfio check-usb check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -471,6 +472,7 @@ help:
 	@echo '  check-root    root mode'"'"'s native grants, hull-root setuid, inside a vm'
 	@echo '  check-systemd systemd as a chroot machine'"'"'s init in a delegated cgroup, inside a vm'
 	@echo '  check-vfio    a PCI device by VFIO, to chroot and a nested vm, inside a vm with an IOMMU'
+	@echo '  check-usb     a USB device followed by chroot as it re-enumerates, inside a vm'
 	@echo '  check-sanitize  the unit tests, store and pull under ASan and UBSan'
 	@echo '  check-fuzz    libFuzzer over the JSON and layer readers, FUZZ_TIME s each'
 	@echo '  check-gui     hull-gui as text, and its requests, against a core of its own'
@@ -1019,6 +1021,11 @@ check-systemd: $(HULL) $(AGENT_BIN)
 check-vfio: $(HULL) $(AGENT_BIN) $(PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/vfio_test.sh '$(HULL)' '$(PROBE)'
 
+# A USB device that re-enumerates while a chroot machine has it, made of
+# dummy_hcd and a configfs gadget inside a vm of hull's own.
+check-usb: $(HULL) $(AGENT_BIN) $(PROBE)
+	BUILD_DIR='$(BUILD_DIR)' sh test/usb_test.sh '$(HULL)' '$(PROBE)'
+
 # The indentation and whitespace gate, shared verbatim with the sibling
 # projects; `docs` additionally holds project.md to the tree it describes.
 style: style-tool style-source style-docs
@@ -1079,7 +1086,7 @@ clean:
 	        $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(BUILD_DIR)/test/arm64/rootfs/probe \
 	        $(BUILD_DIR)/test/riscv64/rootfs/probe $(BUILD_DIR)/test/s390x/rootfs/probe \
-	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) $(SYSTEMD_TEST_FILES) $(VFIO_TEST_FILES) \
+	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) $(SYSTEMD_TEST_FILES) $(VFIO_TEST_FILES) $(USB_TEST_FILES) \
 	        $(FUZZ_FILES) \
 	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor $(CLIENT_LIB) $(GUI_BIN) \
 	        $(GUI_TEST_FILES)

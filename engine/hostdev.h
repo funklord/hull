@@ -78,6 +78,14 @@ const char *hull_hostdev_node(const char *path, hull_hostdev *found, char *why, 
  * video, whose timing a vm's usb-host keeps less well than the host. */
 int hull_hostdev_usb_isochronous(const char *sysfs, const char *port);
 
+/* A kernel uevent, as NETLINK_KOBJECT_UEVENT gives it -- "ACTION@DEVPATH"
+ * then NUL-separated KEY=VALUE -- of `length` bytes: 1 where it is a USB
+ * device added at `port`, its new node then in `node`, "/dev/bus/usb/
+ * BBB/DDD", which a device that reset or was flashed comes back at; else
+ * 0. Malformed input is 0. */
+int hull_hostdev_usb_added(const char *event, size_t length, const char *port, char *node,
+                           size_t cap);
+
 /*
  * The PCI device at `address` below `sysfs`, for VFIO: bound to vfio-pci,
  * which an administrator does once, as root, for a device the host is to

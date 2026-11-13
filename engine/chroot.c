@@ -39,6 +39,7 @@
 #include <pwd.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
+#include <linux/netlink.h>
 #include <linux/if_tun.h>
 #include <net/if.h>
 #include <net/route.h>
@@ -203,6 +204,11 @@ struct hull_machine {
 	size_t           plan_length;
 	char            *persisted;  /* what persist() last gave */
 	pthread_t        reader;
+	pthread_t        usb_watcher;    /* watch_usb(), where follows_usb() */
+	int              usb_watching;
+	int              usb_netlink;    /* the kernel's uevents, or -1 */
+	int              usb_stop[2];    /* written to end the watcher */
+	int              usb_conn;       /* the watcher's own descriptor of the init's socket */
 	int              started;
 	pthread_mutex_t  lock;
 	pthread_cond_t   done_cond;
@@ -1224,6 +1230,81 @@ static int make_parents(const char *path)
 }
 
 /*
+ * A USB device that resets, or is flashed, leaves the bus and comes back at
+ * a new address, its old node gone and a new one in its place, which qemu
+ * follows by port and a node bound in at start does not. So where a chroot
+ * machine is given one, its init keeps the host's /dev/bus/usb bound at
+ * /dev/.hull-usb -- a mount of its namespace, which a bind needs its source
+ * to be -- covered by an empty tmpfs once it holds a descriptor of it. The
+ * core watches the kernel's uevents for the device's port and sends the
+ * init its old node and its new; the init drops the one and binds the
+ * other from beneath the cover, by open_tree() and move_mount(), at its own
+ * path. Not followed: a node root mode remade for the user, whose remaking
+ * is hull-root's, and a machine whose init is the image's, (init ...),
+ * which reads nothing from the core.
+ */
+#define USB_HIDDEN  ".hull-usb"
+#define USB_MESSAGE 64u   /* the old node, then the new, each NUL-padded in 32 */
+
+#ifndef OPEN_TREE_CLONE
+#define OPEN_TREE_CLONE 1
+#endif
+#ifndef MOVE_MOUNT_F_EMPTY_PATH
+#define MOVE_MOUNT_F_EMPTY_PATH 0x00000004
+#endif
+
+static int usb_hidden = -1;  /* the init's: the host's /dev/bus/usb, under its cover */
+
+static void watch_usb_start(hull_machine *m);
+static void unwatch_usb(hull_machine *m);
+
+static int follows_usb(const hull_machine *m)
+{
+	if (m->init != NULL)
+		return 0;
+	for (unsigned i = 0u; i < m->device_count; i++)
+		if (m->device[i].kind == HULL_DEVICE_USB && m->device[i].host.granted[0] == '\0')
+			return 1;
+	return 0;
+}
+
+/* In the init: the old node dropped and the new bound at its own path.
+ * Each a path /dev/bus/usb/BBB/DDD, checked again here. */
+static void follow_usb(const char *old, const char *new)
+{
+	static const char prefix[] = "/dev/bus/usb/";
+	int               tree;
+
+	for (int i = 0; i < 2; i++) {
+		const char *p = i == 0 ? old : new;
+
+		if (strncmp(p, prefix, sizeof prefix - 1u) != 0 || strlen(p) != 20u ||
+		    strspn(p + 13, "0123456789") != 3u || p[16] != '/' ||
+		    strspn(p + 17, "0123456789") != 3u)
+			return;
+	}
+	if (usb_hidden < 0 || strcmp(old, new) == 0 || chdir("/") != 0)
+		return;
+	if (umount2(old + 1, MNT_DETACH) == 0)
+		unlink(old + 1);
+	{
+		int fd;
+
+		if (make_parents(new + 1) != 0 ||
+		    (fd = open(new + 1, O_WRONLY | O_CREAT | O_CLOEXEC, 0600)) < 0)
+			return;
+		close(fd);
+	}
+	tree = (int)syscall(SYS_open_tree, usb_hidden, new + 13,
+	                    (unsigned)OPEN_TREE_CLONE | (unsigned)O_CLOEXEC);
+	if (tree < 0 ||
+	    syscall(SYS_move_mount, tree, "", AT_FDCWD, new + 1, MOVE_MOUNT_F_EMPTY_PATH) != 0)
+		unlink(new + 1);
+	if (tree >= 0)
+		close(tree);
+}
+
+/*
  * The host's devices the machine is given, (devices ...): each node bound
  * at its own path in the machine's /dev, as null is, and a path the spec
  * gave under /dev that is a link to it, as /dev/serial/by-id is, made a
@@ -1245,6 +1326,13 @@ static void bind_devices(const hull_machine *m, int report)
 		    close(fd) != 0 || mount(HULL_VFIO, "dev/vfio/vfio", NULL, MS_BIND, NULL) != 0)
 			child_fail(report, "binding /dev/vfio/vfio into /dev");
 	}
+	/* A USB device is followed when it comes back at a new address
+	 * (follow_usb()): the host's /dev/bus/usb is bound where only the init
+	 * reaches it, covered once it holds a descriptor of it. */
+	if (follows_usb(m) &&
+	    (mkdir("dev/" USB_HIDDEN, 0) != 0 ||
+	     mount("/dev/bus/usb", "dev/" USB_HIDDEN, NULL, MS_BIND | MS_REC, NULL) != 0))
+		child_fail(report, "binding the host's USB nodes where a device is followed");
 	for (unsigned i = 0u; i < m->device_count; i++) {
 		const hull_hostdev *host = &m->device[i].host;
 		char                path[300];
@@ -1838,6 +1926,8 @@ static void export_tree(int conn, int *status, pid_t workload)
 static void relay(int conn, int listener, int out, int err, pid_t workload)
 {
 	uint8_t buffer[16384];
+	char    said[USB_MESSAGE];   /* the core's message, as far as it has come */
+	size_t  heard = 0u;
 	int     status = 0;
 	int     ended = 0;
 
@@ -1898,10 +1988,21 @@ static void relay(int conn, int listener, int out, int err, pid_t workload)
 			if (conn < 0 && listener >= 0)
 				relay_hold(which, buffer, (size_t)n);
 		}
-		/* The core says nothing on this socket: readable is its end. */
-		if (conn >= 0 && fds[2].revents != 0 && read(conn, buffer, sizeof buffer) <= 0) {
-			close(conn);
-			conn = -1;
+		/* The core says one thing on this socket, a USB device's new
+		 * node (follow_usb()); readable and nothing read is its end. */
+		if (conn >= 0 && fds[2].revents != 0) {
+			ssize_t n = read(conn, said + heard, sizeof said - heard);
+
+			if (n <= 0 && !(n < 0 && errno == EINTR)) {
+				close(conn);
+				conn = -1;
+				heard = 0u;
+			} else if (n > 0 && (heard += (size_t)n) == sizeof said) {
+				said[31] = '\0';
+				said[63] = '\0';
+				follow_usb(said, said + 32);
+				heard = 0u;
+			}
 		}
 		if (conn < 0 && listener >= 0 && fds[3].revents != 0) {
 			conn = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
@@ -2546,6 +2647,11 @@ static void run_init(const hull_machine *m, uid_t uid, gid_t gid, int conn, int 
 		if (chdir("/") != 0)
 			child_fail(report, "the machine's root");
 	}
+	if (follows_usb(m) && (usb_hidden = open("/dev/" USB_HIDDEN, O_PATH | O_DIRECTORY |
+	                                         O_CLOEXEC)) >= 0 &&
+	    mount("tmpfs", "/dev/" USB_HIDDEN, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+	          "mode=0,size=4k") != 0)
+		child_fail(report, "covering the host's USB nodes");
 	if (owners_fd >= 0) {
 		hull_give_owners(owners_fd, "/", err[1]);
 		owners_fd = -1;
@@ -3343,6 +3449,7 @@ static hull_status chroot_create(hull_core *core, hull_buf plan, hull_machine **
 		return fail(error, HULL_ERR_INTERNAL, "out of memory");
 	m->core  = core;
 	m->conn  = -1;
+	m->usb_netlink = -1;
 	m->pidfd = -1;
 	for (unsigned i = 0u; i < MAX_SEGMENTS; i++)
 		m->segment_fd[i] = -1;
@@ -3594,6 +3701,7 @@ static hull_status chroot_start(hull_core *core, hull_machine *m, hull_error *er
 		m->done = 1;
 		return fail(error, HULL_ERR_INTERNAL, "the reader thread could not start");
 	}
+	watch_usb_start(m);
 	m->started = 1;
 	host->on_state(core, m, "running");
 	return HULL_OK;
@@ -3672,6 +3780,103 @@ static void signal_init(hull_machine *m, int signal)
 	pthread_mutex_unlock(&m->lock);
 }
 
+/* --- following a USB device ------------------------------------------- */
+
+/* The core's half of follow_usb(): the kernel's uevents read, as any user
+ * may, and where a device the machine was given is added at its port again
+ * under another node, the init told its old node and its new. Only the
+ * kernel's own events are taken, a sender's port id being 0. */
+static void *watch_usb(void *arg)
+{
+	hull_machine *m = arg;
+	char          nodes[HULL_MAX_DEVICES][32];
+	char          event[8192];
+
+	for (unsigned i = 0u; i < m->device_count; i++)
+		snprintf(nodes[i], sizeof nodes[i], "%s",
+		         m->device[i].kind == HULL_DEVICE_USB && m->device[i].host.granted[0] == '\0' ?
+		         m->device[i].host.node : "");
+	for (;;) {
+		struct pollfd      fds[2] = { { m->usb_netlink, POLLIN, 0 }, { m->usb_stop[0], POLLIN, 0 } };
+		struct sockaddr_nl from;
+		socklen_t          length = sizeof from;
+		ssize_t            n;
+
+		if (poll(fds, 2u, -1) < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (fds[1].revents != 0)
+			break;
+		n = recvfrom(m->usb_netlink, event, sizeof event, MSG_DONTWAIT, (struct sockaddr *)&from,
+		             &length);
+		if (n <= 0 || length != sizeof from || from.nl_pid != 0u)
+			continue;
+		for (unsigned i = 0u; i < m->device_count; i++) {
+			char node[32];
+			char message[USB_MESSAGE] = { 0 };
+
+			if (nodes[i][0] == '\0' ||
+			    !hull_hostdev_usb_added(event, (size_t)n, m->device[i].host.port, node,
+			                            sizeof node) ||
+			    strcmp(node, nodes[i]) == 0)
+				continue;
+			memcpy(message, nodes[i], strlen(nodes[i]));
+			memcpy(message + 32, node, strlen(node));
+			if (write(m->usb_conn, message, sizeof message) == (ssize_t)sizeof message)
+				memcpy(nodes[i], node, sizeof node);
+		}
+	}
+	return NULL;
+}
+
+/* The watcher started, where the machine follows a USB device; nothing
+ * where the kernel's uevents cannot be read, the device then kept at the
+ * node it was found at, as before. */
+static void watch_usb_start(hull_machine *m)
+{
+	struct sockaddr_nl here = { .nl_family = AF_NETLINK, .nl_groups = 1u };
+
+	m->usb_watching = 0;
+	if (!follows_usb(m) || m->conn < 0)
+		return;
+	m->usb_netlink = socket(AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC, NETLINK_KOBJECT_UEVENT);
+	if (m->usb_netlink < 0 || bind(m->usb_netlink, (struct sockaddr *)&here, sizeof here) != 0 ||
+	    pipe2(m->usb_stop, O_CLOEXEC) != 0) {
+		if (m->usb_netlink >= 0)
+			close(m->usb_netlink);
+		m->usb_netlink = -1;
+		return;
+	}
+	if ((m->usb_conn = fcntl(m->conn, F_DUPFD_CLOEXEC, 0)) < 0 ||
+	    pthread_create(&m->usb_watcher, NULL, watch_usb, m) != 0) {
+		if (m->usb_conn >= 0)
+			close(m->usb_conn);
+		close(m->usb_netlink);
+		close(m->usb_stop[0]);
+		close(m->usb_stop[1]);
+		m->usb_netlink = -1;
+		return;
+	}
+	m->usb_watching = 1;
+}
+
+static void unwatch_usb(hull_machine *m)
+{
+	if (!m->usb_watching)
+		return;
+	if (write(m->usb_stop[1], "", 1u) != 1)
+		pthread_cancel(m->usb_watcher);
+	pthread_join(m->usb_watcher, NULL);
+	close(m->usb_stop[0]);
+	close(m->usb_stop[1]);
+	close(m->usb_netlink);
+	close(m->usb_conn);
+	m->usb_netlink = -1;
+	m->usb_watching = 0;
+}
+
 /* SIGTERM, and SIGKILL if that is not enough within `timeout_ms`. */
 static hull_status chroot_stop(hull_core *core, hull_machine *m, int timeout_ms,
                                hull_error *error)
@@ -3695,6 +3900,7 @@ static hull_status chroot_destroy(hull_core *core, hull_machine *m, hull_error *
 		chroot_stop(core, m, 0, error);
 		pthread_join(m->reader, NULL);
 	}
+	unwatch_usb(m);
 	/* The work directories overlayfs left, which the user could not
 	 * remove: its namespace, and so its mounts, are gone with it. */
 	hull_stack_unwork(m->upper_work);
@@ -3770,6 +3976,7 @@ static hull_status chroot_adopt(hull_core *core, hull_buf state, hull_machine **
 		return fail(error, HULL_ERR_INTERNAL, "out of memory");
 	m->core  = core;
 	m->conn  = -1;
+	m->usb_netlink = -1;
 	m->pid   = (pid_t)pid;
 	m->keep  = 1;
 	for (unsigned i = 0u; i < MAX_SEGMENTS; i++)

@@ -346,6 +346,54 @@ int main(void)
 		hull_hostdev_unclaim(&b);
 	}
 
+	/* A uevent: the USB device at 1-4.2 added again at a new address,
+	 * and each thing that is not that. */
+	{
+		static const char added[] = "add@/devices/pci0000:00/0000:00:14.0/usb1/1-4/1-4.2\0"
+		                            "ACTION=add\0DEVPATH=/devices/pci0000:00/0000:00:14.0/usb1/1-4/"
+		                            "1-4.2\0SUBSYSTEM=usb\0MAJOR=189\0MINOR=9\0"
+		                            "DEVNAME=bus/usb/001/010\0DEVTYPE=usb_device\0"
+		                            "BUSNUM=001\0DEVNUM=010\0";
+		static const char interface[] = "add@/devices/pci0000:00/0000:00:14.0/usb1/1-4/1-4.2/"
+		                                "1-4.2:1.0\0ACTION=add\0DEVPATH=/devices/pci0000:00/"
+		                                "0000:00:14.0/usb1/1-4/1-4.2/1-4.2:1.0\0SUBSYSTEM=usb\0"
+		                                "DEVTYPE=usb_interface\0";
+		static const char odd[] = "add@/x/1-4.2\0DEVPATH=/x/1-4.2\0SUBSYSTEM=usb\0"
+		                          "DEVTYPE=usb_device\0DEVNAME=bus/usb/001/../../sda\0";
+		static const char unended[] = "add@/x/1-4.2\0DEVPATH=/x/1-4.2\0SUBSYSTEM=usb\0"
+		                              "DEVTYPE=usb_device\0DEVNAME=bus/usb/001/010";
+		char node[64] = "";
+
+		cases++;
+		if (!hull_hostdev_usb_added(added, sizeof added - 1u, "1-4.2", node, sizeof node) ||
+		    strcmp(node, "/dev/bus/usb/001/010") != 0)
+			fail("a USB device added at its port not found", node);
+		cases++;
+		if (hull_hostdev_usb_added(added, sizeof added - 1u, "1-4", node, sizeof node))
+			fail("a device at another port taken for the one at 1-4", node);
+		cases++;
+		if (hull_hostdev_usb_added(added, sizeof added - 1u, "4.2", node, sizeof node))
+			fail("a port taken by its suffix", node);
+		cases++;
+		if (hull_hostdev_usb_added(interface, sizeof interface - 1u, "1-4.2", node, sizeof node))
+			fail("an interface taken for its device", node);
+		cases++;
+		if (hull_hostdev_usb_added(odd, sizeof odd - 1u, "1-4.2", node, sizeof node))
+			fail("a DEVNAME outside bus/usb taken", node);
+		cases++;
+		if (hull_hostdev_usb_added(unended, sizeof unended - 1u, "1-4.2", node, sizeof node))
+			fail("an event whose last pair has no NUL taken", node);
+		{
+			char removed[sizeof added];
+
+			memcpy(removed, added, sizeof added);
+			memcpy(removed, "rem", 3u);
+			cases++;
+			if (hull_hostdev_usb_added(removed, sizeof removed - 1u, "1-4.2", node, sizeof node))
+				fail("a removal taken for an add", node);
+		}
+	}
+
 	{
 		char command[1100];
 
