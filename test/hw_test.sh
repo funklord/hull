@@ -152,6 +152,11 @@ cat > "$XDG_CONFIG_HOME/hull/pools.conf" <<CONF
   (noflash (members
     (board "nf" (address "127.0.0.1") (port $((port + 9))) (root "$root/on-a") (deploy "true")
            (power "$root/power nf $((port + 9))"))))
+  (arches (members
+    (board "ax" (arch "arm64") (address "127.0.0.1") (port $((port + 10))) (root "$root/on-a")
+           (power "$root/power ax $((port + 10))"))
+    (board "rv" (arch "riscv64") (address "127.0.0.1") (port $((port + 11))) (root "$root/on-b")
+           (power "$root/power rv $((port + 11))"))))
   (lab (members
     (board "kept" (by_name true) (address "127.0.0.1") (port $((port + 6))) (root "$root/on-a")
            (power "$root/power kept $((port + 6))")))))
@@ -361,6 +366,32 @@ conf stray '(backend chroot) (pool "bench") (command "/probe" "say" "stray")'
 expect 125 'pool bench has nothing for a ns machine' "$hull" run -f "$root/project/stray.conf"
 conf noboard '(backend hw) (pool "soft") (command "/probe" "say" "no")'
 expect 125 'pool soft has no boards for a hw machine' "$hull" run -f "$root/project/noboard.conf"
+# A board is its own arch: a machine of another arch than the host's is
+# planned for hw, and the pool gives it a board of that arch, which
+# pools.conf says by (arch ...); a machine of an arch no board is, the
+# host's by default, is refused rather than left waiting, and a lease's
+# board of another arch is refused to it. A board's arch here is only a
+# word, every board being this host.
+conf onarm '(backend hw) (pool "arches") (arch arm64) (command "/probe" "say" "ran")'
+conf onrv '(backend hw) (pool "arches") (arch riscv64) (command "/probe" "say" "ran")'
+conf onhost '(backend hw) (pool "arches") (command "/probe" "say" "ran")'
+expect 0 'machine on board \(hw\): ok' "$hull" check -f "$root/project/onarm.conf" --backend hw
+: > "$root/power.log"
+expect 0 '^ran$' "$hull" run -f "$root/project/onarm.conf"
+expect 0 '^ran$' "$hull" run -f "$root/project/onrv.conf"
+cases=$((cases + 1))
+[ "$(powered)" = 'ax rv ' ] || fail 'a machine was not given the board of its arch' "$(cat "$root/power.log")"
+case $(uname -m) in
+x86_64) host_arch=amd64 ;;
+aarch64) host_arch=arm64 ;;
+*) host_arch=$(uname -m) ;;
+esac
+[ "$host_arch" = arm64 ] || [ "$host_arch" = riscv64 ] ||
+	expect 125 "pool arches has no board of arch $host_arch" "$hull" run -f "$root/project/onhost.conf"
+lease=$(timeout 20 "$hull" reserve arches --member rv)
+expect 125 "board rv of lease $lease is riscv64, and the machine arm64" \
+	"$hull" run --lease "$lease" -f "$root/project/onarm.conf"
+expect 0 '' "$hull" release "$lease"
 
 # --- a deploy of the board's own: an image flashed, a netboot served ----------
 

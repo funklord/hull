@@ -29,6 +29,7 @@ typedef struct hull_member {
 	int  priority;  /* the higher fills first; 0 where it says none */
 	int  by_name;   /* (by_name true): given only to what names it, and last in the list */
 	int  broken;    /* a board marked broken */
+	char arch[72];  /* a board's (arch ...), what machines it runs; "" for any */
 } hull_member;
 
 typedef struct hull_pool {

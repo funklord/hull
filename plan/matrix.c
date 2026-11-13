@@ -278,6 +278,10 @@ static void resolve_arch(resolver *r, const hull_sexpr_form *entry)
 	join_form(r, id, "arch", &value);
 	if (strcmp(r->class_name, "ns") == 0 && declared(r, id))
 		resolve(r, id, entry->offset);
+	/* A board is what arch it is: the pool gives a machine one of its
+	 * arch, which pools.conf says by (arch ...). */
+	else if (strcmp(r->class_name, "hw") == 0)
+		emit(r, "arch", HULL_OUTCOME_NATIVE, NULL, NULL, entry->offset);
 	else if (strcmp(r->class_name, "emu") != 0)
 		emit(r, "arch", HULL_OUTCOME_REJECTED,
 		     "only the emu class runs an arch other than the host's", NULL, entry->offset);

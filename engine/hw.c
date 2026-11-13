@@ -218,6 +218,14 @@ static void add_member(hull_pool *pool, const hull_sexpr_doc *doc, const hull_se
 			return;
 		}
 		m.broken = hull_hw_broken(m.name);
+		/* What it runs: a board is its own arch, said where the pool
+		 * has boards of more than one, or another than the host's. */
+		field(doc, item, "arch", m.arch, sizeof m.arch);
+		if (strpbrk(m.arch, " \t\r\n") != NULL) {
+			snprintf(pool->wrong, sizeof pool->wrong, "board %s: (arch %s) is one word", m.name,
+			         m.arch);
+			return;
+		}
 	}
 	if (pool->count == HULL_POOL_MEMBERS) {
 		snprintf(pool->wrong, sizeof pool->wrong, "a pool holds %u members at most",

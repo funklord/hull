@@ -47,6 +47,7 @@
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/un.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <pwd.h>
 #include <time.h>
@@ -2392,6 +2393,7 @@ typedef struct want {
 	char     names[HULL_POOL_MEMBERS][64];
 	unsigned memory_mib;  /* a run's, as its plan declares, against the pool's budget */
 	unsigned cpus;
+	char     arch[72];    /* a hw run's: its machine's arch, which a board of (arch ...) must be */
 } want;
 
 typedef struct waiting {
@@ -2546,15 +2548,34 @@ static int is_unlimited(const hull_pool *p)
 	return p->capacity == 0 && p->count == 0u;
 }
 
-static int member_fits(const hull_member *m, int kind)
+/* A hw machine's arch: its (arch ...), or the host's as on every engine,
+ * which a board saying one must be. */
+static void machine_arch(const hull_sexpr_doc *doc, const hull_sexpr_form *machine, char *out,
+                         size_t cap)
 {
-	return kind == WANT_ANY || m->board == (kind == WANT_BOARD);
+	char          *arch = hull_access_value(doc, machine, "arch");
+	struct utsname host;
+
+	out[0] = '\0';
+	if (arch != NULL && strcmp(arch, "host") != 0)
+		snprintf(out, cap, "%s", arch);
+	else if (uname(&host) == 0)
+		snprintf(out, cap, "%s", strcmp(host.machine, "x86_64") == 0 ? "amd64" :
+		         strcmp(host.machine, "aarch64") == 0 ? "arm64" : host.machine);
+	free(arch);
+}
+
+/* Of `kind`, and of `arch` where both it and a board say one. */
+static int member_fits(const hull_member *m, int kind, const char *arch)
+{
+	return (kind == WANT_ANY || m->board == (kind == WANT_BOARD)) &&
+	       (arch == NULL || arch[0] == '\0' || m->arch[0] == '\0' || strcmp(m->arch, arch) == 0);
 }
 
 /* What of `kind` the pool has now, not counting a board broken, and how
  * much of that is held; with `open` only what is given without a name. */
-static void tally(const char *pool, const hull_pool *p, int kind, int open, unsigned *used,
-                  unsigned *total)
+static void tally(const char *pool, const hull_pool *p, int kind, const char *arch, int open,
+                  unsigned *used, unsigned *total)
 {
 	*used = *total = 0u;
 	if (kind != WANT_BOARD) {
@@ -2562,7 +2583,7 @@ static void tally(const char *pool, const hull_pool *p, int kind, int open, unsi
 		*used  = unnamed_held(pool);
 	}
 	for (unsigned i = 0u; i < p->count; i++)
-		if (member_fits(&p->members[i], kind) && !p->members[i].broken &&
+		if (member_fits(&p->members[i], kind, arch) && !p->members[i].broken &&
 		    !(open && p->members[i].by_name)) {
 			(*total)++;
 			*used += is_held(p->members[i].name) ? 1u : 0u;
@@ -2627,9 +2648,14 @@ static int refused(const char *pool, const hull_pool *p, want *w, const char *cl
 			         pool, pool);
 			return 1;
 		}
-		if (!member_fits(m, w->kind)) {
+		if (!member_fits(m, w->kind, NULL)) {
 			snprintf(why, cap, "member %s of pool %s is a %s", m->name, pool,
 			         m->board ? "board" : "slot");
+			return 1;
+		}
+		if (!member_fits(m, w->kind, w->arch)) {
+			snprintf(why, cap, "board %s of pool %s is %s, and the machine %s", m->name, pool,
+			         m->arch, w->arch);
 			return 1;
 		}
 		for (unsigned k = 0u; k < i; k++)
@@ -2655,8 +2681,8 @@ static int refused(const char *pool, const hull_pool *p, want *w, const char *cl
 	boards = 0u;
 	for (unsigned i = 0u; i < p->count; i++)
 		boards += p->members[i].board ? 1u : 0u;
-	tally(pool, p, w->kind, 0, &used, &every);
-	tally(pool, p, w->kind, 1, &used, &total);
+	tally(pool, p, w->kind, w->arch, 0, &used, &every);
+	tally(pool, p, w->kind, w->arch, 1, &used, &total);
 	total += kept;
 	if (total == 0u && every > 0u) {
 		snprintf(why, cap, "pool %s gives what this asks only by name: `hull reserve %s --member "
@@ -2673,6 +2699,18 @@ static int refused(const char *pool, const hull_pool *p, want *w, const char *cl
 		snprintf(why, cap, "pool %s has no boards for a hw machine: (members (board ...)) in "
 		         "pools.conf", pool);
 		return 1;
+	}
+	if (total == 0u && w->arch[0] != '\0') {
+		unsigned of_arch = 0u;
+
+		tally(pool, p, w->kind, w->arch, 0, &used, &of_arch);
+		for (unsigned i = 0u; i < p->count; i++)
+			of_arch += p->members[i].broken && member_fits(&p->members[i], WANT_BOARD, w->arch);
+		if (of_arch == 0u) {
+			snprintf(why, cap, "pool %s has no board of arch %s: (arch %s) on a (board ...) in "
+			         "pools.conf", pool, w->arch, w->arch);
+			return 1;
+		}
 	}
 	if (total == 0u) {
 		snprintf(why, cap, "every board of pool %s is broken: `hull board ls %s`", pool, pool);
@@ -2763,7 +2801,7 @@ static int pick(const char *pool, const hull_pool *p, const want *w, long long s
 			break;
 		for (unsigned k = 0u; k < w->named; k++)
 			by_name |= strcmp(w->names[k], m->name) == 0;
-		if (by_name || m->by_name || !member_fits(m, w->kind) || m->broken ||
+		if (by_name || m->by_name || !member_fits(m, w->kind, w->arch) || m->broken ||
 		    is_held(m->name) || named_ahead(pool, m->name, since))
 			continue;
 		snprintf(out[taken].name, sizeof out[taken].name, "%s", m->name);
@@ -2785,7 +2823,7 @@ static void in_use(const char *pool, const hull_pool *p, const want *w, char *te
 			snprintf(text, cap, "%s is held", w->names[i]);
 			return;
 		}
-	tally(pool, p, w->kind, 1, &used, &total);
+	tally(pool, p, w->kind, w->arch, 1, &used, &total);
 	if (used < total && !within_budget(pool, p, w, text, cap))
 		return;
 	snprintf(text, cap, "%u of %u in use", used, total);
@@ -3176,7 +3214,18 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 			else if (!lease_entry(l, on_board, member, sizeof member))
 				snprintf(why, sizeof why, "lease %s holds no %s free", l->id,
 				         on_board ? "board" : "slot for a software machine");
-			else if (!on_board) {
+			else if (on_board) {
+				static hull_pool   p;
+				const hull_member *board;
+				char               arch[72];
+
+				machine_arch(&plan_doc, &machine, arch, sizeof arch);
+				if (hull_pool_read(l->pool, &p) == 0 &&
+				    (board = member_of(&p, member)) != NULL &&
+				    !member_fits(board, WANT_BOARD, arch))
+					snprintf(why, sizeof why, "board %s of lease %s is %s, and the machine %s",
+					         member, l->id, board->arch, arch);
+			} else {
 				static hull_pool p;
 				want             asked = { .kind = WANT_SOFTWARE, .count = 1u, .is_run = 1,
 				                           .memory_mib = memory_mib, .cpus = cpus };
@@ -3225,6 +3274,8 @@ static void handle_run(client *c, uint32_t ch, const hull_sexpr_doc *body)
 			free(pool);
 			asked.memory_mib = memory_mib;
 			asked.cpus       = cpus;
+			if (on_board)
+				machine_arch(&plan_doc, &machine, asked.arch, sizeof asked.arch);
 			if (hull_pool_read(pool_name, &p) != 0) {
 				snprintf(why, sizeof why, "pool %s is not one the user's pools.conf names: "
 				         "(pools (%s (capacity N))) in ~/.config/hull/pools.conf",
@@ -5139,7 +5190,7 @@ static void handle_pools(client *c, uint32_t ch)
 			if (hull_pool_read((const char *)pool, &p) == 0 && p.broker[0] != '\0')
 				continue;  /* the frontend asks it */
 			if (p.wrong[0] == '\0' || !broker_mode)
-				tally((const char *)pool, &p, WANT_ANY, 0, &used, &total);
+				tally((const char *)pool, &p, WANT_ANY, NULL, 0, &used, &total);
 			hull_msg_raw(&m, "(4:pool(8:capacity");
 			hull_msg_number(&m, total);
 			hull_msg_raw(&m, ")(4:held");

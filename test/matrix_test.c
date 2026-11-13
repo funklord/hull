@@ -84,6 +84,16 @@ static const hull_capabilities docker = {
 	.entries      = docker_entries,
 };
 
+/* A board's: the hw class, which runs whatever arch its board is. */
+static const char *const board_classes[] = { "hw", NULL };
+
+static const hull_capabilities board = {
+	.struct_size  = sizeof (hull_capabilities),
+	.engine_name  = "board",
+	.classes      = board_classes,
+	.entries      = docker_entries,
+};
+
 typedef struct seen {
 	char     text[1024];
 	size_t   length;
@@ -203,6 +213,10 @@ static void test_lists(void)
 	   "source.ref.overlay:n arch:r");
 	NO("(machine (source \"debian:13\") (arch arm64))", &docker, "ns",
 	   "source.ref.overlay:n arch:r");
+	/* A board is what arch it is: the hw class takes any, the pool giving
+	 * a board of it. */
+	OK("(machine (source \"debian:13\") (arch arm64))", &board, "hw",
+	   "source.ref.overlay:n arch:n");
 	/* An ns engine that declares a foreign arch runs it as its entry says,
 	 * and only that one. */
 	OK("(machine (source \"debian:13\") (arch riscv64))", &docker, "ns",
