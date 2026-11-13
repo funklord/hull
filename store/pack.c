@@ -223,11 +223,7 @@ static int objects_of(const uint8_t *manifest, size_t length, object **objects, 
 }
 
 /* A path and the object it names, from a manifest's entries. */
-typedef struct named {
-	uint8_t     digest[32];
-	const char *path;      /* into the manifest's bytes */
-	size_t      length;
-} named;
+typedef hull_manifest_file named;
 
 static int by_path(const void *a, const void *b)
 {
@@ -340,20 +336,31 @@ static void gear_init(void)
 }
 
 /* The length of the chunk at `data`, of `left` bytes left: cut where the
- * rolling hash's low bits are zero, between CHUNK_MIN and CHUNK_MAX. */
-static size_t chunk_length(const uint8_t *data, size_t left)
+ * rolling hash's bits under `mask` are zero, between `least` and `most`. */
+static size_t cut(const uint8_t *data, size_t left, size_t least, uint64_t mask, size_t most)
 {
 	uint64_t h = 0u;
 	size_t   i;
 
-	if (left <= CHUNK_MIN)
+	gear_init();
+	if (left <= least)
 		return left;
-	for (i = 0u; i < left && i < CHUNK_MAX; i++) {
+	for (i = 0u; i < left && i < most; i++) {
 		h = (h << 1) + gear[data[i]];
-		if (i >= CHUNK_MIN && (h & CHUNK_MASK) == 0u)
+		if (i >= least && (h & mask) == 0u)
 			return i + 1u;
 	}
 	return i;
+}
+
+static size_t chunk_length(const uint8_t *data, size_t left)
+{
+	return cut(data, left, CHUNK_MIN, CHUNK_MASK, CHUNK_MAX);
+}
+
+size_t hull_chunk_length(const uint8_t *data, size_t left)
+{
+	return cut(data, left, HULL_CHUNK_MIN, ((uint64_t)1u << 20) - 1u, HULL_CHUNK_MAX);
 }
 
 typedef struct chunk {
@@ -1090,4 +1097,18 @@ int hull_manifest_objects(const uint8_t *data, size_t length, uint8_t (**digests
 	*count = n;
 	free(objects);
 	return 0;
+}
+
+int hull_manifest_files(const uint8_t *data, size_t length, hull_manifest_file **list,
+                        uint32_t *count)
+{
+	return paths_of(data, length, list, count, by_path);
+}
+
+const hull_manifest_file *hull_manifest_file_at(const hull_manifest_file *list, uint32_t count,
+                                                const char *path, size_t length)
+{
+	hull_manifest_file key = { .path = path, .length = length };
+
+	return count > 0u ? bsearch(&key, list, count, sizeof *list, by_path) : NULL;
 }

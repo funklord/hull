@@ -6642,7 +6642,7 @@ static int pull(const char *name, const char *ref, const char *arch, int objects
 		if (status == 0) {
 			hull_store_close(&store);
 			printf("%s sha256:%s\n", ref, hex);
-			fprintf(stderr, "hull: pull: %u of %u objects fetched, from %s%s\n", fetched, total,
+			fprintf(stderr, "hull: pull: %u of %u blobs fetched, from %s%s\n", fetched, total,
 			        name, HULL_OBJECTS_SUFFIX);
 			return 0;
 		}
@@ -6717,7 +6717,7 @@ static int push(const char *name, const char *image, int objects)
 
 		status = hull_push_objects(&store, name, image, &sent, &total, why, sizeof why);
 		if (status == 0)
-			fprintf(stderr, "hull: push: %u of %u objects sent, under %s%s\n", sent, total,
+			fprintf(stderr, "hull: push: %u of %u blobs sent, under %s%s\n", sent, total,
 			        image, HULL_OBJECTS_SUFFIX);
 	}
 	hull_store_close(&store);

@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <zlib.h>
@@ -24,6 +25,7 @@
 #include "push.h"
 #include "remote.h"
 #include "sexpr.h"
+#include "sha256.h"
 
 #define OCI_MANIFEST "application/vnd.oci.image.manifest.v1+json"
 #define OCI_CONFIG   "application/vnd.oci.image.config.v1+json"
@@ -449,6 +451,7 @@ int hull_push_objects(hull_store *store, const char *name, const char *image, un
 	size_t                   tree_length = 0u;
 	uint8_t                (*digests)[32] = NULL;
 	uint32_t                 count = 0u;
+	unsigned                 layers = 0u;
 	char                     hex[65];
 	char                     config_digest[80];
 	char                     text_size[48];
@@ -500,13 +503,57 @@ int hull_push_objects(hull_store *store, const char *name, const char *image, un
 		}
 		hull_sha256_hex(digests[i], object_hex);
 		snprintf(digest, sizeof digest, "sha256:%s", object_hex);
+		/* A large object as its chunks, each a blob, in order, each
+		 * naming the object it is of: a new version of it sends only
+		 * the chunks that changed. */
+		if ((uint64_t)st.st_size >= HULL_CHUNK_FLOOR) {
+			size_t         length = (size_t)st.st_size;
+			const uint8_t *bytes = mmap(NULL, length, PROT_READ, MAP_PRIVATE, fd, 0);
+
+			close(fd);
+			if (bytes == MAP_FAILED) {
+				say(why, cap, name, "an object of it could not be read");
+				goto done;
+			}
+			for (size_t at = 0u; at < length;) {
+				size_t            n = hull_chunk_length(bytes + at, length - at);
+				hull_https_upload part = { .data = bytes + at, .fd = -1, .length = (long long)n };
+				hull_sha256       h;
+				uint8_t           raw[32];
+				char              chunk_hex[65];
+				char              chunk[80];
+
+				hull_sha256_init(&h);
+				hull_sha256_update(&h, bytes + at, n);
+				hull_sha256_final(&h, raw);
+				hull_sha256_hex(raw, chunk_hex);
+				snprintf(chunk, sizeof chunk, "sha256:%s", chunk_hex);
+				if ((was = upload_blob(&r, chunk, &part, why, cap)) < 0) {
+					munmap((void *)bytes, length);
+					goto done;
+				}
+				*sent += (unsigned)was;
+				add_text(&manifest, layers++ == 0u ? "{\"mediaType\":\"" : ",{\"mediaType\":\"");
+				add_text(&manifest, executable ? HULL_CHUNK_EXECUTABLE_TYPE : HULL_CHUNK_TYPE);
+				add_text(&manifest, "\",\"digest\":\"");
+				add_text(&manifest, chunk);
+				snprintf(text_size, sizeof text_size, "\",\"size\":%zu,", n);
+				add_text(&manifest, text_size);
+				add_text(&manifest, "\"annotations\":{\"" HULL_CHUNK_OF "\":\"");
+				add_text(&manifest, digest);
+				add_text(&manifest, "\"}}");
+				at += n;
+			}
+			munmap((void *)bytes, length);
+			continue;
+		}
 		body.length = (long long)st.st_size;
 		was = upload_blob(&r, digest, &body, why, cap);
 		close(fd);
 		if (was < 0)
 			goto done;
 		*sent += (unsigned)was;
-		add_text(&manifest, i == 0u ? "{\"mediaType\":\"" : ",{\"mediaType\":\"");
+		add_text(&manifest, layers++ == 0u ? "{\"mediaType\":\"" : ",{\"mediaType\":\"");
 		add_text(&manifest, executable ? HULL_EXECUTABLE_TYPE : HULL_OBJECT_TYPE);
 		add_text(&manifest, "\",\"digest\":\"");
 		add_text(&manifest, digest);
@@ -514,7 +561,7 @@ int hull_push_objects(hull_store *store, const char *name, const char *image, un
 		add_text(&manifest, text_size);
 	}
 	add_text(&manifest, "]}");
-	*total = count;
+	*total = layers;
 	if (manifest.failed) {
 		say(why, cap, "out of memory", NULL);
 		goto done;

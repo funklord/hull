@@ -130,6 +130,33 @@ int hull_pack_inspect(int in, FILE *out, char *why, size_t cap);
 int hull_manifest_objects(const uint8_t *data, size_t length, uint8_t (**digests)[32],
                           uint32_t *count);
 
+/* A regular file of a manifest: its object, and its path, pointing into
+ * the manifest's bytes, which must outlive it. */
+typedef struct hull_manifest_file {
+	uint8_t     digest[32];
+	const char *path;
+	size_t      length;
+} hull_manifest_file;
+
+/* Every regular file a manifest's canonical bytes name, sorted by path,
+ * into a new array of `*count`; 0, or -1 where they are not a manifest.
+ * And the one of them at `path`, or NULL. */
+int hull_manifest_files(const uint8_t *data, size_t length, hull_manifest_file **list,
+                        uint32_t *count);
+const hull_manifest_file *hull_manifest_file_at(const hull_manifest_file *list, uint32_t count,
+                                                const char *path, size_t length);
+
+/* Appendix C's chunks for a registry: an object of HULL_CHUNK_FLOOR bytes
+ * or more goes as chunks, cut where a rolling gear hash of its bytes
+ * says, HULL_CHUNK_MIN to HULL_CHUNK_MAX, about 1.5 MiB, so that a byte
+ * changed moves one chunk and not the file. The length of the chunk at
+ * `data`, of `left` bytes left; the same cut in every hull, since a
+ * puller cuts its own copy of the last version to find what it has. */
+#define HULL_CHUNK_FLOOR (4u << 20)
+#define HULL_CHUNK_MIN   (512u << 10)
+#define HULL_CHUNK_MAX   (4u << 20)
+size_t hull_chunk_length(const uint8_t *data, size_t left);
+
 /* A manifest's canonical bytes in A.1's readable view, as `hull manifest
  * show` gives a stored one. 0, or -1 where they are not one. */
 int hull_manifest_print(const uint8_t *data, size_t length, FILE *out);

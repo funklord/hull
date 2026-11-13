@@ -268,14 +268,14 @@ printf 'first version\n' > "$root/ov1/etc/version-file"
 expect 0 '' "$hull" commit "$root/ov1" obj/v:1
 expect 0 '^obj/v:2 sha256:' "$hull" commit "$root/ov2" obj/v:2
 v2hash=$(printf '%s\n' "$out" | sed -n 's/^obj\/v:2 sha256://p')
-expect 0 '^hull: push: ([0-9]+) of \1 objects sent, under 127\.0\.0\.1:'"$port"'/test/objs:1\.hull$' \
+expect 0 '^hull: push: ([0-9]+) of \1 blobs sent, under 127\.0\.0\.1:'"$port"'/test/objs:1\.hull$' \
 	"$hull" push --objects obj/v:1 "127.0.0.1:$port/test/objs:1"
-expect 0 '^hull: push: 1 of [0-9]+ objects sent' \
+expect 0 '^hull: push: 1 of [0-9]+ blobs sent' \
 	"$hull" push --objects obj/v:2 "127.0.0.1:$port/test/objs:2"
 mkdir -p "$root/objhost"
-expect 0 '^hull: pull: ([0-9]+) of \1 objects fetched' \
+expect 0 '^hull: pull: ([0-9]+) of \1 blobs fetched' \
 	env XDG_DATA_HOME="$root/objhost" "$hull" pull --objects "127.0.0.1:$port/test/objs:1" obj/v:1
-expect 0 '^hull: pull: 1 of [0-9]+ objects fetched' \
+expect 0 '^hull: pull: 1 of [0-9]+ blobs fetched' \
 	env XDG_DATA_HOME="$root/objhost" "$hull" pull --objects "127.0.0.1:$port/test/objs:2" obj/v:2
 cases=$((cases + 1))
 printf '%s\n' "$out" | grep -qx "obj/v:2 sha256:$v2hash" ||
@@ -288,6 +288,44 @@ expect 0 'has no .*test/pushed:1\.hull, so the image is pulled' \
 	env XDG_DATA_HOME="$root/objhost" "$hull" pull --objects "$pushed" back/objs
 chmod -R u+w "$root/ov1" "$root/ov2" "$root/objhost" "$root/objtree" 2>/dev/null
 rm -rf "${root:?}/ov1" "${root:?}/ov2" "${root:?}/objhost" "${root:?}/objtree"
+# A large file goes by its chunks: a byte changed in an 8 MiB file sends
+# the chunk or two it falls in, and a store holding the last version under
+# the ref fetches only those, cutting its own copy to find the rest; a
+# store without it fetches every blob. The tree it makes is the one pushed.
+rm -rf "${root:?}/big1" "${root:?}/big2" "${root:?}/bighost" "${root:?}/coldhost" "${root:?}/bigtree"
+mkdir -p "$root/big1/data" "$root/bighost" "$root/coldhost"
+head -c 8388608 /dev/urandom > "$root/big1/data/disk.img"
+printf 'small\n' > "$root/big1/data/note"
+cp -a "$root/big1" "$root/big2"
+printf 'X' | dd of="$root/big2/data/disk.img" bs=1 seek=4194304 conv=notrunc 2> /dev/null
+cmp -s "$root/big1/data/disk.img" "$root/big2/data/disk.img" &&
+	printf 'Y' | dd of="$root/big2/data/disk.img" bs=1 seek=4194304 conv=notrunc 2> /dev/null
+expect 0 '' "$hull" commit "$root/big1" big/v:1
+expect 0 '^big/v:2 sha256:' "$hull" commit "$root/big2" big/v:2
+big2hash=$(printf '%s\n' "$out" | sed -n 's/^big\/v:2 sha256://p')
+expect 0 '^hull: push: ([0-9]+) of \1 blobs sent' \
+	"$hull" push --objects big/v:1 "127.0.0.1:$port/test/big:1"
+cases=$((cases + 1))
+blobs=$(printf '%s\n' "$out" | sed -n 's/^hull: push: \([0-9]*\) of .*/\1/p')
+[ "${blobs:-0}" -ge 4 ] ||
+	fail "an 8 MiB file did not go as chunks" "$out"
+expect 0 '^hull: push: [12] of [0-9]+ blobs sent' \
+	"$hull" push --objects big/v:2 "127.0.0.1:$port/test/big:2"
+expect 0 '^hull: pull: ([0-9]+) of \1 blobs fetched' \
+	env XDG_DATA_HOME="$root/bighost" "$hull" pull --objects "127.0.0.1:$port/test/big:1" big/now
+expect 0 '^hull: pull: [12] of [0-9]+ blobs fetched' \
+	env XDG_DATA_HOME="$root/bighost" "$hull" pull --objects "127.0.0.1:$port/test/big:2" big/now
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -qx "big/now sha256:$big2hash" ||
+	fail "a tree pulled by its chunks is not the tree pushed" "$out"
+expect 0 '' env XDG_DATA_HOME="$root/bighost" "$hull" materialize big/now "$root/bigtree"
+cases=$((cases + 1))
+cmp -s "$root/big2/data/disk.img" "$root/bigtree/data/disk.img" ||
+	fail "a file made from its chunks differs from the one pushed" ""
+expect 0 '^hull: pull: ([0-9]+) of \1 blobs fetched' \
+	env XDG_DATA_HOME="$root/coldhost" "$hull" pull --objects "127.0.0.1:$port/test/big:2" big/now
+chmod -R u+w "$root/big1" "$root/big2" "$root/bighost" "$root/coldhost" "$root/bigtree" 2>/dev/null
+rm -rf "${root:?}/big1" "${root:?}/big2" "${root:?}/bighost" "${root:?}/coldhost" "${root:?}/bigtree"
 # A tree with no runtime pushes with an empty config, and comes back with
 # the workdir a pull gives.
 expect 0 '' "$hull" push again/1 "127.0.0.1:$port/test/plain:1"

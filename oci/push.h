@@ -32,8 +32,11 @@ int hull_push(hull_store *store, const char *name, const char *image, char diges
  * a blob of its raw bytes, so that a blob's digest is the object's name in
  * the store. A registry dedups them as it does any blob, so a new version
  * sends only the objects the last one did not have, and hull_pull_objects
- * fetches only those a store lacks. How many objects were sent into
- * `*sent`, how many there are into `*total`. 0, or -1 with `why`.
+ * fetches only those a store lacks. An object of HULL_CHUNK_FLOOR bytes
+ * or more goes as its chunks (hull_chunk_length), each a blob annotated
+ * HULL_CHUNK_OF with the object's digest, in order, so a large file
+ * changed in one place sends one chunk. How many blobs were sent into
+ * `*sent`, how many layers there are into `*total`. 0, or -1 with `why`.
  */
 int hull_push_objects(hull_store *store, const char *name, const char *image, unsigned *sent,
                       unsigned *total, char *why, size_t cap);
@@ -43,6 +46,9 @@ int hull_push_objects(hull_store *store, const char *name, const char *image, un
 #define HULL_MANIFEST_TYPE    "application/vnd.hull.manifest.v1"
 #define HULL_OBJECT_TYPE      "application/vnd.hull.object.v1"
 #define HULL_EXECUTABLE_TYPE  "application/vnd.hull.object.executable.v1"
+#define HULL_CHUNK_TYPE       "application/vnd.hull.chunk.v1"
+#define HULL_CHUNK_EXECUTABLE_TYPE "application/vnd.hull.chunk.executable.v1"
+#define HULL_CHUNK_OF         "vnd.hull.object"
 
 #ifdef __cplusplus
 }

@@ -19,6 +19,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/file.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -959,6 +960,202 @@ done:
 	return result;
 }
 
+/* --- an object by its chunks (Appendix C) -------------------------------- */
+
+/* A chunk the puller has: where in which bytes. */
+typedef struct held_chunk {
+	uint8_t  digest[32];
+	uint64_t offset;
+	uint64_t length;
+	int      fetched;   /* in the object being made, else in the seed */
+} held_chunk;
+
+/* The object being made from its chunks: its digest, the file it is
+ * written to, and the chunks it can be made from without fetching -- the
+ * seed's, the last version of the same path cut the same way, and those
+ * fetched for it already. */
+typedef struct assembly {
+	int            active;
+	int            skip;        /* the store has it */
+	int            executable;
+	uint8_t        object[32];
+	int            fd;
+	uint64_t       length;
+	const uint8_t *seed;
+	size_t         seed_length;
+	held_chunk    *held;
+	size_t         count;
+	size_t         room;
+} assembly;
+
+static int hold(assembly *a, const uint8_t digest[32], uint64_t offset, uint64_t length,
+                int fetched)
+{
+	if (a->count == a->room) {
+		size_t      room = a->room != 0u ? a->room * 2u : 256u;
+		held_chunk *grown = realloc(a->held, room * sizeof *grown);
+
+		if (grown == NULL)
+			return -1;
+		a->held = grown;
+		a->room = room;
+	}
+	memcpy(a->held[a->count].digest, digest, 32u);
+	a->held[a->count].offset = offset;
+	a->held[a->count].length = length;
+	a->held[a->count].fetched = fetched;
+	a->count++;
+	return 0;
+}
+
+static void assembly_end(assembly *a)
+{
+	if (a->fd >= 0)
+		close(a->fd);
+	if (a->seed != NULL)
+		munmap((void *)a->seed, a->seed_length);
+	free(a->held);
+	*a = (assembly){ .fd = -1 };
+}
+
+/* Begin making `object`: the seed is the object at the same path in the
+ * tree `ref` named before, where it had one and it is not this. */
+static int assembly_begin(assembly *a, hull_store *store, const uint8_t object[32],
+                          int executable, const hull_manifest_file *now, uint32_t now_count,
+                          const hull_manifest_file *was, uint32_t was_count, const char *tmp,
+                          char *why, size_t cap)
+{
+	int fd;
+	int ignored;
+
+	assembly_end(a);
+	a->active = 1;
+	memcpy(a->object, object, 32u);
+	a->executable = executable;
+	if ((fd = hull_store_object_open(store, object, &ignored)) >= 0) {
+		close(fd);
+		a->skip = 1;
+		return 0;
+	}
+	if ((a->fd = open(tmp, O_TMPFILE | O_RDWR | O_CLOEXEC, 0600)) < 0)
+		return say(why, cap, tmp, strerror(errno));
+	for (uint32_t i = 0u; i < now_count; i++) {
+		const hull_manifest_file *old;
+		struct stat               st;
+
+		if (memcmp(now[i].digest, object, 32u) != 0 ||
+		    (old = hull_manifest_file_at(was, was_count, now[i].path, now[i].length)) == NULL ||
+		    (fd = hull_store_object_open(store, old->digest, &ignored)) < 0)
+			continue;
+		if (fstat(fd, &st) == 0 && st.st_size > 0) {
+			void *seed = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+
+			if (seed != MAP_FAILED) {
+				a->seed = seed;
+				a->seed_length = (size_t)st.st_size;
+			}
+		}
+		close(fd);
+		break;
+	}
+	for (size_t at = 0u; a->seed != NULL && at < a->seed_length;) {
+		size_t      n = hull_chunk_length(a->seed + at, a->seed_length - at);
+		hull_sha256 h;
+		uint8_t     raw[32];
+
+		hull_sha256_init(&h);
+		hull_sha256_update(&h, a->seed + at, n);
+		hull_sha256_final(&h, raw);
+		if (hold(a, raw, at, n, 0) != 0)
+			return say(why, cap, "out of memory", NULL);
+		at += n;
+	}
+	return 0;
+}
+
+static int write_at(int fd, const uint8_t *data, size_t n, uint64_t at)
+{
+	while (n > 0u) {
+		ssize_t wrote = pwrite(fd, data, n, (off_t)at);
+
+		if (wrote < 0 && errno == EINTR)
+			continue;
+		if (wrote <= 0)
+			return -1;
+		data += wrote;
+		n -= (size_t)wrote;
+		at += (uint64_t)wrote;
+	}
+	return 0;
+}
+
+/* The next chunk, `digest` of `size` bytes: from what is held where it
+ * is, else fetched into `buffer`, held to its digest. */
+static int assembly_add(assembly *a, hull_remote *s, const char *digest, uint64_t size,
+                        uint8_t *buffer, unsigned *fetched, char *why, size_t cap)
+{
+	uint8_t raw[32];
+
+	if (a->skip)
+		return 0;
+	for (unsigned i = 0u; i < 32u; i++) {
+		unsigned byte;
+
+		sscanf(digest + 7 + 2u * i, "%2x", &byte);
+		raw[i] = (uint8_t)byte;
+	}
+	for (size_t i = 0u; i < a->count; i++) {
+		const held_chunk *c = &a->held[i];
+
+		if (memcmp(c->digest, raw, 32u) != 0 || c->length != size)
+			continue;
+		if (!c->fetched) {
+			if (write_at(a->fd, a->seed + c->offset, (size_t)size, a->length) != 0)
+				return say(why, cap, "an object could not be written", strerror(errno));
+		} else {
+			if (pread(a->fd, buffer, (size_t)size, (off_t)c->offset) != (ssize_t)size ||
+			    write_at(a->fd, buffer, (size_t)size, a->length) != 0)
+				return say(why, cap, "an object could not be written", strerror(errno));
+		}
+		a->length += size;
+		return 0;
+	}
+	{
+		hull_remote_sink blob = { .data = buffer, .cap = HULL_CHUNK_MAX, .fd = -1 };
+		char             url[8192];
+
+		if (size > HULL_CHUNK_MAX)
+			return say(why, cap, digest, "a chunk is larger than a chunk may be");
+		hull_sha256_init(&blob.hash);
+		snprintf(url, sizeof url, "https://%s/v2/%s/blobs/%s", s->img.host, s->img.repository,
+		         digest);
+		if (hull_remote_fetch(s, url, NULL, &blob, why, cap) != 0 ||
+		    hull_remote_verify(&blob, digest, "a chunk", why, cap) != 0)
+			return -1;
+		if (blob.length != size)
+			return say(why, cap, digest, "a chunk is not the size its layer says");
+		if (write_at(a->fd, buffer, blob.length, a->length) != 0)
+			return say(why, cap, "an object could not be written", strerror(errno));
+		if (hold(a, raw, a->length, size, 1) != 0)
+			return say(why, cap, "out of memory", NULL);
+		a->length += size;
+		(*fetched)++;
+	}
+	return 0;
+}
+
+/* The object made: into the store, which holds it to its digest. */
+static int assembly_finish(assembly *a, hull_store *store, char *why, size_t cap)
+{
+	int result = 0;
+
+	if (a->active && !a->skip)
+		result = hull_store_object_put(store, a->fd, a->length, a->executable, a->object, why,
+		                               cap);
+	assembly_end(a);
+	return result;
+}
+
 int hull_pull_objects(hull_store *store, const char *image, const char *ref, char hex[65],
                       unsigned *fetched, unsigned *total, char *why, size_t cap)
 {
@@ -980,6 +1177,15 @@ int hull_pull_objects(hull_store *store, const char *image, const char *ref, cha
 	uint8_t            *tree = NULL;
 	uint8_t           (*named)[32] = NULL;
 	uint32_t            named_count = 0u;
+	hull_manifest_file *now = NULL;
+	uint32_t            now_count = 0u;
+	hull_manifest_file *was = NULL;
+	uint32_t            was_count = 0u;
+	uint8_t            *was_tree = NULL;
+	size_t              was_length = 0u;
+	char                was_hex[65];
+	uint8_t            *chunk_buffer = NULL;
+	assembly            building = { .fd = -1 };
 	int                 first = 1;
 	int                 result = -1;
 
@@ -1052,14 +1258,34 @@ int hull_pull_objects(hull_store *store, const char *image, const char *ref, cha
 			say(why, cap, "the tree's manifest", "it is not a manifest");
 			goto done;
 		}
-		/* Each object the store lacks, by its digest, which is its name. */
+		/* What this tree has at each path, and what the ref named before
+		 * had: a large object's seed is the last version's at its path. */
+		if (hull_manifest_files(tree, (size_t)st.st_size, &now, &now_count) != 0) {
+			say(why, cap, "the tree's manifest", "it is not a manifest");
+			goto done;
+		}
+		{
+			char ignored[200];
+
+			if (hull_store_manifest_of(store, ref, was_hex, &was_tree, &was_length, ignored,
+			                           sizeof ignored) == 0 &&
+			    hull_manifest_files(was_tree, was_length, &was, &was_count) != 0)
+				was_count = 0u;
+		}
+		/* Each object the store lacks, by its digest, which is its name;
+		 * a large one by its chunks, those the seed has taken from it. */
 		while (hull_json_element(&doc, &layers, first, &layer)) {
-			char        digest[80];
-			char        media[128] = "";
-			uint8_t     raw[32];
-			int         executable;
-			int         fd;
-			struct stat object;
+			char            digest[80];
+			char            media[128] = "";
+			char            of[80] = "";
+			uint8_t         raw[32];
+			int             executable;
+			int             fd;
+			int             chunk;
+			long long       size = -1;
+			hull_json_value annotations;
+			hull_json_value size_value;
+			struct stat     object;
 
 			first = 0;
 			if (hull_json_member_string(&doc, &layer, "digest", digest, sizeof digest) < 0 ||
@@ -1068,13 +1294,50 @@ int hull_pull_objects(hull_store *store, const char *image, const char *ref, cha
 				say(why, cap, s.img.reference, "a layer of it names no object");
 				goto done;
 			}
-			for (unsigned i = 0u; i < 32u; i++) {
+			(*total)++;
+			chunk = strcmp(media, HULL_CHUNK_TYPE) == 0 ||
+			        strcmp(media, HULL_CHUNK_EXECUTABLE_TYPE) == 0;
+			if (chunk) {
+				uint8_t of_raw[32];
+
+				if (!hull_json_member(&doc, &layer, "annotations", &annotations) ||
+				    hull_json_member_string(&doc, &annotations, HULL_CHUNK_OF, of, sizeof of) < 0 ||
+				    !hull_remote_is_digest(of) ||
+				    !hull_json_member(&doc, &layer, "size", &size_value) ||
+				    hull_json_integer(&doc, &size_value, &size) != 0 || size <= 0) {
+					say(why, cap, s.img.reference, "a chunk of it names no object");
+					goto done;
+				}
+				for (unsigned j = 0u; j < 32u; j++) {
+					unsigned byte;
+
+					sscanf(of + 7 + 2u * j, "%2x", &byte);
+					of_raw[j] = (uint8_t)byte;
+				}
+				if (!building.active || memcmp(building.object, of_raw, 32u) != 0) {
+					if (assembly_finish(&building, store, why, cap) != 0 ||
+					    assembly_begin(&building, store, of_raw,
+					                   strcmp(media, HULL_CHUNK_EXECUTABLE_TYPE) == 0, now,
+					                   now_count, was, was_count, tmp, why, cap) != 0)
+						goto done;
+				}
+				if (chunk_buffer == NULL && (chunk_buffer = malloc(HULL_CHUNK_MAX)) == NULL) {
+					say(why, cap, "out of memory", NULL);
+					goto done;
+				}
+				if (assembly_add(&building, &s, digest, (uint64_t)size, chunk_buffer, fetched,
+				                 why, cap) != 0)
+					goto done;
+				continue;
+			}
+			if (assembly_finish(&building, store, why, cap) != 0)
+				goto done;
+			for (unsigned j = 0u; j < 32u; j++) {
 				unsigned byte;
 
-				sscanf(digest + 7 + 2u * i, "%2x", &byte);
-				raw[i] = (uint8_t)byte;
+				sscanf(digest + 7 + 2u * j, "%2x", &byte);
+				raw[j] = (uint8_t)byte;
 			}
-			(*total)++;
 			if ((fd = hull_store_object_open(store, raw, &executable)) >= 0) {
 				close(fd);
 				continue;
@@ -1101,6 +1364,8 @@ int hull_pull_objects(hull_store *store, const char *image, const char *ref, cha
 				(*fetched)++;
 			}
 		}
+		if (assembly_finish(&building, store, why, cap) != 0)
+			goto done;
 		/* Every object the manifest names in the store now, whatever the
 		 * layers said. */
 		for (uint32_t i = 0u; i < named_count; i++) {
@@ -1120,7 +1385,12 @@ int hull_pull_objects(hull_store *store, const char *image, const char *ref, cha
 		}
 	}
 done:
+	assembly_end(&building);
 	flock(store->lock, LOCK_UN);
+	free(chunk_buffer);
+	free(was);
+	free(was_tree);
+	free(now);
 	free(named);
 	free(tree);
 	free(data);
