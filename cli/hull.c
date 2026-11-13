@@ -5660,8 +5660,9 @@ static int apply_policy(hull_registry *registry)
  * record, its columns fixed, a header first; "-" for no holder. */
 static int pool_members(const char *pool, int json)
 {
-	static const char *const keys[] = { "name", "kind", "priority", "state", "holder" };
-	static const char *const names[] = { "member", "kind", "priority", "state", "holder" };
+	static const char *const keys[] = { "name", "kind", "priority", "state", "holder", "arch" };
+	static const char *const names[] = { "member", "kind", "priority", "state", "holder",
+	                                     "arch" };
 	static hull_pool         given;
 	unsigned                 records = 0u;
 	hull_wire                wire;
@@ -5683,17 +5684,18 @@ static int pool_members(const char *pool, int json)
 	if (json)
 		printf("[");
 	else
-		printf("%-24s %-6s %-9s %-8s %s\n", "MEMBER", "KIND", "PRIORITY", "STATE", "HOLDER");
+		printf("%-24s %-6s %-8s %-9s %-8s %s\n", "MEMBER", "KIND", "ARCH", "PRIORITY", "STATE",
+		       "HOLDER");
 	hull_sexpr_first(&body, &message);
 	hull_sexpr_child(&body, &message, &item);
 	while (hull_sexpr_next(&body, &item, &item)) {
-		char            values[5][64] = { "", "", "", "", "" };
+		char            values[6][64] = { "", "", "", "", "", "" };
 		hull_sexpr_form head;
 
 		if (item.kind != HULL_SEXPR_LIST || !hull_sexpr_child(&body, &item, &head) ||
 		    !hull_sexpr_is(&body, &head, "member"))
 			continue;
-		for (unsigned k = 0u; k < 5u; k++) {
+		for (unsigned k = 0u; k < 6u; k++) {
 			hull_sexpr_form value;
 			hull_sexpr_form name;
 			hull_sexpr_form v;
@@ -5703,11 +5705,13 @@ static int pool_members(const char *pool, int json)
 				hull_msg_string(&body, &v, values[k], sizeof values[k]);
 		}
 		if (json) {
-			const char *const row[] = { values[0], values[1], values[2], values[3], values[4] };
+			const char *const row[] = { values[0], values[1], values[2], values[3], values[4],
+			                            values[5] };
 
-			json_record(names, row, 5u, 0x4u, &records);
+			json_record(names, row, 6u, 0x4u, &records);
 		} else {
-			printf("%-24s %-6s %-9s %-8s %s\n", values[0], values[1], values[2], values[3],
+			printf("%-24s %-6s %-8s %-9s %-8s %s\n", values[0], values[1],
+			       values[5][0] != '\0' ? values[5] : "-", values[2], values[3],
 			       values[4][0] != '\0' ? values[4] : "-");
 		}
 	}

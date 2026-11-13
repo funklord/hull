@@ -177,9 +177,9 @@ printf '%s\n' "$out" | grep -q 'uid=' && fail 'a broker key gave a shell' "$out"
 
 as alice 0 '^bench +4 +0 +0$' pool ls
 as alice 0 '^mine +1 +0 +0$' pool ls
-as alice 0 '^gpu +slot +by-name +free +-$' pool ls bench
+as alice 0 '^gpu +slot +- +by-name +free +-$' pool ls bench
 lease=$(run_as alice timeout 30 "$hull" reserve bench --member gpu < /dev/null)
-as bob 0 "^gpu +slot +by-name +leased +$lease\$" pool ls bench
+as bob 0 "^gpu +slot +- +by-name +leased +$lease\$" pool ls bench
 as bob 75 'no slot of pool bench: gpu is held' reserve bench --member gpu --no-wait
 as bob 0 "^$lease +bench +1 +0 +- +alice\$" lease ls
 # What is alice's is not bob's to end, or to run under.
@@ -190,7 +190,7 @@ conf quick '(backend chroot) (pool "bench") (hostname "quick") (command "/probe"
 as bob 125 'no such lease is held' run --lease "$lease" -f "$root/project/quick.conf"
 as alice 0 '^quick$' run --lease "$lease" -f "$root/project/quick.conf"
 as alice 0 '' release "$lease"
-as bob 0 '^gpu +slot +by-name +free +-$' pool ls bench
+as bob 0 '^gpu +slot +- +by-name +free +-$' pool ls bench
 
 # --- a run: asked there, run here, given back ---------------------------------
 
@@ -215,7 +215,7 @@ conf board2 '(backend hw) (pool "bench") (hostname "onboard2") (command "/probe"
 (run_as alice timeout -k 2 70 "$hull" run -f "$root/project/board.conf" > "$root/board.out" 2>&1 < /dev/null) &
 onboard=$!
 wait_ready "$root/board.out"
-as bob 0 '^b1 +board +5 +leased ' pool ls bench
+as bob 0 '^b1 +board +- +5 +leased ' pool ls bench
 # bob's --no-wait takes the board left, which his file does not describe:
 # told, and it goes back.
 as bob 125 'which pools.conf here does not describe' run --no-wait -f "$root/project/board2.conf"
@@ -390,11 +390,11 @@ until run_as bob timeout 20 "$hull" pool ls bench < /dev/null | grep -q '^b1 .*b
 	n=$((n + 1))
 	sleep 0.5
 done
-as bob 0 '^b1 +board +5 +broken +-$' pool ls bench
+as bob 0 '^b1 +board +- +5 +broken +-$' pool ls bench
 cases=$((cases + 1))
 env XDG_DATA_HOME="$broker" timeout 20 "$hull" board fix b1 ||
 	fail 'a mark at the broker could not be taken off' ''
-as bob 0 '^b1 +board +5 +free +-$' pool ls bench
+as bob 0 '^b1 +board +- +5 +free +-$' pool ls bench
 
 # A grant nobody hears goes back: told, and gone or silent, a peer holds nothing.
 # What is held stays, gone or not, and a lease is not another's to hold.
@@ -472,11 +472,11 @@ wait "$silent" 2> /dev/null
 cases=$((cases + 1))
 python3 -I "$root/unheld.py" "$broker" held > "$root/unheld.out" 2>&1
 heldid=$(head -1 "$root/unheld.out")
-as bob 0 "^gpu +slot +by-name +leased +$heldid\$" pool ls bench
+as bob 0 "^gpu +slot +- +by-name +leased +$heldid\$" pool ls bench
 kill -KILL "$broker_pid"
 wait "$broker_pid" 2> /dev/null
 broker_up
-as bob 0 "^gpu +slot +by-name +leased +$heldid\$" pool ls bench
+as bob 0 "^gpu +slot +- +by-name +leased +$heldid\$" pool ls bench
 run_as admin timeout 20 "$hull" release "$heldid" > /dev/null 2>&1 < /dev/null
 # Not held, a broker that dies has given nothing: it was on no disk.
 python3 -I "$root/unheld.py" "$broker" silent 5 > "$root/unheld.out" 2>&1 &
@@ -485,7 +485,7 @@ sleep 1
 kill -KILL "$broker_pid"
 wait "$broker_pid" 2> /dev/null
 broker_up
-as bob 0 '^gpu +slot +by-name +free +-$' pool ls bench
+as bob 0 '^gpu +slot +- +by-name +free +-$' pool ls bench
 kill "$silent" 2> /dev/null
 wait "$silent" 2> /dev/null
 

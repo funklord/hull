@@ -5237,7 +5237,11 @@ static void handle_members(client *c, uint32_t ch, const hull_sexpr_doc *body)
 			snprintf(priority, sizeof priority, "by-name");
 		else
 			snprintf(priority, sizeof priority, "%d", entry->priority);
-		hull_msg_raw(&m, "(6:member(6:holder");
+		/* A board's arch, which machines it is given (section 4.12), ""
+		 * where it says none; first, its key sorting first. */
+		hull_msg_raw(&m, "(6:member(4:arch");
+		hull_msg_text(&m, entry->arch);
+		hull_msg_raw(&m, ")(6:holder");
 		hull_msg_text(&m, holder != NULL ? holder : "");
 		hull_msg_raw(&m, ")(4:kind");
 		hull_msg_text(&m, entry->board ? "board" : "slot");

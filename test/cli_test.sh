@@ -3597,19 +3597,19 @@ cat > "$root/home/.config/hull/pools.conf" <<'CONF'
   (tend (capacity 1))
   (tbudget (capacity 4) (memory "1G") (cpus 3)))
 CONF
-expect 0 '^plain +slot +5 +free +-$' "$hull" pool ls tmix
-expect 0 '^gpu +slot +-1 +free +-$' "$hull" pool ls tmix
+expect 0 '^plain +slot +- +5 +free +-$' "$hull" pool ls tmix
+expect 0 '^gpu +slot +- +-1 +free +-$' "$hull" pool ls tmix
 cases=$((cases + 1))
 [ "$(timeout 20 "$hull" pool ls tmix | awk 'NR > 1 { print $1 }' | tr '\n' ' ')" = "plain gpu " ] ||
 	fail "pool ls POOL is not the order the pool fills" "$("$hull" pool ls tmix 2>&1)"
 expect 0 '^tmix +3 +0 +0$' "$hull" pool ls
 first=$(timeout 20 "$hull" reserve tmix)
-expect 0 "^plain +slot +5 +leased +$first\$" "$hull" pool ls tmix
+expect 0 "^plain +slot +- +5 +leased +$first\$" "$hull" pool ls tmix
 second=$(timeout 20 "$hull" reserve tmix)
-expect 0 '^gpu +slot +-1 +free +-$' "$hull" pool ls tmix
+expect 0 '^gpu +slot +- +-1 +free +-$' "$hull" pool ls tmix
 expect 0 '^tmix +3 +2 +0$' "$hull" pool ls
 third=$(timeout 20 "$hull" reserve tmix)
-expect 0 "^gpu +slot +-1 +leased +$third\$" "$hull" pool ls tmix
+expect 0 "^gpu +slot +- +-1 +leased +$third\$" "$hull" pool ls tmix
 expect 75 'no slot of pool tmix: 3 of 3 in use, and the lease does not wait' \
 	"$hull" reserve tmix --no-wait
 expect 0 '' "$hull" release "$second"
@@ -3618,8 +3618,8 @@ expect 0 '' "$hull" release "$first"
 # A lease by name: that entry and no other, a run of the pool going past it;
 # held, refused 75, saying what holds it up; what cannot be, refused 125.
 named=$(timeout 20 "$hull" reserve tmix --member gpu)
-expect 0 "^gpu +slot +-1 +leased +$named\$" "$hull" pool ls tmix
-expect 0 '^plain +slot +5 +free +-$' "$hull" pool ls tmix
+expect 0 "^gpu +slot +- +-1 +leased +$named\$" "$hull" pool ls tmix
+expect 0 '^plain +slot +- +5 +free +-$' "$hull" pool ls tmix
 expect 75 'no slot of pool tmix: gpu is held, and the lease does not wait' \
 	"$hull" reserve tmix --member gpu --no-wait
 expect 125 'pool tmix has no member nosuch' "$hull" reserve tmix --member nosuch
@@ -3650,9 +3650,9 @@ until grep -q '^ready$' "$root/pfill.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
 	tries=$((tries + 1))
 	sleep 0.25
 done
-expect 0 '^plain +slot +5 +running +pfill$' "$hull" pool ls tmix
+expect 0 '^plain +slot +- +5 +running +pfill$' "$hull" pool ls tmix
 wait "$pfill" 2>/dev/null
-expect 0 '^plain +slot +5 +free +-$' "$hull" pool ls tmix
+expect 0 '^plain +slot +- +5 +free +-$' "$hull" pool ls tmix
 # What waits for a held entry by name stops nothing else of its pool, and
 # gets it when it comes free, ahead of what asks for anything.
 (cd / && exec timeout -k 2 30 "$hull_abs" reserve tmix --member gpu > "$root/pwait.out" 2> "$root/pwait.err") &
@@ -3665,7 +3665,7 @@ until grep -q 'waiting for a slot of pool tmix: gpu is held, place 1 in line' "$
 done
 expect 0 '^tmix +3 +1 +1$' "$hull" pool ls
 past=$(timeout 20 "$hull" reserve tmix --no-wait)
-expect 0 "^plain +slot +5 +leased +$past\$" "$hull" pool ls tmix
+expect 0 "^plain +slot +- +5 +leased +$past\$" "$hull" pool ls tmix
 more=$(timeout 20 "$hull" reserve tmix --no-wait)
 expect 75 'no slot of pool tmix: 3 of 3 in use' "$hull" reserve tmix --no-wait
 expect 0 '' "$hull" release "$named"
@@ -3674,7 +3674,7 @@ cases=$((cases + 1))
 waited=$(cat "$root/pwait.out")
 printf '%s\n' "$waited" | grep -Eqx 'lease-[0-9a-f]{8}' ||
 	fail "a lease waiting for an entry by name did not get it" "$waited $(cat "$root/pwait.err")"
-expect 0 "^gpu +slot +-1 +leased +$waited\$" "$hull" pool ls tmix
+expect 0 "^gpu +slot +- +-1 +leased +$waited\$" "$hull" pool ls tmix
 # An entry a waiting request names is not there for one that came later,
 # though it is free: gpu here, waited for along with plain, which is held.
 expect 0 '' "$hull" release "$waited"
@@ -3686,21 +3686,21 @@ until grep -q 'waiting for a slot of pool tmix: plain is held, place 1 in line' 
 	tries=$((tries + 1))
 	sleep 0.25
 done
-expect 0 '^gpu +slot +-1 +free +-$' "$hull" pool ls tmix
+expect 0 '^gpu +slot +- +-1 +free +-$' "$hull" pool ls tmix
 expect 75 'no slot of pool tmix: 2 of 3 in use' "$hull" reserve tmix --no-wait
 expect 0 '' "$hull" release "$past"
 wait "$pwait"
 waited=$(cat "$root/pwait.out")
-expect 0 "^gpu +slot +-1 +leased +$waited\$" "$hull" pool ls tmix
-expect 0 "^plain +slot +5 +leased +$waited\$" "$hull" pool ls tmix
+expect 0 "^gpu +slot +- +-1 +leased +$waited\$" "$hull" pool ls tmix
+expect 0 "^plain +slot +- +5 +leased +$waited\$" "$hull" pool ls tmix
 # A named count holds the name and then what fills first; every lease and
 # what it holds is read back by the next core, and a kept machine goes on
 # counting against its pool there.
 expect 0 '' "$hull" release "$more"
 expect 0 '' "$hull" release "$waited"
 both=$(timeout 20 "$hull" reserve tmix --member gpu --count 2)
-expect 0 "^gpu +slot +-1 +leased +$both\$" "$hull" pool ls tmix
-expect 0 "^plain +slot +5 +leased +$both\$" "$hull" pool ls tmix
+expect 0 "^gpu +slot +- +-1 +leased +$both\$" "$hull" pool ls tmix
+expect 0 "^plain +slot +- +5 +leased +$both\$" "$hull" pool ls tmix
 other=$(timeout 20 "$hull" reserve tmix)
 conf pkept '(pool "tcap") (hostname "pkept") (on_disconnect keep) (command "/probe" "say" "ready" "sleep" "30")'
 rm -f "$root/pkept.out"
@@ -3715,7 +3715,7 @@ kill -KILL "$(head -1 "$XDG_RUNTIME_DIR/hull/core.lock")" 2> /dev/null
 wait "$pkept" 2>/dev/null
 expect 0 "^$both +tmix +2 +0 +- +-\$" "$hull" lease ls
 expect 0 "^$other +tmix +1 +0 +- +-\$" "$hull" lease ls
-expect 0 "^gpu +slot +-1 +leased +$both\$" "$hull" pool ls tmix
+expect 0 "^gpu +slot +- +-1 +leased +$both\$" "$hull" pool ls tmix
 expect 0 '^tmix +3 +3 +0$' "$hull" pool ls
 expect 0 '^tcap +1 +1 +0$' "$hull" pool ls
 expect 75 'no slot of pool tcap: 1 of 1 in use' "$hull" run --no-wait -f "$root/pnext2.conf"
@@ -3725,21 +3725,21 @@ expect 0 '' "$hull" release "$other"
 # (by_name true): what asks for anything never gets it, though all else is
 # held and it is free; a name does, and a lease is how. It lists last and
 # counts in the pool, and not in what a request with no name is told of.
-expect 0 '^lab +slot +by-name +free +-$' "$hull" pool ls tkept
+expect 0 '^lab +slot +- +by-name +free +-$' "$hull" pool ls tkept
 cases=$((cases + 1))
 [ "$(timeout 20 "$hull" pool ls tkept | awk 'NR > 1 { print $1 }' | tr '\n' ' ')" = "open lab " ] ||
 	fail "an entry given by name is not last in the list" "$("$hull" pool ls tkept 2>&1)"
 expect 0 '^tkept +3 +0 +0$' "$hull" pool ls
 expect 125 'pool tkept has 2 slots, and the lease asks 3' "$hull" reserve tkept --count 3
 two=$(timeout 20 "$hull" reserve tkept --count 2)
-expect 0 '^lab +slot +by-name +free +-$' "$hull" pool ls tkept
+expect 0 '^lab +slot +- +by-name +free +-$' "$hull" pool ls tkept
 expect 75 'no slot of pool tkept: 2 of 2 in use, and the lease does not wait' \
 	"$hull" reserve tkept --no-wait
 conf pkept2 '(pool "tkept") (hostname "pkept2") (command "/probe" "say" "ran")'
 expect 75 'no slot of pool tkept: 2 of 2 in use, and the run does not wait' \
 	"$hull" run --no-wait -f "$root/pkept2.conf"
 lab=$(timeout 20 "$hull" reserve tkept --member lab --no-wait)
-expect 0 "^lab +slot +by-name +leased +$lab\$" "$hull" pool ls tkept
+expect 0 "^lab +slot +- +by-name +leased +$lab\$" "$hull" pool ls tkept
 expect 0 '^tkept +3 +3 +0$' "$hull" pool ls
 expect 0 '^ran$' "$hull" run --lease "$lab" -f "$root/pkept2.conf"
 expect 0 '' "$hull" release "$lab"
@@ -3804,7 +3804,7 @@ pools, members, leases = (json.loads(sys.argv[i]) for i in (1, 2, 3))
 tmix = [p for p in pools if p["pool"] == "tmix"][0]
 assert tmix == {"pool": "tmix", "capacity": 3, "held": 1, "waiting": 0}, tmix
 assert [m["member"] for m in members] == ["plain", "gpu"], members
-assert members[0] == {"member": "plain", "kind": "slot", "priority": 5, "state": "free", "holder": None}, members
+assert members[0] == {"member": "plain", "kind": "slot", "priority": 5, "state": "free", "holder": None, "arch": None}, members
 assert members[1]["priority"] == -1 and members[1]["state"] == "leased" and members[1]["holder"] == sys.argv[4], members
 mine = [l for l in leases if l["id"] == sys.argv[4]][0]
 assert mine["count"] == 1 and mine["machines"] == 0 and mine["ends"].endswith("Z"), mine

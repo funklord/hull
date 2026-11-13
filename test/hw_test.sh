@@ -329,7 +329,7 @@ cases=$((cases + 1))
 [ "$(powered)" = 'high ' ] || fail 'the board of the highest priority did not fill first' "$(cat "$root/power.log")"
 # Named, the lease holds that board, and a run under it lands there.
 lease=$(timeout 20 "$hull" reserve steer --member low)
-expect 0 "^low +board +-1 +leased +$lease\$" "$hull" pool ls steer
+expect 0 "^low +board +- +-1 +leased +$lease\$" "$hull" pool ls steer
 : > "$root/power.log"
 expect 0 '^ran$' "$hull" run --lease "$lease" -f "$root/project/fill.conf"
 cases=$((cases + 1))
@@ -338,7 +338,7 @@ expect 125 "lease $lease holds no slot for a software machine" "$hull" run --lea
 # With every board held the hw run is told 75, and a software machine still
 # has the pool's capacity: neither is counted against the other.
 any=$(timeout 20 "$hull" reserve steer --kind board)
-expect 0 "^high +board +3 +leased +$any\$" "$hull" pool ls steer
+expect 0 "^high +board +- +3 +leased +$any\$" "$hull" pool ls steer
 expect 75 'no slot of pool steer: 2 of 2 in use' "$hull" run --no-wait -f "$root/project/fill.conf"
 expect 0 '^soft$' "$hull" run --no-wait -f "$root/project/soft.conf"
 expect 0 '' "$hull" release "$lease"
@@ -346,7 +346,7 @@ expect 0 '' "$hull" release "$any"
 # A lease of a slot holds no board, so a hw run under it is told.
 lease=$(timeout 20 "$hull" reserve steer --kind slot)
 expect 125 "lease $lease holds no board free" "$hull" run --lease "$lease" -f "$root/project/fill.conf"
-expect 0 '^high +board +3 +free +-$' "$hull" pool ls steer
+expect 0 '^high +board +- +3 +free +-$' "$hull" pool ls steer
 expect 0 '^ran$' "$hull" run --no-wait -f "$root/project/fill.conf"
 expect 0 '' "$hull" release "$lease"
 # A board given only by name: a run is refused, naming the way; a lease by
@@ -376,6 +376,7 @@ conf onarm '(backend hw) (pool "arches") (arch arm64) (command "/probe" "say" "r
 conf onrv '(backend hw) (pool "arches") (arch riscv64) (command "/probe" "say" "ran")'
 conf onhost '(backend hw) (pool "arches") (command "/probe" "say" "ran")'
 expect 0 'machine on board \(hw\): ok' "$hull" check -f "$root/project/onarm.conf" --backend hw
+expect 0 '^ax +board +arm64 +0 +free +-$' "$hull" pool ls arches
 : > "$root/power.log"
 expect 0 '^ran$' "$hull" run -f "$root/project/onarm.conf"
 expect 0 '^ran$' "$hull" run -f "$root/project/onrv.conf"
@@ -429,7 +430,7 @@ expect 0 '^s +127.0.0.1 +broken' "$hull" board ls sick
 # Every board broken is no wait's to end: said at once, naming what fixes it.
 expect 125 'every board of pool sick is broken' "$hull" run --no-wait -f "$root/project/sick.conf"
 expect 125 'member s of pool sick is broken' "$hull" reserve sick --member s
-expect 0 '^s +board +0 +broken +-$' "$hull" pool ls sick
+expect 0 '^s +board +- +0 +broken +-$' "$hull" pool ls sick
 expect 0 '' "$hull" board fix s
 expect 0 '^s +127.0.0.1 +up' "$hull" board ls sick
 : > "$root/power.log"
