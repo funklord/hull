@@ -389,6 +389,16 @@ aarch64) host_arch=arm64 ;;
 esac
 [ "$host_arch" = arm64 ] || [ "$host_arch" = riscv64 ] ||
 	expect 125 "pool arches has no board of arch $host_arch" "$hull" run -f "$root/project/onhost.conf"
+# A lease of a board of an arch holds one of it, and none of an arch the
+# pool has none of.
+lease=$(timeout 20 "$hull" reserve arches --arch riscv64)
+expect 0 "^rv +board +riscv64 +0 +leased +$lease\$" "$hull" pool ls arches
+expect 0 '' "$hull" release "$lease"
+cases=$((cases + 1))
+said=$(timeout 20 "$hull" reserve arches --arch s390x --no-wait 2>&1) &&
+	fail "a lease of a board of an arch no board is was given" "$said"
+printf '%s\n' "$said" | grep -q 'pool arches has no board of arch s390x' ||
+	fail "a lease of a board of an arch no board is was not refused naming it" "$said"
 lease=$(timeout 20 "$hull" reserve arches --member rv)
 expect 125 "board rv of lease $lease is riscv64, and the machine arm64" \
 	"$hull" run --lease "$lease" -f "$root/project/onarm.conf"

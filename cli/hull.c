@@ -128,7 +128,7 @@ static void usage(FILE *out)
 	      "       hull run [-f FILE] [--backend B] [--accept TOKEN]... [--wait D|--no-wait]\n"
 	      "                [--lease ID] [NAME]\n"
 	      "       hull reserve POOL [--count N] [--member NAME]... [--kind board|slot]\n"
-	      "                    [--for D] [--wait D|--no-wait] | hull release ID\n"
+	      "                    [--arch A] [--for D] [--wait D|--no-wait] | hull release ID\n"
 	      "       hull pool ls [POOL] [--json] | hull lease ls [--json]\n"
 	      "       hull broker DIR | hull broker-dial --dir DIR [--as NAME]\n"
 	      "       hull pack [--against DIR|REF] DIR|REF FILE | hull unpack FILE|- DIR\n"
@@ -5174,7 +5174,8 @@ static int broker_hold(hull_wire *wire, const char *id, int *status)
 }
 
 /* `hull reserve POOL [--count N] [--member NAME]... [--kind board|slot]
- * [--for D] [--wait D|--no-wait]`: a lease's id, alone on stdout, so that
+ * [--arch A] [--for D] [--wait D|--no-wait]`: a lease's id, alone on
+ * stdout, so that
  * `lease=$(hull reserve ci)` takes it. Its count is what it names, or 1,
  * unless it says; what is not named is what fills first. */
 static int reserve(int argc, char **argv)
@@ -5194,6 +5195,7 @@ static int reserve(int argc, char **argv)
 	size_t          names_at = 0u;
 	unsigned        named = 0u;
 	const char     *kind = "any";
+	const char     *arch = NULL;
 	int             bad = 0;
 
 	for (int i = 2; i < argc; i++) {
@@ -5214,6 +5216,10 @@ static int reserve(int argc, char **argv)
 		} else if (strcmp(argv[i], "--kind") == 0 && i + 1 < argc) {
 			kind = argv[++i];
 			bad |= strcmp(kind, "board") != 0 && strcmp(kind, "slot") != 0;
+		} else if (strcmp(argv[i], "--arch") == 0 && i + 1 < argc) {
+			/* Boards of that arch, as a hw run of it is given (4.12). */
+			arch = argv[++i];
+			bad |= arch[0] == '\0' || strpbrk(arch, " \t,") != NULL;
 		} else if (strcmp(argv[i], "--wait") == 0 && i + 1 < argc)
 			wait = seconds_of(argv[++i]) > 0 ? seconds_of(argv[i]) : -2;
 		else if (strcmp(argv[i], "--no-wait") == 0)
@@ -5231,6 +5237,11 @@ static int reserve(int argc, char **argv)
 	}
 	hull_msg_raw(&m, "(5:lease");
 	hull_msg_channel(&m, 1u);
+	if (arch != NULL) {
+		hull_msg_raw(&m, "(4:arch");
+		hull_msg_text(&m, arch);
+		hull_msg_raw(&m, ")");
+	}
 	hull_msg_raw(&m, "(5:count");
 	hull_msg_number(&m, count);
 	hull_msg_raw(&m, ")(4:cpus1:0)(3:for");
