@@ -5357,6 +5357,24 @@ static int add_broker(hull_plan *plan, const char *pool, const hull_pool *given,
 	} else {
 		hull_msg_raw(&m, "(5:lease");
 		hull_msg_channel(&m, 1u);
+		/* A board's run says its machine's arch, its (arch ...) or the
+		 * host's, which a board saying one must be. */
+		if (board) {
+			char          *arch = NULL;
+			struct utsname host;
+
+			if (hull_access_machine(&doc, plan->canonical, plan->canonical_length, &machine))
+				arch = hull_access_value(&doc, &machine, "arch");
+			hull_msg_raw(&m, "(4:arch");
+			if (arch != NULL && strcmp(arch, "host") != 0)
+				hull_msg_text(&m, arch);
+			else
+				hull_msg_text(&m, uname(&host) != 0 ? "" :
+				                  strcmp(host.machine, "x86_64") == 0 ? "amd64" :
+				                  strcmp(host.machine, "aarch64") == 0 ? "arm64" : host.machine);
+			hull_msg_raw(&m, ")");
+			free(arch);
+		}
 		hull_msg_raw(&m, "(5:count1:1)(4:cpus");
 		hull_msg_number(&m, cpus);
 		hull_msg_raw(&m, ")(3:for1:0)(4:kind");

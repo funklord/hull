@@ -123,6 +123,7 @@ struct client_hello {
 }
 
 const COMMIT_ENTRY = ('(' << 24) | ('6' << 16) | (':' << 8) | 'c';
+const ARCH_ENTRY   = ('(' << 24) | ('4' << 16) | (':' << 8) | 'a';
 const EXE_ENTRY    = ('(' << 24) | ('3' << 16) | (':' << 8) | 'e';
 
 struct build_entries {
@@ -200,9 +201,16 @@ struct stop {
 // a run's own, a broker's (section 4.12), held to a budget by the `cpus`
 // and `memory` it declares. Waited for as a run waits, `(wait N)` seconds,
 // 0 not at all; answered `lease`, its id, seconds left and first member.
+// A run's `arch`, first where given, is its machine's: a board saying one
+// is given only to machines of it (section 4.12).
 struct lease_ask {
 	preamble u8[7] = "5:lease";
 	channel  ch;
+	peek u32  after_ch;
+	variant machine_arch switch (after_ch) {
+		case ARCH_ENTRY:  arch_entry  has_arch;
+		default:          absent      no_arch;
+	}
 	preamble u8[8] = "(5:count";
 	atom  count;
 	preamble u8[8] = ")(4:cpus";
@@ -226,6 +234,12 @@ struct lease_ask {
 		default:   absent      no_wait;
 	}
 	u8  close  [must_eq = ')'];
+}
+
+struct arch_entry {
+	preamble u8[7] = "(4:arch";
+	atom  arch;
+	u8    close  [must_eq = ')'];
 }
 
 struct wait_entry {

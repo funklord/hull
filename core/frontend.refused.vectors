@@ -177,6 +177,10 @@ client_message lease_no_count 28 35 3A 6C 65 61 73 65 28 32 3A 63 68 31 3A 37 29
 # lease: the kind and the members come before the pool
 client_message lease_no_kind 28 35 3A 6C 65 61 73 65 28 32 3A 63 68 31 3A 37 29 28 35 3A 63 6F 75 6E 74 31 3A 31 29 28 34 3A 63 70 75 73 31 3A 30 29 28 33 3A 66 6F 72 31 3A 30 29 28 34 3A 70 6F 6F 6C 32 3A 63 69 29 29
 
+# lease_arch_last: (5:lease(2:ch1:7)(5:count1:1)(4:cpus1:0)(3:for1:0)(4:kind5:board)(7:members0:)(6:memory1:0)(3:run1:1)(4:pool2:ci)(4:arch5:arm64))
+# lease: the arch comes first, before the count
+client_message lease_arch_last 28 35 3A 6C 65 61 73 65 28 32 3A 63 68 31 3A 37 29 28 35 3A 63 6F 75 6E 74 31 3A 31 29 28 34 3A 63 70 75 73 31 3A 30 29 28 33 3A 66 6F 72 31 3A 30 29 28 34 3A 6B 69 6E 64 35 3A 62 6F 61 72 64 29 28 37 3A 6D 65 6D 62 65 72 73 30 3A 29 28 36 3A 6D 65 6D 6F 72 79 31 3A 30 29 28 33 3A 72 75 6E 31 3A 31 29 28 34 3A 70 6F 6F 6C 32 3A 63 69 29 28 34 3A 61 72 63 68 35 3A 61 72 6D 36 34 29 29
+
 # identify_nobody: (8:identify(2:ch1:1))
 # identify: it names who
 client_message identify_nobody 28 38 3A 69 64 65 6E 74 69 66 79 28 32 3A 63 68 31 3A 31 29 29

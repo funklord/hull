@@ -4754,6 +4754,13 @@ static void handle_lease_ask(client *c, uint32_t ch, const hull_sexpr_doc *body)
 	asked.cpus = (unsigned)cpus;
 	asked.kind  = strcmp(kind, "board") == 0 ? WANT_BOARD :
 	              strcmp(kind, "slot") == 0  ? WANT_SOFTWARE : WANT_ANY;
+	/* A run's arch, which a board saying one must be (section 4.12). */
+	if (hull_msg_find(body, "arch", &value) &&
+	    (!hull_msg_string(body, &value, asked.arch, sizeof asked.arch) ||
+	     strpbrk(asked.arch, " \t\r\n,") != NULL)) {
+		send_error(c, ch, "a lease's arch is one word");
+		return;
+	}
 	for (char *name = strtok(names, ","); name != NULL; name = strtok(NULL, ",")) {
 		if (asked.named == HULL_POOL_MEMBERS || strlen(name) >= sizeof asked.names[0]) {
 			send_error(c, ch, "a lease names too many members, or one too long");

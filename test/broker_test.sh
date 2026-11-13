@@ -122,12 +122,18 @@ cp "$probe" "$root/project/tree/probe"
 cat > "$broker/pools.conf" <<'CONF'
 (pools
   (bench (capacity 1)
-    (members (board "b1" (priority 5) (address "127.0.0.1"))
-             (board "unknown" (priority -5) (address "127.0.0.1"))
+    (members (board "b1" (priority 5) (address "127.0.0.1") (arch "HOSTARCH"))
+             (board "unknown" (priority -5) (address "127.0.0.1") (arch "HOSTARCH"))
              (slot "gpu" (by_name true))))
   (many (capacity 60))
   (budget (capacity 4) (memory "1G")))
 CONF
+case $(uname -m) in
+x86_64) host_arch=amd64 ;;
+aarch64) host_arch=arm64 ;;
+*) host_arch=$(uname -m) ;;
+esac
+sed -i "s/HOSTARCH/$host_arch/" "$broker/pools.conf"
 chmod 640 "$broker/pools.conf"
 for u in alice bob; do
 	cat > "$root/$u/config/hull/pools.conf" <<CONF
@@ -215,7 +221,7 @@ conf board2 '(backend hw) (pool "bench") (hostname "onboard2") (command "/probe"
 (run_as alice timeout -k 2 70 "$hull" run -f "$root/project/board.conf" > "$root/board.out" 2>&1 < /dev/null) &
 onboard=$!
 wait_ready "$root/board.out"
-as bob 0 '^b1 +board +- +5 +leased ' pool ls bench
+as bob 0 "^b1 +board +$host_arch +5 +leased " pool ls bench
 # bob's --no-wait takes the board left, which his file does not describe:
 # told, and it goes back.
 as bob 125 'which pools.conf here does not describe' run --no-wait -f "$root/project/board2.conf"
@@ -223,6 +229,11 @@ run_as alice timeout 20 "$hull" stop --timeout 1 onboard > /dev/null 2>&1
 wait "$onboard"
 cases=$((cases + 1))
 grep -q '^ready$' "$root/board.out" || fail 'a run on a broker board did not run' "$(cat "$root/board.out")"
+# A board says its arch at the broker too: a run asks for its machine's,
+# and one of an arch no board of the pool is, is refused, not left waiting.
+conf onrv '(backend hw) (pool "bench") (arch riscv64) (command "/probe" "say" "never")'
+[ "$host_arch" = riscv64 ] ||
+	as alice 125 'pool bench has no board of arch riscv64' run --no-wait -f "$root/project/onrv.conf"
 n=0
 until run_as alice timeout 30 "$hull" pool ls < /dev/null | grep -q '^bench  *4  *0 ' || [ "$n" -ge 40 ]; do
 	n=$((n + 1))
@@ -390,11 +401,11 @@ until run_as bob timeout 20 "$hull" pool ls bench < /dev/null | grep -q '^b1 .*b
 	n=$((n + 1))
 	sleep 0.5
 done
-as bob 0 '^b1 +board +- +5 +broken +-$' pool ls bench
+as bob 0 "^b1 +board +$host_arch +5 +broken +-\$" pool ls bench
 cases=$((cases + 1))
 env XDG_DATA_HOME="$broker" timeout 20 "$hull" board fix b1 ||
 	fail 'a mark at the broker could not be taken off' ''
-as bob 0 '^b1 +board +- +5 +free +-$' pool ls bench
+as bob 0 "^b1 +board +$host_arch +5 +free +-\$" pool ls bench
 
 # A grant nobody hears goes back: told, and gone or silent, a peer holds nothing.
 # What is held stays, gone or not, and a lease is not another's to hold.
