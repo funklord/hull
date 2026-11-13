@@ -173,6 +173,12 @@ typedef struct build {
 	unsigned  global_count;
 	build_arg arg[MAX_ARGS];      /* this stage's */
 	unsigned  arg_count;
+	/* Images a COPY --from names that are no stage: each a stage of its
+	 * own, image-N, its base the image and no steps, built before the rest. */
+	sb        images;
+	char      image[MAX_STAGES][256];
+	char      image_stage_name[MAX_STAGES][16];
+	unsigned  image_count;
 } build;
 
 /* The value the build was given for `name`, or NULL. */
@@ -306,6 +312,32 @@ static const char *stage_called(const build *b, const char *word)
 		if (strcasecmp(b->stage[i], word) == 0 || strcmp(b->stage_number[i], word) == 0)
 			return b->stage[i];
 	return NULL;
+}
+
+/* An image a COPY --from names that is no stage of the file, as docker
+ * takes it: a stage of its own, image-N, the image its base and nothing
+ * done to it, the same image the same stage. Its name, or NULL. */
+static const char *image_stage(build *b, const char *image)
+{
+	char *name;
+
+	if (image[0] == '\0' || strpbrk(image, "\"\\ \t") != NULL || strlen(image) >= 256u)
+		return NULL;
+	for (unsigned i = 0u; i < b->image_count; i++)
+		if (strcmp(b->image[i], image) == 0)
+			return b->image_stage_name[i];
+	if (b->image_count == MAX_STAGES)
+		return NULL;
+	name = b->image_stage_name[b->image_count];
+	snprintf(b->image[b->image_count], sizeof b->image[0], "%s", image);
+	snprintf(name, sizeof b->image_stage_name[0], "image-%u", b->image_count + 1u);
+	b->image_count++;
+	sb_str(&b->images, "\n  (stage (name ");
+	sb_quoted(&b->images, name);
+	sb_str(&b->images, ") (base ");
+	sb_quoted(&b->images, image);
+	sb_str(&b->images, "))");
+	return name;
 }
 
 /* ENV accumulated so far, as the entries of an (env ...) record, and the
@@ -616,7 +648,8 @@ static void do_copy(build *b, const char *instr, char *arg)
 	for (char *w = strtok_r(trim(arg), " \t", &save); w != NULL && n < 64;
 	     w = strtok_r(NULL, " \t", &save)) {
 		if (strncmp(w, "--from=", 7u) == 0) {
-			if ((stage = stage_called(b, w + 7)) == NULL) {
+			if ((stage = stage_called(b, w + 7)) == NULL &&
+			    (stage = image_stage(b, w + 7)) == NULL) {
 				note(&b->steps, "COPY --from an image not translated", w + 7);
 				return;
 			}
@@ -897,8 +930,9 @@ static int import_dockerfile(FILE *file)
 		printf("\"%s\")", base);
 		if (rt.len > 0u)
 			printf("\n  (runtime%s)", rt.data);
-		if (stages.len > 0u)
-			printf("\n  (stages%s\n  )", stages.data);
+		if (stages.len > 0u || b.images.len > 0u)
+			printf("\n  (stages%s%s\n  )", b.images.len > 0u ? b.images.data : "",
+			       stages.len > 0u ? stages.data : "");
 		/* The steps' closing paren is on its own line: the last entry may be
 		 * a `;` comment, which would swallow a paren on the same line. */
 		if (b.steps.len > 0u)
@@ -907,6 +941,7 @@ static int import_dockerfile(FILE *file)
 	}
 	free(base);
 	free(b.steps.data);
+	free(b.images.data);
 	free(rt.data);
 	free(after.data);
 	free(stages.data);

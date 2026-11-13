@@ -415,6 +415,15 @@ data = bytearray(open(sys.argv[1], "rb").read())
 at = data.find(b"from the archive")
 data[at] ^= 1
 open(sys.argv[1], "wb").write(data)' "$root/ld/saved.tar"
+# COPY --from an image that is no stage of the file, as docker takes it:
+# a stage of its own whose base is the image, run of nothing, copied from.
+printf 'FROM scratch\nCOPY --from=test/saved:1 /greeting /copied\n' > "$root/ld/Dockerfile"
+timeout 10 "$hull" import "$root/ld/Dockerfile" > "$root/ld/fromimage.conf"
+check 'COPY --from an image is a stage of it' grep -q '(stage (name "image-1") (base "test/saved:1"))' \
+	"$root/ld/fromimage.conf"
+expect 0 '^fromimage/1 sha256:' "$hull" build -f "$root/ld/fromimage.conf" fromimage/1
+expect 0 '' "$hull" materialize fromimage/1 "$root/ld/fromimage"
+check 'a file copied from another image is there' grep -q 'from the archive' "$root/ld/fromimage/copied"
 expect 1 'not the digest that names it' "$hull" load "$root/ld/saved.tar" tampered/1
 # An image's USER is whom its command runs as, unless the machine says.
 python3 -I "$(dirname "$0")/oci_archive.py" user "$root/ld/user.tar" "$probe"
