@@ -524,6 +524,11 @@ static int prepare_state(hull_machine *m)
 		         "SX1276, `make esp-qemu-lora`, and HULL_ESP_LORA_QEMU naming it\n");
 		return -1;
 	}
+	if (m->nic != NULL && strcmp(m->nic, "wifi") == 0 && esp_lora_emulator(from, sizeof from) != 0) {
+		snprintf(m->why, sizeof m->why, "an ESP32's WiFi needs Espressif's qemu built with hull's "
+		         "patch, `make esp-qemu-lora`, and HULL_ESP_LORA_QEMU naming it\n");
+		return -1;
+	}
 	/* A screen by VNC has its D-Bus display's monitor here too. */
 	if (!m->secure && !m->tpm && !s51 && !is_esp(b) && !m->vnc && !m->local && !m->box)
 		return 0;
@@ -1139,8 +1144,11 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 		if (board_named(m->machine_type)->nic != NULL) {
 			if ((m->network ? 1u : 0u) + m->segment_count > 1u)
 				return "a board has one Ethernet: (network nat) or one segment, not both";
-			if (m->nic != NULL)
-				return "a board's Ethernet is its chip's: no (nic …)";
+			/* An ESP32's WiFi, its own MAC to an access point in qemu,
+			 * in place of its Ethernet, on the same network. */
+			if (m->nic != NULL && (strcmp(m->nic, "wifi") != 0 ||
+			                       strcmp(board_named(m->machine_type)->chip, "esp32") != 0))
+				return "a board's Ethernet is its chip's: no (nic …) but an ESP32's (nic wifi)";
 		} else if (m->network || m->segment_count != 0u || m->port_count != 0u) {
 			return "a board's serial port is its one way in: no network, segments or ports";
 		}
@@ -1198,6 +1206,7 @@ static void exec_board(const hull_machine *m, const board *b)
 	char *argv[28];
 	int   n = 0;
 	int   monitor_fd;
+	int   wifi = m->nic != NULL && strcmp(m->nic, "wifi") == 0;
 
 	/* s51: the UART on descriptors 3 and 4, the machine's stdin and
 	 * stdout; its command console on a pipe whose writing end it holds
@@ -1307,7 +1316,9 @@ static void exec_board(const hull_machine *m, const board *b)
 		argv[n++] = drive;
 		if (esp_emulator(b, emulator, sizeof emulator) != 0)
 			return;
-		argv[0] = m->lora != NULL ? lora_emulator : emulator;
+		if (wifi && esp_lora_emulator(lora_emulator, sizeof lora_emulator) != 0)
+			return;
+		argv[0] = m->lora != NULL || wifi ? lora_emulator : emulator;
 	} else {
 		argv[n++] = (char *)b->load;
 		argv[n++] = (char *)m->media[0].path;
@@ -1316,7 +1327,8 @@ static void exec_board(const hull_machine *m, const board *b)
 	 * card is, or the segment's wire, by the old -net form, as the card
 	 * is the machine's own and no -device. */
 	if (b->nic != NULL && m->network) {
-		size_t at = (size_t)snprintf(nic, sizeof nic, "user,model=%s", b->nic);
+		size_t at = (size_t)snprintf(nic, sizeof nic, "user,model=%s",
+		                             wifi ? "esp32_wifi" : b->nic);
 
 		for (unsigned i = 0u; i < m->port_count && at < sizeof nic; i++)
 			at += (size_t)snprintf(nic + at, sizeof nic - at, ",hostfwd=%s:%s:%u-:%u",
@@ -1335,7 +1347,7 @@ static void exec_board(const hull_machine *m, const board *b)
 		hull_access_segment_mac(m->address, m->segment[0], 0u, mac);
 		snprintf(netdev, sizeof netdev, "stream,id=s0,addr.type=fd,addr.str=%d", fd);
 		snprintf(nic, sizeof nic, "nic,model=%s,netdev=s0,"
-		         "macaddr=%02x:%02x:%02x:%02x:%02x:%02x", b->nic,
+		         "macaddr=%02x:%02x:%02x:%02x:%02x:%02x", wifi ? "esp32_wifi" : b->nic,
 		         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 		argv[n++] = "-netdev";
 		argv[n++] = netdev;
@@ -2870,6 +2882,10 @@ static const hull_cap_entry entries[] = {
 	{ "pc.cpu.core2duo", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.cpu.skylake", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.nic.virtio", HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.nic.wifi", HULL_SUP_NATIVE,
+	  "an ESP32's WiFi, ESP-IDF's own driver against the chip's MAC, joined to an open access "
+	  "point in qemu, PICSimLabWifi, bridged to the board's network; hull's patched qemu",
+	  NULL },
 	{ "security.no_new_privs", HULL_SUP_NATIVE, "set on the qemu process", NULL },
 	{ "on_disconnect.stop", HULL_SUP_NATIVE,   NULL, NULL },
 	{ "on_disconnect.keep", HULL_SUP_REJECTED,

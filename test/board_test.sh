@@ -273,6 +273,44 @@ if [ -n "${LORA_FW:-}" ] && [ -n "${LORA_QEMU:-}" ] && [ -n "${esp:-}" ] && [ -L
 	out=$(cd "$root" && timeout 30 "$hull" run -f "$root/noqemu.conf" 2>&1)
 	printf '%s\n' "$out" | grep -q 'make esp-qemu-lora' ||
 		fail "a radio with no qemu built for it was not refused naming the build" "$out"
+	# An ESP32's WiFi, (nic wifi): MicroPython's published image for the
+	# ESP32, fetched once and checked, its station joining the open access
+	# point hull's patched qemu models, by the console, and given an
+	# address by the board's NAT.
+	mp=${BUILD_DIR:?}/test/board-data/ESP32_GENERIC-20250415-v1.25.0.bin
+	mkdir -p "${BUILD_DIR:?}/test/board-data"
+	[ -f "$mp" ] || curl -fsS -m 200 -o "$mp.part" \
+		https://micropython.org/resources/firmware/ESP32_GENERIC-20250415-v1.25.0.bin &&
+		mv "$mp.part" "$mp" 2> /dev/null
+	if [ -f "$mp" ] &&
+	   printf '1eb1a88473e32aa6a4d45dc1b5b6ad40bc1f06128e7aa8548e438cfa4633da1b  %s\n' "$mp" |
+	   sha256sum -c --quiet > /dev/null 2>&1; then
+		# Its image is from 0x1000, the bootloader's place; the flash is whole.
+		python3 -I -c '
+import sys
+d = open(sys.argv[1], "rb").read()
+img = b"\xff" * 0x1000 + d
+open(sys.argv[2], "wb").write(img + b"\xff" * (4 * 1024 * 1024 - len(img)))' "$mp" "$root/mp.fw"
+		printf '(machine (backend pc) (hostname "mp") (source "image:./mp.fw") (network nat) (tuning (pc (machine heltec-wifi-lora-32) (nic wifi))))\n' \
+			> "$root/mp.conf"
+		(cd "$root" && XDG_RUNTIME_DIR=$root/run-lora HULL_ESP_LORA_QEMU=$LORA_QEMU \
+			exec timeout -k 2 120 "$hull" run -f "$root/mp.conf" > "$root/mp.out" 2>&1) &
+		runner=$!
+		tries=0
+		until grep -aq 'MicroPython v' "$root/mp.out" 2> /dev/null || [ "$tries" -ge 120 ]; do
+			tries=$((tries + 1))
+			sleep 0.5
+		done
+		sleep 2
+		said=$(XDG_RUNTIME_DIR=$root/run-lora timeout 90 python3 -I "$(cd "$(dirname "$0")" && pwd)/board/mp_wifi.py" "$hull" mp 2>&1)
+		XDG_RUNTIME_DIR=$root/run-lora timeout 30 "$hull" stop mp > /dev/null 2>&1
+		wait "$runner"
+		cases=$((cases + 1))
+		printf '%s\n' "$said" | grep -q '^wifi True 10\.0\.2\.15' ||
+			fail "an ESP32 running MicroPython did not join the WiFi and get an address" "$said"
+	else
+		printf 'board: no WiFi tried: MicroPython for the ESP32 not fetched\n'
+	fi
 else
 	printf 'board: no LoRa tried: no xtensa-esp32-elf-gcc, no make esp-qemu-lora, or no ESP32 fetched\n'
 fi

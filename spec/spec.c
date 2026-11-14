@@ -566,7 +566,7 @@ static const char *const pc_machine_values[] = {
 static const char *const pc_vga_values[]     = { "std", "cirrus", "vmware", "none", NULL };
 
 static const char *const pc_nic_values[]     = { "ne2k_pci", "ne2k_isa", "pcnet", "rtl8139",
-                                                 "e1000", "e1000e", "virtio", NULL };
+                                                 "e1000", "e1000e", "virtio", "wifi", NULL };
 static const char *const pc_cpu_values[]     = { "host", "max", "qemu64", "486", "pentium",
                                                  "pentium3", "core2duo", "skylake", NULL };
 

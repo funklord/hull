@@ -1248,14 +1248,33 @@ $(BUILD_DIR)/test/board-fw/lora-%.flash: test/board/lora_esp32.c test/board/esp3
 # for some minutes.
 esp-qemu-lora: $(ESP_QEMU_LORA)
 
+# The files engine/esp-lora.patch adds, reset and removed before it is
+# applied again: its radios, its S3 SPI2, and lcgamboa's WiFi.
+ESP_PATCH_NEW = hw/misc/sx127x.c \
+                hw/misc/sx126x.c \
+                hw/misc/esp32_ana.c \
+                hw/misc/esp32_fe.c \
+                hw/misc/esp32_phya.c \
+                hw/misc/esp32_wifi.c \
+                hw/misc/esp32_wifi_ap.c \
+                hw/misc/esp32_wlan_packet.c \
+                hw/misc/esp32_wlan.h \
+                hw/misc/esp32_wlan_packet.h \
+                include/hw/misc/esp32_wifi.h \
+                include/hw/misc/esp32_phya.h \
+                include/hw/misc/esp32_ana.h \
+                include/hw/misc/esp32_fe.h \
+                hw/ssi/esp32s3_gpspi.c \
+                include/hw/ssi/esp32s3_gpspi.h
+
 $(ESP_QEMU_LORA): engine/esp-lora.patch
 	@mkdir -p '$(BUILD_DIR)/esp-qemu-lora'
 	test -d '$(BUILD_DIR)/esp-qemu-lora/src' || git clone -q --depth 1 --branch $(ESP_QEMU_TAG) \
 		https://github.com/espressif/qemu.git '$(BUILD_DIR)/esp-qemu-lora/src'
 	test "$$(git -C '$(BUILD_DIR)/esp-qemu-lora/src' rev-parse HEAD)" = $(ESP_QEMU_COMMIT)
-	git -C '$(BUILD_DIR)/esp-qemu-lora/src' reset -q -- hw/misc/sx127x.c hw/misc/sx126x.c hw/ssi/esp32s3_gpspi.c include/hw/ssi/esp32s3_gpspi.h
+	git -C '$(BUILD_DIR)/esp-qemu-lora/src' reset -q -- $(ESP_PATCH_NEW)
 	git -C '$(BUILD_DIR)/esp-qemu-lora/src' checkout -q -- .
-	git -C '$(BUILD_DIR)/esp-qemu-lora/src' clean -q -f -- hw/misc/sx127x.c hw/misc/sx126x.c hw/ssi/esp32s3_gpspi.c include/hw/ssi/esp32s3_gpspi.h
+	git -C '$(BUILD_DIR)/esp-qemu-lora/src' clean -q -f -- $(ESP_PATCH_NEW)
 	git -C '$(BUILD_DIR)/esp-qemu-lora/src' apply '$(abspath engine/esp-lora.patch)'
 	mkdir -p '$(BUILD_DIR)/esp-qemu-lora/build'
 	cd '$(BUILD_DIR)/esp-qemu-lora/build' && test -f build.ninja || ../src/configure \

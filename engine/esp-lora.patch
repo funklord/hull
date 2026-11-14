@@ -129,18 +129,2460 @@ index 5e25782..5c2f15a 100644
  }
  
  static Property esp32_gpio_properties[] = {
+diff --git a/hw/misc/esp32_ana.c b/hw/misc/esp32_ana.c
+new file mode 100644
+index 0000000..37124ac
+--- /dev/null
++++ b/hw/misc/esp32_ana.c
+@@ -0,0 +1,81 @@
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/error-report.h"
++#include "qemu/guest-random.h"
++#include "qapi/error.h"
++#include "hw/hw.h"
++#include "hw/sysbus.h"
++#include "hw/misc/esp32_ana.h"
++
++#define DEBUG 0
++
++int esp32_wifi_channel=0;
++
++static uint64_t esp32_ana_read(void *opaque, hwaddr addr, unsigned int size)
++{
++    Esp32AnaState *s = ESP32_ANA(opaque);
++    uint32_t r = s->mem[addr/4];
++    switch(addr) {    
++        case 0x04: 
++          r= 0xFDFFFFFF;
++          break;
++        case 0x44:
++        case 0x4C:
++        case 0xC4: 
++          r=0xFFFFFFFF;
++          break;
++    }
++    if(DEBUG) printf("esp32_ana_read  0x%04lx= 0x%08x\n",(unsigned long) addr,r);
++
++    return r;
++}
++
++static void esp32_ana_write(void *opaque, hwaddr addr, uint64_t value,
++                                 unsigned int size) {
++    Esp32AnaState *s = ESP32_ANA(opaque);
++
++    if(DEBUG) printf("esp32_ana_write 0x%04lx= 0x%08lx\n",(unsigned long) addr, (unsigned long) value);
++
++    if(addr == 0xC4) {
++        //printf("wifi channel:%x %x\n",(int)value, (int)~value);
++        int v=value & 0xFF;
++        if((v % 10) ==4 ){ 
++            esp32_wifi_channel=(v/10)-1;
++            //printf("===========> esp32_wifi_channel %i \n", esp32_wifi_channel);
++        }
++    }
++    s->mem[addr/4]=value;
++
++}
++
++static const MemoryRegionOps esp32_ana_ops = {
++    .read =  esp32_ana_read,
++    .write = esp32_ana_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static void esp32_ana_init(Object *obj)
++{
++    Esp32AnaState *s = ESP32_ANA(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &esp32_ana_ops, s,
++                          TYPE_ESP32_ANA, 0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++    memset(s->mem,0,sizeof(s->mem));
++}
++
++
++static const TypeInfo esp32_ana_info = {
++    .name = TYPE_ESP32_ANA,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Esp32AnaState),
++    .instance_init = esp32_ana_init,
++};
++
++static void esp32_ana_register_types(void)
++{
++    type_register_static(&esp32_ana_info);
++}
++
++type_init(esp32_ana_register_types)
+diff --git a/hw/misc/esp32_fe.c b/hw/misc/esp32_fe.c
+new file mode 100644
+index 0000000..181e460
+--- /dev/null
++++ b/hw/misc/esp32_fe.c
+@@ -0,0 +1,67 @@
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/error-report.h"
++#include "qemu/guest-random.h"
++#include "qapi/error.h"
++#include "hw/hw.h"
++#include "hw/sysbus.h"
++#include "hw/misc/esp32_fe.h"
++
++#define DEBUG 0
++
++static uint64_t esp32_fe_read(void *opaque, hwaddr addr, unsigned int size)
++{
++    uint32_t r = 0;
++    Esp32FeState *s = ESP32_FE(opaque);
++    r=s->mem[addr/4];
++    switch(addr){
++      case 0x174:
++      case 0x7C:
++        r=0xffffffff;
++        break;
++    }
++    if(DEBUG) printf("esp32_fe_read  0x%04lx= 0x%08x\n",(unsigned long) addr,r);
++    
++    return r;
++}
++
++static void esp32_fe_write(void *opaque, hwaddr addr, uint64_t value,
++                                 unsigned int size) {
++  Esp32FeState *s = ESP32_FE(opaque);
++  if(DEBUG) printf("esp32_fe_write 0x%04lx= 0x%08lx\n",(unsigned long) addr, (unsigned long) value);
++
++  s->mem[addr/4]=(uint32_t)value;
++}
++
++static const MemoryRegionOps esp32_fe_ops = {
++    .read =  esp32_fe_read,
++    .write = esp32_fe_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static void esp32_fe_init(Object *obj)
++{
++    Esp32FeState *s = ESP32_FE(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &esp32_fe_ops, s,
++                          TYPE_ESP32_FE, 0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++    memset(s->mem,0,sizeof(s->mem));
++}
++
++
++static const TypeInfo esp32_fe_info = {
++    .name = TYPE_ESP32_FE,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Esp32FeState),
++    .instance_init = esp32_fe_init,
++};
++
++static void esp32_fe_register_types(void)
++{
++    type_register_static(&esp32_fe_info);
++}
++
++type_init(esp32_fe_register_types)
+diff --git a/hw/misc/esp32_phya.c b/hw/misc/esp32_phya.c
+new file mode 100644
+index 0000000..c14b281
+--- /dev/null
++++ b/hw/misc/esp32_phya.c
+@@ -0,0 +1,71 @@
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/error-report.h"
++#include "qemu/guest-random.h"
++#include "qapi/error.h"
++#include "hw/hw.h"
++#include "hw/sysbus.h"
++#include "hw/misc/esp32_phya.h"
++
++#define DEBUG 0
++
++static uint32_t *g_mem;
++
++static uint64_t esp32_phya_read(void *opaque, hwaddr addr, unsigned int size)
++{
++    uint32_t r = 0;
++    Esp32PhyaState *s = ESP32_PHYA(opaque);
++    r=s->mem[addr/4];
++    if(DEBUG) printf("esp32_phya_read  0x%04lx= 0x%08x\n",(unsigned long) addr,r);
++
++    return r;
++}
++
++void Esp32_WLAN_Set_Packet_Status(const uint32_t state){
++    if(g_mem){
++      g_mem[0x270/4] = state; //ESP32
++      g_mem[0x320/4] = state; //ESP32C3
++    }
++}
++
++static void esp32_phya_write(void *opaque, hwaddr addr, uint64_t value,
++                                 unsigned int size) {
++  Esp32PhyaState *s = ESP32_PHYA(opaque);
++  
++  if(DEBUG) printf("esp32_phya_write 0x%04lx= 0x%08lx\n",(unsigned long) addr, (unsigned long) value);
++
++  s->mem[addr/4]=(uint32_t)value;
++}
++
++static const MemoryRegionOps esp32_phya_ops = {
++    .read =  esp32_phya_read,
++    .write = esp32_phya_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static void esp32_phya_init(Object *obj)
++{
++    Esp32PhyaState *s = ESP32_PHYA(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &esp32_phya_ops, s,
++                          TYPE_ESP32_PHYA, 0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++    memset(s->mem,0,sizeof(s->mem));
++    g_mem = s->mem;
++}
++
++
++static const TypeInfo esp32_phya_info = {
++    .name = TYPE_ESP32_PHYA,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Esp32PhyaState),
++    .instance_init = esp32_phya_init,
++};
++
++static void esp32_phya_register_types(void)
++{
++    type_register_static(&esp32_phya_info);
++}
++
++type_init(esp32_phya_register_types)
+diff --git a/hw/misc/esp32_wifi.c b/hw/misc/esp32_wifi.c
+new file mode 100644
+index 0000000..bf001d3
+--- /dev/null
++++ b/hw/misc/esp32_wifi.c
+@@ -0,0 +1,446 @@
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/error-report.h"
++#include "qemu/guest-random.h"
++#include "qapi/error.h"
++#include "sysemu/sysemu.h"
++#include "hw/hw.h"
++#include "hw/irq.h"
++#include "hw/sysbus.h"
++#include "hw/misc/esp32_wifi.h"
++#include "exec/address-spaces.h"
++#include "esp32_wlan_packet.h"
++#include "hw/qdev-properties.h"
++
++#define DEBUG 0
++
++#if DEBUG
++
++static const char * get_reg_name(hwaddr addr){
++    switch (addr)
++    {
++        case A_WIFI_BSSID_ADDR_FST_0:
++          return "WIFI_BSSID_ADDR_FST_0";
++          break;
++        case A_WIFI_BSSID_ADDR_SND_0:
++          return "WIFI_BSSID_ADDR_SND_0";
++          break;
++        case A_WIFI_BSSID_ADDR_SND_1:
++          return "WIFI_BSSID_ADDR_SND_1";
++          break;
++        case A_WIFI_BSSID_FILTER_FST_0:
++          return "WIFI_BSSID_FILTER_FST_0";
++          break;
++        case A_WIFI_BSSID_FILTER_SND_0:
++          return "WIFI_BSSID_FILTER_SND_0";
++          break;
++        case A_WIFI_BSSID_FILTER_FST_1:
++          return "WIFI_BSSID_FILTER_FST_1";
++          break;
++        case A_WIFI_BSSID_FILTER_SND_1:
++          return "WIFI_BSSID_FILTER_SND_1";
++          break;
++        case A_WIFI_MAC_ADDR_FST_0:
++          return "WIFI_MAC_ADDR_FST_0";
++          break;
++        case A_WIFI_MAC_ADDR_SND_0:
++          return "WIFI_MAC_ADDR_SND_0";
++          break;
++        case A_WIFI_MAC_ADDR_FST_1:
++          return "WIFI_MAC_ADDR_FST_1";
++          break;
++        case A_WIFI_MAC_ADDR_SND_1:
++          return "WIFI_MAC_ADDR_SND_1";
++          break;
++        case A_WIFI_MAC_FILTER_FST_0:
++          return "WIFI_MAC_FILTER_FST_0";
++          break;
++        case A_WIFI_MAC_FILTER_SND_0:
++          return "WIFI_MAC_FILTER_SND_0";
++          break;
++        case A_WIFI_MAC_FILTER_FST_1:
++          return "WIFI_MAC_FILTER_FST_1";
++          break;
++        case A_WIFI_MAC_FILTER_SND_1:
++          return "WIFI_MAC_FILTER_SND_1";
++          break;
++        case A_WIFI_RXBUF_INIT_BITMASK:
++          return "WIFI_RXBUF_INIT_BITMASK";
++          break;
++        case A_WIFI_DMA_IN_STATUS:
++          return "WIFI_DMA_IN_STATUS";
++          break ;
++        case  A_WIFI_DMA_INLINK:
++          return "WIFI_DMA_INLINK";
++          break;       
++        case A_WIFI_NEXT_RX_DSCR:
++          return "WIFI_NEXT_RX_DSCR";
++          break;
++        case A_WIFI_LAST_RX_DSCR:
++          return "WIFI_LAST_RX_DSCR";
++          break;
++        case A_WIFI_LAST_RXBUF_INIT_09C:
++          return "WIFI_LAST_RXBUF_INIT_09C";
++          break;
++        case A_WIFI_RX_POLICY_0:
++          return "WIFI_RX_POLICY_0";
++          break;
++        case A_WIFI_RX_POLICY_1:
++          return "WIFI_RX_POLICY_1";
++          break;
++        case A_WIFI_RX_POLICY_2:
++          return "WIFI_RX_POLICY_2";
++          break;
++        case A_WIFI_RX_POLICY_3:
++          return "WIFI_RX_POLICY_3";
++          break;
++        case A_WIFI_PROMISC_MISC_BITMASK0:
++          return "WIFI_PROMISC_MISC_BITMASK0";
++          break;
++        case A_WIFI_PROMISC_MISC_BITMASK1:
++          return "WIFI_PROMISC_MISC_BITMASK1";
++          break;
++        case A_WIFI_PROMISC_MISC_BITMASK2:
++          return "WIFI_PROMISC_MISC_BITMASK2";
++          break;
++        case A_WIFI_PROMISC_MISC_BITMASK3:
++          return "WIFI_PROMISC_MISC_BITMASK3";
++          break;
++        case A_WIFI_RXBUF_INIT_HIGH_ADDR_0:
++          return "WIFI_RXBUF_INIT_HIGH_ADDR_0";
++          break;
++        case A_WIFI_LAST_RXBUF_INIT_148:
++          return "WIFI_LAST_RXBUF_INIT_148";
++          break;
++        case A_WIFI_LAST_RXBUF_INIT_14C:
++          return "WIFI_LAST_RXBUF_INIT_14C";
++          break;
++        case A_WIFI_LAST_RXBUF_INIT_158:
++          return "WIFI_LAST_RXBUF_INIT_158";
++          break;
++        case A_WIFI_LAST_RXBUF_INIT_164:
++          return "WIFI_LAST_RXBUF_INIT_164";
++          break;
++        case A_WIFI_ANTENNA_INIT_284:
++          return "WIFI_ANTENNA_INIT_284";
++          break;
++        case A_WIFI_AUTOACK_INIT_400:
++          return "WIFI_AUTOACK_INIT_400";
++          break;
++        case A_WIFI_AUTOACK_INIT_404:
++          return "WIFI_AUTOACK_INIT_404";
++          break;
++        case A_WIFI_AUTOACK_INIT_408:
++          return "WIFI_AUTOACK_INIT_408";
++          break;
++        case A_WIFI_AUTOACK_INIT_40C:
++          return "WIFI_AUTOACK_INIT_40C";
++          break;
++        case A_WIFI_AUTOACK_INIT_410:
++          return "WIFI_AUTOACK_INIT_410";
++          break;
++        case A_WIFI_AUTOACK_INIT_414:
++          return "WIFI_AUTOACK_INIT_414";
++          break;
++        case A_WIFI_LOW_RATE_418:
++          return "WIFI_LOW_RATE_418";
++          break;
++        case A_WIFI_LOW_RATE_41C:
++          return "WIFI_LOW_RATE_41C";
++          break;
++        case A_WIFI_MAYBE_TIMESTAMP:
++          return "WIFI_MAYBE_TIMESTAMP";
++          break;
++        case A_WIFI_PROMISC_CONTROL_PKT:
++          return "WIFI_PROMISC_CONTROL_PKT";
++          break;
++        case A_WIFI_DMA_INT_STATUS:
++          return "WIFI_DMA_INT_STATUS";
++          break;
++        case A_WIFI_DMA_INT_CLR:
++          return "WIFI_DMA_INT_CLR";
++          break;
++        case A_WIFI_MAYBE_PWR_CTL:
++          return "WIFI_MAYBE_PWR_CTL";
++          break;
++        case A_WIFI_TXQ_CLR_STATE_COLL_TIMEOUT:
++          return "WIFI_TXQ_CLR_STATE_COLL_TIMEOUT";
++          break;
++        case A_WIFI_TXQ_STATE_COLL_TIMEOUT:
++          return "WIFI_TXQ_STATE_COLL_TIMEOUT";
++          break;
++        case A_WIFI_TXQ_CLR_STATE_COMPLETE:
++          return "WIFI_TXQ_CLR_STATE_COMPLETE";
++          break;
++        case A_WIFI_TXQ_STATE_COMPLETE:
++          return "WIFI_TXQ_STATE_COMPLETE";
++          break;
++        case A_WIFI_TX_CONFIG_0:
++          return "WIFI_TX_CONFIG_0";
++          break;
++        case A_WIFI_DMA_OUTLINK:
++          return "WIFI_DMA_OUTLINK";
++          break;
++        case A_WIFI_DMA_OUT_STATUS:
++          return "WIFI_DMA_OUT_STATUS";
++          break ;
++        case A_WIFI_TXRX_INIT_10C:
++          return "WIFI_TXRX_INIT_10C" ;
++          break;
++        case A_WIFI_TXRX_INIT_114:
++          return "WIFI_TXRX_INIT_114" ;
++          break;       
++        case A_WIFI_TXRX_INIT_C1C:
++          return "WIFI_TXRX_INIT_C1C" ;
++          break;
++        case A_WIFI_TXRX_INIT_C20:
++          return "WIFI_TXRX_INIT_C20" ;
++          break;
++        case A_WIFI_TXRX_INIT_C24:
++          return "WIFI_TXRX_INIT_C24" ;
++          break;
++        case A_WIFI_TXRX_INIT_C54:
++          return "WIFI_TXRX_INIT_C54" ;
++          break;
++        case A_WIFI_TXRX_INIT_C5C:
++          return "WIFI_TXRX_INIT_C5C" ;
++          break;
++        case A_WIFI_TXRX_INIT_C6C:
++          return "WIFI_TXRX_INIT_C6C" ;
++          break;
++        case A_WIFI_TXRX_INIT_C74:
++          return "WIFI_TXRX_INIT_C74" ;
++          break;
++        case A_WIFI_TXRX_INIT_C78:
++          return "WIFI_TXRX_INIT_C78" ;
++          break;
++        case A_WIFI_TXRX_INIT_C88:
++          return "WIFI_TXRX_INIT_C88" ;
++          break;
++        case A_WIFI_TXRX_INIT_CAC:
++          return "WIFI_TXRX_INIT_CAC" ;
++          break;
++        case A_WIFI_TXRX_INIT_D78:
++          return "WIFI_TXRX_INIT_D78";
++          break;      
++        case A_WIFI_TXRX_INIT_288:
++          return "WIFI_TXRX_INIT_288";
++          break;
++    }
++    return "**************";
++}
++
++static void macprint(const uint8_t *p, const char * name) {
++    printf("%s: %02x:%02x:%02x:%02x:%02x:%02x\n",name, p[0],p[1],p[2],p[3],p[4],p[5]);
++}
++
++#endif
++
++static uint64_t esp32_wifi_read(void *opaque, hwaddr addr, unsigned int size)
++{
++    
++    Esp32WifiState *s = ESP32_WIFI(opaque);
++    uint32_t r = s->mem[addr/4];
++    
++    switch(addr) {
++        case A_WIFI_DMA_INLINK:
++            r=s->dma_inlink_address;
++            break;
++        case A_WIFI_DMA_IN_STATUS:
++            r= r & ~0x1;
++            break;
++        case A_WIFI_DMA_INT_STATUS:
++        case A_WIFI_DMA_INT_CLR:
++            r=s->raw_interrupt;
++            break;
++        case A_WIFI_TXQ_STATE_COMPLETE:
++        case A_WIFI_DMA_OUT_STATUS:
++            r=1;
++            break;           
++    }
++#if DEBUG
++    printf("esp32_wifi_read  %20s(0x%04lx)= 0x%08x\n",get_reg_name(addr),(unsigned long) addr,r);
++#endif
++    return r;
++}
++static void set_interrupt(Esp32WifiState *s,int e) {
++    s->raw_interrupt |= e;
++    qemu_set_irq(s->irq, 1);
++}
++
++void Esp32_WLAN_frame_delivered(Esp32WifiState *s){
++    s->raw_interrupt |= 0x80;
++    qemu_set_irq(s->irq, 1);
++}
++
++static void esp32_wifi_write(void *opaque, hwaddr addr, uint64_t value,
++                                 unsigned int size) {
++    Esp32WifiState *s = ESP32_WIFI(opaque);
++#if DEBUG    
++    printf("esp32_wifi_write %20s(0x%04lx)= 0x%08lx\n",get_reg_name(addr),(unsigned long) addr, (unsigned long) value);
++#endif
++    
++    switch (addr) {
++        case A_WIFI_DMA_INLINK:
++            s->dma_inlink_address = value;
++            s->dma_inlink_ptr = value;
++            s->mem[R_WIFI_NEXT_RX_DSCR] = value; 
++            s->mem[R_WIFI_LAST_RX_DSCR] = value;
++            break;
++        case A_WIFI_DMA_INT_CLR:
++            s->raw_interrupt &= ~value;
++            if(s->raw_interrupt==0)
++                qemu_set_irq(s->irq, 0);
++            break;
++        case A_WIFI_DMA_OUTLINK:
++            if (value & 0xc0000000) {
++                // do a DMA transfer to the hardware from esp32 memory
++                mac80211_frame frame;
++                dma_list_item item;
++                unsigned memaddr = (0x3ff00000 | (value & 0xfffff));
++                address_space_read(&address_space_memory, memaddr,
++                            MEMTXATTRS_UNSPECIFIED, &item, 12);
++                address_space_read(&address_space_memory, item.address,
++                            MEMTXATTRS_UNSPECIFIED, &frame, item.length);
++                // frame from esp32 to ap
++                frame.frame_length=item.length;
++                frame.next_frame=0;
++                Esp32_WLAN_handle_frame(s, &frame);
++                set_interrupt(s,0x80);
++            }
++    }
++    s->mem[addr/4]=value;
++}
++
++static int match_mac_address(uint8_t *a1,uint8_t *a2) {
++    if(!memcmp(a1,a2,6)) return 1;
++    if(!memcmp(a1,BROADCAST,6)) return 1;
++    return 0;
++}
++// frame from ap to esp32
++void Esp32_sendFrame(Esp32WifiState *s, mac80211_frame *frame,int length, int signal_strength) {
++    if(s->dma_inlink_address==0) return;
++    uint8_t *header=malloc(sizeof(wifi_pkt_rx_ctrl_t)+length);
++    memset(header,0,sizeof(wifi_pkt_rx_ctrl_t)+length);
++    wifi_pkt_rx_ctrl_t *pkt=(wifi_pkt_rx_ctrl_t *)header;
++    *pkt=(wifi_pkt_rx_ctrl_t){
++        .rssi=(signal_strength+(rand()%10)+96),
++        .rate=11,
++        .sig_len=length,
++        .sig_len_copy=length,
++        .legacy_length=length,
++        .noise_floor=-97,
++        .channel=esp32_wifi_channel,
++        .timestamp=(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)/1000),
++    };
++    // These 4 bits are set if the mac addresses previously stored at 0x40 and 0x48
++    // match the destination or bssid addresses in the frame
++    if(match_mac_address(frame->destination_address,(uint8_t *)s->mem+A_WIFI_MAC_ADDR_FST_0)) 
++        pkt->damatch0=1;
++    if(match_mac_address(frame->destination_address,(uint8_t *)s->mem+A_WIFI_MAC_ADDR_FST_1)) 
++        pkt->damatch1=1;
++    if(match_mac_address(frame->bssid_address,(uint8_t *)s->mem+A_WIFI_MAC_ADDR_FST_0)) 
++        pkt->bssidmatch0=1;
++    if(match_mac_address(frame->bssid_address,(uint8_t *)s->mem+A_WIFI_MAC_ADDR_FST_1)) 
++        pkt->bssidmatch1=1;
++    //printf("...%x %x\n",header[3],frame->destination_address[0]);
++
++#if DEBUG     
++    macprint(frame->destination_address,"1 -destination_address");
++    macprint(frame->bssid_address,"2 -bssid_address");
++    macprint((uint8_t *)s->mem+A_WIFI_MAC_ADDR_FST_0,"3 -WIFI_MAC_ADDR_FST_0");
++    macprint((uint8_t *)s->mem+A_WIFI_MAC_ADDR_FST_1,"4 -A_WIFI_MAC_ADDR_FST_1");
++    printf("match 1_3=%i 1_4=%i 2_3=%i 2_4=%i\n", pkt->damatch0, pkt->damatch1, pkt->bssidmatch0, pkt->bssidmatch1);
++#endif
++
++    memcpy(header+sizeof(wifi_pkt_rx_ctrl_t),frame,length);
++    length+=sizeof(wifi_pkt_rx_ctrl_t);
++    // do a DMA transfer from the hardware to esp32 memory
++    dma_list_item item;
++    address_space_read(&address_space_memory, s->dma_inlink_ptr, MEMTXATTRS_UNSPECIFIED, &item, 12);
++    
++    /* Write only where real hardware would - a descriptor the
++     * driver has handed over (owner set), with room for the frame. Writing
++     * anywhere else corrupts the guest's heap, which then fails in free(). A
++     * frame with nowhere to go is dropped, as the hardware drops it. */
++    if (!item.owner || item.address == 0 || item.size < length) {
++        static int shown;
++        if (shown < 20) {
++            shown++;
++            printf("esp32_wifi: frame dropped - descriptor %08x owner=%u size=%u, frame %d bytes\n",
++                   s->dma_inlink_ptr, item.owner, item.size, length);
++            fflush(stdout);
++        }
++        free(header);
++        return;
++    }
++    
++    address_space_write(&address_space_memory, item.address, MEMTXATTRS_UNSPECIFIED, header, length);
++    item.length=length;
++    item.eof=1;
++    address_space_write(&address_space_memory, s->dma_inlink_ptr, MEMTXATTRS_UNSPECIFIED,&item,4);
++    s->dma_inlink_ptr=item.next;
++    if(s->dma_inlink_ptr == 0) s->dma_inlink_ptr = s->dma_inlink_address;
++    set_interrupt(s,0x1000024);
++    free(header);
++}
++
++static const MemoryRegionOps esp32_wifi_ops = {
++    .read =  esp32_wifi_read,
++    .write = esp32_wifi_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static void esp32_wifi_realize(DeviceState *dev, Error **errp)
++{
++    Esp32WifiState *s = ESP32_WIFI(dev);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
++    s->dma_inlink_address=0;
++    s->dma_inlink_ptr=0;
++
++    memory_region_init_io(&s->iomem, OBJECT(dev), &esp32_wifi_ops, s,
++                          TYPE_ESP32_WIFI, 0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
++    memset(s->mem,0,sizeof(s->mem));
++    Esp32_WLAN_setup_ap(dev, s);
++}
++static Property esp32_wifi_properties[] = {
++    DEFINE_NIC_PROPERTIES(Esp32WifiState, conf),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void esp32_wifi_reset_enter(Object *obj, ResetType type)
++{
++    Esp32WifiState *s = ESP32_WIFI(obj);
++    if(s)
++	    s->ap_state=0;
++}
++
++static void esp32_wifi_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    ResettablePhases rp;
++    dc->realize = esp32_wifi_realize;
++    set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
++    dc->desc = "Esp32 WiFi";
++    device_class_set_props(dc, esp32_wifi_properties);
++    Esp32_WLAN_class_init(klass);
++    ResettableClass *rc = RESETTABLE_CLASS(klass);
++    resettable_class_set_parent_phases(rc, esp32_wifi_reset_enter, NULL, NULL,
++                                   &rp);
++}
++
++static const TypeInfo esp32_wifi_info = {
++    .name = TYPE_ESP32_WIFI,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Esp32WifiState),
++    .class_init    = esp32_wifi_class_init,
++};
++
++static void esp32_wifi_register_types(void)
++{
++    type_register_static(&esp32_wifi_info);
++}
++
++type_init(esp32_wifi_register_types)
+diff --git a/hw/misc/esp32_wifi_ap.c b/hw/misc/esp32_wifi_ap.c
+new file mode 100644
+index 0000000..1f5d492
+--- /dev/null
++++ b/hw/misc/esp32_wifi_ap.c
+@@ -0,0 +1,1081 @@
++/**
++ * QEMU WLAN access point emulation
++ *
++ * Copyright (c) 2008 Clemens Kolbitsch
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ *
++ * Modifications:
++ *  2008-February-24  Clemens Kolbitsch :
++ *                                  New implementation based on ne2000.c
++ *  18/01/22 Martin Johnson : Modified for esp32 wifi emulation
++ *  08/12/23 lcgamboa@yahoo.com : Modified for esp32c3, espnow and SoftAp wifi emulation
++ */
++
++
++#include "qemu/osdep.h"
++#include "qom/object.h"
++#include "net/net.h"
++#include "qemu/timer.h"
++
++#include "hw/irq.h"
++#include "hw/misc/esp32_wifi.h"
++#include "hw/misc/esp32_phya.h"
++#include "esp32_wlan.h"
++#include "esp32_wlan_packet.h"
++
++// 50ms between beacons
++#define BEACON_TIME 500000000
++#define INTER_FRAME_TIME 5000000
++#define WAIT_ACK_TIMEOUT 10000000
++#define DEBUG 0
++#define ENABLE_BEACON 1
++#define DEBUG_DUMPFRAMES 0
++#define DEBUG_WIRESHARK_IMPORT 0
++
++// color defines
++#define BLACK 0
++#define RED 1
++#define GREEN 2
++#define YELLOW 3
++#define BLUE 4
++#define MAGNETA 5
++#define CYAN 6
++#define WHITE 7
++#define ANSI_DEFAULT() printf("\033[0m")
++#define ANSI_COLOR(f, b) printf("\033[%d;%dm", (f) + 30, (b) + 40)
++#define ANSI_FG_LCOLOR(f) printf("\033[0;%dm", (f) + 30)
++#define ANSI_FG_HCOLOR(f) printf("\033[1;%dm", (f) + 30)
++
++access_point_info access_points[]={
++    {"PICSimLabWifi",1,-25,{0x10,0x01,0x00,0xc4,0x0a,0x56}},
++    {"Espressif",5,-30,{0x10,0x01,0x00,0xc4,0x0a,0x51}},
++    {"MasseyWifi",10,-40,{0x10,0x01,0x00,0xc4,0x0a,0x52}}
++};
++
++int nb_aps=sizeof(access_points)/sizeof(access_point_info);
++
++/* The access points can be switched off, as a router is when it restarts: while
++ * the property access-points-off is set, they send no beacons and answer
++ * nothing, and a guest station joined to one is deauthenticated - a few times,
++ * as real access points do, in case one is missed - so its Wi-Fi goes down as
++ * it would. The guest's own SoftAP and the host's station on it go on. */
++static bool esp32_wifi_get_access_points_off(Object *obj, Error **errp)
++{
++    return ESP32_WIFI(obj)->access_points_off;
++}
++
++static void esp32_wifi_set_access_points_off(Object *obj, bool value, Error **errp)
++{
++    ESP32_WIFI(obj)->access_points_off = value;
++}
++
++void Esp32_WLAN_class_init(ObjectClass *klass)
++{
++    object_class_property_add_bool(klass, "access-points-off",
++                                   esp32_wifi_get_access_points_off,
++                                   esp32_wifi_set_access_points_off);
++}
++
++static void esp32_wifi_send_deauth(Esp32WifiState *s)
++{
++    struct mac80211_frame *frame = Esp32_WLAN_create_deauthentication();
++    int8_t strength = -25;
++    for (int i = 0; i < nb_aps; i++) {
++        if (!memcmp(access_points[i].mac_address, s->associated_ap_macaddr, 6)) {
++            strength = access_points[i].sigstrength;
++        }
++    }
++    /* new_frame() leaves both unset: the guest would drop the frame. */
++    frame->signal_strength = strength;
++    memcpy(frame->destination_address, BROADCAST, 6);
++    memcpy(s->ap_macaddr, s->associated_ap_macaddr, 6);
++    Esp32_WLAN_init_ap_frame(s, frame);
++    Esp32_WLAN_insert_frame(s, frame);
++}
++
++/* The host side of the network as a station of the guest's SoftAP,
++ * alongside the guest's own station link with the fork's access points - the
++ * guest may run both at once, as Tasmota and ESPHome do while trying Wi-Fi
++ * details their setup page was given (AP+STA). Kept apart from ap_state and
++ * mode, which stay the guest station's; frames are told apart by address: to
++ * or from the station's MAC (and the SoftAP's broadcasts) are this link's. */
++enum { SOFTAP_NONE, SOFTAP_AUTHENTICATING, SOFTAP_ASSOCIATING, SOFTAP_ASSOCIATED };
++static struct {
++    int state;
++    uint8_t bssid[6];       /* the guest's SoftAP */
++    char ssid[33];
++    int64_t last_beacon;    /* ns, QEMU_CLOCK_VIRTUAL */
++    int64_t last_try;
++    uint16_t seq;
++    uint8_t peer[6];        /* a host using its own MAC, e.g. slirp */
++    bool peer_set;
++    bool native;            /* a host has used the station's MAC */
++} softap;
++static const uint8_t softap_station[6] = {0x02, 0x53, 0x36, 0x30, 0x00, 0x02};
++#define SOFTAP_RETRY_NS 1000000000LL
++#define SOFTAP_GONE_NS  2000000000LL
++
++static void esp32_softap_send(Esp32WifiState *s, struct mac80211_frame *frame)
++{
++    memcpy(frame->destination_address, softap.bssid, 6);
++    memcpy(frame->source_address, softap_station, 6);
++    memcpy(frame->bssid_address, softap.bssid, 6);
++    frame->sequence_control.sequence_number = softap.seq++;
++    frame->signal_strength = -30;
++    Esp32_WLAN_insert_frame(s, frame);
++}
++
++/* Authentication, then association, each asked for again once a second until
++ * answered: the guest's SoftAP answers none until it is ready, and no probe. */
++static void esp32_softap_try(Esp32WifiState *s)
++{
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    if (now - softap.last_try < SOFTAP_RETRY_NS) {
++        return;
++    }
++    softap.last_try = now;
++    if (softap.state == SOFTAP_AUTHENTICATING) {
++        esp32_softap_send(s, Esp32_WLAN_create_authentication_request());
++    } else if (softap.state == SOFTAP_ASSOCIATING) {
++        access_point_info ap = { .ssid = softap.ssid, .channel = esp32_wifi_channel, .sigstrength = -30 };
++        memcpy(ap.mac_address, softap.bssid, 6);
++        esp32_softap_send(s, Esp32_WLAN_create_association_request(&ap));
++    }
++}
++
++static void esp32_softap_drop(const char *why)
++{
++    if (softap.state != SOFTAP_NONE) {
++        printf("esp32_wifi: guest SoftAP %s gone (%s)\n", softap.ssid, why);
++        fflush(stdout);
++    }
++    softap.state = SOFTAP_NONE;
++    softap.ssid[0] = 0;
++}
++
++/* Every half second: give up a SoftAP that stopped beaconing, ask again. */
++static void esp32_softap_tick(Esp32WifiState *s)
++{
++    if (softap.state == SOFTAP_NONE) {
++        return;
++    }
++    if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - softap.last_beacon > SOFTAP_GONE_NS) {
++        esp32_softap_drop("no beacons");
++    } else {
++        esp32_softap_try(s);
++    }
++}
++
++/* A frame the guest sent: true when it is this link's, and dealt with here. */
++static bool esp32_softap_frame(Esp32WifiState *s, struct mac80211_frame *frame)
++{
++    int type = frame->frame_control.type, sub = frame->frame_control.sub_type;
++    if (type == IEEE80211_TYPE_MGT && sub == IEEE80211_TYPE_MGT_SUBTYPE_BEACON) {
++        char ssid[33] = {0};
++        memcpy(ssid, frame->data_and_fcs + 14, MIN(frame->data_and_fcs[13], 32));
++        if (softap.state == SOFTAP_NONE || memcmp(softap.bssid, frame->bssid_address, 6) ||
++            strcmp(ssid, softap.ssid)) {
++            memcpy(softap.bssid, frame->bssid_address, 6);
++            strcpy(softap.ssid, ssid);
++            softap.state = SOFTAP_AUTHENTICATING;
++            softap.last_try = 0;
++            printf("esp32_wifi: guest SoftAP %s up\n", ssid);
++            fflush(stdout);
++        }
++        softap.last_beacon = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++        esp32_softap_try(s);
++        return true;
++    }
++    bool to_station = !memcmp(frame->destination_address, softap_station, 6);
++    /* From the SoftAP to all its stations (from-DS, a group address). */
++    bool broadcast = type == IEEE80211_TYPE_DATA && (frame->frame_control.flags & 0x03) == 0x02 &&
++                     (frame->destination_address[0] & 1) && softap.state == SOFTAP_ASSOCIATED &&
++                     !memcmp(frame->source_address, softap.bssid, 6);
++    if (!to_station && !broadcast) {
++        return false;
++    }
++    if (type == IEEE80211_TYPE_MGT) {
++        switch (sub) {
++        case IEEE80211_TYPE_MGT_SUBTYPE_AUTHENTICATION:
++            if (frame->data_and_fcs[2] == 2 && softap.state == SOFTAP_AUTHENTICATING) {
++                softap.state = SOFTAP_ASSOCIATING;
++                softap.last_try = 0;
++                esp32_softap_try(s);
++            }
++            break;
++        case IEEE80211_TYPE_MGT_SUBTYPE_ASSOCIATION_RESP:
++            if (softap.state == SOFTAP_ASSOCIATING) {
++                softap.state = SOFTAP_ASSOCIATED;
++            }
++            break;
++        case IEEE80211_TYPE_MGT_SUBTYPE_DEAUTHENTICATION:
++        case IEEE80211_TYPE_MGT_SUBTYPE_DISASSOCIATION:
++            softap.state = SOFTAP_AUTHENTICATING;
++            softap.last_try = 0;
++            break;
++        }
++        return true;
++    }
++    if (type == IEEE80211_TYPE_DATA && sub == IEEE80211_TYPE_DATA_SUBTYPE_DATA &&
++        softap.state == SOFTAP_ASSOCIATED) {
++        /* from-DS: addr1 the destination, addr2 the BSSID, addr3 the source. */
++        unsigned char ethernet_frame[1518];
++        unsigned long size = frame->frame_length - IEEE80211_HEADER_SIZE - 4 - 8 + 22;
++        if (size > sizeof(ethernet_frame) - 14) {
++            size = sizeof(ethernet_frame) - 14;
++        }
++        memcpy(&ethernet_frame[0], frame->destination_address, 6);
++        memcpy(&ethernet_frame[6], frame->bssid_address, 6);
++        ethernet_frame[12] = frame->data_and_fcs[6];
++        ethernet_frame[13] = frame->data_and_fcs[7];
++        memcpy(&ethernet_frame[14], &frame->data_and_fcs[8], size);
++        if (to_station && softap.peer_set && !softap.native) {
++            memcpy(&ethernet_frame[0], softap.peer, 6);
++            /* An ARP's target hardware address too. */
++            if (ethernet_frame[12] == 0x08 && ethernet_frame[13] == 0x06 && size >= 28 &&
++                !memcmp(&ethernet_frame[32], softap_station, 6)) {
++                memcpy(&ethernet_frame[32], softap.peer, 6);
++            }
++        }
++        qemu_send_packet(qemu_get_queue(s->nic), ethernet_frame, size + 14);
++    }
++    return true;
++}
++
++/* A frame from the tap: true when it is the host's station's (its source MAC),
++ * sent into the guest's SoftAP (to-DS) - or dropped, while not joined. */
++static bool esp32_softap_receive(Esp32WifiState *s, const uint8_t *buf, size_t size)
++{
++    if (size < 14) {
++        return false;
++    }
++    bool native = !memcmp(buf + 6, softap_station, 6);
++    softap.native |= native;
++    /* A host with a MAC of its own (slirp, say) uses the station too, as one
++     * did before, while the guest is not a station itself and no host has
++     * used the station's MAC: its frames go in as the station's, and the
++     * station's come back to it. */
++    if (!native && (softap.native || softap.state != SOFTAP_ASSOCIATED ||
++                    s->ap_state == Esp32_WLAN__STATE_ASSOCIATED)) {
++        return false;
++    }
++    if (softap.state != SOFTAP_ASSOCIATED) {
++        return true;
++    }
++    struct mac80211_frame *frame = Esp32_WLAN_create_data_packet(s, buf, size);
++    if (!frame) {
++        return true;
++    }
++    if (!native) {
++        memcpy(softap.peer, buf + 6, 6);
++        softap.peer_set = true;
++        /* An ARP's sender hardware address too. */
++        if (buf[12] == 0x08 && buf[13] == 0x06 && size >= 42) {
++            memcpy(frame->data_and_fcs + 16, softap_station, 6);
++        }
++    }
++    frame->frame_control.flags = 0x01;                   /* to-DS */
++    memcpy(frame->destination_address, softap.bssid, 6); /* addr1: the BSSID */
++    memcpy(frame->source_address, softap_station, 6);    /* addr2: the source */
++    memcpy(frame->bssid_address, buf, 6);                /* addr3: the destination */
++    frame->sequence_control.sequence_number = softap.seq++;
++    frame->signal_strength = -30;
++    Esp32_WLAN_insert_frame(s, frame);
++    return true;
++}
++
++static void Esp32_WLAN_beacon_timer(void *opaque)
++{ 
++    struct mac80211_frame *frame;
++    Esp32WifiState *s = (Esp32WifiState *)opaque;
++    esp32_softap_tick(s);
++    static int deauths_left;
++    static bool was_off;
++    if (s->access_points_off && s->mode == Esp32_Mode_Station) {
++        if (!was_off) {
++            was_off = true;
++            printf("esp32_wifi: access points off\n");
++            fflush(stdout);
++        }
++        if (s->ap_state == Esp32_WLAN__STATE_ASSOCIATED ||
++            s->ap_state == Esp32_WLAN__STATE_AUTHENTICATED) {
++            deauths_left = 5;
++            s->ap_state = Esp32_WLAN__STATE_NOT_AUTHENTICATED;
++        }
++        if (deauths_left > 0) {
++            deauths_left--;
++            esp32_wifi_send_deauth(s);
++        }
++        timer_mod(s->beacon_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + BEACON_TIME);
++        return;
++    }
++    if (was_off) {
++        was_off = false;
++        printf("esp32_wifi: access points on\n");
++        fflush(stdout);
++    }
++    deauths_left = 0;
++    // only send a beacon if we are an access point
++    if((ENABLE_BEACON)&&(s->mode == Esp32_Mode_Station)){
++      if(s->ap_state!=Esp32_WLAN__STATE_STA_ASSOCIATED) {
++        for(int i=0;i<nb_aps;i++){
++          int ap = (i + s->beacon_ap)%nb_aps;
++          if (access_points[ap].channel==esp32_wifi_channel) {
++              memcpy(s->ap_macaddr,access_points[ap].mac_address,6);
++              frame = Esp32_WLAN_create_beacon_frame(&access_points[ap]);
++              Esp32_WLAN_init_ap_frame(s, frame);
++              Esp32_WLAN_insert_frame(s, frame);
++              break;
++          }
++        }
++        s->beacon_ap=(s->beacon_ap+1)%nb_aps;
++      } 
++    }
++    timer_mod(s->beacon_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + BEACON_TIME);
++}
++
++static void Esp32_WLAN_inject_timer(void *opaque)
++{
++    Esp32WifiState *s = (Esp32WifiState *)opaque;
++    struct mac80211_frame *frame;
++
++    frame = s->inject_queue;
++    if (frame) {
++        // remove from queue
++        s->inject_queue_size--;
++        s->inject_queue = frame->next_frame;
++        Esp32_sendFrame(s, (void *)frame, frame->frame_length,frame->signal_strength);
++        free(frame);
++    }
++    if (s->inject_queue_size > 0) {
++        // there are more packets... schedule
++        // the timer for sending them as well
++        timer_mod(s->inject_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + INTER_FRAME_TIME);
++    } else {
++        // we wait until a new packet schedules
++        // us again
++        s->inject_timer_running = 0;
++    }
++
++}
++
++static void Esp32_WLAN_Wait_ACk_timer(void *opaque)
++{
++    Esp32WifiState *s = (Esp32WifiState *)opaque;
++
++    Esp32_WLAN_frame_delivered(s);
++}
++
++static void macprint(const uint8_t *p, const char * name) {
++    printf("%s: %02x:%02x:%02x:%02x:%02x:%02x\n",name, p[0],p[1],p[2],p[3],p[4],p[5]);
++}
++
++static void buffer_print(uint8_t * b, unsigned size){
++    for(int i=0;i < size ;i++) {
++        if((i%16)==0) printf("%04x: ",i);
++        printf("%02x ",b[i]);
++        if((i%16)==15) printf("\n");
++    }
++    if((size%16)!=0)printf("\n");
++}
++
++static void infoprint(struct mac80211_frame *frame) {
++    if(DEBUG_DUMPFRAMES) {
++#if  (DEBUG_WIRESHARK_IMPORT == 0 )
++        printf("\nFrame Info type:%d subtype:%d flags:%d duration:%d length:%d\n",frame->frame_control.type,
++           frame->frame_control.sub_type,frame->frame_control.flags,frame->duration_id, frame->frame_length);
++
++        printf("protocol_version: %i\n",frame->frame_control.protocol_version);    
++        printf("type: %i ",frame->frame_control.type );
++        switch (frame->frame_control.type)
++        {
++        case IEEE80211_TYPE_MGT:
++            printf("MGT\n"); 
++            break;
++        case IEEE80211_TYPE_CTL:
++            printf("CTL\n"); 
++            break;
++       case IEEE80211_TYPE_DATA:
++            printf("DATA\n"); 
++            break;
++        }    
++        printf("subtype: %i  ",frame->frame_control.sub_type);     
++        switch (frame->frame_control.type)
++        {
++        case IEEE80211_TYPE_MGT:
++            switch (frame->frame_control.sub_type)
++            {
++            case IEEE80211_TYPE_MGT_SUBTYPE_BEACON:
++                printf("BEACON\n");
++                break;
++            case IEEE80211_TYPE_MGT_SUBTYPE_ACTION:
++                printf("ACTION\n");
++                break;                      
++            case IEEE80211_TYPE_MGT_SUBTYPE_PROBE_REQ:
++                printf("PROBE_REQ\n");
++                break;       
++            case IEEE80211_TYPE_MGT_SUBTYPE_PROBE_RESP:  
++                printf("PROBE_RESP\n");
++                break;     
++            case IEEE80211_TYPE_MGT_SUBTYPE_AUTHENTICATION:
++                printf("AUTHENTICATION\n");
++                break;
++            case IEEE80211_TYPE_MGT_SUBTYPE_DEAUTHENTICATION:
++                printf("DEAUTHENTICATION\n");
++                break;
++            case IEEE80211_TYPE_MGT_SUBTYPE_ASSOCIATION_REQ:
++                printf("ASSOCIATION_REQ\n");
++                break;
++            case IEEE80211_TYPE_MGT_SUBTYPE_ASSOCIATION_RESP:
++                printf("ASSOCIATION_RESP\n");
++                break;
++            case IEEE80211_TYPE_MGT_SUBTYPE_DISASSOCIATION:
++                printf("DISASSOCIATION\n");
++                break;
++            default:
++                printf("---\n");
++                break;
++            }
++            break;
++        case IEEE80211_TYPE_CTL:
++           switch (frame->frame_control.sub_type)
++            {
++            case IEEE80211_TYPE_CTL_SUBTYPE_ACK:
++                printf("ACK\n");
++                break;
++            default:
++                printf("---\n");
++                break;
++            }
++            break;
++       case IEEE80211_TYPE_DATA:
++            switch (frame->frame_control.sub_type)
++            {
++            case IEEE80211_TYPE_DATA_SUBTYPE_DATA:
++                printf("DATA\n");
++                break;
++            default:
++                printf("---\n");
++                break;
++            }           
++            break;
++        }
++
++        printf("flags: %i\n",frame->frame_control.flags);
++        printf("duration_id: %i\n",frame->duration_id);
++        macprint(frame->destination_address,"destination");
++        macprint(frame->source_address,"source");
++        macprint(frame->bssid_address,"bssid");
++        printf("fragment_number: %u\n",frame->sequence_control.fragment_number);     
++        printf("sequence_number : %u\n",frame->sequence_control.sequence_number);         
++        
++        switch (frame->frame_control.type)
++        {
++          case IEEE80211_TYPE_MGT:
++            switch (frame->frame_control.sub_type)
++            {        
++              case IEEE80211_TYPE_MGT_SUBTYPE_BEACON:
++                printf("beacon timestamp : %lu\n",(unsigned long) frame->beacon_info.timestamp);
++                printf("beacon interval : %u\n",frame->beacon_info.interval);
++                printf("beacon capability : %u\n",frame->beacon_info.capability);
++                break;  
++              default:
++                if(frame->frame_length  > IEEE80211_HEADER_SIZE)
++                   buffer_print((uint8_t *)frame->data_and_fcs, frame->frame_length - IEEE80211_HEADER_SIZE);
++                break;
++            }
++            break; 
++          case IEEE80211_TYPE_CTL:
++            switch (frame->frame_control.sub_type)
++            {        
++              default:
++                if(frame->frame_length  > IEEE80211_HEADER_SIZE)
++                   buffer_print((uint8_t *)frame->data_and_fcs, frame->frame_length - IEEE80211_HEADER_SIZE);
++                break;
++            }
++            break; 
++            case IEEE80211_TYPE_DATA:
++            switch (frame->frame_control.sub_type)
++            {        
++              default:
++                printf("EtherType 0x%02X%02X\n",frame->data_and_fcs[6],frame->data_and_fcs[7]);
++                if( frame->data_and_fcs[6]==8 && frame->data_and_fcs[7]==0x06) {
++                    printf("ARP\n");
++                    arp_header_t *header=(arp_header_t *)&frame->data_and_fcs[8];
++                    printf("Operation %i\n", header->operation>>8);
++                }
++                if( frame->data_and_fcs[6]==8 && frame->data_and_fcs[7]==0x00) {
++                    printf("IPV4\n");
++                    ip_header_t *header=(ip_header_t *)&frame->data_and_fcs[8];
++                    printf("Protocol: 0x%04X\n",header->protocol);
++                    switch (header->protocol)
++                    {
++                    case 0x11:
++                        printf("UDP\n");
++                        break;
++                    case 0x06:
++                        printf("TCP\n");
++                        break;
++                    }
++                }
++                if( frame->data_and_fcs[6]==8 && frame->data_and_fcs[7]==0xdd) {
++                    printf("IPV6\n");
++                }
++                if(frame->frame_length  > IEEE80211_HEADER_SIZE)
++                   buffer_print((uint8_t *)frame->data_and_fcs, frame->frame_length - IEEE80211_HEADER_SIZE);
++                break;
++            }
++            break;   
++        }
++        printf("frame_length : %u\n", frame->frame_length);
++#else       
++        uint8_t *b=(uint8_t *)frame;
++        for(int i=0;i<frame->frame_length;i++) {
++            if((i%16)==0) printf("\n%04x: ",i);
++            printf("%02x ",b[i]);
++        }
++        printf("\n");
++#endif        
++    }
++}
++
++void Esp32_WLAN_insert_frame(Esp32WifiState *s, struct mac80211_frame *frame)
++{
++    struct mac80211_frame *i_frame;
++
++    insertCRC(frame);
++    if(DEBUG) {
++        ANSI_FG_HCOLOR(GREEN);
++        printf("---------------\n>IN Send Frame type:%d subtype:%d channel:%d ap_state:%d  time:%ld \n",frame->frame_control.type,frame->frame_control.sub_type,esp32_wifi_channel,s->ap_state,(unsigned long) qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
++        ANSI_DEFAULT();
++    }
++    infoprint(frame);
++    s->inject_queue_size++;
++    i_frame = s->inject_queue;
++    if (!i_frame) {
++        s->inject_queue = frame;
++    } else {
++        while (i_frame->next_frame) {
++            i_frame = i_frame->next_frame;
++        }
++        i_frame->next_frame = frame;
++    }
++
++    if (!s->inject_timer_running) {
++        // if the injection timer is not
++        // running currently, let's schedule
++        // one run...
++        s->inject_timer_running = 1;
++        timer_mod(s->inject_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + INTER_FRAME_TIME);
++    }
++
++}
++
++static _Bool Esp32_WLAN_can_receive(NetClientState *ncs)
++{
++    Esp32WifiState *s = qemu_get_nic_opaque(ncs);
++    /*
++    if (s->ap_state != Esp32_WLAN__STATE_ASSOCIATED  && s->ap_state != Esp32_WLAN__STATE_STA_ASSOCIATED) {
++        // we are currently not connected
++        // to the access point
++        return 0;
++    }
++    */
++    if (s->inject_queue_size > Esp32_WLAN__MAX_INJECT_QUEUE_SIZE) {
++        // overload, please give me some time...
++        return 0;
++    }
++
++    return 1;
++}
++
++static ssize_t Esp32_WLAN_receive(NetClientState *ncs,
++                                    const uint8_t *buf, size_t size)
++{
++    Esp32WifiState *s = qemu_get_nic_opaque(ncs);
++    struct mac80211_frame *frame;
++    if (!Esp32_WLAN_can_receive(ncs)) {
++        // this should not happen, but in
++        // case it does, let's simply drop
++        // the packet
++        return -1;
++    }
++
++    if (!s) {
++        return -1;
++    }
++    if (esp32_softap_receive(s, buf, size)) {
++        return size;
++    }
++    /*
++     * A 802.3 packet comes from the qemu network. The
++     * access points turns it into a 802.11 frame and
++     * forwards it to the wireless device
++     */
++    frame = Esp32_WLAN_create_data_packet(s, buf, size);
++    if (frame) {
++        if(s->mode == Esp32_Mode_Station){
++             memcpy(s->ap_macaddr,s->associated_ap_macaddr,6);
++        
++            if(s->ap_state==Esp32_WLAN__STATE_STA_ASSOCIATED) {
++                frame->frame_control.flags=1;
++                // if it's an arp request put the correct reply mac address in the packet 
++                if( frame->data_and_fcs[6]==8 && frame->data_and_fcs[7]==6) {
++                    memcpy(frame->data_and_fcs+16,s->macaddr,6);
++                }
++            }
++        }
++        else{
++            memcpy(frame->destination_address, s->softap_macaddr,6);
++            if(s->ap_state==Esp32_WLAN__STATE_STA_ASSOCIATED) {
++                frame->frame_control.flags=1;
++                // if it's an arp request put the correct reply mac address in the packet 
++                if( frame->data_and_fcs[6]==8 && frame->data_and_fcs[7]==6) {
++                    memcpy(frame->data_and_fcs+16,s->ap_macaddr,6);
++                }
++            }
++        }
++
++
++        if(((buf[12] & 0xE0) == IEEE80211_ENCAPSULATED)&&(buf[13] == ((IEEE80211_TYPE_MGT << 4)|IEEE80211_TYPE_MGT_SUBTYPE_ACTION)))
++        {
++          unsigned long ethernet_frame_size;
++          unsigned char ethernet_frame[1518];
++          struct mac80211_frame *reply = NULL;
++
++          //discard packages from others channels
++          if((buf[12] & 0x0F) != esp32_wifi_channel) return -1;
++          //discard packages originated from the same mac address
++          if(!memcmp(&buf[6],s->macaddr,6)) return -1;
++          //check destination
++          if((memcmp(&buf[0],BROADCAST,6))&&(memcmp(&buf[0],s->macaddr,6))) return -1;
++
++          //action frame  
++          Esp32_WLAN_init_ap_frame(s, frame);
++          memcpy(frame->data_and_fcs, buf+14, size-14);   
++          memcpy(frame->destination_address, &buf[0], 6);
++          memcpy(frame->source_address, &buf[6], 6);
++          memset(frame->bssid_address, 0xff, 6);
++          frame->frame_control.type= IEEE80211_TYPE_MGT;
++          frame->frame_control.sub_type= IEEE80211_TYPE_MGT_SUBTYPE_ACTION;
++          frame->frame_control.flags=  ((buf[12] & 0xF0) == IEEE80211_ENCAPSULATED_PROTECTED) ? 0x40 : 00;
++          frame->duration_id= 0 ;
++          frame->frame_length-=12;
++          Esp32_WLAN_insert_frame(s, frame);
++
++
++           //if destination is broadcast, don´t send ack 
++          if(!memcmp(&buf[0],BROADCAST,6)) return size;
++
++          //Send Ack
++          reply = Esp32_WLAN_create_ack();
++          memcpy(reply->destination_address, &buf[6], 6);
++          memcpy(reply->source_address, s->macaddr, 6);
++          memset(reply->bssid_address, 0xff, 6);
++          reply->duration_id=0;
++
++          if(DEBUG) {
++            ANSI_FG_HCOLOR(RED);
++            macprint(reply->destination_address,"---------------\n<OUT ACK send: dest ");
++            ANSI_DEFAULT();
++          }
++          infoprint(reply);
++           /*
++            * The access point uses the 802.11 frame
++            * and sends a 802.3 frame into the network...
++            * This packet is then understandable by
++            * qemu-slirp
++            *
++            * If we ever want the access point to offer
++            * some services, it can be added here!!
++            */
++          // ethernet header type
++          ethernet_frame[12] = IEEE80211_ENCAPSULATED | esp32_wifi_channel;
++          ethernet_frame[13] = ((IEEE80211_TYPE_CTL << 4)|IEEE80211_TYPE_CTL_SUBTYPE_ACK); 
++
++          memcpy(&ethernet_frame[0], reply->destination_address, 6);
++          memcpy(&ethernet_frame[6], reply->source_address, 6);
++
++          // add size of ethernet header
++          ethernet_frame_size = 14;
++          /*
++           * Send 802.3 frame
++           */
++          qemu_send_packet(qemu_get_queue(s->nic), ethernet_frame, ethernet_frame_size);
++
++          return size; 
++        }
++
++        if(((buf[12] & 0xF0)== IEEE80211_ENCAPSULATED)&&(buf[13] == ((IEEE80211_TYPE_CTL << 4)|IEEE80211_TYPE_CTL_SUBTYPE_ACK)))
++        {
++
++          //discard packages from others channels
++          if((buf[12] & 0x0F) != esp32_wifi_channel) return -1;  
++          //discard packages originated from the same mac address
++          if(!memcmp(&buf[6],s->macaddr,6)) return -1;
++          //check destination
++          if(memcmp(&buf[0],s->macaddr,6)) return -1;
++
++          Esp32_WLAN_Set_Packet_Status(ESP32_PHYA_ACK);
++          timer_mod_anticipate(s->wait_ack_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
++
++          Esp32_WLAN_init_ap_frame(s, frame); 
++          memcpy(frame->destination_address, &buf[0], 6);
++          memcpy(frame->source_address, &buf[6], 6);
++          memset(frame->bssid_address, 0xff, 6); 
++          frame->frame_control.type= IEEE80211_TYPE_CTL;
++          frame->frame_control.sub_type= IEEE80211_TYPE_CTL_SUBTYPE_ACK;
++          frame->frame_control.flags= 0; 
++          frame->duration_id= 0 ;
++          frame->frame_length = 10;
++
++          if(DEBUG) {
++            ANSI_FG_HCOLOR(GREEN);
++            macprint(&buf[6],"---------------\n>IN ACK received: source");
++            ANSI_DEFAULT();
++          }
++          infoprint(frame);
++          //ACK is not inserted in DMA
++          return size; 
++        }
++        Esp32_WLAN_init_ap_frame(s, frame);
++        if (s->mode == Esp32_Mode_Station && s->ap_state == Esp32_WLAN__STATE_ASSOCIATED) {
++            /* From-DS: addr3 is the real sender, as on a bridged network. */
++            memcpy(frame->bssid_address, &buf[6], 6);
++        }
++        Esp32_WLAN_insert_frame(s, frame);
++    }
++    return size;
++}
++static void Esp32_WLAN_cleanup(NetClientState *ncs) { }
++
++static NetClientInfo net_info = {
++    .type = NET_CLIENT_DRIVER_NIC,
++    .size = sizeof(NICState),
++    .can_receive = Esp32_WLAN_can_receive,
++    .receive = Esp32_WLAN_receive,
++    .cleanup = Esp32_WLAN_cleanup,
++};
++
++void Esp32_WLAN_reset_ap(Esp32WifiState *s) {
++    esp32_softap_drop("reset");
++    esp32_wifi_channel = 0;
++    s->ap_state = Esp32_WLAN__STATE_NOT_AUTHENTICATED;
++    s->beacon_ap=0;
++    s->mode = Esp32_Mode_Station;
++    memcpy(s->ap_macaddr,(uint8_t[]){0x10,0x13,0x46,0xbf,0x31,0x50},sizeof(s->ap_macaddr));
++
++    s->inject_timer_running = 0;
++    s->inject_sequence_number = 0;
++
++    s->inject_queue = NULL;
++    s->inject_queue_size = 0;
++}
++
++void Esp32_WLAN_setup_ap(DeviceState *dev,Esp32WifiState *s) {
++
++    Esp32_WLAN_reset_ap(s);
++
++    s->beacon_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, Esp32_WLAN_beacon_timer, s);
++    timer_mod(s->beacon_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+BEACON_TIME);
++
++    // setup the timer but only schedule
++    // it when necessary...
++    s->inject_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, Esp32_WLAN_inject_timer, s);
++
++    s->wait_ack_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, Esp32_WLAN_Wait_ACk_timer, s);
++
++    s->nic = qemu_new_nic(&net_info, &s->conf, object_get_typename(OBJECT(s)), dev->id, &dev->mem_reentrancy_guard, s);
++    qemu_format_nic_info_str(qemu_get_queue(s->nic), s->macaddr);
++}
++
++static void send_single_frame(Esp32WifiState *s, struct mac80211_frame *frame, struct mac80211_frame *reply) {
++    reply->sequence_control.sequence_number = s->inject_sequence_number++ +0x730;
++    reply->signal_strength=-10;
++
++    if(frame) {
++        memcpy(reply->destination_address, frame->source_address, 6);
++        if(s->mode == Esp32_Mode_Station){
++           memcpy(reply->source_address, s->macaddr, 6);
++        }
++        else{
++           memcpy(reply->source_address, s->ap_macaddr, 6);      
++        }
++        memcpy(reply->bssid_address, frame->source_address, 6);
++    }
++    
++    Esp32_WLAN_insert_frame(s, reply);
++}
++
++void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
++{
++    struct mac80211_frame *reply = NULL;
++    static access_point_info dummy_ap={0};
++    static char ssid[64];
++    unsigned long ethernet_frame_size;
++    unsigned char ethernet_frame[1518];
++
++    
++    if(DEBUG){ 
++        if((ENABLE_BEACON)||!((frame->frame_control.type == IEEE80211_TYPE_MGT)&&(frame->frame_control.sub_type == IEEE80211_TYPE_MGT_SUBTYPE_BEACON))){
++            ANSI_FG_HCOLOR(RED);
++            printf("-------------------------\n<OUT Handle Frame type:%d subtype:%d channel:%d ap_state:%d time:%ld \n",frame->frame_control.type,
++                         frame->frame_control.sub_type,esp32_wifi_channel,s->ap_state,(unsigned long)  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
++            ANSI_DEFAULT();
++        }
++    }
++    if((ENABLE_BEACON)||!((frame->frame_control.type == IEEE80211_TYPE_MGT)&&(frame->frame_control.sub_type == IEEE80211_TYPE_MGT_SUBTYPE_BEACON))){
++        infoprint(frame);
++    }
++    access_point_info *ap_info=0;
++
++    if(s->mode == Esp32_Mode_Station){
++        for(int i=0;i<nb_aps;i++)
++            if(access_points[i].channel==esp32_wifi_channel){
++                ap_info=&access_points[i];
++                break;
++        }
++        /* One sent to an access point by its MAC (authenticating, associating)
++         * is answered whatever channel the radio is on: with its own SoftAP up
++         * and a station on it (AP+STA), the guest stays on the SoftAP's channel,
++         * where a real one moves its SoftAP to the router's. */
++        if (frame->frame_control.type == IEEE80211_TYPE_MGT && !(frame->destination_address[0] & 1)) {
++            for (int i = 0; i < nb_aps; i++) {
++                if (!memcmp(access_points[i].mac_address, frame->destination_address, 6)) {
++                    ap_info = &access_points[i];
++                    break;
++                }
++            }
++        }
++    }
++
++    Esp32_WLAN_Set_Packet_Status(ESP32_PHYA_ACK);
++    if (esp32_softap_frame(s, frame)) {
++        Esp32_WLAN_frame_delivered(s);
++        return;
++    }
++    if(frame->frame_control.type == IEEE80211_TYPE_MGT) {        
++        switch(frame->frame_control.sub_type) {
++            case IEEE80211_TYPE_MGT_SUBTYPE_BEACON:
++                if(s->ap_state==Esp32_WLAN__STATE_NOT_AUTHENTICATED || s->ap_state==Esp32_WLAN__STATE_AUTHENTICATED) {
++                    strncpy(ssid,(char *)frame->data_and_fcs+14,frame->data_and_fcs[13]);
++                    if(DEBUG) printf("beacon from %s\n",ssid);
++                    dummy_ap.ssid=ssid;
++                    dummy_ap.channel = esp32_wifi_channel;
++                    dummy_ap.sigstrength= -23;
++                    memcpy(dummy_ap.mac_address,s->ap_macaddr,6) ;
++                    memcpy(s->softap_macaddr,frame->bssid_address,6);
++                    s->mode = Esp32_Mode_SoftAP;
++                    s->ap_state=Esp32_WLAN__STATE_STA_NOT_AUTHENTICATED;
++                    send_single_frame(s,frame,Esp32_WLAN_create_probe_request(&dummy_ap));
++                }
++                break;
++            case IEEE80211_TYPE_MGT_SUBTYPE_ACTION:    
++                if(DEBUG) printf("action\n");
++               /*
++                * The access point uses the 802.11 frame
++                * and sends a 802.3 frame into the network...
++                * This packet is then understandable by
++                * qemu-slirp
++                *
++                * If we ever want the access point to offer
++                * some services, it can be added here!!
++                */
++                // ethernet header type
++                ethernet_frame[12] = ((frame->frame_control.flags & 0x40) ? IEEE80211_ENCAPSULATED_PROTECTED : IEEE80211_ENCAPSULATED)| esp32_wifi_channel;
++                ethernet_frame[13] = ((IEEE80211_TYPE_MGT << 4)|IEEE80211_TYPE_MGT_SUBTYPE_ACTION); 
++
++                memcpy(&ethernet_frame[0], frame->destination_address, 6);
++                memcpy(&ethernet_frame[6], s->macaddr, 6);
++
++                // add packet content
++                ethernet_frame_size = frame->frame_length -IEEE80211_HEADER_SIZE;
++
++                if (ethernet_frame_size > sizeof(ethernet_frame)) {
++                    ethernet_frame_size = sizeof(ethernet_frame);
++                }
++                memcpy(&ethernet_frame[14], &frame->data_and_fcs[0], ethernet_frame_size);
++                // add size of ethernet header
++                ethernet_frame_size += 14;
++                /*
++                * Send 802.3 frame
++                */
++                qemu_send_packet(qemu_get_queue(s->nic), ethernet_frame, ethernet_frame_size);
++                 
++                //if destination is not broadcast wait for ack 
++                if(memcmp(&ethernet_frame[0],BROADCAST,6)){ 
++                   Esp32_WLAN_Set_Packet_Status(ESP32_PHYA_NACK);
++                   timer_mod(s->wait_ack_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + WAIT_ACK_TIMEOUT);
++                   return;
++                }
++                break;
++            case IEEE80211_TYPE_MGT_SUBTYPE_PROBE_RESP:
++                ap_info=&dummy_ap;
++                strncpy(ssid,(char *)frame->data_and_fcs+14,frame->data_and_fcs[13]);
++                if(DEBUG) printf("probe resp from %s\n",ssid);
++                dummy_ap.ssid=ssid;
++                s->ap_state=Esp32_WLAN__STATE_STA_NOT_AUTHENTICATED;
++                send_single_frame(s,frame,Esp32_WLAN_create_deauthentication());
++                send_single_frame(s,frame,Esp32_WLAN_create_authentication_request());
++                break;
++            case IEEE80211_TYPE_MGT_SUBTYPE_ASSOCIATION_RESP:
++                if(DEBUG) printf("assoc resp\n");
++                mac80211_frame *frame1=Esp32_WLAN_create_dhcp_discover(s);
++                memcpy(frame1->bssid_address,BROADCAST,6);
++                memcpy(frame1->source_address,frame->destination_address,6);
++                memcpy(frame1->destination_address,frame->source_address,6);
++                send_single_frame(s,0,frame1);
++                s->ap_state=Esp32_WLAN__STATE_STA_DHCP;
++                break;
++            case IEEE80211_TYPE_MGT_SUBTYPE_DISASSOCIATION:
++                DEBUG_PRINT_AP(("Received disassociation!\n"));
++                send_single_frame(s,frame,Esp32_WLAN_create_disassociation());
++                if (s->ap_state == Esp32_WLAN__STATE_ASSOCIATED || s->ap_state == Esp32_WLAN__STATE_STA_ASSOCIATED) {
++                    s->ap_state = Esp32_WLAN__STATE_AUTHENTICATED;
++                }
++                break;
++            case IEEE80211_TYPE_MGT_SUBTYPE_DEAUTHENTICATION:
++                DEBUG_PRINT_AP(("Received deauthentication!\n"));
++                //reply = Esp32_WLAN_create_authentication_response(ap_info);
++                if (s->ap_state == Esp32_WLAN__STATE_AUTHENTICATED) {
++                    s->ap_state = Esp32_WLAN__STATE_NOT_AUTHENTICATED;
++                }
++                break;
++            case IEEE80211_TYPE_MGT_SUBTYPE_AUTHENTICATION:
++                DEBUG_PRINT_AP(("Received authentication!\n"));
++                if(frame->data_and_fcs[2]==2) { // response
++                    send_single_frame(s,frame,Esp32_WLAN_create_association_request(&dummy_ap));
++                }
++                break;
++        }
++        if(ap_info && !s->access_points_off) {
++            memcpy(s->ap_macaddr,ap_info->mac_address,6);
++            switch(frame->frame_control.sub_type) {
++                case IEEE80211_TYPE_MGT_SUBTYPE_PROBE_REQ:
++                    DEBUG_PRINT_AP(("Received probe request!\n"));
++                    reply = Esp32_WLAN_create_probe_response(ap_info);
++                    break;
++                case IEEE80211_TYPE_MGT_SUBTYPE_AUTHENTICATION:
++                    DEBUG_PRINT_AP(("Received authentication req!\n"));
++                    if(frame->data_and_fcs[2]==1) { // request
++                        reply = Esp32_WLAN_create_authentication_response(ap_info);
++                        if (s->ap_state == Esp32_WLAN__STATE_NOT_AUTHENTICATED) {
++                            s->ap_state = Esp32_WLAN__STATE_AUTHENTICATED;
++                        }
++                    } 
++                break;
++                case IEEE80211_TYPE_MGT_SUBTYPE_ASSOCIATION_REQ:
++                    DEBUG_PRINT_AP(("Received association request!\n"));
++                    reply = Esp32_WLAN_create_association_response(ap_info);
++                    if (s->ap_state == Esp32_WLAN__STATE_AUTHENTICATED) {
++                        s->ap_state = Esp32_WLAN__STATE_ASSOCIATED;
++                        memcpy(s->associated_ap_macaddr,s->ap_macaddr,6);
++                    }
++                    break;
++            }
++            if (reply) {
++                reply->signal_strength=ap_info->sigstrength;
++                memcpy(reply->destination_address, frame->source_address, 6);
++                Esp32_WLAN_init_ap_frame(s, reply);
++                Esp32_WLAN_insert_frame(s, reply);
++            }
++        }
++    }
++    if (s->access_points_off && s->mode == Esp32_Mode_Station &&
++        frame->frame_control.type == IEEE80211_TYPE_DATA) {
++        /* As a real access point does to a station that sends it data while
++         * not joined to it: it may have missed the first deauthentication. */
++        esp32_wifi_send_deauth(s);
++        Esp32_WLAN_frame_delivered(s);
++        return;
++    }
++    if ((frame->frame_control.type == IEEE80211_TYPE_DATA) &&
++        (frame->frame_control.sub_type == IEEE80211_TYPE_DATA_SUBTYPE_DATA)) {
++        if(s->ap_state == Esp32_WLAN__STATE_STA_DHCP) {
++            dhcp_request_t *req=(dhcp_request_t *)&frame->data_and_fcs[8];
++            // check for a dhcp offer
++            if(req->dhcp.bp_options[0]==0x35 && req->dhcp.bp_options[2]==0x2) {
++                mac80211_frame *frame1=Esp32_WLAN_create_dhcp_request(s,req->dhcp.yiaddr);
++                memcpy(frame1->bssid_address,BROADCAST,6);
++                memcpy(frame1->source_address,s->ap_macaddr,6);
++                memcpy(frame1->destination_address,frame->source_address,6);
++                send_single_frame(s,0,frame1);
++                //memcpy(s->ap_macaddr,(uint8_t[]){0x10,0x01,0x00,0xc4,0x0a,0x25},sizeof(s->ap_macaddr));
++                //memcpy(s->associated_ap_macaddr,s->ap_macaddr,sizeof(s->ap_macaddr));
++                memcpy(s->associated_ap_macaddr,s->macaddr,sizeof(s->macaddr));
++                s->ap_state=Esp32_WLAN__STATE_STA_ASSOCIATED; 
++                if(DEBUG) printf("Dhcp received addr %d.%d.%d.%d\n",req->dhcp.yiaddr[0],req->dhcp.yiaddr[1],req->dhcp.yiaddr[2],req->dhcp.yiaddr[3]);
++            }
++        } else if (s->ap_state == Esp32_WLAN__STATE_ASSOCIATED || s->ap_state == Esp32_WLAN__STATE_STA_ASSOCIATED) {
++            /*
++            * The access point uses the 802.11 frame
++            * and sends a 802.3 frame into the network...
++            * This packet is then understandable by
++            * qemu-slirp
++            *
++            * If we ever want the access point to offer
++            * some services, it can be added here!!
++            */
++            // ethernet header type
++            ethernet_frame[12] = frame->data_and_fcs[6];
++            ethernet_frame[13] = frame->data_and_fcs[7];
++
++            if(s->ap_state == Esp32_WLAN__STATE_ASSOCIATED) {
++                /* Bridge, do not NAT: a to-DS frame carries addr1 = BSSID,
++                 * addr2 = sender, addr3 = destination. Putting the real ones
++                 * on the wire lets a tap or bridge network see the guest's own
++                 * MAC (DHCP reservations, ARP); slirp works either way. */
++                memcpy(&ethernet_frame[0], frame->bssid_address, 6);
++                memcpy(&ethernet_frame[6], frame->source_address, 6);
++            } else {
++                memcpy(&ethernet_frame[6], s->macaddr, 6);
++            }
++
++            if (s->ap_state == Esp32_WLAN__STATE_ASSOCIATED) {
++                /* addresses set above */
++            } else if (ethernet_frame[12] == 0x08 && ethernet_frame[13] == 0x06) {
++                // for arp request, we use a broadcast
++                memset(&ethernet_frame[0], 0xff, 6);
++            } else {
++                // otherwise we forward the packet to
++                // where it really belongs
++                memcpy(&ethernet_frame[0], frame->destination_address, 6);
++            }
++
++            // add packet content
++            ethernet_frame_size = frame->frame_length - IEEE80211_HEADER_SIZE - 4 - 8;
++
++            // for some reason, the packet is 22 bytes too small (??)
++            ethernet_frame_size += 22;
++            if (ethernet_frame_size > sizeof(ethernet_frame)) {
++                ethernet_frame_size = sizeof(ethernet_frame);
++            }
++            memcpy(&ethernet_frame[14], &frame->data_and_fcs[8], ethernet_frame_size);
++            // add size of ethernet header
++            ethernet_frame_size += 14;
++            /*
++            * Send 802.3 frame
++            */
++            qemu_send_packet(qemu_get_queue(s->nic), ethernet_frame, ethernet_frame_size);
++        }
++    }
++    Esp32_WLAN_frame_delivered(s);
++}
++
+diff --git a/hw/misc/esp32_wlan.h b/hw/misc/esp32_wlan.h
+new file mode 100644
+index 0000000..474c92d
+--- /dev/null
++++ b/hw/misc/esp32_wlan.h
+@@ -0,0 +1,280 @@
++/**
++ * QEMU WLAN device emulation
++ *
++ * Copyright (c) 2008 Clemens Kolbitsch
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ *
++ * Modifications:
++ *  2008-February-24  Clemens Kolbitsch :
++ *                                  New implementation based on ne2000.c
++ *  18/1/22 Martin Johnson : Modified for esp32 wifi emulation
++ *
++ */
++
++#ifndef esp32_wlan_h
++#define esp32_wlan_h 1
++
++
++//#define DEBUG_Esp32_WLAN
++
++#ifdef DEBUG_Esp32_WLAN
++#define DEBUG_PRINT_AP(x) \
++    do { \
++        struct timeval __tt; \
++        gettimeofday(&__tt, NULL); \
++        printf("%u:%u  ", (unsigned)__tt.tv_sec, (unsigned)__tt.tv_usec); \
++        printf x ;\
++    } while (0)
++#else
++#define DEBUG_PRINT_AP(x)
++#endif
++
++
++#define IEEE80211_IDLE                  0xff
++
++#define IEEE80211_TYPE_MGT              0x00
++#define IEEE80211_TYPE_CTL              0x01
++#define IEEE80211_TYPE_DATA             0x02
++
++#define IEEE80211_ENCAPSULATED                    0xA0
++#define IEEE80211_ENCAPSULATED_PROTECTED          0xB0
++
++#define IEEE80211_TYPE_MGT_SUBTYPE_BEACON           0x08
++#define IEEE80211_TYPE_MGT_SUBTYPE_ACTION           0x0d
++#define IEEE80211_TYPE_MGT_SUBTYPE_PROBE_REQ        0x04
++#define IEEE80211_TYPE_MGT_SUBTYPE_PROBE_RESP       0x05
++#define IEEE80211_TYPE_MGT_SUBTYPE_AUTHENTICATION   0x0b
++#define IEEE80211_TYPE_MGT_SUBTYPE_DEAUTHENTICATION 0x0c
++#define IEEE80211_TYPE_MGT_SUBTYPE_ASSOCIATION_REQ  0x00
++#define IEEE80211_TYPE_MGT_SUBTYPE_ASSOCIATION_RESP 0x01
++#define IEEE80211_TYPE_MGT_SUBTYPE_DISASSOCIATION   0x0a
++
++#define IEEE80211_TYPE_CTL_SUBTYPE_ACK          0x0d
++
++#define IEEE80211_TYPE_DATA_SUBTYPE_DATA        0x00
++
++#define IEEE80211_BEACON_PARAM_SSID             0x00
++#define IEEE80211_BEACON_PARAM_RATES            0x01
++#define IEEE80211_BEACON_PARAM_CHANNEL          0x03
++#define IEEE80211_BEACON_PARAM_EXTENDED_RATES   0x32
++#define IEEE80211_BEACON_PARAM_TIM              0x05
++
++
++#define IEEE80211_HEADER_SIZE               24
++
++typedef struct beacon_info_t {
++    uint64_t timestamp;
++    uint16_t interval;
++    uint16_t capability;
++}  QEMU_PACKED beacon_info_t;
++
++typedef uint8_t macaddr_t[6];
++
++#define BROADCAST (uint8_t[]){0xff,0xff,0xff,0xff,0xff,0xff}
++
++typedef struct mac80211_frame {
++    struct mac80211_frame_control {
++        unsigned    protocol_version    : 2;
++        unsigned    type            : 2;
++        unsigned    sub_type        : 4;
++        unsigned  flags:8;
++    } QEMU_PACKED frame_control;
++    uint16_t  duration_id;
++    macaddr_t destination_address;
++    macaddr_t source_address;
++    macaddr_t bssid_address;
++    struct mac80211_sequence_control {
++        unsigned    fragment_number     : 4;
++        unsigned    sequence_number     : 12;
++    } QEMU_PACKED sequence_control;
++    // variable length, 2312 byte plus 4 byte frame-checksum
++    union {
++        uint8_t     data_and_fcs[2316];
++        beacon_info_t beacon_info;
++    };
++    unsigned int frame_length;
++    int signal_strength;
++    int pos;
++    struct mac80211_frame *next_frame;
++}  QEMU_PACKED mac80211_frame;
++
++typedef struct access_point_info {
++    const char *ssid;
++    int channel;
++    int sigstrength;
++    macaddr_t mac_address;
++} access_point_info;
++
++enum esp32_ap_state {
++    Esp32_WLAN__STATE_NOT_AUTHENTICATED,
++    Esp32_WLAN__STATE_AUTHENTICATED,
++    Esp32_WLAN__STATE_ASSOCIATED,
++    Esp32_WLAN__STATE_STA_NOT_AUTHENTICATED,
++    Esp32_WLAN__STATE_STA_AUTHENTICATED,
++    Esp32_WLAN__STATE_STA_ASSOCIATED,
++    Esp32_WLAN__STATE_STA_DHCP,
++};
++
++#define Esp32_WLAN__MAX_INJECT_QUEUE_SIZE 20
++
++typedef struct {
++    signed rssi:8;                /**< Received Signal Strength Indicator(RSSI) of packet. unit: dBm */
++    unsigned rate:5;              /**< PHY rate encoding of the packet. Only valid for non HT(11bg) packet */
++    unsigned :1;                  /**< reserved */
++    unsigned sig_mode:2;          /**< 0: non HT(11bg) packet; 1: HT(11n) packet; 3: VHT(11ac) packet */
++    unsigned legacy_length:12;    /**< copy of the length */
++    unsigned damatch0:1;          /* destination matches address0 */
++    unsigned damatch1:1;          /* destination matches address1 */
++    unsigned bssidmatch0:1;       /* bssid matches address0  */
++    unsigned bssidmatch1:1;       /* bssid matches address1  */
++    unsigned mcs:7;               /**< Modulation Coding Scheme. If is HT(11n) packet, shows the modulation, range from 0 to 76(MSC0 ~ MCS76) */
++    unsigned cwb:1;               /**< Channel Bandwidth of the packet. 0: 20MHz; 1: 40MHz */
++    unsigned :16;                 /**< reserved */
++    unsigned smoothing:1;         /**< reserved */
++    unsigned not_sounding:1;      /**< reserved */
++    unsigned :1;                  /**< reserved */
++    unsigned aggregation:1;       /**< Aggregation. 0: MPDU packet; 1: AMPDU packet */
++    unsigned stbc:2;              /**< Space Time Block Code(STBC). 0: non STBC packet; 1: STBC packet */
++    unsigned fec_coding:1;        /**< Flag is set for 11n packets which are LDPC */
++    unsigned sgi:1;               /**< Short Guide Interval(SGI). 0: Long GI; 1: Short GI */
++    signed noise_floor:8;         /**< noise floor of Radio Frequency Module(RF). unit: 0.25dBm*/
++    unsigned ampdu_cnt:8;         /**< ampdu cnt */
++    unsigned channel:4;           /**< primary channel on which this packet is received */
++    unsigned secondary_channel:4; /**< secondary channel on which this packet is received. 0: none; 1: above; 2: below */
++    unsigned :8;                  /**< reserved */
++    unsigned timestamp:32;        /**< timestamp. The local time when this packet is received. It is precise only if modem sleep or light sleep is not enabled. unit: microsecond */
++    unsigned :32;                 /**< reserved */
++    unsigned :31;                 /**< reserved */
++    unsigned ant:1;               /**< antenna number from which this packet is received. 0: WiFi antenna 0; 1: WiFi antenna 1 */
++    unsigned sig_len:12;          /**< length of packet including Frame Check Sequence(FCS) */
++    unsigned sig_len_copy:12;     /**< another copy of the length */
++    unsigned rx_state:8;          /**< state of the packet. 0: no error; others: error numbers which are not public */
++} QEMU_PACKED wifi_pkt_rx_ctrl_t;
++
++
++typedef struct {
++    signed rssi:8;                /**< Received Signal Strength Indicator(RSSI) of packet. unit: dBm */
++    unsigned rate:5;              /**< PHY rate encoding of the packet. Only valid for non HT(11bg) packet */
++    unsigned :1;                  /**< reserved */
++    unsigned sig_mode:2;          /**< 0: non HT(11bg) packet; 1: HT(11n) packet; 3: VHT(11ac) packet */
++    unsigned legacy_length:12;    /**< copy of the length */
++    unsigned damatch0:1;          /* destination matches address0 */
++    unsigned damatch1:1;          /* destination matches address1 */
++    unsigned bssidmatch0:1;       /* bssid matches address0  */
++    unsigned bssidmatch1:1;       /* bssid matches address1  */
++    unsigned mcs:7;               /**< Modulation Coding Scheme. If is HT(11n) packet, shows the modulation, range from 0 to 76(MSC0 ~ MCS76) */
++    unsigned cwb:1;               /**< Channel Bandwidth of the packet. 0: 20MHz; 1: 40MHz */
++    unsigned :16;                 /**< reserved */
++    unsigned smoothing:1;         /**< reserved */
++    unsigned not_sounding:1;      /**< reserved */
++    unsigned :1;                  /**< reserved */
++    unsigned aggregation:1;       /**< Aggregation. 0: MPDU packet; 1: AMPDU packet */
++    unsigned stbc:2;              /**< Space Time Block Code(STBC). 0: non STBC packet; 1: STBC packet */
++    unsigned fec_coding:1;        /**< Flag is set for 11n packets which are LDPC */
++    unsigned sgi:1;               /**< Short Guide Interval(SGI). 0: Long GI; 1: Short GI */
++    unsigned :8;                  /**< reserved */
++    unsigned ampdu_cnt:8;         /**< ampdu cnt */
++    unsigned channel:4;           /**< primary channel on which this packet is received */
++    unsigned secondary_channel:4; /**< secondary channel on which this packet is received. 0: none; 1: above; 2: below */
++    unsigned :8;                  /**< reserved */
++    unsigned timestamp:32;        /**< timestamp. The local time when this packet is received. It is precise only if modem sleep or light sleep is not enabled. unit: microsecond */
++    unsigned :32;                 /**< reserved */
++    signed noise_floor:8;         /**< noise floor of Radio Frequency Module(RF). unit: dBm*/
++    unsigned :24;                 /**< reserved */
++    unsigned :32;                 /**< reserved */
++    unsigned :31;                 /**< reserved */
++    unsigned ant:1;               /**< antenna number from which this packet is received. 0: WiFi antenna 0; 1: WiFi antenna 1 */
++    unsigned :32;                 /**< reserved */
++    unsigned :32;                 /**< reserved */
++    unsigned :32;                 /**< reserved */
++    unsigned sig_len:12;          /**< length of packet including Frame Check Sequence(FCS) */
++    unsigned sig_len_copy:12;     /**< another copy of the length */
++    unsigned rx_state:8;          /**< state of the packet. 0: no error; others: error numbers which are not public */
++} QEMU_PACKED wifi_pkt_rx_ctrl_c3_t;
++
++extern int esp32_wifi_channel;
++
++typedef uint8_t ip4_t[4];
++
++#define DHCP_CHADDR_LEN 16
++#define DHCP_SNAME_LEN  64
++#define DHCP_FILE_LEN   128
++
++typedef struct ip_header_t {
++    uint8_t version_size;
++    uint8_t dscp_ecn;
++    uint8_t len_h;
++    uint8_t len_l;
++    uint32_t z;
++    uint8_t ttl;
++    uint8_t protocol;
++    uint16_t checksum;
++    ip4_t source_ip;
++    ip4_t dest_ip;
++}ip_header_t ;
++
++typedef struct udp_header_t {
++    uint8_t src_port_h;
++    uint8_t src_port_l;
++    uint8_t dest_port_h;
++    uint8_t dest_port_l;
++    uint8_t len_h;
++    uint8_t len_l;
++    uint16_t checksum;
++} udp_header_t;
++
++typedef struct dhcp_t {
++    uint8_t    opcode;
++    uint8_t    htype;
++    uint8_t    hlen;
++    uint8_t    hops;
++    uint32_t   xid;
++    uint16_t   secs;
++    uint16_t   flags;
++    ip4_t       ciaddr;
++    ip4_t       yiaddr;
++    ip4_t       siaddr;
++    ip4_t       giaddr;
++    uint8_t     chaddr[DHCP_CHADDR_LEN];
++    char        bp_sname[DHCP_SNAME_LEN];
++    char        bp_file[DHCP_FILE_LEN];
++    uint32_t    magic_cookie;
++    uint8_t     bp_options[0];
++} dhcp_t;
++
++typedef struct dhcp_request_t {
++    ip_header_t ipheader;
++    udp_header_t udpheader;
++    dhcp_t dhcp;
++} dhcp_request_t;
++
++typedef struct arp_header_t {
++  uint16_t htype;
++  uint16_t ptype;
++  uint8_t hlen;
++  uint8_t plen;
++  uint16_t operation;
++  uint8_t sender_mac[6];
++  uint8_t sender_ip[4];
++  uint8_t target_mac[6];
++  uint8_t target_ip[4];
++}arp_header_t;
++
++#endif // esp32_wlan_h
+diff --git a/hw/misc/esp32_wlan_packet.c b/hw/misc/esp32_wlan_packet.c
+new file mode 100644
+index 0000000..fa0e3d4
+--- /dev/null
++++ b/hw/misc/esp32_wlan_packet.c
+@@ -0,0 +1,306 @@
++/**
++ * QEMU WLAN access point emulation
++ *
++ * Copyright (c) 2008 Clemens Kolbitsch
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ *
++ * Modifications:
++ *  2008-February-24  Clemens Kolbitsch :
++ *                                  New implementation based on ne2000.c
++ *  18/1/22 Martin Johnson : Modified for esp32 wifi emulation
++ */
++
++#include "qemu/osdep.h"
++
++#include "net/net.h"
++
++#include "esp32_wlan.h"
++#include "esp32_wlan_packet.h"
++
++// the frame checksum isn't used so just put zero in there.
++void insertCRC(mac80211_frame *frame) {
++    unsigned long crc;
++    unsigned char *fcs = (unsigned char *)frame;
++    crc = 0;
++    memcpy(fcs+frame->frame_length, &crc, 4);
++    frame->frame_length += 4;
++}
++
++static void add_byte(mac80211_frame *frame, uint8_t data) {
++    frame->data_and_fcs[frame->pos++]=data;
++    frame->frame_length=IEEE80211_HEADER_SIZE+frame->pos;
++}
++
++static void add_data(mac80211_frame *frame, int len,uint8_t *data) {
++    for(int i=0;i<len;i++)
++        add_byte(frame,data[i]);
++}
++
++static void add_tag(mac80211_frame *frame, int tag, int len, unsigned char bytes[]) {
++    add_byte(frame,tag);
++    add_byte(frame,len);
++    add_data(frame,len,bytes);
++}
++
++void Esp32_WLAN_init_ap_frame(Esp32WifiState *s, mac80211_frame *frame) {
++    frame->sequence_control.sequence_number = s->inject_sequence_number++;
++    if(s->mode == Esp32_Mode_Station){
++        if(s->ap_state == Esp32_WLAN__STATE_STA_ASSOCIATED)
++            memcpy(frame->source_address, s->macaddr, 6);
++        else
++            memcpy(frame->source_address, s->ap_macaddr, 6);
++        memcpy(frame->bssid_address, s->ap_macaddr, 6);
++    }
++    else{
++        if(s->ap_state == Esp32_WLAN__STATE_STA_ASSOCIATED)
++            memcpy(frame->source_address, s->ap_macaddr, 6);
++        else
++            memcpy(frame->source_address, s->softap_macaddr, 6);
++        memcpy(frame->bssid_address, s->softap_macaddr, 6);
++    } 
++
++}
++
++static mac80211_frame *new_frame(unsigned type, unsigned subtype) {
++    mac80211_frame *frame = (mac80211_frame *)malloc(sizeof(mac80211_frame));
++    frame->next_frame = NULL;
++    frame->frame_control.protocol_version = 0;
++    frame->frame_control.type = type;
++    frame->frame_control.sub_type = subtype;
++    frame->frame_control.flags = 0;
++    frame->duration_id = 314;
++    frame->sequence_control.fragment_number = 0;
++    frame->pos=0;
++    return frame;
++}
++
++static void add_rates(mac80211_frame *frame) {
++    add_tag(frame,IEEE80211_BEACON_PARAM_RATES,8,(uint8_t[]){0x8b,0x96,0x82,0x84,0x0c,0x18,0x30,0x60});
++    add_tag(frame,IEEE80211_BEACON_PARAM_EXTENDED_RATES,4,(uint8_t[]){0x6c,0x12,0x24,0x48});
++}
++
++static void add_ssid(mac80211_frame *frame, const char *ssid) {
++    add_tag(frame,IEEE80211_BEACON_PARAM_SSID,strlen(ssid),(uint8_t *)ssid);
++}
++
++mac80211_frame *Esp32_WLAN_create_beacon_frame(access_point_info *ap) {
++    mac80211_frame *frame=new_frame(IEEE80211_TYPE_MGT,IEEE80211_TYPE_MGT_SUBTYPE_BEACON);
++    frame->signal_strength=ap->sigstrength;
++    memcpy(frame->destination_address,BROADCAST,6);
++    frame->beacon_info.timestamp=qemu_clock_get_ns(QEMU_CLOCK_REALTIME)/1000;
++    frame->beacon_info.interval=1000;
++    frame->beacon_info.capability=1;
++    frame->pos=12;
++    add_ssid(frame,ap->ssid);
++    add_rates(frame);
++    add_tag(frame,IEEE80211_BEACON_PARAM_CHANNEL,1,(uint8_t[]){ap->channel});
++    add_tag(frame,IEEE80211_BEACON_PARAM_TIM,4,(uint8_t[]){4,1,3,0,0});
++    return frame;
++}
++
++static uint16_t in_cksum(uint16_t *addr, int len) {
++    int sum = 0;
++    uint16_t answer = 0;
++    uint16_t *w = addr;
++    int nleft = len;
++    while (nleft > 1) {
++        sum += *w++;
++        nleft -= 2;
++    }
++    /* mop up an odd byte, if necessary */
++    if (nleft == 1) {
++        *(uint8_t *)(&answer) = *(uint8_t *) w;
++        sum += answer;
++    }
++    sum = (sum >> 16) + (sum & 0xffff);     /* add hi 16 to low 16 */
++    sum += (sum >> 16);             /* add carry */
++    answer = ~sum;              /* truncate to 16 bits */
++    return (answer);
++}
++
++static mac80211_frame *Esp32_WLAN_create_dhcp_frame(Esp32WifiState *s, int cmd_size, uint8_t dhcp_commands[]) {
++    mac80211_frame *frame=new_frame(IEEE80211_TYPE_DATA,IEEE80211_TYPE_DATA_SUBTYPE_DATA);
++    frame->frame_control.flags=1;
++    add_data(frame,8,(uint8_t[]){ 0xaa, 0xaa ,0x03 ,00 ,00 ,00 ,8 ,00});
++    dhcp_request_t req={
++        {.version_size=0x45,.ttl=0xff,.protocol=0x11,.dest_ip={0xff,0xff,0xff,0xff}},
++        {.src_port_l=0x44,.dest_port_l=0x43},
++        {.htype=1,.hlen=6,.xid=0x1d3d00,.chaddr={0,0,0,0,0,0},
++        .magic_cookie=0x63538263}
++    };    
++    memcpy(req.dhcp.chaddr, s->macaddr, 6);
++    int len=sizeof(req)+cmd_size;
++    req.ipheader.len_h=len>>8;
++    req.ipheader.len_l=len&0xff;
++    len=len-sizeof(ip_header_t);
++    req.udpheader.len_h=len>>8;
++    req.udpheader.len_l=len&0xff;
++    req.ipheader.checksum=in_cksum((void *)&req.ipheader,sizeof(ip_header_t));
++    add_data(frame,sizeof(req),(uint8_t *)&req);
++    add_data(frame,cmd_size,dhcp_commands);
++    return frame;
++}
++
++mac80211_frame *Esp32_WLAN_create_dhcp_request(Esp32WifiState *s, uint8_t *ip) {
++    uint8_t dhcp_commands[]={
++        0x35, 1, 3,
++        0x39, 2 ,5 ,0xdc ,
++        0x32, 4, ip[0],ip[1],ip[2],ip[3],
++        0x3d, 0x07, 0x01, 0x3c, 0x61, 0x05, 0x0d, 0x99, 0x24,
++        0x37, 0x04, 0x01, 0x03, 0x1c, 0x06,
++        0xff, 0, 0
++    };
++    return Esp32_WLAN_create_dhcp_frame(s, sizeof(dhcp_commands),dhcp_commands);
++}
++    
++mac80211_frame *Esp32_WLAN_create_dhcp_discover(Esp32WifiState *s) {
++    uint8_t dhcp_commands[]={
++        0x35, 1, 1,
++        0x39, 2 ,5 ,0xdc ,
++        0x0c ,0x09 ,0x65 ,0x73 ,0x70 ,0x72 ,0x65 ,0x73 ,0x73 ,0x69 ,0x66 ,
++        0x3d ,0x07, 0x01 ,0x3c ,0x61 ,0x05 ,0x0d ,0x99 ,0x24 ,
++        0x37 ,0x04 ,0x01 ,0x03 ,0x1c ,0x06 ,
++        0xff, 0,0
++    };
++    return Esp32_WLAN_create_dhcp_frame(s,sizeof(dhcp_commands),dhcp_commands);
++}
++
++mac80211_frame *Esp32_WLAN_create_association_request(access_point_info *ap) {
++    mac80211_frame *frame=new_frame(IEEE80211_TYPE_MGT,IEEE80211_TYPE_MGT_SUBTYPE_ASSOCIATION_REQ);
++    add_data(frame,4,(uint8_t []){0x21,4,3,0});
++    add_ssid(frame,ap->ssid);
++    add_rates(frame);
++    return frame;
++}
++
++mac80211_frame *Esp32_WLAN_create_ack(void) {
++    mac80211_frame *frame=new_frame(IEEE80211_TYPE_CTL,IEEE80211_TYPE_CTL_SUBTYPE_ACK);
++    frame->frame_length=10;
++    return frame;
++}
++
++mac80211_frame *Esp32_WLAN_create_probe_response(access_point_info *ap) {
++    mac80211_frame *frame=new_frame(IEEE80211_TYPE_MGT,IEEE80211_TYPE_MGT_SUBTYPE_PROBE_RESP);
++    frame->beacon_info.timestamp=qemu_clock_get_ns(QEMU_CLOCK_REALTIME)/1000;
++    frame->beacon_info.interval=1000;
++    frame->beacon_info.capability=1;
++    frame->pos=12;
++    add_ssid(frame,ap->ssid);
++    add_rates(frame);
++    add_tag(frame,IEEE80211_BEACON_PARAM_CHANNEL,1,(uint8_t[]){ap->channel});
++    return frame;
++}
++
++mac80211_frame *Esp32_WLAN_create_probe_request(access_point_info *ap) {
++    mac80211_frame *frame=new_frame(IEEE80211_TYPE_MGT,IEEE80211_TYPE_MGT_SUBTYPE_PROBE_REQ);
++    memcpy(frame->destination_address,BROADCAST,6);
++    memcpy(frame->bssid_address,BROADCAST,6);
++    add_ssid(frame,ap->ssid);
++    add_tag(frame,IEEE80211_BEACON_PARAM_CHANNEL,1,(uint8_t[]){ap->channel});
++    add_rates(frame);
++    return frame;
++}
++
++mac80211_frame *Esp32_WLAN_create_authentication_response(access_point_info *ap) {
++    mac80211_frame *frame=new_frame(IEEE80211_TYPE_MGT,IEEE80211_TYPE_MGT_SUBTYPE_AUTHENTICATION);
++    /*
++     * Fixed params... typical AP params (6 byte)
++     *
++     * They include
++     *  - Authentication Algorithm (here: Open System)
++     *  - Authentication SEQ
++     *  - Status code (successful 0x0)
++     */
++    add_data(frame,6,(uint8_t []){0,0,2,0,0,0});
++    add_ssid(frame,ap->ssid);
++    return frame;
++}
++
++mac80211_frame *Esp32_WLAN_create_authentication_request(void) {
++    mac80211_frame *frame=new_frame(IEEE80211_TYPE_MGT,IEEE80211_TYPE_MGT_SUBTYPE_AUTHENTICATION);
++    /*
++     * Fixed params... typical AP params (6 byte)
++     *
++     * They include
++     *  - Authentication Algorithm (here: Open System)
++     *  - Authentication SEQ
++     *  - Status code (successful 0x0)
++     */
++    //frame->duration_id=0x13a;
++    add_data(frame,6,(uint8_t []){0,0,1,0,0,0});
++    //add_data(frame,11,(uint8_t []){0,0,0,0,0,0,0,0,0,0,0});
++    //add_ssid(frame,ap->ssid);
++    return frame;
++}
++
++mac80211_frame *Esp32_WLAN_create_deauthentication(void) {
++    mac80211_frame *frame=new_frame(IEEE80211_TYPE_MGT,IEEE80211_TYPE_MGT_SUBTYPE_DEAUTHENTICATION);
++    /*
++     * Insert reason code:
++     *  "Deauthentication because sending STA is leaving"
++     */
++    add_data(frame,2,(uint8_t []){3,0});
++    return frame;
++}
++
++mac80211_frame *Esp32_WLAN_create_association_response(access_point_info *ap) {
++    mac80211_frame *frame=new_frame(IEEE80211_TYPE_MGT,IEEE80211_TYPE_MGT_SUBTYPE_ASSOCIATION_RESP);
++    /*
++     * Fixed params... typical AP params (6 byte)
++     *
++     * They include
++     *  - Capability Information
++     *  - Status code (successful 0x0)
++     *  - Association ID
++    */
++    add_data(frame,6,(uint8_t []){33,4,0,0,1,0xc0});
++    add_ssid(frame,ap->ssid);
++    add_rates(frame);
++    return frame;
++}
++
++mac80211_frame *Esp32_WLAN_create_disassociation(void) {
++    mac80211_frame *frame=new_frame(IEEE80211_TYPE_MGT,IEEE80211_TYPE_MGT_SUBTYPE_DISASSOCIATION);
++    /*
++     * Insert reason code:
++     *  "Disassociation because sending STA is leaving"
++     */
++    add_data(frame,2,(uint8_t []){3,0});
++    return frame;
++}
++
++mac80211_frame *Esp32_WLAN_create_data_packet(Esp32WifiState *s, const uint8_t *buf, int size) {
++    mac80211_frame *frame=new_frame(IEEE80211_TYPE_DATA,IEEE80211_TYPE_DATA_SUBTYPE_DATA);
++
++    frame->frame_control.flags = 0x2; /* from station back to station via AP */
++    frame->duration_id = 44;
++    /* send message to wlan-device */
++    if(s->ap_state == Esp32_WLAN__STATE_STA_ASSOCIATED) {
++        memcpy(frame->destination_address, s->ap_macaddr, 6);
++        frame->frame_control.flags = 0x2;
++    }
++    else
++        memcpy(frame->destination_address, s->macaddr, 6);
++    /* LLC */
++    add_data(frame,6,(uint8_t[]){ 0xaa, 0xaa ,0x03 ,0 ,0 ,0});
++    memcpy(frame->data_and_fcs+6, buf+12, size-12);
++    frame->frame_length = IEEE80211_HEADER_SIZE + size-6;
++    return frame;
++}
+diff --git a/hw/misc/esp32_wlan_packet.h b/hw/misc/esp32_wlan_packet.h
+new file mode 100644
+index 0000000..53e64bb
+--- /dev/null
++++ b/hw/misc/esp32_wlan_packet.h
+@@ -0,0 +1,56 @@
++/**
++ * QEMU WLAN access point emulation
++ *
++ * Copyright (c) 2008 Clemens Kolbitsch
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ *
++ * Modifications:
++ *  2008-February-24  Clemens Kolbitsch :
++ *                                  New implementation based on ne2000.c
++ *  18/1/22 Martin Johnson : Modified for esp32 wifi emulation
++ *
++ */
++
++#ifndef esp32_wlan_packet_h
++#define esp32_wlan_packet_h 1
++
++#include "esp32_wlan.h"
++#include "hw/misc/esp32_wifi.h"
++
++void Esp32_WLAN_init_ap_frame(Esp32WifiState *s, struct mac80211_frame *frame);
++int Esp32_WLAN_dumpFrame(struct mac80211_frame *frame, int frame_len, char *filename);
++void Esp32_WLAN_insert_frame(Esp32WifiState *s, struct mac80211_frame *frame);
++struct mac80211_frame *Esp32_WLAN_create_beacon_frame(access_point_info *ap);
++struct mac80211_frame *Esp32_WLAN_create_probe_response(access_point_info *ap);
++struct mac80211_frame *Esp32_WLAN_create_probe_request(access_point_info *ap);
++struct mac80211_frame *Esp32_WLAN_create_authentication_request(void);
++struct mac80211_frame *Esp32_WLAN_create_authentication_response(access_point_info *ap);
++struct mac80211_frame *Esp32_WLAN_create_deauthentication(void);
++struct mac80211_frame *Esp32_WLAN_create_association_request(access_point_info *ap);
++struct mac80211_frame *Esp32_WLAN_create_association_response(access_point_info *ap);
++struct mac80211_frame *Esp32_WLAN_create_disassociation(void);
++struct mac80211_frame *Esp32_WLAN_create_data_reply(Esp32WifiState *s, struct mac80211_frame *incoming);
++struct mac80211_frame *Esp32_WLAN_create_data_packet(Esp32WifiState *s, const uint8_t *buf, int size);
++struct mac80211_frame *Esp32_WLAN_create_ack(void);
++struct mac80211_frame *Esp32_WLAN_create_dhcp_discover(Esp32WifiState *s);
++struct mac80211_frame *Esp32_WLAN_create_dhcp_request(Esp32WifiState *s, uint8_t *ip);
++void insertCRC(mac80211_frame *frame);
++
++#endif // esp32_wlan_packet_h
 diff --git a/hw/misc/meson.build b/hw/misc/meson.build
-index dc9ff35..be27fee 100644
+index dc9ff35..a80b53b 100644
 --- a/hw/misc/meson.build
 +++ b/hw/misc/meson.build
-@@ -145,7 +145,9 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
+@@ -145,7 +145,15 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
    'esp32_aes.c',
    'esp32_ledc.c',
    'esp32_flash_enc.c',
 -  'ssi_psram.c'
 +  'ssi_psram.c',
 +  'sx127x.c',
-+  'sx126x.c'
++  'sx126x.c',
++  'esp32_ana.c',
++  'esp32_fe.c',
++  'esp32_phya.c',
++  'esp32_wifi.c',
++  'esp32_wifi_ap.c',
++  'esp32_wlan_packet.c'
  ))
  
  system_ss.add(when: 'CONFIG_RISCV_ESP32C3', if_true: files(
@@ -1387,7 +3829,7 @@ index 4c12114..c254062 100644
  system_ss.add(when: 'CONFIG_BCM2835_SPI', if_true: files('bcm2835_spi.c'))
  system_ss.add(when: 'CONFIG_PNV_SPI', if_true: files('pnv_spi.c'))
 diff --git a/hw/xtensa/esp32.c b/hw/xtensa/esp32.c
-index c3cf32e..eb6b45c 100644
+index c3cf32e..b0bee95 100644
 --- a/hw/xtensa/esp32.c
 +++ b/hw/xtensa/esp32.c
 @@ -26,6 +26,9 @@
@@ -1400,7 +3842,46 @@ index c3cf32e..eb6b45c 100644
  #include "hw/sd/dwc_sdmmc.h"
  #include "core-esp32/core-isa.h"
  #include "qemu/datadir.h"
-@@ -421,8 +424,28 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
+@@ -271,6 +274,38 @@ static void esp32_soc_add_unimp_device(MemoryRegion *dest, const char* name, hwa
+     g_free(name_apb);
+ }
+ 
++/* The radio's blocks ESP-IDF's WiFi driver reads and no model has: each
++ * reads back its value, all ones or zero as the driver's calibration waits
++ * for, and takes writes, as lcgamboa's picsimlab-esp32 maps them. */
++static uint64_t radio_stub_read(void *opaque, hwaddr addr, unsigned size)
++{
++    return (uint32_t)(uintptr_t)opaque;
++}
++
++static void radio_stub_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
++{
++}
++
++static const MemoryRegionOps radio_stub_ops = {
++    .read = radio_stub_read,
++    .write = radio_stub_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static void esp32_soc_add_radio_stub(MemoryRegion *dest, const char *name, hwaddr base,
++                                     uint32_t value)
++{
++    MemoryRegion *mr = g_new(MemoryRegion, 1);
++
++    MemoryRegion *apb = g_new(MemoryRegion, 1);
++
++    /* At its DPORT address and its APB alias, as the fork's stand-ins are. */
++    memory_region_init_io(mr, NULL, &radio_stub_ops, (void *)(uintptr_t)value, name, 0x1000);
++    memory_region_add_subregion_overlap(dest, base, mr, -2);
++    memory_region_init_io(apb, NULL, &radio_stub_ops, (void *)(uintptr_t)value, name, 0x1000);
++    memory_region_add_subregion_overlap(dest, base - DR_REG_DPORT_APB_BASE + APB_REG_BASE, apb, -2);
++}
++
+ static void esp32_soc_realize(DeviceState *dev, Error **errp)
+ {
+     Esp32SocState *s = ESP32_SOC(dev);
+@@ -421,8 +456,28 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                      qdev_get_gpio_in_named(dev, ESP32_RTC_CPU_STALL_GPIO, i));
      }
  
@@ -1429,7 +3910,40 @@ index c3cf32e..eb6b45c 100644
  
      for (int i = 0; i < ESP32_UART_COUNT; ++i) {
          const hwaddr uart_base[] = {DR_REG_UART_BASE, DR_REG_UART1_BASE, DR_REG_UART2_BASE};
-@@ -710,6 +733,8 @@ struct Esp32MachineState {
+@@ -525,7 +580,18 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
+     esp32_soc_add_periph_device(sys_mem, &s->rgb, DR_REG_FRAMEBUF_BASE);
+     memory_region_add_subregion_overlap(sys_mem, esp32_memmap[ESP32_MEMREGION_FRAMEBUF].base, &s->rgb.vram, 0);
+ 
+-    esp32_soc_add_unimp_device(sys_mem, "esp32.analog", DR_REG_ANA_BASE, 0x1000);
++    esp32_soc_add_radio_stub(sys_mem, "esp32.fe2", DR_REG_FE2_BASE, 0xffffffff);
++    esp32_soc_add_radio_stub(sys_mem, "esp32.chipv7_phy", DR_REG_PHY_BASE, 0xffffffff);
++    esp32_soc_add_radio_stub(sys_mem, "esp32.chipv7_phyb", DR_REG_WDEV_BASE, 0);
++    esp32_soc_add_radio_stub(sys_mem, "esp32.unknown_wifi", DR_REG_NRX_BASE - 0x0C00, 0xffffffff);
++    esp32_soc_add_radio_stub(sys_mem, "esp32.unknown_wifi1", DR_REG_BB_BASE, 0xffffffff);
++    esp32_soc_add_radio_stub(sys_mem, "esp32.bluetooth", DR_REG_BT_BASE, 0xffffffff);
++    qdev_realize(DEVICE(&s->ana), &s->periph_bus, &error_fatal);
++    esp32_soc_add_periph_device(sys_mem, &s->ana, DR_REG_ANA_BASE);
++    qdev_realize(DEVICE(&s->fe), &s->periph_bus, &error_fatal);
++    esp32_soc_add_periph_device(sys_mem, &s->fe, DR_REG_FE_BASE);
++    qdev_realize(DEVICE(&s->phya), &s->periph_bus, &error_fatal);
++    esp32_soc_add_periph_device(sys_mem, &s->phya, DR_REG_PHYA_BASE);
+     esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_RTCIO_BASE, 0x400);
+     esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_SENS_BASE, 0x400);
+     esp32_soc_add_unimp_device(sys_mem, "esp32.iomux", DR_REG_IO_MUX_BASE, 0x2000);
+@@ -654,6 +720,12 @@ static void esp32_soc_init(Object *obj)
+     object_initialize_child(obj, "rsa", &s->rsa, TYPE_ESP32_RSA);
+ 
+     object_initialize_child(obj, "efuse", &s->efuse, TYPE_ESP32_EFUSE);
++    object_initialize_child(obj, "ana", &s->ana, TYPE_ESP32_ANA);
++    object_initialize_child(obj, "fe", &s->fe, TYPE_ESP32_FE);
++    object_initialize_child(obj, "phya", &s->phya, TYPE_ESP32_PHYA);
++    if (qemu_find_nic_info(TYPE_ESP32_WIFI, false, NULL) != NULL) {
++        object_initialize_child(obj, "wifi", &s->wifi, TYPE_ESP32_WIFI);
++    }
+ 
+     object_initialize_child(obj, "flash_enc", &s->flash_enc, TYPE_ESP32_FLASH_ENCRYPTION);
+ 
+@@ -710,6 +782,8 @@ struct Esp32MachineState {
  
      Esp32SocState esp32;
      DeviceState *flash_dev;
@@ -1438,7 +3952,31 @@ index c3cf32e..eb6b45c 100644
  };
  #define TYPE_ESP32_MACHINE MACHINE_TYPE_NAME("esp32")
  
-@@ -806,6 +831,65 @@ static void esp32_machine_init_sd(Esp32SocState *ss)
+@@ -790,6 +864,23 @@ static void esp32_machine_init_openeth(Esp32SocState *ss)
+     memory_region_add_subregion(sys_mem, desc_base, sysbus_mmio_get_region(sbd, 1));
+ }
+ 
++/* The WiFi MAC, where the run gives an esp32_wifi NIC: its access point
++ * in qemu, open, bridged to that NIC's network. */
++static void esp32_machine_init_wifi(Esp32SocState *ss)
++{
++    NICInfo *nd = qemu_find_nic_info(TYPE_ESP32_WIFI, false, NULL);
++
++    if (nd == NULL) {
++        return;
++    }
++    qdev_set_nic_properties(DEVICE(&ss->wifi), nd);
++    sysbus_realize(SYS_BUS_DEVICE(&ss->wifi), &error_fatal);
++    esp32_soc_add_periph_device(get_system_memory(), &ss->wifi, DR_REG_WIFI_BASE);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&ss->wifi), 0,
++                       qdev_get_gpio_in(DEVICE(&ss->intmatrix), ETS_WIFI_MAC_INTR_SOURCE));
++    ss->wifi_dev = DEVICE(&ss->wifi);
++}
++
+ static void esp32_machine_init_sd(Esp32SocState *ss)
+ {
+     DriveInfo *dinfo = drive_get(IF_SD, 0, 0);
+@@ -806,6 +897,65 @@ static void esp32_machine_init_sd(Esp32SocState *ss)
      }
  }
  
@@ -1504,18 +4042,19 @@ index c3cf32e..eb6b45c 100644
  static void esp32_machine_init(MachineState *machine)
  {
      BlockBackend* blk = NULL;
-@@ -845,6 +929,10 @@ static void esp32_machine_init(MachineState *machine)
+@@ -844,6 +994,11 @@ static void esp32_machine_init(MachineState *machine)
+     esp32_machine_init_i2c(ss);
  
      esp32_machine_init_openeth(ss);
- 
++    esp32_machine_init_wifi(ss);
++
 +    if (ms->lora) {
 +        esp32_machine_init_lora(ms, ss);
 +    }
-+
+ 
      esp32_machine_init_sd(ss);
  
-     /* Need MMU initialized prior to ELF loading,
-@@ -946,6 +1034,12 @@ static void esp32_machine_class_init(ObjectClass *oc, void *data)
+@@ -946,6 +1101,12 @@ static void esp32_machine_class_init(ObjectClass *oc, void *data)
      mc->default_cpus = 2;
      mc->default_ram_size = 0;
      mc->fixup_ram_size = esp32_fixup_ram_size;
@@ -1752,6 +4291,257 @@ index 39d8733..5158717 100644
      /* IO_MUX state */
      uint32_t iomux_regs[ESP_GPIO_MAX_PINS];
      uint32_t num_gpios;
+diff --git a/include/hw/misc/esp32_ana.h b/include/hw/misc/esp32_ana.h
+new file mode 100644
+index 0000000..47d4a6a
+--- /dev/null
++++ b/include/hw/misc/esp32_ana.h
+@@ -0,0 +1,16 @@
++#pragma once
++
++#include "hw/hw.h"
++#include "hw/sysbus.h"
++
++
++#define TYPE_ESP32_ANA "misc.esp32.ana"
++#define ESP32_ANA(obj) OBJECT_CHECK(Esp32AnaState, (obj), TYPE_ESP32_ANA)
++
++typedef struct Esp32AnaState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    uint32_t mem[1024];
++} Esp32AnaState;
++
++
+diff --git a/include/hw/misc/esp32_fe.h b/include/hw/misc/esp32_fe.h
+new file mode 100644
+index 0000000..d54961f
+--- /dev/null
++++ b/include/hw/misc/esp32_fe.h
+@@ -0,0 +1,18 @@
++#pragma once
++
++#include "hw/hw.h"
++#include "hw/sysbus.h"
++
++
++#define TYPE_ESP32_FE "misc.esp32.fe"
++#define ESP32_FE(obj) OBJECT_CHECK(Esp32FeState, (obj), TYPE_ESP32_FE)
++//OBJECT_CHECK(Esp32FeState, (obj), TYPE_ESP32_FE)
++//(Esp32FeState *)(obj)
++
++typedef struct Esp32FeState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    uint32_t mem[1024];
++} Esp32FeState;
++
++
+diff --git a/include/hw/misc/esp32_phya.h b/include/hw/misc/esp32_phya.h
+new file mode 100644
+index 0000000..e38d5e9
+--- /dev/null
++++ b/include/hw/misc/esp32_phya.h
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include "hw/hw.h"
++#include "hw/sysbus.h"
++
++
++#define TYPE_ESP32_PHYA "misc.esp32.phya"
++#define ESP32_PHYA(obj) OBJECT_CHECK(Esp32PhyaState, (obj), TYPE_ESP32_PHYA)
++
++typedef struct Esp32PhyaState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    uint32_t mem[1024];
++} Esp32PhyaState;
++
++#define ESP32_PHYA_NACK 0x00002300
++#define ESP32_PHYA_ACK  0x0
++
++void Esp32_WLAN_Set_Packet_Status(const uint32_t state);
+diff --git a/include/hw/misc/esp32_reg.h b/include/hw/misc/esp32_reg.h
+index 5394732..991d1e2 100644
+--- a/include/hw/misc/esp32_reg.h
++++ b/include/hw/misc/esp32_reg.h
+@@ -59,6 +59,9 @@
+ #define DR_REG_UART2_BASE                       0x3ff6E000
+ #define DR_REG_PWM2_BASE                        0x3ff6F000
+ #define DR_REG_PWM3_BASE                        0x3ff70000
++#define DR_REG_PHY_BASE                         0x3ff71000
++#define DR_REG_WIFI_BASE                        0x3ff73000
++#define DR_REG_PHYA_BASE                        0x3ff74000
+ #define DR_REG_WDEV_BASE                        0x3ff75000
+ 
+ #define APB_REG_BASE                            0x60000000
+diff --git a/include/hw/misc/esp32_wifi.h b/include/hw/misc/esp32_wifi.h
+new file mode 100644
+index 0000000..aed765b
+--- /dev/null
++++ b/include/hw/misc/esp32_wifi.h
+@@ -0,0 +1,160 @@
++#pragma once
++
++#include "hw/hw.h"
++#include "hw/registerfields.h"
++#include "hw/sysbus.h"
++//#include "hw/misc/esp32_reg.h"
++#include "sysemu/sysemu.h"
++#include "net/net.h"
++
++#define TYPE_ESP32_WIFI "esp32_wifi"
++#define ESP32_WIFI(obj) OBJECT_CHECK(Esp32WifiState, (obj), TYPE_ESP32_WIFI)
++
++typedef struct dma_list_item {
++    unsigned size:12;
++    unsigned length:12;
++    unsigned offset:5;
++    unsigned sosf:1;
++    unsigned eof:1;
++    unsigned owner:1;
++    uint32_t address;
++    uint32_t next;
++} QEMU_PACKED dma_list_item;
++
++typedef struct Esp32WifiState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    int raw_interrupt;
++    qemu_irq irq;
++    uint32_t mem[1024];
++    unsigned int dma_inlink_address;
++    unsigned int dma_inlink_ptr;
++    uint32_t ap_state;
++    int inject_queue_size;
++    struct mac80211_frame *inject_queue;
++    int inject_timer_running;
++    unsigned int inject_sequence_number;
++    int beacon_ap;
++
++    hwaddr receive_queue_address;
++    uint32_t receive_queue_count;
++    NICConf conf;
++    NICState *nic;
++    // various timers
++    QEMUTimer *beacon_timer;
++    QEMUTimer *inject_timer;
++    QEMUTimer *wait_ack_timer;
++    uint8_t ipaddr[4];              
++    uint8_t macaddr[6];             
++
++    uint8_t ap_ipaddr[4];               
++    uint8_t ap_macaddr[6];     
++
++    uint8_t associated_ap_macaddr[6]; 
++
++    uint8_t softap_macaddr[6];       
++
++    uint8_t mode;  
++    bool access_points_off;
++
++} Esp32WifiState;
++
++#define Esp32_Mode_Station 0
++#define Esp32_Mode_SoftAP  1
++
++
++void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame);
++void Esp32_WLAN_setup_ap(DeviceState *dev,Esp32WifiState *s);
++void Esp32_WLAN_reset_ap(Esp32WifiState *s);
++void Esp32_WLAN_class_init(ObjectClass *klass);
++void Esp32_sendFrame(Esp32WifiState *s, struct mac80211_frame *frame,int length, int signal_strength);
++void Esp32_WLAN_frame_delivered(Esp32WifiState *s);
++
++REG32(WIFI_BSSID_ADDR_FST_0, 0x000);
++REG32(WIFI_BSSID_ADDR_SND_0, 0x004);
++REG32(WIFI_BSSID_ADDR_FST_1, 0x008);
++REG32(WIFI_BSSID_ADDR_SND_1, 0x00c);
++REG32(WIFI_BSSID_FILTER_FST_0, 0x020);
++REG32(WIFI_BSSID_FILTER_SND_0, 0x024);
++REG32(WIFI_BSSID_FILTER_FST_1, 0x028);
++REG32(WIFI_BSSID_FILTER_SND_1, 0x02c);
++
++REG32(WIFI_MAC_ADDR_FST_0, 0x040);
++REG32(WIFI_MAC_ADDR_SND_0, 0x044);
++REG32(WIFI_MAC_ADDR_FST_1, 0x048);
++REG32(WIFI_MAC_ADDR_SND_1, 0x04c);
++REG32(WIFI_MAC_FILTER_FST_0, 0x060);
++REG32(WIFI_MAC_FILTER_SND_0, 0x064);
++REG32(WIFI_MAC_FILTER_FST_1, 0x068);
++REG32(WIFI_MAC_FILTER_SND_1, 0x06c);
++
++REG32(WIFI_RXBUF_INIT_BITMASK, 0x80); // only set in mac_rxbuf_init
++REG32(WIFI_DMA_IN_STATUS, 0x84);
++REG32(WIFI_DMA_INLINK, 0x88);
++REG32(WIFI_NEXT_RX_DSCR, 0x8c);
++REG32(WIFI_LAST_RX_DSCR, 0x90);
++REG32(WIFI_LAST_RXBUF_INIT_09C, 0x09C); // only set in hal_init and mac_last_rxbuf_init
++REG32(WIFI_RX_POLICY_0, 0xd8);
++REG32(WIFI_RX_POLICY_1, 0xdc);
++REG32(WIFI_RX_POLICY_2, 0xe0);
++REG32(WIFI_RX_POLICY_3, 0xe4);
++REG32(WIFI_PROMISC_MISC_BITMASK0, 0xf8);
++REG32(WIFI_PROMISC_MISC_BITMASK1, 0xfc);
++REG32(WIFI_PROMISC_MISC_BITMASK2, 0x100);
++REG32(WIFI_PROMISC_MISC_BITMASK3, 0x104);
++
++REG32(WIFI_RXBUF_INIT_HIGH_ADDR_0, 0x118); // only set in mac_rxbuf_init
++REG32(WIFI_RXBUF_INIT_LOW_ADDR_0, 0x11c);  // only set in mac_rxbuf_init
++REG32(WIFI_RXBUF_INIT_HIGH_ADDR_1, 0x120); // only set in mac_rxbuf_init
++REG32(WIFI_RXBUF_INIT_LOW_ADDR_1, 0x124);  // only set in mac_rxbuf_init
++
++REG32(WIFI_LAST_RXBUF_INIT_148, 0x148); // only set in mac_last_rxbuf_init
++REG32(WIFI_LAST_RXBUF_INIT_14C, 0x14C); // only set in mac_last_rxbuf_init
++REG32(WIFI_LAST_RXBUF_INIT_158, 0x158); // only set in mac_last_rxbuf_init
++REG32(WIFI_LAST_RXBUF_INIT_164, 0x164); // only set in mac_last_rxbuf_init
++
++REG32(WIFI_ANTENNA_INIT_284, 0x284);
++
++REG32(WIFI_AUTOACK_INIT_400, 0x400); // only set in hal_mac_rate_autoack_init
++REG32(WIFI_AUTOACK_INIT_404, 0x404); // only set in hal_mac_rate_autoack_init
++REG32(WIFI_AUTOACK_INIT_408, 0x408); // only set in hal_mac_rate_autoack_init
++REG32(WIFI_AUTOACK_INIT_40C, 0x40c); // only set in hal_mac_rate_autoack_init
++REG32(WIFI_AUTOACK_INIT_410, 0x410); // only set in hal_mac_rate_autoack_init
++REG32(WIFI_AUTOACK_INIT_414, 0x414); // only set in hal_mac_rate_autoack_init
++
++REG32(WIFI_LOW_RATE_418, 0x418);
++REG32(WIFI_LOW_RATE_41C, 0x41C);
++
++// 0x800 - 0x814 are cryptography registers, likely for WPA and WEP
++
++REG32(WIFI_MAYBE_TIMESTAMP, 0xc00);
++REG32(WIFI_PROMISC_CONTROL_PKT, 0xc40);
++REG32(WIFI_DMA_INT_STATUS, 0xc48);
++REG32(WIFI_DMA_INT_CLR, 0xc4c);
++REG32(WIFI_MAYBE_PWR_CTL, 0xcb8);
++REG32(WIFI_TXQ_CLR_STATE_COLL_TIMEOUT, 0xcbc);
++REG32(WIFI_TXQ_STATE_COLL_TIMEOUT, 0xcc0);
++REG32(WIFI_TXQ_CLR_STATE_COMPLETE, 0xcc4);
++REG32(WIFI_TXQ_STATE_COMPLETE, 0xcc8);
++REG32(WIFI_TX_CONFIG_0, 0xd1c);
++REG32(WIFI_DMA_OUTLINK, 0xd20);
++REG32(WIFI_DMA_OUT_STATUS, 0xd24);
++
++
++// Wifi registers only used for initialization
++REG32(WIFI_TXRX_INIT_10C, 0x10c); // only set in mac_txrx_init
++REG32(WIFI_TXRX_INIT_114, 0x114); // only set in mac_txrx_init
++REG32(WIFI_TXRX_INIT_C1C, 0xc1c); // only set in mac_txrx_init
++REG32(WIFI_TXRX_INIT_C20, 0xc20); // only set in mac_txrx_init
++REG32(WIFI_TXRX_INIT_C24, 0xc24); // only set in mac_txrx_init
++REG32(WIFI_TXRX_INIT_C54, 0xc54); // only set in mac_txrx_init
++REG32(WIFI_TXRX_INIT_C5C, 0xc5c); // only set in mac_txrx_init
++REG32(WIFI_TXRX_INIT_C6C, 0xc6c); // only set in mac_txrx_init
++REG32(WIFI_TXRX_INIT_C74, 0xc74); // only set in mac_txrx_init
++REG32(WIFI_TXRX_INIT_C78, 0xc78); // only set in mac_txrx_init
++REG32(WIFI_TXRX_INIT_C88, 0xc88); // only set in mac_txrx_init
++REG32(WIFI_TXRX_INIT_CAC, 0xcac); // only set in mac_txrx_init
++REG32(WIFI_TXRX_INIT_D78, 0xd78); // only set in mac_txrx_init
++
++REG32(WIFI_TXRX_INIT_288, 0x288); // set in mac_txrx_init and hal_deinit
++
 diff --git a/include/hw/ssi/esp32s3_gpspi.h b/include/hw/ssi/esp32s3_gpspi.h
 new file mode 100644
 index 0000000..4d8360a
@@ -1781,3 +4571,33 @@ index 0000000..4d8360a
 +    SSIBus *spi;
 +    uint32_t regs[ESP32S3_GPSPI_REGS];
 +} Esp32s3GpspiState;
+diff --git a/include/hw/xtensa/esp32.h b/include/hw/xtensa/esp32.h
+index 2493bd6..efba13d 100644
+--- a/include/hw/xtensa/esp32.h
++++ b/include/hw/xtensa/esp32.h
+@@ -1,6 +1,10 @@
+ #pragma once
+ 
+ #include "qemu/osdep.h"
++#include "hw/misc/esp32_ana.h"
++#include "hw/misc/esp32_fe.h"
++#include "hw/misc/esp32_phya.h"
++#include "hw/misc/esp32_wifi.h"
+ #include "hw/hw.h"
+ #include "target/xtensa/cpu.h"
+ #include "hw/misc/esp32_reg.h"
+@@ -52,6 +56,14 @@ typedef struct Esp32SocState {
+     Esp32EfuseState efuse;
+     Esp32FlashEncryptionState flash_enc;
+     ESPRgbState rgb;
++    /* The radio's, for ESP-IDF's WiFi driver (lcgamboa's, picsimlab-esp32):
++     * its analog block, front end and PHY, and the WiFi MAC where the run
++     * gives an esp32_wifi NIC. */
++    Esp32AnaState ana;
++    Esp32FeState fe;
++    Esp32PhyaState phya;
++    Esp32WifiState wifi;
++    DeviceState *wifi_dev;
+ 
+     DWCSDMMCState sdmmc;
+     DeviceState *eth;
