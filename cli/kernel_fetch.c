@@ -249,6 +249,39 @@ done:
 	return status;
 }
 
+int hull_fetch_file(const char *url, const char *sha256, const char *file, char *why, size_t cap)
+{
+	char        hex[65];
+	uint8_t     digest[32];
+	download    d;
+	int         got = 0;
+	int         status = -1;
+
+	if ((d.fd = open(file, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0) {
+		snprintf(why, cap, "%s: %s", file, strerror(errno));
+		return -1;
+	}
+	if (get_following(url, &d, &got, why, cap) != 0)
+		goto done;
+	if (got != 200) {
+		snprintf(why, cap, "%s answered %d: the pin wants moving", url, got);
+		goto done;
+	}
+	hull_sha256_final(&d.hash, digest);
+	hull_sha256_hex(digest, hex);
+	if (strcmp(hex, sha256) != 0) {
+		snprintf(why, cap, "the file from %s is not the one pinned: sha256 %s, wanted %s",
+		         url, hex, sha256);
+		goto done;
+	}
+	status = 0;
+done:
+	close(d.fd);
+	if (status != 0)
+		unlink(file);
+	return status;
+}
+
 int hull_fetch_tar_xz(const char *url, const char *sha256, const char *file, const char *tar,
                       char *why, size_t cap)
 {

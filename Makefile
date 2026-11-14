@@ -111,7 +111,7 @@ ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/storefs.o $(BUILD_DIR)/engine/writeback.o \
               $(BUILD_DIR)/engine/display.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o $(BUILD_DIR)/cli/runtime.o $(BUILD_DIR)/cli/doctor.o \
-              $(BUILD_DIR)/cli/import.o $(BUILD_DIR)/cli/export.o $(BUILD_DIR)/cli/kernel_fetch.o $(BUILD_DIR)/cli/vbox_fetch.o $(BUILD_DIR)/cli/esp_fetch.o $(BUILD_DIR)/cli/vbox_host.o $(BUILD_DIR)/cli/vagrant.o $(BUILD_DIR)/cli/dial.o \
+              $(BUILD_DIR)/cli/import.o $(BUILD_DIR)/cli/export.o $(BUILD_DIR)/cli/kernel_fetch.o $(BUILD_DIR)/cli/vbox_fetch.o $(BUILD_DIR)/cli/esp_fetch.o $(BUILD_DIR)/cli/86box_fetch.o $(BUILD_DIR)/cli/vbox_host.o $(BUILD_DIR)/cli/vagrant.o $(BUILD_DIR)/cli/dial.o \
               $(BUILD_DIR)/cli/sshd_fetch.o
 # Section 3's optional store, which only the commands that name it use.
 STORE_OBJS  = $(BUILD_DIR)/store/store.o $(BUILD_DIR)/store/unpack.o $(BUILD_DIR)/store/pack.o

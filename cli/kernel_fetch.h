@@ -20,6 +20,10 @@ int hull_kernel_fetch_arch(const char *arch, char *why, size_t cap);
 int hull_fetch_deb(const char *path, const char *sha256, const char *deb, const char *tar,
                    char *why, size_t cap);
 
+/* The file at the https `url` downloaded to `file`, a new file, and
+ * checked against `sha256`. 0, or -1 with `why` and no `file` left. */
+int hull_fetch_file(const char *url, const char *sha256, const char *file, char *why, size_t cap);
+
 /* The .tar.xz at the https `url` downloaded to `file`, checked against
  * `sha256` and decompressed into `tar`, a new file; `file` removed
  * whatever the outcome. 0, or -1 with `why` and no `tar` left. */
