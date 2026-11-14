@@ -42,6 +42,7 @@ private:
 	QCheckBox *ssh;
 	QComboBox *screen;
 	QComboBox *gpu;
+	QCheckBox *sound;
 	QLabel    *problem;
 	QString    file;
 };

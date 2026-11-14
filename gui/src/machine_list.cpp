@@ -121,6 +121,10 @@ QString spec_text(const new_machine &machine, QString *why)
 		*why = QStringLiteral("3D is a screen's: choose one, in hull-gui (local) for 3D shown here");
 		return QString();
 	}
+	if (machine.sound && machine.display.isEmpty()) {
+		*why = QStringLiteral("sound is heard where a screen is shown: choose a screen");
+		return QString();
+	}
 	if (!machine.memory.isEmpty() && !size.match(machine.memory).hasMatch()) {
 		*why = QStringLiteral("memory is a size such as 512M or 2G");
 		return QString();
@@ -147,8 +151,24 @@ QString spec_text(const new_machine &machine, QString *why)
 		text += QStringLiteral("  (ssh true)\n");
 	if (!machine.display.isEmpty())
 		text += QStringLiteral("  (display %1)\n").arg(machine.display);
-	if (!machine.gpu.isEmpty())
-		text += QStringLiteral("  (tuning (qemu (gpu %1)))\n").arg(machine.gpu);
+	/* One (tuning ...): a pc's card is its own key, a vm's qemu's. */
+	if (machine.backend == QStringLiteral("pc")) {
+		if (machine.sound)
+			text += QStringLiteral("  (tuning (pc (sound hda)))\n");
+		if (!machine.gpu.isEmpty()) {
+			*why = QStringLiteral("a pc's 3D is a card of its own, (devices (pci ...)): "
+			                      "virgl and Venus are a vm's");
+			return QString();
+		}
+	} else if (!machine.gpu.isEmpty() || machine.sound) {
+		QString qemu;
+
+		if (!machine.gpu.isEmpty())
+			qemu += QStringLiteral(" (gpu %1)").arg(machine.gpu);
+		if (machine.sound)
+			qemu += QStringLiteral(" (sound virtio)");
+		text += QStringLiteral("  (tuning (qemu%1))\n").arg(qemu);
+	}
 	if (!ok) {
 		*why = QStringLiteral("a field holds a control character the spec cannot carry");
 		return QString();

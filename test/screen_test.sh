@@ -5,7 +5,8 @@
 # GIO client (test/display_client.py) and by hull-gui's own screen window
 # (gui/test/screen_window_test), which must get qemu's framebuffer shared
 # rather than copied, whose typed key the guest must read from its own
-# keyboard, and whose new size the guest must take as its preferred mode.
+# keyboard, and whose new size the guest must take as its preferred mode;
+# the same machine's (sound virtio) card seen by its guest.
 # A (display local) machine with (gpu virgl) handing its frames over as
 # the GPU's dmabufs, and serving no VNC. Its 3D: (tuning (qemu (gpu
 # virgl))) a guest's OpenGL rendered by the host's GPU through
@@ -86,8 +87,8 @@ machine() {
 
 # The local display: a 2D screen by VNC, whose guest waits for a key on
 # its own virtio keyboard while the clients look.
-printf '(machine (source "gpu/mesa") (backend vm) (mutable overlay) (memory "1G") (hostname "local") (display vnc) (command "/bin/sh" "-c" "%s"))\n' \
-	'for e in /sys/class/input/event*; do grep -q Keyboard $e/device/name && k=/dev/input/${e##*/}; done; echo keyboard=$k; timeout 40 dd if=$k bs=24 count=2 2> /dev/null | od -An -tx1 > /tmp/keys; grep -q \" 1e 00\" /tmp/keys && echo key-a-read; sleep 4; echo mode=$(head -1 /sys/class/drm/card0-Virtual-1/modes)' \
+printf '(machine (source "gpu/mesa") (backend vm) (mutable overlay) (memory "1G") (hostname "local") (display vnc) (tuning (qemu (sound virtio))) (command "/bin/sh" "-c" "%s"))\n' \
+	'for e in /sys/class/input/event*; do grep -q Keyboard $e/device/name && k=/dev/input/${e##*/}; done; echo cards=$(grep -c virtio-snd /proc/asound/cards 2> /dev/null); echo keyboard=$k; timeout 40 dd if=$k bs=24 count=2 2> /dev/null | od -An -tx1 > /tmp/keys; grep -q \" 1e 00\" /tmp/keys && echo key-a-read; sleep 4; echo mode=$(head -1 /sys/class/drm/card0-Virtual-1/modes)' \
 	> "$root/local.conf"
 (cd "$root" && exec timeout -k 2 120 "$hull" run -f "$root/local.conf" > "$root/local.out" 2>&1) &
 runner=$!
@@ -118,6 +119,9 @@ cases=$((cases + 1))
 grep -q '^key-a-read$' "$root/local.out" ||
 	fail "a key typed in hull-gui's screen window did not reach the guest's keyboard" \
 		"$(cat "$root/local.out")"
+cases=$((cases + 1))
+grep -q '^cards=[1-9]' "$root/local.out" ||
+	fail "a (sound virtio) machine's guest has no virtio sound card" "$(cat "$root/local.out")"
 cases=$((cases + 1))
 grep -q '^mode=1000x700$' "$root/local.out" ||
 	fail "the screen window's size was not the guest's preferred mode after it was resized" \

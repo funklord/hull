@@ -201,6 +201,7 @@ struct hull_machine {
 	char            *x_display;    /* (display window): the run's X display */
 	char            *xauthority;   /* and its authority, or NULL */
 	int              gpu;          /* (tuning (qemu (gpu ...))): 0 2d, 1 virgl, 2 venus */
+	int              sound;        /* (tuning (qemu (sound virtio))): a virtio sound card */
 	int              local_display; /* qemu's D-Bus display too, by display.qmp */
 	char             display_link[4200]; /* hull/display/ADDRESS, linked to it, or "" */
 	int              bridge;       /* (network bridge): a tap on a host bridge, its core root */
@@ -1001,7 +1002,22 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			free(text);
 			if (m->gpu != 0 && !m->screen)
 				return "(gpu virgl) and (gpu venus) are a screen's 3D: the machine needs "
-				       "(display window) or (display vnc)";
+				       "(display window) or (display vnc), or (display local)";
+		}
+		/* (sound virtio): virtio-sound, which Linux drives since 5.13,
+		 * heard on this host where the screen is shown here -- (display
+		 * window) or (display local) -- and silent by VNC, as a pc's.
+		 * Not Intel HD Audio: a Debian 13 guest found no codec on qemu's
+		 * intel-hda or ich9-intel-hda with hda-duplex ("Cannot probe
+		 * codecs, giving up"), measured 2026-11-14. */
+		if (hull_access_find(doc, &machine, "tuning", &tuning) &&
+		    hull_access_find(doc, &tuning, "qemu", &qemu_tuning) &&
+		    (text = hull_access_value(doc, &qemu_tuning, "sound")) != NULL) {
+			m->sound = strcmp(text, "virtio") == 0;
+			free(text);
+			if (m->sound && !m->screen)
+				return "(sound virtio) is a screen's machine's, heard where it is shown: the "
+				       "machine needs (display ...)";
 		}
 	}
 	text = hull_access_value(doc, &machine, "network");
@@ -1632,6 +1648,9 @@ static const char *write_initramfs(const hull_machine *m, const char *modules, i
 		extra[extra_count++] = "?virtio_input";
 		extra[extra_count++] = "?evdev";
 	}
+	/* Its sound card's driver. */
+	if (m->sound && load_modules && extra_count + 1u <= MAX_MODULES)
+		extra[extra_count++] = "?virtio_snd";
 	/* A composefs root: erofs for its image, the crc32c erofs's
 	 * libcrc32c asks for, and overlay, which is loaded already. */
 	if (m->composefs != NULL && load_modules && extra_count + 2u <= MAX_MODULES) {
@@ -2380,6 +2399,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        agent_chardev[4500];
 	char        monitor_chardev[64];
 	char        display_chardev[4300];
+	char        audiodev[48];
 	char        swap[9000];
 	char        netdev[64];
 	char        root[9000];
@@ -2400,7 +2420,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        shared_memory[96];
 	char        mmio[MICROVM_TRANSPORTS][128];
 	unsigned    mmio_count = 0u;
-	const char *argv[88 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS + 4u * HULL_MAX_DEVICES + 2u];
+	const char *argv[100 + 4u * MAX_VOLUMES + 4u * MAX_SEGMENTS + 4u * HULL_MAX_DEVICES + 2u];
 	unsigned    serial = 0u;
 	unsigned    parallel = 0u;
 	int         usb = 0;
@@ -2792,6 +2812,15 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		argv[n++] = "virtio-keyboard-pci";
 		argv[n++] = "-device";
 		argv[n++] = "virtio-tablet-pci";
+	}
+	if (m->sound) {
+		/* Heard where the screen is shown here; by VNC, played to nothing. */
+		snprintf(audiodev, sizeof audiodev, "%s,id=sound",
+		         m->vnc ? "none" : hull_audio_backend());
+		argv[n++] = "-audiodev";
+		argv[n++] = audiodev;
+		argv[n++] = "-device";
+		argv[n++] = "virtio-sound-pci,audiodev=sound";
 	}
 	if (!m->no_network) {
 		argv[n++] = "-netdev";
@@ -5975,6 +6004,10 @@ static const hull_cap_entry entries[] = {
 	{ "qemu.share.9p",         HULL_SUP_NATIVE, NULL, NULL },
 	{ "qemu.share.virtiofs",   HULL_SUP_NATIVE, "needs virtiofsd installed", NULL },
 	{ "qemu.gpu.2d",           HULL_SUP_NATIVE, NULL, NULL },
+	{ "qemu.sound.none",       HULL_SUP_NATIVE, NULL, NULL },
+	{ "qemu.sound.virtio",     HULL_SUP_NATIVE,
+	  "virtio-sound, the guest's virtio_snd (Linux 5.13 on), heard on this host's PipeWire, PulseAudio or ALSA where the screen is "
+	  "shown here, silent by VNC", NULL },
 	{ "qemu.gpu.virgl",        HULL_SUP_NATIVE,
 	  "OpenGL forwarded by virglrenderer to the host's GPU, shared; the guest needs Mesa's "
 	  "virgl driver", NULL },

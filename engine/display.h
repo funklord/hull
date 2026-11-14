@@ -19,6 +19,13 @@ int hull_display_fits(const char *monitor);
  * VNC's. */
 void hull_display_link(const char *monitor, const char *address, char *link, size_t cap);
 
+/* Where a machine shown on this host is heard, as qemu's -audiodev
+ * names it: PipeWire's or PulseAudio's server where the user's runtime
+ * directory has one, else ALSA where a playback device is the user's to
+ * open, else "none". qemu will not start on a backend that cannot open,
+ * so it is chosen by what is there rather than tried. */
+const char *hull_audio_backend(void);
+
 /* The link of a machine a later core takes back: `link` names
  * hull/display/`address` where it still names `monitor`, else "", so
  * that the core which ends the machine removes it. */

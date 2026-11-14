@@ -417,6 +417,7 @@ static const char *const cpu_values[]        = { "host", "migratable", NULL };
 static const char *const accel_values[]      = { "auto", "kvm", "tcg", NULL };
 static const char *const transport_values[]  = { "auto", "vsock", "serial", "uart", NULL };
 static const char *const gpu_values[]        = { "2d", "virgl", "venus", NULL };
+static const char *const sound_values[]      = { "none", "virtio", NULL };
 static const char *const share_values[]      = { "auto", "9p", "virtiofs", NULL };
 static const char *const fill_values[]       = { "image", NULL };
 
@@ -544,6 +545,7 @@ static const key qemu_keys[] = {
 	{ .name = "share", .type = CHOICE, .choices = share_values },
 	{ .name = "iommu", .type = BOOLEAN },
 	{ .name = "gpu", .type = CHOICE, .choices = gpu_values },
+	{ .name = "sound", .type = CHOICE, .choices = sound_values },
 };
 static const schema qemu = TABLE(qemu_keys);
 

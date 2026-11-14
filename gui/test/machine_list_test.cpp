@@ -130,10 +130,11 @@ int main(int argc, char **argv)
 		m.backend = QStringLiteral("vm");
 		m.display = QStringLiteral("local");
 		m.gpu = QStringLiteral("virgl");
+		m.sound = true;
 		const QString said = written(scratch + QStringLiteral("/screen"), m, &code, hull);
 
 		check(code == 0, "a written vm with a local 3D screen plans", said);
-		for (const char *entry : { "(display local)", "(gpu virgl)" })
+		for (const char *entry : { "(display local)", "(gpu virgl)", "(sound virtio)" })
 			check(said.contains(QString::fromLatin1(entry)), entry, said);
 	}
 
@@ -157,6 +158,10 @@ int main(int argc, char **argv)
 		why.clear();
 		check(spec_text(m, &why).isEmpty() && !why.isEmpty(), "3D with no screen refused", why);
 		m.gpu.clear();
+		m.sound = true;
+		why.clear();
+		check(spec_text(m, &why).isEmpty() && !why.isEmpty(), "sound with no screen refused", why);
+		m.sound = false;
 		m.command = { QStringLiteral("a\x01") };
 		why.clear();
 		check(spec_text(m, &why).isEmpty() && !why.isEmpty(),

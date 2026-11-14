@@ -59,6 +59,7 @@ struct new_machine {
 	bool        ssh = false;
 	QString     display;   /* "", window, vnc or local: (display ...) */
 	QString     gpu;       /* "", virgl or venus: (tuning (qemu (gpu ...))) */
+	bool        sound = false;  /* a pc's (sound hda), else qemu's (sound virtio) */
 };
 
 /*

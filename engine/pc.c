@@ -1363,13 +1363,17 @@ static void exec_pc(const hull_machine *m)
 	argv[n++] = "-boot";
 	argv[n++] = boot;
 	/* A card, heard where there is a window, SDL's audio beside its
-	 * video, and playing to nothing where there is not: a system still
+	 * video, or where hull-gui shows the screen, on the host's sound
+	 * server or ALSA; and playing to nothing by VNC alone: a system still
 	 * finds the card it was installed with. */
 	if (m->sound != NULL && strcmp(m->sound, "none") != 0) {
 		static char card[48];
+		static __thread char audiodev[48];
 
+		snprintf(audiodev, sizeof audiodev, "%s,id=sound",
+		         m->display != NULL ? "sdl" : m->local ? hull_audio_backend() : "none");
 		argv[n++] = "-audiodev";
-		argv[n++] = m->display != NULL ? "sdl,id=sound" : "none,id=sound";
+		argv[n++] = audiodev;
 		if (strcmp(m->sound, "hda") == 0) {
 			argv[n++] = "-device";
 			argv[n++] = "intel-hda";

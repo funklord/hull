@@ -8,6 +8,7 @@
 #define _DEFAULT_SOURCE
 #include "display.h"
 
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +41,39 @@ void hull_display_link(const char *monitor, const char *address, char *link, siz
 		unlink(temporary);
 		link[0] = '\0';
 	}
+}
+
+const char *hull_audio_backend(void)
+{
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	char        path[4400];
+	struct stat st;
+	DIR        *dir;
+	struct dirent *entry;
+	const char *found = "none";
+
+	if (runtime != NULL && runtime[0] == '/') {
+		snprintf(path, sizeof path, "%s/pipewire-0", runtime);
+		if (stat(path, &st) == 0 && S_ISSOCK(st.st_mode))
+			return "pipewire";
+		snprintf(path, sizeof path, "%s/pulse/native", runtime);
+		if (stat(path, &st) == 0 && S_ISSOCK(st.st_mode))
+			return "pa";
+	}
+	if ((dir = opendir("/dev/snd")) == NULL)
+		return found;
+	while ((entry = readdir(dir)) != NULL) {
+		size_t length = strlen(entry->d_name);
+
+		snprintf(path, sizeof path, "/dev/snd/%s", entry->d_name);
+		if (strncmp(entry->d_name, "pcmC", 4u) == 0 && length > 0u &&
+		    entry->d_name[length - 1u] == 'p' && access(path, W_OK) == 0) {
+			found = "alsa";
+			break;
+		}
+	}
+	closedir(dir);
+	return found;
 }
 
 void hull_display_adopt(const char *monitor, const char *address, char *link, size_t cap)

@@ -61,6 +61,7 @@ new_machine_dialog::new_machine_dialog(const QStringList &images, const QString 
 	gpu->addItem(QStringLiteral("none"), QString());
 	gpu->addItem(QStringLiteral("OpenGL on this host's GPU (virgl)"), QStringLiteral("virgl"));
 	gpu->addItem(QStringLiteral("Vulkan on this host's GPU (Venus)"), QStringLiteral("venus"));
+	sound = new QCheckBox(QStringLiteral("So&und, heard where the screen is shown here"));
 	gpu->setToolTip(QStringLiteral("A vm's 3D, the guest needing Mesa's driver; Venus needs "
 	                               "/dev/udmabuf open to the user"));
 	problem = new QLabel;
@@ -76,6 +77,7 @@ new_machine_dialog::new_machine_dialog(const QStringList &images, const QString 
 	form->addRow(QStringLiteral("C&PUs:"), cpus);
 	form->addRow(QStringLiteral("Sc&reen:"), screen);
 	form->addRow(QStringLiteral("&3D:"), gpu);
+	form->addRow(QString(), sound);
 	form->addRow(QString(), overlay);
 	form->addRow(QString(), ssh);
 
@@ -107,6 +109,7 @@ void new_machine_dialog::accept()
 	machine.ssh = ssh->isChecked();
 	machine.display = screen->currentData().toString();
 	machine.gpu = gpu->currentData().toString();
+	machine.sound = sound->isChecked();
 
 	const QString text = spec_text(machine, &why);
 
