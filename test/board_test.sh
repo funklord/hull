@@ -226,7 +226,8 @@ if [ -n "${LORA_FW:-}" ] && [ -n "${LORA_QEMU:-}" ] && [ -n "${esp:-}" ] && [ -L
 	cp "$LORA_FW/lora-first.flash" "$root/la.fw"
 	cp "$LORA_FW/lora-second.flash" "$root/lb.fw"
 	cp "$LORA_FW/lora-s3.flash" "$root/ls.fw"
-	printf '(machines\n  (la (backend pc) (source "image:./la.fw") (tuning (pc (machine heltec-wifi-lora-32) (lora "field"))))\n  (lb (backend pc) (source "image:./lb.fw") (tuning (pc (machine ttgo-lora32) (lora "field"))))\n  (ls (backend pc) (source "image:./ls.fw") (tuning (pc (machine lilygo-t3-s3) (lora "field")))))\n' \
+	cp "$LORA_FW/lora-v3.flash" "$root/lv.fw"
+	printf '(machines\n  (la (backend pc) (source "image:./la.fw") (tuning (pc (machine heltec-wifi-lora-32) (lora "field"))))\n  (lb (backend pc) (source "image:./lb.fw") (tuning (pc (machine ttgo-lora32) (lora "field"))))\n  (ls (backend pc) (source "image:./ls.fw") (tuning (pc (machine lilygo-t3-s3) (lora "field"))))\n  (lv (backend pc) (source "image:./lv.fw") (tuning (pc (machine heltec-wifi-lora-32-v3) (lora "field")))))\n' \
 		> "$root/lora.conf"
 	# A core of its own: the machines are the core's, and it keeps the
 	# environment it was started with, which names the qemu.
@@ -243,6 +244,7 @@ if [ -n "${LORA_FW:-}" ] && [ -n "${LORA_QEMU:-}" ] && [ -n "${esp:-}" ] && [ -L
 	XDG_RUNTIME_DIR=$root/run-lora timeout 30 "$hull" stop la > /dev/null 2>&1
 	XDG_RUNTIME_DIR=$root/run-lora timeout 30 "$hull" stop lb > /dev/null 2>&1
 	XDG_RUNTIME_DIR=$root/run-lora timeout 30 "$hull" stop ls > /dev/null 2>&1
+	XDG_RUNTIME_DIR=$root/run-lora timeout 30 "$hull" stop lv > /dev/null 2>&1
 	wait "$runner"
 	cases=$((cases + 1))
 	grep -q 'la | radio 12' "$root/lora.out" && grep -q 'lb | radio 12' "$root/lora.out" ||
@@ -260,6 +262,11 @@ if [ -n "${LORA_FW:-}" ] && [ -n "${LORA_QEMU:-}" ] && [ -n "${esp:-}" ] && [ -L
 	cases=$((cases + 1))
 	grep -q 'ls | radio 12' "$root/lora.out" && grep -q 'ls | got ping' "$root/lora.out" ||
 		fail "a T3-S3 did not read its SX1276 over SPI2 and hear the ping" "$(cat "$root/lora.out")"
+	# And a Heltec V3's SX1262, by its commands, hearing the SX1276s: the
+	# two chips' settings on one air.
+	cases=$((cases + 1))
+	grep -q 'lv | radio SX1261' "$root/lora.out" && grep -q 'lv | got ping' "$root/lora.out" ||
+		fail "a Heltec V3 did not read its SX1262 and hear the SX1276's ping" "$(cat "$root/lora.out")"
 	printf '(machine (backend pc) (source "image:./la.fw") (tuning (pc (machine heltec-wifi-lora-32) (lora "field"))))\n' \
 		> "$root/noqemu.conf"
 	cases=$((cases + 1))

@@ -263,7 +263,7 @@ BOARD_LM3S := $(if $(BOARD_ARM),$(foreach b,lm3s mps2,$(foreach w,$(LM3S_NETS),$
 # `make esp-qemu-lora`, which fetches its source at the release hull pins.
 BOARD_XTENSA_CC  ?= xtensa-esp32-elf-gcc
 BOARD_XTENSA_BIN  = $(patsubst %-gcc,%,$(BOARD_XTENSA_CC))
-BOARD_LORA := $(if $(shell command -v $(BOARD_XTENSA_CC) 2>/dev/null),$(foreach r,first second s3,$(BUILD_DIR)/test/board-fw/lora-$(r).flash))
+BOARD_LORA := $(if $(shell command -v $(BOARD_XTENSA_CC) 2>/dev/null),$(foreach r,first second s3 v3,$(BUILD_DIR)/test/board-fw/lora-$(r).flash))
 BOARD_XTENSA_S3_CC = $(subst esp32-elf,esp32s3-elf,$(BOARD_XTENSA_CC))
 BOARD_XTENSA_S3    = $(subst -gcc,,$(BOARD_XTENSA_S3_CC))
 ESP_QEMU_TAG    = esp-develop-9.2.2-20261109
@@ -1217,6 +1217,18 @@ $(BUILD_DIR)/test/board-fw/lora-s3.flash: test/board/lora_esp32.c test/board/esp
 		0x$$($(BOARD_XTENSA_S3)-nm $(@D)/lora-s3.elf | awk '$$3 == "start" { print $$1 }') \
 		$(@D)/lora-s3.data 0x3fcb0000
 
+# A Heltec WiFi LoRa 32 V3's, an S3 with an SX1262 on SPI2, answering what
+# it hears, by the SX1262's commands.
+$(BUILD_DIR)/test/board-fw/lora-v3.flash: test/board/lora_sx1262.c test/board/esp32s3_ram.ld test/board/esp_image.py
+	@mkdir -p '$(@D)'
+	$(BOARD_XTENSA_S3_CC) -Os -Wall -Wextra -ffreestanding -nostdlib -nostartfiles -fno-builtin \
+		-T test/board/esp32s3_ram.ld -o $(@D)/lora-v3.elf $<
+	$(BOARD_XTENSA_S3)-objcopy -O binary -j .text $(@D)/lora-v3.elf $(@D)/lora-v3.text
+	$(BOARD_XTENSA_S3)-objcopy -O binary -j .data $(@D)/lora-v3.elf $(@D)/lora-v3.data
+	$(PYTHON) test/board/esp_image.py $(@D)/lora-v3.text 0x40380000 9 0x0 $@ \
+		0x$$($(BOARD_XTENSA_S3)-nm $(@D)/lora-v3.elf | awk '$$3 == "start" { print $$1 }') \
+		$(@D)/lora-v3.data 0x3fcb0000
+
 $(BUILD_DIR)/test/board-fw/lora-first.flash $(BUILD_DIR)/test/board-fw/lora-second.flash: \
 $(BUILD_DIR)/test/board-fw/lora-%.flash: test/board/lora_esp32.c test/board/esp32_ram.ld test/board/esp_image.py
 	@mkdir -p '$(@D)'
@@ -1241,9 +1253,9 @@ $(ESP_QEMU_LORA): engine/esp-lora.patch
 	test -d '$(BUILD_DIR)/esp-qemu-lora/src' || git clone -q --depth 1 --branch $(ESP_QEMU_TAG) \
 		https://github.com/espressif/qemu.git '$(BUILD_DIR)/esp-qemu-lora/src'
 	test "$$(git -C '$(BUILD_DIR)/esp-qemu-lora/src' rev-parse HEAD)" = $(ESP_QEMU_COMMIT)
-	git -C '$(BUILD_DIR)/esp-qemu-lora/src' reset -q -- hw/misc/sx127x.c hw/ssi/esp32s3_gpspi.c include/hw/ssi/esp32s3_gpspi.h
+	git -C '$(BUILD_DIR)/esp-qemu-lora/src' reset -q -- hw/misc/sx127x.c hw/misc/sx126x.c hw/ssi/esp32s3_gpspi.c include/hw/ssi/esp32s3_gpspi.h
 	git -C '$(BUILD_DIR)/esp-qemu-lora/src' checkout -q -- .
-	git -C '$(BUILD_DIR)/esp-qemu-lora/src' clean -q -f -- hw/misc/sx127x.c hw/ssi/esp32s3_gpspi.c include/hw/ssi/esp32s3_gpspi.h
+	git -C '$(BUILD_DIR)/esp-qemu-lora/src' clean -q -f -- hw/misc/sx127x.c hw/misc/sx126x.c hw/ssi/esp32s3_gpspi.c include/hw/ssi/esp32s3_gpspi.h
 	git -C '$(BUILD_DIR)/esp-qemu-lora/src' apply '$(abspath engine/esp-lora.patch)'
 	mkdir -p '$(BUILD_DIR)/esp-qemu-lora/build'
 	cd '$(BUILD_DIR)/esp-qemu-lora/build' && test -f build.ninja || ../src/configure \

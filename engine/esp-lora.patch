@@ -130,19 +130,525 @@ index 5e25782..5c2f15a 100644
  
  static Property esp32_gpio_properties[] = {
 diff --git a/hw/misc/meson.build b/hw/misc/meson.build
-index dc9ff35..72cea62 100644
+index dc9ff35..be27fee 100644
 --- a/hw/misc/meson.build
 +++ b/hw/misc/meson.build
-@@ -145,7 +145,8 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
+@@ -145,7 +145,9 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
    'esp32_aes.c',
    'esp32_ledc.c',
    'esp32_flash_enc.c',
 -  'ssi_psram.c'
 +  'ssi_psram.c',
-+  'sx127x.c'
++  'sx127x.c',
++  'sx126x.c'
  ))
  
  system_ss.add(when: 'CONFIG_RISCV_ESP32C3', if_true: files(
+diff --git a/hw/misc/sx126x.c b/hw/misc/sx126x.c
+new file mode 100644
+index 0000000..d417881
+--- /dev/null
++++ b/hw/misc/sx126x.c
+@@ -0,0 +1,499 @@
++/*
++ * Semtech SX1261/SX1262 LoRa transceiver, as hull's Heltec WiFi LoRa 32
++ * V3 carries one: its SPI command set in LoRa mode, its data buffer and
++ * registers, transmit and receive, the DIO1 line, and the air.
++ *
++ * Commands are an opcode and its parameters while NSS is low, each byte
++ * answered with the status, or with what a Get or Read command returns;
++ * a command takes effect when NSS rises. BUSY is low throughout: every
++ * command here is done by the time the next can be sent.
++ *
++ * The air is hull's SX1276 model's (sx127x.c): length-prefixed frames,
++ * each LoRa packet an Ethernet frame of type 0x88b5 carrying the sender's
++ * frequency, bandwidth, spreading factor, coding rate, sync word and IQ
++ * polarity in the SX1276's own register encodings, so that the two chips
++ * hear each other as the real ones do. Its time on air is kept as there.
++ *
++ * GFSK is not modelled; its commands are taken and do nothing.
++ */
++
++#include "qemu/osdep.h"
++#include <math.h>
++#include "qemu/log.h"
++#include "qemu/timer.h"
++#include "qemu/module.h"
++#include "qapi/error.h"
++#include "hw/ssi/ssi.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "hw/qdev-properties-system.h"
++#include "chardev/char-fe.h"
++
++#define TYPE_SX126X "sx126x"
++OBJECT_DECLARE_SIMPLE_TYPE(Sx126xState, SX126X)
++
++#define AIR_TYPE  0x88b5
++#define AIR_HEAD  (14 + 12)
++#define AIR_MAX   (4 + AIR_HEAD + 256)
++
++/* Chip modes as the status byte gives them, bits 6:4. */
++enum { MODE_STBY_RC = 2, MODE_STBY_XOSC = 3, MODE_FS = 4, MODE_RX = 5, MODE_TX = 6 };
++
++enum {
++    IRQ_TX_DONE = 1 << 0, IRQ_RX_DONE = 1 << 1, IRQ_HEADER_VALID = 1 << 4,
++    IRQ_TIMEOUT = 1 << 9,
++};
++
++struct Sx126xState {
++    SSIPeripheral parent_obj;
++
++    CharBackend air;
++    QEMUTimer *timer;
++    qemu_irq dio1;
++    qemu_irq busy;
++    uint16_t id;
++
++    uint8_t mode;
++    uint8_t sleeping;
++    uint8_t packet_type;          /* 0 GFSK, 1 LoRa */
++    uint32_t rf;                  /* SetRfFrequency's word, Fxtal / 2^25 a step */
++    uint8_t sf, bw, cr, ldro;     /* SetModulationParams' */
++    uint16_t preamble;            /* SetPacketParams' */
++    uint8_t implicit, payload_length, crc, invert_iq;
++    uint8_t tx_base, rx_base;
++    uint16_t irq, irq_mask, dio1_mask;
++    uint8_t rx_length, rx_start;
++    uint8_t buffer[256];
++    uint8_t reg[0x1000];
++    bool single_rx;               /* SetRx with a timeout: one packet, then standby */
++
++    uint8_t cmd[300];
++    unsigned cmd_length;
++    bool selected;
++
++    uint8_t in[2 * AIR_MAX];
++    unsigned in_length;
++    uint8_t out[AIR_MAX];
++    unsigned out_length;
++};
++
++/* SetModulationParams' bandwidth codes, as the SX1276's RegModemConfig1
++ * numbers them, 7.8 kHz to 500 kHz. */
++static unsigned bw_index(uint8_t code)
++{
++    static const uint8_t codes[] = { 0x00, 0x08, 0x01, 0x09, 0x02, 0x0a, 0x03, 0x04, 0x05, 0x06 };
++
++    for (unsigned i = 0; i < sizeof codes; i++) {
++        if (codes[i] == code) {
++            return i;
++        }
++    }
++    return 7;   /* 125 kHz */
++}
++
++static const uint32_t bandwidth_hz[] = {
++    7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000, 500000,
++};
++
++static uint8_t status_byte(Sx126xState *s)
++{
++    return (uint8_t)(s->mode << 4) | (2u << 1);   /* data available or not: 2, as idle */
++}
++
++static void sx126x_update(Sx126xState *s)
++{
++    qemu_set_irq(s->dio1, (s->irq & s->dio1_mask) != 0);
++}
++
++static void sx126x_raise(Sx126xState *s, uint16_t bits)
++{
++    s->irq |= bits & s->irq_mask;
++    sx126x_update(s);
++}
++
++/* The SX1276's encodings of the settings, which the air carries. */
++static uint32_t frf_1276(Sx126xState *s)
++{
++    return (s->rf + 32) >> 6;
++}
++
++static uint8_t config1(Sx126xState *s)
++{
++    return (uint8_t)(bw_index(s->bw) << 4 | (s->cr & 7) << 1 | (s->implicit & 1));
++}
++
++static uint8_t config2(Sx126xState *s)
++{
++    return (uint8_t)((s->sf & 0xf) << 4 | (s->crc ? 1 << 2 : 0));
++}
++
++static uint8_t sync_1276(Sx126xState *s)
++{
++    return (s->reg[0x740] & 0xf0) | (s->reg[0x741] >> 4);
++}
++
++static int64_t airtime_ns(Sx126xState *s, unsigned length)
++{
++    double hz = bandwidth_hz[bw_index(s->bw)];
++    unsigned sf = s->sf >= 5 && s->sf <= 12 ? s->sf : 7;
++    unsigned cr = s->cr >= 1 && s->cr <= 4 ? s->cr : 1;
++    double symbol = (double)(1u << sf) / hz;
++    double bits = 8.0 * length - 4.0 * sf + 28 + (s->crc ? 16 : 0) - (s->implicit ? 20 : 0);
++    double payload = 8 + MAX(ceil(bits / (4.0 * (sf - (s->ldro ? 2 : 0)))) * (cr + 4), 0);
++
++    return (int64_t)(((s->preamble ? s->preamble : 8) + 4.25 + payload) * symbol * 1e9);
++}
++
++static void sx126x_transmit(Sx126xState *s)
++{
++    unsigned length = s->payload_length;
++    uint8_t *f = s->out + 4;
++    uint32_t frf = frf_1276(s);
++
++    stl_be_p(s->out, AIR_HEAD + length);
++    memset(f, 0xff, 6);
++    f[6] = 0x02;
++    f[7] = 'h';
++    f[8] = 'u';
++    f[9] = 'R';
++    stw_be_p(f + 10, s->id);
++    stw_be_p(f + 12, AIR_TYPE);
++    f[14] = 1;
++    f[15] = frf >> 16;
++    f[16] = frf >> 8;
++    f[17] = frf;
++    f[18] = config1(s);
++    f[19] = config2(s);
++    f[20] = sync_1276(s);
++    f[21] = s->invert_iq & 1;
++    f[22] = f[23] = f[24] = 0;
++    f[25] = length;
++    for (unsigned i = 0; i < length; i++) {
++        f[AIR_HEAD + i] = s->buffer[(uint8_t)(s->tx_base + i)];
++    }
++    s->out_length = 4 + AIR_HEAD + length;
++    s->mode = MODE_TX;
++    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + airtime_ns(s, length));
++}
++
++static void sx126x_timer(void *opaque)
++{
++    Sx126xState *s = opaque;
++
++    if (s->mode == MODE_TX && s->out_length != 0) {
++        if (qemu_chr_fe_backend_connected(&s->air)) {
++            qemu_chr_fe_write_all(&s->air, s->out, s->out_length);
++        }
++        s->out_length = 0;
++        s->mode = MODE_STBY_RC;
++        sx126x_raise(s, IRQ_TX_DONE);
++    }
++}
++
++static void sx126x_hear(Sx126xState *s, const uint8_t *f, unsigned frame)
++{
++    uint32_t frf = frf_1276(s);
++    unsigned length;
++
++    if (frame < AIR_HEAD || lduw_be_p(f + 12) != AIR_TYPE || f[14] != 1 ||
++        lduw_be_p(f + 10) == s->id) {
++        return;
++    }
++    length = f[25];
++    if (frame < AIR_HEAD + length || s->packet_type != 1 || s->mode != MODE_RX ||
++        f[15] != (uint8_t)(frf >> 16) || f[16] != (uint8_t)(frf >> 8) || f[17] != (uint8_t)frf ||
++        (f[18] & 0xf0) != (config1(s) & 0xf0) || (f[19] & 0xf0) != (config2(s) & 0xf0) ||
++        f[20] != sync_1276(s) || (f[21] & 1) != (s->invert_iq & 1)) {
++        return;
++    }
++    for (unsigned i = 0; i < length; i++) {
++        s->buffer[(uint8_t)(s->rx_base + i)] = f[AIR_HEAD + i];
++    }
++    s->rx_start = s->rx_base;
++    s->rx_length = length;
++    if (s->single_rx) {
++        s->mode = MODE_STBY_RC;
++    }
++    sx126x_raise(s, IRQ_HEADER_VALID | IRQ_RX_DONE);
++}
++
++static int sx126x_can_receive(void *opaque)
++{
++    Sx126xState *s = opaque;
++
++    return sizeof(s->in) - s->in_length;
++}
++
++static void sx126x_receive(void *opaque, const uint8_t *buf, int size)
++{
++    Sx126xState *s = opaque;
++
++    memcpy(s->in + s->in_length, buf, size);
++    s->in_length += size;
++    while (s->in_length >= 4) {
++        uint32_t frame = ldl_be_p(s->in);
++
++        if (frame > sizeof(s->in) - 4) {
++            s->in_length = 0;
++            return;
++        }
++        if (s->in_length < 4 + frame) {
++            return;
++        }
++        sx126x_hear(s, s->in + 4, frame);
++        memmove(s->in, s->in + 4 + frame, s->in_length - 4 - frame);
++        s->in_length -= 4 + frame;
++    }
++}
++
++/* A command, its opcode and parameters, done as NSS rises. */
++static void sx126x_execute(Sx126xState *s)
++{
++    const uint8_t *c = s->cmd;
++    unsigned n = s->cmd_length;
++
++    if (n == 0) {
++        return;
++    }
++    switch (c[0]) {
++    case 0x80:   /* SetStandby */
++        s->mode = (n > 1 && c[1]) ? MODE_STBY_XOSC : MODE_STBY_RC;
++        s->sleeping = 0;
++        timer_del(s->timer);
++        s->out_length = 0;
++        break;
++    case 0x84:   /* SetSleep */
++        s->sleeping = 1;
++        s->mode = MODE_STBY_RC;
++        break;
++    case 0xc1:   /* SetFs */
++        s->mode = MODE_FS;
++        break;
++    case 0x8a:   /* SetPacketType */
++        if (n > 1) {
++            s->packet_type = c[1];
++        }
++        break;
++    case 0x86:   /* SetRfFrequency */
++        if (n > 4) {
++            s->rf = ldl_be_p(c + 1);
++        }
++        break;
++    case 0x8b:   /* SetModulationParams, LoRa's */
++        if (n > 4) {
++            s->sf = c[1];
++            s->bw = c[2];
++            s->cr = c[3];
++            s->ldro = c[4];
++        }
++        break;
++    case 0x8c:   /* SetPacketParams, LoRa's */
++        if (n > 6) {
++            s->preamble = lduw_be_p(c + 1);
++            s->implicit = c[3];
++            s->payload_length = c[4];
++            s->crc = c[5];
++            s->invert_iq = c[6];
++        }
++        break;
++    case 0x8f:   /* SetBufferBaseAddress */
++        if (n > 2) {
++            s->tx_base = c[1];
++            s->rx_base = c[2];
++        }
++        break;
++    case 0x0e:   /* WriteBuffer */
++        for (unsigned i = 2; i < n; i++) {
++            s->buffer[(uint8_t)(c[1] + i - 2)] = c[i];
++        }
++        break;
++    case 0x0d:   /* WriteRegister */
++        for (unsigned i = 3; i < n; i++) {
++            s->reg[(lduw_be_p(c + 1) + i - 3) & 0xfff] = c[i];
++        }
++        break;
++    case 0x08:   /* SetDioIrqParams */
++        if (n > 4) {
++            s->irq_mask = lduw_be_p(c + 1);
++            s->dio1_mask = lduw_be_p(c + 3);
++            sx126x_update(s);
++        }
++        break;
++    case 0x02:   /* ClearIrqStatus */
++        if (n > 2) {
++            s->irq &= ~lduw_be_p(c + 1);
++            sx126x_update(s);
++        }
++        break;
++    case 0x83:   /* SetTx */
++        if (s->packet_type == 1) {
++            sx126x_transmit(s);
++        }
++        break;
++    case 0x82:   /* SetRx: 0 or 0xffffff continuous, else one packet */
++        if (n > 3) {
++            uint32_t timeout = (uint32_t)c[1] << 16 | c[2] << 8 | c[3];
++
++            s->single_rx = timeout != 0 && timeout != 0xffffff;
++        }
++        s->mode = MODE_RX;
++        break;
++    default:     /* calibration, regulator, TCXO, RF switch, PA: nothing to do */
++        break;
++    }
++}
++
++/* What the chip answers to byte `n` of the command in progress. */
++static uint8_t sx126x_answer(Sx126xState *s, unsigned n)
++{
++    const uint8_t *c = s->cmd;
++
++    if (n == 0) {
++        return status_byte(s);
++    }
++    switch (c[0]) {
++    case 0x1d:   /* ReadRegister: address, NOP, then data */
++        return n >= 4 ? s->reg[(lduw_be_p(c + 1) + n - 4) & 0xfff] : status_byte(s);
++    case 0x1e:   /* ReadBuffer: offset, NOP, then data */
++        return n >= 3 ? s->buffer[(uint8_t)(c[1] + n - 3)] : status_byte(s);
++    case 0x12:   /* GetIrqStatus */
++        return n == 1 ? status_byte(s) : n == 2 ? s->irq >> 8 : s->irq & 0xff;
++    case 0x13:   /* GetRxBufferStatus */
++        return n == 1 ? status_byte(s) : n == 2 ? s->rx_length : s->rx_start;
++    case 0x14:   /* GetPacketStatus: RSSI -60 dBm, SNR 10 dB */
++        return n == 1 ? status_byte(s) : n == 3 ? 40 : 120;
++    case 0x15:   /* GetRssiInst */
++        return n == 1 ? status_byte(s) : 200;
++    case 0x11:   /* GetPacketType */
++        return n == 1 ? status_byte(s) : s->packet_type;
++    case 0x17:   /* GetDeviceErrors */
++        return n == 1 ? status_byte(s) : 0;
++    default:
++        return status_byte(s);
++    }
++}
++
++static uint32_t sx126x_transfer(SSIPeripheral *dev, uint32_t value)
++{
++    Sx126xState *s = SX126X(dev);
++    unsigned n = s->cmd_length;
++    uint8_t answer;
++
++    if (!s->selected) {
++        return 0xff;
++    }
++    if (n < sizeof(s->cmd)) {
++        s->cmd[n] = (uint8_t)value;
++        s->cmd_length = n + 1;
++    }
++    answer = sx126x_answer(s, n);
++    return answer;
++}
++
++/* qemu's SSI core gives the line's level, low for selected, NSS being
++ * active low. */
++static int sx126x_set_cs(SSIPeripheral *dev, bool level)
++{
++    Sx126xState *s = SX126X(dev);
++    bool select = !level;
++
++    if (select) {
++        s->selected = true;
++        s->cmd_length = 0;
++    } else if (s->selected) {
++        s->selected = false;
++        sx126x_execute(s);
++        s->cmd_length = 0;
++    }
++    return 0;
++}
++
++static void sx126x_reset_state(Sx126xState *s)
++{
++    timer_del(s->timer);
++    s->mode = MODE_STBY_RC;
++    s->sleeping = 0;
++    s->packet_type = 0;
++    s->rf = 0;
++    s->sf = 7;
++    s->bw = 0x04;
++    s->cr = 1;
++    s->ldro = 0;
++    s->preamble = 8;
++    s->implicit = s->crc = s->invert_iq = 0;
++    s->payload_length = 0;
++    s->tx_base = s->rx_base = 0;
++    s->irq = s->irq_mask = s->dio1_mask = 0;
++    s->rx_length = s->rx_start = 0;
++    s->out_length = 0;
++    s->single_rx = false;
++    memset(s->reg, 0, sizeof(s->reg));
++    /* The version string LoRa libraries look for, and the private sync
++     * word, 0x1424, as at reset. */
++    memcpy(s->reg + 0x320, "SX1261 V2D 2D02", 16);
++    s->reg[0x740] = 0x14;
++    s->reg[0x741] = 0x24;
++    sx126x_update(s);
++    qemu_set_irq(s->busy, 0);
++}
++
++static void sx126x_reset_line(void *opaque, int line, int level)
++{
++    Sx126xState *s = opaque;
++
++    if (!level) {   /* NRESET low: held in reset */
++        sx126x_reset_state(s);
++    }
++}
++
++static void sx126x_realize(SSIPeripheral *dev, Error **errp)
++{
++    Sx126xState *s = SX126X(dev);
++
++    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sx126x_timer, s);
++    s->id = (uint16_t)g_random_int();
++    qdev_init_gpio_out_named(DEVICE(dev), &s->dio1, "dio1", 1);
++    qdev_init_gpio_out_named(DEVICE(dev), &s->busy, "busy", 1);
++    qdev_init_gpio_in_named(DEVICE(dev), sx126x_reset_line, "reset", 1);
++    qemu_chr_fe_set_handlers(&s->air, sx126x_can_receive, sx126x_receive, NULL, NULL, s,
++                             NULL, true);
++    sx126x_reset_state(s);
++}
++
++static void sx126x_reset(DeviceState *dev)
++{
++    sx126x_reset_state(SX126X(dev));
++}
++
++static Property sx126x_properties[] = {
++    DEFINE_PROP_CHR("chardev", Sx126xState, air),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void sx126x_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(klass);
++
++    k->realize = sx126x_realize;
++    k->transfer = sx126x_transfer;
++    k->set_cs = sx126x_set_cs;
++    k->cs_polarity = SSI_CS_LOW;
++    device_class_set_legacy_reset(dc, sx126x_reset);
++    device_class_set_props(dc, sx126x_properties);
++    dc->desc = "Semtech SX1262 LoRa transceiver";
++}
++
++static const TypeInfo sx126x_info = {
++    .name = TYPE_SX126X,
++    .parent = TYPE_SSI_PERIPHERAL,
++    .instance_size = sizeof(Sx126xState),
++    .class_init = sx126x_class_init,
++};
++
++static void sx126x_register_types(void)
++{
++    type_register_static(&sx126x_info);
++}
++
++type_init(sx126x_register_types)
 diff --git a/hw/misc/sx127x.c b/hw/misc/sx127x.c
 new file mode 100644
 index 0000000..6c31fb6
@@ -1023,7 +1529,7 @@ index c3cf32e..eb6b45c 100644
  
  static const TypeInfo esp32_info = {
 diff --git a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
-index 5a60acf..c205b9b 100644
+index 5a60acf..fea000e 100644
 --- a/hw/xtensa/esp32s3.c
 +++ b/hw/xtensa/esp32s3.c
 @@ -61,6 +61,9 @@
@@ -1044,16 +1550,17 @@ index 5a60acf..c205b9b 100644
      Esp32s3RngState rng;
      Esp32S3TWAIState twai;
  
-@@ -422,6 +426,8 @@ struct Esp32s3MachineState {
+@@ -422,6 +426,9 @@ struct Esp32s3MachineState {
  
      Esp32s3SocState esp32s3;
      DeviceState *flash_dev;
 +    char *lora;        /* the chardev a LoRa radio on SPI2 talks to the air by */
 +    char *lora_pins;   /* its NSS, NRESET and DIO, as GPIO numbers */
++    char *lora_chip;   /* sx1276, or sx1262 as on a Heltec V3 */
  };
  #define TYPE_ESP32S3_MACHINE MACHINE_TYPE_NAME("esp32s3")
  
-@@ -716,6 +722,63 @@ static void esp32s3_soc_add_unimp_device(MemoryRegion *dest, const char* name, h
+@@ -716,6 +723,85 @@ static void esp32s3_soc_add_unimp_device(MemoryRegion *dest, const char* name, h
      g_free(name_apb);
  }
  
@@ -1065,7 +1572,10 @@ index 5a60acf..c205b9b 100644
 + */
 +static void esp32s3_machine_init_lora(Esp32s3MachineState *ms, Esp32s3SocState *ss)
 +{
-+    unsigned nss = 7, nreset = 8, dio = 9;
++    bool sx1262 = ms->lora_chip && strcmp(ms->lora_chip, "sx1262") == 0;
++    /* An SX1262's as a Heltec WiFi LoRa 32 V3 wires it, BUSY the fourth. */
++    unsigned nss = sx1262 ? 8 : 7, nreset = sx1262 ? 12 : 8, dio = sx1262 ? 14 : 9;
++    unsigned busy = 13;
 +    Chardev *air = qemu_chr_find(ms->lora);
 +    DeviceState *radio;
 +    BusState *bus = qdev_get_child_bus(DEVICE(&ss->gpspi2), "spi");
@@ -1074,22 +1584,41 @@ index 5a60acf..c205b9b 100644
 +        error_report("lora: no chardev %s", ms->lora);
 +        exit(1);
 +    }
-+    if (ms->lora_pins &&
-+        (sscanf(ms->lora_pins, "%u:%u:%u", &nss, &nreset, &dio) != 3 ||
-+         nss > 31 || nreset > 31 || dio > 31)) {
-+        error_report("lora-pins: NSS:NRESET:DIO, each a GPIO below 32");
++    if (ms->lora_chip && !sx1262 && strcmp(ms->lora_chip, "sx1276") != 0) {
++        error_report("lora-chip: sx1276 or sx1262");
 +        exit(1);
 +    }
-+    radio = qdev_new("sx127x");
++    if (ms->lora_pins &&
++        (sscanf(ms->lora_pins, "%u:%u:%u:%u", &nss, &nreset, &dio, &busy) < 3 ||
++         nss > 31 || nreset > 31 || dio > 31 || busy > 31)) {
++        error_report("lora-pins: NSS:NRESET:DIO[:BUSY], each a GPIO below 32");
++        exit(1);
++    }
++    radio = qdev_new(sx1262 ? "sx126x" : "sx127x");
 +    qdev_prop_set_chr(radio, "chardev", air);
 +    qdev_realize_and_unref(radio, bus, &error_fatal);
 +    qdev_connect_gpio_out_named(DEVICE(&ss->gpio), "out", nss,
 +                                qdev_get_gpio_in_named(radio, SSI_GPIO_CS, 0));
 +    qdev_connect_gpio_out_named(DEVICE(&ss->gpio), "out", nreset,
 +                                qdev_get_gpio_in_named(radio, "reset", 0));
-+    qdev_connect_gpio_out_named(radio, "dio0", 0,
++    qdev_connect_gpio_out_named(radio, sx1262 ? "dio1" : "dio0", 0,
 +                                qdev_get_gpio_in_named(DEVICE(&ss->gpio), "in", dio));
++    if (sx1262) {
++        qdev_connect_gpio_out_named(radio, "busy", 0,
++                                    qdev_get_gpio_in_named(DEVICE(&ss->gpio), "in", busy));
++    }
 +    qemu_set_irq(qdev_get_gpio_in_named(radio, SSI_GPIO_CS, 0), 1);
++}
++
++static char *esp32s3_get_lora_chip(Object *obj, Error **errp)
++{
++    return g_strdup(ESP32S3_MACHINE(obj)->lora_chip);
++}
++
++static void esp32s3_set_lora_chip(Object *obj, const char *value, Error **errp)
++{
++    g_free(ESP32S3_MACHINE(obj)->lora_chip);
++    ESP32S3_MACHINE(obj)->lora_chip = g_strdup(value);
 +}
 +
 +static char *esp32s3_get_lora(Object *obj, Error **errp)
@@ -1117,7 +1646,7 @@ index 5a60acf..c205b9b 100644
  static void esp32s3_machine_init(MachineState *machine)
  {
      DriveInfo *dinfo = drive_get(IF_MTD, 0, 0);
-@@ -756,6 +819,7 @@ static void esp32s3_machine_init(MachineState *machine)
+@@ -756,6 +842,7 @@ static void esp32s3_machine_init(MachineState *machine)
      object_initialize_child(OBJECT(ss), "efuse", &ss->efuse, TYPE_ESP32S3_EFUSE);
      object_initialize_child(OBJECT(ss), "jtag", &ss->jtag, TYPE_ESP32C3_JTAG);
      object_initialize_child(OBJECT(ss), "gpio", &ss->gpio, TYPE_ESP32S3_GPIO);
@@ -1125,7 +1654,7 @@ index 5a60acf..c205b9b 100644
      object_initialize_child(OBJECT(ss), "rng", &ss->rng, TYPE_ESP32S3_RNG);
  
      object_initialize_child(OBJECT(ss), "clock", &ss->clock, TYPE_ESP32S3_CLOCK);
-@@ -884,11 +948,37 @@ static void esp32s3_machine_init(MachineState *machine)
+@@ -884,11 +971,37 @@ static void esp32s3_machine_init(MachineState *machine)
      }
  
  
@@ -1164,7 +1693,7 @@ index 5a60acf..c205b9b 100644
      }
  
      {
-@@ -1003,6 +1093,10 @@ static void esp32s3_machine_init(MachineState *machine)
+@@ -1003,6 +1116,10 @@ static void esp32s3_machine_init(MachineState *machine)
      esp32s3_soc_add_unimp_device(sys_mem, "esp32s3.iomux", DR_REG_IO_MUX_BASE, 0x2000);
  
      
@@ -1175,7 +1704,7 @@ index 5a60acf..c205b9b 100644
      esp32s3_machine_init_sd(ss);
  
      /* Need MMU initialized prior to ELF loading,
-@@ -1114,6 +1208,12 @@ static void esp32s3_machine_class_init(ObjectClass *oc, void *data)
+@@ -1114,6 +1231,15 @@ static void esp32s3_machine_class_init(ObjectClass *oc, void *data)
      mc->default_cpus = 2;
      mc->default_ram_size = 0;
      mc->fixup_ram_size = esp32s3_fixup_ram_size;
@@ -1184,7 +1713,10 @@ index 5a60acf..c205b9b 100644
 +        "a chardev for a LoRa radio on SPI2, its air");
 +    object_class_property_add_str(oc, "lora-pins", esp32s3_get_lora_pins, esp32s3_set_lora_pins);
 +    object_class_property_set_description(oc, "lora-pins",
-+        "the radio's NSS:NRESET:DIO GPIOs, 7:8:9 as on a LilyGO T3-S3");
++        "the radio's NSS:NRESET:DIO[:BUSY] GPIOs, 7:8:9 as on a LilyGO T3-S3");
++    object_class_property_add_str(oc, "lora-chip", esp32s3_get_lora_chip, esp32s3_set_lora_chip);
++    object_class_property_set_description(oc, "lora-chip",
++        "sx1276, or sx1262 as on a Heltec WiFi LoRa 32 V3 at 8:12:14:13");
  }
  
  static const TypeInfo esp32s3_info = {

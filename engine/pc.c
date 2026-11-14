@@ -254,7 +254,8 @@ static int is_esp(const board *b)
 static int has_sx1276(const board *b)
 {
 	static const char *const names[] = { "heltec-wifi-lora-32", "heltec-wifi-lora-32-v2",
-	                                     "ttgo-lora32", "lilygo-t3-s3" };
+	                                     "ttgo-lora32", "lilygo-t3-s3",
+	                                     "heltec-wifi-lora-32-v3" };
 
 	for (unsigned i = 0u; b != NULL && i < sizeof names / sizeof names[0]; i++)
 		if (strcmp(b->name, names[i]) == 0)
@@ -1105,8 +1106,8 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 	/* A LoRa radio, on the boards that carry an SX1276 as a Heltec's is
 	 * wired, and a name for its air. */
 	if (m->lora != NULL && !has_sx1276(board_named(m->machine_type)))
-		return "a LoRa radio is on heltec-wifi-lora-32, heltec-wifi-lora-32-v2, ttgo-lora32 "
-		       "and lilygo-t3-s3 alone, an SX1276 as hull models it";
+		return "a LoRa radio is on heltec-wifi-lora-32, heltec-wifi-lora-32-v2, ttgo-lora32, "
+		       "lilygo-t3-s3 (an SX1276 each) and heltec-wifi-lora-32-v3 (an SX1262) alone";
 	if (m->lora != NULL && (strlen(m->lora) > 64u || strchr(m->lora, '/') != NULL))
 		return "a LoRa air's name is at most 64 characters and has no /";
 	/* 86Box's machine: a PC of a period, in its window, its media images
@@ -1282,8 +1283,9 @@ static void exec_board(const hull_machine *m, const board *b)
 		{
 			static __thread char with_radio[64];
 
-			snprintf(with_radio, sizeof with_radio, "%s,lora=air",
-			         b->chip != NULL ? b->chip : b->name);
+			snprintf(with_radio, sizeof with_radio, "%s,lora=air%s",
+			         b->chip != NULL ? b->chip : b->name,
+			         strcmp(b->name, "heltec-wifi-lora-32-v3") == 0 ? ",lora-chip=sx1262" : "");
 			argv[n - 1] = with_radio;
 		}
 		argv[n++] = "-chardev";
