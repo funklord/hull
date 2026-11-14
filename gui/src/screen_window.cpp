@@ -195,7 +195,9 @@ static void called(GDBusConnection *, const gchar *, const gchar *, const gchar 
 		         mmap(nullptr, length + offset, PROT_READ, MAP_SHARED, fd, 0);
 		if (fd >= 0)
 			close(fd);
-		if (mapped == MAP_FAILED ||
+		/* A row narrower than its pixels would have the image read past
+		 * the mapping's end on the last one. */
+		if (mapped == MAP_FAILED || (guint64)stride < (guint64)width * 4u ||
 		    (format != PIXMAN_X8R8G8B8 && format != PIXMAN_A8R8G8B8)) {
 			if (mapped != MAP_FAILED)
 				munmap(mapped, length + offset);
@@ -215,7 +217,7 @@ static void called(GDBusConnection *, const gchar *, const gchar *, const gchar 
 		g_variant_get(parameters, "(uuuu@ay)", &width, &height, &stride, &format, &data);
 		bytes = g_variant_get_fixed_array(data, &size, 1u);
 		if ((format == PIXMAN_X8R8G8B8 || format == PIXMAN_A8R8G8B8) &&
-		    size >= (gsize)stride * height)
+		    (guint64)stride >= (guint64)width * 4u && size >= (gsize)stride * height)
 			window->scanout(QImage(static_cast<const uchar *>(bytes), (int)width, (int)height,
 			                       (qsizetype)stride, QImage::Format_RGB32).copy(),
 			                nullptr, 0u);
