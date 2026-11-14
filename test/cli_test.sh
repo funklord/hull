@@ -1041,6 +1041,14 @@ until grep -q '^serving$' "$root/cserve.out" 2>/dev/null || [ "$tries" -ge 40 ];
 done
 heard=$(printf 'hi from ssh\n' | (cd / && timeout 20 "$hull_abs" proxy-ssh cserve 2>&1))
 got=$?
+# What the machine says of it comes through its output, which reaches
+# the file after proxy-ssh has its answer: a load of 25 from other work
+# once read the file between the two.
+tries=0
+until grep -q '^served=' "$root/cserve.out" 2>/dev/null || [ "$tries" -ge 40 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
 cases=$((cases + 1))
 [ "$got" = 0 ] && [ "$heard" = "hello from the machine" ] &&
 	grep -q '^served=hi from ssh$' "$root/cserve.out" ||
@@ -2437,8 +2445,11 @@ conf pausing '(hostname "pausing") (command "/probe" "ticks" "300")'
 (cd / && exec timeout 60 "$whole_hull" run -f "$root/pausing.conf" > "$root/pausing.out" 2>&1) &
 pauser=$!
 ticks() { grep -c '^tick=' "$root/pausing.out"; }
+# Up to 50 s for its first ticks: a start at a load of 25 from other work
+# once took more than the 20 s this allowed, and the pause then found no
+# machine.
 tries=0
-until [ "$(ticks)" -ge 3 ] || [ "$tries" -ge 80 ]; do
+until [ "$(ticks)" -ge 3 ] || [ "$tries" -ge 200 ]; do
 	tries=$((tries + 1))
 	sleep 0.25
 done
