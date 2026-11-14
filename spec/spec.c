@@ -590,6 +590,16 @@ static const key pc_keys[] = {
 };
 static const schema pc = TABLE(pc_keys);
 
+/* 86Box's names for its parts, as its own settings name them: hundreds of
+ * machines and cards, checked by 86Box against its ROM set, not here. */
+static const key box86_keys[] = {
+	{ .name = "machine", .type = STRING, .value = nonempty },
+	{ .name = "cpu",     .type = STRING, .value = nonempty },
+	{ .name = "video",   .type = STRING, .value = nonempty },
+	{ .name = "sound",   .type = STRING, .value = nonempty },
+};
+static const schema box86 = TABLE(box86_keys);
+
 static const key virtualbox_keys[] = {
 	{ .name = "gui", .type = BOOLEAN },
 };
@@ -597,6 +607,7 @@ static const schema virtualbox = TABLE(virtualbox_keys);
 
 static const key tuning_keys[] = {
 	{ .name = "vm",         .type = RECORD, .record = &vm },
+	{ .name = "86box",      .type = RECORD, .record = &box86 },
 	{ .name = "emu",        .type = RECORD, .record = &emu },
 	{ .name = "ns",         .type = RECORD, .record = &ns },
 	{ .name = "qemu",       .type = RECORD, .record = &qemu },

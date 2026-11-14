@@ -44,6 +44,7 @@
 #define _GNU_SOURCE
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -71,6 +72,7 @@
 #include "display.h"
 #include "hostdev.h"
 #include "hw.h"
+#include "86box.h"
 
 #define PC_MAX_MEDIA 6u    /* four on IDE, two floppy drives */
 #define PC_MAX_ARGS  120u
@@ -139,6 +141,11 @@ struct hull_machine {
 	int             vnc;            /* (display vnc): the screen at the machine's address */
 	int             local;          /* (display local): by qemu's D-Bus display alone */
 	int             local_display;  /* and qemu's D-Bus display, by display.qmp */
+	int             box;            /* the 86box engine's: 86Box runs it, not qemu */
+	char           *box_machine;    /* (tuning (86box (machine ...) ...)), 86Box's names */
+	char           *box_cpu;
+	char           *box_video;
+	char           *box_sound;
 	char            display_link[4400]; /* hull/display/ADDRESS, linked to it, or "" */
 	char            cache[4096];    /* where qemu's snapshots and made images are */
 	hull_device     device[HULL_MAX_DEVICES]; /* (devices (pci ...)), found at start */
@@ -303,6 +310,10 @@ static void release(hull_machine *m)
 	if (m->lora_fd >= 0)
 		close(m->lora_fd);
 	hull_hostdev_unclaim(m);
+	free(m->box_machine);
+	free(m->box_cpu);
+	free(m->box_video);
+	free(m->box_sound);
 	free(m->name);
 	free(m->display);
 	free(m->xauthority);
@@ -512,7 +523,7 @@ static int prepare_state(hull_machine *m)
 		return -1;
 	}
 	/* A screen by VNC has its D-Bus display's monitor here too. */
-	if (!m->secure && !m->tpm && !s51 && !is_esp(b) && !m->vnc && !m->local)
+	if (!m->secure && !m->tpm && !s51 && !is_esp(b) && !m->vnc && !m->local && !m->box)
 		return 0;
 	if (m->cache[0] == '\0' && make_cache(m) != NULL) {
 		snprintf(m->why, sizeof m->why, "the cache directory for the machine's state cannot be made\n");
@@ -636,6 +647,24 @@ static void release_state(hull_machine *m)
 	unlink(run_file(m, "firmware.ihx"));
 	unlink(run_file(m, "flash.bin"));
 	unlink(run_file(m, "display.qmp"));
+	/* 86Box's, where it ran from the run's directory: its settings, its
+	 * log and its CMOS, nvr/ITS-MACHINE.nvr. */
+	unlink(run_file(m, "86box.cfg"));
+	unlink(run_file(m, "86box.log"));
+	{
+		DIR *nvr = opendir(run_file(m, "nvr"));
+
+		if (nvr != NULL) {
+			struct dirent *entry;
+			int            at = dirfd(nvr);
+
+			while ((entry = readdir(nvr)) != NULL)
+				if (entry->d_name[0] != '.')
+					unlinkat(at, entry->d_name, 0);
+			closedir(nvr);
+			rmdir(run_file(m, "nvr"));
+		}
+	}
 	for (unsigned i = 0u; i < sizeof tpm_files / sizeof tpm_files[0]; i++) {
 		snprintf(path, sizeof path, "%s/tpm/%s", m->run_state, tpm_files[i]);
 		unlink(path);
@@ -1030,6 +1059,14 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 	m->name   = hull_access_value(doc, machine, "hostname");
 	if (hull_access_find(doc, machine, "tuning", &entry)) {
 		hull_sexpr_form pc;
+		hull_sexpr_form box;
+
+		if (m->box && hull_access_find(doc, &entry, "86box", &box)) {
+			m->box_machine = hull_access_value(doc, &box, "machine");
+			m->box_cpu     = hull_access_value(doc, &box, "cpu");
+			m->box_video   = hull_access_value(doc, &box, "video");
+			m->box_sound   = hull_access_value(doc, &box, "sound");
+		}
 
 		if (hull_access_find(doc, &entry, "pc", &pc)) {
 			m->machine_type = hull_access_value(doc, &pc, "machine");
@@ -1071,6 +1108,22 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 		       "ttgo-lora32 alone, an SX1276 as hull models it";
 	if (m->lora != NULL && (strlen(m->lora) > 64u || strchr(m->lora, '/') != NULL))
 		return "a LoRa air's name is at most 64 characters and has no /";
+	/* 86Box's machine: a PC of a period, in its window, its media images
+	 * by path, its COM1 the run's console. */
+	if (m->box) {
+		if (m->display == NULL)
+			return "86Box runs a machine in its window: (display window)";
+		if (m->box_machine == NULL)
+			return "86Box needs its machine named: (tuning (86box (machine \"NAME\"))), "
+			       "a name of 86Box's, as roms/machines has it";
+		if ((wrong = read_media(m, doc, machine)) != NULL)
+			return wrong;
+		for (unsigned i = 0u; i < m->media_count; i++)
+			if (m->media[i].path == NULL)
+				return "86Box takes a medium as an image: file; a collection is not "
+				       "reassembled for it yet";
+		return NULL;
+	}
 	/* A board: its firmware, the image: source, and none of a PC's parts. */
 	if (board_named(m->machine_type) != NULL) {
 		if (m->media_count != 1u || m->media[0].path == NULL)
@@ -1525,8 +1578,122 @@ static void exec_pc(const hull_machine *m)
 }
 
 /* In the child: the machine's emulator, a board's or a PC's. */
+/* A floppy image's drive, 86Box's word for it, by the image's size. */
+static const char *box_floppy_type(const char *path)
+{
+	struct stat st;
+
+	if (stat(path, &st) != 0)
+		return "35_2hd";
+	switch (st.st_size) {
+	case 163840: case 184320: case 327680: case 368640: return "525_2dd";
+	case 1228800:                                       return "525_2hd";
+	case 737280:                                        return "35_2dd";
+	case 2949120:                                       return "35_2ed";
+	default:                                            return "35_2hd";
+	}
+}
+
+/* In the child: 86Box's settings for the machine, 86box.cfg in its
+ * directory -- (state DIR) where given, so its CMOS settings, nvr/, are
+ * kept as a PC's are, else the run's -- then 86Box, its COM1 on its own
+ * stdio as qemu's is, in its window on the run's display. Returns to
+ * fail. */
+static void exec_86box(const hull_machine *m)
+{
+	const char *vm = m->state != NULL ? m->state : m->run_state;
+	char        path[4400];
+	char        app[4300];
+	char        roms[4400];
+	unsigned    floppy = 0u;
+	unsigned    disk = 0u;
+	unsigned    cdrom = 0u;
+	FILE       *cfg;
+
+	if (hull_86box_dir(app, sizeof app) != 0)
+		return;
+	snprintf(roms, sizeof roms, "%s/roms", app);
+	strncat(app, "/squashfs-root/AppRun", sizeof app - strlen(app) - 1u);
+	snprintf(path, sizeof path, "%s/86box.cfg", vm);
+	if ((cfg = fopen(path, "w")) == NULL)
+		return;
+	fprintf(cfg, "[General]\nconfirm_exit = 0\nconfirm_reset = 0\nconfirm_save = 0\n\n");
+	fprintf(cfg, "[Machine]\nmachine = %s\n", m->box_machine);
+	if (m->box_cpu != NULL)
+		fprintf(cfg, "cpu_family = %s\n", m->box_cpu);
+	/* In KiB, a period's PC having 512K or 640K: hull_size_mib's MiB would
+	 * round them to nothing. */
+	if (m->memory != NULL) {
+		char         *end;
+		unsigned long kib = strtoul(m->memory, &end, 10);
+
+		kib *= *end == 'G' ? 1024ul * 1024ul : *end == 'M' ? 1024ul : *end == 'K' ? 1ul :
+		       1ul / 1024ul;
+		if (kib > 0ul)
+			fprintf(cfg, "mem_size = %lu\n", kib);
+	}
+	if (m->box_video != NULL)
+		fprintf(cfg, "\n[Video]\ngfxcard = %s\n", m->box_video);
+	if (m->box_sound != NULL)
+		fprintf(cfg, "\n[Sound]\nsndcard = %s\n", m->box_sound);
+	fprintf(cfg, "\n[Ports (COM & LPT)]\nserial1_enabled = 1\nserial1_device = stdio\n"
+	        "\n[Virtual Console (COM) #1]\nmode = 0\n");
+	fprintf(cfg, "\n[Floppy and CD-ROM drives]\n");
+	for (unsigned i = 0u; i < m->media_count; i++) {
+		const medium *d = &m->media[i];
+
+		if (d->type == 'f' && floppy < 2u) {
+			floppy++;
+			fprintf(cfg, "fdd_%02u_type = %s\nfdd_%02u_fn = %s\n", floppy,
+			        box_floppy_type(d->path), floppy, d->path);
+		} else if (d->type == 'c' && cdrom < 1u) {
+			cdrom++;
+			fprintf(cfg, "cdrom_01_parameters = 1, atapi\ncdrom_01_ide_channel = 1:0\n"
+			        "cdrom_01_image_path = %s\n", d->path);
+		}
+	}
+	for (unsigned i = 0u; i < m->media_count; i++) {
+		const medium *d = &m->media[i];
+		struct stat   st;
+
+		/* A disk's geometry from its size, 63 sectors and 16 heads, as
+		 * an IDE disk of the period is addressed. */
+		if (d->type == 'd' && disk < 2u && stat(d->path, &st) == 0) {
+			if (disk == 0u)
+				fprintf(cfg, "\n[Hard disks]\n");
+			disk++;
+			fprintf(cfg, "hdd_%02u_parameters = 63, 16, %llu, 0, ide\nhdd_%02u_fn = %s\n"
+			        "hdd_%02u_ide_channel = 0:%u\n", disk,
+			        (unsigned long long)st.st_size / (63ull * 16ull * 512ull), disk, d->path,
+			        disk, disk - 1u);
+		}
+	}
+	if (fclose(cfg) != 0)
+		return;
+	/* COM1 on stdio reads stdin at its start, and a pipe with nothing in
+	 * it holds the machine there, never started (measured: 0 Hz until
+	 * stdin was /dev/null). So its COM1 is output alone: what the guest
+	 * writes reaches the run; what is typed goes to its window. */
+	{
+		int null = open("/dev/null", O_RDONLY | O_CLOEXEC);
+
+		if (null < 0 || dup2(null, 0) < 0)
+			return;
+	}
+	setenv("DISPLAY", m->display, 1);
+	if (m->xauthority != NULL)
+		setenv("XAUTHORITY", m->xauthority, 1);
+	setenv("QT_QPA_PLATFORM", "xcb", 1);
+	snprintf(path, sizeof path, "%s/86box.log", m->run_state);
+	execl(app, app, "-P", vm, "-R", roms, "-N", "-L", path, (char *)NULL);
+}
+
 static void exec_qemu(const hull_machine *m)
 {
+	if (m->box) {
+		exec_86box(m);
+		return;
+	}
 	if (board_named(m->machine_type) != NULL)
 		exec_board(m, board_named(m->machine_type));
 	else
@@ -1790,7 +1957,21 @@ static void *run_machine(void *arg)
 	return NULL;
 }
 
+static hull_status create(hull_core *core, hull_buf plan, int box, hull_machine **out,
+                          hull_error *error);
+
 static hull_status pc_create(hull_core *core, hull_buf plan, hull_machine **out, hull_error *error)
+{
+	return create(core, plan, 0, out, error);
+}
+
+static hull_status box_create(hull_core *core, hull_buf plan, hull_machine **out, hull_error *error)
+{
+	return create(core, plan, 1, out, error);
+}
+
+static hull_status create(hull_core *core, hull_buf plan, int box, hull_machine **out,
+                          hull_error *error)
 {
 	static char     said[512];
 	hull_sexpr_doc  doc;
@@ -1804,6 +1985,7 @@ static hull_status pc_create(hull_core *core, hull_buf plan, hull_machine **out,
 	if ((m = calloc(1u, sizeof *m)) == NULL)
 		return fail(error, HULL_ERR_INTERNAL, "out of memory");
 	m->core = core;
+	m->box  = box;
 	m->pid  = -1;
 	m->out  = -1;
 	m->err  = -1;
@@ -2224,6 +2406,15 @@ static hull_status pc_exec(hull_core *core, hull_machine *m, hull_buf spec, hull
 		hull_sexpr_child(&doc, &argv, &word);
 		while (count < 3u && hull_sexpr_next(&doc, &word, &word))
 			words[count++] = hull_access_text(&doc, &word);
+	}
+	/* 86Box has no monitor of qemu's to ask. */
+	if (m->box && words[0] != NULL && (strcmp(words[0], "change") == 0 ||
+	                                   strcmp(words[0], "key") == 0 ||
+	                                   strcmp(words[0], "screen") == 0)) {
+		for (unsigned i = 0u; i < count; i++)
+			free(words[i]);
+		return fail(error, HULL_ERR_UNSUPPORTED, "an 86Box machine's media, keys and screen "
+		            "are its window's");
 	}
 	/* `hull media change`, which asks and is done. */
 	if (words[0] != NULL && strcmp(words[0], "change") == 0 && words[1] != NULL) {
@@ -2713,6 +2904,79 @@ static const hull_engine engine = {
 	.caps        = &caps,
 	.ops         = &ops,
 };
+
+/* The 86box engine: the same machine, run by 86Box (section 5.0). What
+ * it declares is what it gives; the rest of a pc's is rejected at plan. */
+static const hull_cap_entry box_entries[] = {
+	{ "source.media.direct",  HULL_SUP_NATIVE,
+	  "86Box's BIOS boots the drive its CMOS names; the media's writes land in their image: "
+	  "files", NULL },
+	{ "source.image.direct",  HULL_SUP_NATIVE,
+	  "the image is the first IDE disk, its writes landing in it", NULL },
+	{ "projection.bind",    HULL_SUP_NATIVE,   "nothing projected: the media are the machine's",
+	  NULL },
+	{ "writeback.none",     HULL_SUP_NATIVE,   NULL, NULL },
+	{ "media",              HULL_SUP_NATIVE,   NULL, NULL },
+	{ "media.image",        HULL_SUP_NATIVE,   "a floppy, disk or CD image by its path", NULL },
+	{ "network.none",       HULL_SUP_NATIVE,   NULL, NULL },
+	{ "display.window",     HULL_SUP_NATIVE,
+	  "86Box's own window on the X display the run was given", NULL },
+	{ "memory",             HULL_SUP_NATIVE,   "the board's RAM, which 86Box rounds to it", NULL },
+	{ "86box.machine.path", HULL_SUP_NATIVE,
+	  "an 86Box machine by its name, its ROM from the fetched set", NULL },
+	{ "86box.cpu.path",     HULL_SUP_NATIVE,   "a CPU family of 86Box's, the board's first if none",
+	  NULL },
+	{ "86box.video.path",   HULL_SUP_NATIVE,   "a video card of 86Box's", NULL },
+	{ "86box.sound.path",   HULL_SUP_NATIVE,   "a sound card of 86Box's", NULL },
+	{ "pc.state.path",      HULL_SUP_NATIVE,
+	  "86Box's directory for the machine: its settings and its CMOS, kept", NULL },
+	{ "security.no_new_privs", HULL_SUP_NATIVE, NULL, NULL },
+	{ "on_disconnect.stop", HULL_SUP_NATIVE,   NULL, NULL },
+	{ "hostname",           HULL_SUP_NATIVE,   "the machine's name, its OS's own", NULL },
+	{ NULL, 0, NULL, NULL },
+};
+
+static const hull_capabilities box_caps = {
+	.struct_size    = sizeof (hull_capabilities),
+	.engine_name    = "86box",
+	.engine_version = HULL_86BOX_VERSION,
+	.classes        = classes,
+	.entries        = box_entries,
+	.media_types    = media,
+	.migration      = HULL_MIG_PINNED,
+	.arches         = NULL,
+	.requires_root  = 0,
+};
+
+static const hull_engine_ops box_ops = {
+	.struct_size = sizeof (hull_engine_ops),
+	.create      = box_create,
+	.start       = pc_start,
+	.stop        = pc_stop,
+	.destroy     = pc_destroy,
+	.signal      = pc_signal,
+	.exec         = pc_exec,
+	.stream_write = pc_stream_write,
+	.stream_eof   = pc_stream_eof,
+	.stream_close = pc_stream_close,
+	.stats       = pc_stats,
+	.pause       = pc_pause,
+};
+
+static const hull_engine box_engine = {
+	.struct_size = sizeof (hull_engine),
+	.abi_major   = HULL_ABI_MAJOR,
+	.abi_minor   = HULL_ABI_MINOR,
+	.caps        = &box_caps,
+	.ops         = &box_ops,
+};
+
+const hull_engine *hull_engine_86box(const hull_host_ops *host_ops)
+{
+	if (host_ops != NULL)
+		host = host_ops;
+	return &box_engine;
+}
 
 const hull_engine *hull_engine_qemu_pc(const hull_host_ops *host_ops)
 {

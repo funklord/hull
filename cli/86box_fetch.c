@@ -2,8 +2,11 @@
  * 86box_fetch.c -- `hull 86box fetch` (project.md section 5.0): 86Box's
  * AppImage for Linux x86_64 and the ROM set of its tag, pinned in
  * engine/86box.h, downloaded over https, each checked against its sha256,
- * into $XDG_CACHE_HOME/hull/86box-VERSION as 86Box.AppImage and roms/.
- * The AppImage is kept whole and nothing of it is run here. Built beside
+ * into $XDG_CACHE_HOME/hull/86box-VERSION as squashfs-root/ and roms/:
+ * the AppImage unpacked by its own --appimage-extract, which is running
+ * it -- the holder's word 2026-11-14 that hull may run what it fetches --
+ * there being no unsquashfs here; a machine runs squashfs-root/AppRun.
+ * Built beside
  * where it goes and renamed in, so a fetch cut short leaves nothing that
  * looks whole.
  */
@@ -19,6 +22,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "86box.h"
@@ -66,7 +70,7 @@ int hull_86box_fetch(char *why, size_t cap)
 		snprintf(why, cap, "neither XDG_CACHE_HOME nor HOME names a place for 86Box");
 		return -1;
 	}
-	snprintf(made, sizeof made, "%s/86Box.AppImage", dir);
+	snprintf(made, sizeof made, "%s/squashfs-root/AppRun", dir);
 	snprintf(roms, sizeof roms, "%s/roms/machines", dir);
 	if (access(made, X_OK) == 0 && access(roms, R_OK) == 0) {
 		printf("%s\n", dir);
@@ -100,6 +104,31 @@ int hull_86box_fetch(char *why, size_t cap)
 	if (chmod(image, 0755) != 0) {
 		snprintf(why, cap, "%s: %s", image, strerror(errno));
 		goto done;
+	}
+	/* Unpacked where it lies, by itself, then removed: AppRun is what runs. */
+	{
+		pid_t child = fork();
+		int   wstatus = 0;
+
+		if (child == 0) {
+			int null = open("/dev/null", O_RDWR | O_CLOEXEC);
+
+			if (chdir(tree) != 0 || null < 0 || dup2(null, 0) < 0 || dup2(null, 1) < 0)
+				_exit(126);
+			execl(image, image, "--appimage-extract", (char *)NULL);
+			_exit(127);
+		}
+		if (child < 0 || waitpid(child, &wstatus, 0) != child || !WIFEXITED(wstatus) ||
+		    WEXITSTATUS(wstatus) != 0) {
+			snprintf(why, cap, "86Box's AppImage did not unpack itself");
+			goto done;
+		}
+		unlink(image);
+		snprintf(made, sizeof made, "%s/squashfs-root/AppRun", tree);
+		if (access(made, X_OK) != 0) {
+			snprintf(why, cap, "86Box's AppImage holds no AppRun");
+			goto done;
+		}
 	}
 	fprintf(stderr, "hull: fetching its ROM set, about 73 MB: %s\n", HULL_86BOX_ROMS_URL);
 	if (hull_fetch_file(HULL_86BOX_ROMS_URL, HULL_86BOX_ROMS_SHA256, roms, why, cap) != 0)

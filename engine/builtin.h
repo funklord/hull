@@ -28,6 +28,7 @@ const hull_engine *hull_engine_chroot(const hull_host_ops *host);
 const hull_engine *hull_engine_dosbox(const hull_host_ops *host);
 const hull_engine *hull_engine_dosemu(const hull_host_ops *host);
 const hull_engine *hull_engine_qemu_pc(const hull_host_ops *host);
+const hull_engine *hull_engine_86box(const hull_host_ops *host);
 const hull_engine *hull_engine_hw(const hull_host_ops *host);
 
 /* A bootable export's kernel, the host's, its path into `kernel`, and
