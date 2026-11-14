@@ -95,11 +95,23 @@ done
 wait
 cat /tmp/p.out
 echo "status=done"
+echo "== kept"
+mkdir -p /tmp/r5 && chown $uid:$gid /tmp/r5 && chmod 700 /tmp/r5
+printf '(machine (source "dir:/") (backend vm) (mutable overlay) (network none) (memory "256M") (hostname "kept") (on_disconnect keep) (devices (pci "%s")) (command "/bin/sleep" "40"))\n' "\$pci" > /tmp/k.conf
+chmod 644 /tmp/k.conf
+(ulimit -l unlimited; as env XDG_RUNTIME_DIR=/tmp/r5 timeout -k 2 60 $hull run -f /tmp/k.conf > /dev/null 2>&1) &
+for i in \$(seq 1 60); do as env XDG_RUNTIME_DIR=/tmp/r5 $hull ps 2> /dev/null | grep -q '^kept .*running' && break; sleep 0.5; done
+kill -KILL \$(head -1 /tmp/r5/hull/core.lock)
+wait
+as env XDG_RUNTIME_DIR=/tmp/r5 timeout 30 $hull ps
+(ulimit -l unlimited; as env XDG_RUNTIME_DIR=/tmp/r5 timeout -k 2 30 $hull run -f /tmp/v.conf 2>&1)
+as env XDG_RUNTIME_DIR=/tmp/r5 timeout 30 $hull stop kept > /dev/null 2>&1
+echo "status=done"
 EOF
 
 printf '(machine (source "dir:/") (backend vm) (mutable overlay) (memory "2G") (cpus 2) (tuning (qemu (iommu true))) (command "/bin/sh" "%s/run.sh"))\n' \
 	"$root" > "$root/vm.conf"
-out=$(cd / && timeout -k 2 400 "$hull" run -f "$root/vm.conf" 2>&1 < /dev/null)
+out=$(cd / && timeout -k 2 500 "$hull" run -f "$root/vm.conf" 2>&1 < /dev/null)
 got=$?
 
 # The guest has an IOMMU, and its NIC is vfio-pci's in a group of its own.
@@ -131,6 +143,14 @@ cases=$((cases + 1))
 pc=$(printf '%s\n' "$out" | sed -n '/^== pc/,/^status=/p')
 printf '%s\n' "$pc" | grep -qx 'pc=has-card' ||
 	fail "a pc machine was not given the device" "$out"
+# A kept vm holding it, its core killed and the machine taken back by the
+# next: a second machine asking for it is refused by hull, the claim
+# carried over, and not left to qemu's own error.
+cases=$((cases + 1))
+kept=$(printf '%s\n' "$out" | sed -n '/^== kept/,/^status=/p')
+printf '%s\n' "$kept" | grep -q '^kept .*running' &&
+	printf '%s\n' "$kept" | grep -q "another running machine's" ||
+	fail "a taken-back vm's device was not held for it" "$out"
 
 case $tree in
 */test/vfio/tree) rm -rf -- "$tree" ;;

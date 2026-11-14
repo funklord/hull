@@ -242,7 +242,7 @@ struct hull_machine {
 	char             launch_modules[4300];
 	int              launch_share;
 	uint8_t          token[32];    /* what a host after this one resumes with */
-	char             persisted[4800];  /* what persist() last gave */
+	char             persisted[9600];  /* what persist() last gave */
 	hull_wire        wire;
 	int              connected;
 	pthread_t        reader;
@@ -4805,7 +4805,8 @@ static hull_status qemu_persist(hull_core *core, hull_machine *m, hull_buf *out,
 	                 (long)m->passt, m->address_text[0] != '\0' ? "address " : "",
 	                 m->address_text, m->address_text[0] != '\0' ? "\n" : "", m->dir);
 	if (wrote < 0 || (size_t)wrote >= sizeof m->persisted - 2u * sizeof m->token - 1u -
-	                                   (size_t)m->port_count * 24u)
+	                                   (size_t)m->port_count * 24u -
+	                                   (size_t)m->device_count * (sizeof m->device[0].host.node + 12u))
 		return fail(error, HULL_ERR_INTERNAL, "the state does not fit");
 	n = (size_t)wrote;
 	for (size_t i = 0u; i < sizeof m->token; i++)
@@ -4814,6 +4815,13 @@ static hull_status qemu_persist(hull_core *core, hull_machine *m, hull_buf *out,
 	for (unsigned i = 0u; i < m->port_count; i++)
 		n += (size_t)snprintf(m->persisted + n, sizeof m->persisted - n, "port %u %u %d\n",
 		                      m->port_host[i], m->port_guest[i], m->port_udp[i]);
+	/* Its devices' nodes, which the core that takes it back claims again:
+	 * a claim is a core's, and a machine held nothing once a new core had
+	 * it, so a second machine was refused by qemu's own error, if at all. */
+	for (unsigned i = 0u; i < m->device_count; i++)
+		if (m->device[i].host.node[0] != '\0')
+			n += (size_t)snprintf(m->persisted + n, sizeof m->persisted - n, "device %d %s\n",
+			                      (int)m->device[i].kind, m->device[i].host.node);
 	out->data = (const uint8_t *)m->persisted;
 	out->len  = n;
 	return HULL_OK;
@@ -4822,7 +4830,7 @@ static hull_status qemu_persist(hull_core *core, hull_machine *m, hull_buf *out,
 /* The persisted text into `m`. A reason, or NULL. */
 static const char *read_state(hull_machine *m, hull_buf state)
 {
-	char  text[4800];
+	char  text[9600];
 	char *line;
 	char *rest;
 	int   seen = 0;
@@ -4836,6 +4844,7 @@ static const char *read_state(hull_machine *m, hull_buf state)
 		unsigned      a;
 		unsigned      b;
 		int           c;
+		int           d = 0;
 		char          hex[2u * sizeof m->token + 1u];
 
 		if (sscanf(line, "pid %ld", &number) == 1 && number > 0) {
@@ -4862,6 +4871,13 @@ static const char *read_state(hull_machine *m, hull_buf state)
 				m->token[i] = (uint8_t)byte;
 			}
 			seen |= 16;
+		} else if (sscanf(line, "device %d %n", &c, &d) == 1 && d > 0 && line[d] == '/' &&
+		           c >= 0 && c <= (int)HULL_DEVICE_PCI && m->device_count < HULL_MAX_DEVICES &&
+		           strlen(line + d) < sizeof m->device[0].host.node) {
+			m->device[m->device_count].kind = (hull_device_kind)c;
+			snprintf(m->device[m->device_count].host.node, sizeof m->device[0].host.node, "%s",
+			         line + d);
+			m->device_count++;
 		} else if (sscanf(line, "port %u %u %d", &a, &b, &c) == 3 && m->port_count < MAX_PORTS &&
 		           a >= 1u && a <= 65535u && b >= 1u && b <= 65535u) {
 			m->port_host[m->port_count]  = a;
@@ -4948,6 +4964,12 @@ static hull_status qemu_adopt(hull_core *core, hull_buf state, hull_machine **ou
 	 * ends the machine, removes it. */
 	hull_display_adopt(display_monitor(m), m->address_text, m->display_link,
 	                   sizeof m->display_link);
+	/* And its devices, as its start claimed them; one claimed since by a
+	 * machine of this core's leaves the machine to the device's kernel
+	 * driver, which a qemu holding it already answers. */
+	if (m->device_count > 0u &&
+	    hull_hostdev_claim(m, m->device, m->device_count, detail, sizeof detail) != NULL)
+		host->log(core, 4, detail);
 	fd = dial(m, m->cid);
 	if (fd >= 0 && hull_wire_open(&m->wire, fd, HULL_WIRE_FROM_AGENT) != 0) {
 		close(fd);
