@@ -558,7 +558,7 @@ static const char *const pc_machine_values[] = {
 	"lm3s811evb", "microbit", "mps2-an385", "b-l475e-iot01a", "at89c51ed2",
 	"esp32", "esp32-devkitc", "esp32-cam", "heltec-wifi-lora-32", "heltec-wifi-lora-32-v2",
 	"ttgo-lora32", "m5stack-core", "esp32s3", "esp32-s3-devkitc-1",
-	"heltec-wifi-lora-32-v3", "xiao-esp32s3", "lilygo-t-display-s3", "esp32c3",
+	"heltec-wifi-lora-32-v3", "xiao-esp32s3", "lilygo-t-display-s3", "lilygo-t3-s3", "esp32c3",
 	"esp32-c3-devkitm-1", "xiao-esp32c3", "esp32c5", "esp32c6", "esp32-c6-devkitc-1",
 	"xiao-esp32c6", "esp32c61", "esp32h2", "esp32-h2-devkitm-1", "esp32p4",
 	"esp32-p4-function-ev-board", NULL

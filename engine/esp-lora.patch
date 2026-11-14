@@ -640,6 +640,246 @@ index 65ca666..5f24133 100644
              memcpy(c_buf + i, &res, 1);
          }
      }
+diff --git a/hw/ssi/esp32s3_gpspi.c b/hw/ssi/esp32s3_gpspi.c
+new file mode 100644
+index 0000000..1f33e46
+--- /dev/null
++++ b/hw/ssi/esp32s3_gpspi.c
+@@ -0,0 +1,221 @@
++/*
++ * esp32s3_gpspi.c -- the ESP32-S3's GPSPI2 as a master: a user command
++ * (SPI_CMD's USR) runs its phases in order, each a byte at a time on the
++ * bus -- the command's (SPI_USER2, its low byte first), the address's
++ * (SPI_ADDR, its high bits first), the data's, out of W0-W15 and back into
++ * them full duplex, W8 on where a HIGHPART bit says -- with CS0 asserted
++ * unless MISC disables it, and released after unless CS_KEEP_ACTIVE.
++ * Then USR clears and TRANS_DONE is raised. Registers per ESP-IDF's
++ * soc/esp32s3/register/soc/spi_reg.h; no DMA, no slave mode.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/module.h"
++#include "hw/irq.h"
++#include "hw/sysbus.h"
++#include "hw/ssi/ssi.h"
++#include "hw/ssi/esp32s3_gpspi.h"
++
++#define CMD        (0x00 / 4)
++#define ADDR       (0x04 / 4)
++#define USER       (0x10 / 4)
++#define USER1      (0x14 / 4)
++#define USER2      (0x18 / 4)
++#define MS_DLEN    (0x1c / 4)
++#define MISC       (0x20 / 4)
++#define INT_ENA    (0x34 / 4)
++#define INT_CLR    (0x38 / 4)
++#define INT_RAW    (0x3c / 4)
++#define INT_ST     (0x40 / 4)
++#define INT_SET    (0x44 / 4)
++#define W0         (0x98 / 4)
++#define DATE       (0xf0 / 4)
++
++#define CMD_USR          (1u << 24)
++#define CMD_UPDATE       (1u << 23)
++#define USER_COMMAND     (1u << 31)
++#define USER_ADDR        (1u << 30)
++#define USER_MISO        (1u << 28)
++#define USER_MOSI        (1u << 27)
++#define USER_MOSI_HIGH   (1u << 25)
++#define USER_MISO_HIGH   (1u << 24)
++#define MISC_CS_KEEP     (1u << 30)
++#define TRANS_DONE       (1u << 12)
++
++static void gpspi_update_irq(Esp32s3GpspiState *s)
++{
++    s->regs[INT_ST] = s->regs[INT_RAW] & s->regs[INT_ENA];
++    qemu_set_irq(s->irq, s->regs[INT_ST] != 0);
++}
++
++/* A byte of W0-W15 by its index from `base`, little-endian in each word. */
++static uint8_t w_get(Esp32s3GpspiState *s, unsigned base, unsigned i)
++{
++    unsigned at = base + i;
++
++    return at < 64 ? (uint8_t)(s->regs[W0 + at / 4] >> (8 * (at % 4))) : 0;
++}
++
++static void w_set(Esp32s3GpspiState *s, unsigned base, unsigned i, uint8_t v)
++{
++    unsigned at = base + i;
++
++    if (at < 64) {
++        uint32_t *w = &s->regs[W0 + at / 4];
++
++        *w = (*w & ~(0xffu << (8 * (at % 4)))) | ((uint32_t)v << (8 * (at % 4)));
++    }
++}
++
++static void gpspi_select(Esp32s3GpspiState *s, int on)
++{
++    uint32_t misc = s->regs[MISC];
++
++    for (unsigned i = 0; i < 6; i++) {
++        if (!(misc & (1u << i))) {
++            qemu_set_irq(s->cs[i], on ? 0 : 1);   /* active low */
++        }
++    }
++}
++
++static void gpspi_transaction(Esp32s3GpspiState *s)
++{
++    uint32_t user = s->regs[USER];
++
++    gpspi_select(s, 1);
++    if (user & USER_COMMAND) {
++        unsigned bits = ((s->regs[USER2] >> 28) & 0xf) + 1;
++        uint32_t value = s->regs[USER2] & 0xffff;
++
++        for (unsigned i = 0; i < (bits + 7) / 8; i++) {
++            ssi_transfer(s->spi, (value >> (8 * i)) & 0xff);
++        }
++    }
++    if (user & USER_ADDR) {
++        unsigned bits = ((s->regs[USER1] >> 27) & 0x1f) + 1;
++        unsigned bytes = (bits + 7) / 8;
++        uint32_t value = s->regs[ADDR];
++
++        for (unsigned i = 0; i < bytes; i++) {
++            ssi_transfer(s->spi, (value >> (8 * (bytes - 1 - i))) & 0xff);
++        }
++    }
++    if (user & (USER_MOSI | USER_MISO)) {
++        unsigned bytes = ((s->regs[MS_DLEN] & 0x3ffff) + 1 + 7) / 8;
++        unsigned out_base = (user & USER_MOSI_HIGH) ? 32 : 0;
++        unsigned in_base = (user & USER_MISO_HIGH) ? 32 : 0;
++
++        for (unsigned i = 0; i < bytes; i++) {
++            uint8_t out = (user & USER_MOSI) ? w_get(s, out_base, i) : 0xff;
++            uint8_t in = (uint8_t)ssi_transfer(s->spi, out);
++
++            if (user & USER_MISO) {
++                w_set(s, in_base, i, in);
++            }
++        }
++    }
++    if (!(s->regs[MISC] & MISC_CS_KEEP)) {
++        gpspi_select(s, 0);
++    }
++    s->regs[CMD] &= ~CMD_USR;
++    s->regs[INT_RAW] |= TRANS_DONE;
++    gpspi_update_irq(s);
++}
++
++static uint64_t gpspi_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Esp32s3GpspiState *s = ESP32S3_GPSPI(opaque);
++
++    if (addr / 4 == DATE) {
++        return 0x2101190;
++    }
++    return addr / 4 < ESP32S3_GPSPI_REGS ? s->regs[addr / 4] : 0;
++}
++
++static void gpspi_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
++{
++    Esp32s3GpspiState *s = ESP32S3_GPSPI(opaque);
++    unsigned reg = addr / 4;
++
++    if (reg >= ESP32S3_GPSPI_REGS) {
++        return;
++    }
++    switch (reg) {
++    case CMD:
++        /* UPDATE syncs the registers to the SPI clock domain at once. */
++        s->regs[CMD] = (uint32_t)value & ~CMD_UPDATE;
++        if (value & CMD_USR) {
++            gpspi_transaction(s);
++        }
++        break;
++    case INT_CLR:
++        s->regs[INT_RAW] &= ~(uint32_t)value;
++        gpspi_update_irq(s);
++        break;
++    case INT_SET:
++        s->regs[INT_RAW] |= (uint32_t)value;
++        gpspi_update_irq(s);
++        break;
++    case INT_ENA:
++        s->regs[INT_ENA] = (uint32_t)value;
++        gpspi_update_irq(s);
++        break;
++    case INT_RAW:
++    case INT_ST:
++        break;
++    default:
++        s->regs[reg] = (uint32_t)value;
++        break;
++    }
++}
++
++static const MemoryRegionOps gpspi_ops = {
++    .read = gpspi_read,
++    .write = gpspi_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void gpspi_reset(DeviceState *dev)
++{
++    Esp32s3GpspiState *s = ESP32S3_GPSPI(dev);
++
++    memset(s->regs, 0, sizeof s->regs);
++    s->regs[MISC] = 0x3e;   /* CS1-CS5 disabled, CS0 in use, as at reset */
++    gpspi_update_irq(s);
++}
++
++static void gpspi_init(Object *obj)
++{
++    Esp32s3GpspiState *s = ESP32S3_GPSPI(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &gpspi_ops, s, TYPE_ESP32S3_GPSPI, 0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
++    s->spi = ssi_create_bus(DEVICE(s), "spi");
++    qdev_init_gpio_out_named(DEVICE(s), s->cs, SSI_GPIO_CS, 6);
++}
++
++static void gpspi_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, gpspi_reset);
++}
++
++static const TypeInfo gpspi_info = {
++    .name = TYPE_ESP32S3_GPSPI,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Esp32s3GpspiState),
++    .instance_init = gpspi_init,
++    .class_init = gpspi_class_init,
++};
++
++static void gpspi_register_types(void)
++{
++    type_register_static(&gpspi_info);
++}
++
++type_init(gpspi_register_types)
+diff --git a/hw/ssi/meson.build b/hw/ssi/meson.build
+index 4c12114..c254062 100644
+--- a/hw/ssi/meson.build
++++ b/hw/ssi/meson.build
+@@ -18,7 +18,7 @@ system_ss.add(when: 'CONFIG_RISCV_ESP32H4', if_true: files('esp32c3_spi.c', 'esp
+ system_ss.add(when: 'CONFIG_RISCV_ESP32P4', if_true: files('esp32c3_spi.c', 'esp32p4_spi.c'))
+ system_ss.add(when: 'CONFIG_RISCV_ESP32C6', if_true: files('esp32c3_spi.c', 'esp32c6_spi.c'))
+ system_ss.add(when: 'CONFIG_RISCV_ESP32H2', if_true: files('esp32c3_spi.c', 'esp32h2_spi.c'))
+-system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('esp32s3_spi.c'))
++system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('esp32s3_spi.c', 'esp32s3_gpspi.c'))
+ system_ss.add(when: 'CONFIG_IBEX', if_true: files('ibex_spi_host.c'))
+ system_ss.add(when: 'CONFIG_BCM2835_SPI', if_true: files('bcm2835_spi.c'))
+ system_ss.add(when: 'CONFIG_PNV_SPI', if_true: files('pnv_spi.c'))
 diff --git a/hw/xtensa/esp32.c b/hw/xtensa/esp32.c
 index c3cf32e..eb6b45c 100644
 --- a/hw/xtensa/esp32.c
@@ -782,6 +1022,172 @@ index c3cf32e..eb6b45c 100644
  }
  
  static const TypeInfo esp32_info = {
+diff --git a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
+index 5a60acf..c205b9b 100644
+--- a/hw/xtensa/esp32s3.c
++++ b/hw/xtensa/esp32s3.c
+@@ -61,6 +61,9 @@
+ #include "hw/timer/esp32s3_timg.h"
+ #include "hw/timer/esp32s3_systimer.h"
+ #include "hw/gpio/esp32s3_gpio.h"
++#include "hw/ssi/esp32s3_gpspi.h"
++#include "chardev/char.h"
++#include "hw/qdev-properties-system.h"
+ #include "hw/misc/esp32s3_xts_aes.h"
+ #include "hw/misc/esp32s3_pms.h"
+ #include "hw/net/can/esp32s3_twai.h"
+@@ -123,6 +126,7 @@ typedef struct Esp32s3SocState {
+     Esp32s3IntMatrixState intmatrix;
+     ESP32S3UARTState uart[ESP32S3_UART_COUNT];
+     ESP32S3GPIOState gpio;
++    Esp32s3GpspiState gpspi2;   /* hull's: SPI2, the general-purpose bus */
+     Esp32s3RngState rng;
+     Esp32S3TWAIState twai;
+ 
+@@ -422,6 +426,8 @@ struct Esp32s3MachineState {
+ 
+     Esp32s3SocState esp32s3;
+     DeviceState *flash_dev;
++    char *lora;        /* the chardev a LoRa radio on SPI2 talks to the air by */
++    char *lora_pins;   /* its NSS, NRESET and DIO, as GPIO numbers */
+ };
+ #define TYPE_ESP32S3_MACHINE MACHINE_TYPE_NAME("esp32s3")
+ 
+@@ -716,6 +722,63 @@ static void esp32s3_soc_add_unimp_device(MemoryRegion *dest, const char* name, h
+     g_free(name_apb);
+ }
+ 
++/*
++ * A LoRa radio on SPI2, its NSS on a GPIO the firmware drives, as LoRa
++ * libraries do, its NRESET on another and its DIO on a third the firmware
++ * reads: an SX1276 as LilyGO's T3-S3 wires one, 7, 8 and 9, unless
++ * lora-pins names others.
++ */
++static void esp32s3_machine_init_lora(Esp32s3MachineState *ms, Esp32s3SocState *ss)
++{
++    unsigned nss = 7, nreset = 8, dio = 9;
++    Chardev *air = qemu_chr_find(ms->lora);
++    DeviceState *radio;
++    BusState *bus = qdev_get_child_bus(DEVICE(&ss->gpspi2), "spi");
++
++    if (!air) {
++        error_report("lora: no chardev %s", ms->lora);
++        exit(1);
++    }
++    if (ms->lora_pins &&
++        (sscanf(ms->lora_pins, "%u:%u:%u", &nss, &nreset, &dio) != 3 ||
++         nss > 31 || nreset > 31 || dio > 31)) {
++        error_report("lora-pins: NSS:NRESET:DIO, each a GPIO below 32");
++        exit(1);
++    }
++    radio = qdev_new("sx127x");
++    qdev_prop_set_chr(radio, "chardev", air);
++    qdev_realize_and_unref(radio, bus, &error_fatal);
++    qdev_connect_gpio_out_named(DEVICE(&ss->gpio), "out", nss,
++                                qdev_get_gpio_in_named(radio, SSI_GPIO_CS, 0));
++    qdev_connect_gpio_out_named(DEVICE(&ss->gpio), "out", nreset,
++                                qdev_get_gpio_in_named(radio, "reset", 0));
++    qdev_connect_gpio_out_named(radio, "dio0", 0,
++                                qdev_get_gpio_in_named(DEVICE(&ss->gpio), "in", dio));
++    qemu_set_irq(qdev_get_gpio_in_named(radio, SSI_GPIO_CS, 0), 1);
++}
++
++static char *esp32s3_get_lora(Object *obj, Error **errp)
++{
++    return g_strdup(ESP32S3_MACHINE(obj)->lora);
++}
++
++static void esp32s3_set_lora(Object *obj, const char *value, Error **errp)
++{
++    g_free(ESP32S3_MACHINE(obj)->lora);
++    ESP32S3_MACHINE(obj)->lora = g_strdup(value);
++}
++
++static char *esp32s3_get_lora_pins(Object *obj, Error **errp)
++{
++    return g_strdup(ESP32S3_MACHINE(obj)->lora_pins);
++}
++
++static void esp32s3_set_lora_pins(Object *obj, const char *value, Error **errp)
++{
++    g_free(ESP32S3_MACHINE(obj)->lora_pins);
++    ESP32S3_MACHINE(obj)->lora_pins = g_strdup(value);
++}
++
+ static void esp32s3_machine_init(MachineState *machine)
+ {
+     DriveInfo *dinfo = drive_get(IF_MTD, 0, 0);
+@@ -756,6 +819,7 @@ static void esp32s3_machine_init(MachineState *machine)
+     object_initialize_child(OBJECT(ss), "efuse", &ss->efuse, TYPE_ESP32S3_EFUSE);
+     object_initialize_child(OBJECT(ss), "jtag", &ss->jtag, TYPE_ESP32C3_JTAG);
+     object_initialize_child(OBJECT(ss), "gpio", &ss->gpio, TYPE_ESP32S3_GPIO);
++    object_initialize_child(OBJECT(ss), "gpspi2", &ss->gpspi2, TYPE_ESP32S3_GPSPI);
+     object_initialize_child(OBJECT(ss), "rng", &ss->rng, TYPE_ESP32S3_RNG);
+ 
+     object_initialize_child(OBJECT(ss), "clock", &ss->clock, TYPE_ESP32S3_CLOCK);
+@@ -884,11 +948,37 @@ static void esp32s3_machine_init(MachineState *machine)
+     }
+ 
+ 
+-    /* GPIO realization */
++    /* GPIO realization: the S3's own registers for pins 0-31, so that a
++     * pin's output and input are modelled for devices on the board (hull's
++     * GPIO lines, engine/esp-lora.patch), per ESP-IDF's
++     * soc/esp32s3/register/soc/gpio_reg.h. */
+     {
++        ss->gpio.parent.out_off = 0x04;
++        ss->gpio.parent.out_w1ts_off = 0x08;
++        ss->gpio.parent.out_w1tc_off = 0x0c;
++        ss->gpio.parent.enable_off = 0x20;
++        ss->gpio.parent.enable_w1ts_off = 0x24;
++        ss->gpio.parent.enable_w1tc_off = 0x28;
++        ss->gpio.parent.in_off = 0x3c;
++        ss->gpio.parent.status_off = 0x44;
++        ss->gpio.parent.status_w1ts_off = 0x48;
++        ss->gpio.parent.status_w1tc_off = 0x4c;
++        ss->gpio.parent.acpu_int_off = 0x5c;
++        ss->gpio.parent.pcpu_int_off = 0x5c;
++        ss->gpio.parent.pin_off = 0x74;
+         sysbus_realize(SYS_BUS_DEVICE(&ss->gpio), &error_fatal);
+         MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->gpio), 0);
+         memory_region_add_subregion_overlap(sys_mem, DR_REG_GPIO_BASE, mr, 0);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&ss->gpio), 0,
++                           qdev_get_gpio_in(intmatrix_dev, ETS_GPIO_INTR_SOURCE));
++    }
++    /* SPI2, the general-purpose bus a board's radio is on (hull's). */
++    {
++        sysbus_realize(SYS_BUS_DEVICE(&ss->gpspi2), &error_fatal);
++        MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->gpspi2), 0);
++        memory_region_add_subregion_overlap(sys_mem, DR_REG_SPI2_BASE, mr, 0);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&ss->gpspi2), 0,
++                           qdev_get_gpio_in(intmatrix_dev, ETS_SPI2_INTR_SOURCE));
+     }
+ 
+     {
+@@ -1003,6 +1093,10 @@ static void esp32s3_machine_init(MachineState *machine)
+     esp32s3_soc_add_unimp_device(sys_mem, "esp32s3.iomux", DR_REG_IO_MUX_BASE, 0x2000);
+ 
+     
++    if (ms->lora) {
++        esp32s3_machine_init_lora(ms, ss);
++    }
++
+     esp32s3_machine_init_sd(ss);
+ 
+     /* Need MMU initialized prior to ELF loading,
+@@ -1114,6 +1208,12 @@ static void esp32s3_machine_class_init(ObjectClass *oc, void *data)
+     mc->default_cpus = 2;
+     mc->default_ram_size = 0;
+     mc->fixup_ram_size = esp32s3_fixup_ram_size;
++    object_class_property_add_str(oc, "lora", esp32s3_get_lora, esp32s3_set_lora);
++    object_class_property_set_description(oc, "lora",
++        "a chardev for a LoRa radio on SPI2, its air");
++    object_class_property_add_str(oc, "lora-pins", esp32s3_get_lora_pins, esp32s3_set_lora_pins);
++    object_class_property_set_description(oc, "lora-pins",
++        "the radio's NSS:NRESET:DIO GPIOs, 7:8:9 as on a LilyGO T3-S3");
+ }
+ 
+ static const TypeInfo esp32s3_info = {
 diff --git a/include/hw/gpio/esp32_gpio.h b/include/hw/gpio/esp32_gpio.h
 index 39d8733..5158717 100644
 --- a/include/hw/gpio/esp32_gpio.h
@@ -814,3 +1220,32 @@ index 39d8733..5158717 100644
      /* IO_MUX state */
      uint32_t iomux_regs[ESP_GPIO_MAX_PINS];
      uint32_t num_gpios;
+diff --git a/include/hw/ssi/esp32s3_gpspi.h b/include/hw/ssi/esp32s3_gpspi.h
+new file mode 100644
+index 0000000..4d8360a
+--- /dev/null
++++ b/include/hw/ssi/esp32s3_gpspi.h
+@@ -0,0 +1,23 @@
++/*
++ * esp32s3_gpspi.h -- the ESP32-S3's general-purpose SPI controller,
++ * GPSPI2, as a master driven by the CPU's user commands through W0-W15;
++ * no DMA. hull's, for a radio on the S3's SPI bus.
++ */
++#pragma once
++
++#include "hw/sysbus.h"
++#include "hw/ssi/ssi.h"
++
++#define TYPE_ESP32S3_GPSPI "ssi.esp32s3.gpspi"
++#define ESP32S3_GPSPI(obj) OBJECT_CHECK(Esp32s3GpspiState, (obj), TYPE_ESP32S3_GPSPI)
++
++#define ESP32S3_GPSPI_REGS (0x100 / 4)
++
++typedef struct Esp32s3GpspiState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    qemu_irq irq;
++    qemu_irq cs[6];
++    SSIBus *spi;
++    uint32_t regs[ESP32S3_GPSPI_REGS];
++} Esp32s3GpspiState;

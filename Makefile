@@ -263,7 +263,9 @@ BOARD_LM3S := $(if $(BOARD_ARM),$(foreach b,lm3s mps2,$(foreach w,$(LM3S_NETS),$
 # `make esp-qemu-lora`, which fetches its source at the release hull pins.
 BOARD_XTENSA_CC  ?= xtensa-esp32-elf-gcc
 BOARD_XTENSA_BIN  = $(patsubst %-gcc,%,$(BOARD_XTENSA_CC))
-BOARD_LORA := $(if $(shell command -v $(BOARD_XTENSA_CC) 2>/dev/null),$(foreach r,first second,$(BUILD_DIR)/test/board-fw/lora-$(r).flash))
+BOARD_LORA := $(if $(shell command -v $(BOARD_XTENSA_CC) 2>/dev/null),$(foreach r,first second s3,$(BUILD_DIR)/test/board-fw/lora-$(r).flash))
+BOARD_XTENSA_S3_CC = $(subst esp32-elf,esp32s3-elf,$(BOARD_XTENSA_CC))
+BOARD_XTENSA_S3    = $(subst -gcc,,$(BOARD_XTENSA_S3_CC))
 ESP_QEMU_TAG    = esp-develop-9.2.2-20261109
 ESP_QEMU_COMMIT = 7411393a2f61e6f0b05af00276d30780769e0839
 ESP_QEMU_LORA   = $(BUILD_DIR)/esp-qemu-lora/build/qemu-system-xtensa
@@ -1203,6 +1205,19 @@ endef
 # A Heltec's LoRa firmware, FIRST sending the ping, the other hearing it by
 # DIO0's interrupt, by Espressif's GCC: its code in IRAM, its constants in
 # DRAM, entered at start.
+# An ESP32-S3's, a LilyGO T3-S3's SX1276 on SPI2, answering what it hears,
+# DIO0 polled: its code at 0x40380000, chip 9, its bootloader at 0.
+$(BUILD_DIR)/test/board-fw/lora-s3.flash: test/board/lora_esp32.c test/board/esp32s3_ram.ld test/board/esp_image.py
+	@mkdir -p '$(@D)'
+	$(BOARD_XTENSA_S3_CC) -Os -Wall -Wextra -ffreestanding -nostdlib -nostartfiles -fno-builtin \
+		-DS3 -T test/board/esp32s3_ram.ld -o $(@D)/lora-s3.elf $<
+	$(BOARD_XTENSA_S3)-objcopy -O binary -j .text $(@D)/lora-s3.elf $(@D)/lora-s3.text
+	$(BOARD_XTENSA_S3)-objcopy -O binary -j .data $(@D)/lora-s3.elf $(@D)/lora-s3.data
+	$(PYTHON) test/board/esp_image.py $(@D)/lora-s3.text 0x40380000 9 0x0 $@ \
+		0x$$($(BOARD_XTENSA_S3)-nm $(@D)/lora-s3.elf | awk '$$3 == "start" { print $$1 }') \
+		$(@D)/lora-s3.data 0x3fcb0000
+
+$(BUILD_DIR)/test/board-fw/lora-first.flash $(BUILD_DIR)/test/board-fw/lora-second.flash: \
 $(BUILD_DIR)/test/board-fw/lora-%.flash: test/board/lora_esp32.c test/board/esp32_ram.ld test/board/esp_image.py
 	@mkdir -p '$(@D)'
 	$(BOARD_XTENSA_CC) -Os -Wall -Wextra -ffreestanding -nostdlib -nostartfiles -fno-builtin \
@@ -1226,8 +1241,9 @@ $(ESP_QEMU_LORA): engine/esp-lora.patch
 	test -d '$(BUILD_DIR)/esp-qemu-lora/src' || git clone -q --depth 1 --branch $(ESP_QEMU_TAG) \
 		https://github.com/espressif/qemu.git '$(BUILD_DIR)/esp-qemu-lora/src'
 	test "$$(git -C '$(BUILD_DIR)/esp-qemu-lora/src' rev-parse HEAD)" = $(ESP_QEMU_COMMIT)
+	git -C '$(BUILD_DIR)/esp-qemu-lora/src' reset -q -- hw/misc/sx127x.c hw/ssi/esp32s3_gpspi.c include/hw/ssi/esp32s3_gpspi.h
 	git -C '$(BUILD_DIR)/esp-qemu-lora/src' checkout -q -- .
-	git -C '$(BUILD_DIR)/esp-qemu-lora/src' clean -q -f -- hw/misc/sx127x.c
+	git -C '$(BUILD_DIR)/esp-qemu-lora/src' clean -q -f -- hw/misc/sx127x.c hw/ssi/esp32s3_gpspi.c include/hw/ssi/esp32s3_gpspi.h
 	git -C '$(BUILD_DIR)/esp-qemu-lora/src' apply '$(abspath engine/esp-lora.patch)'
 	mkdir -p '$(BUILD_DIR)/esp-qemu-lora/build'
 	cd '$(BUILD_DIR)/esp-qemu-lora/build' && test -f build.ninja || ../src/configure \

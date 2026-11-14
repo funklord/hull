@@ -13,21 +13,38 @@
 #include <stdint.h>
 
 #define REG(address) (*(volatile uint32_t *)(address))
+#ifdef S3
+/* An ESP32-S3 with an SX1276 on SPI2, GPSPI2, as LilyGO's T3-S3 wires one:
+ * NSS 7, NRESET 8, DIO0 9; its DIO0 polled. */
+#define UART        0x60000000u
+#define GPIO        0x60004000u
+#define SPI2        0x60024000u
+#define SPI_CMD     REG(SPI2 + 0x00u)
+#define SPI_USER    REG(SPI2 + 0x10u)
+#define SPI_USER2   REG(SPI2 + 0x18u)
+#define SPI_DLEN    REG(SPI2 + 0x1cu)
+#define SPI_W0      REG(SPI2 + 0x98u)
+#define SPI_USR     (1u << 24)
+#else
 #define UART        0x3ff40000u
 #define GPIO        0x3ff44000u
 #define SPI3        0x3ff65000u
+#endif
 #define UART_FIFO   REG(UART + 0x00u)
 #define UART_STATUS REG(UART + 0x1cu)
 #define GPIO_W1TS   REG(GPIO + 0x08u)
 #define GPIO_W1TC   REG(GPIO + 0x0cu)
 #define GPIO_EN_SET REG(GPIO + 0x24u)
 #define GPIO_IN     REG(GPIO + 0x3cu)
+#ifndef S3
 #define SPI_CMD     REG(SPI3 + 0x00u)
 #define SPI_USER    REG(SPI3 + 0x1cu)
 #define SPI_USER2   REG(SPI3 + 0x24u)
 #define SPI_MOSI    REG(SPI3 + 0x28u)
 #define SPI_MISO    REG(SPI3 + 0x2cu)
 #define SPI_W0      REG(SPI3 + 0x80u)
+#define SPI_USR     (1u << 18)
+#endif
 
 #define GPIO_W1TC_STATUS REG(GPIO + 0x4cu)
 #define GPIO_PCPU_INT    REG(GPIO + 0x68u)
@@ -41,9 +58,15 @@
 #define GPIO_SOURCE     22u   /* ETS_GPIO_INTR_SOURCE */
 #define CPU_INTERRUPT   13u   /* a level-1 interrupt the ROM leaves free */
 
+#ifdef S3
+#define PIN_NSS   7u
+#define PIN_RESET 8u
+#define PIN_DIO0  9u
+#else
 #define PIN_NSS   18u
 #define PIN_RESET 14u
 #define PIN_DIO0  26u
+#endif
 
 static void put(char c)
 {
@@ -85,11 +108,15 @@ static void dio0_rose(void *arg)
 static uint8_t spi(uint8_t value)
 {
 	SPI_W0 = value;
+#ifdef S3
+	SPI_DLEN = 7u;                             /* eight bits */
+#else
 	SPI_MOSI = 7u;
 	SPI_MISO = 7u;
+#endif
 	SPI_USER = (1u << 27) | (1u << 28) | 1u;   /* MOSI, MISO, full duplex */
-	SPI_CMD = 1u << 18;                        /* USR */
-	while (SPI_CMD & (1u << 18))
+	SPI_CMD = SPI_USR;
+	while (SPI_CMD & SPI_USR)
 		;
 	return (uint8_t)SPI_W0;
 }

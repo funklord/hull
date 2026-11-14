@@ -225,7 +225,8 @@ fi
 if [ -n "${LORA_FW:-}" ] && [ -n "${LORA_QEMU:-}" ] && [ -n "${esp:-}" ] && [ -L "$root/cache/hull/${esp##*/}" ]; then
 	cp "$LORA_FW/lora-first.flash" "$root/la.fw"
 	cp "$LORA_FW/lora-second.flash" "$root/lb.fw"
-	printf '(machines\n  (la (backend pc) (source "image:./la.fw") (tuning (pc (machine heltec-wifi-lora-32) (lora "field"))))\n  (lb (backend pc) (source "image:./lb.fw") (tuning (pc (machine ttgo-lora32) (lora "field")))))\n' \
+	cp "$LORA_FW/lora-s3.flash" "$root/ls.fw"
+	printf '(machines\n  (la (backend pc) (source "image:./la.fw") (tuning (pc (machine heltec-wifi-lora-32) (lora "field"))))\n  (lb (backend pc) (source "image:./lb.fw") (tuning (pc (machine ttgo-lora32) (lora "field"))))\n  (ls (backend pc) (source "image:./ls.fw") (tuning (pc (machine lilygo-t3-s3) (lora "field")))))\n' \
 		> "$root/lora.conf"
 	# A core of its own: the machines are the core's, and it keeps the
 	# environment it was started with, which names the qemu.
@@ -241,6 +242,7 @@ if [ -n "${LORA_FW:-}" ] && [ -n "${LORA_QEMU:-}" ] && [ -n "${esp:-}" ] && [ -L
 	done
 	XDG_RUNTIME_DIR=$root/run-lora timeout 30 "$hull" stop la > /dev/null 2>&1
 	XDG_RUNTIME_DIR=$root/run-lora timeout 30 "$hull" stop lb > /dev/null 2>&1
+	XDG_RUNTIME_DIR=$root/run-lora timeout 30 "$hull" stop ls > /dev/null 2>&1
 	wait "$runner"
 	cases=$((cases + 1))
 	grep -q 'la | radio 12' "$root/lora.out" && grep -q 'lb | radio 12' "$root/lora.out" ||
@@ -254,6 +256,10 @@ if [ -n "${LORA_FW:-}" ] && [ -n "${LORA_QEMU:-}" ] && [ -n "${esp:-}" ] && [ -L
 	cases=$((cases + 1))
 	grep -q 'la | got pong' "$root/lora.out" ||
 		fail "the Heltec did not hear the TTGO's pong" "$(cat "$root/lora.out")"
+	# And an ESP32-S3's SX1276 on its SPI2, a LilyGO T3-S3, on the same air.
+	cases=$((cases + 1))
+	grep -q 'ls | radio 12' "$root/lora.out" && grep -q 'ls | got ping' "$root/lora.out" ||
+		fail "a T3-S3 did not read its SX1276 over SPI2 and hear the ping" "$(cat "$root/lora.out")"
 	printf '(machine (backend pc) (source "image:./la.fw") (tuning (pc (machine heltec-wifi-lora-32) (lora "field"))))\n' \
 		> "$root/noqemu.conf"
 	cases=$((cases + 1))

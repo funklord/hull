@@ -228,6 +228,7 @@ static const board boards[] = {
 	ESP_XT("heltec-wifi-lora-32-v3", "esp32s3", 8u),
 	ESP_XT("xiao-esp32s3", "esp32s3", 8u),
 	ESP_XT("lilygo-t-display-s3", "esp32s3", 16u),
+	ESP_XT("lilygo-t3-s3", "esp32s3", 4u),
 	ESP_RV("esp32c3", "esp32c3", 0u, 0u),
 	ESP_RV("esp32-c3-devkitm-1", "esp32c3", 4u, 0u),
 	ESP_RV("xiao-esp32c3", "esp32c3", 4u, 0u),
@@ -253,7 +254,7 @@ static int is_esp(const board *b)
 static int has_sx1276(const board *b)
 {
 	static const char *const names[] = { "heltec-wifi-lora-32", "heltec-wifi-lora-32-v2",
-	                                     "ttgo-lora32" };
+	                                     "ttgo-lora32", "lilygo-t3-s3" };
 
 	for (unsigned i = 0u; b != NULL && i < sizeof names / sizeof names[0]; i++)
 		if (strcmp(b->name, names[i]) == 0)
@@ -1104,8 +1105,8 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 	/* A LoRa radio, on the boards that carry an SX1276 as a Heltec's is
 	 * wired, and a name for its air. */
 	if (m->lora != NULL && !has_sx1276(board_named(m->machine_type)))
-		return "a LoRa radio is on heltec-wifi-lora-32, heltec-wifi-lora-32-v2 and "
-		       "ttgo-lora32 alone, an SX1276 as hull models it";
+		return "a LoRa radio is on heltec-wifi-lora-32, heltec-wifi-lora-32-v2, ttgo-lora32 "
+		       "and lilygo-t3-s3 alone, an SX1276 as hull models it";
 	if (m->lora != NULL && (strlen(m->lora) > 64u || strchr(m->lora, '/') != NULL))
 		return "a LoRa air's name is at most 64 characters and has no /";
 	/* 86Box's machine: a PC of a period, in its window, its media images
@@ -1276,7 +1277,15 @@ static void exec_board(const hull_machine *m, const board *b)
 			return;
 		snprintf(air, sizeof air, "socket,id=air,fd=%d", fd);
 		strncat(rom, "/qemu/share/qemu", sizeof rom - strlen(rom) - 1u);
-		argv[n - 1] = "esp32,lora=air";
+		/* The chip's machine, its radio on the air: an ESP32's on VSPI, an
+		 * S3's on SPI2 (engine/esp-lora.patch). */
+		{
+			static __thread char with_radio[64];
+
+			snprintf(with_radio, sizeof with_radio, "%s,lora=air",
+			         b->chip != NULL ? b->chip : b->name);
+			argv[n - 1] = with_radio;
+		}
 		argv[n++] = "-chardev";
 		argv[n++] = air;
 		argv[n++] = "-L";
@@ -2822,6 +2831,9 @@ static const hull_cap_entry entries[] = {
 	{ "pc.machine.heltec-wifi-lora-32-v3", HULL_SUP_NATIVE, ESP_NOTE, NULL },
 	{ "pc.machine.xiao-esp32s3", HULL_SUP_NATIVE, ESP_NOTE, NULL },
 	{ "pc.machine.lilygo-t-display-s3", HULL_SUP_NATIVE, ESP_NOTE, NULL },
+	{ "pc.machine.lilygo-t3-s3", HULL_SUP_NATIVE,
+	  "an ESP32-S3 with an SX1276 on SPI2 (NSS 7, NRESET 8, DIO0 9), its radio by (lora NAME)",
+	  NULL },
 	{ "pc.machine.esp32c3", HULL_SUP_NATIVE, ESP_NOTE, NULL },
 	{ "pc.machine.esp32-c3-devkitm-1", HULL_SUP_NATIVE, ESP_NOTE, NULL },
 	{ "pc.machine.xiao-esp32c3", HULL_SUP_NATIVE, ESP_NOTE, NULL },
