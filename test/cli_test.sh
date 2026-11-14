@@ -3187,7 +3187,12 @@ while time.time() < deadline:
     try:
         s = socket.create_connection((sys.argv[1], int(sys.argv[2])), 2)
         s.sendall(b"hello\n")
-        s.settimeout(5)
+        # Waited on until the deadline, not abandoned: pasta takes the
+        # connection before the machine listens and hands it over once it
+        # does, and the probe serves one connection -- a client that gave
+        # up after 5 s left it answering the socket given up on, once at a
+        # load of 13 (2026-11-14). A connection closed empty is retried.
+        s.settimeout(max(1.0, deadline - time.time()))
         got = s.recv(200)
         if got:
             print(got.decode().strip())
