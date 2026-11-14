@@ -410,7 +410,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: esp-qemu-lora check-tsan
-.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-screen check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-usb check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-usb check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -516,6 +516,7 @@ help:
 	@echo '  check     style, the situ contracts, then the tests'
 	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
 	@echo '  check-qemu    hull run on the qemu engine, as the user, with KVM'
+	@echo '  check-86box   a period'"'"'s PC on 86Box: an IBM XT booting FreeDOS, its COM1 read'
 	@echo '  check-screen  a vm'"'"'s screen in hull-gui by qemu'"'"'s D-Bus display, and its 3D by virgl and Venus'
 	@echo '  check-arm64-host  hull built and make test run on arm64, under emu'
 	@echo '  check-riscv64-host  hull built and make test run on riscv64, under emu'
@@ -973,6 +974,11 @@ check-legacy: $(HULL) $(AGENT_BIN)
 check-qemu: $(HULL) $(AGENT_BIN) $(PROBE) $(AGENT_ARM64) $(ARM64_PROBE) $(AGENT_RISCV64) \
             $(RISCV64_PROBE) $(AGENT_S390X) $(S390X_PROBE) $(AGENT_ARM) $(ARM_PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/qemu_test.sh '$(HULL)' '$(PROBE)'
+
+# A period's PC on 86Box, which `hull 86box fetch` puts in the cache: an
+# IBM XT booting FreeDOS's floppy, what it writes to COM1 read from the run.
+check-86box: $(HULL) $(AGENT_BIN)
+	BUILD_DIR='$(BUILD_DIR)' sh test/86box_test.sh '$(HULL)'
 
 # A vm's screen shown on this host: its local D-Bus display, read by a
 # GIO client and by hull-gui's screen window, and its 3D -- virgl's
