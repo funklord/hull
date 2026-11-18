@@ -569,7 +569,8 @@ const char *hull_access_devices(const hull_sexpr_doc *doc, const hull_sexpr_form
 	} kinds[] = {
 		{ "usb", HULL_DEVICE_USB }, { "serial", HULL_DEVICE_SERIAL },
 		{ "parallel", HULL_DEVICE_PARALLEL }, { "node", HULL_DEVICE_NODE },
-		{ "pci", HULL_DEVICE_PCI },
+		{ "pci", HULL_DEVICE_PCI }, { "gpio", HULL_DEVICE_GPIO },
+		{ "i2c", HULL_DEVICE_I2C },
 	};
 	hull_sexpr_form devices;
 	hull_sexpr_form root;
@@ -605,6 +606,28 @@ again:
 				    copy_value(doc, &item, "port", d->port, sizeof d->port) < 0 ||
 				    copy_value(doc, &item, "host", d->remote, sizeof d->remote) < 0)
 					return "a USB device's serial, port or host is too long";
+			} else if (d->kind == HULL_DEVICE_I2C) {
+				hull_sexpr_form clients;
+				hull_sexpr_form client;
+				size_t          at = 0u;
+
+				/* Its node, and its clients as the daemon takes them,
+				 * decimal and colon-joined. */
+				if (copy_value(doc, &item, "path", d->path, sizeof d->path) < 0)
+					return "an I2C bus's path is too long";
+				if (hull_access_find(doc, &item, "clients", &clients)) {
+					hull_sexpr_child(doc, &clients, &client);
+					while (hull_sexpr_next(doc, &client, &client)) {
+						char *text = hull_access_text(doc, &client);
+						unsigned long value = text != NULL ? strtoul(text, NULL, 16) : 0ul;
+
+						free(text);
+						at += (size_t)snprintf(d->serial + at, sizeof d->serial - at, "%s%lu",
+						                       at != 0u ? ":" : "", value);
+						if (at >= sizeof d->serial)
+							return "an I2C bus has too many clients";
+					}
+				}
 			} else {
 				char *text = hull_access_text(doc, &item);
 

@@ -44,6 +44,7 @@
 #define _GNU_SOURCE
 
 #include <dirent.h>
+#include <ctype.h>
 #include <errno.h>
 #include <grp.h>
 #include <stddef.h>
@@ -98,6 +99,8 @@
 
 #define MAX_PORTS    64u
 #define MAX_MODULES  64u
+/* The rust-vmm vhost-device commit `make vhost-device` builds. */
+#define HULL_VHOST_DEVICE_REV "21f1333"
 #define MAX_SERIAL   4u   /* isa-serial's indices, ttyS0 to ttyS3 */
 #define MAX_PARALLEL 3u   /* isa-parallel's, parport0 to parport2 */
 #define AGENT_PORT   1u
@@ -223,6 +226,7 @@ struct hull_machine {
 	unsigned         segment_count;
 	pid_t            passt;        /* passt's daemon, by the socket it holds, or 0 */
 	pid_t            redir[HULL_MAX_DEVICES]; /* a remote USB device's ssh, or 0 */
+	pid_t            vhost[HULL_MAX_DEVICES]; /* a GPIO or I2C device's vhost-device daemon, or 0 */
 	pid_t            qemu;
 	int              keep;         /* (on_disconnect keep): qemu outlives the core */
 	int              adopted;      /* taken back: qemu is not this process's child */
@@ -315,6 +319,7 @@ static void *forward_ports(void *arg);
 static int handshake(hull_machine *m);
 static void kill_qemu(hull_machine *m);
 static const char *start_redirects(hull_machine *m);
+static int has_vhost(const hull_machine *m);
 static void start_forwarder(hull_machine *m);
 
 static hull_status fail(hull_error *error, hull_status code, const char *detail)
@@ -1656,6 +1661,13 @@ static const char *write_initramfs(const hull_machine *m, const char *modules, i
 	/* Its sound card's driver. */
 	if (m->sound && load_modules && extra_count + 1u <= MAX_MODULES)
 		extra[extra_count++] = "?virtio_snd";
+	/* A GPIO chip's or an I2C bus's virtio driver, where it is given one. */
+	for (unsigned i = 0u; i < m->device_count && load_modules && extra_count + 1u <= MAX_MODULES; i++) {
+		if (m->device[i].kind == HULL_DEVICE_GPIO)
+			extra[extra_count++] = "?gpio_virtio";
+		else if (m->device[i].kind == HULL_DEVICE_I2C)
+			extra[extra_count++] = "?i2c_virtio";
+	}
 	/* A composefs root: erofs for its image, the crc32c erofs's
 	 * libcrc32c asks for, and overlay, which is loaded already. */
 	if (m->composefs != NULL && load_modules && extra_count + 2u <= MAX_MODULES) {
@@ -2528,7 +2540,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	argv[n++] = m->emu ? "max" : "host";
 	argv[n++] = "-m";
 	argv[n++] = memory;
-	if (m->virtiofsd != NULL || m->gpu == 2) {
+	if (m->virtiofsd != NULL || m->gpu == 2 || has_vhost(m)) {
 		/* The daemon reads and writes the guest's buffers itself, so its
 		 * memory has to be shareable; so does Venus, whose blobs are the
 		 * guest's memory mapped by the host. */
@@ -2625,6 +2637,18 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 
 		/* A port root mode gave is the node hull-root made, the user's. */
 		escaped(node, sizeof node, d->host.granted[0] != '\0' ? d->host.granted : d->host.node);
+		/* A GPIO chip or an I2C bus: its vhost-device daemon's socket. */
+		if (d->kind == HULL_DEVICE_GPIO || d->kind == HULL_DEVICE_I2C) {
+			snprintf(device_chardev[i], sizeof device_chardev[i],
+			         "socket,id=vh%u,path=%s/vhost-%u.sock0", i, m->dir, i);
+			snprintf(device_device[i], sizeof device_device[i], "%s,chardev=vh%u",
+			         d->kind == HULL_DEVICE_GPIO ? "vhost-user-gpio-pci" : "vhost-user-i2c-pci", i);
+			argv[n++] = "-chardev";
+			argv[n++] = device_chardev[i];
+			argv[n++] = "-device";
+			argv[n++] = device_device[i];
+			continue;
+		}
 		if (d->kind == HULL_DEVICE_USB) {
 			const char *ports = strchr(d->host.port, '-');
 
@@ -4266,9 +4290,109 @@ static const char *start_redirects(hull_machine *m)
 	return NULL;
 }
 
+/* Whether the machine is given a GPIO chip or an I2C bus. */
+static int has_vhost(const hull_machine *m)
+{
+	for (unsigned i = 0u; i < m->device_count; i++)
+		if (m->device[i].kind == HULL_DEVICE_GPIO || m->device[i].kind == HULL_DEVICE_I2C)
+			return 1;
+	return 0;
+}
+
+/* rust-vmm's vhost-device daemon `name`: the one hull's build put in the
+ * user's cache (make vhost-device), else the PATH's. */
+static void vhost_daemon(const char *name, char *out, size_t cap)
+{
+	const char *cache = getenv("XDG_CACHE_HOME");
+	const char *home = getenv("HOME");
+
+	if (cache != NULL && cache[0] == '/')
+		snprintf(out, cap, "%s/hull/vhost-device-%s/bin/%s", cache, HULL_VHOST_DEVICE_REV, name);
+	else if (home != NULL && home[0] == '/')
+		snprintf(out, cap, "%s/.cache/hull/vhost-device-%s/bin/%s", home, HULL_VHOST_DEVICE_REV,
+		         name);
+	else
+		out[0] = '\0';
+	if (out[0] == '\0' || access(out, X_OK) != 0)
+		snprintf(out, cap, "%s", name);
+}
+
+/*
+ * Each GPIO chip and I2C bus given to the machine (section 4.13): rust-vmm's
+ * vhost-device-gpio or vhost-device-i2c, run as the user on the host's node,
+ * serving vhost-N.sock0 in the machine's directory, which qemu's
+ * vhost-user device connects to as it starts -- so the socket is waited
+ * for here. The daemon ends with the machine. 0, or why.
+ */
+static const char *start_vhost(hull_machine *m)
+{
+	for (unsigned i = 0u; i < m->device_count; i++) {
+		const hull_device *d = &m->device[i];
+		const char        *name = d->kind == HULL_DEVICE_GPIO ? "vhost-device-gpio" : "vhost-device-i2c";
+		const char        *digits;
+		char               program[4400];
+		char               socket_path[4300];
+		char               made[4400];
+		char               list[200];
+		char               log[4300];
+		pid_t              child;
+
+		if (d->kind != HULL_DEVICE_GPIO && d->kind != HULL_DEVICE_I2C)
+			continue;
+		/* The chip's or the bus's number, from /dev/gpiochipN or /dev/i2c-N. */
+		digits = d->path + strlen(d->path);
+		while (digits > d->path && isdigit((unsigned char)digits[-1]))
+			digits--;
+		if (*digits == '\0')
+			return "a GPIO chip or I2C bus is named by its node, /dev/gpiochipN or /dev/i2c-N";
+		if (d->kind == HULL_DEVICE_GPIO)
+			snprintf(list, sizeof list, "%s", digits);
+		else
+			snprintf(list, sizeof list, "%s:%s", digits, d->serial);
+		vhost_daemon(name, program, sizeof program);
+		snprintf(socket_path, sizeof socket_path, "%s/vhost-%u.sock", m->dir, i);
+		snprintf(made, sizeof made, "%s0", socket_path);
+		snprintf(log, sizeof log, "%s/vhost-%u.log", m->dir, i);
+		if (strlen(made) >= sizeof ((struct sockaddr_un *)0)->sun_path)
+			return "the machine's directory is too long for its GPIO or I2C device's socket";
+		child = fork();
+		if (child < 0)
+			return "a vhost-device daemon could not be started";
+		if (child == 0) {
+			int null = open("/dev/null", O_RDONLY | O_CLOEXEC);
+			int out = open(log, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+
+			if (null < 0 || out < 0 || dup2(null, 0) < 0 || dup2(out, 1) < 0 || dup2(out, 2) < 0 ||
+			    setsid() < 0)
+				_exit(126);
+			execlp(program, program, "-s", socket_path, "-c", "1", "-l", list, (char *)NULL);
+			_exit(127);
+		}
+		m->vhost[i] = child;
+		for (int tries = 0; tries < 100 && access(made, F_OK) != 0; tries++) {
+			if (waitpid(child, NULL, WNOHANG) == child) {
+				m->vhost[i] = 0;
+				snprintf(m->detail, sizeof m->detail, "%s ended before it served %s: its own word "
+				         "is in the machine's vhost-%u.log; `make vhost-device` builds it", name,
+				         d->path, i);
+				return m->detail;
+			}
+			usleep(50000);
+		}
+	}
+	return NULL;
+}
+
 /* Each remote USB device's ssh, and so its far usbredirect, ended. */
 static void end_redirects(hull_machine *m)
 {
+	for (unsigned i = 0u; i < HULL_MAX_DEVICES; i++) {
+		if (m->vhost[i] <= 0)
+			continue;
+		kill(m->vhost[i], SIGTERM);
+		waitpid(m->vhost[i], NULL, 0);
+		m->vhost[i] = 0;
+	}
 	for (unsigned i = 0u; i < HULL_MAX_DEVICES; i++) {
 		if (m->redir[i] <= 0)
 			continue;
@@ -4761,6 +4885,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	}
 	if ((reason = make_dir(m)) != NULL ||
 	    (reason = start_redirects(m)) != NULL ||
+	    (reason = start_vhost(m)) != NULL ||
 	    (m->block_root && (reason = build_root_image(m)) != NULL) ||
 	    (m->sleep && (reason = make_swap(m)) != NULL) ||
 	    (reason = write_initramfs(m, mbuf, load_modules)) != NULL ||
@@ -6004,6 +6129,12 @@ static const hull_cap_entry entries[] = {
 	{ "devices.parallel",   HULL_SUP_EMULATED,
 	  "an ISA parallel port of the guest's by ppdev, every port access a trap and an ioctl: "
 	  "a bit-banged device, a JTAG cable, may not work; chroot reaches ppdev directly", NULL },
+	{ "devices.gpio",       HULL_SUP_NATIVE,
+	  "a gpiochip of the host's, its lines the guest's virtio GPIO, by rust-vmm's "
+	  "vhost-device-gpio (make vhost-device)", NULL },
+	{ "devices.i2c",        HULL_SUP_NATIVE,
+	  "an I2C bus of the host's, the clients named on it the guest's virtio I2C, by rust-vmm's "
+	  "vhost-device-i2c (make vhost-device)", NULL },
 	{ "devices.pci",        HULL_SUP_NATIVE,
 	  "vfio-pci: the device itself, its own timing, the guest's memory pinned for its DMA", NULL },
 	{ "devices.root",       HULL_SUP_REJECTED,

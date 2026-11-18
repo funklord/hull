@@ -206,7 +206,14 @@ static void test_values(void)
 	NO(M("(tuning (qemu (iommu yes)))"), VALUE, "yes", "machine.tuning.qemu.iommu");
 	NO(M("(devices (pci \"01:00.0\"))"), VALUE, "\"01:00.0\"", "machine.devices.pci");
 	NO(M("(devices (pci \"0000:01:00.A\"))"), VALUE, "\"0000:01:00.A\"", "machine.devices.pci");
-	NO(M("(devices (gpio \"/dev/gpiochip0\"))"), UNKNOWN, "gpio", "machine.devices.gpio");
+	/* A GPIO chip and an I2C bus, by vhost-device (section 4.13). */
+	OK(M("(devices (gpio \"/dev/gpiochip0\") (i2c (bus (path \"/dev/i2c-1\") (clients \"0x50\" \"0x1A\"))))"));
+	NO(M("(devices (gpio \"gpiochip0\"))"), VALUE, "\"gpiochip0\"", "machine.devices.gpio");
+	NO(M("(devices (i2c (bus (path \"/dev/i2c-1\") (clients \"0x78\"))))"), VALUE, "\"0x78\"",
+	   "machine.devices.i2c.bus.clients");
+	NO(M("(devices (i2c (bus (path \"/dev/i2c-1\") (clients \"80\"))))"), VALUE, "\"80\"",
+	   "machine.devices.i2c.bus.clients");
+	NO(M("(devices (spi \"/dev/spidev0.0\"))"), UNKNOWN, "spi", "machine.devices.spi");
 	/* Root mode's (section 7): the kinds a path names, and no other. */
 	OK(M("(devices (root (node \"/dev/mem\") (serial \"/dev/ttyS0\")))"));
 	NO(M("(devices (root (usb (device (port \"1-2\")))))"), UNKNOWN, "usb",

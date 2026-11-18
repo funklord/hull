@@ -25,6 +25,8 @@ typedef enum hull_device_kind {
 	HULL_DEVICE_PARALLEL,
 	HULL_DEVICE_NODE,
 	HULL_DEVICE_PCI,
+	HULL_DEVICE_GPIO,   /* a gpiochip, to a vm by vhost-device-gpio */
+	HULL_DEVICE_I2C,    /* an I2C bus and its clients, by vhost-device-i2c */
 } hull_device_kind;
 
 /* Where sysfs lists PCI devices and IOMMU groups, and where VFIO's
@@ -49,9 +51,9 @@ typedef struct hull_device {
 	hull_device_kind kind;
 	char             vendor[8];
 	char             product[8];
-	char             serial[128];
+	char             serial[128]; /* USB: its serial; I2C: its clients, decimal, "80:81" */
 	char             port[32];
-	char             path[256];  /* serial, parallel, node: the path given; pci: the address */
+	char             path[256];  /* serial, parallel, node, gpio, i2c: the path given; pci: the address */
 	int              root;       /* named under (devices (root ...)): root mode's to give */
 	char             remote[256]; /* USB: (host "[USER@]HOST"), the host it is plugged into, or "" */
 	hull_hostdev     host;

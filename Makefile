@@ -412,7 +412,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: esp-qemu-lora check-tsan
-.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-usb check-usbredir check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-usb check-usbredir check-vhost vhost-device check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -533,6 +533,8 @@ help:
 	@echo '  check-root    root mode'"'"'s native grants, hull-root setuid, inside a vm'
 	@echo '  check-systemd systemd as a chroot machine'"'"'s init in a delegated cgroup, inside a vm'
 	@echo '  check-vfio    a PCI device by VFIO, to chroot and a nested vm, inside a vm with an IOMMU'
+	@echo '  check-vhost   a GPIO chip and an I2C bus of a host given to a vm, by vhost-device'
+	@echo '  vhost-device  rust-vmm'"'"'s GPIO and I2C daemons, built by cargo (fetches)'
 	@echo '  check-usbredir a USB device on another host given to a vm by usbredir over ssh'
 	@echo '  check-usb     a USB device followed by chroot as it re-enumerates, inside a vm'
 	@echo '  check-board   microcontroller boards (Uno, STM32, 8051, ESP32s) booted from firmware as pc machines'
@@ -1157,6 +1159,33 @@ check-vfio: $(HULL) $(AGENT_BIN) $(PROBE)
 
 # A USB device that re-enumerates while a chroot machine has it, made of
 # dummy_hcd and a configfs gadget inside a vm of hull's own.
+# rust-vmm's vhost-device-gpio and vhost-device-i2c, which serve a vm a
+# GPIO chip or an I2C bus of the host's (section 4.13): built by cargo at a
+# pinned commit into the user's cache, where the qemu engine looks first,
+# with Debian's libgpiod v2 unpacked beside them for the GPIO one. Versions
+# chosen for the rustc installed, its lockfile wanting a newer one. Fetches
+# from the network.
+VHOST_DEVICE_REV  = 21f1333fc45f4d6b202c32d1198a266262d30d4f
+VHOST_DEVICE_ROOT = $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/hull/vhost-device-$(shell echo $(VHOST_DEVICE_REV) | cut -c1-7)
+vhost-device:
+	@mkdir -p '$(BUILD_DIR)/vhost-device' '$(VHOST_DEVICE_ROOT)/gpiod/debs'
+	cd '$(VHOST_DEVICE_ROOT)/gpiod/debs' && apt-get download libgpiod-dev libgpiod3
+	for deb in '$(VHOST_DEVICE_ROOT)'/gpiod/debs/*.deb; do dpkg-deb -x "$$deb" '$(VHOST_DEVICE_ROOT)/gpiod'; done
+	PKG_CONFIG_PATH='$(VHOST_DEVICE_ROOT)/gpiod/usr/lib/x86_64-linux-gnu/pkgconfig' \
+	PKG_CONFIG_SYSROOT_DIR='$(VHOST_DEVICE_ROOT)/gpiod' \
+	RUSTFLAGS='-C link-args=-Wl,-rpath,$(VHOST_DEVICE_ROOT)/gpiod/usr/lib/x86_64-linux-gnu' \
+	CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback \
+	CARGO_TARGET_DIR='$(abspath $(BUILD_DIR))/vhost-device/target' \
+	CARGO_HOME='$(abspath $(BUILD_DIR))/vhost-device/cargo' \
+		cargo install --git https://github.com/rust-vmm/vhost-device.git --rev $(VHOST_DEVICE_REV) \
+		--root '$(VHOST_DEVICE_ROOT)' vhost-device-gpio vhost-device-i2c
+
+# A GPIO chip and an I2C bus of a host given to a vm, the host a vm of
+# hull's own whose root makes them of gpio-sim and i2c-stub, the vm given
+# them nested inside. Needs KVM nested and `make vhost-device`.
+check-vhost: $(HULL) $(AGENT_BIN)
+	BUILD_DIR='$(BUILD_DIR)' sh test/vhost_test.sh '$(HULL)'
+
 # A USB device on another host given to a vm by usbredir over ssh, the far
 # host a vm of hull's own with a gadget, Debian's usbredirect and an sshd,
 # the vm given it nested inside. Needs KVM nested and the network once.

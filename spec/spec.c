@@ -12,6 +12,7 @@
  * so an escape fails a rule rather than slipping past one.
  */
 
+#include <ctype.h>
 #include <string.h>
 #include <arpa/inet.h>
 
@@ -194,6 +195,24 @@ static const char *usb_port(const uint8_t *text, uint32_t length)
 
 /* A PCI address as sysfs names a device, "0000:01:00.0": domain, bus,
  * device and function, lowercase hex. */
+/* An I2C client's 7-bit address, as I2C writes it: 0x08 to 0x77. */
+static const char *i2c_client(const uint8_t *text, uint32_t length)
+{
+	unsigned value = 0u;
+
+	if (length < 3u || length > 4u || text[0] != '0' || (text[1] != 'x' && text[1] != 'X'))
+		return "is an I2C address in hex, 0x08 to 0x77";
+	for (uint32_t i = 2u; i < length; i++) {
+		int digit = isdigit(text[i]) ? text[i] - '0' :
+		            isxdigit(text[i]) ? (tolower(text[i]) - 'a' + 10) : -1;
+
+		if (digit < 0)
+			return "is an I2C address in hex, 0x08 to 0x77";
+		value = value * 16u + (unsigned)digit;
+	}
+	return value >= 0x08u && value <= 0x77u ? NULL : "is an I2C address in hex, 0x08 to 0x77";
+}
+
 static const char *pci_address(const uint8_t *text, uint32_t length)
 {
 	static const char shape[] = "hhhh:hh:hh.h";
@@ -489,12 +508,22 @@ static const key root_device_keys[] = {
 };
 static const schema root_devices = TABLE(root_device_keys);
 
+/* An I2C bus given to a vm: its node and the clients on it the guest may
+ * address, which vhost-device-i2c asks for by name. */
+static const key i2c_bus_keys[] = {
+	{ .name = "path",    .type = STRING,  .value = absolute },
+	{ .name = "clients", .type = STRINGS, .nonempty = 1, .value = i2c_client },
+};
+static const schema i2c_bus = TABLE(i2c_bus_keys);
+
 static const key device_keys[] = {
 	{ .name = "usb",      .type = ENTRIES, .nonempty = 1, .record = &usb_device, .entry = "device" },
 	{ .name = "serial",   .type = STRINGS, .nonempty = 1, .value = absolute },
 	{ .name = "parallel", .type = STRINGS, .nonempty = 1, .value = absolute },
 	{ .name = "node",     .type = STRINGS, .nonempty = 1, .value = absolute },
 	{ .name = "pci",      .type = STRINGS, .nonempty = 1, .value = pci_address },
+	{ .name = "gpio",     .type = STRINGS, .nonempty = 1, .value = absolute },
+	{ .name = "i2c",      .type = ENTRIES, .nonempty = 1, .record = &i2c_bus, .entry = "bus" },
 	{ .name = "root",     .type = RECORD, .record = &root_devices },
 };
 static const schema devices = TABLE(device_keys);
