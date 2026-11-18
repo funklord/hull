@@ -469,6 +469,7 @@ static const key usb_keys[] = {
 	{ .name = "product", .type = STRING, .value = usb_id },
 	{ .name = "serial",  .type = STRING, .value = nonempty },
 	{ .name = "port",    .type = STRING, .value = usb_port },
+	{ .name = "host",    .type = STRING, .value = nonempty },
 };
 static const schema usb_device = TABLE_ACROSS(usb_keys, usb_across);
 
@@ -477,6 +478,7 @@ static const schema usb_device = TABLE_ACROSS(usb_keys, usb_across);
 #define USB_PRODUCT 1u
 #define USB_SERIAL  2u
 #define USB_PORT    3u
+#define USB_HOST    4u
 
 /* (devices (root ...)): devices the user may not open, which root mode
  * alone gives (section 7), named as their kinds are. */
@@ -1524,6 +1526,14 @@ static hull_spec_status usb_across(walk *w, const hull_sexpr_form *record,
 	} else if ((present & ((uint64_t)1 << USB_SERIAL)) && !vendor) {
 		at = USB_SERIAL;
 		why = "tells apart devices of one vendor and product: it needs both";
+	} else if ((present & ((uint64_t)1 << USB_HOST)) && !vendor) {
+		at = USB_HOST;
+		why = "is where the device is plugged in, found there by its vendor and product: "
+		      "it needs both";
+	} else if ((present & ((uint64_t)1 << USB_HOST)) &&
+	           (present & (((uint64_t)1 << USB_SERIAL) | ((uint64_t)1 << USB_PORT)))) {
+		at = USB_HOST;
+		why = "finds the device by its vendor and product alone: no serial or port beside it";
 	} else {
 		return HULL_SPEC_OK;
 	}

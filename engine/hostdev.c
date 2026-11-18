@@ -364,6 +364,13 @@ const char *hull_hostdev_pci(const char *sysfs, const char *groups, const char *
 
 const char *hull_hostdev_find(hull_device *device, char *why, size_t cap)
 {
+	/* A device on another host is not looked for here: qemu's usbredir
+	 * reaches it, and an engine that comes here with one has no way to. */
+	if (device->remote[0] != '\0') {
+		snprintf(why, cap, "a USB device on another host, (host \"%s\"), is a vm's, by "
+		         "usbredir; this engine has no way to it", device->remote);
+		return why;
+	}
 	if (device->kind == HULL_DEVICE_PCI)
 		return hull_hostdev_pci(HULL_SYSFS_PCI, HULL_SYSFS_GROUPS, device->path, &device->host,
 		                        why, cap);
@@ -436,7 +443,8 @@ static pthread_mutex_t claims_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int exclusive(const hull_device *device)
 {
-	return device->kind != HULL_DEVICE_NODE;
+	/* A remote device is its own host's to hold: usbredirect there takes it. */
+	return device->kind != HULL_DEVICE_NODE && device->remote[0] == '\0';
 }
 
 const char *hull_hostdev_claim(const void *owner, const hull_device *devices, unsigned count,

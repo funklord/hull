@@ -222,6 +222,7 @@ struct hull_machine {
 	int              segment_fd[MAX_SEGMENTS];  /* their ports, until qemu has them */
 	unsigned         segment_count;
 	pid_t            passt;        /* passt's daemon, by the socket it holds, or 0 */
+	pid_t            redir[HULL_MAX_DEVICES]; /* a remote USB device's ssh, or 0 */
 	pid_t            qemu;
 	int              keep;         /* (on_disconnect keep): qemu outlives the core */
 	int              adopted;      /* taken back: qemu is not this process's child */
@@ -313,6 +314,7 @@ static const hull_host_ops *host;
 static void *forward_ports(void *arg);
 static int handshake(hull_machine *m);
 static void kill_qemu(hull_machine *m);
+static const char *start_redirects(hull_machine *m);
 static void start_forwarder(hull_machine *m);
 
 static hull_status fail(hull_error *error, hull_status code, const char *detail)
@@ -451,8 +453,11 @@ static const char *read_secrets(hull_machine *m, const hull_sexpr_doc *doc,
 	return reason;
 }
 
+static void end_redirects(hull_machine *m);
+
 static void release(hull_machine *m)
 {
+	end_redirects(m);
 	hull_root_ungrant(m->device, m->device_count, m->devices_dir);
 	hull_hostdev_unclaim(m);
 	/* A bridge's tap is persistent, so it goes with the machine here. */
@@ -2415,7 +2420,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 	char        fsdev[MAX_VOLUMES][9000];
 	char        device[MAX_VOLUMES][96];
 	char        path[8500];
-	char        device_chardev[HULL_MAX_DEVICES][600];
+	char        device_chardev[HULL_MAX_DEVICES][4300];
 	char        device_device[HULL_MAX_DEVICES][96];
 	char        shared_memory[96];
 	char        mmio[MICROVM_TRANSPORTS][128];
@@ -2627,6 +2632,20 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 				argv[n++] = "-device";
 				argv[n++] = "qemu-xhci,id=usb";
 				usb = 1;
+			}
+			/* A device on another host: usbredir's stream, the far
+			 * usbredirect's port forwarded by ssh to a socket here,
+			 * connected again until the far side listens. */
+			if (d->remote[0] != '\0') {
+				snprintf(device_chardev[i], sizeof device_chardev[i],
+				         "socket,id=ur%u,path=%s/usbredir-%u.sock,reconnect-ms=250", i, m->dir, i);
+				snprintf(device_device[i], sizeof device_device[i],
+				         "usb-redir,chardev=ur%u,bus=usb.0", i);
+				argv[n++] = "-chardev";
+				argv[n++] = device_chardev[i];
+				argv[n++] = "-device";
+				argv[n++] = device_device[i];
+				continue;
 			}
 			snprintf(device_device[i], sizeof device_device[i],
 			         "usb-host,bus=usb.0,hostbus=%u,hostport=%s", d->host.bus,
@@ -4197,6 +4216,69 @@ static const char *open_listeners(hull_machine *m)
 }
 
 /* Kill qemu, unless it has been reaped and its pid freed. */
+/*
+ * A USB device on another host, (devices (usb ... (host "[USER@]HOST"))):
+ * one ssh, the user's own with the user's config and keys, running
+ * usbredirect there on the device by its ids, listening on a port of that
+ * host's loopback, and forwarding that port to usbredir-N.sock in the
+ * machine's directory, which qemu's usb-redir connects to. A port taken
+ * there leaves usbredirect refusing and ssh gone, and the machine without
+ * the device; usbredirect's own message is in usbredir-N.log. 0, or why.
+ */
+static const char *start_redirects(hull_machine *m)
+{
+	for (unsigned i = 0u; i < m->device_count; i++) {
+		const hull_device *d = &m->device[i];
+		char               forward[4400];
+		char               id[24];
+		char               at[32];
+		char               log[4300];
+		unsigned           port = 20000u + (unsigned)(((unsigned)getpid() * 131u + i * 7919u +
+		                                               (unsigned)time(NULL)) % 40000u);
+		pid_t              child;
+
+		if (d->kind != HULL_DEVICE_USB || d->remote[0] == '\0')
+			continue;
+		snprintf(forward, sizeof forward, "%s/usbredir-%u.sock:127.0.0.1:%u", m->dir, i, port);
+		snprintf(id, sizeof id, "%s:%s", d->vendor, d->product);
+		snprintf(at, sizeof at, "127.0.0.1:%u", port);
+		snprintf(log, sizeof log, "%s/usbredir-%u.log", m->dir, i);
+		if (strlen(m->dir) + sizeof "/usbredir-00.sock" > sizeof ((struct sockaddr_un *)0)->sun_path)
+			return "the machine's directory is too long for a socket for its remote USB device";
+		child = fork();
+		if (child < 0)
+			return "ssh for a remote USB device could not be started";
+		if (child == 0) {
+			int null = open("/dev/null", O_RDONLY | O_CLOEXEC);
+			int out = open(log, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+
+			if (null < 0 || out < 0 || dup2(null, 0) < 0 || dup2(out, 1) < 0 || dup2(out, 2) < 0 ||
+			    setsid() < 0)
+				_exit(126);
+			execlp("ssh", "ssh", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
+			       "-o", "StreamLocalBindUnlink=yes", "-o", "ServerAliveInterval=15",
+			       "-L", forward, d->remote, "--", "usbredirect", "--device", id, "--as", at,
+			       (char *)NULL);
+			_exit(127);
+		}
+		m->redir[i] = child;
+	}
+	return NULL;
+}
+
+/* Each remote USB device's ssh, and so its far usbredirect, ended. */
+static void end_redirects(hull_machine *m)
+{
+	for (unsigned i = 0u; i < HULL_MAX_DEVICES; i++) {
+		if (m->redir[i] <= 0)
+			continue;
+		kill(-m->redir[i], SIGTERM);
+		kill(m->redir[i], SIGTERM);
+		waitpid(m->redir[i], NULL, 0);
+		m->redir[i] = 0;
+	}
+}
+
 static void kill_qemu(hull_machine *m)
 {
 	pthread_mutex_lock(&m->lock);
@@ -4641,7 +4723,8 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	/* Its devices as the host has them now: a board is plugged in, reset
 	 * and plugged in again between a plan and a start. */
 	for (unsigned i = 0u; i < m->device_count; i++)
-		if (hull_hostdev_find(&m->device[i], m->detail, sizeof m->detail) != NULL)
+		if (m->device[i].remote[0] == '\0' &&
+		    hull_hostdev_find(&m->device[i], m->detail, sizeof m->detail) != NULL)
 			return fail(error, HULL_ERR_RUNTIME, m->detail);
 	if (m->devices_root[0] != '\0' &&
 	    hull_root_grant(m->devices_root, m->plan, m->plan_length, m->device, m->device_count,
@@ -4677,6 +4760,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		break;
 	}
 	if ((reason = make_dir(m)) != NULL ||
+	    (reason = start_redirects(m)) != NULL ||
 	    (m->block_root && (reason = build_root_image(m)) != NULL) ||
 	    (m->sleep && (reason = make_swap(m)) != NULL) ||
 	    (reason = write_initramfs(m, mbuf, load_modules)) != NULL ||

@@ -412,7 +412,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: esp-qemu-lora check-tsan
-.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-usb check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-usb check-usbredir check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -533,6 +533,7 @@ help:
 	@echo '  check-root    root mode'"'"'s native grants, hull-root setuid, inside a vm'
 	@echo '  check-systemd systemd as a chroot machine'"'"'s init in a delegated cgroup, inside a vm'
 	@echo '  check-vfio    a PCI device by VFIO, to chroot and a nested vm, inside a vm with an IOMMU'
+	@echo '  check-usbredir a USB device on another host given to a vm by usbredir over ssh'
 	@echo '  check-usb     a USB device followed by chroot as it re-enumerates, inside a vm'
 	@echo '  check-board   microcontroller boards (Uno, STM32, 8051, ESP32s) booted from firmware as pc machines'
 	@echo '  check-tsan    the pc and board suites under ThreadSanitizer, failing on any report'
@@ -1156,6 +1157,12 @@ check-vfio: $(HULL) $(AGENT_BIN) $(PROBE)
 
 # A USB device that re-enumerates while a chroot machine has it, made of
 # dummy_hcd and a configfs gadget inside a vm of hull's own.
+# A USB device on another host given to a vm by usbredir over ssh, the far
+# host a vm of hull's own with a gadget, Debian's usbredirect and an sshd,
+# the vm given it nested inside. Needs KVM nested and the network once.
+check-usbredir: $(HULL) $(AGENT_BIN)
+	BUILD_DIR='$(BUILD_DIR)' sh test/usbredir_test.sh '$(HULL)'
+
 check-usb: $(HULL) $(AGENT_BIN) $(PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/usb_test.sh '$(HULL)' '$(PROBE)'
 

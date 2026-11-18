@@ -53,6 +53,7 @@ typedef struct hull_device {
 	char             port[32];
 	char             path[256];  /* serial, parallel, node: the path given; pci: the address */
 	int              root;       /* named under (devices (root ...)): root mode's to give */
+	char             remote[256]; /* USB: (host "[USER@]HOST"), the host it is plugged into, or "" */
 	hull_hostdev     host;
 } hull_device;
 

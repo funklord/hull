@@ -602,8 +602,9 @@ again:
 				if (copy_value(doc, &item, "vendor", d->vendor, sizeof d->vendor) < 0 ||
 				    copy_value(doc, &item, "product", d->product, sizeof d->product) < 0 ||
 				    copy_value(doc, &item, "serial", d->serial, sizeof d->serial) < 0 ||
-				    copy_value(doc, &item, "port", d->port, sizeof d->port) < 0)
-					return "a USB device's serial or port is too long";
+				    copy_value(doc, &item, "port", d->port, sizeof d->port) < 0 ||
+				    copy_value(doc, &item, "host", d->remote, sizeof d->remote) < 0)
+					return "a USB device's serial, port or host is too long";
 			} else {
 				char *text = hull_access_text(doc, &item);
 
