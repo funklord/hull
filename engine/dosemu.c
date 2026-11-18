@@ -12,7 +12,7 @@
  * not take those. It runs H:\HULL.BAT from the engine's own
  * directory (-K, -E): LREDIR H: and each volume at its letter, read-only
  * where the volume is, SET for each env entry, C: and the workdir, the
- * command by CALL with its DOS output redirected to H:\OUT.TXT, then
+ * command by COMMAND /C with its DOS output redirected to H:\OUT.TXT, then
  * S%ERRORLEVEL% into H:\STATUS.TXT and exitemu. The status is read from
  * the batch's file rather than dosemu2's exit, which has codes of its
  * own for its own failures.
@@ -74,7 +74,11 @@ static int write_files(const hull_machine *m)
 	ADD("C:\r\ncd \\");
 	for (const char *c = m->workdir + (m->workdir[0] == '/'); *c != '\0'; c++)
 		ADD("%c", *c == '/' ? '\\' : *c);
-	ADD("\r\ncall");
+	/* By COMMAND /C, not CALL: comcom64 sends no redirection into a
+	 * CALLed batch, whose output went to the console and OUT.TXT stayed
+	 * empty (measured 2026-11-18); a child shell's takes it, and hands
+	 * the errorlevel back, a batch's last program's included. */
+	ADD("\r\ncommand /c");
 	for (unsigned i = 0u; i < HULL_DOS_MAX_ARGS && m->argv[i] != NULL; i++)
 		ADD(" %s", m->argv[i]);
 	ADD(" > H:\\OUT.TXT\r\necho S%%ERRORLEVEL%%>H:\\STATUS.TXT\r\nexitemu %%ERRORLEVEL%%\r\n");
@@ -91,6 +95,9 @@ static int write_files(const hull_machine *m)
 	free(text);
 	return ok ? 0 : -1;
 }
+
+/* The dosemu2 commit `make dosemu2` builds. */
+#define HULL_DOSEMU2_REV "7e7f3da"
 
 static void exec_child(const hull_machine *m)
 {
@@ -110,8 +117,21 @@ static void exec_child(const hull_machine *m)
 		at += (size_t)snprintf(paths + at, sizeof paths - at, " %s", m->media_host[i]);
 	snprintf(setting, sizeof setting, "lredir_paths \"%s\"", paths);
 	snprintf(home, sizeof home, "HOME=%s", m->dir);
-	snprintf(path_entry, sizeof path_entry, "PATH=%s",
-	         path != NULL ? path : "/usr/local/bin:/usr/bin:/bin");
+	/* dosemu2 as `make dosemu2` built it into the user's cache, its
+	 * paths compiled in, before the PATH's. */
+	{
+		const char *cache = getenv("XDG_CACHE_HOME");
+		const char *home = getenv("HOME");
+		char        bin[4200];
+
+		bin[0] = '\0';
+		if (cache != NULL && cache[0] == '/')
+			snprintf(bin, sizeof bin, "%s/hull/dosemu2-%s/bin", cache, HULL_DOSEMU2_REV);
+		else if (home != NULL && home[0] == '/')
+			snprintf(bin, sizeof bin, "%s/.cache/hull/dosemu2-%s/bin", home, HULL_DOSEMU2_REV);
+		snprintf(path_entry, sizeof path_entry, "PATH=%s%s%s", bin,
+		         bin[0] != '\0' ? ":" : "", path != NULL ? path : "/usr/local/bin:/usr/bin:/bin");
+	}
 	if (mkdir(local, 0700) != 0)
 		return;
 	{
@@ -167,9 +187,9 @@ static const hull_cap_entry entries[] = {
 	{ "writeback.none",     HULL_SUP_NATIVE,   NULL, NULL },
 
 	{ "command",            HULL_SUP_EMULATED,
-	  "a DOS command line, run by CALL from a batch of hull's under FreeDOS: what a program "
-	  "writes through DOS is its output, redirected, not what it draws on the screen; a "
-	  "command not found ends 127", NULL },
+	  "a DOS command line, run by COMMAND /C from a batch of hull's under FreeDOS: what a "
+	  "program or a batch writes through DOS is its output, redirected, not what it draws on "
+	  "the screen; a command not found ends 127", NULL },
 	{ "workdir",            HULL_SUP_NATIVE,   "a directory of C:", NULL },
 	{ "env",                HULL_SUP_NATIVE,   "SET in the batch", NULL },
 	{ "volumes",            HULL_SUP_NATIVE,

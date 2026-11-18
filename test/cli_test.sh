@@ -708,6 +708,11 @@ mkdir -p "$root/rootfs/srv"
 # ~/.ssh public keys for (ssh true)'s authorized_keys (section 8.1), and it
 # must read a known, benign key rather than whatever the account has. Set
 # before the first run below, which starts the core that reads it.
+# dosemu2 where `make dosemu2` built it, in the user's cache, before HOME
+# is the suite's: on the PATH, which the core and so the engine inherit.
+user_cache=${XDG_CACHE_HOME:-$HOME/.cache}
+[ ! -x "$user_cache/hull/dosemu2-7e7f3da/bin/dosemu" ] ||
+	PATH=$user_cache/hull/dosemu2-7e7f3da/bin:$PATH
 export HOME="$root/home"
 # And its config, where pools.conf is read (section 4.12), whatever the
 # account's XDG_CONFIG_HOME says.
@@ -4640,6 +4645,10 @@ mkdir -p "$root/dosroot" "$root/dosvol" "$root/home"
 printf '\264\011\272\014\001\315\041\270\000\114\315\041hello from dos\r\n$' > "$root/dosroot/HELLO.COM"
 printf '\270\003\114\315\041' > "$root/dosroot/EXIT3.COM"
 printf '\353\376' > "$root/dosroot/LOOP.COM"
+# HI.BAT: a batch running two programs, the line HELLO prints and EXIT3's
+# 3 both to come back -- under dosemu2 a CALLed batch's output was lost,
+# its redirection not reaching it (2026-11-18).
+printf '@echo off\r\nHELLO\r\nEXIT3\r\n' > "$root/dosroot/HI.BAT"
 # MEM.COM: the XMS driver's total free memory -- its entry by INT 2Fh
 # AX=4310h, function 08h, DX in KB -- shifted to MB and ended with as its
 # ERRORLEVEL. INT 15h AH=88h says none where an XMS driver holds it, as
@@ -4696,6 +4705,7 @@ for dosengine in dosbox dosemu; do
 	}
 	dosconf doshello '(command "HELLO")'
 	dosconf dosexit '(command "EXIT3")'
+	dosconf dosbat '(command "HI.BAT")'
 	dosconf dosvol '(volumes (volume (host "./dosvol") (guest "/g") (mode ro))) (command "TYPE" "G:\\IN.TXT")'
 	dosconf dosenv '(env (GREETING "hi")) (command "SET")'
 	dosconf dosnone '(command "NOSUCH")'
@@ -4708,6 +4718,10 @@ for dosengine in dosbox dosemu; do
 	limit=90
 	from_root 0 '^hello from dos' -f "$root/doshello.conf"
 	from_root 3 '' -f "$root/dosexit.conf"
+	# A batch's own output: dosemu2's by COMMAND /C. DOSBox redirects none
+	# into a CALLed batch, as it declares, and its COMMAND /C, which does,
+	# hands back no errorlevel (EXIT3 ended 0, 2026-11-18), so it keeps CALL.
+	[ "$dosengine" != dosemu ] || from_root 3 '^hello from dos' -f "$root/dosbat.conf"
 	from_root 0 '^from a volume' -f "$root/dosvol.conf"
 	from_root 0 '^GREETING=hi' -f "$root/dosenv.conf"
 	from_root 127 "$dosnone" -f "$root/dosnone.conf"
@@ -4866,7 +4880,7 @@ for dosengine in dosbox dosemu; do
 	[ ! -e "$HOME/.dosbox" ] && [ ! -e "$HOME/.dosemu" ] && [ ! -e "$HOME/.config/pulse" ] ||
 		fail "$dosengine wrote into the user's HOME" "$(ls -A "$HOME")"
 	cases=$((cases + 1))
-	[ -z "$(ls -A "$root/dosroot" | grep -vxE 'HELLO\.COM|EXIT3\.COM|LOOP\.COM|CDCHK\.COM|AUDINFO\.COM|MEM\.COM')" ] ||
+	[ -z "$(ls -A "$root/dosroot" | grep -vxE 'HELLO\.COM|EXIT3\.COM|LOOP\.COM|HI\.BAT|CDCHK\.COM|AUDINFO\.COM|MEM\.COM')" ] ||
 		fail "$dosengine left something in the user's C:" "$(ls -A "$root/dosroot")"
 	cases=$((cases + 1))
 	left=$(ls -d "$XDG_RUNTIME_DIR"/hull/"$dosengine"-* 2> /dev/null)

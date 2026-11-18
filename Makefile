@@ -426,7 +426,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: esp-qemu-lora check-tsan
-.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-usb check-usbredir check-vhost vhost-device cross-ppc64le qemu-ppc check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-usb check-usbredir check-vhost vhost-device dosemu2 cross-ppc64le qemu-ppc check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -549,6 +549,7 @@ help:
 	@echo '  check-vfio    a PCI device by VFIO, to chroot and a nested vm, inside a vm with an IOMMU'
 	@echo '  check-vhost   a GPIO chip and an I2C bus of a host given to a vm, by vhost-device'
 	@echo '  vhost-device  rust-vmm'"'"'s GPIO and I2C daemons, built by cargo (fetches)'
+	@echo '  dosemu2       dosemu2 and its chain built from source into the user'"'"'s cache (fetches)'
 	@echo '  cross-ppc64le Debian'"'"'s ppc64el libc for clang to build the ppc64le agent (fetches)'
 	@echo '  qemu-ppc      Debian'"'"'s qemu-system-ppc, unpacked into the user'"'"'s cache (fetches)'
 	@echo '  check-usbredir a USB device on another host given to a vm by usbredir over ssh'
@@ -1183,6 +1184,15 @@ check-vfio: $(HULL) $(AGENT_BIN) $(PROBE)
 
 # A USB device that re-enumerates while a chroot machine has it, made of
 # dummy_hcd and a configfs gadget inside a vm of hull's own.
+# dosemu2 and its chain -- thunk_gen, fdpp, djstub, djdev64, dj64dev,
+# comcom64 -- from pinned commits into the user's cache, as the user, by
+# tool/dosemu2_build.sh: not packaged for Debian 13. Its paths are
+# compiled in, so it is built where it stays. Needs the build dependencies
+# the script names, and fetches.
+DOSEMU2_ROOT := $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/hull/dosemu2-7e7f3da
+dosemu2:
+	bash tool/dosemu2_build.sh '$(DOSEMU2_ROOT)'
+
 # Debian's ppc64el libc, unpacked from its cross packages into the user's
 # cache for clang to build the ppc64le agent against; and Debian's
 # qemu-system-ppc at the installed qemu's version, unpacked into the cache
