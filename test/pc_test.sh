@@ -482,6 +482,61 @@ INIT
 	status 'Secure Boot on the older machine is refused' "$?" 125 "$out"
 	says 'and said to be q35'"'"'s' "$out" '(machine q35)'
 
+	# (medium (type usb)): a USB stick, removable usb-storage on an xHCI,
+	# which Windows Setup searches for its answer file. The guest's own
+	# kernel, given the host's USB and SCSI modules, finds a removable disk
+	# and reads the stick's first bytes; a type pc does not list is
+	# refused at plan.
+	mods=/lib/modules/$(uname -r)/kernel
+	usbmods=
+	for m in usb/common/usb-common usb/core/usbcore usb/host/xhci-hcd usb/host/xhci-pci \
+	         scsi/scsi_common scsi/scsi_mod usb/storage/usb-storage scsi/sd_mod; do
+		f=$(ls "$mods/drivers/$m.ko"* 2> /dev/null | head -1)
+		[ -n "$f" ] || { usbmods=; break; }
+		case $f in
+		*.xz) xz -dc "$f" > "$tree/${m##*/}.ko" ;;
+		*) cp "$f" "$tree/${m##*/}.ko" ;;
+		esac
+		usbmods="$usbmods ${m##*/}"
+	done
+	{ printf 'HULLSTICK'; head -c 1048567 /dev/zero; } > "$root/stick.img"
+	if [ -z "$usbmods" ]; then
+		printf 'pc: a USB stick not tried: the host has no USB storage modules to give the guest\n'
+	else
+		{
+			printf '#!/bin/busybox sh\n'
+			printf '/bin/busybox mount -t proc proc /proc\n'
+			printf '/bin/busybox mount -t sysfs sys /sys\n'
+			printf '/bin/busybox mount -t devtmpfs none /dev\n'
+			for m in $usbmods; do printf '/bin/busybox insmod /%s.ko\n' "$m"; done
+			# The boot disk is a disk too, on q35's AHCI: the stick is
+			# the removable one.
+			printf 'for i in 1 2 3 4 5 6 7 8 9 10; do\n'
+			printf '  for d in /sys/block/sd*; do\n'
+			printf '    [ "$(/bin/busybox cat $d/removable)" = 1 ] || continue\n'
+			printf '    echo removable=1; echo "stick=$(/bin/busybox head -c 9 /dev/${d##*/})"; i=done; break\n'
+			printf '  done\n'
+			printf '  [ "$i" = done ] && break; /bin/busybox sleep 1\n'
+			printf 'done\n'
+			printf '/bin/busybox poweroff -f\n'
+		} > "$tree/init.sh"
+		out=$(timeout 120 "$hull" export --bootable "$tree" "$root/usb.img" --init /init.sh 2>&1)
+		status 'a bootable export for the USB stick' "$?" 0 "$out"
+		conf '(source "image:./usb.img") (memory "512M")' \
+			'(media (medium (type usb) (source "image:./stick.img")))' \
+			'(tuning (pc (machine q35) (firmware uefi)))'
+		out=$(timeout 120 "$hull" run -f "$root/hull.conf" 2>&1)
+		status 'a machine with a USB stick' "$?" 0 "$out"
+		says 'its kernel found a removable disk' "$out" 'removable=1'
+		says 'and read the stick' "$out" 'stick=HULLSTICK'
+		for f in $usbmods; do rm -f "$tree/$f.ko"; done
+	fi
+	conf '(source "image:./stick.img") (memory "512M")' \
+		'(media (medium (type tape) (source "image:./stick.img")))'
+	out=$(timeout 30 "$hull" run -f "$root/hull.conf" 2>&1)
+	status 'a medium of a type pc does not list is refused' "$?" 125 "$out"
+	says 'at plan' "$out" 'does not list this medium type'
+
 	# (boot_key N): Enter, pressed on the machine's keyboard once a second,
 	# as a UEFI disc's "Press any key to boot from CD" wants and nobody is
 	# there to give. The guest's own kernel reads its first virtual

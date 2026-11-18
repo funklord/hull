@@ -75,7 +75,7 @@
 #include "86box.h"
 
 #define PC_MAX_MEDIA 6u    /* four on IDE, two floppy drives */
-#define PC_MAX_ARGS  120u
+#define PC_MAX_ARGS  140u  /* a USB stick takes four, an IDE medium two */
 #define PC_MAX_CARDS 4u    /* (devices (pci ...)), within PC_MAX_ARGS */
 #define SECURE_CODE  "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"
 #define SECURE_VARS  "/usr/share/OVMF/OVMF_VARS_4M.ms.fd"
@@ -795,10 +795,14 @@ static const char *read_media(hull_machine *m, const hull_sexpr_doc *doc,
 		char       *path = image || dir ? hull_access_path(doc, source + (image ? 6 : 4)) : NULL;
 		medium     *d = &m->media[m->media_count];
 		int         kind = type == NULL ? 0 : strcmp(type, "cdrom") == 0 ? 'c' :
-		                   strcmp(type, "disk") == 0 ? 'd' : 'f';
+		                   strcmp(type, "disk") == 0 ? 'd' : strcmp(type, "floppy") == 0 ? 'f' :
+		                   strcmp(type, "usb") == 0 ? 'u' : 0;
 		const char *wrong = NULL;
 
-		if (path == NULL)
+		/* Any other word had been taken for a floppy, silently. */
+		if (kind == 0)
+			wrong = "a medium's type is cdrom, disk, floppy or usb";
+		else if (path == NULL)
 			wrong = "a pc machine's medium is a dir: collection or an image:";
 		else if (image)
 			wrong = add_image(m, kind, path);
@@ -1164,6 +1168,9 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 		return "the plan gives (display vnc) no address";
 	if ((wrong = read_media(m, doc, machine)) != NULL)
 		return wrong;
+	for (unsigned i = 0u; m->box && i < m->media_count; i++)
+		if (m->media[i].type == 'u')
+			return "86Box is given no USB stick here: its media are IDE disks, a CD and floppies";
 	for (unsigned i = 0u; i < m->media_count; i++)
 		if (m->media[i].type == wanted)
 			return NULL;
@@ -1374,6 +1381,7 @@ static void exec_pc(const hull_machine *m)
 	unsigned ide = 0u;
 	unsigned floppy = 0u;
 	unsigned cdrom = 0u;
+	unsigned sticks = 0u;
 	char     boot[16];
 	const char *accel = m->accel != NULL ? m->accel : "auto";
 
@@ -1559,7 +1567,7 @@ static void exec_pc(const hull_machine *m)
 		}
 		snprintf(head, sizeof head, "%s,format=%s%s%s,file=",
 		         d->type == 'f' ? "if=floppy" : d->type == 'c' ? "if=ide,media=cdrom" :
-		         "if=ide,media=disk", d->path == NULL ? "raw" : d->format,
+		         d->type == 'u' ? "if=none" : "if=ide,media=disk", d->path == NULL ? "raw" : d->format,
 		         d->type == 'c' ? ",readonly=on" : "",
 		         d->type != 'c' && d->path != NULL && !m->direct ? ",snapshot=on" : "");
 		if ((drive = option(head, path)) == NULL)
@@ -1570,6 +1578,25 @@ static void exec_pc(const hull_machine *m)
 
 			if (indexed == NULL)
 				return;
+			/* A USB stick: usb-storage on an xHCI of its own, made
+			 * removable, which is the media Windows Setup searches for
+			 * its answer file. */
+			if (d->type == 'u') {
+				sprintf(indexed, "%s,id=stick%u", drive, sticks);
+				argv[n++] = "-drive";
+				argv[n++] = indexed;
+				if (sticks == 0u) {
+					argv[n++] = "-device";
+					argv[n++] = "qemu-xhci,id=sticks";
+				}
+				if ((indexed = malloc(64u)) == NULL)
+					return;
+				snprintf(indexed, 64u, "usb-storage,bus=sticks.0,drive=stick%u,removable=on", sticks);
+				sticks++;
+				argv[n++] = "-device";
+				argv[n++] = indexed;
+				continue;
+			}
 			/* What change_medium() calls it, for a removable one. */
 			if (d->type == 'f')
 				sprintf(indexed, "%s,index=%u,id=floppy%u", drive, floppy, floppy);
@@ -2897,7 +2924,7 @@ static const hull_cap_entry entries[] = {
 };
 
 static const char *const classes[] = { "pc", NULL };
-static const char *const media[]   = { "cdrom", "floppy", "disk", NULL };
+static const char *const media[]   = { "cdrom", "floppy", "disk", "usb", NULL };
 
 static const hull_capabilities caps = {
 	.struct_size    = sizeof (hull_capabilities),
@@ -2947,7 +2974,8 @@ static const hull_cap_entry box_entries[] = {
 	  NULL },
 	{ "writeback.none",     HULL_SUP_NATIVE,   NULL, NULL },
 	{ "media",              HULL_SUP_NATIVE,   NULL, NULL },
-	{ "media.image",        HULL_SUP_NATIVE,   "a floppy, disk or CD image by its path", NULL },
+	{ "media.image",        HULL_SUP_NATIVE,   "a floppy, disk or CD image by its path, or a USB "
+	  "stick's, (type usb), removable usb-storage on an xHCI of its own", NULL },
 	{ "network.none",       HULL_SUP_NATIVE,   NULL, NULL },
 	{ "display.window",     HULL_SUP_NATIVE,
 	  "86Box's own window on the X display the run was given", NULL },
