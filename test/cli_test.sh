@@ -4887,5 +4887,58 @@ for dosengine in dosbox dosemu; do
 	[ -z "$left" ] || fail "$dosengine machines left their directories" "$left"
 done
 
+# hull setup windows: a machine directory that installs Windows from the
+# user's own disc unattended -- answer files on a USB stick of FAT with
+# their long names, a disk, the install's spec and the machine's -- and
+# refuses a directory there already, a HOME with no public key, an
+# account name Windows would not take and a disc not there. Windows
+# itself is not installed here: there is no disc of it on this host.
+if command -v mformat > /dev/null && command -v mcopy > /dev/null && command -v qemu-img > /dev/null; then
+	rm -rf "$root/setup"
+	mkdir -p "$root/setup/home/.ssh" "$root/setup/nokeys"
+	ssh-keygen -q -t ed25519 -N '' -C hull-setup-test -f "$root/setup/home/.ssh/id_ed25519"
+	head -c 4096 /dev/zero > "$root/setup/win.iso"
+	expect 0 'install.conf installs Windows' \
+		env HOME="$root/setup/home" "$hull" setup windows --index 3 --user ann "$root/setup/win.iso" "$root/setup/w"
+	cases=$((cases + 1))
+	listed=$(mdir -b -i "$root/setup/w/answer.img" :: 2> /dev/null | sed 's|^::/||' | sort | tr '\n' ' ')
+	[ "$listed" = 'authorized_keys autounattend.xml hull-setup.ps1 ' ] ||
+		fail "the answer stick does not hold its three files by their long names" "$listed"
+	cases=$((cases + 1))
+	python3 -c '
+import sys, xml.dom.minidom as m
+d = m.parse(sys.argv[1])
+values = [n.firstChild.data for n in d.getElementsByTagName("Value")]
+assert values[0] == "3", values
+assert d.getElementsByTagName("Name")[0].firstChild.data == "ann"
+assert values[1] == open(sys.argv[2]).read().strip()' \
+		"$root/setup/w/answer/autounattend.xml" "$root/setup/w/password" 2> /dev/null ||
+		fail "the answer file is not XML naming the edition, the account and its password" \
+			"$(cat "$root/setup/w/answer/autounattend.xml")"
+	cases=$((cases + 1))
+	grep -qx 'ssh-ed25519 .* hull-setup-test' "$root/setup/w/answer/authorized_keys" ||
+		fail "the user's public key is not what the machine's OpenSSH server lets in" \
+			"$(cat "$root/setup/w/answer/authorized_keys")"
+	cases=$((cases + 1))
+	[ "$(stat -c %a "$root/setup/w/password")" = 600 ] ||
+		fail "the account's password is open to others" "$(ls -l "$root/setup/w/password")"
+	expect 0 'machine on qemu-pc \(pc\): ok$' "$hull" check -f "$root/setup/w/install.conf" --backend pc
+	expect 0 'machine on qemu-pc \(pc\): ok$' "$hull" check -f "$root/setup/w/machine.conf" --backend pc
+	expect 1 'setup makes a directory of its own' \
+		env HOME="$root/setup/home" "$hull" setup windows "$root/setup/win.iso" "$root/setup/w"
+	expect 1 'no public key in ~/.ssh' \
+		env HOME="$root/setup/nokeys" "$hull" setup windows "$root/setup/win.iso" "$root/setup/w2"
+	expect 1 'an account name is 1 to 20' \
+		env HOME="$root/setup/home" "$hull" setup windows --user 'a b' "$root/setup/win.iso" "$root/setup/w3"
+	expect 1 'not a disc image' \
+		env HOME="$root/setup/home" "$hull" setup windows "$root/setup/nope.iso" "$root/setup/w4"
+	cases=$((cases + 1))
+	[ ! -e "$root/setup/w2" ] && [ ! -e "$root/setup/w3" ] && [ ! -e "$root/setup/w4" ] ||
+		fail "a refused setup left a directory" "$(ls "$root/setup")"
+	rm -rf "${root:?}/setup"
+else
+	printf 'cli: hull setup windows not tried: no mtools or qemu-img\n'
+fi
+
 printf 'cli: %u cases, %u failed\n' "$cases" "$failures"
 [ "$failures" -eq 0 ]

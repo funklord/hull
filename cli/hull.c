@@ -69,6 +69,7 @@
 #include "vbox_host.h"
 #include "esp_fetch.h"
 #include "86box_fetch.h"
+#include "setup.h"
 #include "import.h"
 #include "dial.h"
 #include "matrix.h"
@@ -169,6 +170,7 @@ static void usage(FILE *out)
 	      "       hull key ID KEY... | hull type ID TEXT | hull screenshot ID FILE\n"
 	      "       hull board ls POOL | hull board fix NAME\n"
 	      "       hull vagrant box add NAME FILE\n"
+	      "       hull setup windows [--index N] [--user NAME] ISO DIR\n"
 	      "       hull up [-f COMPOSE-FILE] [--backend B] [--profile P]... [NAME]\n"
 	      "       hull core\n"
 	      "       hull engines | hull doctor\n"
@@ -8681,6 +8683,40 @@ int main(int argc, char **argv)
 			fprintf(stderr, "hull: kernel fetch: %s\n", why);
 			return 1;
 		}
+		return 0;
+	}
+	/* `hull setup windows [--index N] [--user NAME] ISO DIR` (setup.c). */
+	if (strcmp(command, "setup") == 0 && argc >= 5 && strcmp(argv[2], "windows") == 0) {
+		char          why[4400] = "";
+		unsigned long index = 1ul;
+		const char   *user = "hull";
+		int           at = 3;
+
+		for (; at + 2 < argc; at += 2) {
+			char *end = NULL;
+
+			if (strcmp(argv[at], "--index") == 0) {
+				index = strtoul(argv[at + 1], &end, 10);
+				if (end == argv[at + 1] || *end != '\0' || index == 0ul || index > 99ul) {
+					fprintf(stderr, "hull: setup: --index is an edition's number, 1 to 99\n");
+					return 2;
+				}
+			} else if (strcmp(argv[at], "--user") == 0) {
+				user = argv[at + 1];
+			} else {
+				break;
+			}
+		}
+		if (at + 2 != argc) {
+			fprintf(stderr, "usage: hull setup windows [--index N] [--user NAME] ISO DIR\n");
+			return 2;
+		}
+		if (hull_setup_windows(argv[at], argv[at + 1], (unsigned)index, user, why, sizeof why) != 0) {
+			fprintf(stderr, "hull: setup: %s\n", why);
+			return 1;
+		}
+		printf("%s: hull run -f %s/install.conf installs Windows, unattended, and powers off; "
+		       "then hull run -f %s/machine.conf\n", argv[at + 1], argv[at + 1], argv[at + 1]);
 		return 0;
 	}
 	if (strcmp(command, "vagrant") == 0 && argc == 6 && strcmp(argv[2], "box") == 0 &&
