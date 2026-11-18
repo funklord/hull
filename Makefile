@@ -376,6 +376,20 @@ AGENT_S390X := $(if $(shell command -v $(S390X_CC) 2>/dev/null),$(BUILD_DIR)/hul
 ARM_CC    ?= arm-linux-gnueabihf-gcc
 ARM_PROBE := $(if $(shell command -v $(ARM_CC) 2>/dev/null),$(BUILD_DIR)/test/arm/rootfs/probe)
 AGENT_ARM := $(if $(shell command -v $(ARM_CC) 2>/dev/null),$(BUILD_DIR)/hull-agent-arm)
+# And 64-bit little-endian POWER's, for a ppc64le machine under emu: Debian's
+# cross gcc where it is installed, else clang, which targets it already,
+# against Debian's ppc64el libc that `make cross-ppc64le` unpacks into the
+# user's cache, linked by lld.
+PPC64LE_SYSROOT := $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/hull/cross-ppc64el
+PPC64LE_GCCDIR  := $(PPC64LE_SYSROOT)/usr/lib/gcc-cross/powerpc64le-linux-gnu/14
+PPC64LE_LLD     := $(firstword $(shell for l in ld.lld ld.lld-19; do command -v $$l; done 2>/dev/null))
+PPC64LE_CC ?= $(if $(shell command -v powerpc64le-linux-gnu-gcc 2>/dev/null),powerpc64le-linux-gnu-gcc,$(if \
+	$(and $(wildcard $(PPC64LE_SYSROOT)/usr/powerpc64le-linux-gnu/lib/libc.a),$(PPC64LE_LLD),$(shell command -v clang 2>/dev/null)),clang \
+	--target=powerpc64le-linux-gnu --sysroot=$(PPC64LE_SYSROOT)/usr/powerpc64le-linux-gnu \
+	-isystem $(PPC64LE_SYSROOT)/usr/powerpc64le-linux-gnu/include -B$(PPC64LE_GCCDIR) -L$(PPC64LE_GCCDIR) \
+	--ld-path=$(PPC64LE_LLD)))
+PPC64LE_PROBE := $(if $(PPC64LE_CC),$(BUILD_DIR)/test/ppc64le/rootfs/probe)
+AGENT_PPC64LE := $(if $(PPC64LE_CC),$(BUILD_DIR)/hull-agent-ppc64le)
 # And on a host that is not x86_64, arm64's or riscv64's, the agent for an
 # amd64 machine under emu, where x86_64's cross compiler is installed; on
 # an x86_64 host hull-agent is it.
@@ -412,13 +426,13 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: esp-qemu-lora check-tsan
-.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-usb check-usbredir check-vhost vhost-device check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-usb check-usbredir check-vhost vhost-device cross-ppc64le qemu-ppc check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
 # which is installed apart, as root: `make nss`, or `make install-nss`.
 all: $(SEXPR_OBJS) $(AGENT_OBJS) $(SPEC_OBJS) $(PLAN_OBJS) $(HULL) $(AGENT_BIN) $(AGENT_ARM64) \
-     $(AGENT_AMD64) $(AGENT_RISCV64) $(AGENT_S390X) $(AGENT_ARM)
+     $(AGENT_AMD64) $(AGENT_RISCV64) $(AGENT_S390X) $(AGENT_ARM) $(AGENT_PPC64LE)
 
 nss: $(NSS_LIB)
 
@@ -535,6 +549,8 @@ help:
 	@echo '  check-vfio    a PCI device by VFIO, to chroot and a nested vm, inside a vm with an IOMMU'
 	@echo '  check-vhost   a GPIO chip and an I2C bus of a host given to a vm, by vhost-device'
 	@echo '  vhost-device  rust-vmm'"'"'s GPIO and I2C daemons, built by cargo (fetches)'
+	@echo '  cross-ppc64le Debian'"'"'s ppc64el libc for clang to build the ppc64le agent (fetches)'
+	@echo '  qemu-ppc      Debian'"'"'s qemu-system-ppc, unpacked into the user'"'"'s cache (fetches)'
 	@echo '  check-usbredir a USB device on another host given to a vm by usbredir over ssh'
 	@echo '  check-usb     a USB device followed by chroot as it re-enumerates, inside a vm'
 	@echo '  check-board   microcontroller boards (Uno, STM32, 8051, ESP32s) booted from firmware as pc machines'
@@ -672,6 +688,10 @@ $(BUILD_DIR)/test/arm/rootfs/probe: test/probe.c
 	@mkdir -p '$(@D)/proc' '$(@D)/dev'
 	$(ARM_CC) -static $(CFLAGS) -o $@ $<
 
+$(BUILD_DIR)/test/ppc64le/rootfs/probe: test/probe.c
+	@mkdir -p '$(@D)/proc' '$(@D)/dev'
+	$(PPC64LE_CC) -static $(CFLAGS) -o $@ $<
+
 $(HULL): $(CLI_OBJS) $(CORE_OBJS) $(ENGINE_OBJS) $(STORE_OBJS) $(OCI_OBJS) $(PLAN_OBJS) \
          $(SPEC_OBJS) $(SEXPR_OBJS)
 	$(CC) $(CFLAGS) -pthread -o $@ $^ $(PULL_LIBS)
@@ -765,6 +785,9 @@ $(BUILD_DIR)/hull-agent-s390x: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
 
 $(BUILD_DIR)/hull-agent-arm: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
 	$(ARM_CC) -static $(CPPFLAGS) $(CFLAGS) -o $@ $(AGENT_SOURCES)
+
+$(BUILD_DIR)/hull-agent-ppc64le: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
+	$(PPC64LE_CC) -static $(CPPFLAGS) $(CFLAGS) -o $@ $(AGENT_SOURCES)
 
 $(BUILD_DIR)/hull-agent-amd64: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
 	$(AMD64_CC) -static $(CPPFLAGS) $(CFLAGS) -o $@ $(AGENT_SOURCES)
@@ -977,7 +1000,8 @@ check-legacy: $(HULL) $(AGENT_BIN)
 	BUILD_DIR='$(BUILD_DIR)' sh test/legacy_test.sh '$(HULL)'
 
 check-qemu: $(HULL) $(AGENT_BIN) $(PROBE) $(AGENT_ARM64) $(ARM64_PROBE) $(AGENT_RISCV64) \
-            $(RISCV64_PROBE) $(AGENT_S390X) $(S390X_PROBE) $(AGENT_ARM) $(ARM_PROBE)
+            $(RISCV64_PROBE) $(AGENT_S390X) $(S390X_PROBE) $(AGENT_ARM) $(ARM_PROBE) \
+            $(AGENT_PPC64LE) $(PPC64LE_PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/qemu_test.sh '$(HULL)' '$(PROBE)'
 
 # A period's PC on 86Box, which `hull 86box fetch` puts in the cache: an
@@ -1159,6 +1183,24 @@ check-vfio: $(HULL) $(AGENT_BIN) $(PROBE)
 
 # A USB device that re-enumerates while a chroot machine has it, made of
 # dummy_hcd and a configfs gadget inside a vm of hull's own.
+# Debian's ppc64el libc, unpacked from its cross packages into the user's
+# cache for clang to build the ppc64le agent against; and Debian's
+# qemu-system-ppc at the installed qemu's version, unpacked into the cache
+# where the engine looks when it is not installed. Both fetch, and need no
+# root.
+cross-ppc64le:
+	@mkdir -p '$(PPC64LE_SYSROOT)/debs'
+	cd '$(PPC64LE_SYSROOT)/debs' && apt-get download libc6-dev-ppc64el-cross libc6-ppc64el-cross \
+		linux-libc-dev-ppc64el-cross libgcc-14-dev-ppc64el-cross libgcc-s1-ppc64el-cross
+	for deb in '$(PPC64LE_SYSROOT)'/debs/*.deb; do dpkg-deb -x "$$deb" '$(PPC64LE_SYSROOT)'; done
+
+QEMU_PPC_ROOT := $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/hull/qemu-system-ppc
+qemu-ppc:
+	@mkdir -p '$(QEMU_PPC_ROOT)/debs'
+	cd '$(QEMU_PPC_ROOT)/debs' && apt-get download \
+		"qemu-system-ppc=$$(dpkg-query -W -f '$${Version}' qemu-system-common)"
+	for deb in '$(QEMU_PPC_ROOT)'/debs/*.deb; do dpkg-deb -x "$$deb" '$(QEMU_PPC_ROOT)'; done
+
 # rust-vmm's vhost-device-gpio and vhost-device-i2c, which serve a vm a
 # GPIO chip or an I2C bus of the host's (section 4.13): built by cargo at a
 # pinned commit into the user's cache, where the qemu engine looks first,
@@ -1399,11 +1441,12 @@ clean:
 	        $(ENGINE_OBJS) $(ENGINE_OBJS:.o=.d) $(STORE_OBJS) $(STORE_OBJS:.o=.d) $(OCI_OBJS) $(OCI_OBJS:.o=.d) $(CLI_OBJS) $(CLI_OBJS:.o=.d) $(HULL) $(ROOT_BIN) \
 	        $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(FRONTEND_GEN) $(PROTOCOL_GEN) $(DISC_GEN) $(FRAME_GEN) \
 	        $(AGENT_BIN) $(BUILD_DIR)/hull-agent-arm64 $(BUILD_DIR)/hull-agent-amd64 \
-	        $(BUILD_DIR)/hull-agent-riscv64 $(BUILD_DIR)/hull-agent-s390x $(BUILD_DIR)/hull-agent-arm $(KERNEL_BIN) \
+	        $(BUILD_DIR)/hull-agent-riscv64 $(BUILD_DIR)/hull-agent-s390x $(BUILD_DIR)/hull-agent-arm $(BUILD_DIR)/hull-agent-ppc64le $(KERNEL_BIN) \
 	        $(LIMINE_FILES) \
 	        $(BUILD_DIR)/agent/agent.o $(BUILD_DIR)/agent/agent.d $(GEN_DIR)/commit.h \
 	        $(CLI_TEST_FILES) $(PROBE) $(BUILD_DIR)/test/arm64/rootfs/probe \
 	        $(BUILD_DIR)/test/riscv64/rootfs/probe $(BUILD_DIR)/test/s390x/rootfs/probe \
+	        $(BUILD_DIR)/test/ppc64le/rootfs/probe \
 	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) $(SYSTEMD_TEST_FILES) $(VFIO_TEST_FILES) $(USB_TEST_FILES) $(BOARD_TEST_FILES) \
 	        $(FUZZ_FILES) \
 	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor $(CLIENT_LIB) $(GUI_BIN) \

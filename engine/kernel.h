@@ -59,6 +59,12 @@ static const hull_kernel_pin hull_kernel_pins[] = {
 	/* 32-bit ARM's, armhf's multiplatform kernel, unsigned by nobody, the
 	 * sha256 checked against the snapshot's armhf Packages index,
 	 * 2026-11-13. */
+	/* 64-bit little-endian POWER's, unsigned by nobody, the sha256 the
+	 * same in the snapshot's and the mirror's ppc64el Packages index,
+	 * 2026-11-18; Debian names it boot/vmlinux-RELEASE. */
+	{ "ppc64le", "6.12.107+deb13-powerpc64le",
+	  "l/linux/linux-image-6.12.107+deb13-powerpc64le_6.12.107-1_ppc64el.deb",
+	  "b31bd6d3a2e7e557702e9481a8957a7ea7dbbc533cc1d588519fcd40ecbdff8b", 80u, "vmlinux" },
 	{ "arm", "6.12.107+deb13-armmp",
 	  "l/linux/linux-image-6.12.107+deb13-armmp_6.12.107-1_armhf.deb",
 	  "9db6efc15fcc408acdc417911bdb7ac2c3ee0dd04fd1535a16b34744293a4380", 57u, "vmlinuz" },

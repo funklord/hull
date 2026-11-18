@@ -47,6 +47,9 @@ root=$(cd "$dir" && pwd)
 # fixture rather than the real ones. Exported so the core, started by the
 # first hull call below, has it. The ssh-config case below already used
 # this HOME per command.
+# The user's own cache, before HOME is the suite's: where `make qemu-ppc`
+# unpacked qemu-system-ppc64.
+user_cache=${XDG_CACHE_HOME:-$HOME/.cache}
 export HOME="$root/home"
 mkdir -p "$root/home/.ssh"
 chmod 700 "$root/home/.ssh"
@@ -3370,6 +3373,70 @@ else
 		done
 		rm -rf "${root:?}/szroot"
 	fi
+	# 64-bit little-endian POWER, 2026-11-18: qemu-system-ppc64's pseries
+	# booting Debian's powerpc64le kernel, the agent cross-built -- by clang
+	# where Debian's cross gcc is not installed -- and qemu-system-ppc64
+	# Debian's, installed or unpacked into the cache by `make qemu-ppc`.
+	ppc_probe=${BUILD_DIR:?}/test/ppc64le/rootfs/probe
+	ppc_qemu=$(command -v qemu-system-ppc64 2> /dev/null)
+	[ -n "$ppc_qemu" ] || [ ! -x "$user_cache/hull/qemu-system-ppc/usr/bin/qemu-system-ppc64" ] ||
+		ppc_qemu=cache
+	if [ -z "$ppc_qemu" ] || [ ! -x "$(dirname "$hull")/hull-agent-ppc64le" ] || [ ! -x "$ppc_probe" ]; then
+		printf 'qemu: ppc64le under emu not tried: no qemu-system-ppc64, hull-agent-ppc64le or ppc64le probe\n'
+	else
+		rm -rf "$root/p64root"
+		mkdir -p "$root/p64root/proc" "$root/p64root/dev" "$root/p64root/sys"
+		cp "$ppc_probe" "$root/p64root/probe"
+		printf '(machine (source "dir:./p64root") (backend emu) (arch ppc64le) (hostname "qp64") %s)\n' \
+			'(command "/probe" "say" "from ppc64le" "host" "read" "/proc/sys/kernel/arch" "exit" "5")' \
+			> "$root/p64.conf"
+		printf '(machine (source "dir:./p64root") (backend emu) (arch ppc64le) %s %s)\n' \
+			'(tuning (vm (kernel hull)))' '(command "/probe")' > "$root/p64hull.conf"
+		p64none=$(mktemp -d "$root/run-p64none.XXXXXX")
+		p64run=$(mktemp -d "$root/run-p64.XXXXXX")
+		# The runs' caches are the test's own, for the kernel fetch; a qemu
+		# unpacked into the user's cache is linked into each.
+		for c in "$root/cache-empty" "$root/cache"; do
+			mkdir -p "$c/hull"
+			[ "$ppc_qemu" != cache ] || [ -e "$c/hull/qemu-system-ppc" ] ||
+				ln -s "$user_cache/hull/qemu-system-ppc" "$c/hull/qemu-system-ppc"
+		done
+		name='a ppc64le machine with no ppc64le kernel fetched'
+		out=$(cd / && XDG_RUNTIME_DIR=$p64none XDG_CACHE_HOME="$root/cache-empty" timeout 60 \
+			"$hull" run -f "$root/p64.conf" 2>&1)
+		got=$?
+		has 125 '`hull kernel fetch --arch ppc64le` downloads it'
+		name='(kernel hull) on ppc64le'
+		out=$(cd / && XDG_RUNTIME_DIR=$p64none XDG_CACHE_HOME="$root/cache-empty" timeout 60 \
+			"$hull" run -f "$root/p64hull.conf" 2>&1)
+		got=$?
+		has 125 'is built for amd64 and arm64'
+		name='kernel fetch --arch ppc64le'
+		out=$(XDG_CACHE_HOME="$root/cache" timeout 300 "$hull" kernel fetch --arch ppc64le 2>&1)
+		got=$?
+		if [ "$got" -ne 0 ] && printf '%s\n' "$out" | grep -q 'answered\|could not\|resolve\|connect'; then
+			printf 'qemu: ppc64le under emu not tried: %s\n' "$out"
+		else
+			has 0 "^$root/cache/hull/kernel-ppc64le-[0-9]"
+			name='a ppc64le machine under emu'
+			out=$(cd / && XDG_RUNTIME_DIR=$p64run XDG_CACHE_HOME="$root/cache" timeout 400 \
+				"$hull" run -f "$root/p64.conf" 2>&1)
+			got=$?
+			has 5 '^from ppc64le$'
+			has 5 '^host=qp64$'
+			has 5 '^read=ppc64le$'
+		fi
+		for run in "$p64none" "$p64run"; do
+			tries=0
+			while [ -S "$run/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+				tries=$((tries + 1))
+				sleep 0.25
+			done
+			rm -rf "${run:?}"
+		done
+		rm -rf "${root:?}/p64root"
+	fi
+
 	# 32-bit arm, armhf, the same way, 2026-11-13: qemu-system-arm's virt
 	# below 4 GiB booting Debian's armmp kernel, the agent cross-built.
 	# hull builds no arm kernel of its own, so (kernel hull) is refused,
