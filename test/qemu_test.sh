@@ -3425,6 +3425,69 @@ else
 			has 5 '^from ppc64le$'
 			has 5 '^host=qp64$'
 			has 5 '^read=ppc64le$'
+			# (ssh true) with no sshd in the image: ppc64le's dropbear, real ssh
+			# logging in as root against the machine's own host key.
+			name='hull sshd fetch --arch ppc64le'
+			out=$(XDG_CACHE_HOME="$root/cache" timeout 120 "$hull" sshd fetch --arch ppc64le 2>&1)
+			got=$?
+			has 0 'dropbear-ppc64le-'
+			p64dbrt=$(mktemp -d /dev/shm/hull-qp64d.XXXXXX 2>/dev/null)
+			if [ "$got" = 0 ] && [ -n "$p64dbrt" ]; then
+				chmod 700 "$p64dbrt"
+				rm -rf "$root/p64db"
+				mkdir -p "$root/p64db/bin" "$root/p64db/etc" "$root/p64db/run" "$root/p64db/tmp" \
+					"$root/p64db/proc" "$root/p64db/dev" "$root/p64db/sys" "$root/p64db/root"
+				cp "$ppc_probe" "$root/p64db/bin/sh"
+				printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/p64db/etc/passwd"
+				chmod 755 "$root/p64db"
+				printf '(machine (source "dir:./p64db") (backend emu) (arch ppc64le) %s %s)\n' \
+					'(mutable overlay) (hostname "qp64db") (ssh true)' \
+					'(command "/bin/sh" "-c" "probe say ready sleep 600")' > "$root/p64db.conf"
+				rm -f "$root/home/.ssh/p64key" "$root/home/.ssh/p64key.pub"
+				ssh-keygen -q -t ed25519 -N '' -C hull-test-p64 -f "$root/home/.ssh/p64key"
+				{
+					printf 'Host qp64db.hull\n'
+					printf '  ProxyCommand env XDG_RUNTIME_DIR=%s %s proxy-ssh %%h\n' "$p64dbrt" "$hull"
+					printf '  User root\n  IdentityFile %s\n  IdentitiesOnly yes\n' "$root/home/.ssh/p64key"
+					printf '  BatchMode yes\n  ConnectTimeout 20\n  LogLevel error\n'
+					printf '  StrictHostKeyChecking yes\n  UserKnownHostsFile %s\n' "$root/p64db.known"
+				} > "$root/p64db.ssh"
+				rm -f "$root/p64db.out" "$root/p64db.known"
+				(cd / && exec env XDG_RUNTIME_DIR="$p64dbrt" XDG_CACHE_HOME="$root/cache" timeout -k 2 400 \
+					"$hull" run -f "$root/p64db.conf" > "$root/p64db.out" 2>&1) &
+				runner=$!
+				tries=0
+				until grep -q '^ready$' "$root/p64db.out" 2>/dev/null || [ "$tries" -ge 240 ]; do
+					tries=$((tries + 1))
+					sleep 0.5
+				done
+				printf 'qp64db.hull %s\n' \
+					"$(cut -d' ' -f1,2 "$root/data/hull/machines/qp64db/host_key.pub" 2>&1)" \
+					> "$root/p64db.known"
+				tries=0
+				until timeout 20 ssh -F "$root/p64db.ssh" qp64db.hull 'probe say up' < /dev/null 2>/dev/null |
+				      grep -q '^up$' || [ "$tries" -ge 60 ]; do
+					tries=$((tries + 1))
+					sleep 1
+				done
+				who=$(timeout 20 ssh -F "$root/p64db.ssh" qp64db.hull 'probe uid host' < /dev/null 2>&1)
+				XDG_RUNTIME_DIR="$p64dbrt" timeout 30 "$hull" stop qp64db > /dev/null 2>&1
+				wait "$runner"
+				cases=$((cases + 1))
+				[ "$who" = "$(printf 'uid=0\nhost=qp64db')" ] ||
+					fail "ssh did not log in as root to a ppc64le machine through ppc64le's dropbear" \
+						"$who; $(cat "$root/p64db.out")"
+				rm -f "$root/home/.ssh/p64key" "$root/home/.ssh/p64key.pub"
+				rm -rf "${root:?}/p64db"
+			fi
+			if [ -n "$p64dbrt" ]; then
+				tries=0
+				while [ -S "$p64dbrt/hull/core.sock" ] && [ "$tries" -lt 40 ]; do
+					tries=$((tries + 1))
+					sleep 0.25
+				done
+				rm -rf "${p64dbrt:?}"
+			fi
 		fi
 		for run in "$p64none" "$p64run"; do
 			tries=0

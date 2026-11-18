@@ -1711,9 +1711,10 @@ static const char *apply(const hull_sexpr_doc *doc, const hull_sexpr_form *machi
 		    (cmdline_value("hull.root", named_root, sizeof named_root) ?
 		     hosted_sshd() : share("sshd", "/machine/run/hull/sshd", 1)) != 0)
 			rmdir("/machine/run/hull/sshd");
-#if defined(__s390x__)
-		/* s390x's dropbear names its loader by this shorter link, its own
-		 * /lib/ld64.so.1 having no room for the tree's path (sshd.h). */
+#if defined(__s390x__) || (defined(__powerpc64__) && defined(__LITTLE_ENDIAN__))
+		/* s390x's and ppc64le's dropbear name their loader by this shorter
+		 * link, their own /lib/ld64.so.1 and /lib64/ld64.so.2 having no
+		 * room for the tree's path (sshd.h). */
 		else if (symlink(HULL_SSHD_INTERP_TO, "/machine" HULL_SSHD_INTERP_SHORT) != 0 &&
 		         errno != EEXIST)
 			say("the sshd's loader", strerror(errno));

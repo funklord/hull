@@ -137,6 +137,27 @@ static const hull_sshd_package hull_sshd_packages_arm[] = {
 	  "7337db5cadb267f4d6966af138d529bd611a3298a9aa5f4e7e557dfe9a746494" },
 };
 
+/* 64-bit little-endian POWER's, ppc64el's, the same versions, each
+ * package's sha256 from the ppc64el Packages index, 2026-11-19. */
+static const hull_sshd_package hull_sshd_packages_ppc64le[] = {
+	{ "d/dropbear/dropbear-bin_2025.89-1~deb13u1_ppc64el.deb",
+	  "a99a3673e8358acc49e7e018637fc5b9299c1cd3b7afb8f7b65ed1dfb02f5604" },
+	{ "libt/libtomcrypt/libtomcrypt1_1.18.2+dfsg-7+b2_ppc64el.deb",
+	  "0773cf0997ef066cc96401e1cf8b910c61a53927b48b4b1bb5e051b264717707" },
+	{ "libt/libtommath/libtommath1_1.3.0-1_ppc64el.deb",
+	  "5607ec9ddf6fcee4979eab360d2c8c31637424e04b7f228495b6977f82eeed7d" },
+	{ "g/gmp/libgmp10_6.3.0+dfsg-3_ppc64el.deb",
+	  "ed258e13f7bd7c6d407651e4fc419dfe2895cb6876a0fb1237e71f17ef5be555" },
+	{ "z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+b1_ppc64el.deb",
+	  "f526e830310db11983cf51cfde95a74bc449a7bdc44b6ce68827d78802f1b4ae" },
+	{ "libx/libxcrypt/libcrypt1_4.4.38-1_ppc64el.deb",
+	  "271558e9158d9c01e706d2b8702b9ffcca50858e52e840482789d1e52ee7c5d2" },
+	{ "g/glibc/libc6_2.41-12+deb13u4_ppc64el.deb",
+	  "917cbd81a9038133bd58bbfe0991db889a78eb446be2080015b7804942b45ec2" },
+	{ "o/openssh/openssh-sftp-server_10.0p1-7+deb13u4_ppc64el.deb",
+	  "e683fb34ae1c0875514259a99154ae92c5103fdae320986d35d749e5af531509" },
+};
+
 /* What differs between the two: dropbear as Debian builds it and as hull
  * runs it, its two paths rewritten (above); the loader it names; where
  * the libraries are. */
@@ -199,6 +220,13 @@ static const hull_sshd_arch hull_sshd_arches[] = {
 	  "c2e8b7809508725b31a3549ca65685de16a82b0bd1baf76d08c68f0fc74dfd17",
 	  "e93c8e520ee55e27b67900c67ff72e0eac20da2f5cd6e4eab79bfd77e81fe008",
 	  "/lib/ld-linux-armhf.so.3", HULL_SSHD_LIBS_ARM, HULL_SSHD_LOADER_ARM, HULL_SSHD_INTERP_TO },
+	/* ppc64le's loader, /lib64/ld64.so.2, is shorter than the tree's path,
+	 * as s390x's is: it names the short link. */
+	{ "ppc64le", hull_sshd_packages_ppc64le,
+	  sizeof hull_sshd_packages_ppc64le / sizeof hull_sshd_packages_ppc64le[0],
+	  "4d5fcea9b09939bb54e858ae03564dbd4f32efef26a1e066ea3202c15804b943",
+	  "0db84e684fc1391620cd1555857cc9a8a556470e520903869b6a99c37f09ddb3",
+	  "/lib64/ld64.so.2", HULL_SSHD_LIBS_PPC64LE, HULL_SSHD_LOADER_PPC64LE, HULL_SSHD_INTERP_SHORT },
 };
 
 /* `arch`'s, or NULL where hull fetches none for it. */
