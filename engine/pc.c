@@ -1565,10 +1565,15 @@ static void exec_pc(const hull_machine *m)
 			snprintf(file, sizeof file, "/proc/self/fd/%d", fd);
 			path = file;
 		}
+		/* A disk or stick passes the guest's TRIM to its image, and
+		 * zeroes written become holes: attached without, a guest's
+		 * image only grows, whatever it frees (fmake's Windows 11
+		 * reached 24G and could not shrink, 2026-11-18). */
 		snprintf(head, sizeof head, "%s,format=%s%s%s,file=",
 		         d->type == 'f' ? "if=floppy" : d->type == 'c' ? "if=ide,media=cdrom" :
 		         d->type == 'u' ? "if=none" : "if=ide,media=disk", d->path == NULL ? "raw" : d->format,
-		         d->type == 'c' ? ",readonly=on" : "",
+		         d->type == 'c' ? ",readonly=on" :
+		         d->type != 'f' ? ",discard=unmap,detect-zeroes=unmap" : "",
 		         d->type != 'c' && d->path != NULL && !m->direct ? ",snapshot=on" : "");
 		if ((drive = option(head, path)) == NULL)
 			return;

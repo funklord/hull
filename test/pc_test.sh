@@ -531,6 +531,39 @@ INIT
 		says 'and read the stick' "$out" 'stick=HULLSTICK'
 		for f in $usbmods; do rm -f "$tree/$f.ko"; done
 	fi
+
+	# A disk passes the guest's TRIM to its image: attached without
+	# discard, a guest's image only grew whatever it freed (fmake's
+	# Windows 11, 2026-11-18). An 8M disk of random bytes, fully
+	# allocated, is the 16384-sector one; the guest discards it whole and
+	# its image holds next to nothing after.
+	cat > "$tree/init.sh" <<'INIT'
+#!/bin/busybox sh
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sys /sys
+/bin/busybox mount -t devtmpfs none /dev
+for d in /sys/block/sd*; do
+	[ "$(/bin/busybox cat $d/size)" = 16384 ] || continue
+	echo "discard_max=$(/bin/busybox cat $d/queue/discard_max_bytes)"
+	/bin/busybox blkdiscard /dev/${d##*/} && echo discarded=yes
+done
+/bin/busybox poweroff -f
+INIT
+	out=$(timeout 120 "$hull" export --bootable "$tree" "$root/trim.img" --init /init.sh 2>&1)
+	status 'a bootable export for TRIM' "$?" 0 "$out"
+	head -c 8388608 /dev/urandom > "$root/data.img"
+	before=$(du -k "$root/data.img" | cut -f1)
+	conf '(source "image:./trim.img") (memory "512M") (mutable direct)' \
+		'(media (medium (type disk) (source "image:./data.img")))' \
+		'(tuning (pc (machine q35) (firmware uefi)))'
+	out=$(timeout 120 "$hull" run -f "$root/hull.conf" 2>&1)
+	status 'a machine with a disk to trim' "$?" 0 "$out"
+	says 'its disk offers discard' "$out" 'discarded=yes'
+	after=$(du -k "$root/data.img" | cut -f1)
+	cases=$((cases + 1))
+	[ "$after" -lt $((before / 4)) ] ||
+		fail "the guest's discard freed nothing in the image: ${before}K before, ${after}K after" "$out"
+	rm -f "$root/data.img" "$root/trim.img"
 	conf '(source "image:./stick.img") (memory "512M")' \
 		'(media (medium (type tape) (source "image:./stick.img")))'
 	out=$(timeout 30 "$hull" run -f "$root/hull.conf" 2>&1)

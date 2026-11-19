@@ -4911,9 +4911,11 @@ d = m.parse(sys.argv[1])
 values = [n.firstChild.data for n in d.getElementsByTagName("Value")]
 assert values[0] == "3", values
 assert d.getElementsByTagName("Name")[0].firstChild.data == "ann"
-assert values[1] == open(sys.argv[2]).read().strip()' \
+assert values[1] == open(sys.argv[2]).read().strip()
+paths = [n.firstChild.data for n in d.getElementsByTagName("Path")]
+assert any("PreventDeviceEncryption /t REG_DWORD /d 1" in p for p in paths), paths' \
 		"$root/setup/w/answer/autounattend.xml" "$root/setup/w/password" 2> /dev/null ||
-		fail "the answer file is not XML naming the edition, the account and its password" \
+		fail "the answer file is not XML naming the edition, the account, its password and no device encryption" \
 			"$(cat "$root/setup/w/answer/autounattend.xml")"
 	cases=$((cases + 1))
 	grep -qx 'ssh-ed25519 .* hull-setup-test' "$root/setup/w/answer/authorized_keys" ||

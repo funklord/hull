@@ -224,6 +224,16 @@ static char *answer(unsigned index, const char *user, const char *secret)
 	    "publicKeyToken=\"31bf3856ad364e35\" language=\"neutral\" versionScope=\"nonSxS\">\r\n"
 	    "   <ComputerName>HULL-WINDOWS</ComputerName><TimeZone>UTC</TimeZone>\r\n"
 	    "  </component>\r\n"
+	    /* No device encryption, which Windows 11 turns on by itself:
+	     * an encrypted disk's image cannot be compacted from outside
+	     * (fmake, 2026-11-18). */
+	    "  <component name=\"Microsoft-Windows-Deployment\" processorArchitecture=\"amd64\" "
+	    "publicKeyToken=\"31bf3856ad364e35\" language=\"neutral\" versionScope=\"nonSxS\">\r\n"
+	    "   <RunSynchronous><RunSynchronousCommand wcm:action=\"add\"><Order>1</Order>\r\n"
+	    "    <Path>reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\BitLocker /v PreventDeviceEncryption "
+	    "/t REG_DWORD /d 1 /f</Path>\r\n"
+	    "   </RunSynchronousCommand></RunSynchronous>\r\n"
+	    "  </component>\r\n"
 	    " </settings>\r\n"
 	    " <settings pass=\"oobeSystem\">\r\n"
 	    "  <component name=\"Microsoft-Windows-International-Core\" processorArchitecture=\"amd64\" "
