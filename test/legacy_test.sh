@@ -287,6 +287,34 @@ else
 	fail 'the Debian floppies are what Debian published, or were not fetched' "$media"
 fi
 
+# --- hull setup freedos: installed with nobody at it --------------------------
+
+# FreeDOS's installer has no unattended mode, so hull setup freedos writes
+# its own FDAUTO.BAT onto a copy of the boot floppy: FDISK /AUTO, a warm
+# boot, FORMAT /S, power off. The disk it makes then boots alone; for the
+# test its AUTOEXEC.BAT is swapped for one that says so on COM1 and powers
+# off, the 8 bytes of KEY.COM first as above.
+rm -rf "$root/sf"
+out=$("$hull" setup freedos --size 64 "$root/boot.img" "$root/sf" 2>&1)
+status 'hull setup freedos' "$?" 0 "$out"
+(cd / && timeout -k 5 240 "$hull" run -f "$root/sf/install.conf" < /dev/null > "$root/sf.out" 2>&1)
+got=$?
+out=$(tr -d '\r' < "$root/sf.out")
+status 'its install ran to the end' "$got" 0 "$out"
+says 'partitioning, restarting and formatting on its way' "$out" 'hull setup: restarting for DOS to see C:'
+says 'and done' "$out" 'hull setup: done'
+out=$(mdir -i "$root/sf/disk.img@@32256" :: 2>&1)
+says 'the disk holds DOS' "$out" 'KERNEL   SYS'
+printf '\264\005\271\040\071\315\026\303' > "$root/KEY.COM"
+printf '@echo off\r\nC:\\KEY.COM\r\nCTTY COM1\r\necho booted-from-c\r\nC:\\FDAPM POWEROFF\r\n' > "$root/CAUTO.BAT"
+mcopy -o -i "$root/sf/disk.img@@32256" "$root/KEY.COM" ::KEY.COM
+mcopy -o -i "$root/sf/disk.img@@32256" "$root/CAUTO.BAT" ::AUTOEXEC.BAT
+(cd / && timeout -k 5 90 "$hull" run -f "$root/sf/machine.conf" < /dev/null > "$root/sf.out" 2>&1)
+got=$?
+out=$(tr -d '\r' < "$root/sf.out")
+status 'the installed disk boots alone' "$got" 0 "$out"
+says 'to its own AUTOEXEC' "$out" 'booted-from-c'
+
 printf 'legacy: %s cases, %s failed\n' "$cases" "$failures"
 [ "$failures" = 0 ] && rm -rf "$dir"
 [ "$failures" = 0 ]

@@ -171,6 +171,7 @@ static void usage(FILE *out)
 	      "       hull board ls POOL | hull board fix NAME\n"
 	      "       hull vagrant box add NAME FILE\n"
 	      "       hull setup windows [--index N] [--user NAME] ISO DIR\n"
+	      "       hull setup freedos [--size MB] BOOT DIR\n"
 	      "       hull up [-f COMPOSE-FILE] [--backend B] [--profile P]... [NAME]\n"
 	      "       hull core\n"
 	      "       hull engines | hull doctor\n"
@@ -8683,6 +8684,34 @@ int main(int argc, char **argv)
 			fprintf(stderr, "hull: kernel fetch: %s\n", why);
 			return 1;
 		}
+		return 0;
+	}
+	/* `hull setup freedos [--size MB] BOOT DIR` (setup.c). */
+	if (strcmp(command, "setup") == 0 && argc >= 5 && strcmp(argv[2], "freedos") == 0) {
+		char          why[4400] = "";
+		unsigned long size = 256ul;
+		int           at = 3;
+
+		if (argc == 7 && strcmp(argv[3], "--size") == 0) {
+			char *end = NULL;
+
+			size = strtoul(argv[4], &end, 10);
+			if (end == argv[4] || *end != '\0') {
+				fprintf(stderr, "hull: setup: --size is the disk's megabytes\n");
+				return 2;
+			}
+			at = 5;
+		}
+		if (at + 2 != argc) {
+			fprintf(stderr, "usage: hull setup freedos [--size MB] BOOT DIR\n");
+			return 2;
+		}
+		if (hull_setup_freedos(argv[at], argv[at + 1], (unsigned)size, why, sizeof why) != 0) {
+			fprintf(stderr, "hull: setup: %s\n", why);
+			return 1;
+		}
+		printf("%s: hull run -f %s/install.conf installs FreeDOS, unattended, and powers off; "
+		       "then hull run -f %s/machine.conf\n", argv[at + 1], argv[at + 1], argv[at + 1]);
 		return 0;
 	}
 	/* `hull setup windows [--index N] [--user NAME] ISO DIR` (setup.c). */

@@ -4935,6 +4935,14 @@ assert values[1] == open(sys.argv[2]).read().strip()' \
 	cases=$((cases + 1))
 	[ ! -e "$root/setup/w2" ] && [ ! -e "$root/setup/w3" ] && [ ! -e "$root/setup/w4" ] ||
 		fail "a refused setup left a directory" "$(ls "$root/setup")"
+	# hull setup freedos, its install measured by check-legacy: a file not
+	# a 1.44 MB floppy, and a disk FAT16 cannot be, refused.
+	expect 1 'not a 1.44 MB floppy image' "$hull" setup freedos "$root/setup/win.iso" "$root/setup/f1"
+	head -c 1474560 /dev/zero > "$root/setup/boot.img"
+	expect 1 'FreeDOS.s disk is 8 to 2047 MB' "$hull" setup freedos --size 4 "$root/setup/boot.img" "$root/setup/f2"
+	cases=$((cases + 1))
+	[ ! -e "$root/setup/f1" ] && [ ! -e "$root/setup/f2" ] ||
+		fail "a refused freedos setup left a directory" "$(ls "$root/setup")"
 	rm -rf "${root:?}/setup"
 else
 	printf 'cli: hull setup windows not tried: no mtools or qemu-img\n'

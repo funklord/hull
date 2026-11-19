@@ -411,3 +411,140 @@ done:
 	free(spec);
 	return result;
 }
+
+/*
+ * `hull setup freedos BOOT DIR`: FreeDOS's own installer has no unattended
+ * mode (FDI's stages each ask), so this is FreeDOS's documented install
+ * without it, run by the floppy's FDAUTO.BAT with its console on COM1, the
+ * run's own output:
+ *
+ *   FDISK /AUTO 1         a whole-disk partition, active; 0, and the
+ *                         machine warm-boots for DOS to see it; 9 on the
+ *                         second boot, the disk partitioned already;
+ *   FORMAT C: /S          with the system, /Z:seriously answering its
+ *                         question for a hard disk;
+ *   AUTOEXEC.BAT and FDAPM on C:, and power off.
+ *
+ * Measured 2026-11-19 on FreeDOS 1.4's floppy edition: 0, then 9 after the
+ * warm boot, FORMAT 0, and the disk alone booting to FreeCOM. KEY.COM, eight
+ * bytes of INT 16h AH=05, leaves a key pending, which FreeDOS's first read
+ * after CTTY waits for (test/legacy_test.sh).
+ */
+static const char key_com[] = "\264\005\271\040\071\315\026\303";
+
+static const char freedos_auto[] =
+    "@echo off\r\n"
+    "SET PATH=A:\\FREEDOS\\BIN\r\n"
+    "A:\\KEY.COM\r\n"
+    "CTTY COM1\r\n"
+    "echo hull setup: partitioning C:\r\n"
+    "FDISK /AUTO 1\r\n"
+    "if errorlevel 9 goto made\r\n"
+    "echo hull setup: restarting for DOS to see C:\r\n"
+    "FDAPM WARMBOOT\r\n"
+    ":made\r\n"
+    "echo hull setup: formatting C: with the system\r\n"
+    "FORMAT C: /V:FREEDOS /S /Z:seriously\r\n"
+    "if errorlevel 1 goto failed\r\n"
+    "copy A:\\FREEDOS\\BIN\\FDAPM.COM C:\\ > NUL\r\n"
+    "copy A:\\HULLAUTO.BAT C:\\AUTOEXEC.BAT > NUL\r\n"
+    "echo hull setup: done\r\n"
+    "FDAPM POWEROFF\r\n"
+    ":failed\r\n"
+    "echo hull setup: FORMAT failed\r\n";
+
+/* What the installed disk boots to: its prompt on the screen. */
+static const char freedos_disk_auto[] =
+    "@echo off\r\n"
+    "SET PATH=C:\\\r\n"
+    "PROMPT $P$G\r\n";
+
+int hull_setup_freedos(const char *boot, const char *dir, unsigned megabytes, char *why,
+                       size_t cap)
+{
+	char        floppy[PATH_MAX];
+	char        disk[PATH_MAX];
+	char        stage[PATH_MAX];
+	struct stat st;
+	int         fd;
+
+	if (megabytes < 8u || megabytes > 2047u) {
+		snprintf(why, cap, "FreeDOS's disk is 8 to 2047 MB, one FAT16 partition");
+		return -1;
+	}
+	if (stat(boot, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size != 1474560) {
+		snprintf(why, cap, "%s: not a 1.44 MB floppy image, as FreeDOS's x86BOOT.img is", boot);
+		return -1;
+	}
+	if (mkdir(dir, 0755) != 0) {
+		snprintf(why, cap, "%s: %s%s", dir, strerror(errno),
+		         errno == EEXIST ? ": setup makes a directory of its own" : "");
+		return -1;
+	}
+	snprintf(floppy, sizeof floppy, "%s/setup.img", dir);
+	snprintf(disk, sizeof disk, "%s/disk.img", dir);
+	snprintf(stage, sizeof stage, "%s/setup", dir);
+	if (mkdir(stage, 0755) != 0) {
+		snprintf(why, cap, "%s: %s", stage, strerror(errno));
+		return -1;
+	}
+	/* The user's floppy copied, theirs left as it was. */
+	{
+		char *copy[] = { "cp", (char *)boot, floppy, NULL };
+
+		if (run(copy) != 0 || chmod(floppy, 0644) != 0) {
+			snprintf(why, cap, "%s could not be copied", boot);
+			return -1;
+		}
+	}
+	if (put(stage, "KEY.COM", key_com, 0644, why, cap) != 0 ||
+	    put(stage, "FDAUTO.BAT", freedos_auto, 0644, why, cap) != 0 ||
+	    put(stage, "HULLAUTO.BAT", freedos_disk_auto, 0644, why, cap) != 0)
+		return -1;
+	for (const char *const *f = (const char *const[]){ "KEY.COM", "FDAUTO.BAT", "HULLAUTO.BAT",
+	                                                   NULL }; *f != NULL; f++) {
+		char  from[PATH_MAX + 32];
+		char  to[64];
+		char *copy[] = { "mcopy", "-o", "-i", floppy, from, to, NULL };
+
+		snprintf(from, sizeof from, "%s/%s", stage, *f);
+		snprintf(to, sizeof to, "::%s", *f);
+		if (run(copy) != 0) {
+			snprintf(why, cap, "mtools' mcopy could not put %s on the floppy: is it FAT?", *f);
+			return -1;
+		}
+	}
+	if ((fd = open(disk, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0 ||
+	    ftruncate(fd, (off_t)megabytes * 1024 * 1024) != 0) {
+		snprintf(why, cap, "%s: %s", disk, strerror(errno));
+		if (fd >= 0)
+			close(fd);
+		return -1;
+	}
+	close(fd);
+	if (put(dir, "install.conf",
+	    "; Installs FreeDOS onto disk.img from the floppy, unattended (hull setup\n"
+	    "; freedos): it partitions, restarts, formats and powers off. Then\n"
+	    "; machine.conf boots the disk.\n"
+	    "(machine\n"
+	    "  (backend pc)\n"
+	    "  (hostname \"freedos\")\n"
+	    "  (source \"media:floppy\")\n"
+	    "  (mutable direct)\n"
+	    "  (memory \"32M\")\n"
+	    "  (media\n"
+	    "    (medium (type floppy) (source \"image:./setup.img\"))\n"
+	    "    (medium (type disk) (source \"image:./disk.img\"))))\n", 0644, why, cap) != 0 ||
+	    put(dir, "machine.conf",
+	    "; FreeDOS as hull setup freedos installed it.\n"
+	    "(machine\n"
+	    "  (backend pc)\n"
+	    "  (hostname \"freedos\")\n"
+	    "  (source \"media:disk\")\n"
+	    "  (mutable direct)\n"
+	    "  (memory \"32M\")\n"
+	    "  (media\n"
+	    "    (medium (type disk) (source \"image:./disk.img\"))))\n", 0644, why, cap) != 0)
+		return -1;
+	return 0;
+}

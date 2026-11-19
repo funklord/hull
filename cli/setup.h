@@ -13,4 +13,12 @@
 int hull_setup_windows(const char *iso, const char *dir, unsigned index, const char *user,
                        char *why, size_t cap);
 
+/* A machine directory DIR that installs FreeDOS onto a blank disk of
+ * `megabytes` from the user's own FreeDOS boot floppy BOOT, with nobody at
+ * it, and then boots that disk: the floppy's FDAUTO.BAT partitions,
+ * reboots, formats with the system and powers off. 0, or -1 with `why`;
+ * DIR must not exist. */
+int hull_setup_freedos(const char *boot, const char *dir, unsigned megabytes, char *why,
+                       size_t cap);
+
 #endif
