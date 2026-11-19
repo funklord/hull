@@ -1,6 +1,7 @@
 # Hull
 
 **Status:** in development; usable for testing single machines since 2026-10-22, on the terms in §12's *Adopting hull for testing*. Designed from August 2026, written from October.
+**Where the work stands, folded 2026-11-19:** the holder's list of 2026-11-14 is built -- usbredir, GPIO/I2C by vhost-device, ppc64le under emu with its dropbear, dosemu2, the pc USB stick and TRIM, `hull setup windows` and `hull setup freedos` (each in its section, measured there). **Open, and waiting on:** the GPIO and I2C read end to end needs hull's kernel rebuilt (~1.9 GB of disk; `/home` had room again by the fold); a Windows install end to end needs a Windows ISO; macOS setup is the holder's licensing call; ppc64le's root by virtiofs fails `Not a directory`, cause not found; FreeDOS's base packages by `FDINST` are not yet in `setup freedos`; Win9x setup needs its media; vmware has no adapter. **Removed for disk, on claude-guidelines' maintenance request:** stale alternate `build/` directories (`dev g1 q2 q3 st bisect tsan tsan-report esp-qemu-build esp-qemu-src`, and the other account's `k try try2 v lim sanitize` by the holder), and from the user's store the tags `beerssh/check-ci-trial` and openwrt `x86-64-24.10.4`, which nothing names, then `hull gc`: 9.1G to 7.8G.
 **Name:** Hull — the body of a vessel, which carries what is put in it. (Prior "Hull" CDP by hull.io was acquired by MessageBird in 2021 and discontinued; name considered safe for an open-source systems tool. Formerly working-titled "Crate".)
 
 ---
