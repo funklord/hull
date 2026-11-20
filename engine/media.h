@@ -95,6 +95,7 @@ int hull_media_export(const char *dir, const char *out, char *detail, size_t cap
 typedef struct hull_media_map hull_media_map;
 hull_media_map *hull_media_map_open(const char *dir, uint64_t *bytes, char *detail, size_t cap);
 int hull_media_map_read(hull_media_map *map, uint64_t at, void *out, size_t n);
+uint64_t hull_media_map_size(const hull_media_map *map);
 int hull_media_map_verify(hull_media_map *map, char *detail, size_t cap);
 void hull_media_map_close(hull_media_map *map);
 

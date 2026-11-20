@@ -2946,6 +2946,11 @@ static int map_layer(const map_piece *list, size_t count, uint64_t longest, uint
 	return 0;
 }
 
+uint64_t hull_media_map_size(const hull_media_map *map)
+{
+	return map->bytes;
+}
+
 int hull_media_map_read(hull_media_map *map, uint64_t at, void *out, size_t n)
 {
 	uint64_t longest_quirk = 0u;

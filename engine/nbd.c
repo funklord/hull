@@ -201,6 +201,18 @@ static int answer(int fd, uint32_t error, const uint8_t handle[8])
 	return full_write(fd, head, sizeof head);
 }
 
+/* The files' bytes at [at, at + n), and zeros past the collection's end:
+ * a disk served larger than its collection (a medium's (size ...)) is the
+ * collection, then nothing. */
+static int read_files(served *s, uint64_t at, uint8_t *out, size_t n)
+{
+	uint64_t own = hull_media_map_size(s->map);
+	size_t   inside = at >= own ? 0u : own - at < n ? (size_t)(own - at) : n;
+
+	memset(out + inside, 0, n - inside);
+	return inside == 0u ? 0 : hull_media_map_read(s->map, at, out, inside);
+}
+
 static int is_written(const hull_nbd_writes *w, uint64_t block)
 {
 	return (w->written[block / 8u] >> (block % 8u)) & 1u;
@@ -210,7 +222,7 @@ static int is_written(const hull_nbd_writes *w, uint64_t block)
  * the guest has written read from the overlay over them. */
 static int read_merged(served *s, uint64_t at, uint8_t *out, size_t n)
 {
-	if (hull_media_map_read(s->map, at, out, n) != 0)
+	if (read_files(s, at, out, n) != 0)
 		return -1;
 	if (s->writes == NULL || s->writes->count == 0u)
 		return 0;
@@ -242,7 +254,7 @@ static int write_overlay(served *s, uint64_t at, const uint8_t *data, size_t n)
 
 		if (is_written(w, block))
 			continue;
-		if (hull_media_map_read(s->map, from, block_bytes, length) != 0 ||
+		if (read_files(s, from, block_bytes, length) != 0 ||
 		    pwrite(w->overlay, block_bytes, length, (off_t)from) != (ssize_t)length)
 			return -1;
 		w->written[block / 8u] |= (uint8_t)(1u << (block % 8u));

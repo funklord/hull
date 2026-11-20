@@ -348,6 +348,9 @@ static void resolve_media(resolver *r, const hull_sexpr_form *entry)
 			join(id, "media", text, n);
 		}
 		resolve(r, id, source.offset);
+		/* A size of its own: a disk larger than its collection. */
+		if (hull_spec_find(r->spec, &medium, "size", &head))
+			resolve(r, "media.size", head.offset);
 	}
 }
 

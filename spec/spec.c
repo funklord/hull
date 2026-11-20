@@ -548,6 +548,7 @@ static const schema secret = TABLE(secret_keys);
 static const key medium_keys[] = {
 	{ .name = "type",   .type = SYMBOL, .required = 1, .value = identifier },
 	{ .name = "source", .type = STRING, .required = 1, .value = medium_source },
+	{ .name = "size",   .type = STRING, .value = size },
 };
 static const schema medium = TABLE(medium_keys);
 

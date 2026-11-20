@@ -181,6 +181,31 @@ cases=$((cases + 1))
 [ ! -e "$root/cw.hull-new" ] && [ ! -e "$root/cw.unsaved.img" ] ||
 	fail 'nothing left beside the collection' "$(ls "$root")"
 
+# (size ...): the disk served larger than its collection, zeros after
+# it; under direct the collection takes the larger disk back, its own
+# media.conf saying the new size and verifying. Never smaller, and an
+# image: disk is the user's file, not grown by a word.
+cp -a "$root/c" "$root/cg"
+conf '(source "media:disk") (mutable direct)' \
+	'(media (medium (type disk) (source "dir:./cg") (size "4M")))'
+run
+status 'a collection served at 4M' "$got" 0 "$out"
+says 'and written back' "$out" 'cg written back'
+cases=$((cases + 1))
+grep -q '(bytes 4194304)' "$root/cg/media.conf" &&
+	"$hull" media verify "$root/cg" > /dev/null 2>&1 ||
+	fail 'the collection grown to its disk' "$(cat "$root/cg/media.conf")"
+run
+says 'and its write kept at the new size' "$out" 'word: written'
+conf '(source "media:disk") (media (medium (type disk) (source "dir:./c") (size "512K")))'
+run
+status 'a size below the collection refused' "$got" 125 "$out"
+says 'and said' "$out" 'grown, not cut'
+conf '(source "media:disk") (media (medium (type disk) (source "image:./c.img") (size "4M")))'
+run
+status 'a size on an image: refused' "$got" 125 "$out"
+says 'and said' "$out" "a disk collection's"
+
 # One file a collection can travel as, tar: or pack:, as a machine's source.
 tar -cf "$root/c.tar" -C "$root/c" .
 conf '(source "media:disk") (media (medium (type disk) (source "tar:./c.tar")))'

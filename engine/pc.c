@@ -98,6 +98,7 @@ typedef struct medium {
 	hull_nbd_writes  writes;   /* under (mutable direct): the blocks the guest wrote */
 	pthread_t        server;   /* and the thread serving it, joined before they are read */
 	int              serving;  /* that thread is running, to be joined */
+	uint64_t         size;     /* (size ...): the disk served this large, 0 for its own */
 	char  format[8];     /* qemu's word for an image's container */
 } medium;
 
@@ -803,8 +804,11 @@ static void write_back(hull_machine *m, medium *d)
 			size_t   n = bytes - at < HULL_NBD_BLOCK ? (size_t)(bytes - at) : HULL_NBD_BLOCK;
 			static const uint8_t zero[HULL_NBD_BLOCK];
 
-			if ((d->writes.written[index / 8u] >> (index % 8u)) & 1u)
+			if (((d->writes.written[index / 8u] >> (index % 8u)) & 1u) ||
+			    at >= hull_media_map_size(d->map))
 				continue;
+			if (at + n > hull_media_map_size(d->map))
+				n = (size_t)(hull_media_map_size(d->map) - at);
 			if (hull_media_map_read(d->map, at, block, n) != 0 ||
 			    (memcmp(block, zero, n) != 0 &&
 			     pwrite(d->fd, block, n, (off_t)at) != (ssize_t)n)) {
@@ -900,6 +904,15 @@ static int serve_collection(hull_machine *m, medium *d)
 		snprintf(m->why, sizeof m->why, "a medium's disk cannot be served: %s\n", detail);
 		return -1;
 	}
+	/* Grown, never shrunk: a disk smaller than its files would cut them. */
+	if (d->size != 0u && d->size < bytes) {
+		hull_media_map_close(map);
+		snprintf(m->why, sizeof m->why, "a medium's (size ...) is smaller than its collection's "
+		         "disk, %llu bytes: a disk is grown, not cut\n", (unsigned long long)bytes);
+		return -1;
+	}
+	if (d->size > bytes)
+		bytes = d->size;
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) {
 		hull_media_map_close(map);
 		snprintf(m->why, sizeof m->why, "a medium's disk cannot be served: %s\n", strerror(errno));
@@ -1026,6 +1039,26 @@ static const char *read_media(hull_machine *m, const hull_sexpr_doc *doc,
 					        "one is the store's: give it as a dir: collection";
 				else
 					d->write_back = 1;
+			}
+		}
+		/* (size ...): a disk collection served larger than it is, zeros
+		 * after it, so a guest has room to grow into (section 3.13). */
+		if (wrong == NULL) {
+			char *size = hull_access_value(doc, &item, "size");
+
+			if (size != NULL) {
+				char              *end;
+				unsigned long long n = strtoull(size, &end, 10);
+				unsigned           shift = *end == 'K' ? 10u : *end == 'M' ? 20u :
+				                           *end == 'G' ? 30u : *end == 'T' ? 40u : 0u;
+
+				if (kind != 'd' || image)
+					wrong = "a medium's size is a disk collection's: the disk served that large";
+				else if (n > (UINT64_MAX >> shift) || (n << shift) / HULL_NBD_BLOCK == 0u)
+					wrong = "a medium's size is too large or too small";
+				else
+					d->size = (uint64_t)n << shift;
+				free(size);
 			}
 		}
 		free(type);
@@ -3036,6 +3069,10 @@ static const hull_cap_entry entries[] = {
 	  "under (mutable direct) taken apart into the collection again at power-off; a "
 	  "CD-ROM's tree alone made an ISO; a raw dump's audio tracks and quirks not given, qemu "
 	  "reading a disc by its 2048-byte sectors", NULL },
+	{ "media.size",         HULL_SUP_EMULATED,
+	  "a disk collection served that large by NBD, zeros after its files; the guest grows its "
+	  "own partition into the room, and under (mutable direct) the collection takes the "
+	  "larger disk back", NULL },
 	{ "media.image",        HULL_SUP_NATIVE,
 	  "raw, qcow2, vmdk, vhd, vhdx or vdi, by its first bytes", NULL },
 	{ "media.tar",          HULL_SUP_EMULATED,
