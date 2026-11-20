@@ -6505,6 +6505,23 @@ static int screenshot_of(const char *id, const char *file)
 	return exec_in(id, words, 2, 0, 0u);
 }
 
+/* Whether the collection at `dir` is a raw dump's: media.conf says (raw. */
+static int raw_collection(const char *dir)
+{
+	char  path[4400];
+	char  text[4096];
+	FILE *conf;
+	size_t n;
+
+	snprintf(path, sizeof path, "%s/media.conf", dir);
+	if ((conf = fopen(path, "re")) == NULL)
+		return 0;
+	n = fread(text, 1u, sizeof text - 1u, conf);
+	fclose(conf);
+	text[n] = '\0';
+	return strstr(text, "(raw ") != NULL;
+}
+
 /* `hull media verify DIR`: reassembled and held to the hash of what was
  * imported. */
 static int media_verify(const char *dir)
@@ -6514,6 +6531,21 @@ static int media_verify(const char *dir)
 	int  fd;
 	int  status;
 
+	/* A disc or disk collection is read where it lies and hashed, no
+	 * image written; a raw dump's is reassembled, its sectors made. */
+	if (hull_media_exact(dir) && !raw_collection(dir)) {
+		uint64_t        bytes;
+		hull_media_map *map = hull_media_map_open(dir, &bytes, why, sizeof why);
+
+		status = map != NULL ? hull_media_map_verify(map, why, sizeof why) : -1;
+		hull_media_map_close(map);
+		if (status != 0) {
+			fprintf(stderr, "hull: media: %s\n", why);
+			return 1;
+		}
+		printf("the collection gives its disc, byte for byte\n");
+		return 0;
+	}
 	snprintf(temporary, sizeof temporary, "%s/.verify-XXXXXX", dir);
 	if ((fd = mkostemp(temporary, O_CLOEXEC)) < 0) {
 		fprintf(stderr, "hull: media: %s: %s\n", dir, strerror(errno));

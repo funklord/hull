@@ -2726,6 +2726,320 @@ done:
  * buffers. Recursive, as a raw dump's write and an export call the
  * plain write within.
  */
+/* --- read in place ---------------------------------------------------------- */
+
+/*
+ * A collection's disc read where it lies, with no image made: what
+ * media_write_locked() writes, at any offset -- zeros, each layout line's
+ * file bytes at its sector in the order the lines come, each run of
+ * quirks/sectors over those -- so a machine's drive can be served from the
+ * files themselves (the pc class's NBD server, engine/pc.c). Each layer is
+ * sorted by where it starts, and a read finds the pieces it crosses by
+ * bisection. The files are opened as they are read, so a map holds no
+ * descriptors between reads.
+ */
+typedef struct map_piece {
+	uint64_t at;       /* on the disc */
+	uint64_t length;
+	uint64_t from;     /* in the file */
+	unsigned order;    /* its layer's, a later one laid over an earlier */
+	char    *path;
+} map_piece;
+
+struct hull_media_map {
+	uint64_t   bytes;
+	unsigned   unit;
+	int        sparse;
+	char       sha[65];
+	map_piece *files;
+	size_t     file_count;
+	map_piece *quirks;
+	size_t     quirk_count;
+	uint64_t   longest;  /* the longest file piece, bounding the bisection's look back */
+};
+
+static int by_at(const void *a, const void *b)
+{
+	const map_piece *x = a, *y = b;
+
+	return x->at < y->at ? -1 : x->at > y->at ? 1 : x->order < y->order ? -1 : x->order > y->order;
+}
+
+static int map_add(map_piece **list, size_t *count, size_t *room, uint64_t at, uint64_t length,
+                   uint64_t from, const char *path)
+{
+	if (*count == *room) {
+		size_t     grown = *room != 0u ? 2u * *room : 256u;
+		map_piece *more = realloc(*list, grown * sizeof *more);
+
+		if (more == NULL)
+			return -1;
+		*list = more;
+		*room = grown;
+	}
+	(*list)[*count] = (map_piece){ at, length, from, (unsigned)*count, strdup(path) };
+	if ((*list)[*count].path == NULL)
+		return -1;
+	(*count)++;
+	return 0;
+}
+
+void hull_media_map_close(hull_media_map *map)
+{
+	if (map == NULL)
+		return;
+	for (size_t i = 0u; i < map->file_count; i++)
+		free(map->files[i].path);
+	for (size_t i = 0u; i < map->quirk_count; i++)
+		free(map->quirks[i].path);
+	free(map->files);
+	free(map->quirks);
+	free(map);
+}
+
+hull_media_map *hull_media_map_open(const char *dir, uint64_t *bytes, char *detail, size_t cap)
+{
+	hull_media_map *map = calloc(1u, sizeof *map);
+	size_t          file_room = 0u, quirk_room = 0u;
+	char            path[4300];
+	char            line[4400];
+	FILE           *layout;
+	DIR            *runs;
+	struct dirent  *entry;
+
+	if (map == NULL) {
+		fail(detail, cap, "out of memory", NULL);
+		return NULL;
+	}
+	if (read_conf(dir, &map->bytes, map->sha, &map->unit, &map->sparse) != 0) {
+		fail(detail, cap, "the collection's media.conf gives no bytes and sha256", NULL);
+		goto fail;
+	}
+	snprintf(path, sizeof path, "%s/layout.conf", dir);
+	if ((layout = fopen(path, "re")) == NULL) {
+		fail(detail, cap, "the collection's layout.conf cannot be read", strerror(errno));
+		goto fail;
+	}
+	/* As place_files() reads it, each line checked the same way. */
+	while (fgets(line, sizeof line, layout) != NULL) {
+		uint64_t    sector, size, offset = 0u, total;
+		int         used = 0, more = 0;
+		size_t      n = strlen(line);
+		char        file[8800];
+		struct stat st;
+
+		if (n > 0u && line[n - 1u] == '\n')
+			line[n - 1u] = '\0';
+		if (sscanf(line, "%" SCNu64 " %" SCNu64 " %n", &sector, &size, &used) != 2 || used == 0)
+			break;
+		total = size;
+		if (line[used] == '@') {
+			if (sscanf(line + used, "@%" SCNu64 "/%" SCNu64 " %n", &offset, &total, &more) != 2 ||
+			    more == 0 || offset + size > total)
+				break;
+			used += more;
+		}
+		if (!plain_path(line + used) || sector > map->bytes / map->unit ||
+		    sector * map->unit + size > map->bytes)
+			break;
+		snprintf(file, sizeof file, "%s/files/%s", dir, line + used);
+		if (lstat(file, &st) != 0 || !S_ISREG(st.st_mode) || (uint64_t)st.st_size != total) {
+			fclose(layout);
+			fail(detail, cap, "a file is not the size the layout says", file);
+			goto fail;
+		}
+		if (size != 0u &&
+		    map_add(&map->files, &map->file_count, &file_room, sector * map->unit, size, offset,
+		            file) != 0) {
+			fclose(layout);
+			fail(detail, cap, "out of memory", NULL);
+			goto fail;
+		}
+		if (size > map->longest)
+			map->longest = size;
+	}
+	if (!feof(layout)) {
+		fclose(layout);
+		fail(detail, cap, "a line of layout.conf is not a file on this disc", line);
+		goto fail;
+	}
+	fclose(layout);
+	snprintf(path, sizeof path, "%s/quirks/sectors", dir);
+	if ((runs = opendir(path)) != NULL) {
+		while ((entry = readdir(runs)) != NULL) {
+			uint64_t    sector;
+			int         used = 0;
+			char        file[4700];
+			struct stat st;
+
+			if (entry->d_name[0] == '.')
+				continue;
+			snprintf(file, sizeof file, "%s/%s", path, entry->d_name);
+			if (sscanf(entry->d_name, "0x%" SCNx64 ".raw%n", &sector, &used) != 1 ||
+			    entry->d_name[used] != '\0' || sector > map->bytes / map->unit ||
+			    lstat(file, &st) != 0 || !S_ISREG(st.st_mode) ||
+			    sector * map->unit + (uint64_t)st.st_size > map->bytes) {
+				closedir(runs);
+				fail(detail, cap, "a file in quirks/sectors is no run of this disc", entry->d_name);
+				goto fail;
+			}
+			if (st.st_size != 0 &&
+			    map_add(&map->quirks, &map->quirk_count, &quirk_room, sector * map->unit,
+			            (uint64_t)st.st_size, 0u, file) != 0) {
+				closedir(runs);
+				fail(detail, cap, "out of memory", NULL);
+				goto fail;
+			}
+		}
+		closedir(runs);
+	} else if (errno != ENOENT) {
+		fail(detail, cap, path, strerror(errno));
+		goto fail;
+	}
+	/* Runs never overlap one another, each a stretch the diff found; the
+	 * files are laid in their lines' order, kept by `order` on a tie. */
+	if (map->file_count != 0u)
+		qsort(map->files, map->file_count, sizeof map->files[0], by_at);
+	if (map->quirk_count != 0u)
+		qsort(map->quirks, map->quirk_count, sizeof map->quirks[0], by_at);
+	*bytes = map->bytes;
+	return map;
+fail:
+	hull_media_map_close(map);
+	return NULL;
+}
+
+/* The pieces of `list` crossing [at, at + n) laid onto `out`, which is
+ * the disc from `at`. `longest` bounds how far back a crossing piece can
+ * start. */
+static int map_layer(const map_piece *list, size_t count, uint64_t longest, uint64_t at,
+                     uint8_t *out, size_t n)
+{
+	size_t   low = 0u, high = count;
+	uint64_t from = at > longest ? at - longest : 0u;
+
+	/* The first piece that starts at or after `from`. */
+	while (low < high) {
+		size_t mid = low + (high - low) / 2u;
+
+		if (list[mid].at < from)
+			low = mid + 1u;
+		else
+			high = mid;
+	}
+	for (size_t i = low; i < count && list[i].at < at + n; i++) {
+		const map_piece *p = &list[i];
+		uint64_t         start = p->at > at ? p->at : at;
+		uint64_t         end = p->at + p->length < at + n ? p->at + p->length : at + n;
+		int              fd;
+
+		if (end <= start)
+			continue;
+		if ((fd = open(p->path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)) < 0)
+			return -1;
+		if (read_all(fd, out + (start - at), (size_t)(end - start), p->from + (start - p->at)) != 0) {
+			close(fd);
+			return -1;
+		}
+		close(fd);
+	}
+	return 0;
+}
+
+int hull_media_map_read(hull_media_map *map, uint64_t at, void *out, size_t n)
+{
+	uint64_t longest_quirk = 0u;
+
+	if (at > map->bytes || n > map->bytes - at)
+		return -1;
+	memset(out, 0, n);
+	for (size_t i = 0u; i < map->quirk_count; i++)
+		if (map->quirks[i].length > longest_quirk)
+			longest_quirk = map->quirks[i].length;
+	return map_layer(map->files, map->file_count, map->longest, at, out, n) == 0 &&
+	       map_layer(map->quirks, map->quirk_count, longest_quirk, at, out, n) == 0 ? 0 : -1;
+}
+
+int hull_media_map_verify(hull_media_map *map, char *detail, size_t cap)
+{
+	/* Its own, not a static: two machines verify on their own threads,
+	 * and one buffer between them gave each the other's bytes (the pc
+	 * suite's two collections started together). */
+	uint8_t       *buffer = malloc(COPY_BYTES);
+	hull_sha256    h;
+	uint8_t        digest[32];
+	char           got[65];
+
+	if (buffer == NULL)
+		return fail(detail, cap, "out of memory", NULL);
+	hull_sha256_init(&h);
+	if (!map->sparse) {
+		for (uint64_t at = 0u; at < map->bytes;) {
+			size_t n = map->bytes - at < COPY_BYTES ? (size_t)(map->bytes - at) : COPY_BYTES;
+
+			if (hull_media_map_read(map, at, buffer, n) != 0) {
+				free(buffer);
+				return fail(detail, cap, "the collection's files cannot be read", strerror(errno));
+			}
+			hull_sha256_update(&h, buffer, n);
+			at += n;
+		}
+	} else {
+		/* hash_sparse()'s digest: each non-zero block with its offset, in
+		 * order; a block no piece reaches is zero, so only the blocks the
+		 * pieces cover are read. */
+		static const uint8_t zero[SPARSE_BLOCK];
+		uint8_t              block[SPARSE_BLOCK];
+		uint8_t              offset[8];
+		uint64_t             next = 0u;
+		size_t               fi = 0u, qi = 0u;
+
+		for (;;) {
+			uint64_t start = UINT64_MAX;
+			uint64_t at;
+			size_t   piece;
+
+			/* The next piece of either layer not wholly behind `next`. */
+			while (fi < map->file_count && map->files[fi].at + map->files[fi].length <= next)
+				fi++;
+			while (qi < map->quirk_count && map->quirks[qi].at + map->quirks[qi].length <= next)
+				qi++;
+			if (fi < map->file_count)
+				start = map->files[fi].at > next ? map->files[fi].at : next;
+			if (qi < map->quirk_count) {
+				uint64_t q = map->quirks[qi].at > next ? map->quirks[qi].at : next;
+
+				start = q < start ? q : start;
+			}
+			if (start >= map->bytes)
+				break;
+			at = start - start % SPARSE_BLOCK;
+			piece = map->bytes - at < SPARSE_BLOCK ? (size_t)(map->bytes - at) : SPARSE_BLOCK;
+			if (hull_media_map_read(map, at, block, piece) != 0) {
+				free(buffer);
+				return fail(detail, cap, "the collection's files cannot be read", strerror(errno));
+			}
+			if (memcmp(block, zero, piece) != 0) {
+				le64_of(at, offset);
+				hull_sha256_update(&h, offset, sizeof offset);
+				hull_sha256_update(&h, block, piece);
+			}
+			next = at + piece;
+		}
+		le64_of(map->bytes, offset);
+		hull_sha256_update(&h, offset, sizeof offset);
+	}
+	free(buffer);
+	hull_sha256_final(&h, digest);
+	hull_sha256_hex(digest, got);
+	if (strcmp(map->sha, got) != 0) {
+		snprintf(detail, cap, "the collection no longer gives its disc: sha256 %s, and %s was "
+		         "imported", got, map->sha);
+		return -1;
+	}
+	return 0;
+}
+
 static pthread_mutex_t media_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 
 int hull_media_write(const char *dir, int fd, char *detail, size_t cap)

@@ -71,6 +71,7 @@
 #include "esp.h"
 #include "iso.h"
 #include "media.h"
+#include "nbd.h"
 #include "usage.h"
 #include "display.h"
 #include "hostdev.h"
@@ -92,6 +93,7 @@ typedef struct medium {
 	char *collection;    /* its directory, until then */
 	int   exact;         /* `hull media import`'s, or a tree alone */
 	int   write_back;    /* (mutable direct): taken apart into the collection again */
+	int   nbd;           /* a disk collection served by NBD, qemu's end; 0 for none */
 	char  format[8];     /* qemu's word for an image's container */
 } medium;
 
@@ -295,6 +297,8 @@ static void release(hull_machine *m)
 		free(m->media[i].collection);
 		if (m->media[i].fd >= 0)
 			close(m->media[i].fd);
+		if (m->media[i].nbd > 0)
+			close(m->media[i].nbd);
 	}
 	for (unsigned i = 0u; i < m->segment_count; i++) {
 		free(m->segment[i]);
@@ -823,6 +827,36 @@ static const char *add_collection(hull_machine *m, medium *d, const char *collec
 		return "out of memory";
 	strcpy(d->format, "raw");
 	return NULL;
+}
+
+/* A disk's collection under (mutable overlay) served where its files lie,
+ * by NBD on a socketpair (engine/nbd.c), held to its hash first by reading
+ * it through, and no image made of it: qemu's snapshot takes the writes,
+ * as for an image: disk. 1 where served, 0 where the collection is not one
+ * to serve so, -1 with m->why. */
+static int serve_collection(hull_machine *m, medium *d)
+{
+	char            detail[512];
+	uint64_t        bytes;
+	hull_media_map *map;
+	int             pair[2];
+
+	if (d->type != 'd' || !d->exact || d->write_back)
+		return 0;
+	if ((map = hull_media_map_open(d->collection, &bytes, detail, sizeof detail)) == NULL ||
+	    hull_media_map_verify(map, detail, sizeof detail) != 0) {
+		hull_media_map_close(map);
+		snprintf(m->why, sizeof m->why, "a medium's disk cannot be served: %s\n", detail);
+		return -1;
+	}
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0 ||
+	    hull_nbd_serve(map, bytes, pair[1]) != 0) {
+		hull_media_map_close(map);
+		snprintf(m->why, sizeof m->why, "a medium's disk cannot be served: %s\n", strerror(errno));
+		return -1;
+	}
+	d->nbd = pair[0];
+	return 1;
 }
 
 /* A collection reassembled into an unnamed file of the cache's, on the
@@ -1685,8 +1719,23 @@ static void exec_pc(const hull_machine *m)
 		         d->type == 'u' ? "if=none" : "if=ide,media=disk", d->path == NULL ? "raw" : d->format,
 		         d->type == 'c' ? ",readonly=on" :
 		         d->type != 'f' ? ",discard=unmap,detect-zeroes=unmap" : "",
-		         d->type != 'c' && d->path != NULL && !m->direct ? ",snapshot=on" : "");
-		if ((drive = option(head, path)) == NULL)
+		         d->type != 'c' && (d->path != NULL || d->nbd > 0) && !m->direct ? ",snapshot=on" :
+		         "");
+		/* A served collection: qemu's NBD client on its end of the pair,
+		 * by number, in place of a file. */
+		if (d->nbd > 0) {
+			int  fd = fcntl(d->nbd, F_DUPFD, 3);
+			char served[96];
+
+			if (fd < 0)
+				return;
+			head[strlen(head) - strlen("file=")] = '\0';
+			snprintf(served, sizeof served, "file.driver=nbd,file.server.type=fd,file.server.str=%d",
+			         fd);
+			if ((drive = malloc(strlen(head) + strlen(served) + 1u)) == NULL)
+				return;
+			strcpy(stpcpy(drive, head), served);
+		} else if ((drive = option(head, path)) == NULL)
 			return;
 		{
 			size_t length = strlen(drive);
@@ -2107,8 +2156,11 @@ static void *run_machine(void *arg)
 	int           pressing;
 
 	for (unsigned i = 0u; i < m->media_count && !failed; i++)
-		if (m->media[i].collection != NULL)
-			failed = make_image(m, &m->media[i]) != 0;
+		if (m->media[i].collection != NULL) {
+			int served = serve_collection(m, &m->media[i]);
+
+			failed = served < 0 || (served == 0 && make_image(m, &m->media[i]) != 0);
+		}
 	pthread_mutex_lock(&m->lock);
 	stopped = m->stopping;
 	pthread_mutex_unlock(&m->lock);

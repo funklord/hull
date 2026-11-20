@@ -87,6 +87,17 @@ int hull_media_write_raw(const char *dir, int fd, char *detail, size_t cap);
  * the sheet. 0, or -1 with why in `detail`. */
 int hull_media_export(const char *dir, const char *out, char *detail, size_t cap);
 
+/* A collection read where it lies, with no image made (section 3.10):
+ * opened, its bytes into `*bytes`; read at any offset as the reassembled
+ * disc would be; its whole held to media.conf's hash; closed. Not for a raw
+ * dump's collection, whose disc is its data track's. NULL, or -1, with why
+ * in `detail`. */
+typedef struct hull_media_map hull_media_map;
+hull_media_map *hull_media_map_open(const char *dir, uint64_t *bytes, char *detail, size_t cap);
+int hull_media_map_read(hull_media_map *map, uint64_t at, void *out, size_t n);
+int hull_media_map_verify(hull_media_map *map, char *detail, size_t cap);
+void hull_media_map_close(hull_media_map *map);
+
 /* Whether `dir` is a collection this file made: has it a layout.conf. */
 int hull_media_exact(const char *dir);
 

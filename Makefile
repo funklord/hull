@@ -98,7 +98,7 @@ PLAN_OBJS = $(BUILD_DIR)/plan/matrix.o $(BUILD_DIR)/plan/registry.o \
 # lives; `hull --version` prints it.
 ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/chroot.o $(BUILD_DIR)/engine/dos.o \
-              $(BUILD_DIR)/engine/dosbox.o $(BUILD_DIR)/engine/dosemu.o $(BUILD_DIR)/engine/pc.o \
+              $(BUILD_DIR)/engine/dosbox.o $(BUILD_DIR)/engine/dosemu.o $(BUILD_DIR)/engine/pc.o $(BUILD_DIR)/engine/nbd.o \
               $(BUILD_DIR)/engine/hw.o \
               $(BUILD_DIR)/engine/iso.o \
               $(BUILD_DIR)/engine/media.o \

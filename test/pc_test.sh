@@ -289,8 +289,8 @@ sleep 1
 out=$(ps -eo pid=,args= | grep -F "$root/" | grep '[q]emu-system')
 [ -z "$out" ] || fail 'a stop left no qemu' "$out"
 
-# A core killed with a collection's image open: qemu goes with it, and
-# its unnamed image and snapshot with qemu.
+# A core killed with a collection's disk open: qemu goes with it, and
+# its snapshot with qemu.
 conf '(source "media:disk") (media (medium (type disk) (source "dir:./spinc")))'
 "$hull" media import "$root/spin.img" "$root/spinc" > /dev/null 2>&1
 timeout 60 "$hull" run -f "$root/hull.conf" > "$root/spin.out" 2>&1 &
@@ -302,6 +302,10 @@ done | head -1)
 qemu=$(ps -o pid= --ppid "${core:-1}" | while read -r p; do
 	[ "$(cat "/proc/$p/comm" 2>/dev/null)" = qemu-system-x86 ] && echo "$p"
 done | head -1)
+# Its disk served where its files lie, by NBD, no image made of it.
+cases=$((cases + 1))
+[ -n "$qemu" ] && tr '\0' ' ' < "/proc/$qemu/cmdline" | grep -q 'file.driver=nbd,file.server.type=fd' ||
+	fail 'a disk collection is served, not copied' "$(tr '\0' ' ' < "/proc/${qemu:-1}/cmdline" 2>&1)"
 cases=$((cases + 1))
 if [ -z "$core" ] || [ -z "$qemu" ]; then
 	fail 'the core and its qemu are found' "core ${core:-none}, qemu ${qemu:-none}"
