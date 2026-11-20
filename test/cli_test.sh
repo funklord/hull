@@ -554,7 +554,7 @@ expect 0 '^ok +user namespaces$' "$hull" doctor
 # has been fetched, the fix is the user's own command (Appendix F).
 expect 0 '^ok +a vm.s kernel, the host.s: /' "$hull" doctor
 if [ -r "$(dirname "$hull")/vmlinux-hull" ]; then
-	expect 0 '^ok +hull.s own kernel: \(kernel hull\), a microvm' "$hull" doctor
+	expect 0 '^ok +hull.s own kernel: a vm.s default, a microvm' "$hull" doctor
 else
 	expect 0 '^absent +hull.s own kernel: ' "$hull" doctor
 fi
