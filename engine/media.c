@@ -1793,96 +1793,6 @@ static uint64_t image_data(const walk *w, uint64_t at)
 	       next_data(w->image, at, w->bytes);
 }
 
-/* hash_fd()'s or hash_sparse()'s digest of the disk being taken apart,
- * read as image_read() reads it. */
-static int hash_walk(const walk *w, char out[65])
-{
-	static const uint8_t zero[SPARSE_BLOCK];
-	uint8_t             *buffer = malloc(COPY_BYTES);
-	hull_sha256          h;
-	uint8_t              digest[32];
-	uint8_t              offset[8];
-	uint64_t             at = 0u;
-
-	if (buffer == NULL)
-		return -1;
-	hull_sha256_init(&h);
-	if (!w->sparse) {
-		while (at < w->bytes) {
-			size_t n = w->bytes - at < COPY_BYTES ? (size_t)(w->bytes - at) : COPY_BYTES;
-
-			if (image_read(w, buffer, n, at) != 0) {
-				free(buffer);
-				return -1;
-			}
-			hull_sha256_update(&h, buffer, n);
-			at += n;
-		}
-	} else {
-		while ((at = image_data(w, at)) < w->bytes) {
-			size_t n;
-
-			at -= at % SPARSE_BLOCK;
-			n = w->bytes - at < COPY_BYTES ? (size_t)(w->bytes - at) : COPY_BYTES;
-			if (image_read(w, buffer, n, at) != 0) {
-				free(buffer);
-				return -1;
-			}
-			for (size_t i = 0u; i < n; i += SPARSE_BLOCK) {
-				size_t piece = n - i < SPARSE_BLOCK ? n - i : SPARSE_BLOCK;
-
-				if (memcmp(buffer + i, zero, piece) != 0) {
-					le64_of(at + i, offset);
-					hull_sha256_update(&h, offset, sizeof offset);
-					hull_sha256_update(&h, buffer + i, piece);
-				}
-			}
-			at += n;
-		}
-		le64_of(w->bytes, offset);
-		hull_sha256_update(&h, offset, sizeof offset);
-	}
-	free(buffer);
-	hull_sha256_final(&h, digest);
-	hull_sha256_hex(digest, out);
-	return 0;
-}
-
-static int hash_sparse(int fd, uint64_t bytes, char out[65])
-{
-	static uint8_t       buffer[COPY_BYTES];
-	static const uint8_t zero[SPARSE_BLOCK];
-	hull_sha256          h;
-	uint8_t              digest[32];
-	uint8_t              offset[8];
-	uint64_t             at = 0u;
-
-	hull_sha256_init(&h);
-	while ((at = next_data(fd, at, bytes)) < bytes) {
-		size_t n;
-
-		at -= at % SPARSE_BLOCK;
-		n = bytes - at < sizeof buffer ? (size_t)(bytes - at) : sizeof buffer;
-		if (read_all(fd, buffer, n, at) != 0)
-			return -1;
-		for (size_t i = 0u; i < n; i += SPARSE_BLOCK) {
-			size_t piece = n - i < SPARSE_BLOCK ? n - i : SPARSE_BLOCK;
-
-			if (memcmp(buffer + i, zero, piece) != 0) {
-				le64_of(at + i, offset);
-				hull_sha256_update(&h, offset, sizeof offset);
-				hull_sha256_update(&h, buffer + i, piece);
-			}
-		}
-		at += n;
-	}
-	le64_of(bytes, offset);
-	hull_sha256_update(&h, offset, sizeof offset);
-	hull_sha256_final(&h, digest);
-	hull_sha256_hex(digest, out);
-	return 0;
-}
-
 /* --- regions: the disk's digest by the MiB (format 2) --------------------- */
 
 /*
@@ -1950,28 +1860,80 @@ static int region_digest(const disk_reader *d, uint8_t *buffer, uint64_t at, siz
 	return 0;
 }
 
-/* Every region of the disk `bytes` long into `out`, in order. */
-static int region_digests(const disk_reader *d, uint64_t bytes, regions *out)
+/* A disk's digests in one read: its whole one into `sha` where not NULL --
+ * a plain sha256, or hash_sparse()'s where `sparse` -- and its regions
+ * into `out` where not NULL. Only what `d` says may hold data is read
+ * where the whole digest does not need every byte. */
+static int disk_digests(const disk_reader *d, uint64_t bytes, int sparse, char sha[65], regions *out)
 {
-	uint8_t *buffer = malloc(REGION);
-	uint64_t at = 0u;
+	static const uint8_t zero[SPARSE_BLOCK];
+	uint8_t             *buffer = malloc(REGION);
+	hull_sha256          h;
+	uint8_t              digest[32];
+	uint8_t              offset[8];
+	uint64_t             at = 0u;
+	int                  every = sha != NULL && !sparse;
 
 	if (buffer == NULL)
 		return -1;
-	while ((at = d->data(d->context, at, bytes)) < bytes) {
+	hull_sha256_init(&h);
+	for (;;) {
 		size_t n;
-		char   sha[65];
+		char   region_sha[65];
 
+		if (!every)
+			at = d->data(d->context, at, bytes);
+		if (at >= bytes)
+			break;
 		at -= at % REGION;
 		n = bytes - at < REGION ? (size_t)(bytes - at) : REGION;
-		if (region_digest(d, buffer, at, n, sha) != 0 ||
-		    (sha[0] != '\0' && regions_add(out, at, sha) != 0)) {
+		if (d->read(d->context, buffer, n, at) != 0) {
 			free(buffer);
 			return -1;
+		}
+		if (every) {
+			hull_sha256_update(&h, buffer, n);
+		} else if (sha != NULL) {
+			for (size_t i = 0u; i < n; i += SPARSE_BLOCK) {
+				size_t piece = n - i < SPARSE_BLOCK ? n - i : SPARSE_BLOCK;
+
+				if (memcmp(buffer + i, zero, piece) != 0) {
+					le64_of(at + i, offset);
+					hull_sha256_update(&h, offset, sizeof offset);
+					hull_sha256_update(&h, buffer + i, piece);
+				}
+			}
+		}
+		if (out != NULL) {
+			size_t i;
+
+			for (i = 0u; i < n; i += SPARSE_BLOCK)
+				if (memcmp(buffer + i, zero, n - i < SPARSE_BLOCK ? n - i : SPARSE_BLOCK) != 0)
+					break;
+			if (i < n) {
+				hull_sha256 r;
+
+				hull_sha256_init(&r);
+				hull_sha256_update(&r, buffer, n);
+				hull_sha256_final(&r, digest);
+				hull_sha256_hex(digest, region_sha);
+				if (regions_add(out, at, region_sha) != 0) {
+					free(buffer);
+					return -1;
+				}
+			}
 		}
 		at += n;
 	}
 	free(buffer);
+	if (sha != NULL) {
+		if (sparse) {
+			le64_of(bytes, offset);
+			hull_sha256_update(&h, offset, sizeof offset);
+		}
+		hull_sha256_final(&h, digest);
+		hull_sha256_hex(digest, sha);
+	}
 	return 0;
 }
 
@@ -2080,27 +2042,64 @@ static int regions_read(const char *dir, const char top[65], uint64_t bytes, reg
 	}
 }
 
-/* The disk `d` hashed by the region and held to `top`: 0, or -1 with why. */
-static int regions_check(const disk_reader *d, uint64_t bytes, const char top[65], char *detail,
-                         size_t cap)
+/* The disk `d` hashed by the region and held to `top`, and in the same
+ * read to `whole`, its whole digest (sparse where `sparse`), where not
+ * NULL: 0, or -1 with why. */
+static int regions_check(const disk_reader *d, uint64_t bytes, const char top[65], const char *whole,
+                         int sparse, const regions *listed, char *detail, size_t cap)
 {
 	regions r = { 0 };
 	char    got[65];
+	char    sha[65];
 	size_t  length;
 	char   *text;
 
-	if (region_digests(d, bytes, &r) != 0) {
+	if (disk_digests(d, bytes, sparse, whole != NULL ? sha : NULL, &r) != 0) {
 		regions_free(&r);
-		return fail(detail, cap, "the disc cannot be read by the region", strerror(errno));
+		return fail(detail, cap, "the disc cannot be read back", strerror(errno));
 	}
 	text = regions_text(&r, &length, got);
-	regions_free(&r);
-	if (text == NULL)
+	if (text == NULL) {
+		regions_free(&r);
 		return fail(detail, cap, "out of memory", NULL);
+	}
 	free(text);
 	if (strcmp(got, top) != 0) {
+		/* Where, by regions.conf: the first region the two disagree on,
+		 * for dd and sha256sum to look at. */
+		size_t i = 0u, j = 0u;
+
+		while (listed != NULL && (i < r.count || j < listed->count)) {
+			const region *a = i < r.count ? &r.list[i] : NULL;
+			const region *b = j < listed->count ? &listed->list[j] : NULL;
+
+			if (a != NULL && b != NULL && a->at == b->at && strcmp(a->sha, b->sha) == 0) {
+				i++;
+				j++;
+				continue;
+			}
+			if (b == NULL || (a != NULL && a->at < b->at))
+				snprintf(detail, cap, "the collection no longer gives its disc: its region at "
+				         "0x%" PRIX64 " is not all zeros, as regions.conf has it", a->at);
+			else if (a == NULL || b->at < a->at)
+				snprintf(detail, cap, "the collection no longer gives its disc: its region at "
+				         "0x%" PRIX64 " is all zeros, where regions.conf has %s", b->at, b->sha);
+			else
+				snprintf(detail, cap, "the collection no longer gives its disc: its region at "
+				         "0x%" PRIX64 " hashes to %s, where regions.conf has %s", a->at, a->sha,
+				         b->sha);
+			regions_free(&r);
+			return -1;
+		}
+		regions_free(&r);
 		snprintf(detail, cap, "the collection no longer gives its disc: its regions hash to %s, "
 		         "and %s was taken", got, top);
+		return -1;
+	}
+	regions_free(&r);
+	if (whole != NULL && strcmp(sha, whole) != 0) {
+		snprintf(detail, cap, "the collection no longer gives its disc: sha256 %s, and %s was "
+		         "imported", sha, whole);
 		return -1;
 	}
 	return 0;
@@ -2552,19 +2551,24 @@ static int media_write_locked(const char *dir, int fd, char *detail, size_t cap)
 	if (top[0] != '\0') {
 		disk_reader d = { fd_read, fd_data, &fd };
 		regions     listed = { 0 };
-		int         read = regions_read(dir, top, bytes, &listed);
+		int         status;
 
-		regions_free(&listed);
-		if (read != 0)
+		if (regions_read(dir, top, bytes, &listed) != 0) {
+			regions_free(&listed);
 			return fail(detail, cap, "the collection's regions.conf is not the one its media.conf "
 			            "names", NULL);
-		if (regions_check(&d, bytes, top, detail, cap) != 0)
-			return -1;
+		}
+		status = regions_check(&d, bytes, top, want[0] != '\0' ? want : NULL, sparse, &listed,
+		                       detail, cap);
+		regions_free(&listed);
+		return status;
 	}
-	if (want[0] == '\0')
-		return 0;
-	if ((sparse ? hash_sparse(fd, bytes, got) : hash_fd(fd, bytes, got)) != 0)
-		return fail(detail, cap, "the disc's image cannot be read back", strerror(errno));
+	{
+		disk_reader d = { fd_read, fd_data, &fd };
+
+		if (disk_digests(&d, bytes, sparse, got, NULL) != 0)
+			return fail(detail, cap, "the disc's image cannot be read back", strerror(errno));
+	}
 	if (strcmp(want, got) != 0) {
 		snprintf(detail, cap, "the collection no longer gives its disc: sha256 %s, and %s was "
 		         "imported", got, want);
@@ -2797,7 +2801,7 @@ static int import_into(walk *w, const char *dir, hull_media_report *report, char
 	if (w->prior == NULL) {
 		disk_reader d = { walk_read, walk_data, w };
 
-		if (hash_walk(w, sha) != 0 || region_digests(&d, w->bytes, &digests) != 0) {
+		if (disk_digests(&d, w->bytes, w->sparse, sha, &digests) != 0) {
 			regions_free(&digests);
 			return fail(detail, cap, "the image cannot be read", strerror(errno));
 		}
@@ -3228,6 +3232,7 @@ struct hull_media_map {
 	int        sparse;
 	char       sha[65];
 	char       regions[65];
+	regions    listed;   /* regions.conf, held to `regions` at open */
 	map_piece *files;
 	size_t     file_count;
 	map_piece *quirks;
@@ -3272,6 +3277,7 @@ void hull_media_map_close(hull_media_map *map)
 		free(map->quirks[i].path);
 	free(map->files);
 	free(map->quirks);
+	regions_free(&map->listed);
 	free(map);
 }
 
@@ -3370,11 +3376,7 @@ hull_media_map *hull_media_map_open(const char *dir, uint64_t *bytes, char *deta
 	/* Runs never overlap one another, each a stretch the diff found; the
 	 * files are laid in their lines' order, kept by `order` on a tie. */
 	if (map->regions[0] != '\0') {
-		regions listed = { 0 };
-		int     read = regions_read(dir, map->regions, map->bytes, &listed);
-
-		regions_free(&listed);
-		if (read != 0) {
+		if (regions_read(dir, map->regions, map->bytes, &map->listed) != 0) {
 			fail(detail, cap, "the collection's regions.conf is not the one its media.conf names",
 			     NULL);
 			goto fail;
@@ -3488,88 +3490,18 @@ static uint64_t map_disk_data(void *context, uint64_t at, uint64_t bytes)
 
 int hull_media_map_verify(hull_media_map *map, char *detail, size_t cap)
 {
-	/* Its own, not a static: two machines verify on their own threads,
-	 * and one buffer between them gave each the other's bytes (the pc
-	 * suite's two collections started together). */
-	uint8_t       *buffer = malloc(COPY_BYTES);
-	hull_sha256    h;
-	uint8_t        digest[32];
-	char           got[65];
+	/* One read of the disc as the map gives it, every digest it has
+	 * taken from that read; a block no piece reaches is zero, so where
+	 * the whole digest needs no zeros, only what the pieces cover is
+	 * read. */
+	disk_reader d = { map_disk_read, map_disk_data, map };
+	char        got[65];
 
-	if (buffer == NULL)
-		return fail(detail, cap, "out of memory", NULL);
-	if (map->regions[0] != '\0') {
-		disk_reader d = { map_disk_read, map_disk_data, map };
-
-		if (regions_check(&d, map->bytes, map->regions, detail, cap) != 0) {
-			free(buffer);
-			return -1;
-		}
-	}
-	if (map->sha[0] == '\0') {
-		free(buffer);
-		return 0;
-	}
-	hull_sha256_init(&h);
-	if (!map->sparse) {
-		for (uint64_t at = 0u; at < map->bytes;) {
-			size_t n = map->bytes - at < COPY_BYTES ? (size_t)(map->bytes - at) : COPY_BYTES;
-
-			if (hull_media_map_read(map, at, buffer, n) != 0) {
-				free(buffer);
-				return fail(detail, cap, "the collection's files cannot be read", strerror(errno));
-			}
-			hull_sha256_update(&h, buffer, n);
-			at += n;
-		}
-	} else {
-		/* hash_sparse()'s digest: each non-zero block with its offset, in
-		 * order; a block no piece reaches is zero, so only the blocks the
-		 * pieces cover are read. */
-		static const uint8_t zero[SPARSE_BLOCK];
-		uint8_t              block[SPARSE_BLOCK];
-		uint8_t              offset[8];
-		uint64_t             next = 0u;
-		size_t               fi = 0u, qi = 0u;
-
-		for (;;) {
-			uint64_t start = UINT64_MAX;
-			uint64_t at;
-			size_t   piece;
-
-			/* The next piece of either layer not wholly behind `next`. */
-			while (fi < map->file_count && map->files[fi].at + map->files[fi].length <= next)
-				fi++;
-			while (qi < map->quirk_count && map->quirks[qi].at + map->quirks[qi].length <= next)
-				qi++;
-			if (fi < map->file_count)
-				start = map->files[fi].at > next ? map->files[fi].at : next;
-			if (qi < map->quirk_count) {
-				uint64_t q = map->quirks[qi].at > next ? map->quirks[qi].at : next;
-
-				start = q < start ? q : start;
-			}
-			if (start >= map->bytes)
-				break;
-			at = start - start % SPARSE_BLOCK;
-			piece = map->bytes - at < SPARSE_BLOCK ? (size_t)(map->bytes - at) : SPARSE_BLOCK;
-			if (hull_media_map_read(map, at, block, piece) != 0) {
-				free(buffer);
-				return fail(detail, cap, "the collection's files cannot be read", strerror(errno));
-			}
-			if (memcmp(block, zero, piece) != 0) {
-				le64_of(at, offset);
-				hull_sha256_update(&h, offset, sizeof offset);
-				hull_sha256_update(&h, block, piece);
-			}
-			next = at + piece;
-		}
-		le64_of(map->bytes, offset);
-		hull_sha256_update(&h, offset, sizeof offset);
-	}
-	free(buffer);
-	hull_sha256_final(&h, digest);
-	hull_sha256_hex(digest, got);
+	if (map->regions[0] != '\0')
+		return regions_check(&d, map->bytes, map->regions, map->sha[0] != '\0' ? map->sha : NULL,
+		                     map->sparse, &map->listed, detail, cap);
+	if (disk_digests(&d, map->bytes, map->sparse, got, NULL) != 0)
+		return fail(detail, cap, "the collection's files cannot be read", strerror(errno));
 	if (strcmp(map->sha, got) != 0) {
 		snprintf(detail, cap, "the collection no longer gives its disc: sha256 %s, and %s was "
 		         "imported", got, map->sha);

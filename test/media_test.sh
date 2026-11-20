@@ -71,6 +71,10 @@ cp "$dir/disc/files/README.TXT" "$dir/kept"
 printf 'X' | dd of="$dir/disc/files/README.TXT" bs=1 count=1 conv=notrunc 2>/dev/null
 media verify "$dir/disc"
 check 'a file changed fails' "$got" 1 "$out"
+# Saying where, by regions.conf: the first MiB, which the file is in.
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q 'its region at 0x0 hashes to [0-9a-f]\{64\}, where regions.conf has' ||
+	{ failures=$((failures + 1)); printf 'FAIL: it did not name the region: %s\n' "$out"; }
 cp "$dir/kept" "$dir/disc/files/README.TXT"
 printf 'more' >> "$dir/disc/files/README.TXT"
 media verify "$dir/disc"
