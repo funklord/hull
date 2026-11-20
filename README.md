@@ -124,6 +124,16 @@ them has:
 - **The host's devices.** USB by vendor and product or by port, serial
   and parallel ports, and PCI by VFIO, each held by one machine at a
   time.
+- **Disks as files, and back onto drives.** A disc, floppy or disk image
+  is imported as its files plus only the bytes no file explains --
+  copy-protection sectors included -- and given back byte for byte. A
+  `(disk …)` -- label, partitions, filesystems and their features, boot
+  code, SYSLINUX or EXTLINUX -- is written to a USB stick or a disk at
+  that drive's own size, as the user, and read back; an imported disk
+  is described that way too, so its files go onto a drive of another
+  size. `dd` copies an image as it is, and systemd-repart builds
+  partitions but not from a description of an old disk or for a BIOS
+  bootloader.
 - **Built for scripts.** A machine's exit status and output are `hull
   run`'s, and a killed `hull run`, `SIGKILL` included, takes its machine
   with it, where a Docker container belongs to the daemon and outlives

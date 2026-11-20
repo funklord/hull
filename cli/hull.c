@@ -58,6 +58,7 @@
 #include "builtin.h"
 #include "core.h"
 #include "doctor.h"
+#include "disk.h"
 #include "export.h"
 #include "hostnet.h"
 #include "kernel_fetch.h"
@@ -167,6 +168,7 @@ static void usage(FILE *out)
 	      "       hull import COMPOSE-FILE | hull import IMAGE DIR\n"
 	      "       hull media import IMAGE DIR | verify DIR | export DIR IMAGE\n"
 	      "       hull media change ID DRIVE [IMAGE]\n"
+	      "       hull disk write FILE DEVICE|IMAGE\n"
 	      "       hull key ID KEY... | hull type ID TEXT | hull screenshot ID FILE\n"
 	      "       hull board ls POOL | hull board fix NAME\n"
 	      "       hull vagrant box add NAME FILE\n"
@@ -6644,6 +6646,185 @@ static int export_machine(const char *file, const char *name, const char *image)
 	return status;
 }
 
+/* A size of the spec's -- digits, then K, M, G or T or nothing -- in
+ * bytes; 0 where it is none. */
+static uint64_t spec_bytes(const char *text)
+{
+	char              *end;
+	unsigned long long n = strtoull(text, &end, 10);
+	unsigned           shift = *end == 'K' ? 10u : *end == 'M' ? 20u : *end == 'G' ? 30u :
+	                           *end == 'T' ? 40u : 0u;
+
+	if (end == text || (*end != '\0' && (shift == 0u || end[1] != '\0')) ||
+	    n > (UINT64_MAX >> shift))
+		return 0u;
+	return (uint64_t)n << shift;
+}
+
+/* The one value of `key` in `record` as text into `out`; 0 where absent. */
+static int disk_text(hull_spec *spec, const hull_sexpr_form *record, const char *key, char *out,
+                       size_t cap)
+{
+	hull_sexpr_form entry;
+	hull_sexpr_form head;
+	hull_sexpr_form value;
+
+	out[0] = '\0';
+	if (!hull_spec_find(spec, record, key, &entry) || !hull_sexpr_child(&spec->doc, &entry, &head) ||
+	    !hull_sexpr_next(&spec->doc, &head, &value) || value.content_length >= cap)
+		return 0;
+	memcpy(out, spec->doc.data + value.content, value.content_length);
+	out[value.content_length] = '\0';
+	return 1;
+}
+
+/* `hull disk write FILE TARGET` (section 3.13): the file's (disk ...) to
+ * TARGET, a drive at its own size or an image file at the described or
+ * needed one, and read back. */
+static int disk_write(const char *file, const char *target)
+{
+	static hull_disk disk;
+	hull_spec        spec;
+	hull_spec_error  error;
+	hull_sexpr_form  partitions;
+	hull_sexpr_form  part;
+	hull_disk_report report;
+	hull_store       store;
+	uint8_t         *data;
+	size_t           length;
+	char             text[3000];
+	char             why[4400] = "";
+	int              more;
+	int              status;
+	const char      *slash = strrchr(file, '/');
+	int              dir_length = slash != NULL ? (int)(slash - file + 1) : 0;
+
+	if ((data = spec_text(file, &length)) == NULL)
+		return 125;
+	if (hull_spec_open(&spec, data, length, &error) != HULL_SPEC_OK) {
+		fprintf(stderr, "%s:%u:%u: %s%s%s\n", file, error.line, error.column, error.path,
+		        error.path[0] != '\0' ? ": " : "", error.reason);
+		free(data);
+		return 125;
+	}
+	if (!spec.has_disk) {
+		fprintf(stderr, "%s: there is no (disk ...) in it\n", file);
+		free(data);
+		return 125;
+	}
+	memset(&disk, 0, sizeof disk);
+	disk_text(&spec, &spec.disk, "label", text, sizeof text);
+	disk.gpt = strcmp(text, "gpt") == 0;
+	if (disk_text(&spec, &spec.disk, "size", text, sizeof text))
+		disk.bytes = spec_bytes(text);
+	if (disk_text(&spec, &spec.disk, "boot", text, sizeof text))
+		snprintf(disk.boot, sizeof disk.boot, "%.*s%s", text[0] == '/' ? 0 : dir_length, file, text);
+	more = hull_spec_find(&spec, &spec.disk, "partitions", &partitions) &&
+	       hull_sexpr_child(&spec.doc, &partitions, &part);
+	status = 0;
+	for (more = more && hull_sexpr_next(&spec.doc, &part, &part); more && status == 0;
+	     more = hull_sexpr_next(&spec.doc, &part, &part)) {
+		static const char *const types[] = { "linux", "efi", "fat", "bios", "swap" };
+		static const char *const systems[] = { "none", "ext2", "ext3", "ext4", "vfat" };
+		hull_disk_partition     *p;
+		hull_sexpr_form          entry;
+		hull_sexpr_form          head;
+		hull_sexpr_form          value;
+
+		if (disk.count == HULL_DISK_PARTITIONS) {
+			fprintf(stderr, "%s: a disk has 16 partitions at most here\n", file);
+			status = 125;
+			break;
+		}
+		p = &disk.partition[disk.count++];
+		disk_text(&spec, &part, "name", p->name, sizeof p->name);
+		disk_text(&spec, &part, "size", text, sizeof text);
+		p->bytes = strcmp(text, "rest") == 0 ? 0u : spec_bytes(text);
+		p->type = HULL_DISK_LINUX;
+		if (disk_text(&spec, &part, "type", text, sizeof text))
+			for (unsigned k = 0u; k < 5u; k++)
+				if (strcmp(text, types[k]) == 0)
+					p->type = (hull_disk_type)k;
+		disk_text(&spec, &part, "active", text, sizeof text);
+		p->active = strcmp(text, "true") == 0;
+		/* ext4 unless said, or vfat for a partition FAT is what it is. */
+		p->fs = p->type == HULL_DISK_EFI || p->type == HULL_DISK_FAT ? HULL_DISK_VFAT :
+		        p->type == HULL_DISK_BIOS || p->type == HULL_DISK_SWAP ? HULL_DISK_NONE :
+		        HULL_DISK_EXT4;
+		if (disk_text(&spec, &part, "filesystem", text, sizeof text))
+			for (unsigned k = 0u; k < 5u; k++)
+				if (strcmp(text, systems[k]) == 0)
+					p->fs = (hull_disk_fs)k;
+		/* mke2fs -O's list, the features joined by commas. */
+		if (hull_spec_find(&spec, &part, "features", &entry) &&
+		    hull_sexpr_child(&spec.doc, &entry, &head))
+			for (value = head; hull_sexpr_next(&spec.doc, &value, &value);) {
+				size_t used = strlen(p->features);
+
+				if (used + value.content_length + 2u > sizeof p->features)
+					break;
+				snprintf(p->features + used, sizeof p->features - used, "%s%.*s",
+				         used != 0u ? "," : "", (int)value.content_length,
+				         (const char *)spec.doc.data + value.content);
+			}
+		disk_text(&spec, &part, "volume", p->volume, sizeof p->volume);
+		disk_text(&spec, &part, "loader", text, sizeof text);
+		p->syslinux = strcmp(text, "syslinux") == 0;
+		p->extlinux = strcmp(text, "extlinux") == 0;
+		if (!disk_text(&spec, &part, "source", text, sizeof text))
+			continue;
+		/* The tree that fills it, as a machine's source is named: a
+		 * directory relative to the file, a tarball or a pack committed
+		 * as a run commits one, or a stored ref as it is. */
+		if (strncmp(text, "tar:", 4u) == 0) {
+			if (tar_ref(file, &spec, &part, text + 4, p->ref, sizeof p->ref) != 0)
+				status = 125;
+		} else if (strncmp(text, "pack:", 5u) == 0) {
+			if (pack_ref(file, text + 5, p->ref, sizeof p->ref) != 0)
+				status = 125;
+		} else if (strncmp(text, "image:", 6u) == 0) {
+			fprintf(stderr, "%s: partition %u: a partition is filled from a tree, and an image "
+			        "is none\n", file, disk.count);
+			status = 125;
+		} else {
+			char path[4400];
+
+			if (strncmp(text, "dir:", 4u) == 0)
+				snprintf(path, sizeof path, "%.*s%s", text[4] == '/' ? 0 : dir_length, file,
+				         text + 4);
+			else
+				snprintf(path, sizeof path, "%s", text);
+			if ((status = open_store(&store, 1)) == 0) {
+				if (tree_name(&store, path, p->ref, sizeof p->ref, why, sizeof why) != 0) {
+					fprintf(stderr, "hull: disk: %s\n", why);
+					status = 1;
+				}
+				hull_store_close(&store);
+			}
+		}
+	}
+	free(data);
+	if (status != 0)
+		return status;
+	if ((status = open_store(&store, 1)) != 0)
+		return status;
+	if (hull_disk_write(&store, &disk, target, &report, why, sizeof why) != 0) {
+		hull_store_close(&store);
+		fprintf(stderr, "hull: disk: %s\n", why);
+		return 1;
+	}
+	hull_store_close(&store);
+	printf("%s: %llu MiB, %s, read back as written\n", target,
+	       (unsigned long long)(report.bytes >> 20), disk.gpt ? "gpt" : "dos");
+	for (unsigned i = 0u; i < disk.count; i++)
+		printf("  %u: %llu MiB at %llu MiB\n", i + 1u,
+		       (unsigned long long)(report.length[i] >> 20),
+		       (unsigned long long)(report.first[i] >> 20));
+	if (report.note[0] != '\0')
+		printf("note: %s\n", report.note);
+	return 0;
+}
+
 /* `hull pack [--against BASE] SRC FILE` (section 3.13): the tree SRC is,
  * a directory -- committed first, its owners as a commit takes them -- or
  * a stored ref, as one file, its manifest's hash printed; against BASE,
@@ -8881,6 +9062,8 @@ int main(int argc, char **argv)
 		return type_in(argv[2], argv[3]);
 	if (strcmp(command, "screenshot") == 0 && argc == 4 && argv[2][0] != '-')
 		return screenshot_of(argv[2], argv[3]);
+	if (strcmp(command, "disk") == 0 && argc == 5 && strcmp(argv[2], "write") == 0)
+		return disk_write(argv[3], argv[4]);
 	if (strcmp(command, "media") == 0 && argc == 5 && strcmp(argv[2], "export") == 0)
 		return media_export(argv[3], argv[4]);
 	if ((strcmp(command, "media") == 0 && argc == 5 && strcmp(argv[2], "import") == 0) ||

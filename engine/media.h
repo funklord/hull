@@ -21,7 +21,14 @@
  * its regular files; a link's, a device's and every owner and mode being
  * the patch's. A partitioned disk, by GPT or MBR, is each such partition's
  * tree under files/pN, N its place in the table; a partition of anything
- * else is the patch's.
+ * else is the patch's. Such a disk is also described, for `hull disk
+ * write` at any size (cli/disk.c):
+ *
+ *     DIR/disk.conf             a (disk ...): the table's kind, each
+ *                               partition's type, flag, name, filesystem,
+ *                               features and label, its tree files/pN
+ *     DIR/boot.bin              the first sector's 440 bytes of code, where
+ *                               there are any
  *
  * A raw dump, `IMAGE.cue` and the .bin files it names, carries more: the
  * disc above is its data track's 2048 bytes a sector, and

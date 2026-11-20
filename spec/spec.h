@@ -50,15 +50,18 @@ typedef struct hull_spec_error {
 
 /* A checked file. Each form is a whole top-level list, its key included,
  * and is valid only where its flag is set. A file holds `machine` or
- * `machines`, not both, and may hold `build` beside either or alone. */
+ * `machines`, not both, and may hold `build` beside either or alone, and
+ * `disk` (section 3.13) beside any of them or alone. */
 typedef struct hull_spec {
 	hull_sexpr_doc   doc;
 	hull_sexpr_form  machine;
 	hull_sexpr_form  machines;
 	hull_sexpr_form  build;
+	hull_sexpr_form  disk;
 	int              has_machine;
 	int              has_machines;
 	int              has_build;
+	int              has_disk;
 } hull_spec;
 
 /* Read and check a whole file, binding `spec` to `data`, which must

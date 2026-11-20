@@ -950,17 +950,72 @@ static const schema build = TABLE(build_keys);
 static hull_spec_status file_across(walk *w, const hull_sexpr_form *record,
                                     const hull_sexpr_form *found, uint64_t present);
 
+/* A disk without a machine (section 3.13, `hull disk`): its label, its
+ * size, the boot code its first sector carries, and its partitions, each
+ * a filesystem filled from a tree. */
+static const char *const label_values[]      = { "dos", "gpt", NULL };
+static const char *const part_type_values[]  = { "linux", "efi", "fat", "bios", "swap", NULL };
+static const char *const filesystem_values[] = { "ext2", "ext3", "ext4", "vfat", "none", NULL };
+static const char *const loader_values[]     = { "syslinux", "extlinux", NULL };
+
+/* A partition's size: a size, or "rest", what the disk has left. */
+static const char *part_size(const uint8_t *text, uint32_t length)
+{
+	if (length == 4u && memcmp(text, "rest", 4u) == 0)
+		return NULL;
+	return size(text, length) == NULL ? NULL :
+	       "must be a size above zero -- digits, then K, M, G or T or nothing -- or \"rest\"";
+}
+
+/* An mke2fs feature, as -O takes it: a name, ^ before it to turn it off. */
+static const char *feature(const uint8_t *text, uint32_t length)
+{
+	uint32_t i = length != 0u && text[0] == '^' ? 1u : 0u;
+
+	if (i == length)
+		return "must name a feature, ^ before it to turn it off";
+	for (; i < length; i++)
+		if (!is_lower(text[i]) && !is_digit(text[i]) && text[i] != '_')
+			return "must name a feature, ^ before it to turn it off";
+	return NULL;
+}
+
+static const key partition_keys[] = {
+	{ .name = "name",       .type = STRING, .value = nonempty },
+	{ .name = "size",       .type = STRING, .required = 1, .value = part_size },
+	{ .name = "type",       .type = CHOICE, .choices = part_type_values },
+	{ .name = "active",     .type = BOOLEAN },
+	{ .name = "filesystem", .type = CHOICE, .choices = filesystem_values },
+	{ .name = "features",   .type = STRINGS, .nonempty = 1, .value = feature },
+	{ .name = "volume",     .type = STRING, .value = nonempty },
+	{ .name = "source",     .type = STRING, .value = nonempty },
+	{ .name = "loader",     .type = CHOICE, .choices = loader_values },
+};
+static const schema partition = TABLE(partition_keys);
+
+static const key disk_keys[] = {
+	{ .name = "label",      .type = CHOICE, .required = 1, .choices = label_values },
+	{ .name = "size",       .type = STRING, .value = size },
+	{ .name = "boot",       .type = STRING, .value = nonempty },
+	{ .name = "partitions", .type = ENTRIES, .required = 1, .nonempty = 1, .record = &partition,
+	  .entry = "partition" },
+};
+static const schema disk = TABLE(disk_keys);
+
+
 /* The top of a file (J.7): one machine, or several by name, and a build. */
 static const key file_keys[] = {
 	{ .name = "machine",  .type = RECORD, .record = &machine },
 	{ .name = "machines", .type = MAP, .record = &machine, .names = label, .nonempty = 1 },
 	{ .name = "build",    .type = RECORD, .record = &build },
+	{ .name = "disk",     .type = RECORD, .record = &disk },
 };
 static const schema file = TABLE_ACROSS(file_keys, file_across);
 
 #define FILE_MACHINE  0u
 #define FILE_MACHINES 1u
 #define FILE_BUILD    2u
+#define FILE_DISK     3u
 
 _Static_assert(sizeof machine_keys / sizeof machine_keys[0] <= MAX_KEYS,
                "a record has more keys than the walk can track");
@@ -1512,7 +1567,7 @@ static hull_spec_status file_across(walk *w, const hull_sexpr_form *record,
 		return HULL_SPEC_ERR_SHAPE;
 	}
 	if (present == 0u)
-		return fail(w, HULL_SPEC_ERR_MISSING, 0u, "a file holds machine, machines or build");
+		return fail(w, HULL_SPEC_ERR_MISSING, 0u, "a file holds machine, machines, build or disk");
 	/* A lone machine has no sibling to start after, nor one to be ready
 	 * for. */
 	if (present & ((uint64_t)1 << FILE_MACHINE)) {
@@ -1657,6 +1712,9 @@ hull_spec_status hull_spec_open(hull_spec *spec, const uint8_t *data, size_t len
 		spec->machines = found[FILE_MACHINES];
 	if (spec->has_build)
 		spec->build = found[FILE_BUILD];
+	spec->has_disk     = !!(present & ((uint64_t)1 << FILE_DISK));
+	if (spec->has_disk)
+		spec->disk = found[FILE_DISK];
 	return HULL_SPEC_OK;
 }
 

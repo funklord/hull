@@ -1213,6 +1213,267 @@ static int read_partitions(walk *w, char *volume, size_t cap)
 	return 0;
 }
 
+/* --- the disk, described ---------------------------------------------------- */
+
+/* An ext superblock's feature bits, by mke2fs's names: what `-O` takes.
+ * Bits that say a state rather than a choice -- needs_recovery, a journal
+ * device, orphan_present -- are no part of a description. */
+typedef struct ext_feature {
+	unsigned    word;   /* 0 compat, 1 incompat, 2 ro_compat */
+	uint32_t    bit;
+	const char *name;
+} ext_feature;
+
+static const ext_feature ext_features[] = {
+	{ 0, 0x0001u, "dir_prealloc" }, { 0, 0x0002u, "imagic_inodes" },
+	{ 0, 0x0004u, "has_journal" }, { 0, 0x0008u, "ext_attr" },
+	{ 0, 0x0010u, "resize_inode" }, { 0, 0x0020u, "dir_index" },
+	{ 0, 0x0200u, "sparse_super2" }, { 0, 0x0400u, "fast_commit" },
+	{ 0, 0x0800u, "stable_inodes" }, { 0, 0x1000u, "orphan_file" },
+	{ 1, 0x0002u, "filetype" }, { 1, 0x0010u, "meta_bg" }, { 1, 0x0040u, "extent" },
+	{ 1, 0x0080u, "64bit" }, { 1, 0x0100u, "mmp" }, { 1, 0x0200u, "flex_bg" },
+	{ 1, 0x0400u, "ea_inode" }, { 1, 0x2000u, "metadata_csum_seed" },
+	{ 1, 0x4000u, "large_dir" }, { 1, 0x8000u, "inline_data" }, { 1, 0x10000u, "encrypt" },
+	{ 1, 0x20000u, "casefold" },
+	{ 2, 0x0001u, "sparse_super" }, { 2, 0x0002u, "large_file" }, { 2, 0x0008u, "huge_file" },
+	{ 2, 0x0010u, "uninit_bg" }, { 2, 0x0020u, "dir_nlink" }, { 2, 0x0040u, "extra_isize" },
+	{ 2, 0x0100u, "quota" }, { 2, 0x0200u, "bigalloc" }, { 2, 0x0400u, "metadata_csum" },
+	{ 2, 0x2000u, "project" }, { 2, 0x8000u, "verity" },
+};
+
+/* A label of `n` bytes as a spec's string: its trailing spaces and NULs
+ * gone, and "" where anything in it is not plain printable ASCII or a
+ * quote, which a description cannot carry. */
+static void plain_label(const uint8_t *from, size_t n, char *out, size_t cap)
+{
+	size_t length = n;
+
+	while (length > 0u && (from[length - 1u] == ' ' || from[length - 1u] == '\0'))
+		length--;
+	out[0] = '\0';
+	if (length >= cap)
+		return;
+	for (size_t i = 0u; i < length; i++)
+		if (from[i] < 0x20u || from[i] > 0x7eu || from[i] == '"' || from[i] == '\\')
+			return;
+	memcpy(out, from, length);
+	out[length] = '\0';
+}
+
+typedef struct described {
+	uint64_t first;     /* sector */
+	uint64_t sectors;
+	char     type[8];   /* the spec's word */
+	int      active;
+	char     name[37];
+} described;
+
+static const char *type_of_dos(uint8_t code)
+{
+	switch (code) {
+	case 0xefu: return "efi";
+	case 0x01u: case 0x04u: case 0x06u: case 0x0bu: case 0x0cu: case 0x0eu: return "fat";
+	case 0x82u: return "swap";
+	default:    return "linux";
+	}
+}
+
+static const char *type_of_gpt(const uint8_t g[16])
+{
+	/* Each GUID as GPT holds it, the first three fields little endian. */
+	static const struct { uint8_t guid[16]; const char *type; } known[] = {
+		{ { 0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b }, "efi" },
+		{ { 0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7 }, "fat" },
+		{ { 0x48, 0x61, 0x68, 0x21, 0x49, 0x64, 0x6f, 0x6e, 0x74, 0x4e, 0x65, 0x65, 0x64, 0x45, 0x46, 0x49 }, "bios" },
+		{ { 0x6d, 0xfd, 0x57, 0x06, 0xab, 0xa4, 0xc4, 0x43, 0x84, 0xe5, 0x09, 0x33, 0xc8, 0x4b, 0x4f, 0x4f }, "swap" },
+	};
+
+	for (unsigned i = 0u; i < sizeof known / sizeof known[0]; i++)
+		if (memcmp(g, known[i].guid, 16u) == 0)
+			return known[i].type;
+	return "linux";
+}
+
+/* The table again, as a description wants it: each partition read_table
+ * counted, in its order, so its N is files/pN's. */
+static unsigned describe_table(walk *w, described *out, int *gpt, uint8_t code[440])
+{
+	uint8_t  sector[512];
+	unsigned count = 0u;
+
+	*gpt = 0;
+	if (read_all(w->image, sector, sizeof sector, 0u) != 0)
+		return 0u;
+	memcpy(code, sector, 440u);
+	if (sector[446 + 4] == 0xEEu) {
+		uint8_t  header[512];
+		uint64_t entries;
+		uint32_t number, size;
+
+		*gpt = 1;
+		if (read_all(w->image, header, sizeof header, 512u) != 0)
+			return 0u;
+		entries = (uint64_t)le32(header + 72) | (uint64_t)le32(header + 76) << 32;
+		number = le32(header + 80);
+		size = le32(header + 84);
+		for (uint32_t i = 0u; i < number && count < MAX_PARTITIONS; i++) {
+			uint8_t              entry[128];
+			static const uint8_t none[16];
+			uint64_t             start, last;
+			described           *d = &out[count];
+
+			if (read_all(w->image, entry, sizeof entry, entries * 512u + (uint64_t)i * size) != 0)
+				break;
+			if (memcmp(entry, none, sizeof none) == 0)
+				continue;
+			start = (uint64_t)le32(entry + 32) | (uint64_t)le32(entry + 36) << 32;
+			last = (uint64_t)le32(entry + 40) | (uint64_t)le32(entry + 44) << 32;
+			if (start == 0u || start >= w->bytes / 512u)
+				continue;
+			d->first = start;
+			d->sectors = last >= start ? last - start + 1u : 0u;
+			snprintf(d->type, sizeof d->type, "%s", type_of_gpt(entry));
+			d->active = (entry[48] & 0x04u) != 0u;
+			for (unsigned k = 0u; k < 36u; k++) {
+				unsigned c = entry[56 + 2u * k] | (unsigned)entry[57 + 2u * k] << 8;
+
+				d->name[k] = c >= 0x20u && c < 0x7fu && c != '"' && c != '\\' ? (char)c : '\0';
+				if (c == 0u || d->name[k] == '\0')
+					break;
+			}
+			count++;
+		}
+		return count;
+	}
+	for (unsigned i = 0u; i < 4u; i++) {
+		const uint8_t *entry = sector + 446 + 16u * i;
+		uint64_t       start = le32(entry + 8);
+		described     *d = &out[count];
+
+		if (entry[4] == 0u || start == 0u || start >= w->bytes / 512u)
+			continue;
+		d->first = start;
+		d->sectors = le32(entry + 12);
+		snprintf(d->type, sizeof d->type, "%s", type_of_dos(entry[4]));
+		d->active = entry[0] == 0x80u;
+		count++;
+	}
+	return count;
+}
+
+/* `disk.conf` beside a partitioned disk's collection: a (disk ...) that
+ * `hull disk write` projects at any size -- its table's kind, each
+ * partition's type, flag, name and filesystem, an ext one's features and
+ * a label, the tree files/pN, the first sector's code as boot.bin -- so
+ * the files are a disk again on a drive of another size. Equivalent, not
+ * exact: the exact disk is `hull media export`'s. A partition this could
+ * not read is described empty, and says so. */
+static int describe_disk(walk *w, const char *dir, char *detail, size_t cap)
+{
+	static described parts[MAX_PARTITIONS];
+	uint8_t          code[440];
+	static const uint8_t no_code[440];
+	char             path[4400];
+	unsigned         count;
+	int              gpt;
+	FILE            *file;
+
+	count = describe_table(w, parts, &gpt, code);
+	if (count == 0u || count > (gpt ? 16u : 4u))
+		return 0;
+	if (memcmp(code, no_code, sizeof code) != 0) {
+		int fd;
+
+		snprintf(path, sizeof path, "%s/boot.bin", dir);
+		if ((fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0 ||
+		    write_all(fd, code, sizeof code, 0u) != 0) {
+			if (fd >= 0)
+				close(fd);
+			return fail(detail, cap, path, strerror(errno));
+		}
+		close(fd);
+	}
+	snprintf(path, sizeof path, "%s/disk.conf", dir);
+	if ((file = fopen(path, "we")) == NULL)
+		return fail(detail, cap, path, strerror(errno));
+	fprintf(file, "; This disk described, for `hull disk write disk.conf DRIVE` at any size.\n"
+	        "; The exact disk is `hull media export` of this directory.\n"
+	        "(disk\n  (label %s)\n", gpt ? "gpt" : "dos");
+	if (memcmp(code, no_code, sizeof code) != 0)
+		fprintf(file, "  (boot \"boot.bin\")\n");
+	fprintf(file, "  (partitions");
+	for (unsigned i = 0u; i < count; i++) {
+		const described *d = &parts[i];
+		uint8_t          super[1024];
+		char             label[40] = "";
+		char             tree[64];
+		struct stat      st;
+		int              read_tree;
+		int              ext = 0;
+
+		snprintf(tree, sizeof tree, "files/p%u", i + 1u);
+		snprintf(path, sizeof path, "%s/%s", dir, tree);
+		read_tree = stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+		if (read_all(w->image, super, sizeof super, d->first * 512u + 1024u) == 0 &&
+		    super[56] == 0x53u && super[57] == 0xefu)
+			ext = 1;
+		if (!read_tree)
+			fprintf(file, "\n    ; partition %u's filesystem was not read: written empty", i + 1u);
+		else if (ext)
+			fprintf(file, "\n    ; partition %u's owners and devices are owners.p%u's and "
+			        "devices.p%u's, not yet carried", i + 1u, i + 1u, i + 1u);
+		fprintf(file, "\n    (partition");
+		if (d->name[0] != '\0')
+			fprintf(file, " (name \"%s\")", d->name);
+		if (i + 1u == count)
+			fprintf(file, " (size \"rest\")");
+		else
+			fprintf(file, " (size \"%" PRIu64 "K\")", (d->sectors * 512u + 1023u) / 1024u);
+		fprintf(file, " (type %s)", d->type);
+		if (d->active)
+			fprintf(file, " (active true)");
+		if (ext && read_tree) {
+			uint32_t word[3] = { le32(super + 0x5c), le32(super + 0x60), le32(super + 0x64) };
+			int      journal = (word[0] & 0x4u) != 0u;
+			int      four = (word[1] & 0x2c0u) != 0u || (word[2] & 0x400u) != 0u;
+
+			fprintf(file, "\n               (filesystem %s) (features \"none\"",
+			        four ? "ext4" : journal ? "ext3" : "ext2");
+			for (unsigned k = 0u; k < sizeof ext_features / sizeof ext_features[0]; k++)
+				if (word[ext_features[k].word] & ext_features[k].bit)
+					fprintf(file, " \"%s\"", ext_features[k].name);
+			fprintf(file, ")");
+			plain_label(super + 0x78, 16u, label, sizeof label);
+		} else if (read_tree) {
+			uint8_t boot[512];
+
+			fprintf(file, "\n               (filesystem vfat)");
+			if (read_all(w->image, boot, sizeof boot, d->first * 512u) == 0)
+				plain_label(memcmp(boot + 0x52, "FAT32", 5u) == 0 ? boot + 0x47 : boot + 0x2b, 11u,
+				            label, sizeof label);
+			if (strcmp(label, "NO NAME") == 0)
+				label[0] = '\0';
+			snprintf(path, sizeof path, "%s/%s/LDLINUX.SYS", dir, tree);
+			if (access(path, F_OK) == 0)
+				fprintf(file, " (loader syslinux)");
+			else if (snprintf(path, sizeof path, "%s/%s/ldlinux.sys", dir, tree) > 0 &&
+			         access(path, F_OK) == 0)
+				fprintf(file, " (loader syslinux)");
+		} else {
+			fprintf(file, " (filesystem none)");
+		}
+		if (label[0] != '\0')
+			fprintf(file, " (volume \"%s\")", label);
+		if (read_tree)
+			fprintf(file, " (source \"dir:./%s\")", tree);
+		fprintf(file, ")");
+	}
+	fprintf(file, "))\n");
+	if (fclose(file) != 0)
+		return fail(detail, cap, path, strerror(errno));
+	return 0;
+}
+
 /* --- reassembly ----------------------------------------------------------- */
 
 /* media.conf's bytes and sha256, by the text this file wrote and any
@@ -2125,7 +2386,7 @@ static int import_into(walk *w, const char *dir, hull_media_report *report, char
 		goto done;
 	}
 	unlink(path);
-	if (hull_media_write(dir, naive, detail, cap) != 0)
+	if (hull_media_write(dir, naive, detail, cap) != 0 || describe_disk(w, dir, detail, cap) != 0)
 		goto done;
 	for (size_t i = 0u; i < w->count; i++)
 		report->files += w->files[i].offset == 0u;

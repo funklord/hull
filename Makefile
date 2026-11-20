@@ -111,7 +111,7 @@ ENGINE_OBJS = $(BUILD_DIR)/engine/docker.o $(BUILD_DIR)/engine/qemu.o \
               $(BUILD_DIR)/engine/storefs.o $(BUILD_DIR)/engine/writeback.o \
               $(BUILD_DIR)/engine/display.o
 CLI_OBJS    = $(BUILD_DIR)/cli/hull.o $(BUILD_DIR)/cli/runtime.o $(BUILD_DIR)/cli/doctor.o \
-              $(BUILD_DIR)/cli/import.o $(BUILD_DIR)/cli/export.o $(BUILD_DIR)/cli/kernel_fetch.o $(BUILD_DIR)/cli/vbox_fetch.o $(BUILD_DIR)/cli/esp_fetch.o $(BUILD_DIR)/cli/86box_fetch.o $(BUILD_DIR)/cli/setup.o $(BUILD_DIR)/cli/vbox_host.o $(BUILD_DIR)/cli/vagrant.o $(BUILD_DIR)/cli/dial.o \
+              $(BUILD_DIR)/cli/import.o $(BUILD_DIR)/cli/export.o $(BUILD_DIR)/cli/disk.o $(BUILD_DIR)/cli/kernel_fetch.o $(BUILD_DIR)/cli/vbox_fetch.o $(BUILD_DIR)/cli/esp_fetch.o $(BUILD_DIR)/cli/86box_fetch.o $(BUILD_DIR)/cli/setup.o $(BUILD_DIR)/cli/vbox_host.o $(BUILD_DIR)/cli/vagrant.o $(BUILD_DIR)/cli/dial.o \
               $(BUILD_DIR)/cli/sshd_fetch.o
 # Section 3's optional store, which only the commands that name it use.
 STORE_OBJS  = $(BUILD_DIR)/store/store.o $(BUILD_DIR)/store/unpack.o $(BUILD_DIR)/store/pack.o
@@ -426,7 +426,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: esp-qemu-lora check-tsan
-.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-usb check-usbredir check-vhost vhost-device dosemu2 cross-ppc64le qemu-ppc check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-disk check-usb check-usbredir check-vhost vhost-device dosemu2 cross-ppc64le qemu-ppc check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -547,6 +547,7 @@ help:
 	@echo '  check-root    root mode'"'"'s native grants, hull-root setuid, inside a vm'
 	@echo '  check-systemd systemd as a chroot machine'"'"'s init in a delegated cgroup, inside a vm'
 	@echo '  check-vfio    a PCI device by VFIO, to chroot and a nested vm, inside a vm with an IOMMU'
+	@echo '  check-disk    hull disk write to a drive: a loop device a vm'"'"'s root makes'
 	@echo '  check-vhost   a GPIO chip and an I2C bus of a host given to a vm, by vhost-device'
 	@echo '  vhost-device  rust-vmm'"'"'s GPIO and I2C daemons, built by cargo (fetches)'
 	@echo '  dosemu2       dosemu2 and its chain built from source into the user'"'"'s cache (fetches)'
@@ -933,6 +934,7 @@ test: $(TEST_BINS) $(HULL) $(PROBE) $(ARM64_PROBE) $(NSS_LIB) $(ROOT_BIN) vector
 	BUILD_DIR='$(BUILD_DIR)' $(BUILD_DIR)/test/iso_test
 	BUILD_DIR='$(BUILD_DIR)' sh test/tree_test.sh '$(BUILD_DIR)/test/tree_tar'
 	BUILD_DIR='$(BUILD_DIR)' sh test/media_test.sh '$(HULL)' '$(PROBE)'
+	BUILD_DIR='$(BUILD_DIR)' sh test/disk_test.sh '$(HULL)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/cli_test.sh '$(HULL)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/nss_test.sh '$(HULL)' '$(NSS_LIB)'
 	BUILD_DIR='$(BUILD_DIR)' sh test/root_test.sh '$(HULL)' '$(ROOT_BIN)'
@@ -1178,6 +1180,11 @@ check-root: $(HULL) $(AGENT_BIN) $(PROBE) $(ROOT_BIN)
 
 check-systemd: $(HULL) $(AGENT_BIN)
 	BUILD_DIR='$(BUILD_DIR)' sh test/systemd_test.sh '$(HULL)'
+
+# `hull disk write` to a drive: a loop device made by a vm's root, the
+# user writing it (project.md section 3.13).
+check-disk: $(HULL) $(AGENT_BIN)
+	BUILD_DIR='$(BUILD_DIR)' sh test/disk_device_test.sh '$(HULL)'
 
 check-vfio: $(HULL) $(AGENT_BIN) $(PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/vfio_test.sh '$(HULL)' '$(PROBE)'
