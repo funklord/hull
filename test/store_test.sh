@@ -470,8 +470,8 @@ expect 1 'No such file' "$hull" tag \
 expect 1 'no such ref' "$hull" manifest show one/nope
 
 # commit --tar: a tar of engine/tree.c's shape, made here by Python's own
-# tarfile, its owners kept as the tar gives them, 0 as root and others as
-# their ids, as a machine's export carries what it saw while no file of
+# tarfile, its owners kept as the tar gives them, 0:0 as root and others
+# as their ids -- root's file in another group, /etc/shadow's, among them -- as a machine's export carries what it saw while no file of
 # another owner is on the disk: a file of 101's and a directory, a symlink,
 # a name too long for ustar and an xattr, both by pax. Cut short, it is
 # refused and names nothing.
@@ -489,6 +489,7 @@ add("etc/owned", tarfile.REGTYPE, 101, 102, 0o640, b"dnsmasq's\n", pax={"SCHILY.
 add("etc/link", tarfile.SYMTYPE, 0, 0, 0o777, link="owned")
 add("etc/" + "x" * 120, tarfile.REGTYPE, 0, 0, 0o644, b"long\n")
 add("run", tarfile.DIRTYPE, 101, 0, 0o750)
+add("etc/shadow", tarfile.REGTYPE, 0, 42, 0o640, b"root's, shadow's\n")
 t.close()
 PYEOF2
 expect 0 '^tarred/1 sha256:[0-9a-f]{64}$' "$hull" commit --tar "$root/owned.tar" tarred/1
@@ -502,7 +503,8 @@ for want in '(entry (kind dir) (mode 493) (owner root) (path "etc"))' \
 	'(owner (gid 102) (uid 101)) (path "etc/owned") (size 10) (xattrs (user.note kept)))' \
 	'(entry (kind symlink) (mode 511) (owner root) (path "etc/link") (target "owned"))' \
 	"(path \"etc/$(printf 'x%.0s' $(seq 120))\") (size 5))" \
-	'(entry (kind dir) (mode 488) (owner (gid 0) (uid 101)) (path "run")))'; do
+	'(entry (kind dir) (mode 488) (owner (gid 0) (uid 101)) (path "run")))' \
+	'(owner (gid 42) (uid 0)) (path "etc/shadow")'; do
 	cases=$((cases + 1))
 	grep -qF -- "$want" "$root/tarred.view" || fail "a tar's entry is not as it was: $want" \
 		"$(cat "$root/tarred.view")"
@@ -522,14 +524,14 @@ PYEOF3
 expect 0 '^mine/1 sha256:' "$hull" commit --tar "$root/mine.tar" mine/1
 expect 0 "\\(owner \\(gid $(id -g)\\) \\(uid $(id -u)\\)\\) \\(path \"home/user\"\\)" \
 	"$hull" manifest show mine/1
-# Its two entries of other owners materialized as the user's, rootless,
+# Its three entries of other owners materialized as the user's, rootless,
 # and said in one line naming the first, not a line an entry, which for a
 # distribution's tree was every one of 37,956.
 rm -rf "${root:?}/tarredout"
 cases=$((cases + 1))
 said=$(timeout 30 "$hull" materialize tarred/1 "$root/tarredout" 2>&1 >/dev/null)
 [ "$(printf '%s\n' "$said" | grep -c 'owner')" = 1 ] &&
-	printf '%s\n' "$said" | grep -q "^hull: materialize: 2 entries' owner kept as the user's, etc/owned's among them" ||
+	printf '%s\n' "$said" | grep -q "^hull: materialize: 3 entries' owner kept as the user's, etc/owned's among them" ||
 	fail "other owners materialized were not said once" "$said"
 chmod -R u+w "$root/tarredout" 2>/dev/null
 rm -rf "${root:?}/tarredout"

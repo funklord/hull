@@ -864,8 +864,11 @@ static int read_tar(hull_store *store, walk *w, int fd, const char *const *drop,
 		 * is in a directory's commit; any other owner is its ids, the
 		 * user's own uid among them: a machine's uid 1000 is not the
 		 * host's user of uid 1000. Only a tree whose workload ran as the
-		 * user, docker's, says that the user's uid is root's. */
-		it->root = uid == 0u || (w->user_root && uid == (uint64_t)getuid());
+		 * user, docker's, says that the user's uid is root's. Root is
+		 * 0:0, as an OCI layer's is (unpack.c): a file of root's in
+		 * another group -- /etc/shadow's shadow -- keeps its ids, where
+		 * the class root dropped its group. */
+		it->root = (uid == 0u && gid == 0u) || (w->user_root && uid == (uint64_t)getuid());
 		it->st.st_uid = (uid_t)uid;
 		it->st.st_gid = (gid_t)gid;
 		it->st.st_size = (off_t)(type == '0' ? size : 0u);
@@ -936,14 +939,14 @@ static int finish_commit(hull_store *store, walk *wp, const char *arch, const ch
 	put_text(&manifest, ")(7:entries");
 	for (size_t i = 0u; i < w.count; i++) {
 		/* An owner the disk cannot say, a pulled layer's, over the disk's:
-		 * uid 0 is root's, as the user's own file is. */
+		 * 0:0 is root's, as the user's own file is. */
 		if (extra != NULL && extra->owners != NULL) {
 			hull_owner        key = { .path = w.items[i].path };
 			const hull_owner *found = bsearch(&key, extra->owners, extra->owner_count,
 			                                  sizeof extra->owners[0], owner_order);
 
 			if (found != NULL) {
-				w.items[i].root = found->uid == 0u;
+				w.items[i].root = found->uid == 0u && found->gid == 0u;
 				w.items[i].st.st_uid = (uid_t)found->uid;
 				w.items[i].st.st_gid = (gid_t)found->gid;
 			}

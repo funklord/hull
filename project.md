@@ -2146,7 +2146,7 @@ Raw numeric uids are what make Docker images awkward under rootless and across b
 - `(owner user)` → the machine's default unprivileged user,
 - explicit `(owner (gid n) (uid n))` → preserved verbatim for images that need real multi-user layouts (recorded as-is; ns backend maps through the subordinate range).
 
-OCI imports map `0 → root`, the image's configured user → `user`, everything else → explicit. Round-trip to OCI is lossless.
+OCI imports map `0:0 → root`, the image's configured user → `user`, everything else → explicit. Round-trip to OCI is lossless. **A tar's commit the same, since 2026-11-20:** it took uid 0 alone for root, so a file of root's in another group -- `/etc/shadow` in `shadow`, `/var/log` in `adm` -- lost its group in the store, found by writing a rescue system's tar to a disk (§3.13); the class root is 0:0 now, as a pulled layer's already was (`store/unpack.c`).
 
 ## A.4 RuntimeDefaults
 
