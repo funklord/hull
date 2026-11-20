@@ -1422,8 +1422,8 @@ static void exec_pc(const hull_machine *m)
 	 * ib_qib's among them, oopsed on the root bus, where there is none
 	 * (section 5.0). i440fx has no PCIe to put one on. */
 	for (unsigned i = 0u; i < m->device_count; i++) {
-		static __thread char port[PC_MAX_CARDS][64];
-		static __thread char card[PC_MAX_CARDS][128];
+		static __thread char port[PC_MAX_CARDS][96];
+		static __thread char card[PC_MAX_CARDS][160];
 		int q35 = m->machine_type != NULL && strstr(m->machine_type, "q35") != NULL;
 
 		if (q35) {
