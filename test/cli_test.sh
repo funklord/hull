@@ -4981,6 +4981,37 @@ assert any("PreventDeviceEncryption /t REG_DWORD /d 1" in p for p in paths), pat
 	cases=$((cases + 1))
 	[ ! -e "$root/setup/f1" ] && [ ! -e "$root/setup/f2" ] ||
 		fail "a refused freedos setup left a directory" "$(ls "$root/setup")"
+	# hull setup reactos, its install measured by check-legacy: on a disc
+	# shaped as ReactOS's (reactos_disc.py), the answer file switched on
+	# and the menu starting setup, by both volumes, the rest of the menu
+	# kept and the user's disc as it was; a disc not ReactOS's and a disk
+	# too small refused, leaving nothing.
+	python3 -I "$(dirname "$0")/reactos_disc.py" write "$root/setup/ros.iso"
+	cp "$root/setup/ros.iso" "$root/setup/ros.orig"
+	expect 0 'install.conf installs ReactOS' "$hull" setup reactos "$root/setup/ros.iso" "$root/setup/r"
+	expect 0 '^UnattendSetupEnabled = yes' \
+		python3 -I "$(dirname "$0")/reactos_disc.py" read "$root/setup/r/setup.iso" i386/unattend.inf
+	expect 0 '^DefaultOS=Setup' \
+		python3 -I "$(dirname "$0")/reactos_disc.py" read "$root/setup/r/setup.iso" freeldr.ini
+	expect 0 '^BootType=ReactOSSetup' \
+		python3 -I "$(dirname "$0")/reactos_disc.py" read "$root/setup/r/setup.iso" freeldr.ini
+	# Its length rewritten in each volume's record: read by the old one,
+	# the file would end in the sectors' zeros.
+	cases=$((cases + 1))
+	answer=$(python3 -I "$(dirname "$0")/reactos_disc.py" read "$root/setup/r/setup.iso" i386/unattend.inf | od -An -c)
+	! printf '%s\n' "$answer" | grep -q '\\0' && printf '%s\n' "$answer" | tail -1 | grep -q '0  *\\r  *\\n *$' ||
+		fail "the answer file's length is not what its records say" "$answer"
+	cases=$((cases + 1))
+	cmp -s "$root/setup/ros.iso" "$root/setup/ros.orig" ||
+		fail "hull setup reactos changed the user's own disc" "$(cmp "$root/setup/ros.iso" "$root/setup/ros.orig")"
+	expect 0 'machine on qemu-pc \(pc\): ok$' "$hull" check -f "$root/setup/r/install.conf" --backend pc
+	expect 0 'machine on qemu-pc \(pc\): ok$' "$hull" check -f "$root/setup/r/machine.conf" --backend pc
+	expect 1 'not a ReactOS boot CD' "$hull" setup reactos "$root/setup/win.iso" "$root/setup/r1"
+	expect 1 'ReactOS.s disk is 1024 to 32768 MB' \
+		"$hull" setup reactos --size 100 "$root/setup/ros.iso" "$root/setup/r2"
+	cases=$((cases + 1))
+	[ ! -e "$root/setup/r1" ] && [ ! -e "$root/setup/r2" ] ||
+		fail "a refused reactos setup left a directory" "$(ls -R "$root/setup/r1" "$root/setup/r2" 2>&1)"
 	rm -rf "${root:?}/setup"
 else
 	printf 'cli: hull setup windows not tried: no mtools or qemu-img\n'

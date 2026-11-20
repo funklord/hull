@@ -393,6 +393,63 @@ else
 	printf 'legacy: %s not fetched, the packages not tried\n' "$lite"
 fi
 
+# --- hull setup reactos: ReactOS's own unattended setup, switched on --------
+
+# ReactOS 0.4.16's boot CD, held to the digest GitHub gives its release.
+# hull setup reactos rewrites two files on a copy of it, the answer file
+# and the boot menu, where they lie; its text-mode setup, a restart, its
+# graphical setup and a restart follow with nobody at them, and the first
+# logon powers off. The disk then boots alone to its shell, a script put
+# in its Startup folder by mtools writing a file and powering off.
+ros=ReactOS-0.4.16-i386.zip
+rossum=e5851510cf5b79ef51a76b8155dd5ef7faca1155f44d0a1d41c35b77ece4ce2a
+if [ ! -f "$media/$ros" ]; then
+	curl -fsSL -m 600 -o "$media/$ros.part" \
+		"https://github.com/reactos/reactos/releases/download/0.4.16-release/$ros" &&
+		mv "$media/$ros.part" "$media/$ros"
+	rm -f "$media/$ros.part"
+fi
+if [ -f "$media/$ros" ]; then
+	cases=$((cases + 1))
+	if ! printf '%s  %s\n' "$rossum" "$media/$ros" | sha256sum -c --quiet > /dev/null 2>&1; then
+		fail 'the ReactOS medium is what its publisher published' "$media/$ros"
+	else
+		python3 -I -c '
+import shutil, sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as archive, archive.open("ReactOS-0.4.16-i386.iso") as disc, \
+		open(sys.argv[2], "wb") as out:
+	shutil.copyfileobj(disc, out)' "$media/$ros" "$root/ros.iso"
+		before=$(sha256sum < "$root/ros.iso")
+		rm -rf "$root/sr"
+		out=$(timeout 120 "$hull" setup reactos "$root/ros.iso" "$root/sr" 2>&1)
+		status 'hull setup reactos' "$?" 0 "$out"
+		cases=$((cases + 1))
+		[ "$(sha256sum < "$root/ros.iso")" = "$before" ] ||
+			fail "hull setup reactos changed the user's own disc" "$(ls -l "$root/ros.iso")"
+		(cd / && timeout -k 5 900 "$hull" run -f "$root/sr/install.conf" < /dev/null > "$root/sr.out" 2>&1)
+		got=$?
+		out=$(tr -d '\r' < "$root/sr.out")
+		status 'its install ran to the end' "$got" 0 "$(printf '%s\n' "$out" | tail -40)"
+		says 'its text-mode setup copying with nobody at it' "$out" 'CHECKPOINT:HALF_COPIED'
+		says 'its graphical setup' "$out" 'SYSSETUP: SetAdministratorPassword() done'
+		out=$(mdir -b -i "$root/sr/disk.img@@1M" ::/ReactOS/system32/ntoskrnl.exe 2>&1)
+		says 'the disk holds ReactOS' "$out" 'ReactOS/system32/ntoskrnl.exe'
+		printf '@echo off\r\necho hull: the shell started> C:\\HULLRAN.TXT\r\nshutdown /s /t 0\r\n' \
+			> "$root/off.cmd"
+		mcopy -o -i "$root/sr/disk.img@@1M" "$root/off.cmd" \
+			"::/Documents and Settings/All Users/Start Menu/Programs/Startup/off.cmd"
+		(cd / && timeout -k 5 300 "$hull" run -f "$root/sr/machine.conf" < /dev/null > "$root/sr.out" 2>&1)
+		got=$?
+		out=$(tr -d '\r' < "$root/sr.out")
+		status 'the installed disk boots alone' "$got" 0 "$(printf '%s\n' "$out" | tail -40)"
+		says 'from the disk' "$out" 'ARC Paths: multi(0)disk(0)rdisk(0)partition(1)'
+		out=$(mtype -i "$root/sr/disk.img@@1M" ::/HULLRAN.TXT 2>&1)
+		says 'to its shell, which ran the Startup folder' "$out" 'hull: the shell started'
+	fi
+else
+	printf 'legacy: %s not fetched, ReactOS not tried\n' "$ros"
+fi
+
 printf 'legacy: %s cases, %s failed\n' "$cases" "$failures"
 [ "$failures" = 0 ] && rm -rf "$dir"
 [ "$failures" = 0 ]

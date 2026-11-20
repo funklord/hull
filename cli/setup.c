@@ -830,3 +830,362 @@ int hull_setup_freedos(const char *boot, const char *dir, unsigned megabytes, co
 		return -1;
 	return 0;
 }
+
+/*
+ * `hull setup reactos ISO DIR`: ReactOS's own unattended setup, which its
+ * boot CD carries switched off -- i386/unattend.inf saying
+ * `UnattendSetupEnabled = no` -- and its boot menu starting the LiveCD
+ * rather than setup. Both are files on the disc, so a copy of the disc has
+ * the two rewritten where they lie: each file's sectors are its own, a
+ * file starting on a sector of its own, so a file may grow to the end of
+ * its last, and its length is written into every directory record naming
+ * it -- the primary volume's and the ISO 9660:1999 or Joliet one's. No
+ * ISO is mastered again, so the boot record and every other byte stay as
+ * the user's disc has them.
+ */
+#define DISC_SECTOR 2048u
+
+/* A directory record of the disc found by its path. */
+struct disc_file {
+	off_t    records[4];  /* where each record naming it lies */
+	unsigned count;
+	uint32_t extent;      /* its first sector */
+	uint32_t length;      /* its bytes */
+};
+
+static uint32_t le32(const unsigned char *p)
+{
+	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+/* Whether a record's identifier is `want`, a name of ASCII: compared
+ * without case, the ";1" of its version and a bare name's trailing "."
+ * left off; a Joliet one is UCS-2, big-endian. */
+static int disc_named(const unsigned char *id, unsigned n, int joliet, const char *want)
+{
+	char     name[128];
+	unsigned length = 0u;
+
+	if (joliet) {
+		if (n % 2u != 0u)
+			return 0;
+		for (unsigned i = 0u; i < n; i += 2u) {
+			if (id[i] != 0u || length + 1u >= sizeof name)
+				return 0;
+			name[length++] = (char)id[i + 1u];
+		}
+	} else {
+		if (n >= sizeof name)
+			return 0;
+		memcpy(name, id, n);
+		length = n;
+	}
+	name[length] = '\0';
+	if (strchr(name, ';') != NULL)
+		*strchr(name, ';') = '\0';
+	length = (unsigned)strlen(name);
+	if (length > 0u && name[length - 1u] == '.')
+		name[--length] = '\0';
+	return strcasecmp(name, want) == 0;
+}
+
+/* `path`'s records under the root record `root` of one volume
+ * descriptor: 0 with its record's offset added to `file`, 1 where the
+ * volume has no such file, -1 where the disc cannot be read. */
+static int disc_walk(int fd, off_t size, const unsigned char *root, int joliet, const char *path,
+                     struct disc_file *file)
+{
+	uint32_t extent = le32(root + 2), length = le32(root + 10);
+	char     part[128];
+
+	while (*path != '\0') {
+		const char *slash = strchr(path, '/');
+		size_t      n = slash != NULL ? (size_t)(slash - path) : strlen(path);
+		int         found = 0;
+
+		if (n == 0u || n >= sizeof part)
+			return 1;
+		memcpy(part, path, n);
+		part[n] = '\0';
+		path += n + (slash != NULL ? 1u : 0u);
+		if (length > (16u << 20) || (off_t)extent * DISC_SECTOR + length > size)
+			return -1;
+		for (uint32_t s = 0u; !found && s < (length + DISC_SECTOR - 1u) / DISC_SECTOR; s++) {
+			unsigned char sector[DISC_SECTOR];
+			off_t         at = ((off_t)extent + s) * DISC_SECTOR;
+
+			if (pread(fd, sector, sizeof sector, at) != (ssize_t)sizeof sector)
+				return -1;
+			for (unsigned i = 0u; i < DISC_SECTOR && sector[i] != 0u; i += sector[i]) {
+				unsigned char *r = sector + i;
+				int            directory;
+
+				if (sector[i] < 34u || i + sector[i] > DISC_SECTOR || 33u + r[32] > sector[i])
+					return -1;
+				directory = (r[25] & 2u) != 0u;
+				if (directory != (*path != '\0') || !disc_named(r + 33, r[32], joliet, part))
+					continue;
+				if (*path == '\0') {
+					if (file->count == sizeof file->records / sizeof file->records[0])
+						return -1;
+					file->records[file->count++] = at + i;
+				}
+				extent = le32(r + 2);
+				length = le32(r + 10);
+				found = 1;
+				break;
+			}
+		}
+		if (!found)
+			return 1;
+	}
+	if (file->count > 1u && (extent != file->extent || length != file->length))
+		return -1;  /* two volumes disagree on where it is */
+	file->extent = extent;
+	file->length = length;
+	return 0;
+}
+
+/* `path` on the disc, by every volume descriptor naming it: 0, or -1. */
+static int disc_find(int fd, const char *path, struct disc_file *file)
+{
+	struct stat st;
+
+	memset(file, 0, sizeof *file);
+	if (fstat(fd, &st) != 0)
+		return -1;
+	for (unsigned s = 16u; s < 32u; s++) {
+		unsigned char d[DISC_SECTOR];
+		int           joliet;
+
+		if (pread(fd, d, sizeof d, (off_t)s * DISC_SECTOR) != (ssize_t)sizeof d ||
+		    memcmp(d + 1, "CD001", 5u) != 0 || d[0] == 255u)
+			break;
+		if (d[0] != 1u && d[0] != 2u)
+			continue;
+		joliet = d[0] == 2u && d[88] == '%' && d[89] == '/';
+		if (disc_walk(fd, st.st_size, d + 156, joliet, path, file) < 0)
+			return -1;
+	}
+	return file->count > 0u && file->length > 0u &&
+	       (off_t)file->extent * DISC_SECTOR + file->length <= st.st_size ? 0 : -1;
+}
+
+/* `path`'s bytes, allocated and terminated: NULL where it is not there. */
+static char *disc_read(int fd, const char *path)
+{
+	struct disc_file file;
+	char            *text;
+
+	if (disc_find(fd, path, &file) != 0 || file.length > (1u << 20) ||
+	    (text = malloc(file.length + 1u)) == NULL)
+		return NULL;
+	if (pread(fd, text, file.length, (off_t)file.extent * DISC_SECTOR) != (ssize_t)file.length) {
+		free(text);
+		return NULL;
+	}
+	text[file.length] = '\0';
+	return text;
+}
+
+/* `path` rewritten as `text`, which must fit its sectors: 0, or -1 with
+ * `why`. */
+static int disc_rewrite(int fd, const char *path, const char *text, char *why, size_t cap)
+{
+	struct disc_file file;
+	size_t           length = strlen(text);
+	size_t           room;
+	char            *sectors;
+	unsigned char    both[8];
+
+	if (disc_find(fd, path, &file) != 0) {
+		snprintf(why, cap, "%s is not on the disc: not a ReactOS boot CD", path);
+		return -1;
+	}
+	room = ((size_t)file.length + DISC_SECTOR - 1u) / DISC_SECTOR * DISC_SECTOR;
+	if (length > room) {
+		snprintf(why, cap, "%s: %zu bytes do not fit the %zu its sectors hold", path, length, room);
+		return -1;
+	}
+	if ((sectors = calloc(1u, room)) == NULL) {
+		snprintf(why, cap, "out of memory");
+		return -1;
+	}
+	memcpy(sectors, text, length);
+	for (unsigned i = 0u; i < 4u; i++) {
+		both[i] = (unsigned char)(length >> (8u * i));
+		both[7u - i] = (unsigned char)(length >> (8u * i));
+	}
+	if (pwrite(fd, sectors, room, (off_t)file.extent * DISC_SECTOR) != (ssize_t)room) {
+		snprintf(why, cap, "%s: %s", path, strerror(errno));
+		free(sectors);
+		return -1;
+	}
+	free(sectors);
+	for (unsigned i = 0u; i < file.count; i++)
+		if (pwrite(fd, both, sizeof both, file.records[i] + 10) != (ssize_t)sizeof both) {
+			snprintf(why, cap, "%s: %s", path, strerror(errno));
+			return -1;
+		}
+	return 0;
+}
+
+/* ReactOS's own answer file, switched on: the whole of the first disk one
+ * partition, formatted FAT, the system in C:\ReactOS, the boot loader in
+ * the MBR and the partition's boot sector; and, at the first logon after
+ * setup, a power-off, which ends the install's run. */
+static const char reactos_unattend[] =
+    "; Written by hull setup reactos: ReactOS's own unattended setup,\r\n"
+    "; i386/unattend.inf on its boot CD, switched on.\r\n"
+    "[Unattend]\r\n"
+    "Signature = \"$ReactOS$\"\r\n"
+    "UnattendSetupEnabled = yes\r\n"
+    "DestinationDiskNumber = 0\r\n"
+    "DestinationPartitionNumber = 1\r\n"
+    "InstallationDirectory = ReactOS\r\n"
+    "BootLoaderLocation = 2\r\n"
+    "FullName = \"hull\"\r\n"
+    "ComputerName = \"REACTOS\"\r\n"
+    "TimeZoneIndex = 85\r\n"
+    "FormatPartition = 1\r\n"
+    "AutoPartition = 1\r\n"
+    "FsType = 0\r\n"
+    "RappsDownload = no\r\n"
+    "LocaleID = 409\r\n"
+    "InstallationType = 1\r\n"
+    "\r\n"
+    "[GuiRunOnce]\r\n"
+    "%SystemRoot%\\system32\\shutdown.exe /s /t 0\r\n";
+
+/* freeldr.ini with its menu's default `Setup`, the text-mode setup that
+ * reads the answer file, in place of the LiveCD: allocated, or NULL where
+ * the menu has no DefaultOS or no Setup entry to choose. */
+static char *reactos_menu(const char *ini)
+{
+	const char *line = ini;
+	const char *at = NULL;
+	int         setup = 0;
+	char       *menu;
+
+	while (*line != '\0') {
+		const char *end = line + strcspn(line, "\r\n");
+
+		if (strncasecmp(line, "DefaultOS=", 10u) == 0 && at == NULL)
+			at = line;
+		if (strncasecmp(line, "[Setup]", 7u) == 0)
+			setup = 1;
+		line = end + strspn(end, "\r\n");
+	}
+	if (at == NULL || !setup)
+		return NULL;
+	if (asprintf(&menu, "%.*sDefaultOS=Setup%s", (int)(at - ini), ini, at + strcspn(at, "\r\n")) < 0)
+		return NULL;
+	return menu;
+}
+
+int hull_setup_reactos(const char *iso, const char *dir, unsigned megabytes, char *why, size_t cap)
+{
+	char        disc[PATH_MAX];
+	char        disk[PATH_MAX];
+	char       *ini = NULL;
+	char       *menu = NULL;
+	struct stat st;
+	int         fd = -1;
+	int         result = -1;
+
+	if (megabytes < 1024u || megabytes > 32768u) {
+		snprintf(why, cap, "ReactOS's disk is 1024 to 32768 MB, one FAT32 partition");
+		return -1;
+	}
+	if (stat(iso, &st) != 0 || !S_ISREG(st.st_mode)) {
+		snprintf(why, cap, "%s: not a disc image", iso);
+		return -1;
+	}
+	if (mkdir(dir, 0755) != 0) {
+		snprintf(why, cap, "%s: %s%s", dir, strerror(errno),
+		         errno == EEXIST ? ": setup makes a directory of its own" : "");
+		return -1;
+	}
+	snprintf(disc, sizeof disc, "%s/setup.iso", dir);
+	snprintf(disk, sizeof disk, "%s/disk.img", dir);
+	/* The user's disc copied, theirs left as it was; a reflink where the
+	 * filesystem has them. */
+	{
+		char *copy[] = { "cp", "--reflink=auto", (char *)iso, disc, NULL };
+
+		if (run(copy) != 0 || chmod(disc, 0644) != 0) {
+			snprintf(why, cap, "%s could not be copied", iso);
+			goto done;
+		}
+	}
+	if ((fd = open(disc, O_RDWR | O_CLOEXEC)) < 0) {
+		snprintf(why, cap, "%s: %s", disc, strerror(errno));
+		goto done;
+	}
+	if ((ini = disc_read(fd, "freeldr.ini")) == NULL || (menu = reactos_menu(ini)) == NULL) {
+		snprintf(why, cap, "%s: no freeldr.ini with a Setup entry: not a ReactOS boot CD", iso);
+		goto done;
+	}
+	if (disc_rewrite(fd, "i386/unattend.inf", reactos_unattend, why, cap) != 0 ||
+	    disc_rewrite(fd, "freeldr.ini", menu, why, cap) != 0)
+		goto done;
+	if (close(fd) != 0) {
+		fd = -1;
+		snprintf(why, cap, "%s: %s", disc, strerror(errno));
+		goto done;
+	}
+	fd = -1;
+	if ((fd = open(disk, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0 ||
+	    ftruncate(fd, (off_t)megabytes * 1024 * 1024) != 0) {
+		snprintf(why, cap, "%s: %s", disk, strerror(errno));
+		goto done;
+	}
+	close(fd);
+	fd = -1;
+	if (put(dir, "install.conf",
+	    "; Installs ReactOS onto disk.img from setup.iso, unattended (hull\n"
+	    "; setup reactos): its text-mode setup, a restart, its graphical\n"
+	    "; setup, a restart, and a power-off at the first logon. Its log is\n"
+	    "; the run's output, the setup's debug port being COM1. Then\n"
+	    "; machine.conf boots the disk.\n"
+	    "(machine\n"
+	    "  (backend pc)\n"
+	    "  (hostname \"reactos\")\n"
+	    "  (source \"media:cdrom\")\n"
+	    "  (mutable direct)\n"
+	    "  (memory \"1G\")\n"
+	    "  (network nat)\n"
+	    "  (media\n"
+	    "    (medium (type cdrom) (source \"image:./setup.iso\"))\n"
+	    "    (medium (type disk) (source \"image:./disk.img\"))))\n", 0644, why, cap) != 0 ||
+	    put(dir, "machine.conf",
+	    "; ReactOS as hull setup reactos installed it.\n"
+	    "(machine\n"
+	    "  (backend pc)\n"
+	    "  (hostname \"reactos\")\n"
+	    "  (source \"media:disk\")\n"
+	    "  (mutable direct)\n"
+	    "  (memory \"1G\")\n"
+	    "  (network nat)\n"
+	    "  (media\n"
+	    "    (medium (type disk) (source \"image:./disk.img\"))))\n", 0644, why, cap) != 0)
+		goto done;
+	result = 0;
+done:
+	if (fd >= 0)
+		close(fd);
+	free(ini);
+	free(menu);
+	/* Refused, nothing of it left: what it made, by name, and DIR. */
+	if (result != 0) {
+		char path[PATH_MAX + 32];
+
+		for (const char *const *f = (const char *const[]){ "setup.iso", "disk.img", "install.conf",
+		                                                   "machine.conf", NULL }; *f != NULL; f++) {
+			snprintf(path, sizeof path, "%s/%s", dir, *f);
+			unlink(path);
+		}
+		rmdir(dir);
+	}
+	return result;
+}

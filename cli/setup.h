@@ -22,4 +22,11 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 int hull_setup_freedos(const char *boot, const char *dir, unsigned megabytes, const char *packages,
                        char *why, size_t cap);
 
+/* A machine directory DIR that installs ReactOS onto a blank disk of
+ * `megabytes` from the user's own ReactOS boot CD ISO, with nobody at it:
+ * a copy of the disc whose own unattend.inf is switched on and whose boot
+ * menu starts setup, each rewritten where it lies on the disc. 0, or -1
+ * with `why`; DIR must not exist. */
+int hull_setup_reactos(const char *iso, const char *dir, unsigned megabytes, char *why, size_t cap);
+
 #endif
