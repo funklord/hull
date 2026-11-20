@@ -49,6 +49,15 @@ typedef struct hull_nbd_writes {
 int hull_nbd_serve_writes(hull_media_map *map, uint64_t bytes, int fd, hull_nbd_writes *writes,
                           pthread_t *thread);
 
+/* The guest's writes taken into `writes->collection` now, as the server
+ * does at each pause: the collection swapped for the disk as the guest has
+ * it, `writes->map` opened again on it, and the writes emptied -- 0; or -1
+ * with why in `detail`, the collection and the writes as they were. For a
+ * served disk `bytes` long whose server is not running: joined, or this
+ * thread its own. */
+int hull_nbd_take(hull_nbd_writes *writes, uint64_t bytes, hull_media_report *report, char *detail,
+                  size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

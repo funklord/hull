@@ -304,49 +304,72 @@ static int take_away(const char *path, const struct stat *st, int kind, struct F
 	return (kind == FTW_DP ? rmdir(path) : unlink(path)) == 0 ? 0 : -1;
 }
 
+/* Whether the guest wrote any of [at, at + n) since the last taking. */
+static int changed(void *context, uint64_t at, uint64_t n)
+{
+	const hull_nbd_writes *w = context;
+
+	for (uint64_t block = at / HULL_NBD_BLOCK; block * HULL_NBD_BLOCK < at + n; block++)
+		if (is_written(w, block))
+			return 1;
+	return 0;
+}
+
 /* The disk as the guest has it now -- the files and its writes over them
  * -- taken apart into COLLECTION.hull-new, swapped in whole with the
  * collection, and the map opened again on it; then the writes are the
  * collection's and the overlay starts empty. Lossless whatever state the
- * guest's filesystem is in, a taking being every byte of the disk. Where
- * any step fails the collection and the writes stay as they were. */
-static void take(served *s)
+ * guest's filesystem is in, a taking giving every byte of the disk; only
+ * what the guest wrote is read again, where the collection is of format
+ * 2 and the disk its size (hull_media_take). Where any step fails the
+ * collection and the writes stay as they were. */
+int hull_nbd_take(hull_nbd_writes *w, uint64_t bytes, hull_media_report *report, char *detail,
+                  size_t cap)
 {
-	hull_nbd_writes     *w = s->writes;
-	hull_media_report    report;
-	hull_media_reader    reader = { view_read, view_data, s };
+	served               view = { w->map, bytes, -1, w };
+	hull_media_reader    reader = { view_read, view_data, &view };
+	hull_media_changes   changes = { changed, w };
 	hull_media_map      *fresh_map;
 	char                 fresh[4300];
-	char                 detail[4400];
-	uint64_t             bytes;
+	uint64_t             had;
 
 	snprintf(fresh, sizeof fresh, "%s.hull-new", w->collection);
-	if (hull_media_import_from(&reader, s->bytes, hull_media_map_sparse(s->map), fresh, &report,
-	                           detail, sizeof detail) != 0) {
-		snprintf(w->failed, sizeof w->failed, "%.255s", detail);
-		return;
-	}
+	if (hull_media_take(&reader, bytes, hull_media_map_sparse(w->map), w->collection, &changes, fresh,
+	                    report, detail, cap) != 0)
+		return -1;
 	if (renameat2(AT_FDCWD, fresh, AT_FDCWD, w->collection, RENAME_EXCHANGE) != 0) {
-		snprintf(w->failed, sizeof w->failed, "%s: %s", w->collection, strerror(errno));
+		snprintf(detail, cap, "%s: %s", w->collection, strerror(errno));
 		nftw(fresh, take_away, 16, FTW_DEPTH | FTW_PHYS);
-		return;
+		return -1;
 	}
-	if ((fresh_map = hull_media_map_open(w->collection, &bytes, detail, sizeof detail)) == NULL) {
+	if ((fresh_map = hull_media_map_open(w->collection, &had, detail, cap)) == NULL) {
 		/* Back as it was: the old map's files are at `fresh` now, and
 		 * swapped back they are where it read them. */
 		renameat2(AT_FDCWD, fresh, AT_FDCWD, w->collection, RENAME_EXCHANGE);
 		nftw(fresh, take_away, 16, FTW_DEPTH | FTW_PHYS);
-		snprintf(w->failed, sizeof w->failed, "%.255s", detail);
-		return;
+		return -1;
 	}
-	hull_media_map_close(s->map);
-	s->map = fresh_map;
+	hull_media_map_close(w->map);
 	w->map = fresh_map;
 	nftw(fresh, take_away, 16, FTW_DEPTH | FTW_PHYS);
 	if (ftruncate(w->overlay, 0) == 0)
-		(void)ftruncate(w->overlay, (off_t)s->bytes);
-	memset(w->written, 0, (size_t)((s->bytes + HULL_NBD_BLOCK - 1u) / HULL_NBD_BLOCK + 7u) / 8u);
+		(void)ftruncate(w->overlay, (off_t)bytes);
+	memset(w->written, 0, (size_t)((bytes + HULL_NBD_BLOCK - 1u) / HULL_NBD_BLOCK + 7u) / 8u);
 	w->count = 0u;
+	return 0;
+}
+
+static void take(served *s)
+{
+	hull_nbd_writes  *w = s->writes;
+	hull_media_report report;
+	char              detail[4400];
+
+	if (hull_nbd_take(w, s->bytes, &report, detail, sizeof detail) != 0) {
+		snprintf(w->failed, sizeof w->failed, "%.255s", detail);
+		return;
+	}
+	s->map = w->map;
 	w->taken++;
 	w->failed[0] = '\0';
 }

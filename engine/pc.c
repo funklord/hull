@@ -804,6 +804,19 @@ static void write_back(hull_machine *m, medium *d)
 		}
 		if (fstat(d->fd, &st) == 0)
 			bytes = (uint64_t)st.st_size;
+		/* Taken as the server takes them as the machine runs: only what
+		 * was written read again. Where that fails, the whole disk is
+		 * made and taken apart as an image, and kept where that fails. */
+		uint64_t blocks = d->writes.count;
+
+		if (bytes != 0u &&
+		    hull_nbd_take(&d->writes, bytes, &report, detail, sizeof detail) == 0) {
+			snprintf(said, sizeof said, "hull: %s written back: %llu blocks written, %llu files, "
+			         "%llu bytes not understood\n", d->collection, (unsigned long long)blocks,
+			         report.files, report.patch_bytes);
+			host->on_data(m->core, NULL, 2, (const uint8_t *)said, strlen(said));
+			return;
+		}
 		for (uint64_t at = 0u; at < bytes; at += HULL_NBD_BLOCK) {
 			uint64_t index = at / HULL_NBD_BLOCK;
 			size_t   n = bytes - at < HULL_NBD_BLOCK ? (size_t)(bytes - at) : HULL_NBD_BLOCK;

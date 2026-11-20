@@ -7,7 +7,14 @@
  *     DIR/media.conf            (disc (volume V) (bytes N) (sha256 H)), and
  *                               (sparse true) where H is over the non-zero
  *                               blocks of an image mostly holes, and no
- *                               plain sha256
+ *                               plain sha256; since format 2, (region R)
+ *                               (regions H2), H2 regions.conf's sha256,
+ *                               and no (sha256 H) after a taking that
+ *                               read only what changed
+ *     DIR/regions.conf          format 2: a line each, `0xOFFSET SHA256`,
+ *                               each region of R bytes from OFFSET that is
+ *                               not all zeros and its bytes' sha256
+ *                               (`dd bs=1M skip=N count=1 | sha256sum`)
  *     DIR/layout.conf           a line each, `SECTOR SIZE PATH`: where on
  *                               the disc each file's bytes sit
  *     DIR/quirks/sectors/0xS.raw  every run of bytes from sector S that
@@ -91,6 +98,26 @@ typedef struct hull_media_reader {
  * disk's files and its guest's writes -- taken apart with no image made. */
 int hull_media_import_from(const hull_media_reader *reader, uint64_t bytes, int sparse,
                            const char *dir, hull_media_report *report, char *detail, size_t cap);
+
+/* Which bytes of a disk changed since its collection was taken: `written`
+ * says whether any of [at, at + n) may have. */
+typedef struct hull_media_changes {
+	int  (*written)(void *context, uint64_t at, uint64_t n);
+	void  *context;
+} hull_media_changes;
+
+/* As hull_media_import_from, the disk being the collection `prior` with
+ * `changes` over it, so where `prior` has regions (media.conf's (regions
+ * H)) and the disk's size, only what changed is redone: a file none of
+ * whose bytes were written, at the same place, is linked from `prior`, not
+ * copied; quirks and digests are redone in each region written or whose
+ * files moved, and the rest linked; and those regions are what the new
+ * collection is held to. Its media.conf then has (regions H) alone, no
+ * whole sha256. Otherwise the whole disk is taken. `dir` must be on
+ * `prior`'s filesystem for the links. */
+int hull_media_take(const hull_media_reader *reader, uint64_t bytes, int sparse, const char *prior,
+                    const hull_media_changes *changes, const char *dir, hull_media_report *report,
+                    char *detail, size_t cap);
 
 /* `dir`'s raw dump, reassembled to the empty file `fd` and its hash held
  * to media.conf's. 0, or -1 with why in `detail`; 1 where the collection

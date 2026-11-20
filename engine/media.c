@@ -35,6 +35,10 @@
 #define MAX_FILES   200000u
 #define MAX_DIRS    50000u
 #define COPY_BYTES  (1u << 20)
+/* A region of the disk, hashed alone (regions.conf), and the unit a taking
+ * redoes: what the guest wrote costs a region's read, not the disk's. A
+ * MiB, so an 8 GB disk is 8192 lines, a 64 GB one 5 MB of them. */
+#define REGION      COPY_BYTES
 
 typedef struct placed {
 	uint64_t sector;
@@ -43,6 +47,30 @@ typedef struct placed {
 	uint64_t total;    /* the file's size */
 	char    *path;     /* under files/ */
 } placed;
+
+/* A region's digest, regions.conf's line: an all-zero region has none. */
+typedef struct region {
+	uint64_t at;
+	char     sha[65];
+} region;
+
+typedef struct regions {
+	region *list;
+	size_t  count;
+	size_t  room;
+} regions;
+
+/* The collection a taking starts from (hull_media_take): its layout, by
+ * path, and its regions, and which bytes the guest wrote since. */
+typedef struct prior {
+	const char *dir;
+	placed     *lines;     /* layout.conf's, its pieces of no bytes left out */
+	size_t      count;
+	placed    **by_path;   /* the same, by path then offset */
+	regions     digests;
+	unsigned    unit;
+	const hull_media_changes *changes;
+} prior;
 
 typedef struct walk {
 	int      image;           /* the image, where no reader is given */
@@ -59,6 +87,7 @@ typedef struct walk {
 	int      sparse;          /* its digest is hash_sparse's */
 	int      owners;          /* the open owners list of the tree being read, or -1 */
 	int      devices;         /* the open devices list of the tree being read, or -1 */
+	const prior *prior;       /* a taking's, whose unchanged files are linked, not copied */
 } walk;
 
 static int fail(char *detail, size_t cap, const char *what, const char *why)
@@ -153,29 +182,6 @@ static int disc_name(const uint8_t *id, size_t length, char *out, size_t cap)
 	return strcmp(out, ".") != 0 && strcmp(out, "..") != 0;
 }
 
-/* The file at `sector` of `size` bytes copied out to `path`. */
-static int copy_out(walk *w, uint64_t sector, uint64_t size, const char *path)
-{
-	static uint8_t buffer[COPY_BYTES];
-	int            fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644);
-	uint64_t       done = 0u;
-
-	if (fd < 0)
-		return -1;
-	while (done < size) {
-		size_t n = size - done < sizeof buffer ? (size_t)(size - done) : sizeof buffer;
-
-		if (image_read(w, buffer, n, sector * SECTOR + done) != 0 ||
-		    write_all(fd, buffer, n, done) != 0) {
-			close(fd);
-			unlink(path);
-			return -1;
-		}
-		done += n;
-	}
-	return close(fd);
-}
-
 static int place_piece(walk *w, uint64_t sector, uint64_t size, uint64_t offset, uint64_t total,
                        const char *relative)
 {
@@ -201,6 +207,99 @@ static int place_piece(walk *w, uint64_t sector, uint64_t size, uint64_t offset,
 static int place(walk *w, uint64_t sector, uint64_t size, const char *relative)
 {
 	return place_piece(w, sector, size, 0u, size, relative);
+}
+
+/* Whether the file `relative`, its pieces w->files[first..], is the
+ * prior's: the same pieces at the same places, and none of their bytes
+ * written since. */
+static int unchanged(const walk *w, const char *relative, size_t first)
+{
+	const prior *p = w->prior;
+	size_t       k = w->count - first;
+	size_t       low = 0u, high;
+
+	if (p == NULL || k == 0u || k > 4096u || p->unit != w->unit || w->files[first].total == 0u)
+		return 0;
+	high = p->count;
+	while (low < high) {
+		size_t mid = low + (high - low) / 2u;
+
+		if (strcmp(p->by_path[mid]->path, relative) < 0)
+			low = mid + 1u;
+		else
+			high = mid;
+	}
+	if (low + k > p->count ||
+	    (low + k < p->count && strcmp(p->by_path[low + k]->path, relative) == 0))
+		return 0;
+	for (size_t i = 0u; i < k; i++) {
+		const placed *old = p->by_path[low + i];
+		int           found = 0;
+
+		if (strcmp(old->path, relative) != 0)
+			return 0;
+		for (size_t j = first; j < w->count && !found; j++) {
+			const placed *now = &w->files[j];
+
+			found = now->sector == old->sector && now->size == old->size &&
+			        now->offset == old->offset && now->total == old->total;
+		}
+		if (!found || p->changes->written(p->changes->context, old->sector * w->unit, old->size))
+			return 0;
+	}
+	return 1;
+}
+
+/* The file at `path`, `relative` under files/, `total` bytes long, made
+ * of its pieces w->files[first..]: linked from the prior collection where
+ * it is unchanged there, else copied from the disk; `mode`, where not -1,
+ * set last, as a write clears a setuid bit. 0 made; 1 not, a read failing,
+ * and its pieces taken back, so nothing names a file that is not there;
+ * -1 where the walk cannot go on. */
+static int fill_file(walk *w, const char *path, const char *relative, size_t first, uint64_t total,
+                     int mode)
+{
+	static uint8_t buffer[COPY_BYTES];
+	int            fd;
+
+	if (unchanged(w, relative, first)) {
+		char from[8800];
+
+		snprintf(from, sizeof from, "%s/files/%s", w->prior->dir, relative);
+		if (link(from, path) == 0) {
+			if (mode != -1)
+				(void)!chmod(path, (mode_t)mode);
+			return 0;
+		}
+	}
+	if ((fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644)) < 0)
+		goto drop;
+	if (ftruncate(fd, (off_t)total) != 0)
+		goto unmade;
+	for (size_t j = first; j < w->count; j++) {
+		const placed *piece = &w->files[j];
+
+		for (uint64_t done = 0u; done < piece->size;) {
+			size_t n = piece->size - done < sizeof buffer ? (size_t)(piece->size - done) :
+			           sizeof buffer;
+
+			if (image_read(w, buffer, n, piece->sector * w->unit + done) != 0 ||
+			    write_all(fd, buffer, n, piece->offset + done) != 0)
+				goto unmade;
+			done += n;
+		}
+	}
+	if (mode != -1)
+		(void)!fchmod(fd, (mode_t)mode);
+	return close(fd);
+unmade:
+	close(fd);
+	unlink(path);
+drop:
+	for (size_t j = first; j < w->count; j++)
+		free(w->files[j].path);
+	w->count = first;
+	return 1;
 }
 
 /*
@@ -327,9 +426,17 @@ static int read_directory(walk *w, uint64_t sector, uint64_t size, const char *r
 		}
 		if (w->count >= MAX_FILES || extent * SECTOR + bytes_of > w->bytes)
 			continue;
-		if (copy_out(w, extent, bytes_of, path) == 0 &&
-		    (status = rock_ridge_owner(w, record, length, next)) == 0)
-			status = place(w, extent, bytes_of, next);
+		{
+			size_t first = w->count;
+			int    made;
+
+			if ((status = place(w, extent, bytes_of, next)) != 0)
+				break;
+			if ((made = fill_file(w, path, next, first, bytes_of, -1)) < 0)
+				status = -1;
+			else if (made == 0)
+				status = rock_ridge_owner(w, record, length, next);
+		}
 	}
 	free(bytes);
 	return status;
@@ -463,12 +570,10 @@ static uint8_t *fat_chain(walk *w, const fat *f, uint32_t cluster, size_t *lengt
 static int fat_file(walk *w, const fat *f, uint32_t cluster, uint64_t size, const char *path,
                     const char *relative)
 {
-	static uint8_t buffer[COPY_BYTES];
-	uint64_t       cluster_bytes = f->sectors_per_cluster * f->bytes_per_sector;
-	size_t         first = w->count;
-	uint64_t       done = 0u;
-	uint64_t       steps = 0u;
-	int            fd;
+	uint64_t cluster_bytes = f->sectors_per_cluster * f->bytes_per_sector;
+	size_t   first = w->count;
+	uint64_t done = 0u;
+	uint64_t steps = 0u;
 
 	if (size == 0u)
 		return close(open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) == 0 ?
@@ -479,8 +584,6 @@ static int fat_file(walk *w, const fat *f, uint32_t cluster, uint64_t size, cons
 			return 0;
 		done += cluster_bytes;
 	}
-	if ((fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644)) < 0)
-		return 0;
 	done = 0u;
 	while (done < size) {
 		uint32_t start = cluster;
@@ -495,28 +598,12 @@ static int fat_file(walk *w, const fat *f, uint32_t cluster, uint64_t size, cons
 		}
 		piece = run < size - done ? run : size - done;
 		if (place_piece(w, fat_sector(f, start) * f->bytes_per_sector / DISK_UNIT, piece, done, size,
-		                relative) != 0) {
-			close(fd);
+		                relative) != 0)
 			return -1;
-		}
-		for (uint64_t at = 0u; at < piece;) {
-			size_t n = piece - at < sizeof buffer ? (size_t)(piece - at) : sizeof buffer;
-
-			if (image_read(w, buffer, n, fat_sector(f, start) * f->bytes_per_sector + at) != 0 ||
-			    write_all(fd, buffer, n, done + at) != 0) {
-				close(fd);
-				unlink(path);
-				for (size_t i = first; i < w->count; i++)
-					free(w->files[i].path);
-				w->count = first;
-				return 0;
-			}
-			at += n;
-		}
 		done += piece;
 		cluster = next;
 	}
-	return close(fd);
+	return fill_file(w, path, relative, first, size, -1) < 0 ? -1 : 0;
 }
 
 static int fat_directory(walk *w, const fat *f, const uint8_t *entries, size_t length,
@@ -909,25 +996,21 @@ static void ext_link(walk *w, const ext *e, const uint8_t inode[128], ext_run *r
 static int ext_file(walk *w, const ext *e, const uint8_t inode[128], ext_run *runs,
                     const char *path, const char *relative)
 {
-	static uint8_t buffer[COPY_BYTES];
-	size_t         count;
-	uint64_t       size;
-	size_t         first = w->count;
-	int            fd;
+	size_t   count;
+	uint64_t size;
+	size_t   first = w->count;
+	int      mode = (int)((le16(inode) & 07777u) | 0600u);
 
 	/* Past the image's size it is a hole or a lie, and either way not
 	 * something to make on this disk. */
 	if (ext_runs(w, e, inode, &size, runs, &count) != 0 || size > w->bytes)
 		return 0;
-	if ((fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644)) < 0)
-		return 0;
-	if (ftruncate(fd, (off_t)size) != 0) {
-		close(fd);
-		unlink(path);
-		return 0;
-	}
 	if (size == 0u) {
-		(void)!fchmod(fd, (mode_t)(le16(inode) & 07777u) | 0600u);
+		int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644);
+
+		if (fd < 0)
+			return 0;
+		(void)!fchmod(fd, (mode_t)mode);
 		close(fd);
 		return place(w, 0u, 0u, relative);
 	}
@@ -940,28 +1023,24 @@ static int ext_file(walk *w, const ext *e, const uint8_t inode[128], ext_run *ru
 			break;
 		if (piece > size - offset)
 			piece = size - offset;
-		if (place_piece(w, at / DISK_UNIT, piece, offset, size, relative) != 0) {
-			close(fd);
+		if (place_piece(w, at / DISK_UNIT, piece, offset, size, relative) != 0)
 			return -1;
-		}
-		for (uint64_t done = 0u; done < piece;) {
-			size_t n = piece - done < sizeof buffer ? (size_t)(piece - done) : sizeof buffer;
-
-			if (image_read(w, buffer, n, at + done) != 0 ||
-			    write_all(fd, buffer, n, offset + done) != 0) {
-				close(fd);
-				unlink(path);
-				for (size_t k = first; k < w->count; k++)
-					free(w->files[k].path);
-				w->count = first;
-				return 0;
-			}
-			done += n;
-		}
 	}
-	/* Last, as a write clears a setuid bit. */
-	(void)!fchmod(fd, (mode_t)(le16(inode) & 07777u) | 0600u);
-	return close(fd);
+	if (w->count == first) {
+		/* All holes: a file of its size and no piece. */
+		int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644);
+
+		if (fd < 0)
+			return 0;
+		if (ftruncate(fd, (off_t)size) != 0) {
+			close(fd);
+			unlink(path);
+			return 0;
+		}
+		(void)!fchmod(fd, (mode_t)mode);
+		return close(fd);
+	}
+	return fill_file(w, path, relative, first, size, mode) < 0 ? -1 : 0;
 }
 
 /*
@@ -1480,9 +1559,12 @@ static int describe_disk(walk *w, const char *dir, char *detail, size_t cap)
 
 /* --- reassembly ----------------------------------------------------------- */
 
-/* media.conf's bytes and sha256, by the text this file wrote and any
- * readable form as near it as a hand might: (bytes N), (sha256 "H"). */
-static int read_conf(const char *dir, uint64_t *bytes, char sha[65], unsigned *unit, int *sparse)
+/* media.conf's bytes, sha256 and regions digest, by the text this file
+ * wrote and any readable form as near it as a hand might: (bytes N),
+ * (sha256 "H"), (regions "H"). Either digest may be absent, `sha` or
+ * `regions` then "", not both. */
+static int read_conf(const char *dir, uint64_t *bytes, char sha[65], unsigned *unit, int *sparse,
+                     char regions[65])
 {
 	char    path[4300];
 	static char text[65536];
@@ -1500,14 +1582,54 @@ static int read_conf(const char *dir, uint64_t *bytes, char sha[65], unsigned *u
 	text[got] = '\0';
 	if ((at = strstr(text, "(bytes ")) == NULL || sscanf(at, "(bytes %" SCNu64 ")", bytes) != 1)
 		return -1;
-	if ((at = strstr(text, "(sha256 \"")) == NULL || sscanf(at, "(sha256 \"%64[0-9a-f]\")", sha) != 1)
+	sha[0] = regions[0] = '\0';
+	if ((at = strstr(text, "(sha256 \"")) != NULL &&
+	    (sscanf(at, "(sha256 \"%64[0-9a-f]\")", sha) != 1 || strlen(sha) != 64u))
 		return -1;
+	if ((at = strstr(text, "(regions \"")) != NULL &&
+	    (sscanf(at, "(regions \"%64[0-9a-f]\")", regions) != 1 || strlen(regions) != 64u))
+		return -1;
+	/* (region N), the bytes a region is: this file's alone, so far. */
+	if ((at = strstr(text, "(region ")) != NULL) {
+		uint64_t size;
+
+		if (sscanf(at, "(region %" SCNu64 ")", &size) != 1 || size != REGION)
+			return -1;
+	}
 	*sparse = strstr(text, "(sparse true)") != NULL;
 	*unit = SECTOR;
 	if ((at = strstr(text, "(unit ")) != NULL &&
 	    (sscanf(at, "(unit %u)", unit) != 1 || *unit == 0u || *unit > SECTOR * 2u))
 		return -1;
-	return strlen(sha) == 64u ? 0 : -1;
+	return sha[0] != '\0' || regions[0] != '\0' ? 0 : -1;
+}
+
+/* A line of layout.conf, `SECTOR SIZE [@OFFSET/TOTAL] PATH`, read in
+ * place into `out`, its path pointing into `line`: 0, or -1 where it is no
+ * file of a disc `bytes` long in sectors of `unit`. */
+static int layout_line(char *line, uint64_t bytes, unsigned unit, placed *out)
+{
+	size_t n = strlen(line);
+	int    used = 0;
+	int    more = 0;
+
+	if (n > 0u && line[n - 1u] == '\n')
+		line[n - 1u] = '\0';
+	out->offset = 0u;
+	if (sscanf(line, "%" SCNu64 " %" SCNu64 " %n", &out->sector, &out->size, &used) != 2 || used == 0)
+		return -1;
+	out->total = out->size;
+	/* A piece of a fragmented file: @OFFSET/TOTAL before its path. */
+	if (line[used] == '@') {
+		if (sscanf(line + used, "@%" SCNu64 "/%" SCNu64 " %n", &out->offset, &out->total, &more) != 2 ||
+		    more == 0 || out->offset + out->size > out->total)
+			return -1;
+		used += more;
+	}
+	if (!plain_path(line + used) || out->sector > bytes / unit || out->sector * unit + out->size > bytes)
+		return -1;
+	out->path = line + used;
+	return 0;
 }
 
 /* layout.conf's files placed on `fd`, already `bytes` long and empty. */
@@ -1524,39 +1646,22 @@ static int place_files(const char *dir, int fd, uint64_t bytes, unsigned unit, c
 	if ((layout = fopen(path, "re")) == NULL)
 		return fail(detail, cap, "the collection's layout.conf cannot be read", strerror(errno));
 	while (status == 0 && fgets(line, sizeof line, layout) != NULL) {
-		uint64_t sector;
-		uint64_t size;
-		uint64_t offset = 0u;
-		uint64_t total;
-		int      used = 0;
-		int      more = 0;
-		size_t   n = strlen(line);
+		placed   piece;
+		uint64_t sector, size, offset, total;
 		char     file[8800];
 		int      in;
 		uint64_t done = 0u;
 		struct stat st;
 
-		if (n > 0u && line[n - 1u] == '\n')
-			line[n - 1u] = '\0';
-		if (sscanf(line, "%" SCNu64 " %" SCNu64 " %n", &sector, &size, &used) != 2 || used == 0) {
+		if (layout_line(line, bytes, unit, &piece) != 0) {
 			status = fail(detail, cap, "a line of layout.conf is not a file on this disc", line);
 			break;
 		}
-		total = size;
-		/* A piece of a fragmented file: @OFFSET/TOTAL before its path. */
-		if (line[used] == '@') {
-			if (sscanf(line + used, "@%" SCNu64 "/%" SCNu64 " %n", &offset, &total, &more) != 2 ||
-			    more == 0 || offset + size > total) {
-				status = fail(detail, cap, "a line of layout.conf is not a file on this disc", line);
-				break;
-			}
-			used += more;
-		}
-		if (!plain_path(line + used) || sector > bytes / unit || sector * unit + size > bytes) {
-			status = fail(detail, cap, "a line of layout.conf is not a file on this disc", line);
-			break;
-		}
-		snprintf(file, sizeof file, "%s/files/%s", dir, line + used);
+		sector = piece.sector;
+		size = piece.size;
+		offset = piece.offset;
+		total = piece.total;
+		snprintf(file, sizeof file, "%s/files/%s", dir, piece.path);
 		if ((in = open(file, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)) < 0) {
 			status = fail(detail, cap, file, strerror(errno));
 			break;
@@ -1776,6 +1881,250 @@ static int hash_sparse(int fd, uint64_t bytes, char out[65])
 	hull_sha256_final(&h, digest);
 	hull_sha256_hex(digest, out);
 	return 0;
+}
+
+/* --- regions: the disk's digest by the MiB (format 2) --------------------- */
+
+/*
+ * One sha256 of a whole disk is a read of the whole disk, and so is
+ * checking it: a taking that redoes only what the guest wrote could never
+ * say the new collection's. So the disk is hashed by the region as well:
+ * regions.conf a line for each region that is not all zeros, its offset
+ * and its bytes' sha256, and media.conf's (regions H) that file's sha256
+ * -- each line checkable with dd and sha256sum, and a taking rehashing the
+ * regions it rewrote and keeping the other lines. All zeros is no line,
+ * whether holes or written, so a sparse disk's file is as short as its
+ * data.
+ */
+static int regions_add(regions *r, uint64_t at, const char sha[65])
+{
+	if (r->count == r->room) {
+		size_t  room = r->room != 0u ? 2u * r->room : 256u;
+		region *grown = realloc(r->list, room * sizeof *grown);
+
+		if (grown == NULL)
+			return -1;
+		r->list = grown;
+		r->room = room;
+	}
+	r->list[r->count].at = at;
+	memcpy(r->list[r->count].sha, sha, 65u);
+	r->count++;
+	return 0;
+}
+
+static void regions_free(regions *r)
+{
+	free(r->list);
+	memset(r, 0, sizeof *r);
+}
+
+/* A reader of a disk for region_digests: read `n` at `at`, and the next
+ * offset from `at` that may hold anything but zeros. */
+typedef struct disk_reader {
+	int      (*read)(void *context, void *to, size_t n, uint64_t at);
+	uint64_t (*data)(void *context, uint64_t at, uint64_t bytes);
+	void      *context;
+} disk_reader;
+
+/* The region at `at`, `n` bytes, hashed into `sha`; "" where all zeros. */
+static int region_digest(const disk_reader *d, uint8_t *buffer, uint64_t at, size_t n, char sha[65])
+{
+	static const uint8_t zero[SPARSE_BLOCK];
+	hull_sha256          h;
+	uint8_t              digest[32];
+	size_t               i;
+
+	if (d->read(d->context, buffer, n, at) != 0)
+		return -1;
+	for (i = 0u; i < n; i += SPARSE_BLOCK)
+		if (memcmp(buffer + i, zero, n - i < SPARSE_BLOCK ? n - i : SPARSE_BLOCK) != 0)
+			break;
+	sha[0] = '\0';
+	if (i >= n)
+		return 0;
+	hull_sha256_init(&h);
+	hull_sha256_update(&h, buffer, n);
+	hull_sha256_final(&h, digest);
+	hull_sha256_hex(digest, sha);
+	return 0;
+}
+
+/* Every region of the disk `bytes` long into `out`, in order. */
+static int region_digests(const disk_reader *d, uint64_t bytes, regions *out)
+{
+	uint8_t *buffer = malloc(REGION);
+	uint64_t at = 0u;
+
+	if (buffer == NULL)
+		return -1;
+	while ((at = d->data(d->context, at, bytes)) < bytes) {
+		size_t n;
+		char   sha[65];
+
+		at -= at % REGION;
+		n = bytes - at < REGION ? (size_t)(bytes - at) : REGION;
+		if (region_digest(d, buffer, at, n, sha) != 0 ||
+		    (sha[0] != '\0' && regions_add(out, at, sha) != 0)) {
+			free(buffer);
+			return -1;
+		}
+		at += n;
+	}
+	free(buffer);
+	return 0;
+}
+
+/* regions.conf's text of `r`, and its sha256 into `top`. */
+static char *regions_text(const regions *r, size_t *length, char top[65])
+{
+	size_t      room = r->count * 84u + 1u;
+	char       *text = malloc(room);
+	size_t      used = 0u;
+	hull_sha256 h;
+	uint8_t     digest[32];
+
+	if (text == NULL)
+		return NULL;
+	for (size_t i = 0u; i < r->count; i++)
+		used += (size_t)snprintf(text + used, room - used, "0x%" PRIX64 " %s\n", r->list[i].at,
+		                         r->list[i].sha);
+	hull_sha256_init(&h);
+	hull_sha256_update(&h, (const uint8_t *)text, used);
+	hull_sha256_final(&h, digest);
+	hull_sha256_hex(digest, top);
+	*length = used;
+	return text;
+}
+
+static int regions_write(const char *dir, const regions *r, char top[65])
+{
+	char   path[4300];
+	size_t length;
+	char  *text = regions_text(r, &length, top);
+	int    fd;
+	int    status;
+
+	if (text == NULL)
+		return -1;
+	snprintf(path, sizeof path, "%s/regions.conf", dir);
+	if ((fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0) {
+		free(text);
+		return -1;
+	}
+	status = write_all(fd, text, length, 0u);
+	free(text);
+	return close(fd) == 0 ? status : -1;
+}
+
+/* regions.conf read into `out`, held to `top` first: a line a taking keeps
+ * is trusted, so the file is the one media.conf names or nothing. */
+static int regions_read(const char *dir, const char top[65], uint64_t bytes, regions *out)
+{
+	char        path[4300];
+	struct stat st;
+	char       *text;
+	int         fd;
+	hull_sha256 h;
+	uint8_t     digest[32];
+	char        got[65];
+	char       *line;
+	uint64_t    last = 0u;
+
+	snprintf(path, sizeof path, "%s/regions.conf", dir);
+	if ((fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)) < 0)
+		return -1;
+	if (fstat(fd, &st) != 0 || st.st_size > (off_t)(bytes / REGION + 1u) * 84 ||
+	    (text = malloc((size_t)st.st_size + 1u)) == NULL) {
+		close(fd);
+		return -1;
+	}
+	if (st.st_size != 0 && read_all(fd, text, (size_t)st.st_size, 0u) != 0) {
+		close(fd);
+		free(text);
+		return -1;
+	}
+	close(fd);
+	text[st.st_size] = '\0';
+	hull_sha256_init(&h);
+	hull_sha256_update(&h, (const uint8_t *)text, (size_t)st.st_size);
+	hull_sha256_final(&h, digest);
+	hull_sha256_hex(digest, got);
+	if (strcmp(got, top) != 0) {
+		free(text);
+		return -1;
+	}
+	for (line = text; *line != '\0';) {
+		char    *end = strchr(line, '\n');
+		uint64_t at;
+		char     sha[65];
+		int      used = 0;
+
+		if (end == NULL)
+			break;
+		*end = '\0';
+		if (sscanf(line, "0x%" SCNx64 " %64[0-9a-f]%n", &at, sha, &used) != 2 ||
+		    line[used] != '\0' || strlen(sha) != 64u || at % REGION != 0u || at >= bytes ||
+		    (out->count != 0u && at <= last) || regions_add(out, at, sha) != 0) {
+			free(text);
+			return -1;
+		}
+		last = at;
+		line = end + 1;
+	}
+	{
+		int whole = *line == '\0';
+
+		free(text);
+		return whole ? 0 : -1;
+	}
+}
+
+/* The disk `d` hashed by the region and held to `top`: 0, or -1 with why. */
+static int regions_check(const disk_reader *d, uint64_t bytes, const char top[65], char *detail,
+                         size_t cap)
+{
+	regions r = { 0 };
+	char    got[65];
+	size_t  length;
+	char   *text;
+
+	if (region_digests(d, bytes, &r) != 0) {
+		regions_free(&r);
+		return fail(detail, cap, "the disc cannot be read by the region", strerror(errno));
+	}
+	text = regions_text(&r, &length, got);
+	regions_free(&r);
+	if (text == NULL)
+		return fail(detail, cap, "out of memory", NULL);
+	free(text);
+	if (strcmp(got, top) != 0) {
+		snprintf(detail, cap, "the collection no longer gives its disc: its regions hash to %s, "
+		         "and %s was taken", got, top);
+		return -1;
+	}
+	return 0;
+}
+
+static int fd_read(void *context, void *to, size_t n, uint64_t at)
+{
+	return read_all(*(const int *)context, to, n, at);
+}
+
+static uint64_t fd_data(void *context, uint64_t at, uint64_t bytes)
+{
+	return next_data(*(const int *)context, at, bytes);
+}
+
+static int walk_read(void *context, void *to, size_t n, uint64_t at)
+{
+	return image_read(context, to, n, at);
+}
+
+static uint64_t walk_data(void *context, uint64_t at, uint64_t bytes)
+{
+	(void)bytes;
+	return image_data(context, at);
 }
 
 /* --- a raw dump ------------------------------------------------------------ */
@@ -2191,14 +2540,29 @@ static int media_write_locked(const char *dir, int fd, char *detail, size_t cap)
 	int      sparse;
 	char     want[65];
 	char     got[65];
+	char     top[65];
 
-	if (read_conf(dir, &bytes, want, &unit, &sparse) != 0)
-		return fail(detail, cap, "the collection's media.conf gives no bytes and sha256", NULL);
+	if (read_conf(dir, &bytes, want, &unit, &sparse, top) != 0)
+		return fail(detail, cap, "the collection's media.conf gives no bytes and digest", NULL);
 	if (ftruncate(fd, (off_t)bytes) != 0)
 		return fail(detail, cap, "the disc's image cannot be sized", strerror(errno));
 	if (place_files(dir, fd, bytes, unit, detail, cap) != 0 ||
 	    apply_quirks(dir, fd, bytes, unit, detail, cap) != 0)
 		return -1;
+	if (top[0] != '\0') {
+		disk_reader d = { fd_read, fd_data, &fd };
+		regions     listed = { 0 };
+		int         read = regions_read(dir, top, bytes, &listed);
+
+		regions_free(&listed);
+		if (read != 0)
+			return fail(detail, cap, "the collection's regions.conf is not the one its media.conf "
+			            "names", NULL);
+		if (regions_check(&d, bytes, top, detail, cap) != 0)
+			return -1;
+	}
+	if (want[0] == '\0')
+		return 0;
 	if ((sparse ? hash_sparse(fd, bytes, got) : hash_fd(fd, bytes, got)) != 0)
 		return fail(detail, cap, "the disc's image cannot be read back", strerror(errno));
 	if (strcmp(want, got) != 0) {
@@ -2359,6 +2723,12 @@ static int write_quirks(const walk *w, int naive, const char *dir, hull_media_re
 		for (size_t i = 0u; i < n; i += w->unit) {
 			size_t piece = n - i < w->unit ? n - i : w->unit;
 
+			/* A run ends at a region's end, so a region's quirks are its
+			 * own, redone with it by a taking. */
+			if ((at + i) % REGION == 0u && run >= 0) {
+				close(run);
+				run = -1;
+			}
 			if (memcmp(ours + i, theirs + i, piece) == 0) {
 				if (run >= 0) {
 					close(run);
@@ -2386,12 +2756,19 @@ static int write_quirks(const walk *w, int naive, const char *dir, hull_media_re
 	return 0;
 }
 
+static int take_regions(walk *w, regions *out);
+static int take_quirks(walk *w, const char *dir, hull_media_report *report, char *detail,
+                       size_t cap);
+
 static int import_into(walk *w, const char *dir, hull_media_report *report, char *detail,
                        size_t cap)
 {
 	char        volume[33] = "";
 	char        path[4400];
-	char        sha[65];
+	char        sha[65] = "";
+	char        sha_entry[90] = "";
+	char        top[65];
+	regions     digests = { 0 };
 	FILE       *file;
 	int         naive = -1;
 	int         status = -1;
@@ -2413,17 +2790,36 @@ static int import_into(walk *w, const char *dir, hull_media_report *report, char
 		    (!found && read_partitions(w, volume, sizeof volume) != 0))
 			return fail(detail, cap, "the disk's files cannot be written", strerror(errno));
 	}
-	if (hash_walk(w, sha) != 0)
-		return fail(detail, cap, "the image cannot be read", strerror(errno));
+	/* A taking whose filesystem changed its sector meanwhile is a whole
+	 * one: no line of the prior's means the same. */
+	if (w->prior != NULL && w->prior->unit != w->unit)
+		w->prior = NULL;
+	if (w->prior == NULL) {
+		disk_reader d = { walk_read, walk_data, w };
+
+		if (hash_walk(w, sha) != 0 || region_digests(&d, w->bytes, &digests) != 0) {
+			regions_free(&digests);
+			return fail(detail, cap, "the image cannot be read", strerror(errno));
+		}
+		snprintf(sha_entry, sizeof sha_entry, " (sha256 \"%s\")", sha);
+	} else if (take_regions(w, &digests) != 0) {
+		regions_free(&digests);
+		return fail(detail, cap, "the disk cannot be read", strerror(errno));
+	}
+	if (regions_write(dir, &digests, top) != 0) {
+		regions_free(&digests);
+		return fail(detail, cap, "the collection's regions.conf cannot be written", strerror(errno));
+	}
+	regions_free(&digests);
 	if (w->count != 0u)
 		qsort(w->files, w->count, sizeof w->files[0], by_sector);
 
 	snprintf(path, sizeof path, "%s/media.conf", dir);
 	if ((file = fopen(path, "we")) == NULL)
 		return fail(detail, cap, path, strerror(errno));
-	fprintf(file, "(disc (volume \"%s\") (bytes %" PRIu64 ") (sha256 \"%s\") (unit %u)%s%s)\n",
-	        volume, w->bytes, sha, w->unit, w->sparse ? " (sparse true)" : "",
-	        w->extra != NULL ? w->extra : "");
+	fprintf(file, "(disc (volume \"%s\") (bytes %" PRIu64 ")%s (unit %u)%s (region %u) (regions "
+	        "\"%s\")%s)\n", volume, w->bytes, sha_entry, w->unit, w->sparse ? " (sparse true)" : "",
+	        REGION, top, w->extra != NULL ? w->extra : "");
 	if (fclose(file) != 0)
 		return fail(detail, cap, path, strerror(errno));
 	snprintf(path, sizeof path, "%s/layout.conf", dir);
@@ -2441,6 +2837,14 @@ static int import_into(walk *w, const char *dir, hull_media_report *report, char
 	if (fclose(file) != 0)
 		return fail(detail, cap, path, strerror(errno));
 
+	if (w->prior != NULL) {
+		if (take_quirks(w, dir, report, detail, cap) != 0 || describe_disk(w, dir, detail, cap) != 0)
+			return -1;
+		for (size_t i = 0u; i < w->count; i++)
+			report->files += w->files[i].offset == 0u;
+		report->bytes = w->bytes;
+		return 0;
+	}
 	/* Project, diff, and reassemble: the last is the proof, by the same
 	 * function a machine's disc is made with. */
 	snprintf(path, sizeof path, "%s/.projected", dir);
@@ -2823,11 +3227,13 @@ struct hull_media_map {
 	unsigned   unit;
 	int        sparse;
 	char       sha[65];
+	char       regions[65];
 	map_piece *files;
 	size_t     file_count;
 	map_piece *quirks;
 	size_t     quirk_count;
 	uint64_t   longest;  /* the longest file piece, bounding the bisection's look back */
+	uint64_t   longest_quirk;
 };
 
 static int by_at(const void *a, const void *b)
@@ -2883,8 +3289,8 @@ hull_media_map *hull_media_map_open(const char *dir, uint64_t *bytes, char *deta
 		fail(detail, cap, "out of memory", NULL);
 		return NULL;
 	}
-	if (read_conf(dir, &map->bytes, map->sha, &map->unit, &map->sparse) != 0) {
-		fail(detail, cap, "the collection's media.conf gives no bytes and sha256", NULL);
+	if (read_conf(dir, &map->bytes, map->sha, &map->unit, &map->sparse, map->regions) != 0) {
+		fail(detail, cap, "the collection's media.conf gives no bytes and digest", NULL);
 		goto fail;
 	}
 	snprintf(path, sizeof path, "%s/layout.conf", dir);
@@ -2894,27 +3300,18 @@ hull_media_map *hull_media_map_open(const char *dir, uint64_t *bytes, char *deta
 	}
 	/* As place_files() reads it, each line checked the same way. */
 	while (fgets(line, sizeof line, layout) != NULL) {
-		uint64_t    sector, size, offset = 0u, total;
-		int         used = 0, more = 0;
-		size_t      n = strlen(line);
+		placed      piece;
+		uint64_t    sector, size, offset, total;
 		char        file[8800];
 		struct stat st;
 
-		if (n > 0u && line[n - 1u] == '\n')
-			line[n - 1u] = '\0';
-		if (sscanf(line, "%" SCNu64 " %" SCNu64 " %n", &sector, &size, &used) != 2 || used == 0)
+		if (layout_line(line, map->bytes, map->unit, &piece) != 0)
 			break;
-		total = size;
-		if (line[used] == '@') {
-			if (sscanf(line + used, "@%" SCNu64 "/%" SCNu64 " %n", &offset, &total, &more) != 2 ||
-			    more == 0 || offset + size > total)
-				break;
-			used += more;
-		}
-		if (!plain_path(line + used) || sector > map->bytes / map->unit ||
-		    sector * map->unit + size > map->bytes)
-			break;
-		snprintf(file, sizeof file, "%s/files/%s", dir, line + used);
+		sector = piece.sector;
+		size = piece.size;
+		offset = piece.offset;
+		total = piece.total;
+		snprintf(file, sizeof file, "%s/files/%s", dir, piece.path);
 		if (lstat(file, &st) != 0 || !S_ISREG(st.st_mode) || (uint64_t)st.st_size != total) {
 			fclose(layout);
 			fail(detail, cap, "a file is not the size the layout says", file);
@@ -2962,6 +3359,8 @@ hull_media_map *hull_media_map_open(const char *dir, uint64_t *bytes, char *deta
 				fail(detail, cap, "out of memory", NULL);
 				goto fail;
 			}
+			if ((uint64_t)st.st_size > map->longest_quirk)
+				map->longest_quirk = (uint64_t)st.st_size;
 		}
 		closedir(runs);
 	} else if (errno != ENOENT) {
@@ -2970,6 +3369,17 @@ hull_media_map *hull_media_map_open(const char *dir, uint64_t *bytes, char *deta
 	}
 	/* Runs never overlap one another, each a stretch the diff found; the
 	 * files are laid in their lines' order, kept by `order` on a tie. */
+	if (map->regions[0] != '\0') {
+		regions listed = { 0 };
+		int     read = regions_read(dir, map->regions, map->bytes, &listed);
+
+		regions_free(&listed);
+		if (read != 0) {
+			fail(detail, cap, "the collection's regions.conf is not the one its media.conf names",
+			     NULL);
+			goto fail;
+		}
+	}
 	if (map->file_count != 0u)
 		qsort(map->files, map->file_count, sizeof map->files[0], by_at);
 	if (map->quirk_count != 0u)
@@ -3030,16 +3440,50 @@ int hull_media_map_sparse(const hull_media_map *map)
 
 int hull_media_map_read(hull_media_map *map, uint64_t at, void *out, size_t n)
 {
-	uint64_t longest_quirk = 0u;
-
 	if (at > map->bytes || n > map->bytes - at)
 		return -1;
 	memset(out, 0, n);
-	for (size_t i = 0u; i < map->quirk_count; i++)
-		if (map->quirks[i].length > longest_quirk)
-			longest_quirk = map->quirks[i].length;
 	return map_layer(map->files, map->file_count, map->longest, at, out, n) == 0 &&
-	       map_layer(map->quirks, map->quirk_count, longest_quirk, at, out, n) == 0 ? 0 : -1;
+	       map_layer(map->quirks, map->quirk_count, map->longest_quirk, at, out, n) == 0 ? 0 : -1;
+}
+
+/* The first offset from `at` that a piece of `list` covers, or UINT64_MAX. */
+static uint64_t layer_next(const map_piece *list, size_t count, uint64_t longest, uint64_t at)
+{
+	size_t   low = 0u, high = count;
+	uint64_t from = at > longest ? at - longest : 0u;
+
+	while (low < high) {
+		size_t mid = low + (high - low) / 2u;
+
+		if (list[mid].at < from)
+			low = mid + 1u;
+		else
+			high = mid;
+	}
+	for (size_t i = low; i < count; i++) {
+		if (list[i].at >= at)
+			return list[i].at;
+		if (list[i].at + list[i].length > at)
+			return at;
+	}
+	return UINT64_MAX;
+}
+
+static int map_disk_read(void *context, void *to, size_t n, uint64_t at)
+{
+	return hull_media_map_read(context, at, to, n);
+}
+
+/* Nothing but zeros where no piece of either layer reaches. */
+static uint64_t map_disk_data(void *context, uint64_t at, uint64_t bytes)
+{
+	const hull_media_map *map = context;
+	uint64_t              file = layer_next(map->files, map->file_count, map->longest, at);
+	uint64_t              quirk = layer_next(map->quirks, map->quirk_count, map->longest_quirk, at);
+	uint64_t              next = file < quirk ? file : quirk;
+
+	return next < bytes ? next : bytes;
 }
 
 int hull_media_map_verify(hull_media_map *map, char *detail, size_t cap)
@@ -3054,6 +3498,18 @@ int hull_media_map_verify(hull_media_map *map, char *detail, size_t cap)
 
 	if (buffer == NULL)
 		return fail(detail, cap, "out of memory", NULL);
+	if (map->regions[0] != '\0') {
+		disk_reader d = { map_disk_read, map_disk_data, map };
+
+		if (regions_check(&d, map->bytes, map->regions, detail, cap) != 0) {
+			free(buffer);
+			return -1;
+		}
+	}
+	if (map->sha[0] == '\0') {
+		free(buffer);
+		return 0;
+	}
 	hull_sha256_init(&h);
 	if (!map->sparse) {
 		for (uint64_t at = 0u; at < map->bytes;) {
@@ -3122,6 +3578,368 @@ int hull_media_map_verify(hull_media_map *map, char *detail, size_t cap)
 	return 0;
 }
 
+/* --- a taking: only what changed redone ------------------------------------ */
+
+static int by_line(const void *a, const void *b)
+{
+	const placed *x = *(placed *const *)a;
+	const placed *y = *(placed *const *)b;
+
+	if (x->sector != y->sector)
+		return x->sector < y->sector ? -1 : 1;
+	if (x->size != y->size)
+		return x->size < y->size ? -1 : 1;
+	if (x->offset != y->offset)
+		return x->offset < y->offset ? -1 : 1;
+	if (x->total != y->total)
+		return x->total < y->total ? -1 : 1;
+	return strcmp(x->path, y->path);
+}
+
+static int by_path(const void *a, const void *b)
+{
+	const placed *x = *(placed *const *)a;
+	const placed *y = *(placed *const *)b;
+	int           c = strcmp(x->path, y->path);
+
+	return c != 0 ? c : x->offset < y->offset ? -1 : x->offset > y->offset;
+}
+
+static void prior_free(prior *p)
+{
+	for (size_t i = 0u; i < p->count; i++)
+		free(p->lines[i].path);
+	free(p->lines);
+	free(p->by_path);
+	regions_free(&p->digests);
+	memset(p, 0, sizeof *p);
+}
+
+/* The collection `dir` as a taking's start: 0, or -1 where it cannot be
+ * one -- no regions, another size, a file not as media.conf names it --
+ * and the whole disk is taken. */
+static int prior_open(const char *dir, uint64_t bytes, const hull_media_changes *changes, prior *p)
+{
+	uint64_t had;
+	char     sha[65];
+	char     top[65];
+	int      sparse;
+	char     path[4300];
+	char     line[4400];
+	FILE    *layout;
+	size_t   room = 0u;
+
+	memset(p, 0, sizeof *p);
+	if (read_conf(dir, &had, sha, &p->unit, &sparse, top) != 0 || top[0] == '\0' || had != bytes ||
+	    regions_read(dir, top, bytes, &p->digests) != 0)
+		goto fail;
+	snprintf(path, sizeof path, "%s/layout.conf", dir);
+	if ((layout = fopen(path, "re")) == NULL)
+		goto fail;
+	while (fgets(line, sizeof line, layout) != NULL) {
+		placed piece;
+
+		if (layout_line(line, bytes, p->unit, &piece) != 0) {
+			fclose(layout);
+			goto fail;
+		}
+		if (piece.size == 0u)
+			continue;
+		if (p->count == room) {
+			size_t  grown = room != 0u ? 2u * room : 256u;
+			placed *more = realloc(p->lines, grown * sizeof *more);
+
+			if (more == NULL) {
+				fclose(layout);
+				goto fail;
+			}
+			p->lines = more;
+			room = grown;
+		}
+		if ((piece.path = strdup(piece.path)) == NULL) {
+			fclose(layout);
+			goto fail;
+		}
+		p->lines[p->count++] = piece;
+	}
+	fclose(layout);
+	if ((p->by_path = malloc((p->count != 0u ? p->count : 1u) * sizeof *p->by_path)) == NULL)
+		goto fail;
+	for (size_t i = 0u; i < p->count; i++)
+		p->by_path[i] = &p->lines[i];
+	qsort(p->by_path, p->count, sizeof *p->by_path, by_path);
+	p->dir = dir;
+	p->changes = changes;
+	return 0;
+fail:
+	prior_free(p);
+	return -1;
+}
+
+static int written(const prior *p, uint64_t at, uint64_t n)
+{
+	return p->changes->written(p->changes->context, at, n);
+}
+
+/* Each region's digest: rehashed where written, else the prior's line. */
+static int take_regions(walk *w, regions *out)
+{
+	const regions *had = &w->prior->digests;
+	uint8_t       *buffer = malloc(REGION);
+	size_t         k = 0u;
+	disk_reader    d = { walk_read, walk_data, w };
+
+	if (buffer == NULL)
+		return -1;
+	for (uint64_t at = 0u; at < w->bytes; at += REGION) {
+		size_t n = w->bytes - at < REGION ? (size_t)(w->bytes - at) : REGION;
+		char   sha[65];
+
+		while (k < had->count && had->list[k].at < at)
+			k++;
+		if (written(w->prior, at, n)) {
+			if (region_digest(&d, buffer, at, n, sha) != 0) {
+				free(buffer);
+				return -1;
+			}
+		} else if (k < had->count && had->list[k].at == at) {
+			memcpy(sha, had->list[k].sha, sizeof sha);
+		} else {
+			sha[0] = '\0';
+		}
+		if (sha[0] != '\0' && regions_add(out, at, sha) != 0) {
+			free(buffer);
+			return -1;
+		}
+	}
+	free(buffer);
+	return 0;
+}
+
+static void mark(uint8_t *affected, uint64_t at, uint64_t n)
+{
+	for (uint64_t r = at / REGION; r * REGION < at + n; r++)
+		affected[r / 8u] |= (uint8_t)(1u << (r % 8u));
+}
+
+static int is_marked(const uint8_t *affected, uint64_t r)
+{
+	return (affected[r / 8u] >> (r % 8u)) & 1u;
+}
+
+/* The bytes of region [at, at + n) that the walk's files do not give, as
+ * write_quirks() finds them over the whole disk, `longest` bounding how
+ * far back a piece crossing it starts. */
+static int region_quirks(walk *w, const char *dir, uint64_t at, size_t n, uint64_t longest,
+                         uint8_t *ours, uint8_t *theirs, hull_media_report *report)
+{
+	size_t   low = 0u, high = w->count;
+	uint64_t from = at > longest ? at - longest : 0u;
+	int      run = -1;
+	uint64_t run_at = 0u;
+	char     path[4400];
+
+	memset(ours, 0, n);
+	while (low < high) {
+		size_t mid = low + (high - low) / 2u;
+
+		if (w->files[mid].sector * w->unit < from)
+			low = mid + 1u;
+		else
+			high = mid;
+	}
+	for (size_t i = low; i < w->count && w->files[i].sector * w->unit < at + n; i++) {
+		const placed *p = &w->files[i];
+		uint64_t      begin = p->sector * w->unit;
+		uint64_t      start = begin > at ? begin : at;
+		uint64_t      end = begin + p->size < at + n ? begin + p->size : at + n;
+		char          file[8800];
+		int           fd;
+
+		if (end <= start)
+			continue;
+		snprintf(file, sizeof file, "%s/%s", w->root, p->path);
+		if ((fd = open(file, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)) < 0)
+			return -1;
+		if (read_all(fd, ours + (start - at), (size_t)(end - start), p->offset + (start - begin)) != 0) {
+			close(fd);
+			return -1;
+		}
+		close(fd);
+	}
+	if (image_read(w, theirs, n, at) != 0)
+		return -1;
+	for (size_t i = 0u; i < n; i += w->unit) {
+		size_t piece = n - i < w->unit ? n - i : w->unit;
+
+		if (memcmp(ours + i, theirs + i, piece) == 0) {
+			if (run >= 0) {
+				close(run);
+				run = -1;
+			}
+			continue;
+		}
+		if (run < 0) {
+			snprintf(path, sizeof path, "%s/quirks/sectors/0x%" PRIX64 ".raw", dir,
+			         (at + i) / w->unit);
+			run_at = at + i;
+			if ((run = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0)
+				return -1;
+		}
+		if (write_all(run, theirs + i, piece, at + i - run_at) != 0) {
+			close(run);
+			return -1;
+		}
+		report->patch_bytes += piece;
+	}
+	if (run >= 0)
+		close(run);
+	return 0;
+}
+
+/*
+ * The quirks of a taking: a region is redone where the guest wrote in it,
+ * or a layout line there differs from the prior's -- a file moved, gone or
+ * new, whose bytes there change what the files give -- and every other
+ * region's runs are the prior's, linked. Then each region redone is held
+ * to the disk: the new collection read there as a machine reads it, byte
+ * for byte the disk. A region not redone is the prior's files and runs
+ * over bytes nobody wrote, and the prior gave those.
+ */
+static int take_quirks(walk *w, const char *dir, hull_media_report *report, char *detail,
+                       size_t cap)
+{
+	const prior    *p = w->prior;
+	uint64_t        count = (w->bytes + REGION - 1u) / REGION;
+	uint8_t        *affected = calloc((size_t)(count + 7u) / 8u + 1u, 1u);
+	placed        **now = malloc((w->count != 0u ? w->count : 1u) * sizeof *now);
+	placed        **then = malloc((p->count != 0u ? p->count : 1u) * sizeof *then);
+	uint8_t        *ours = malloc(REGION);
+	uint8_t        *theirs = malloc(REGION);
+	size_t          now_count = 0u;
+	size_t          i = 0u, j = 0u;
+	uint64_t        longest = 0u;
+	char            path[4300];
+	DIR            *runs = NULL;
+	struct dirent  *entry;
+	hull_media_map *map = NULL;
+	uint64_t        bytes;
+	int             status = -1;
+
+	if (affected == NULL || now == NULL || then == NULL || ours == NULL || theirs == NULL) {
+		fail(detail, cap, "out of memory", NULL);
+		goto done;
+	}
+	for (uint64_t r = 0u; r < count; r++)
+		if (written(p, r * REGION, w->bytes - r * REGION < REGION ? w->bytes - r * REGION : REGION))
+			mark(affected, r * REGION, 1u);
+	/* The lines either side has and the other does not. */
+	for (size_t k = 0u; k < w->count; k++) {
+		if (w->files[k].size > longest)
+			longest = w->files[k].size;
+		if (w->files[k].size != 0u)
+			now[now_count++] = &w->files[k];
+	}
+	for (size_t k = 0u; k < p->count; k++)
+		then[k] = &p->lines[k];
+	qsort(now, now_count, sizeof *now, by_line);
+	qsort(then, p->count, sizeof *then, by_line);
+	while (i < now_count || j < p->count) {
+		int c = i == now_count ? 1 : j == p->count ? -1 : by_line(&now[i], &then[j]);
+
+		if (c == 0) {
+			i++;
+			j++;
+		} else if (c < 0) {
+			mark(affected, now[i]->sector * w->unit, now[i]->size);
+			i++;
+		} else {
+			mark(affected, then[j]->sector * p->unit, then[j]->size);
+			j++;
+		}
+	}
+	/* The prior's runs, each its region's; one crossing into another
+	 * region, which this file never writes, has both redone. */
+	snprintf(path, sizeof path, "%s/quirks/sectors", p->dir);
+	if ((runs = opendir(path)) == NULL && errno != ENOENT) {
+		fail(detail, cap, path, strerror(errno));
+		goto done;
+	}
+	for (int pass = 0; runs != NULL && pass < 2; pass++) {
+		rewinddir(runs);
+		while ((entry = readdir(runs)) != NULL) {
+			uint64_t    sector;
+			int         used = 0;
+			char        from[4700];
+			char        to[4700];
+			struct stat st;
+			uint64_t    at;
+
+			if (entry->d_name[0] == '.')
+				continue;
+			snprintf(from, sizeof from, "%s/%s", path, entry->d_name);
+			if (sscanf(entry->d_name, "0x%" SCNx64 ".raw%n", &sector, &used) != 1 ||
+			    entry->d_name[used] != '\0' || lstat(from, &st) != 0 || !S_ISREG(st.st_mode)) {
+				fail(detail, cap, "a file in quirks/sectors is no run of this disc", entry->d_name);
+				goto done;
+			}
+			at = sector * p->unit;
+			if (pass == 0) {
+				if (st.st_size != 0 && at / REGION != (at + (uint64_t)st.st_size - 1u) / REGION)
+					mark(affected, at, (uint64_t)st.st_size);
+				continue;
+			}
+			if (at >= w->bytes || is_marked(affected, at / REGION))
+				continue;
+			snprintf(to, sizeof to, "%s/quirks/sectors/%s", dir, entry->d_name);
+			if (link(from, to) != 0) {
+				fail(detail, cap, to, strerror(errno));
+				goto done;
+			}
+			report->patch_bytes += (uint64_t)st.st_size;
+		}
+	}
+	for (uint64_t r = 0u; r < count; r++) {
+		uint64_t at = r * REGION;
+		size_t   n = w->bytes - at < REGION ? (size_t)(w->bytes - at) : REGION;
+
+		if (is_marked(affected, r) &&
+		    region_quirks(w, dir, at, n, longest, ours, theirs, report) != 0) {
+			fail(detail, cap, "a region's quirks cannot be written", strerror(errno));
+			goto done;
+		}
+	}
+	/* The proof, region by region. */
+	if ((map = hull_media_map_open(dir, &bytes, detail, cap)) == NULL)
+		goto done;
+	for (uint64_t r = 0u; r < count; r++) {
+		uint64_t at = r * REGION;
+		size_t   n = w->bytes - at < REGION ? (size_t)(w->bytes - at) : REGION;
+
+		if (!is_marked(affected, r))
+			continue;
+		if (hull_media_map_read(map, at, ours, n) != 0 || image_read(w, theirs, n, at) != 0) {
+			fail(detail, cap, "a region cannot be read back", strerror(errno));
+			goto done;
+		}
+		if (memcmp(ours, theirs, n) != 0) {
+			snprintf(detail, cap, "the taking does not give the disk at 0x%" PRIX64, at);
+			goto done;
+		}
+	}
+	status = 0;
+done:
+	hull_media_map_close(map);
+	if (runs != NULL)
+		closedir(runs);
+	free(affected);
+	free(now);
+	free(then);
+	free(ours);
+	free(theirs);
+	return status;
+}
+
 static pthread_mutex_t media_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 
 int hull_media_write(const char *dir, int fd, char *detail, size_t cap)
@@ -3157,8 +3975,17 @@ int hull_media_export(const char *dir, const char *out, char *detail, size_t cap
 int hull_media_import_from(const hull_media_reader *reader, uint64_t bytes, int sparse,
                            const char *dir, hull_media_report *report, char *detail, size_t cap)
 {
+	return hull_media_take(reader, bytes, sparse, NULL, NULL, dir, report, detail, cap);
+}
+
+int hull_media_take(const hull_media_reader *reader, uint64_t bytes, int sparse, const char *from,
+                    const hull_media_changes *changes, const char *dir, hull_media_report *report,
+                    char *detail, size_t cap)
+{
 	walk *w;
 	int   status;
+	prior had;
+	int   incremental;
 
 	memset(report, 0, sizeof *report);
 	pthread_mutex_lock(&media_lock);
@@ -3172,6 +3999,9 @@ int hull_media_import_from(const hull_media_reader *reader, uint64_t bytes, int 
 	w->devices = -1;
 	w->bytes = bytes;
 	w->sparse = sparse;
+	incremental = from != NULL && changes != NULL && prior_open(from, bytes, changes, &had) == 0;
+	if (incremental)
+		w->prior = &had;
 	if (mkdir(dir, 0755) != 0) {
 		status = fail(detail, cap, dir, strerror(errno));
 	} else {
@@ -3180,6 +4010,8 @@ int hull_media_import_from(const hull_media_reader *reader, uint64_t bytes, int 
 		if (status != 0)
 			nftw(dir, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
 	}
+	if (incremental)
+		prior_free(&had);
 	for (size_t i = 0u; i < w->count; i++)
 		free(w->files[i].path);
 	free(w->files);
