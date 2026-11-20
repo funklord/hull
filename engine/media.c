@@ -3311,8 +3311,14 @@ hull_media_map *hull_media_map_open(const char *dir, uint64_t *bytes, char *deta
 		char        file[8800];
 		struct stat st;
 
-		if (layout_line(line, map->bytes, map->unit, &piece) != 0)
-			break;
+		if (layout_line(line, map->bytes, map->unit, &piece) != 0) {
+			/* Refused here, not by the loop's end: a last line with no
+			 * newline leaves the file at its end, and the map served the
+			 * disc without the line that place_files() refuses. */
+			fclose(layout);
+			fail(detail, cap, "a line of layout.conf is not a file on this disc", line);
+			goto fail;
+		}
 		sector = piece.sector;
 		size = piece.size;
 		offset = piece.offset;
@@ -3354,8 +3360,9 @@ hull_media_map *hull_media_map_open(const char *dir, uint64_t *bytes, char *deta
 			    entry->d_name[used] != '\0' || sector > map->bytes / map->unit ||
 			    lstat(file, &st) != 0 || !S_ISREG(st.st_mode) ||
 			    sector * map->unit + (uint64_t)st.st_size > map->bytes) {
-				closedir(runs);
+				/* Said before the directory closes: the name is its. */
 				fail(detail, cap, "a file in quirks/sectors is no run of this disc", entry->d_name);
+				closedir(runs);
 				goto fail;
 			}
 			if (st.st_size != 0 &&

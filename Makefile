@@ -1145,6 +1145,10 @@ $(FUZZ_DIR)/media_fuzz: test/fuzz/media_fuzz.c engine/media.c engine/media.h eng
 	@mkdir -p $(dir $@)
 	$(FUZZ_CC) $(FUZZ_FLAGS) -Iengine -o $@ $(filter %.c,$^)
 
+$(FUZZ_DIR)/collection_fuzz: test/fuzz/collection_fuzz.c engine/media.c engine/media.h engine/sha256.c
+	@mkdir -p $(dir $@)
+	$(FUZZ_CC) $(FUZZ_FLAGS) -Iengine -o $@ $(filter %.c,$^)
+
 $(FUZZ_DIR)/pack_fuzz: test/fuzz/pack_fuzz.c store/pack.c $(wildcard store/*.h) \
                        $(BUILD_DIR)/store/store.o $(BUILD_DIR)/engine/sha256.o \
                        $(BUILD_DIR)/engine/verity.o $(BUILD_DIR)/engine/tree.o $(SEXPR_OBJS)
@@ -1160,7 +1164,8 @@ $(FUZZ_DIR)/spec_fuzz: test/fuzz/spec_fuzz.c spec/spec.c spec/spec.h sexpr/sexpr
 	@mkdir -p $(dir $@)
 	$(FUZZ_CC) $(FUZZ_FLAGS) $(CPPFLAGS) -o $@ $(filter %.c,$^)
 
-check-fuzz: $(FUZZ_DIR)/json_fuzz $(FUZZ_DIR)/unpack_fuzz $(FUZZ_DIR)/media_fuzz $(FUZZ_DIR)/import_fuzz \
+check-fuzz: $(FUZZ_DIR)/json_fuzz $(FUZZ_DIR)/unpack_fuzz $(FUZZ_DIR)/media_fuzz $(FUZZ_DIR)/collection_fuzz \
+            $(FUZZ_DIR)/import_fuzz \
             $(FUZZ_DIR)/spec_fuzz $(FUZZ_DIR)/pack_fuzz $(HULL)
 	$(PYTHON) test/fuzz/seeds.py '$(FUZZ_DIR)/corpus' '$(HULL)'
 	mkdir -p '$(FUZZ_DIR)/work' '$(FUZZ_DIR)/found'
@@ -1170,6 +1175,8 @@ check-fuzz: $(FUZZ_DIR)/json_fuzz $(FUZZ_DIR)/unpack_fuzz $(FUZZ_DIR)/media_fuzz
 		-max_total_time=$(FUZZ_TIME) -max_len=8192 -timeout=10 ../corpus/tar
 	cd '$(FUZZ_DIR)/found' && FUZZ_DIR='$(abspath $(FUZZ_DIR))' ../media_fuzz \
 		-max_total_time=$(FUZZ_TIME) -max_len=65536 -timeout=10 ../corpus/disc
+	cd '$(FUZZ_DIR)/found' && FUZZ_DIR='$(abspath $(FUZZ_DIR))' ../collection_fuzz \
+		-max_total_time=$(FUZZ_TIME) -max_len=65536 -timeout=10 ../corpus/collection
 	cd '$(FUZZ_DIR)/found' && FUZZ_DIR='$(abspath $(FUZZ_DIR))' ../import_fuzz \
 		-max_total_time=$(FUZZ_TIME) -max_len=8192 -timeout=10 ../corpus/import
 	cd '$(FUZZ_DIR)/found' && ../spec_fuzz -max_total_time=$(FUZZ_TIME) -max_len=8192 -timeout=10 \

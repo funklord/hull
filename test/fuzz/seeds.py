@@ -227,5 +227,41 @@ if len(sys.argv) > 2:
 		                      stdout=subprocess.DEVNULL)
 		with open(whole, 'rb') as f, open(os.path.join(packs, 'cut'), 'wb') as cut:
 			cut.write(f.read()[:60])
+		# Collections, as `hull media import` makes them of the disc and
+		# disk seeds, laid out as collection_fuzz.c reads one: media.conf,
+		# layout.conf, regions.conf, the file, then each quirk run, the
+		# file's and each run's name its first line, the parts apart at a
+		# line of "--". It holds one file, so a collection of one file
+		# under files/ is a whole seed.
+		cols = os.path.join(out, 'collection')
+		os.makedirs(cols, exist_ok=True)
+		for seed in sorted(os.listdir(disc)):
+			source = os.path.join(disc, seed)
+			image = os.path.join(work, seed + '.img')
+			with open(source, 'rb') as f:
+				body = f.read()
+			with open(image, 'wb') as f:
+				if body[:1] not in (b'\xeb', b'\xe2'):
+					f.write(bytes(16 * 2048))
+				f.write(body)
+			col = os.path.join(work, seed + '.col')
+			if subprocess.call([sys.argv[2], 'media', 'import', image, col], env=env, timeout=60,
+			                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
+				continue
+			def read(name):
+				path = os.path.join(col, name)
+				return open(path, 'rb').read() if os.path.exists(path) else b''
+			lines = read('layout.conf').decode().splitlines()
+			paths = sorted({line.split(' ')[-1] for line in lines})
+			content = b'F\n'
+			if len(paths) == 1 and '/' not in paths[0]:
+				content = paths[0].encode() + b'\n' + read(os.path.join('files', paths[0]))
+			parts = [read('media.conf'), ''.join(l + '\n' for l in lines).encode(),
+			         read('regions.conf'), content]
+			runs = os.path.join(col, 'quirks', 'sectors')
+			for run in sorted(os.listdir(runs)) if os.path.isdir(runs) else []:
+				parts.append(run.encode() + b'\n' + read(os.path.join('quirks', 'sectors', run)))
+			with open(os.path.join(cols, seed), 'wb') as f:
+				f.write(b'\n--\n'.join(parts))
 	finally:
 		shutil.rmtree(work)

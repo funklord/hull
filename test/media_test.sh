@@ -89,6 +89,13 @@ printf '20 1 ../media.conf\n' >> "$dir/disc/layout.conf"
 media verify "$dir/disc"
 check 'a path out of files/ is refused' "$got" 1 "$out"
 cp "$dir/layout.kept" "$dir/disc/layout.conf"
+# Nor may its last line be no file at all for want of a newline: the map
+# stopped at the file's end there and served the disc without it, which
+# the reassembly refuses (found by collection_fuzz.c).
+printf '3 512 @//' >> "$dir/disc/layout.conf"
+media verify "$dir/disc"
+check 'a last line of layout.conf that is no file is refused' "$got" 1 "$out"
+cp "$dir/layout.kept" "$dir/disc/layout.conf"
 
 # What is no ISO is the honest blob: exact, and all of it patch.
 head -c 5000 /dev/urandom > "$dir/blob.bin"
