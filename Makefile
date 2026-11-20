@@ -1223,11 +1223,28 @@ qemu-ppc:
 # pinned commit into the user's cache, where the qemu engine looks first,
 # with Debian's libgpiod v2 unpacked beside them for the GPIO one. Versions
 # chosen for the rustc installed, its lockfile wanting a newer one. Fetches
-# from the network.
+# from the network. vhost-device-patch/'s patches are applied to the
+# checkout first: hull's change to rust-vmm's source, kept as patches to
+# offer upstream whole rather than a fork.
 VHOST_DEVICE_REV  = 21f1333fc45f4d6b202c32d1198a266262d30d4f
+VHOST_DEVICE_SRC  = $(BUILD_DIR)/vhost-device/src
 VHOST_DEVICE_ROOT = $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/hull/vhost-device-$(shell echo $(VHOST_DEVICE_REV) | cut -c1-7)
 vhost-device:
 	@mkdir -p '$(BUILD_DIR)/vhost-device' '$(VHOST_DEVICE_ROOT)/gpiod/debs'
+	test -d '$(VHOST_DEVICE_SRC)/.git' || git clone -q https://github.com/rust-vmm/vhost-device.git \
+		'$(VHOST_DEVICE_SRC)'
+	git -C '$(VHOST_DEVICE_SRC)' checkout -q $(VHOST_DEVICE_REV)
+	@# Each patch applied, or found applied already; one that applies
+	@# neither way fails here, naming it, not in the build after.
+	@for patch in vhost-device-patch/*.patch; do \
+		if git -C '$(VHOST_DEVICE_SRC)' apply --check "$(abspath .)/$$patch" 2> /dev/null; then \
+			git -C '$(VHOST_DEVICE_SRC)' apply "$(abspath .)/$$patch" && echo "applied $$patch"; \
+		elif git -C '$(VHOST_DEVICE_SRC)' apply --reverse --check "$(abspath .)/$$patch" 2> /dev/null; then \
+			echo "already applied: $$patch"; \
+		else \
+			echo "$$patch no longer applies to rust-vmm/vhost-device $(VHOST_DEVICE_REV)" >&2; exit 1; \
+		fi; \
+	done
 	cd '$(VHOST_DEVICE_ROOT)/gpiod/debs' && apt-get download libgpiod-dev libgpiod3
 	for deb in '$(VHOST_DEVICE_ROOT)'/gpiod/debs/*.deb; do dpkg-deb -x "$$deb" '$(VHOST_DEVICE_ROOT)/gpiod'; done
 	PKG_CONFIG_PATH='$(VHOST_DEVICE_ROOT)/gpiod/usr/lib/x86_64-linux-gnu/pkgconfig' \
@@ -1236,8 +1253,14 @@ vhost-device:
 	CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback \
 	CARGO_TARGET_DIR='$(abspath $(BUILD_DIR))/vhost-device/target' \
 	CARGO_HOME='$(abspath $(BUILD_DIR))/vhost-device/cargo' \
-		cargo install --git https://github.com/rust-vmm/vhost-device.git --rev $(VHOST_DEVICE_REV) \
-		--root '$(VHOST_DEVICE_ROOT)' vhost-device-gpio vhost-device-i2c
+		cargo install --path '$(VHOST_DEVICE_SRC)/vhost-device-gpio' --root '$(VHOST_DEVICE_ROOT)'
+	PKG_CONFIG_PATH='$(VHOST_DEVICE_ROOT)/gpiod/usr/lib/x86_64-linux-gnu/pkgconfig' \
+	PKG_CONFIG_SYSROOT_DIR='$(VHOST_DEVICE_ROOT)/gpiod' \
+	RUSTFLAGS='-C link-args=-Wl,-rpath,$(VHOST_DEVICE_ROOT)/gpiod/usr/lib/x86_64-linux-gnu' \
+	CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback \
+	CARGO_TARGET_DIR='$(abspath $(BUILD_DIR))/vhost-device/target' \
+	CARGO_HOME='$(abspath $(BUILD_DIR))/vhost-device/cargo' \
+		cargo install --path '$(VHOST_DEVICE_SRC)/vhost-device-i2c' --root '$(VHOST_DEVICE_ROOT)'
 
 # A GPIO chip and an I2C bus of a host given to a vm, the host a vm of
 # hull's own whose root makes them of gpio-sim and i2c-stub, the vm given

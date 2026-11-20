@@ -81,7 +81,7 @@ for f in /sys/bus/pci/devices/*; do
 	[ "\$(cat \$f/vendor)" = 0x1af4 ] || continue
 	case \$(cat \$f/device) in 0x1069) echo gpio=pci ;; 0x1062) echo i2c=pci ;; esac
 done
-ls /sys/bus/virtio/drivers/gpio-virtio 2> /dev/null | grep -q virtio && echo gpio=bound
+ls /sys/bus/virtio/drivers/gpio_virtio /sys/bus/virtio/drivers/gpio-virtio 2> /dev/null | grep -q virtio && echo gpio=bound
 ls /sys/bus/virtio/drivers/i2c_virtio 2> /dev/null | grep -q virtio && echo i2c=bound
 ls /dev/gpiochip* > /dev/null 2>&1 && echo gpiochip=here
 for a in /sys/bus/i2c/devices/i2c-*; do

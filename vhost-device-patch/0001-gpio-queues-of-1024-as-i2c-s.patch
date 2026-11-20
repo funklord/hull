@@ -1,0 +1,22 @@
+From: hull
+Subject: [PATCH] vhost-device-gpio: take queues of up to 1024, as i2c does
+
+qemu 10.0's vhost-user-gpio-pci offers its guest virtqueues of 1024 and
+has no property to make them smaller, and Linux's virtio-gpio driver
+takes the size offered; vhost-device-gpio refused anything over 256,
+"vring 0 requested queue size 1024 out of range (1-256)", its start
+failed, and qemu's teardown of the half-started device then aborted on
+`i != mr->ioeventfd_nb' in memory_region_del_eventfd. vhost-device-i2c
+already takes 1024.
+
+--- a/vhost-device-gpio/src/vhu_gpio.rs
++++ b/vhost-device-gpio/src/vhu_gpio.rs
+@@ -44,7 +44,7 @@ const VIRTIO_GPIO_STATUS_ERR: u8 = 0x1;
+ /// Virtio GPIO Feature bits
+ const VIRTIO_GPIO_F_IRQ: u16 = 0;
+ 
+-const QUEUE_SIZE: usize = 256;
++const QUEUE_SIZE: usize = 1024;
+ const NUM_QUEUES: usize = 2;
+ 
+ /// Queues
