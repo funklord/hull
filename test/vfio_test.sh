@@ -54,6 +54,21 @@ esac
 mkdir -p "$tree/dev" "$tree/proc"
 cp "$probe" "$tree/probe"
 
+# The nested vm's: the NIC seen, and what it sits under -- a PCIe root
+# port, as a card in a real slot does, not the root bus, where a driver
+# reading its link from the bridge above it oopses (ib_qib's did).
+cat > "$root/nested.sh" <<'NESTED'
+for d in /sys/bus/pci/devices/*; do
+	grep -q '^0x0200' "$d/class" || continue
+	echo nic=seen
+	up=$(basename "$(dirname "$(readlink -f "$d")")")
+	case $up in
+	pci*) echo "nic.under=root-bus" ;;
+	*) echo "nic.under=$(cat "/sys/bus/pci/devices/$up/class")" ;;
+	esac
+done
+NESTED
+
 # The guest's script, as its root: vfio-pci loaded, the NIC passt's
 # eth0 is unbound from virtio and bound to vfio-pci, its group's node the
 # user's; KVM and vsock open to the user for the nested vm.
@@ -70,7 +85,7 @@ chown $uid:$gid /dev/vfio/\$group
 mkdir -p /tmp/r1 /tmp/r2 /tmp/r3 && chown $uid:$gid /tmp/r1 /tmp/r2 /tmp/r3 && chmod 700 /tmp/r1 /tmp/r2 /tmp/r3
 as() { setpriv --reuid $uid --regid $gid --init-groups env HOME=/tmp HULL_CORE_IDLE=1 "\$@"; }
 printf '(machine (source "dir:$tree") (backend chroot) (network none) (devices (pci "%s")) (command "/probe" "vfio" "/dev/vfio/%s" "%s"))\n' "\$pci" "\$group" "\$pci" > /tmp/c.conf
-printf '(machine (source "dir:/") (backend vm) (mutable overlay) (network none) (memory "256M") (devices (pci "%s")) (command "/bin/sh" "-c" "grep -l 0x0200 /sys/bus/pci/devices/*/class > /dev/null && echo nic=seen"))\n' "\$pci" > /tmp/v.conf
+printf '(machine (source "dir:/") (backend vm) (mutable overlay) (network none) (memory "256M") (devices (pci "%s")) (command "/bin/sh" "$root/nested.sh"))\n' "\$pci" > /tmp/v.conf
 chmod 644 /tmp/c.conf /tmp/v.conf
 echo "== chroot"
 as env XDG_RUNTIME_DIR=/tmp/r1 timeout -k 2 60 $hull run -f /tmp/c.conf 2>&1
@@ -94,6 +109,19 @@ for id in \$(as env XDG_RUNTIME_DIR=/tmp/r4 $hull ps | awk '\$5 == "running" { p
 done
 wait
 cat /tmp/p.out
+# On q35 the card goes behind a root port of its own.
+printf '(machine (backend pc) (source "image:/tmp/blank.img") (memory "256M") (devices (pci "%s")) (tuning (pc (machine q35))))\n' "\$pci" > /tmp/q.conf
+chmod 644 /tmp/q.conf
+(ulimit -l unlimited; as env XDG_RUNTIME_DIR=/tmp/r4 timeout -k 2 60 $hull run -f /tmp/q.conf > /tmp/q.out 2>&1) &
+sleep 8
+for p in \$(pgrep -x qemu-system-x86); do
+	tr '\\0' ' ' < /proc/\$p/cmdline | grep -q "pcie-root-port,id=hullport0.* vfio-pci,host=\$pci,bus=hullport0" && echo pc=q35-port
+done
+for id in \$(as env XDG_RUNTIME_DIR=/tmp/r4 $hull ps | awk '\$5 == "running" { print \$1 }'); do
+	as env XDG_RUNTIME_DIR=/tmp/r4 timeout 30 $hull stop "\$id" > /dev/null 2>&1
+done
+wait
+cat /tmp/q.out
 echo "status=done"
 echo "== kept"
 mkdir -p /tmp/r5 && chown $uid:$gid /tmp/r5 && chmod 700 /tmp/r5
@@ -138,11 +166,18 @@ nested=$(printf '%s\n' "$out" | sed -n '/^== nested/,/^status=/p')
 printf '%s\n' "$nested" | grep -qx 'nic=seen' &&
 	printf '%s\n' "$nested" | grep -qx 'status=0' ||
 	fail "a nested vm was not given the device" "$out"
+# Behind a PCIe root port (class 0x060400, a PCI bridge), not on the root bus.
+cases=$((cases + 1))
+printf '%s\n' "$nested" | grep -qx 'nic.under=0x060400' ||
+	fail "a nested vm's device was not behind a root port of its own" "$out"
 # A pc machine, Windows' kind, given it: its qemu holding the group.
 cases=$((cases + 1))
 pc=$(printf '%s\n' "$out" | sed -n '/^== pc/,/^status=/p')
 printf '%s\n' "$pc" | grep -qx 'pc=has-card' ||
 	fail "a pc machine was not given the device" "$out"
+cases=$((cases + 1))
+printf '%s\n' "$pc" | grep -qx 'pc=q35-port' ||
+	fail "a q35 pc machine's card was not behind a root port of its own" "$out"
 # A kept vm holding it, its core killed and the machine taken back by the
 # next: a second machine asking for it is refused by hull, the claim
 # carried over, and not left to qemu's own error.

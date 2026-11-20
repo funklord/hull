@@ -2694,7 +2694,20 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 			argv[n++] = "-device";
 			argv[n++] = device_device[i];
 		} else if (d->kind == HULL_DEVICE_PCI) {
-			snprintf(device_device[i], sizeof device_device[i], "vfio-pci,host=%s", d->host.port);
+			/* Behind a PCIe root port of its own, as a card in a real
+			 * slot is: a driver reading its link from the bridge above
+			 * it oopses on the root bus, where there is none (section
+			 * 5.0). q35 and virt have PCIe; pseries and s390x do not. */
+			int port = !m->micro && !m->s390x && !m->ppc64le;
+
+			if (port) {
+				snprintf(device_chardev[i], sizeof device_chardev[i],
+				         "pcie-root-port,id=hullport%u,chassis=%u,slot=%u", i, i + 1u, i + 1u);
+				argv[n++] = "-device";
+				argv[n++] = device_chardev[i];
+			}
+			snprintf(device_device[i], sizeof device_device[i],
+			         port ? "vfio-pci,host=%s,bus=hullport%u" : "vfio-pci,host=%s", d->host.port, i);
 			argv[n++] = "-device";
 			argv[n++] = device_device[i];
 		} else if (d->kind == HULL_DEVICE_PARALLEL) {

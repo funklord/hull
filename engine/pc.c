@@ -75,7 +75,7 @@
 #include "86box.h"
 
 #define PC_MAX_MEDIA 6u    /* four on IDE, two floppy drives */
-#define PC_MAX_ARGS  140u  /* a USB stick takes four, an IDE medium two */
+#define PC_MAX_ARGS  148u  /* a USB stick takes four, an IDE medium two, a card four */
 #define PC_MAX_CARDS 4u    /* (devices (pci ...)), within PC_MAX_ARGS */
 #define SECURE_CODE  "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"
 #define SECURE_VARS  "/usr/share/OVMF/OVMF_VARS_4M.ms.fd"
@@ -1417,10 +1417,23 @@ static void exec_pc(const hull_machine *m)
 	}
 	argv[n++] = "-vga";
 	argv[n++] = m->vga != NULL ? m->vga : "std";
+	/* A card on q35 goes behind a PCIe root port of its own, as a card in
+	 * a real slot is: a driver reading its link from the bridge above it,
+	 * ib_qib's among them, oopsed on the root bus, where there is none
+	 * (section 5.0). i440fx has no PCIe to put one on. */
 	for (unsigned i = 0u; i < m->device_count; i++) {
-		static __thread char card[PC_MAX_CARDS][96];
+		static __thread char port[PC_MAX_CARDS][64];
+		static __thread char card[PC_MAX_CARDS][128];
+		int q35 = m->machine_type != NULL && strstr(m->machine_type, "q35") != NULL;
 
-		snprintf(card[i], sizeof card[i], "vfio-pci,host=%s", m->device[i].host.port);
+		if (q35) {
+			snprintf(port[i], sizeof port[i], "pcie-root-port,id=hullport%u,chassis=%u,slot=%u", i,
+			         i + 1u, i + 1u);
+			argv[n++] = "-device";
+			argv[n++] = port[i];
+		}
+		snprintf(card[i], sizeof card[i], q35 ? "vfio-pci,host=%s,bus=hullport%u" : "vfio-pci,host=%s",
+		         m->device[i].host.port, i);
 		argv[n++] = "-device";
 		argv[n++] = card[i];
 	}
