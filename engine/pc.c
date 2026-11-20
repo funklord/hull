@@ -94,6 +94,10 @@ typedef struct medium {
 	int   exact;         /* `hull media import`'s, or a tree alone */
 	int   write_back;    /* (mutable direct): taken apart into the collection again */
 	int   nbd;           /* a disk collection served by NBD, qemu's end; 0 for none */
+	hull_media_map  *map;      /* a served collection's, kept where its writes are */
+	hull_nbd_writes  writes;   /* under (mutable direct): the blocks the guest wrote */
+	pthread_t        server;   /* and the thread serving it, joined before they are read */
+	int              serving;  /* that thread is running, to be joined */
 	char  format[8];     /* qemu's word for an image's container */
 } medium;
 
@@ -299,6 +303,10 @@ static void release(hull_machine *m)
 			close(m->media[i].fd);
 		if (m->media[i].nbd > 0)
 			close(m->media[i].nbd);
+		if (m->media[i].serving)
+			pthread_join(m->media[i].server, NULL);
+		free(m->media[i].writes.written);
+		hull_media_map_close(m->media[i].map);
 	}
 	for (unsigned i = 0u; i < m->segment_count; i++) {
 		free(m->segment[i]);
@@ -769,6 +777,44 @@ static void write_back(hull_machine *m, medium *d)
 	char              said[4800];
 	char              detail[4400];
 
+	/* A served disk: its server joined, qemu gone; nothing written is
+	 * nothing to take apart, and otherwise the overlay is made the whole
+	 * disk -- each block the guest did not write filled from the files,
+	 * where it is not zero -- and taken apart as an image would be. */
+	if (d->serving) {
+		uint8_t  block[HULL_NBD_BLOCK];
+		uint64_t bytes = 0u;
+		struct stat st;
+
+		close(d->nbd);
+		d->nbd = 0;
+		pthread_join(d->server, NULL);
+		d->serving = 0;
+		if (d->writes.count == 0u) {
+			snprintf(said, sizeof said, "hull: %s: nothing written, nothing to write back\n",
+			         d->collection);
+			host->on_data(m->core, NULL, 2, (const uint8_t *)said, strlen(said));
+			return;
+		}
+		if (fstat(d->fd, &st) == 0)
+			bytes = (uint64_t)st.st_size;
+		for (uint64_t at = 0u; at < bytes; at += HULL_NBD_BLOCK) {
+			uint64_t index = at / HULL_NBD_BLOCK;
+			size_t   n = bytes - at < HULL_NBD_BLOCK ? (size_t)(bytes - at) : HULL_NBD_BLOCK;
+			static const uint8_t zero[HULL_NBD_BLOCK];
+
+			if ((d->writes.written[index / 8u] >> (index % 8u)) & 1u)
+				continue;
+			if (hull_media_map_read(d->map, at, block, n) != 0 ||
+			    (memcmp(block, zero, n) != 0 &&
+			     pwrite(d->fd, block, n, (off_t)at) != (ssize_t)n)) {
+				snprintf(said, sizeof said, "hull: %s was not written back: its files could not "
+				         "be read with the writes; they are lost\n", d->collection);
+				host->on_data(m->core, NULL, 2, (const uint8_t *)said, strlen(said));
+				return;
+			}
+		}
+	}
 	snprintf(image, sizeof image, "/proc/self/fd/%d", d->fd);
 	snprintf(fresh, sizeof fresh, "%s.hull-new", d->collection);
 	if (fdatasync(d->fd) != 0 ||
@@ -799,8 +845,13 @@ static void write_back(hull_machine *m, medium *d)
 	/* The old collection, now at the new one's name, goes. */
 	nftw(fresh, open_up, 16, FTW_PHYS);
 	nftw(fresh, take_away, 16, FTW_PHYS | FTW_DEPTH);
-	snprintf(said, sizeof said, "hull: %s written back: %llu files, %llu bytes not understood\n",
-	         d->collection, report.files, report.patch_bytes);
+	if (d->writes.count != 0u)
+		snprintf(said, sizeof said, "hull: %s written back: %llu blocks written, %llu files, %llu "
+		         "bytes not understood\n", d->collection, (unsigned long long)d->writes.count,
+		         report.files, report.patch_bytes);
+	else
+		snprintf(said, sizeof said, "hull: %s written back: %llu files, %llu bytes not "
+		         "understood\n", d->collection, report.files, report.patch_bytes);
 	host->on_data(m->core, NULL, 2, (const uint8_t *)said, strlen(said));
 }
 
@@ -841,7 +892,7 @@ static int serve_collection(hull_machine *m, medium *d)
 	hull_media_map *map;
 	int             pair[2];
 
-	if (d->type != 'd' || !d->exact || d->write_back)
+	if (d->type != 'd' || !d->exact)
 		return 0;
 	if ((map = hull_media_map_open(d->collection, &bytes, detail, sizeof detail)) == NULL ||
 	    hull_media_map_verify(map, detail, sizeof detail) != 0) {
@@ -849,9 +900,37 @@ static int serve_collection(hull_machine *m, medium *d)
 		snprintf(m->why, sizeof m->why, "a medium's disk cannot be served: %s\n", detail);
 		return -1;
 	}
-	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0 ||
-	    hull_nbd_serve(map, bytes, pair[1]) != 0) {
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) {
 		hull_media_map_close(map);
+		snprintf(m->why, sizeof m->why, "a medium's disk cannot be served: %s\n", strerror(errno));
+		return -1;
+	}
+	/* Under (mutable direct) the guest's writes are kept, block by block,
+	 * in a sparse overlay of the cache's, unnamed, and go back into the
+	 * collection at power-off (write_back); else qemu's snapshot has them
+	 * and the server is read-only. */
+	if (d->write_back) {
+		size_t bits = (size_t)((bytes + HULL_NBD_BLOCK - 1u) / HULL_NBD_BLOCK + 7u) / 8u;
+
+		d->map = map;
+		if ((d->writes.overlay = open(m->cache, O_TMPFILE | O_RDWR | O_CLOEXEC, 0600)) < 0 ||
+		    ftruncate(d->writes.overlay, (off_t)bytes) != 0 ||
+		    (d->writes.written = calloc(1u, bits != 0u ? bits : 1u)) == NULL ||
+		    hull_nbd_serve_writes(map, bytes, pair[1], &d->writes, &d->server) != 0) {
+			snprintf(m->why, sizeof m->why, "a medium's disk cannot be served: %s\n",
+			         strerror(errno));
+			if (d->writes.overlay >= 0)
+				close(d->writes.overlay);
+			close(pair[0]);
+			close(pair[1]);
+			return -1;
+		}
+		d->serving = 1;
+		d->fd = d->writes.overlay;
+	} else if (hull_nbd_serve(map, bytes, pair[1]) != 0) {
+		hull_media_map_close(map);
+		close(pair[0]);
+		close(pair[1]);
 		snprintf(m->why, sizeof m->why, "a medium's disk cannot be served: %s\n", strerror(errno));
 		return -1;
 	}

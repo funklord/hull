@@ -52,10 +52,13 @@
 #define MOST_READ    (32u << 20)  /* qemu asks 32 MiB at most */
 
 typedef struct served {
-	hull_media_map *map;
-	uint64_t        bytes;
-	int             fd;
+	hull_media_map  *map;
+	uint64_t         bytes;
+	int              fd;
+	hull_nbd_writes *writes;  /* NULL: read-only, and the map the thread's */
 } served;
+
+#define CMD_WRITE 1u
 
 static int full_read(int fd, void *to, size_t n)
 {
@@ -135,7 +138,8 @@ static int reply(int fd, uint32_t option, uint32_t type, const uint8_t *data, ui
 /* The handshake to the start of transmission: 0, or -1 to end. */
 static int negotiate(served *s)
 {
-	static const uint16_t flags = FLAG_HAS_FLAGS | FLAG_READ_ONLY | FLAG_SEND_FLUSH;
+	const uint16_t        flags = FLAG_HAS_FLAGS | FLAG_SEND_FLUSH |
+	                              (s->writes == NULL ? FLAG_READ_ONLY : 0u);
 	uint8_t               out[18];
 	uint8_t               in[16];
 	uint8_t               data[MOST_OPTION];
@@ -197,6 +201,56 @@ static int answer(int fd, uint32_t error, const uint8_t handle[8])
 	return full_write(fd, head, sizeof head);
 }
 
+static int is_written(const hull_nbd_writes *w, uint64_t block)
+{
+	return (w->written[block / 8u] >> (block % 8u)) & 1u;
+}
+
+/* [at, at + n) of the disk into `out`: the files' bytes, with every block
+ * the guest has written read from the overlay over them. */
+static int read_merged(served *s, uint64_t at, uint8_t *out, size_t n)
+{
+	if (hull_media_map_read(s->map, at, out, n) != 0)
+		return -1;
+	if (s->writes == NULL || s->writes->count == 0u)
+		return 0;
+	for (uint64_t block = at / HULL_NBD_BLOCK; block * HULL_NBD_BLOCK < at + n; block++) {
+		uint64_t start, end;
+
+		if (!is_written(s->writes, block))
+			continue;
+		start = block * HULL_NBD_BLOCK > at ? block * HULL_NBD_BLOCK : at;
+		end = (block + 1u) * HULL_NBD_BLOCK < at + n ? (block + 1u) * HULL_NBD_BLOCK : at + n;
+		if (pread(s->writes->overlay, out + (start - at), (size_t)(end - start), (off_t)start) !=
+		    (ssize_t)(end - start))
+			return -1;
+	}
+	return 0;
+}
+
+/* `data`, `n` bytes at `at`, into the overlay: each block it touches made
+ * the overlay's first, filled from the files, then the bytes laid over. */
+static int write_overlay(served *s, uint64_t at, const uint8_t *data, size_t n)
+{
+	hull_nbd_writes *w = s->writes;
+	uint8_t          block_bytes[HULL_NBD_BLOCK];
+
+	for (uint64_t block = at / HULL_NBD_BLOCK; block * HULL_NBD_BLOCK < at + n; block++) {
+		uint64_t from = block * HULL_NBD_BLOCK;
+		size_t   length = s->bytes - from < HULL_NBD_BLOCK ? (size_t)(s->bytes - from) :
+		                  HULL_NBD_BLOCK;
+
+		if (is_written(w, block))
+			continue;
+		if (hull_media_map_read(s->map, from, block_bytes, length) != 0 ||
+		    pwrite(w->overlay, block_bytes, length, (off_t)from) != (ssize_t)length)
+			return -1;
+		w->written[block / 8u] |= (uint8_t)(1u << (block % 8u));
+		w->count++;
+	}
+	return pwrite(w->overlay, data, n, (off_t)at) == (ssize_t)n ? 0 : -1;
+}
+
 static void *serve(void *arg)
 {
 	served  *s = arg;
@@ -217,20 +271,33 @@ static void *serve(void *arg)
 					break;
 				continue;
 			}
-			if (type != CMD_READ) {
-				/* A write to a read-only export; whatever else, refused. */
-				if (answer(s->fd, type == 1u ? EPERM : EINVAL, request + 8) != 0)
+			if (length > MOST_READ)
+				break;
+			if (type == CMD_WRITE && s->writes != NULL) {
+				/* The payload is read whatever the answer, to stay in step. */
+				if (full_read(s->fd, buffer, length) != 0)
+					break;
+				if (answer(s->fd, offset > s->bytes || length > s->bytes - offset ? EINVAL :
+				           write_overlay(s, offset, buffer, length) != 0 ? EIO : 0u,
+				           request + 8) != 0)
 					break;
 				continue;
 			}
-			if (length > MOST_READ)
-				break;
+			if (type != CMD_READ) {
+				/* A write to a read-only export; whatever else, refused. A
+				 * write's payload follows its request, and is read off. */
+				if (type == CMD_WRITE && full_read(s->fd, buffer, length) != 0)
+					break;
+				if (answer(s->fd, type == CMD_WRITE ? EPERM : EINVAL, request + 8) != 0)
+					break;
+				continue;
+			}
 			if (offset > s->bytes || length > s->bytes - offset) {
 				if (answer(s->fd, EINVAL, request + 8) != 0)
 					break;
 				continue;
 			}
-			if (hull_media_map_read(s->map, offset, buffer, length) != 0) {
+			if (read_merged(s, offset, buffer, length) != 0) {
 				if (answer(s->fd, EIO, request + 8) != 0)
 					break;
 				continue;
@@ -241,7 +308,8 @@ static void *serve(void *arg)
 	}
 	free(buffer);
 	close(s->fd);
-	hull_media_map_close(s->map);
+	if (s->writes == NULL)
+		hull_media_map_close(s->map);
 	free(s);
 	return NULL;
 }
@@ -255,7 +323,7 @@ int hull_nbd_serve(hull_media_map *map, uint64_t bytes, int fd)
 
 	if (s == NULL)
 		return -1;
-	*s = (served){ map, bytes, fd };
+	*s = (served){ map, bytes, fd, NULL };
 	if (pthread_attr_init(&attr) != 0) {
 		free(s);
 		return -1;
@@ -264,6 +332,21 @@ int hull_nbd_serve(hull_media_map *map, uint64_t bytes, int fd)
 	started = pthread_create(&thread, &attr, serve, s) == 0;
 	pthread_attr_destroy(&attr);
 	if (!started) {
+		free(s);
+		return -1;
+	}
+	return 0;
+}
+
+int hull_nbd_serve_writes(hull_media_map *map, uint64_t bytes, int fd, hull_nbd_writes *writes,
+                          pthread_t *thread)
+{
+	served *s = malloc(sizeof *s);
+
+	if (s == NULL)
+		return -1;
+	*s = (served){ map, bytes, fd, writes };
+	if (pthread_create(thread, NULL, serve, s) != 0) {
 		free(s);
 		return -1;
 	}

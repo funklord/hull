@@ -170,6 +170,9 @@ conf '(source "media:disk") (mutable direct)' \
 run
 status 'a collection written under direct' "$got" 0 "$out"
 says 'and said' "$out" 'cw written back'
+# Served, not copied: the server kept the blocks the guest wrote, one
+# sector's worth here, and only those went back.
+says 'by the blocks it wrote' "$out" 'written back: 1 blocks written'
 run
 says 'its write kept in its files' "$out" 'word: written'
 cases=$((cases + 1))
