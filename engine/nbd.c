@@ -274,6 +274,14 @@ static int write_overlay(served *s, uint64_t at, const uint8_t *data, size_t n)
 #define QUIET_MS   2000   /* the guest paused this long after writing */
 #define LONGEST_S  30     /* or writing this long without a pause */
 
+static uint64_t now_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
+}
+
 static int view_read(void *context, void *out, size_t n, uint64_t at)
 {
 	return read_merged(context, at, out, n);
@@ -351,7 +359,8 @@ static void *serve(void *arg)
 	if (buffer != NULL && negotiate(s) == 0) {
 		uint8_t request[28];
 
-		time_t since = 0;  /* when the first write not yet taken came */
+		time_t   since = 0;    /* when the first write not yet taken came */
+		uint64_t next_ms = 0u; /* no taking before this, by its budget */
 
 		for (;;) {
 			/* Live, with writes not yet taken: wait for the next request
@@ -362,8 +371,16 @@ static void *serve(void *arg)
 
 				if (since == 0)
 					since = time(NULL);
-				if (got == 0 || time(NULL) - since >= LONGEST_S) {
+				/* A taking reads the whole disk: at most a tenth of the
+				 * time is spent so, the next not before nine times the
+				 * last one's length has passed -- a large disk a busy
+				 * guest writes to every few seconds is taken less often,
+				 * its files later, nothing lost. */
+				if ((got == 0 || time(NULL) - since >= LONGEST_S) && now_ms() >= next_ms) {
+					uint64_t started = now_ms();
+
 					take(s);
+					next_ms = now_ms() + 9u * (now_ms() - started);
 					since = 0;
 					if (got == 0)
 						continue;
