@@ -4742,9 +4742,13 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	 * the host's or the fetched one standing in where it did not. (profile
 	 * full) keeps the stand-in, Appendix F's escape hatch for a full
 	 * distribution's kernel: a workload wanting a module outside hull's
-	 * set is a full machine's. */
+	 * set is a full machine's. So is a screen's or a sound card's, as a
+	 * sleeping machine's is: hull's kernel has no DRM, virtio-input or
+	 * sound, and a vm with (display vnc) on it had no output of its own
+	 * (2026-11-20, the first check-qemu with the kernel built since). */
 	if (!m->kernel_hull && !m->kernel_fetched && m->kernel_path == NULL && !m->kernel_image &&
-	    !m->profile_full && !m->sleep && !m->riscv64 && !m->s390x && !m->arm && !m->ppc64le &&
+	    !m->profile_full && !m->sleep && !m->screen && !m->sound && !m->riscv64 && !m->s390x &&
+	    !m->arm && !m->ppc64le &&
 	    agent_path(kbuf, sizeof kbuf, host_arch()) && strrchr(kbuf, '/') != NULL) {
 		snprintf(strrchr(kbuf, '/'), sizeof kbuf - (size_t)(strrchr(kbuf, '/') - kbuf),
 		         "/vmlinuz-hull%s", m->arm64 ? "-arm64" : "");
@@ -6265,7 +6269,8 @@ static const hull_cap_entry entries[] = {
 	  "s390x one s390-ccw-virtio, a ppc64le one pseries", NULL },
 	{ "vm.kernel.bundled",   HULL_SUP_EMULATED,
 	  "hull's own kernel, as (kernel hull), where `make kernel` built it beside hull; else, and "
-	  "under (profile full), the host's own kernel and modules, or for a machine of another "
+	  "under (profile full), with (sleep true), a screen or a sound card, the host's own kernel "
+	  "and modules, or for a machine of another "
 	  "arch Debian's kernel of that arch, `hull kernel fetch --arch ARCH`'s; riscv64, s390x, arm "
 	  "and ppc64le have no kernel of hull's", NULL },
 	{ "vm.kernel.path",      HULL_SUP_NATIVE,
