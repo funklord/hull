@@ -131,8 +131,10 @@ them has:
   code, SYSLINUX or EXTLINUX -- is written to a USB stick or a disk at
   that drive's own size, as the user, and read back; an imported disk
   is described that way too, so its files go onto a drive of another
-  size. `dd` copies an image as it is, and systemd-repart builds
-  partitions but not from a description of an old disk or for a BIOS
+  size. A PC runs from such a collection with no image made, and what
+  its guest writes comes back as files while it runs. `dd` copies an
+  image as it is, and systemd-repart builds partitions but not from a
+  description of an old disk or for a BIOS
   bootloader.
 - **Built for scripts.** A machine's exit status and output are `hull
   run`'s, and a killed `hull run`, `SIGKILL` included, takes its machine
@@ -482,8 +484,9 @@ and installing from a disc then booting the disk is one changed line.
 | | |
 |---|---|
 | Boots | `media:cdrom`, `media:disk`, `media:floppy`, or `image:./old.vmdk` attached as it came |
-| Media | an `image:` file (raw, qcow2, vmdk, vhd, vhdx, vdi), or a `dir:` collection of `hull media import`, reassembled and its hash checked |
-| Writes | thrown away with the machine by default; `(mutable direct)` writes the image |
+| Media | an `image:` file (raw, qcow2, vmdk, vhd, vhdx, vdi), or a `dir:` collection of `hull media import`, its hash checked; a disk's served from its files, no image made |
+| Writes | thrown away with the machine by default; `(mutable direct)` writes the image, or a collection's files: what the guest wrote is taken into them each time it pauses, only the MiB it touched read again |
+| Growth | `(medium (type disk) (source "dir:./c") (size "8G"))` serves a collection larger, for the guest to grow its filesystem into |
 | Disk sets | `hull media change ID floppy next.img` swaps a floppy or CD while it runs; no image takes it out |
 | Keyboard and screen | `hull type ID 'text'`, `hull key ID ctrl-alt-delete` and `hull screenshot ID now.png` drive an installer from a script; `(tuning (pc (boot_key 60)))` presses Enter for a disc's *Press any key* |
 | Output | its first serial port is `hull run`'s output; powering off is exit 0 |
@@ -768,7 +771,8 @@ rest kept as the patch. A virtual machine's qcow2, VMDK, VDI, VHD or VHDX
 disk is taken as the raw disk it holds, and comes back as that raw disk. `hull media verify cd/` checks it against the
 original's hash; `hull media export cd/ game.iso` reassembles it; and DOSBox
 runs the collection as it is, as `(media (medium (type cdrom) (source
-"dir:./cd")))`. An image hull does not understand is still kept exactly, as
+"dir:./cd")))`, and a floppy's the same way, what DOS writes to `A:`
+going back into its files. An image hull does not understand is still kept exactly, as
 one blob.
 
 `hull up` runs a `Vagrantfile` too, reading its declarations and refusing
