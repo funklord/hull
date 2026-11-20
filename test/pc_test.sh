@@ -160,11 +160,23 @@ says 'its writes gone with the machine' "$out" 'word: fresh'
 cases=$((cases + 1))
 "$hull" media verify "$root/c" > /dev/null 2>&1 || fail 'the collection is as it was' ''
 
+# Under (mutable direct) its writes go back into it when the machine
+# powers off: taken apart again, swapped in whole, and verifying as the
+# disk it now is; the next boot reads the word the first one left. On a
+# copy, the original kept for the cases after.
+cp -a "$root/c" "$root/cw"
 conf '(source "media:disk") (mutable direct)' \
-	'(media (medium (type disk) (source "dir:./c")))'
+	'(media (medium (type disk) (source "dir:./cw")))'
 run
-status 'a collection is not written' "$got" 125 "$out"
-says 'and said' "$out" 'collection'
+status 'a collection written under direct' "$got" 0 "$out"
+says 'and said' "$out" 'cw written back'
+run
+says 'its write kept in its files' "$out" 'word: written'
+cases=$((cases + 1))
+"$hull" media verify "$root/cw" > /dev/null 2>&1 || fail 'the collection verifies as the disk it is now' ''
+cases=$((cases + 1))
+[ ! -e "$root/cw.hull-new" ] && [ ! -e "$root/cw.unsaved.img" ] ||
+	fail 'nothing left beside the collection' "$(ls "$root")"
 
 # One file a collection can travel as, tar: or pack:, as a machine's source.
 tar -cf "$root/c.tar" -C "$root/c" .
@@ -177,6 +189,11 @@ conf '(source "media:disk") (media (medium (type disk) (source "pack:./c.hull"))
 run
 status 'a collection as a pack boots' "$got" 0 "$out"
 says 'as the disk it was' "$out" 'word: fresh'
+# A tar: collection is the store's checkout: not written back into.
+conf '(source "media:disk") (mutable direct) (media (medium (type disk) (source "tar:./c.tar")))'
+run
+status 'a tar: collection is not written under direct' "$got" 125 "$out"
+says 'and said' "$out" "the store's"
 
 first=$(find "$root/c/quirks" -type f | head -1)
 cp "$first" "$root/quirk.saved"

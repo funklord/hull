@@ -14,7 +14,8 @@
  * written. A dir: collection is reassembled, on the machine's own thread
  * and not the core's loop, into an unnamed file, whose hash media.c holds
  * to the collection's, its writes going with the fd, so a killed core
- * leaves nothing to sweep.
+ * leaves nothing to sweep; under (mutable direct) a disk's or floppy's
+ * is taken apart into the collection again when the machine powers off.
  *
  * `hull exec -t ID -- console` is the serial bridge: a stream joined to
  * COM1, input written to the port and what the port says copied to it,
@@ -45,6 +46,8 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <ftw.h>
+#include <limits.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -88,6 +91,7 @@ typedef struct medium {
 	int   fd;            /* a collection reassembled, or -1 */
 	char *collection;    /* its directory, until then */
 	int   exact;         /* `hull media import`'s, or a tree alone */
+	int   write_back;    /* (mutable direct): taken apart into the collection again */
 	char  format[8];     /* qemu's word for an image's container */
 } medium;
 
@@ -709,6 +713,93 @@ static void read_format(medium *d)
 	close(fd);
 }
 
+/* Whether `path` is under the user's store, as a tar: or pack:
+ * collection's checkout is. */
+static int in_store(const char *path)
+{
+	const char *data = getenv("XDG_DATA_HOME");
+	const char *home = getenv("HOME");
+	char        root[4200];
+	char        real_root[PATH_MAX];
+	char        real_path[PATH_MAX];
+	size_t      n;
+
+	if (data != NULL && data[0] == '/')
+		snprintf(root, sizeof root, "%s/hull/store", data);
+	else if (home != NULL)
+		snprintf(root, sizeof root, "%s/.local/share/hull/store", home);
+	else
+		return 0;
+	if (realpath(root, real_root) == NULL || realpath(path, real_path) == NULL)
+		return 0;
+	n = strlen(real_root);
+	return strncmp(real_path, real_root, n) == 0 && (real_path[n] == '/' || real_path[n] == '\0');
+}
+
+/* For nftw: a directory made the user's to empty, then all removed. */
+static int open_up(const char *path, const struct stat *st, int kind, struct FTW *at)
+{
+	(void)at;
+	if (kind == FTW_D)
+		chmod(path, (st->st_mode & 07777) | 0700);
+	return 0;
+}
+
+static int take_away(const char *path, const struct stat *st, int kind, struct FTW *at)
+{
+	(void)st;
+	(void)at;
+	return (kind == FTW_DP ? rmdir(path) : unlink(path)) == 0 ? 0 : -1;
+}
+
+/* The disk's image as the machine left it taken apart into its collection
+ * again (`hull media import`), the new collection swapped in whole and the
+ * old removed, so a reader sees one or the other; where the import fails,
+ * the image is kept beside the collection as COLLECTION.unsaved.img, the
+ * writes not lost. What it did, said on the machine's stderr. */
+static void write_back(hull_machine *m, medium *d)
+{
+	hull_media_report report = { 0 };
+	char              image[64];
+	char              fresh[4300];
+	char              said[4800];
+	char              detail[4400];
+
+	snprintf(image, sizeof image, "/proc/self/fd/%d", d->fd);
+	snprintf(fresh, sizeof fresh, "%s.hull-new", d->collection);
+	if (fdatasync(d->fd) != 0 ||
+	    hull_media_import(image, fresh, &report, detail, sizeof detail) != 0 ||
+	    renameat2(AT_FDCWD, fresh, AT_FDCWD, d->collection, RENAME_EXCHANGE) != 0) {
+		char  unsaved[4300];
+		int   out;
+		off_t at = 0;
+		struct stat st;
+
+		if (detail[0] == '\0')
+			snprintf(detail, sizeof detail, "%s", strerror(errno));
+		snprintf(unsaved, sizeof unsaved, "%s.unsaved.img", d->collection);
+		out = open(unsaved, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+		if (out >= 0 && fstat(d->fd, &st) == 0) {
+			while (at < st.st_size && copy_file_range(d->fd, &at, out, NULL,
+			                                          (size_t)(st.st_size - at), 0) > 0)
+				;
+		}
+		snprintf(said, sizeof said, "hull: %s was not written back (%s): %s\n", d->collection,
+		         detail, out >= 0 && at == st.st_size ? "its writes are in the image beside it, "
+		         ".unsaved.img" : "and its writes are lost");
+		if (out >= 0)
+			close(out);
+		host->on_data(m->core, NULL, 2, (const uint8_t *)said, strlen(said));
+		return;
+	}
+	/* The old collection, now at the new one's name, goes. */
+	nftw(fresh, open_up, 16, FTW_PHYS);
+	nftw(fresh, take_away, 16, FTW_PHYS | FTW_DEPTH);
+	snprintf(said, sizeof said, "hull: %s written back: %llu files, %llu bytes not understood\n",
+	         d->collection, report.files, report.patch_bytes);
+	host->on_data(m->core, NULL, 2, (const uint8_t *)said, strlen(said));
+}
+
 /* A collection's medium checked, to be made as the machine starts: NULL,
  * or why not. A cdrom's may be a tree alone, an ISO then made of it. */
 static const char *add_collection(hull_machine *m, medium *d, const char *collection)
@@ -808,14 +899,21 @@ static const char *read_media(hull_machine *m, const hull_sexpr_doc *doc,
 			wrong = add_image(m, kind, path);
 		else if (m->media_count == PC_MAX_MEDIA)
 			wrong = "there are too many media: four on IDE and two floppy drives are a PC's";
-		else if (kind != 'c' && m->direct)
-			wrong = "(mutable direct) writes an image: a disk or floppy made of a collection "
-			        "has no file to write, its writes going with the machine";
 		else {
 			d->type = kind;
 			d->fd   = -1;
 			m->media_count++;
 			wrong = add_collection(m, d, path);
+			/* (mutable direct): a disk's or floppy's writes go back into
+			 * its collection when the machine powers off -- not a store's
+			 * checkout, which a tar: or pack: collection is. */
+			if (wrong == NULL && kind != 'c' && kind != 'u' && m->direct) {
+				if (in_store(path))
+					wrong = "(mutable direct) writes a collection back, and a tar: or pack: "
+					        "one is the store's: give it as a dir: collection";
+				else
+					d->write_back = 1;
+			}
 		}
 		free(type);
 		free(source);
@@ -1792,6 +1890,13 @@ static void end_console(hull_machine *m)
 /* The machine's end said. */
 static void finish(hull_machine *m, int code, int signum)
 {
+	/* Powered off by itself: a collection's writes go back into it, before
+	 * the machine's end is said. Killed or failed, the image is dropped,
+	 * as a crash would leave it untrustworthy. */
+	if (code == 0 && signum == 0)
+		for (unsigned i = 0u; i < m->media_count; i++)
+			if (m->media[i].write_back && m->media[i].fd >= 0)
+				write_back(m, &m->media[i]);
 	pthread_mutex_lock(&m->lock);
 	m->done = 1;
 	pthread_cond_broadcast(&m->done_cond);
@@ -2796,7 +2901,8 @@ static const hull_cap_entry entries[] = {
 	{ "media",              HULL_SUP_NATIVE,
 	  "a drive each: disks and CD-ROMs on IDE, four between them, and two floppy drives", NULL },
 	{ "media.dir",          HULL_SUP_EMULATED,
-	  "the collection reassembled, its hash held, into an unnamed file its writes go with; a "
+	  "the collection reassembled, its hash held, into an unnamed file its writes go with, or "
+	  "under (mutable direct) taken apart into the collection again at power-off; a "
 	  "CD-ROM's tree alone made an ISO; a raw dump's audio tracks and quirks not given, qemu "
 	  "reading a disc by its 2048-byte sectors", NULL },
 	{ "media.image",        HULL_SUP_NATIVE,
