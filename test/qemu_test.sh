@@ -3019,7 +3019,7 @@ else
 	cp "$arm64_probe" "$root/a64root/probe"
 	printf '(machine (source "dir:./a64root") (backend emu) (arch arm64) (hostname "qa64") %s %s)\n' \
 		'(tuning (vm (profile full)))' \
-		'(command "/probe" "say" "from arm64" "host" "read" "/proc/sys/kernel/arch" "exit" "5")' \
+		'(command "/probe" "say" "from arm64" "host" "read" "/proc/sys/kernel/arch" "direct" "/probe" "exit" "5")' \
 		> "$root/a64.conf"
 	a64none=$(mktemp -d "$root/run-a64none.XXXXXX")
 	a64run=$(mktemp -d "$root/run-a64.XXXXXX")
@@ -3042,6 +3042,17 @@ else
 		has 5 '^from arm64$'
 		has 5 '^host=qa64$'
 		has 5 '^read=aarch64$'
+		# An O_DIRECT open, a database's: arm64's O_DIRECT is amd64's
+		# O_DIRECTORY, so by virtiofs, which hands the guest's flags to the
+		# host as they are, it failed `Not a directory`; auto takes 9p,
+		# whose flags the guest translates, and a pin is refused.
+		has 5 '^direct=yes$'
+		sed 's|(profile full))|(profile full)) (qemu (share virtiofs))|' "$root/a64.conf" > "$root/a64v.conf"
+		name='(share virtiofs) on arm64 under emu'
+		out=$(cd / && XDG_RUNTIME_DIR=$a64run XDG_CACHE_HOME="$root/cache" timeout 60 \
+			"$hull" run -f "$root/a64v.conf" 2>&1)
+		got=$?
+		has 125 'this guest.s arch encodes them otherwise'
 		# (ssh true) on an arm64 machine whose image has no sshd (section
 		# 8.1 item 3): arm64's dropbear, `hull sshd fetch --arch arm64`'s,
 		# where amd64's, which an arm64 guest cannot run, had been shared.

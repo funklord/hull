@@ -535,6 +535,25 @@ static const char *guest_arch(const hull_machine *m)
 	return m->arch[0] != '\0' ? m->arch : host_arch();
 }
 
+/* Which encoding of open(2)'s flags an arch's kernel has: 0 asm-generic's
+ * (amd64, riscv64, s390x), 1 arm's and arm64's, 2 powerpc's. FUSE, and so
+ * virtio-fs, carries a guest's open flags as its kernel has them, and
+ * virtiofsd gives them to the host's open as its own, where 9p2000.L has
+ * an encoding of its own the guest translates to. Across two encodings
+ * a flag means another: powerpc's O_LARGEFILE, on every open of a 64-bit
+ * kernel, is amd64's O_DIRECTORY, so a ppc64le guest could open no file
+ * at all, `Not a directory`; arm64's O_DIRECT is amd64's O_DIRECTORY too,
+ * so a database's or `dd iflag=direct`'s open failed the same way
+ * (measured 2026-11-20, virtiofsd 1.13's openat under strace). */
+static int open_flags(const char *arch)
+{
+	if (strcmp(arch, "arm64") == 0 || strcmp(arch, "arm") == 0 || strncmp(arch, "armv", 4u) == 0)
+		return 1;
+	if (strncmp(arch, "ppc", 3u) == 0)
+		return 2;
+	return 0;
+}
+
 /* --- reading the plan ---------------------------------------------------- */
 
 /*
@@ -851,6 +870,10 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 		if (wanted && m->s390x)
 			return "(share virtiofs) speaks FUSE in the guest's byte order, which virtiofsd "
 			       "cannot read from a big-endian s390x guest: its shares go by 9p";
+		if (wanted && open_flags(guest_arch(m)) != open_flags(host_arch()))
+			return "(share virtiofs) gives the guest's open flags to virtiofsd as the host's, and "
+			       "this guest's arch encodes them otherwise -- its O_DIRECT or O_LARGEFILE "
+			       "is the host's O_DIRECTORY, and such an open fails: its shares go by 9p";
 		if (wanted && (m->virtiofsd = hull_qemu_virtiofsd()) == NULL)
 			return "(share virtiofs) needs virtiofsd with --translate-uid, and none is installed: "
 			       "its package, or HULL_VIRTIOFSD naming the program";
@@ -4888,10 +4911,10 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	 * a guest missing virtiofs has no root at all; hull's own has it. */
 	if (m->share_auto) {
 		free(m->virtiofsd);
-		/* Not on ppc64le, whose root by virtiofs left the agent unable
-		 * to run the command, "Not a directory", where 9p's ran it
-		 * (2026-11-18, Debian's 64 KiB-page kernel; why not found). */
-		m->virtiofsd = !m->s390x && !m->ppc64le && hull_qemu_virtiofs_room() &&
+		/* Not where the guest's open flags are not the host's
+		 * (open_flags), nor on big-endian s390x. */
+		m->virtiofsd = !m->s390x && open_flags(guest_arch(m)) == open_flags(host_arch()) &&
+		               hull_qemu_virtiofs_room() &&
 		               (m->kernel_hull || (load_modules && kernel_has_virtiofs(mbuf))) ?
 		               hull_qemu_virtiofsd() : NULL;
 	}

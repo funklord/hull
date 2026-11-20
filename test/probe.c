@@ -19,6 +19,8 @@
  *   owner PATH  PATH's owner, group and mode, not following a link
  *   kind PATH   PATH's kind, and a character device's major:minor
  *   read PATH   PATH's first line
+ *   direct PATH whether PATH opens for reading with O_DIRECT, as a
+ *               database or `dd iflag=direct` opens it
  *   load PATH   whether the module PATH, under /lib/modules/RELEASE, loads
  *   vfio GROUP ADDRESS  whether VFIO gives the PCI device ADDRESS of the
  *               group node GROUP to user space: its group viable, a
@@ -1347,6 +1349,13 @@ int main(int argc, char **argv)
 				printf("read=%s", text);
 			if (file != NULL)
 				fclose(file);
+			i++;
+		} else if (strcmp(step, "direct") == 0) {
+			int fd = open(arg, O_RDONLY | O_DIRECT | O_CLOEXEC);
+
+			printf("direct=%s\n", fd >= 0 ? "yes" : strerror(errno));
+			if (fd >= 0)
+				close(fd);
 			i++;
 		} else if (strcmp(step, "load") == 0) {
 			/* As modprobe would, a compressed module the kernel
