@@ -121,6 +121,10 @@ refuse 'too small a disk' '(disk (label dos) (size "4M") (partitions (partition 
 refuse 'a tree larger than its partition' '(disk (label dos) (partitions (partition (size "1M") (source "dir:./big"))))' 'could not be made'
 refuse 'boot code of the wrong size' '(disk (label dos) (boot "dos.conf") (partitions (partition (size "8M"))))' '440'
 refuse 'an image as a tree' '(disk (label dos) (partitions (partition (size "8M") (source "image:./x"))))' 'an image is none'
+mkdir -p "$dir/case"
+printf 'lower\n' > "$dir/case/x"
+printf 'upper\n' > "$dir/case/X"
+refuse 'names FAT folds into one' '(disk (label dos) (partitions (partition (size "8M") (type fat) (source "dir:./case"))))' 'folds'
 refuse 'a feature with a comma' '(disk (label dos) (partitions (partition (size "8M") (features "a,b"))))' 'feature'
 
 # A file that is there is written over; one that the write refuses is

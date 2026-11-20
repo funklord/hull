@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -801,6 +802,60 @@ static int materialize(work *w, const hull_disk_partition *p, unsigned i, char *
 	return hull_store_materialize(w->store, p->ref, dir, &skipped, why, cap);
 }
 
+/* Two names in one directory of `dir`, or below, that differ only in
+ * case: FAT folds case, so they would be one name on the disk and the tree
+ * could not be what it read back as. The first such pair into `first` and
+ * `second`, 1; 0 for none; -1 where the tree cannot be read. */
+static int case_collision(const char *dir, char *first, char *second, size_t cap)
+{
+	DIR           *d = opendir(dir);
+	struct dirent *e;
+	char         **names = NULL;
+	size_t         count = 0u, room = 0u;
+	int            found = 0;
+
+	if (d == NULL)
+		return -1;
+	while ((e = readdir(d)) != NULL) {
+		if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+			continue;
+		if (count == room) {
+			char **grown = realloc(names, (room = room != 0u ? 2u * room : 64u) * sizeof *grown);
+
+			if (grown == NULL) {
+				found = -1;
+				break;
+			}
+			names = grown;
+		}
+		if ((names[count] = strdup(e->d_name)) == NULL) {
+			found = -1;
+			break;
+		}
+		count++;
+	}
+	closedir(d);
+	for (size_t i = 0u; found == 0 && i < count; i++)
+		for (size_t k = i + 1u; found == 0 && k < count; k++)
+			if (strcasecmp(names[i], names[k]) == 0) {
+				snprintf(first, cap, "%s/%s", dir, names[i]);
+				snprintf(second, cap, "%s/%s", dir, names[k]);
+				found = 1;
+			}
+	for (size_t i = 0u; found == 0 && i < count; i++) {
+		char        path[PATH_MAX];
+		struct stat is;
+
+		snprintf(path, sizeof path, "%s/%s", dir, names[i]);
+		if (lstat(path, &is) == 0 && S_ISDIR(is.st_mode))
+			found = case_collision(path, first, second, cap);
+	}
+	for (size_t i = 0u; i < count; i++)
+		free(names[i]);
+	free(names);
+	return found;
+}
+
 static int make_vfat(work *w, const char *target, const hull_disk_partition *p, unsigned i,
                      const layout *l, char *why, size_t cap)
 {
@@ -857,9 +912,10 @@ static int make_vfat(work *w, const char *target, const hull_disk_partition *p, 
 	}
 	if (p->ref[0] == '\0')
 		return 0;
+	/* Its tree, materialized and checked before anything was written. */
+	snprintf(source, sizeof source, "%s/s%u", w->dir, i + 1u);
 	if (need("mcopy", "mtools", mcopy, sizeof mcopy, why, cap) != 0 ||
-	    mtools_rc(w, setting, sizeof setting, why, cap) != 0 ||
-	    materialize(w, p, i, source, sizeof source, why, cap) != 0)
+	    mtools_rc(w, setting, sizeof setting, why, cap) != 0)
 		return -1;
 	snprintf(image, sizeof image, "%s@@%" PRIu64, target, l->first[i]);
 	{
@@ -1071,6 +1127,22 @@ int hull_disk_write(hull_store *store, const hull_disk *disk, const char *target
 		if (disk->partition[i].ref[0] != '\0' &&
 		    tree_tar(&w, &disk->partition[i], i, &l.tree[i], why, cap) != 0)
 			goto done;
+	/* A FAT partition's tree, materialized and held to FAT's names
+	 * before anything is written: a refusal touches nothing. */
+	for (unsigned i = 0u; i < disk->count; i++) {
+		const hull_disk_partition *p = &disk->partition[i];
+		char                       source[4300], first[PATH_MAX], second[PATH_MAX];
+
+		if (p->fs != HULL_DISK_VFAT || p->ref[0] == '\0')
+			continue;
+		if (materialize(&w, p, i, source, sizeof source, why, cap) != 0)
+			goto done;
+		if (case_collision(source, first, second, sizeof first) == 1) {
+			snprintf(why, cap, "partition %u's tree has %s and %s, one name on FAT, which folds "
+			         "case", i + 1u, first + strlen(source) + 1u, second + strlen(source) + 1u);
+			goto done;
+		}
+	}
 	if ((fd = open_target(target, &device, &bytes, why, cap)) < 0)
 		goto done;
 	made = !device;
