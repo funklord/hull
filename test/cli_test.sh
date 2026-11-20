@@ -4840,6 +4840,42 @@ for dosengine in dosbox dosemu; do
 		"$hull" media import "$root/doscd.cue" "$root/doscdraw" > /dev/null
 		dosconf doscdraw '(media (medium (type cdrom) (source "dir:./doscdraw"))) (command "AUDINFO")'
 		from_root 0 '^2' -f "$root/doscdraw.conf"
+		# A floppy as a collection, under direct, a dos machine's default:
+		# what DOS writes to A: is taken into the files when the batch ends
+		# (section 5.0's write-back); a run that only reads, or one under
+		# overlay, leaves the collection as it was.
+		mkvfat=$(command -v mkfs.vfat || echo /usr/sbin/mkfs.vfat)
+		if [ -x "$mkvfat" ] && command -v mcopy > /dev/null 2>&1; then
+			rm -rf "$root/dosfd" "$root/dosfd.img"
+			"$mkvfat" -C "$root/dosfd.img" 1440 > /dev/null
+			printf 'on a floppy\r\n' > "$root/dosfd.txt"
+			MTOOLS_SKIP_CHECK=1 mcopy -i "$root/dosfd.img" "$root/dosfd.txt" ::IN.TXT
+			"$hull" media import "$root/dosfd.img" "$root/dosfd" > /dev/null
+			conf_inode=$(stat -c %i "$root/dosfd/media.conf")
+			dosconf dosfdread '(media (medium (type floppy) (source "dir:./dosfd"))) (command "TYPE" "A:\\IN.TXT")'
+			from_root 0 '^on a floppy' -f "$root/dosfdread.conf"
+			cases=$((cases + 1))
+			[ "$(stat -c %i "$root/dosfd/media.conf")" = "$conf_inode" ] ||
+				fail 'a floppy only read was taken again' "$(ls -la "$root/dosfd")"
+			dosconf dosfdover '(mutable overlay) (media (medium (type floppy) (source "dir:./dosfd"))) (command "COPY" "A:\\IN.TXT" "A:\\OVER.TXT")'
+			from_root 0 '' -f "$root/dosfdover.conf"
+			cases=$((cases + 1))
+			[ ! -e "$root/dosfd/files/OVER.TXT" ] ||
+				fail 'a floppy under overlay was written back' "$(ls "$root/dosfd/files")"
+			dosconf dosfdwrite '(media (medium (type floppy) (source "dir:./dosfd"))) (command "COPY" "A:\\IN.TXT" "A:\\OUT.TXT")'
+			from_root 0 'dosfd written back' -f "$root/dosfdwrite.conf"
+			cases=$((cases + 1))
+			[ "$(tr -d '\r' < "$root/dosfd/files/OUT.TXT" 2>&1)" = 'on a floppy' ] ||
+				fail 'what DOS wrote to a floppy is not in its files' "$(ls "$root/dosfd/files" 2>&1)"
+			expect 0 '' "$hull" media verify "$root/dosfd"
+			# Its image went with its run: each projection is removed by its
+			# name, and a floppy's .img was not, keeping the run's directory.
+			cases=$((cases + 1))
+			[ -z "$(ls "$XDG_RUNTIME_DIR/hull" 2>/dev/null | grep '^dosbox-')" ] ||
+				fail 'a dos run with a floppy left its directory' "$(ls -R "$XDG_RUNTIME_DIR/hull" 2>&1 | head)"
+		else
+			echo "cli: a dos floppy's write-back not measured: mkfs.vfat or mtools is missing"
+		fi
 	else
 		from_root 125 'whose layout dosemu2 cannot' -f "$root/doscdimp.conf"
 	fi

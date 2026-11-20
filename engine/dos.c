@@ -601,6 +601,8 @@ static void remove_dir(hull_machine *m)
 		unlink(path);
 		snprintf(path, sizeof path, "%s/disc%u.cue", m->dir, i + 1u);
 		unlink(path);
+		snprintf(path, sizeof path, "%s/disc%u.img", m->dir, i + 1u);
+		unlink(path);
 	}
 	/* What dosemu2 keeps under the HOME it is given, the machine's own
 	 * directory: boot.log, and stderr.log.PID where it was killed, a name
@@ -825,6 +827,77 @@ static void unmake(const hull_machine *m)
 	rmdir(path);
 }
 
+/* Whether the file open at `fd` and the file at `path` hold the same bytes. */
+static int files_equal(int fd, const char *path)
+{
+	static uint8_t a[65536], b[65536];
+	int            other = open(path, O_RDONLY | O_CLOEXEC);
+	struct stat    x, y;
+	int            same;
+
+	if (other < 0)
+		return 0;
+	same = fstat(fd, &x) == 0 && fstat(other, &y) == 0 && x.st_size == y.st_size;
+	for (off_t at = 0; same && at < x.st_size; at += (off_t)sizeof a) {
+		ssize_t n = pread(fd, a, sizeof a, at);
+
+		same = n > 0 && pread(other, b, (size_t)n, at) == n && memcmp(a, b, (size_t)n) == 0;
+	}
+	close(other);
+	return same;
+}
+
+/* A floppy given as a collection, under direct (a dos machine's default):
+ * what DOS wrote to its image taken apart into the collection again when
+ * the batch has ended, as the pc class does at power-off (section 5.0),
+ * so a program saving to A: saves to the files. The image is compared with
+ * the collection first, a floppy nobody wrote costing no taking; where the
+ * taking fails the image is kept beside the collection, COLLECTION.unsaved.img.
+ * What it did, on the machine's stderr. */
+static void write_back(hull_machine *m)
+{
+	for (unsigned i = 0u; i < m->media_count; i++) {
+		char              fresh[4300];
+		char              said[4800];
+		char              detail[4400] = "";
+		char              again[4300];
+		hull_media_report report;
+		int               fd;
+		int               same;
+
+		if (m->overlay || !m->media_floppy[i] || m->media_collection[i] == NULL ||
+		    m->media_host[i] == NULL)
+			continue;
+		snprintf(again, sizeof again, "%s/again%u.img", m->dir, i + 1u);
+		if ((fd = open(again, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0)
+			continue;
+		same = hull_media_write(m->media_collection[i], fd, detail, sizeof detail) == 0 &&
+		       files_equal(fd, m->media_host[i]);
+		close(fd);
+		unlink(again);
+		if (same)
+			continue;
+		snprintf(fresh, sizeof fresh, "%s.hull-new", m->media_collection[i]);
+		if (hull_media_import(m->media_host[i], fresh, &report, detail, sizeof detail) == 0 &&
+		    renameat2(AT_FDCWD, fresh, AT_FDCWD, m->media_collection[i], RENAME_EXCHANGE) == 0) {
+			nftw(fresh, remove_one, 16, FTW_DEPTH | FTW_PHYS);
+			snprintf(said, sizeof said, "hull: %s written back: %llu files, %llu bytes not "
+			         "understood\n", m->media_collection[i], report.files, report.patch_bytes);
+		} else {
+			char unsaved[4400];
+
+			if (access(fresh, F_OK) == 0)
+				nftw(fresh, remove_one, 16, FTW_DEPTH | FTW_PHYS);
+			snprintf(unsaved, sizeof unsaved, "%s.unsaved.img", m->media_collection[i]);
+			snprintf(said, sizeof said, "hull: %s was not written back (%s): %s\n",
+			         m->media_collection[i], detail[0] != '\0' ? detail : strerror(errno),
+			         rename(m->media_host[i], unsaved) == 0 ?
+			         "its writes are in the image beside it, .unsaved.img" : "and its writes are lost");
+		}
+		hull_dos_host->on_data(m->core, NULL, 2, (const uint8_t *)said, strlen(said));
+	}
+}
+
 /* The emulator's output while it runs, and its end once it has gone. */
 static void *read_workload(void *arg)
 {
@@ -852,6 +925,10 @@ static void *read_workload(void *arg)
 	code = m->engine->end_code(m, status);
 	if (code == 0 && not_found(m))
 		code = 127;
+	/* Ended with the batch's word: the run is over and its floppies' writes
+	 * are kept; killed, or ended without it, they go with the machine. */
+	if (code >= 0)
+		write_back(m);
 	if (code >= 0) {
 		hull_dos_host->on_exit(m->core, m, NULL, code, 0);
 	} else if (WIFSIGNALED(status)) {
