@@ -315,6 +315,53 @@ out=$(tr -d '\r' < "$root/sf.out")
 status 'the installed disk boots alone' "$got" 0 "$out"
 says 'to its own AUTOEXEC' "$out" 'booted-from-c'
 
+# --- the base packages, from FreeDOS's Lite USB image ------------------------
+
+# The floppy edition's packages are a Slicer archive; the Lite USB image
+# carries them as zips, which setup unpacks on the host into a disk D:
+# that the install copies onto C:. The disk then runs FIND, a package's,
+# over the list FreeDOS's tools keep of what EDIT installed.
+lite=FD14-LiteUSB.zip
+litesum=857dcd2ebf9d3d094320154db5fb5b830acba6fb98f981a95a0ca7ab3350338b
+if [ ! -f "$media/$lite" ]; then
+	curl -fsS -m 300 -o "$media/$lite.part" \
+		"https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.4/$lite" &&
+		mv "$media/$lite.part" "$media/$lite"
+	rm -f "$media/$lite.part"
+fi
+if [ -f "$media/$lite" ]; then
+	cases=$((cases + 1))
+	printf '%s  %s\n' "$litesum" "$media/$lite" | sha256sum -c --quiet > /dev/null 2>&1 ||
+		fail 'the Lite USB medium is what its publisher published' "$media/$lite"
+	python3 -I -c '
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as archive, open(sys.argv[2], "wb") as out:
+	out.write(archive.read("FD14LITE.img"))' "$media/$lite" "$root/lite.img"
+	rm -rf "$root/sp"
+	out=$(timeout 300 "$hull" setup freedos --size 64 --packages "$root/lite.img" "$root/boot.img" \
+		"$root/sp" 2>&1)
+	status 'hull setup freedos --packages' "$?" 0 "$out"
+	(cd / && timeout -k 5 300 "$hull" run -f "$root/sp/install.conf" < /dev/null > "$root/sp.out" 2>&1)
+	got=$?
+	out=$(tr -d '\r' < "$root/sp.out")
+	status 'its install ran to the end' "$got" 0 "$out"
+	says 'installing the packages on its way' "$out" 'hull setup: installing the base packages'
+	out=$(mdir -i "$root/sp/disk.img@@32256" ::/FREEDOS/BIN/EDIT.EXE ::/FREEDOS/PACKAGES/EDIT.LST 2>&1)
+	says 'EDIT installed' "$out" 'EDIT     EXE'
+	says 'and its list kept' "$out" 'EDIT     LST'
+	printf '@echo off\r\nC:\\KEY.COM\r\nCTTY COM1\r\nSET TEMP=C:\\\r\nC:\\FREEDOS\\BIN\\FIND "EDIT.EXE" C:\\FREEDOS\\PACKAGES\\EDIT.LST\r\nC:\\FDAPM POWEROFF\r\n' \
+		> "$root/PAUTO.BAT"
+	mcopy -o -i "$root/sp/disk.img@@32256" "$root/KEY.COM" ::KEY.COM
+	mcopy -o -i "$root/sp/disk.img@@32256" "$root/PAUTO.BAT" ::AUTOEXEC.BAT
+	(cd / && timeout -k 5 90 "$hull" run -f "$root/sp/machine.conf" < /dev/null > "$root/sp.out" 2>&1)
+	got=$?
+	out=$(tr -d '\r' < "$root/sp.out")
+	status 'the disk with its packages boots' "$got" 0 "$out"
+	says 'and runs a package of them' "$out" 'C:\FreeDOS\BIN\EDIT.EXE'
+else
+	printf 'legacy: %s not fetched, the packages not tried\n' "$lite"
+fi
+
 printf 'legacy: %s cases, %s failed\n' "$cases" "$failures"
 [ "$failures" = 0 ] && rm -rf "$dir"
 [ "$failures" = 0 ]

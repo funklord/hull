@@ -37,9 +37,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -62,6 +64,25 @@ static int run(char *const argv[])
 	}
 	return child > 0 && waitpid(child, &wstatus, 0) == child && WIFEXITED(wstatus) &&
 	       WEXITSTATUS(wstatus) == 0 ? 0 : -1;
+}
+
+/* `argv`, its output to /dev/null: its exit status, or -1 where it did
+ * not exit. */
+static int run_code(char *const argv[])
+{
+	pid_t child = fork();
+	int   wstatus = 0;
+
+	if (child == 0) {
+		int null = open("/dev/null", O_RDWR | O_CLOEXEC);
+
+		if (null < 0 || dup2(null, 0) < 0 || dup2(null, 1) < 0 || dup2(null, 2) < 0)
+			_exit(126);
+		execvp(argv[0], argv);
+		_exit(127);
+	}
+	return child > 0 && waitpid(child, &wstatus, 0) == child && WIFEXITED(wstatus) ?
+	       WEXITSTATUS(wstatus) : -1;
 }
 
 /* `text` into DIR/NAME with `mode`: 0, or -1 with `why`. */
@@ -458,20 +479,266 @@ static const char freedos_auto[] =
     "if errorlevel 1 goto failed\r\n"
     "copy A:\\FREEDOS\\BIN\\FDAPM.COM C:\\ > NUL\r\n"
     "copy A:\\HULLAUTO.BAT C:\\AUTOEXEC.BAT > NUL\r\n"
+    "%s"
     "echo hull setup: done\r\n"
     "FDAPM POWEROFF\r\n"
     ":failed\r\n"
-    "echo hull setup: FORMAT failed\r\n";
+    "echo hull setup: FORMAT or the packages' copy failed\r\n";
 
-/* What the installed disk boots to: its prompt on the screen. */
+/* With --packages, after FORMAT: the packages' disk, D:, copied onto C:.
+ * Written in only then -- a test of D: in the script, `if not exist
+ * D:\FREEDOS\NUL`, took the branch on a machine with no D: and once
+ * hung the install at a critical-error prompt (2026-11-20). */
+static const char freedos_packages[] =
+    "echo hull setup: installing the base packages\r\n"
+    "A:\\FREEDOS\\BIN\\XCOPY D:\\FREEDOS C:\\FREEDOS /S /E /I /Y > NUL\r\n"
+    "if errorlevel 1 goto failed\r\n";
+
+/* What the installed disk boots to: its prompt on the screen, the base
+ * packages on its PATH where they were installed. */
 static const char freedos_disk_auto[] =
     "@echo off\r\n"
-    "SET PATH=C:\\\r\n"
+    "SET DOSDIR=C:\\FREEDOS\r\n"
+    "SET PATH=C:\\;C:\\FREEDOS\\BIN\r\n"
+    "SET TEMP=C:\\\r\n"
     "PROMPT $P$G\r\n";
 
-int hull_setup_freedos(const char *boot, const char *dir, unsigned megabytes, char *why,
-                       size_t cap)
+/* Every name under `dir` upper-cased, as DOS names are and FAT folds
+ * them: packages unpack some into nls/ and others into NLS/, which on the
+ * FAT disk are one directory, so a directory whose upper-cased name is
+ * taken is merged into it. 0, or -1. */
+static int upcase_tree(const char *dir)
 {
+	DIR           *d = opendir(dir);
+	struct dirent *e;
+	int            status = 0;
+
+	if (d == NULL)
+		return -1;
+	while (status == 0 && (e = readdir(d)) != NULL) {
+		char        from[PATH_MAX], to[PATH_MAX], upper[256];
+		struct stat is, there;
+		size_t      i;
+
+		if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+			continue;
+		for (i = 0u; e->d_name[i] != '\0' && i + 1u < sizeof upper; i++)
+			upper[i] = (char)toupper((unsigned char)e->d_name[i]);
+		upper[i] = '\0';
+		snprintf(from, sizeof from, "%s/%s", dir, e->d_name);
+		snprintf(to, sizeof to, "%s/%s", dir, upper);
+		if (lstat(from, &is) != 0) {
+			status = -1;
+			break;
+		}
+		if (strcmp(from, to) != 0) {
+			if (lstat(to, &there) == 0) {
+				/* Taken: a directory merges into it, entry by entry,
+				 * then goes; a file of the same name is the one already
+				 * there, as XCOPY /Y would leave the later. */
+				if (S_ISDIR(is.st_mode) && S_ISDIR(there.st_mode)) {
+					DIR           *inner = opendir(from);
+					struct dirent *f;
+
+					if (inner == NULL) {
+						status = -1;
+						break;
+					}
+					while (status == 0 && (f = readdir(inner)) != NULL) {
+						char a[PATH_MAX + 256], b[PATH_MAX + 256];
+
+						if (strcmp(f->d_name, ".") == 0 || strcmp(f->d_name, "..") == 0)
+							continue;
+						snprintf(a, sizeof a, "%s/%s", from, f->d_name);
+						snprintf(b, sizeof b, "%s/%s", to, f->d_name);
+						status = rename(a, b) == 0 ? 0 : -1;
+					}
+					closedir(inner);
+					if (status == 0 && rmdir(from) != 0)
+						status = -1;
+					/* The merged entries are renamed again below. */
+					rewinddir(d);
+					continue;
+				}
+				status = rename(from, to) == 0 ? 0 : -1;
+			} else {
+				status = rename(from, to) == 0 ? 0 : -1;
+			}
+		}
+		if (status == 0 && S_ISDIR(is.st_mode))
+			status = upcase_tree(to);
+	}
+	closedir(d);
+	return status;
+}
+
+/* FreeDOS's base packages from `image` -- a FreeDOS 1.4 USB image, its
+ * FAT partition holding packages/base's zips, as the Lite USB edition's
+ * FD14LITE.img does -- laid out as %DOSDIR% would hold them installed:
+ * each zip unpacked into DIR/packages/FREEDOS but its SOURCE, and its
+ * files listed in PACKAGES\NAME.LST, C:\FreeDOS\... a line, as FreeDOS's
+ * installer writes them. Then that tree as a disk of its own,
+ * DIR/packages.img, one FAT16 partition by `hull disk write`, which the
+ * install's script copies onto C: by XCOPY: the zips need no unzip in
+ * DOS, and FreeDOS's own tools find the packages as installed. */
+static int stage_packages(const char *image, const char *dir, char *why, size_t cap)
+{
+	char          zips[PATH_MAX], top[PATH_MAX], tree[PATH_MAX + 16], lists[PATH_MAX + 32];
+	char          at[PATH_MAX + 32];
+	char          self[PATH_MAX];
+	uint8_t       mbr[512];
+	unsigned long first = 0ul;
+	ssize_t       n;
+	int           fd;
+	DIR          *d;
+	struct dirent *e;
+	unsigned      count = 0u;
+
+	if ((fd = open(image, O_RDONLY | O_CLOEXEC)) < 0 || read(fd, mbr, sizeof mbr) != 512) {
+		snprintf(why, cap, "%s: %s", image, strerror(errno));
+		if (fd >= 0)
+			close(fd);
+		return -1;
+	}
+	close(fd);
+	/* The first partition the table names, or a disk of no table. */
+	if (mbr[510] == 0x55u && mbr[511] == 0xaau)
+		for (unsigned i = 0u; i < 4u && first == 0ul; i++)
+			if (mbr[446 + 16u * i + 4u] != 0u)
+				first = (unsigned long)mbr[454 + 16u * i] | (unsigned long)mbr[455 + 16u * i] << 8 |
+				        (unsigned long)mbr[456 + 16u * i] << 16 |
+				        (unsigned long)mbr[457 + 16u * i] << 24;
+	snprintf(at, sizeof at, "%s@@%lu", image, first * 512ul);
+	snprintf(zips, sizeof zips, "%s/packages-zip", dir);
+	snprintf(top, sizeof top, "%s/packages", dir);
+	snprintf(tree, sizeof tree, "%s/FREEDOS", top);
+	snprintf(lists, sizeof lists, "%s/PACKAGES", tree);
+	if (mkdir(zips, 0755) != 0 || mkdir(top, 0755) != 0 || mkdir(tree, 0755) != 0 ||
+	    mkdir(lists, 0755) != 0) {
+		snprintf(why, cap, "%s: %s", dir, strerror(errno));
+		return -1;
+	}
+	{
+		char *copy[] = { "env", "MTOOLSRC=/dev/null", "mcopy", "-n", "-i", at,
+		                 "::/packages/base/*.zip", zips, NULL };
+
+		if (run(copy) != 0) {
+			snprintf(why, cap, "%s has no packages/base/*.zip that mtools can read: FreeDOS "
+			         "1.4's Lite USB image, FD14LITE.img, has", image);
+			return -1;
+		}
+	}
+	if ((d = opendir(zips)) == NULL) {
+		snprintf(why, cap, "%s: %s", zips, strerror(errno));
+		return -1;
+	}
+	while ((e = readdir(d)) != NULL) {
+		char   zip[PATH_MAX + 256];
+		char   list[PATH_MAX + 256];
+		char   name[64];
+		char   line[1024];
+		char   command[PATH_MAX + 300];
+		int    code;
+		size_t length = strlen(e->d_name);
+		FILE  *files;
+		FILE  *out;
+		char  *unpack[] = { "unzip", "-q", "-o", zip, "-x", "SOURCE/*", "source/*", "-d", tree,
+		                    NULL };
+
+		if (length < 5u || length > 60u || strcasecmp(e->d_name + length - 4u, ".zip") != 0)
+			continue;
+		snprintf(zip, sizeof zip, "%s/%s", zips, e->d_name);
+		for (size_t i = 0u; i + 4u < length; i++)
+			name[i] = (char)toupper((unsigned char)e->d_name[i]);
+		name[length - 4u] = '\0';
+		/* unzip exits 11 where an excluded name matched nothing -- a
+		 * package with no SOURCE -- and has unpacked all the same. */
+		code = run_code(unpack);
+		if (code != 0 && code != 11) {
+			closedir(d);
+			snprintf(why, cap, "%s could not be unpacked (unzip)", zip);
+			return -1;
+		}
+		/* Its list: each file the zip holds but its sources. */
+		snprintf(command, sizeof command, "unzip -Z1 '%s'", zip);
+		snprintf(list, sizeof list, "%s/%s.LST", lists, name);
+		if (strchr(zip, '\'') != NULL || (files = popen(command, "re")) == NULL) {
+			closedir(d);
+			snprintf(why, cap, "%s could not be listed", zip);
+			return -1;
+		}
+		if ((out = fopen(list, "we")) == NULL) {
+			pclose(files);
+			closedir(d);
+			snprintf(why, cap, "%s: %s", list, strerror(errno));
+			return -1;
+		}
+		while (fgets(line, sizeof line, files) != NULL) {
+			size_t k = strcspn(line, "\r\n");
+
+			line[k] = '\0';
+			if (k == 0u || line[k - 1u] == '/' || strncasecmp(line, "SOURCE/", 7u) == 0)
+				continue;
+			for (char *c = line; *c != '\0'; c++)
+				*c = *c == '/' ? '\\' : (char)toupper((unsigned char)*c);
+			fprintf(out, "C:\\FreeDOS\\%s\r\n", line);
+		}
+		pclose(files);
+		if (fclose(out) != 0) {
+			closedir(d);
+			snprintf(why, cap, "%s could not be written", list);
+			return -1;
+		}
+		count++;
+	}
+	closedir(d);
+	if (count == 0u) {
+		snprintf(why, cap, "%s's packages/base holds no package", image);
+		return -1;
+	}
+	if (upcase_tree(tree) != 0) {
+		snprintf(why, cap, "%s's names could not be made DOS's: %s", tree, strerror(errno));
+		return -1;
+	}
+	if (put(dir, "packages.conf",
+	    "; FreeDOS's base packages as installed, a disk the install copies onto C:\n"
+	    "; (hull setup freedos --packages).\n"
+	    "(disk (label dos)\n"
+	    "  (partitions\n"
+	    "    (partition (size \"rest\") (type fat) (volume \"PACKAGES\") (source \"dir:./packages\"))))\n",
+	    0644, why, cap) != 0)
+		return -1;
+	n = readlink("/proc/self/exe", self, sizeof self - 1u);
+	if (n <= 0) {
+		snprintf(why, cap, "hull cannot find itself to write the packages' disk");
+		return -1;
+	}
+	self[n] = '\0';
+	{
+		char conf[PATH_MAX + 32];
+		char disk[PATH_MAX + 32];
+		char *write[] = { self, "disk", "write", conf, disk, NULL };
+		char *clear[] = { "rm", "-rf", "--", zips, NULL };
+
+		snprintf(conf, sizeof conf, "%s/packages.conf", dir);
+		snprintf(disk, sizeof disk, "%s/packages.img", dir);
+		if (run(write) != 0) {
+			snprintf(why, cap, "the packages' disk could not be written: `hull disk write %s %s` "
+			         "says why", conf, disk);
+			return -1;
+		}
+		/* The zips are the image's still; the tree stays, the disk's
+		 * source, for a look at what was installed. */
+		run(clear);
+	}
+	return 0;
+}
+
+int hull_setup_freedos(const char *boot, const char *dir, unsigned megabytes, const char *packages,
+                       char *why, size_t cap)
+{
+	char        install[1024];
+	char        fdauto[sizeof freedos_auto + sizeof freedos_packages];
 	char        floppy[PATH_MAX];
 	char        disk[PATH_MAX];
 	char        stage[PATH_MAX];
@@ -507,8 +774,9 @@ int hull_setup_freedos(const char *boot, const char *dir, unsigned megabytes, ch
 			return -1;
 		}
 	}
+	snprintf(fdauto, sizeof fdauto, freedos_auto, packages != NULL ? freedos_packages : "");
 	if (put(stage, "KEY.COM", key_com, 0644, why, cap) != 0 ||
-	    put(stage, "FDAUTO.BAT", freedos_auto, 0644, why, cap) != 0 ||
+	    put(stage, "FDAUTO.BAT", fdauto, 0644, why, cap) != 0 ||
 	    put(stage, "HULLAUTO.BAT", freedos_disk_auto, 0644, why, cap) != 0)
 		return -1;
 	for (const char *const *f = (const char *const[]){ "KEY.COM", "FDAUTO.BAT", "HULLAUTO.BAT",
@@ -524,6 +792,8 @@ int hull_setup_freedos(const char *boot, const char *dir, unsigned megabytes, ch
 			return -1;
 		}
 	}
+	if (packages != NULL && stage_packages(packages, dir, why, cap) != 0)
+		return -1;
 	if ((fd = open(disk, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0 ||
 	    ftruncate(fd, (off_t)megabytes * 1024 * 1024) != 0) {
 		snprintf(why, cap, "%s: %s", disk, strerror(errno));
@@ -532,7 +802,7 @@ int hull_setup_freedos(const char *boot, const char *dir, unsigned megabytes, ch
 		return -1;
 	}
 	close(fd);
-	if (put(dir, "install.conf",
+	snprintf(install, sizeof install,
 	    "; Installs FreeDOS onto disk.img from the floppy, unattended (hull setup\n"
 	    "; freedos): it partitions, restarts, formats and powers off. Then\n"
 	    "; machine.conf boots the disk.\n"
@@ -544,7 +814,9 @@ int hull_setup_freedos(const char *boot, const char *dir, unsigned megabytes, ch
 	    "  (memory \"32M\")\n"
 	    "  (media\n"
 	    "    (medium (type floppy) (source \"image:./setup.img\"))\n"
-	    "    (medium (type disk) (source \"image:./disk.img\"))))\n", 0644, why, cap) != 0 ||
+	    "    (medium (type disk) (source \"image:./disk.img\"))%s))\n",
+	         packages != NULL ? "\n    (medium (type disk) (source \"image:./packages.img\"))" : "");
+	if (put(dir, "install.conf", install, 0644, why, cap) != 0 ||
 	    put(dir, "machine.conf",
 	    "; FreeDOS as hull setup freedos installed it.\n"
 	    "(machine\n"
