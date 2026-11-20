@@ -307,7 +307,7 @@ static void release(hull_machine *m)
 		if (m->media[i].serving)
 			pthread_join(m->media[i].server, NULL);
 		free(m->media[i].writes.written);
-		hull_media_map_close(m->media[i].map);
+		hull_media_map_close(m->media[i].map != NULL ? m->media[i].map : m->media[i].writes.map);
 	}
 	for (unsigned i = 0u; i < m->segment_count; i++) {
 		free(m->segment[i]);
@@ -792,8 +792,13 @@ static void write_back(hull_machine *m, medium *d)
 		pthread_join(d->server, NULL);
 		d->serving = 0;
 		if (d->writes.count == 0u) {
-			snprintf(said, sizeof said, "hull: %s: nothing written, nothing to write back\n",
-			         d->collection);
+			if (d->writes.taken != 0u)
+				snprintf(said, sizeof said, "hull: %s: its writes taken in %llu times as the "
+				         "machine ran, nothing left at power-off\n", d->collection,
+				         (unsigned long long)d->writes.taken);
+			else
+				snprintf(said, sizeof said, "hull: %s: nothing written, nothing to write back\n",
+				         d->collection);
 			host->on_data(m->core, NULL, 2, (const uint8_t *)said, strlen(said));
 			return;
 		}
@@ -805,11 +810,11 @@ static void write_back(hull_machine *m, medium *d)
 			static const uint8_t zero[HULL_NBD_BLOCK];
 
 			if (((d->writes.written[index / 8u] >> (index % 8u)) & 1u) ||
-			    at >= hull_media_map_size(d->map))
+			    at >= hull_media_map_size(d->writes.map))
 				continue;
-			if (at + n > hull_media_map_size(d->map))
-				n = (size_t)(hull_media_map_size(d->map) - at);
-			if (hull_media_map_read(d->map, at, block, n) != 0 ||
+			if (at + n > hull_media_map_size(d->writes.map))
+				n = (size_t)(hull_media_map_size(d->writes.map) - at);
+			if (hull_media_map_read(d->writes.map, at, block, n) != 0 ||
 			    (memcmp(block, zero, n) != 0 &&
 			     pwrite(d->fd, block, n, (off_t)at) != (ssize_t)n)) {
 				snprintf(said, sizeof said, "hull: %s was not written back: its files could not "
@@ -925,7 +930,7 @@ static int serve_collection(hull_machine *m, medium *d)
 	if (d->write_back) {
 		size_t bits = (size_t)((bytes + HULL_NBD_BLOCK - 1u) / HULL_NBD_BLOCK + 7u) / 8u;
 
-		d->map = map;
+		d->writes.collection = d->collection;  /* live: taken in at each pause */
 		if ((d->writes.overlay = open(m->cache, O_TMPFILE | O_RDWR | O_CLOEXEC, 0600)) < 0 ||
 		    ftruncate(d->writes.overlay, (off_t)bytes) != 0 ||
 		    (d->writes.written = calloc(1u, bits != 0u ? bits : 1u)) == NULL ||
@@ -934,6 +939,7 @@ static int serve_collection(hull_machine *m, medium *d)
 			         strerror(errno));
 			if (d->writes.overlay >= 0)
 				close(d->writes.overlay);
+			hull_media_map_close(map);
 			close(pair[0]);
 			close(pair[1]);
 			return -1;

@@ -181,6 +181,42 @@ cases=$((cases + 1))
 [ ! -e "$root/cw.hull-new" ] && [ ! -e "$root/cw.unsaved.img" ] ||
 	fail 'nothing left beside the collection' "$(ls "$root")"
 
+# Live: under direct the server takes the guest's writes into the
+# collection whenever it pauses, not only at power-off. A held disk -- its
+# third sector says 'h' -- runs about 8 s after its write; the collection
+# holds the write while the machine still runs, and at power-off nothing
+# is left to take.
+image 1M "$root/held.img"
+printf 'hold' | dd of="$root/held.img" bs=1 seek=1024 conv=notrunc status=none
+"$hull" media import "$root/held.img" "$root/cl" > /dev/null 2>&1
+conf '(source "media:disk") (mutable direct) (media (medium (type disk) (source "dir:./cl")))'
+(timeout 60 "$hull" run -f "$root/hull.conf" > "$root/held.out" 2>&1) &
+heldrun=$!
+live=no
+# The second sector, the one the guest writes, read from the collection
+# exported -- not a grep of its files, the boot sector's own code holding
+# the same words.
+for i in $(seq 1 40); do
+	rm -f "$root/held-now.img"
+	if "$hull" media export "$root/cl" "$root/held-now.img" > /dev/null 2>&1 &&
+	   [ "$(dd if="$root/held-now.img" bs=1 skip=512 count=13 status=none)" = 'word: written' ] &&
+	   ! grep -q '^held' "$root/held.out"; then
+		live=yes
+		break
+	fi
+	sleep 0.25
+done
+wait "$heldrun"
+got=$?
+cases=$((cases + 1))
+[ "$live" = yes ] || fail 'the write in the collection while the machine ran' "$(cat "$root/held.out")"
+out=$(cat "$root/held.out")
+status 'the held machine ran to its end' "$got" 0 "$out"
+says 'and its writes were taken as it ran' "$out" 'taken in 1 times as the machine ran'
+cases=$((cases + 1))
+"$hull" media verify "$root/cl" > /dev/null 2>&1 && [ ! -e "$root/cl.hull-new" ] ||
+	fail 'the collection verifies, nothing beside it' "$(ls "$root")"
+
 # (size ...): the disk served larger than its collection, zeros after
 # it; under direct the collection takes the larger disk back, its own
 # media.conf saying the new size and verifying. Never smaller, and an

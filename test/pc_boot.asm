@@ -3,7 +3,8 @@
 ;
 ; From a hard disk or floppy it prints the next sector of its drive, then
 ; overwrites that sector with "written", so a second boot shows whether
-; the first one's write was kept. From a CD, in El Torito's no-emulation
+; the first one's write was kept; and where the third sector begins with
+; 'h', runs about 8 s more before it powers off. From a CD, in El Torito's no-emulation
 ; mode, it installs: this sector and a fresh next one go to the first
 ; hard disk, which then boots.
 
@@ -44,6 +45,32 @@ start:
 	mov dl, [drive]
 	int 0x13
 	jc failed
+	; Held: where the third sector begins with 'h', about 8 s more
+	; running after the write, by the BIOS's tick count, then off -- so
+	; a server taking writes in at a pause has one while the machine runs.
+	mov ax, 0x0201
+	mov bx, 0x8200
+	mov cx, 3
+	xor dh, dh
+	mov dl, [drive]
+	int 0x13
+	jc off
+	cmp byte [0x8200], 'h'
+	jne off
+	xor ah, ah
+	int 0x1a
+	mov bx, dx
+.wait:
+	sti
+	hlt
+	xor ah, ah
+	int 0x1a
+	mov ax, dx
+	sub ax, bx
+	cmp ax, 146
+	jb .wait
+	mov si, held
+	call print
 	jmp off
 
 install:
@@ -94,6 +121,7 @@ drive:		db 0
 booted:		db 'booted from a drive', 13, 10, 0
 installing:	db 'installing from a disc', 13, 10, 0
 failure:	db 'a read or write failed', 13, 10, 0
+held:		db 'held', 13, 10, 0
 written:	db 'word: written', 13, 10, 0
 written_end:
 fresh:		db 'word: fresh', 13, 10, 0

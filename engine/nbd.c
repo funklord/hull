@@ -13,7 +13,13 @@
  */
 #define _GNU_SOURCE
 
+#define _ATFILE_SOURCE
 #include <errno.h>
+#include <fcntl.h>
+#include <ftw.h>
+#include <poll.h>
+#include <stdio.h>
+#include <time.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -263,6 +269,80 @@ static int write_overlay(served *s, uint64_t at, const uint8_t *data, size_t n)
 	return pwrite(w->overlay, data, n, (off_t)at) == (ssize_t)n ? 0 : -1;
 }
 
+/* --- live: the writes taken into the collection ------------------------------ */
+
+#define QUIET_MS   2000   /* the guest paused this long after writing */
+#define LONGEST_S  30     /* or writing this long without a pause */
+
+static int view_read(void *context, void *out, size_t n, uint64_t at)
+{
+	return read_merged(context, at, out, n);
+}
+
+/* Whether anything but zeros may be at `at`: the view cannot say, so all
+ * of it is read. */
+static uint64_t view_data(void *context, uint64_t at, uint64_t bytes)
+{
+	(void)context;
+	(void)bytes;
+	return at;
+}
+
+static int take_away(const char *path, const struct stat *st, int kind, struct FTW *at)
+{
+	(void)at;
+	if (kind == FTW_D || kind == FTW_DP)
+		chmod(path, (st->st_mode & 07777) | 0700);
+	return (kind == FTW_DP ? rmdir(path) : unlink(path)) == 0 ? 0 : -1;
+}
+
+/* The disk as the guest has it now -- the files and its writes over them
+ * -- taken apart into COLLECTION.hull-new, swapped in whole with the
+ * collection, and the map opened again on it; then the writes are the
+ * collection's and the overlay starts empty. Lossless whatever state the
+ * guest's filesystem is in, a taking being every byte of the disk. Where
+ * any step fails the collection and the writes stay as they were. */
+static void take(served *s)
+{
+	hull_nbd_writes     *w = s->writes;
+	hull_media_report    report;
+	hull_media_reader    reader = { view_read, view_data, s };
+	hull_media_map      *fresh_map;
+	char                 fresh[4300];
+	char                 detail[4400];
+	uint64_t             bytes;
+
+	snprintf(fresh, sizeof fresh, "%s.hull-new", w->collection);
+	if (hull_media_import_from(&reader, s->bytes, hull_media_map_sparse(s->map), fresh, &report,
+	                           detail, sizeof detail) != 0) {
+		snprintf(w->failed, sizeof w->failed, "%.255s", detail);
+		return;
+	}
+	if (renameat2(AT_FDCWD, fresh, AT_FDCWD, w->collection, RENAME_EXCHANGE) != 0) {
+		snprintf(w->failed, sizeof w->failed, "%s: %s", w->collection, strerror(errno));
+		nftw(fresh, take_away, 16, FTW_DEPTH | FTW_PHYS);
+		return;
+	}
+	if ((fresh_map = hull_media_map_open(w->collection, &bytes, detail, sizeof detail)) == NULL) {
+		/* Back as it was: the old map's files are at `fresh` now, and
+		 * swapped back they are where it read them. */
+		renameat2(AT_FDCWD, fresh, AT_FDCWD, w->collection, RENAME_EXCHANGE);
+		nftw(fresh, take_away, 16, FTW_DEPTH | FTW_PHYS);
+		snprintf(w->failed, sizeof w->failed, "%.255s", detail);
+		return;
+	}
+	hull_media_map_close(s->map);
+	s->map = fresh_map;
+	w->map = fresh_map;
+	nftw(fresh, take_away, 16, FTW_DEPTH | FTW_PHYS);
+	if (ftruncate(w->overlay, 0) == 0)
+		(void)ftruncate(w->overlay, (off_t)s->bytes);
+	memset(w->written, 0, (size_t)((s->bytes + HULL_NBD_BLOCK - 1u) / HULL_NBD_BLOCK + 7u) / 8u);
+	w->count = 0u;
+	w->taken++;
+	w->failed[0] = '\0';
+}
+
 static void *serve(void *arg)
 {
 	served  *s = arg;
@@ -271,7 +351,26 @@ static void *serve(void *arg)
 	if (buffer != NULL && negotiate(s) == 0) {
 		uint8_t request[28];
 
-		while (full_read(s->fd, request, sizeof request) == 0 && get32(request) == NBD_REQUEST) {
+		time_t since = 0;  /* when the first write not yet taken came */
+
+		for (;;) {
+			/* Live, with writes not yet taken: wait for the next request
+			 * no longer than the pause that takes them. */
+			if (s->writes != NULL && s->writes->collection != NULL && s->writes->count != 0u) {
+				struct pollfd ready = { s->fd, POLLIN, 0 };
+				int           got = poll(&ready, 1u, QUIET_MS);
+
+				if (since == 0)
+					since = time(NULL);
+				if (got == 0 || time(NULL) - since >= LONGEST_S) {
+					take(s);
+					since = 0;
+					if (got == 0)
+						continue;
+				}
+			}
+			if (full_read(s->fd, request, sizeof request) != 0 || get32(request) != NBD_REQUEST)
+				break;
 			uint16_t type = (uint16_t)(request[6] << 8 | request[7]);
 			uint64_t offset = get64(request + 16);
 			uint32_t length = get32(request + 24);
@@ -358,6 +457,7 @@ int hull_nbd_serve_writes(hull_media_map *map, uint64_t bytes, int fd, hull_nbd_
 	if (s == NULL)
 		return -1;
 	*s = (served){ map, bytes, fd, writes };
+	writes->map = map;
 	if (pthread_create(thread, NULL, serve, s) != 0) {
 		free(s);
 		return -1;

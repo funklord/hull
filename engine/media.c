@@ -45,7 +45,8 @@ typedef struct placed {
 } placed;
 
 typedef struct walk {
-	int      image;
+	int      image;           /* the image, where no reader is given */
+	const hull_media_reader *reader;  /* or the disk read through this, no file of it */
 	uint64_t bytes;
 	char     root[4200];      /* DIR/files */
 	placed  *files;
@@ -70,6 +71,9 @@ static uint32_t le32(const uint8_t *p)
 {
 	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
+
+static int image_read(const walk *w, void *to, size_t n, uint64_t at);
+static uint64_t image_data(const walk *w, uint64_t at);
 
 static int read_all(int fd, void *to, size_t n, uint64_t at)
 {
@@ -161,7 +165,7 @@ static int copy_out(walk *w, uint64_t sector, uint64_t size, const char *path)
 	while (done < size) {
 		size_t n = size - done < sizeof buffer ? (size_t)(size - done) : sizeof buffer;
 
-		if (read_all(w->image, buffer, n, sector * SECTOR + done) != 0 ||
+		if (image_read(w, buffer, n, sector * SECTOR + done) != 0 ||
 		    write_all(fd, buffer, n, done) != 0) {
 			close(fd);
 			unlink(path);
@@ -277,7 +281,7 @@ static int read_directory(walk *w, uint64_t sector, uint64_t size, const char *r
 	w->dir_extents[w->dirs++] = sector;
 	if ((bytes = malloc((size_t)size)) == NULL)
 		return -1;
-	if (read_all(w->image, bytes, (size_t)size, sector * SECTOR) != 0) {
+	if (image_read(w, bytes, (size_t)size, sector * SECTOR) != 0) {
 		free(bytes);
 		return -1;
 	}
@@ -338,7 +342,7 @@ static int read_iso(walk *w, char *volume, size_t cap)
 	uint8_t pvd[SECTOR];
 	size_t  n = 32u;
 
-	if (w->bytes < 17u * SECTOR || read_all(w->image, pvd, sizeof pvd, 16u * SECTOR) != 0 ||
+	if (w->bytes < 17u * SECTOR || image_read(w, pvd, sizeof pvd, 16u * SECTOR) != 0 ||
 	    pvd[0] != 1u || memcmp(pvd + 1, "CD001", 5u) != 0)
 		return 0;
 	while (n > 0u && pvd[40u + n - 1u] == ' ')
@@ -443,7 +447,7 @@ static uint8_t *fat_chain(walk *w, const fat *f, uint32_t cluster, size_t *lengt
 			return NULL;
 		}
 		all = grown;
-		if (read_all(w->image, all + used, (size_t)bytes,
+		if (image_read(w, all + used, (size_t)bytes,
 		             fat_sector(f, cluster) * f->bytes_per_sector) != 0) {
 			free(all);
 			return NULL;
@@ -498,7 +502,7 @@ static int fat_file(walk *w, const fat *f, uint32_t cluster, uint64_t size, cons
 		for (uint64_t at = 0u; at < piece;) {
 			size_t n = piece - at < sizeof buffer ? (size_t)(piece - at) : sizeof buffer;
 
-			if (read_all(w->image, buffer, n, fat_sector(f, start) * f->bytes_per_sector + at) != 0 ||
+			if (image_read(w, buffer, n, fat_sector(f, start) * f->bytes_per_sector + at) != 0 ||
 			    write_all(fd, buffer, n, done + at) != 0) {
 				close(fd);
 				unlink(path);
@@ -603,7 +607,7 @@ static int read_fat(walk *w, uint64_t base, const char *prefix, int *found, char
 	int      status = 0;
 
 	memset(&f, 0, sizeof f);
-	if (w->bytes < base + sizeof boot || read_all(w->image, boot, sizeof boot, base) != 0)
+	if (w->bytes < base + sizeof boot || image_read(w, boot, sizeof boot, base) != 0)
 		return 0;
 	f.bytes_per_sector    = le16(boot + 11);
 	f.sectors_per_cluster = boot[13];
@@ -629,7 +633,7 @@ static int read_fat(walk *w, uint64_t base, const char *prefix, int *found, char
 	if ((f.bits == 32u) != (root_entries == 0u) ||
 	    (f.table_bytes = (size_t)(table_sectors * f.bytes_per_sector)) > (256u << 20) ||
 	    (f.table = malloc(f.table_bytes)) == NULL ||
-	    read_all(w->image, f.table, f.table_bytes, base + reserved * f.bytes_per_sector) != 0) {
+	    image_read(w, f.table, f.table_bytes, base + reserved * f.bytes_per_sector) != 0) {
 		free(f.table);
 		return 0;
 	}
@@ -648,7 +652,7 @@ static int read_fat(walk *w, uint64_t base, const char *prefix, int *found, char
 		size_t   length = (size_t)root_entries * 32u;
 		uint8_t *root = malloc(length);
 
-		if (root != NULL && read_all(w->image, root, length, base + (reserved + fats * table_sectors) *
+		if (root != NULL && image_read(w, root, length, base + (reserved + fats * table_sectors) *
 		                             f.bytes_per_sector) == 0)
 			status = fat_directory(w, &f, root, length, prefix, 0u, volume, cap);
 		free(root);
@@ -697,7 +701,7 @@ static int ext_read_block(walk *w, const ext *e, uint64_t number, uint8_t *to)
 {
 	if (number == 0u || number >= e->blocks)
 		return -1;
-	return read_all(w->image, to, (size_t)e->block, e->base + number * e->block);
+	return image_read(w, to, (size_t)e->block, e->base + number * e->block);
 }
 
 static int ext_add(ext_run *runs, size_t *count, uint64_t logical, uint64_t physical, uint64_t n,
@@ -816,7 +820,7 @@ static int ext_inode(walk *w, const ext *e, uint64_t number, uint8_t inode[128])
 	group = (number - 1u) / e->inodes_per_group;
 	index = (number - 1u) % e->inodes_per_group;
 	if (group >= e->groups ||
-	    read_all(w->image, descriptor, (size_t)(e->descriptor_size < 64u ? e->descriptor_size : 64u),
+	    image_read(w, descriptor, (size_t)(e->descriptor_size < 64u ? e->descriptor_size : 64u),
 	             e->base + e->descriptors + group * e->descriptor_size) != 0)
 		return -1;
 	table = le32(descriptor + 8);
@@ -824,7 +828,7 @@ static int ext_inode(walk *w, const ext *e, uint64_t number, uint8_t inode[128])
 		table |= (uint64_t)le32(descriptor + 40) << 32;
 	if (table == 0u || table >= e->blocks)
 		return -1;
-	return read_all(w->image, inode, 128u, e->base + table * e->block + index * e->inode_size);
+	return image_read(w, inode, 128u, e->base + table * e->block + index * e->inode_size);
 }
 
 /* The inode's blocks as runs, its size in *size. -1 where they are not to
@@ -893,7 +897,7 @@ static void ext_link(walk *w, const ext *e, const uint8_t inode[128], ext_run *r
 		uint64_t n;
 
 		if (ext_runs(w, e, inode, &n, runs, &count) != 0 || count == 0u || runs[0].logical != 0u ||
-		    read_all(w->image, target, (size_t)size, e->base + runs[0].physical * e->block) != 0)
+		    image_read(w, target, (size_t)size, e->base + runs[0].physical * e->block) != 0)
 			return;
 	}
 	target[size] = '\0';
@@ -943,7 +947,7 @@ static int ext_file(walk *w, const ext *e, const uint8_t inode[128], ext_run *ru
 		for (uint64_t done = 0u; done < piece;) {
 			size_t n = piece - done < sizeof buffer ? (size_t)(piece - done) : sizeof buffer;
 
-			if (read_all(w->image, buffer, n, at + done) != 0 ||
+			if (image_read(w, buffer, n, at + done) != 0 ||
 			    write_all(fd, buffer, n, offset + done) != 0) {
 				close(fd);
 				unlink(path);
@@ -1036,7 +1040,7 @@ static int ext_directory(walk *w, const ext *e, uint64_t number, const char *rel
 			continue;
 		if (n > size - offset)
 			n = size - offset;
-		if (read_all(w->image, bytes + offset, (size_t)n, e->base + runs[i].physical * e->block) != 0) {
+		if (image_read(w, bytes + offset, (size_t)n, e->base + runs[i].physical * e->block) != 0) {
 			free(bytes);
 			return 0;
 		}
@@ -1092,7 +1096,7 @@ static int read_ext(walk *w, uint64_t base, const char *prefix, int *found, char
 	int      status;
 
 	memset(&e, 0, sizeof e);
-	if (w->bytes < base + 2048u || read_all(w->image, super, sizeof super, base + 1024u) != 0 ||
+	if (w->bytes < base + 2048u || image_read(w, super, sizeof super, base + 1024u) != 0 ||
 	    le16(super + 56) != 0xEF53u || le32(super + 24) > 6u)
 		return 0;
 	e.base             = base;
@@ -1145,7 +1149,7 @@ static unsigned read_table(walk *w, uint64_t first[MAX_PARTITIONS])
 	uint8_t  sector[512];
 	unsigned count = 0u;
 
-	if (w->bytes < 1024u || read_all(w->image, sector, sizeof sector, 0u) != 0 ||
+	if (w->bytes < 1024u || image_read(w, sector, sizeof sector, 0u) != 0 ||
 	    sector[510] != 0x55u || sector[511] != 0xAAu)
 		return 0u;
 	if (sector[446 + 4] == 0xEEu) {
@@ -1154,7 +1158,7 @@ static unsigned read_table(walk *w, uint64_t first[MAX_PARTITIONS])
 		uint32_t number;
 		uint32_t size;
 
-		if (read_all(w->image, header, sizeof header, 512u) != 0 ||
+		if (image_read(w, header, sizeof header, 512u) != 0 ||
 		    memcmp(header, "EFI PART", 8u) != 0)
 			return 0u;
 		entries = (uint64_t)le32(header + 72) | (uint64_t)le32(header + 76) << 32;
@@ -1168,7 +1172,7 @@ static unsigned read_table(walk *w, uint64_t first[MAX_PARTITIONS])
 			uint64_t start;
 			static const uint8_t none[16];
 
-			if (read_all(w->image, entry, sizeof entry, entries * 512u + (uint64_t)i * size) != 0)
+			if (image_read(w, entry, sizeof entry, entries * 512u + (uint64_t)i * size) != 0)
 				break;
 			if (memcmp(entry, none, sizeof none) == 0)
 				continue;
@@ -1302,7 +1306,7 @@ static unsigned describe_table(walk *w, described *out, int *gpt, uint8_t code[4
 	unsigned count = 0u;
 
 	*gpt = 0;
-	if (read_all(w->image, sector, sizeof sector, 0u) != 0)
+	if (image_read(w, sector, sizeof sector, 0u) != 0)
 		return 0u;
 	memcpy(code, sector, 440u);
 	if (sector[446 + 4] == 0xEEu) {
@@ -1311,7 +1315,7 @@ static unsigned describe_table(walk *w, described *out, int *gpt, uint8_t code[4
 		uint32_t number, size;
 
 		*gpt = 1;
-		if (read_all(w->image, header, sizeof header, 512u) != 0)
+		if (image_read(w, header, sizeof header, 512u) != 0)
 			return 0u;
 		entries = (uint64_t)le32(header + 72) | (uint64_t)le32(header + 76) << 32;
 		number = le32(header + 80);
@@ -1322,7 +1326,7 @@ static unsigned describe_table(walk *w, described *out, int *gpt, uint8_t code[4
 			uint64_t             start, last;
 			described           *d = &out[count];
 
-			if (read_all(w->image, entry, sizeof entry, entries * 512u + (uint64_t)i * size) != 0)
+			if (image_read(w, entry, sizeof entry, entries * 512u + (uint64_t)i * size) != 0)
 				break;
 			if (memcmp(entry, none, sizeof none) == 0)
 				continue;
@@ -1414,7 +1418,7 @@ static int describe_disk(walk *w, const char *dir, char *detail, size_t cap)
 		snprintf(tree, sizeof tree, "files/p%u", i + 1u);
 		snprintf(path, sizeof path, "%s/%s", dir, tree);
 		read_tree = stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-		if (read_all(w->image, super, sizeof super, d->first * 512u + 1024u) == 0 &&
+		if (image_read(w, super, sizeof super, d->first * 512u + 1024u) == 0 &&
 		    super[56] == 0x53u && super[57] == 0xefu)
 			ext = 1;
 		if (!read_tree)
@@ -1448,7 +1452,7 @@ static int describe_disk(walk *w, const char *dir, char *detail, size_t cap)
 			uint8_t boot[512];
 
 			fprintf(file, "\n               (filesystem vfat)");
-			if (read_all(w->image, boot, sizeof boot, d->first * 512u) == 0)
+			if (image_read(w, boot, sizeof boot, d->first * 512u) == 0)
 				plain_label(memcmp(boot + 0x52, "FAT32", 5u) == 0 ? boot + 0x47 : boot + 0x2b, 11u,
 				            label, sizeof label);
 			if (strcmp(label, "NO NAME") == 0)
@@ -1669,6 +1673,74 @@ static uint64_t next_data(int fd, uint64_t at, uint64_t bytes)
 	off_t found = lseek(fd, (off_t)at, SEEK_DATA);
 
 	return found < 0 ? (errno == ENXIO ? bytes : at) : (uint64_t)found;
+}
+
+/* The disk being taken apart, from its file or through its reader. */
+static int image_read(const walk *w, void *to, size_t n, uint64_t at)
+{
+	return w->reader != NULL ? w->reader->read(w->reader->context, to, n, at) :
+	       read_all(w->image, to, n, at);
+}
+
+static uint64_t image_data(const walk *w, uint64_t at)
+{
+	return w->reader != NULL ? w->reader->data(w->reader->context, at, w->bytes) :
+	       next_data(w->image, at, w->bytes);
+}
+
+/* hash_fd()'s or hash_sparse()'s digest of the disk being taken apart,
+ * read as image_read() reads it. */
+static int hash_walk(const walk *w, char out[65])
+{
+	static const uint8_t zero[SPARSE_BLOCK];
+	uint8_t             *buffer = malloc(COPY_BYTES);
+	hull_sha256          h;
+	uint8_t              digest[32];
+	uint8_t              offset[8];
+	uint64_t             at = 0u;
+
+	if (buffer == NULL)
+		return -1;
+	hull_sha256_init(&h);
+	if (!w->sparse) {
+		while (at < w->bytes) {
+			size_t n = w->bytes - at < COPY_BYTES ? (size_t)(w->bytes - at) : COPY_BYTES;
+
+			if (image_read(w, buffer, n, at) != 0) {
+				free(buffer);
+				return -1;
+			}
+			hull_sha256_update(&h, buffer, n);
+			at += n;
+		}
+	} else {
+		while ((at = image_data(w, at)) < w->bytes) {
+			size_t n;
+
+			at -= at % SPARSE_BLOCK;
+			n = w->bytes - at < COPY_BYTES ? (size_t)(w->bytes - at) : COPY_BYTES;
+			if (image_read(w, buffer, n, at) != 0) {
+				free(buffer);
+				return -1;
+			}
+			for (size_t i = 0u; i < n; i += SPARSE_BLOCK) {
+				size_t piece = n - i < SPARSE_BLOCK ? n - i : SPARSE_BLOCK;
+
+				if (memcmp(buffer + i, zero, piece) != 0) {
+					le64_of(at + i, offset);
+					hull_sha256_update(&h, offset, sizeof offset);
+					hull_sha256_update(&h, buffer + i, piece);
+				}
+			}
+			at += n;
+		}
+		le64_of(w->bytes, offset);
+		hull_sha256_update(&h, offset, sizeof offset);
+	}
+	free(buffer);
+	hull_sha256_final(&h, digest);
+	hull_sha256_hex(digest, out);
+	return 0;
 }
 
 static int hash_sparse(int fd, uint64_t bytes, char out[65])
@@ -2266,7 +2338,7 @@ static int write_quirks(const walk *w, int naive, const char *dir, hull_media_re
 
 	for (uint64_t at = 0u; at < w->bytes;) {
 		size_t   n;
-		uint64_t next = next_data(w->image, at, w->bytes);
+		uint64_t next = image_data(w, at);
 		uint64_t other = next_data(naive, at, w->bytes);
 
 		/* Where both are holes, they agree. */
@@ -2282,7 +2354,7 @@ static int write_quirks(const walk *w, int naive, const char *dir, hull_media_re
 			at = next - next % w->unit;
 		}
 		n = w->bytes - at < sizeof ours ? (size_t)(w->bytes - at) : sizeof ours;
-		if (read_all(w->image, theirs, n, at) != 0 || read_all(naive, ours, n, at) != 0)
+		if (image_read(w, theirs, n, at) != 0 || read_all(naive, ours, n, at) != 0)
 			return fail(detail, cap, "the image cannot be read", strerror(errno));
 		for (size_t i = 0u; i < n; i += w->unit) {
 			size_t piece = n - i < w->unit ? n - i : w->unit;
@@ -2341,7 +2413,7 @@ static int import_into(walk *w, const char *dir, hull_media_report *report, char
 		    (!found && read_partitions(w, volume, sizeof volume) != 0))
 			return fail(detail, cap, "the disk's files cannot be written", strerror(errno));
 	}
-	if ((w->sparse ? hash_sparse(w->image, w->bytes, sha) : hash_fd(w->image, w->bytes, sha)) != 0)
+	if (hash_walk(w, sha) != 0)
 		return fail(detail, cap, "the image cannot be read", strerror(errno));
 	if (w->count != 0u)
 		qsort(w->files, w->count, sizeof w->files[0], by_sector);
@@ -2951,6 +3023,11 @@ uint64_t hull_media_map_size(const hull_media_map *map)
 	return map->bytes;
 }
 
+int hull_media_map_sparse(const hull_media_map *map)
+{
+	return map->sparse;
+}
+
 int hull_media_map_read(hull_media_map *map, uint64_t at, void *out, size_t n)
 {
 	uint64_t longest_quirk = 0u;
@@ -3073,6 +3150,40 @@ int hull_media_export(const char *dir, const char *out, char *detail, size_t cap
 
 	pthread_mutex_lock(&media_lock);
 	status = media_export_locked(dir, out, detail, cap);
+	pthread_mutex_unlock(&media_lock);
+	return status;
+}
+
+int hull_media_import_from(const hull_media_reader *reader, uint64_t bytes, int sparse,
+                           const char *dir, hull_media_report *report, char *detail, size_t cap)
+{
+	walk *w;
+	int   status;
+
+	memset(report, 0, sizeof *report);
+	pthread_mutex_lock(&media_lock);
+	if ((w = calloc(1u, sizeof *w)) == NULL) {
+		pthread_mutex_unlock(&media_lock);
+		return fail(detail, cap, "out of memory", NULL);
+	}
+	w->image = -1;
+	w->reader = reader;
+	w->owners = -1;
+	w->devices = -1;
+	w->bytes = bytes;
+	w->sparse = sparse;
+	if (mkdir(dir, 0755) != 0) {
+		status = fail(detail, cap, dir, strerror(errno));
+	} else {
+		snprintf(w->root, sizeof w->root, "%s/files", dir);
+		status = import_into(w, dir, report, detail, cap);
+		if (status != 0)
+			nftw(dir, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
+	}
+	for (size_t i = 0u; i < w->count; i++)
+		free(w->files[i].path);
+	free(w->files);
+	free(w);
 	pthread_mutex_unlock(&media_lock);
 	return status;
 }

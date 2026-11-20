@@ -358,6 +358,37 @@ with zipfile.ZipFile(sys.argv[1]) as archive, open(sys.argv[2], "wb") as out:
 	out=$(tr -d '\r' < "$root/sp.out")
 	status 'the disk with its packages boots' "$got" 0 "$out"
 	says 'and runs a package of them' "$out" 'C:\FreeDOS\BIN\EDIT.EXE'
+
+	# Live: the disk as a collection, FreeDOS writing a file on it under
+	# (mutable direct) and then idling; the server takes the writes in at
+	# the pause, so the file is a file of the collection's while DOS runs.
+	cp "$root/sp/disk.img" "$root/live.img"
+	printf '@echo off\r\nC:\\KEY.COM\r\nCTTY COM1\r\necho written by DOS> C:\\NEW.TXT\r\necho wrote\r\n:spin\r\ngoto spin\r\n' \
+		> "$root/LAUTO.BAT"
+	mcopy -o -i "$root/live.img@@32256" "$root/LAUTO.BAT" ::AUTOEXEC.BAT
+	rm -rf "$root/lc"
+	timeout 120 "$hull" media import "$root/live.img" "$root/lc" > /dev/null 2>&1
+	printf '(machine (backend pc) (source "media:disk") (mutable direct) (memory "32M") (media (medium (type disk) (source "dir:%s/lc"))))\n' \
+		"$root" > "$root/live.conf"
+	(cd / && exec timeout -k 5 60 "$hull" run -f "$root/live.conf" < /dev/null > "$root/live.out" 2>&1) &
+	liverun=$!
+	live=no
+	for i in $(seq 1 120); do
+		if [ "$(tr -d '\r' < "$root/lc/files/p1/NEW.TXT" 2> /dev/null)" = 'written by DOS' ]; then
+			live=yes
+			break
+		fi
+		sleep 0.25
+	done
+	cases=$((cases + 1))
+	[ "$live" = yes ] && kill -0 "$liverun" 2> /dev/null ||
+		fail 'a file DOS wrote is a file of the collection while DOS runs' \
+			"$(tr -d '\r' < "$root/live.out"; ls "$root/lc/files/p1" 2>&1)"
+	kill "$liverun" 2> /dev/null
+	wait "$liverun"
+	cases=$((cases + 1))
+	"$hull" media verify "$root/lc" > /dev/null 2>&1 ||
+		fail 'the collection verifies after it' "$(ls "$root")"
 else
 	printf 'legacy: %s not fetched, the packages not tried\n' "$lite"
 fi

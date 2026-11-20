@@ -77,6 +77,21 @@ typedef struct hull_media_report {
 int hull_media_import(const char *image, const char *dir, hull_media_report *report, char *detail,
                       size_t cap);
 
+/* A disk read through callbacks rather than a file: `read` fills `n`
+ * bytes at `at`, 0 or -1; `data` gives the next offset from `at` that may
+ * hold anything but zeros, or `bytes` -- `at` itself where it cannot say. */
+typedef struct hull_media_reader {
+	int      (*read)(void *context, void *out, size_t n, uint64_t at);
+	uint64_t (*data)(void *context, uint64_t at, uint64_t bytes);
+	void      *context;
+} hull_media_reader;
+
+/* As hull_media_import, the disk `bytes` long read through `reader`, its
+ * digest hash_sparse's where `sparse`: a disk that is no file -- a served
+ * disk's files and its guest's writes -- taken apart with no image made. */
+int hull_media_import_from(const hull_media_reader *reader, uint64_t bytes, int sparse,
+                           const char *dir, hull_media_report *report, char *detail, size_t cap);
+
 /* `dir`'s raw dump, reassembled to the empty file `fd` and its hash held
  * to media.conf's. 0, or -1 with why in `detail`; 1 where the collection
  * was imported from no raw dump. */
@@ -96,6 +111,7 @@ typedef struct hull_media_map hull_media_map;
 hull_media_map *hull_media_map_open(const char *dir, uint64_t *bytes, char *detail, size_t cap);
 int hull_media_map_read(hull_media_map *map, uint64_t at, void *out, size_t n);
 uint64_t hull_media_map_size(const hull_media_map *map);
+int hull_media_map_sparse(const hull_media_map *map);
 int hull_media_map_verify(hull_media_map *map, char *detail, size_t cap);
 void hull_media_map_close(hull_media_map *map);
 
