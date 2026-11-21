@@ -1406,8 +1406,12 @@ $(BUILD_DIR)/test/board-fw/lora-%.flash: test/board/lora_esp32.c test/board/esp3
 
 # Espressif's qemu with hull's SX1276 (engine/esp-lora.patch), for a
 # board's (tuning (pc (lora NAME))): its source at the tag hull's fetch
-# pins, the commit checked, patched and built for xtensa alone, into
-# $(BUILD_DIR)/esp-qemu-lora, where HULL_ESP_LORA_QEMU names it. Not part
+# pins, the commit checked, patched and built for xtensa, into
+# $(BUILD_DIR)/esp-qemu-lora, where HULL_ESP_LORA_QEMU names it; and for
+# riscv32, the ESP32-C3's WiFi, from a build directory of its own --
+# lcgamboa's ESP32 and C3 WiFi files define the same symbols, which one
+# build's common library would hold both of -- linked beside the Xtensa
+# qemu, where the engine looks for it. Not part
 # of any other target: it fetches the source, about 200 MB, and builds
 # for some minutes.
 esp-qemu-lora: $(ESP_QEMU_LORA)
@@ -1429,7 +1433,11 @@ ESP_PATCH_NEW = hw/misc/sx127x.c \
                 include/hw/misc/esp32_ana.h \
                 include/hw/misc/esp32_fe.h \
                 hw/ssi/esp32s3_gpspi.c \
-                include/hw/ssi/esp32s3_gpspi.h
+                include/hw/ssi/esp32s3_gpspi.h \
+                hw/misc/esp32c3_wifi.c \
+                hw/misc/esp32c3_ana.c \
+                include/hw/misc/esp32c3_wifi.h \
+                include/hw/misc/esp32c3_ana.h
 
 $(ESP_QEMU_LORA): engine/esp-lora.patch
 	@mkdir -p '$(BUILD_DIR)/esp-qemu-lora'
@@ -1445,6 +1453,12 @@ $(ESP_QEMU_LORA): engine/esp-lora.patch
 		--target-list=xtensa-softmmu --without-default-features --enable-slirp \
 		--enable-gcrypt --disable-werror --disable-docs > configure.log
 	ninja -C '$(BUILD_DIR)/esp-qemu-lora/build' -j $(ESP_QEMU_JOBS) qemu-system-xtensa
+	mkdir -p '$(BUILD_DIR)/esp-qemu-lora/build-riscv'
+	cd '$(BUILD_DIR)/esp-qemu-lora/build-riscv' && test -f build.ninja || ../src/configure \
+		--target-list=riscv32-softmmu --without-default-features --enable-slirp \
+		--enable-gcrypt --disable-werror --disable-docs > configure.log
+	ninja -C '$(BUILD_DIR)/esp-qemu-lora/build-riscv' -j $(ESP_QEMU_JOBS) qemu-system-riscv32
+	ln -sfn ../build-riscv/qemu-system-riscv32 '$(BUILD_DIR)/esp-qemu-lora/build/qemu-system-riscv32'
 
 # The LM3S6965's and the MPS2 AN385's network firmware, as the
 # ESP32-C3's: NAT and a wire. BOARD, then NAT or WIRE-END.

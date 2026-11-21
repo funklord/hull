@@ -342,6 +342,62 @@ open(sys.argv[2], "wb").write(img + b"\xff" * (4 * 1024 * 1024 - len(img)))' "$m
 	else
 		printf 'board: no WiFi tried: MicroPython for the ESP32 not fetched\n'
 	fi
+	# An ESP32-C3's WiFi, lcgamboa's C3 model in the RISC-V qemu make
+	# esp-qemu-lora builds beside the Xtensa one: MicroPython's published
+	# image for the C3, a whole flash from 0, joining on NAT, then two on
+	# one segment hearing each other, as the ESP32s do.
+	c3=${BUILD_DIR:?}/test/board-data/ESP32_GENERIC_C3-20250415-v1.25.0.bin
+	[ -f "$c3" ] || curl -fsS -m 200 -o "$c3.part" \
+		https://micropython.org/resources/firmware/ESP32_GENERIC_C3-20250415-v1.25.0.bin &&
+		mv "$c3.part" "$c3" 2> /dev/null
+	if [ ! -x "$(dirname "$LORA_QEMU")/qemu-system-riscv32" ]; then
+		printf 'board: no C3 WiFi tried: make esp-qemu-lora has built no RISC-V qemu\n'
+	elif [ -f "$c3" ] &&
+	     printf '4dd82c4bc8b90d4a8f303eedc1bf2b87ace1827daad3a855c6ce3209482f46f3  %s\n' "$c3" |
+	     sha256sum -c --quiet > /dev/null 2>&1; then
+		python3 -I -c '
+import sys
+d = open(sys.argv[1], "rb").read()
+open(sys.argv[2], "wb").write(d + b"\xff" * (4 * 1024 * 1024 - len(d)))' "$c3" "$root/c3.fw"
+		cp "$root/c3.fw" "$root/c3b.fw"
+		printf '(machine (backend pc) (hostname "c3") (source "image:./c3.fw") (network nat) (tuning (pc (machine esp32-c3-devkitm-1) (nic wifi))))\n' \
+			> "$root/c3.conf"
+		(cd "$root" && XDG_RUNTIME_DIR=$root/run-lora HULL_ESP_LORA_QEMU=$LORA_QEMU \
+			exec timeout -k 2 120 "$hull" run -f "$root/c3.conf" > "$root/c3.out" 2>&1) &
+		runner=$!
+		tries=0
+		until grep -aq 'MicroPython v' "$root/c3.out" 2> /dev/null || [ "$tries" -ge 120 ]; do
+			tries=$((tries + 1))
+			sleep 0.5
+		done
+		sleep 2
+		said=$(XDG_RUNTIME_DIR=$root/run-lora timeout 90 python3 -I "$(cd "$(dirname "$0")" && pwd)/board/mp_wifi.py" "$hull" c3 2>&1)
+		XDG_RUNTIME_DIR=$root/run-lora timeout 30 "$hull" stop c3 > /dev/null 2>&1
+		wait "$runner"
+		cases=$((cases + 1))
+		printf '%s\n' "$said" | grep -q '^wifi True 10\.0\.2\.15' ||
+			fail "an ESP32-C3 running MicroPython did not join the WiFi and get an address" "$said"
+		printf '(machines\n  (ca (backend pc) (source "image:./c3.fw") (segments "air3") (tuning (pc (machine esp32-c3-devkitm-1) (nic wifi))))\n  (cb (backend pc) (source "image:./c3b.fw") (segments "air3") (tuning (pc (machine esp32-c3-devkitm-1) (nic wifi)))))\n' \
+			> "$root/air3.conf"
+		(cd "$root" && XDG_RUNTIME_DIR=$root/run-lora HULL_ESP_LORA_QEMU=$LORA_QEMU \
+			exec timeout -k 2 200 "$hull" run -f "$root/air3.conf" > "$root/air3.out" 2>&1) &
+		runner=$!
+		tries=0
+		until [ "$(grep -ac 'MicroPython v' "$root/air3.out" 2> /dev/null)" -ge 2 ] || [ "$tries" -ge 120 ]; do
+			tries=$((tries + 1))
+			sleep 0.5
+		done
+		sleep 2
+		said=$(XDG_RUNTIME_DIR=$root/run-lora timeout 170 python3 -I "$(cd "$(dirname "$0")" && pwd)/board/mp_wire.py" "$hull" ca cb 2>&1)
+		XDG_RUNTIME_DIR=$root/run-lora timeout 30 "$hull" stop ca > /dev/null 2>&1
+		XDG_RUNTIME_DIR=$root/run-lora timeout 30 "$hull" stop cb > /dev/null 2>&1
+		wait "$runner"
+		cases=$((cases + 1))
+		printf '%s\n' "$said" | grep -q "^heard b'over the air'" ||
+			fail "two ESP32-C3s on one segment by WiFi did not hear each other" "$said"
+	else
+		printf 'board: no C3 WiFi tried: MicroPython for the ESP32-C3 not fetched\n'
+	fi
 else
 	printf 'board: no WiFi tried: no make esp-qemu-lora, or no ESP32 fetched\n'
 fi

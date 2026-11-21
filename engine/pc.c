@@ -439,6 +439,34 @@ static int esp_lora_emulator(char *out, size_t cap)
 	return access(out, X_OK);
 }
 
+/* The same build's RISC-V qemu, for an ESP32-C3's WiFi: beside the
+ * Xtensa one HULL_ESP_LORA_QEMU names, as make esp-qemu-lora puts it. */
+static int esp_lora_riscv(char *out, size_t cap)
+{
+	char *slash;
+
+	if (esp_lora_emulator(out, cap) != 0)
+		return -1;
+	if ((slash = strrchr(out, '/')) == NULL ||
+	    (size_t)(slash - out) + sizeof "/qemu-system-riscv32" > cap)
+		return -1;
+	strcpy(slash, "/qemu-system-riscv32");
+	return access(out, X_OK);
+}
+
+/* Whether the board's chip has lcgamboa's WiFi: the ESP32's, and the C3's. */
+static int esp_wifi_chip(const board *b)
+{
+	return b != NULL && b->chip != NULL &&
+	       (strcmp(b->chip, "esp32") == 0 || strcmp(b->chip, "esp32c3") == 0);
+}
+
+/* qemu for a board with WiFi: the C3's RISC-V build or the ESP32's. */
+static int esp_wifi_emulator(const board *b, char *out, size_t cap)
+{
+	return strcmp(b->chip, "esp32c3") == 0 ? esp_lora_riscv(out, cap) : esp_lora_emulator(out, cap);
+}
+
 /*
  * An ESP32's flash for this run: the firmware, a whole flash image, copied
  * into the run directory and filled out with erased flash, 0xff, to the
@@ -532,26 +560,42 @@ static uint8_t esp_mac_crc(const uint8_t mac[6])
  * one Espressif's qemu gives a blank efuse, a MAC of zeros, which slirp
  * answers but which every board shares: two on one segment each sent
  * from 00:00:00:00:00:00, and the second's ARP reply went to itself.
- * The 124 bytes are the efuse's read registers in order, BLK0's seven
- * words then BLK1 to 3; the MAC is BLK0's bits 32 to 79, its bytes the
- * other way round, the ROM's CRC-8 of it at 80. 0, or -1 with m->why.
+ * An ESP32's 124 bytes are the efuse's read registers in order, BLK0's
+ * seven words then BLK1 to 3; the MAC is BLK0's bits 32 to 79, its bytes
+ * the other way round, the ROM's CRC-8 of it at 80. A C3's are qemu's
+ * ESPEfuseBlocks, 336 bytes: BLK0's six words, then BLK1, whose first 48
+ * bits are the MAC the same way round, no CRC; and the chip revision v0.3
+ * and efuse block version 1.3 qemu sets where it is given no file, which
+ * ESP-IDF 5 requires of a C3. 0, or -1 with m->why.
  */
-static int esp_efuse(hull_machine *m)
+static int esp_efuse(hull_machine *m, const board *b)
 {
-	uint8_t efuse[124] = { 0 };
+	uint8_t efuse[336] = { 0 };
+	size_t  size = 124u;
 	uint8_t mac[6];
 	int     out;
 	int     good;
 
 	hull_access_segment_mac(m->address, m->segment_count > 0u ? m->segment[0] : "wifi", 0u, mac);
-	for (unsigned i = 0u; i < 6u; i++)
-		efuse[4u + i] = mac[5u - i];
-	efuse[10] = esp_mac_crc(mac);
+	if (strcmp(b->chip, "esp32c3") == 0) {
+		uint32_t revision = 3u << 24 | 3u << 18;   /* BLK_VERSION_MINOR, WAFER_VER_MINOR_LO */
+
+		size = sizeof efuse;
+		for (unsigned i = 0u; i < 6u; i++)
+			efuse[24u + i] = mac[5u - i];
+		for (unsigned i = 0u; i < 4u; i++)
+			efuse[36u + i] = (uint8_t)(revision >> (8u * i));
+		efuse[64] = 1u;                              /* BLK_VERSION_MAJOR */
+	} else {
+		for (unsigned i = 0u; i < 6u; i++)
+			efuse[4u + i] = mac[5u - i];
+		efuse[10] = esp_mac_crc(mac);
+	}
 	if ((out = open(run_file(m, "efuse.bin"), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0) {
 		snprintf(m->why, sizeof m->why, "the board's efuse could not be made in the run directory\n");
 		return -1;
 	}
-	good = write(out, efuse, sizeof efuse) == (ssize_t)sizeof efuse;
+	good = write(out, efuse, size) == (ssize_t)size;
 	if (close(out) != 0 || !good) {
 		snprintf(m->why, sizeof m->why, "the board's efuse could not be made in the run directory\n");
 		return -1;
@@ -588,7 +632,7 @@ static int prepare_state(hull_machine *m)
 		         "SX1276, `make esp-qemu-lora`, and HULL_ESP_LORA_QEMU naming it\n");
 		return -1;
 	}
-	if (m->nic != NULL && strcmp(m->nic, "wifi") == 0 && esp_lora_emulator(from, sizeof from) != 0) {
+	if (m->nic != NULL && strcmp(m->nic, "wifi") == 0 && b != NULL && esp_wifi_emulator(b, from, sizeof from) != 0) {
 		snprintf(m->why, sizeof m->why, "an ESP32's WiFi needs Espressif's qemu built with hull's "
 		         "patch, `make esp-qemu-lora`, and HULL_ESP_LORA_QEMU naming it\n");
 		return -1;
@@ -627,7 +671,7 @@ static int prepare_state(hull_machine *m)
 	if (is_esp(b)) {
 		if (esp_flash(m, b) != 0)
 			return -1;
-		return m->nic != NULL && strcmp(m->nic, "wifi") == 0 ? esp_efuse(m) : 0;
+		return m->nic != NULL && strcmp(m->nic, "wifi") == 0 ? esp_efuse(m, b) : 0;
 	}
 	if (m->state != NULL && m->direct && mkdir(m->state, 0700) != 0 && errno != EEXIST) {
 		snprintf(m->why, sizeof m->why, "%s: %s\n", m->state, strerror(errno));
@@ -1465,8 +1509,8 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 			/* An ESP32's WiFi, its own MAC to an access point in qemu,
 			 * in place of its Ethernet, on the same network. */
 			if (m->nic != NULL && (strcmp(m->nic, "wifi") != 0 ||
-			                       strcmp(board_named(m->machine_type)->chip, "esp32") != 0))
-				return "a board's Ethernet is its chip's: no (nic …) but an ESP32's (nic wifi)";
+			                       !esp_wifi_chip(board_named(m->machine_type))))
+				return "a board's Ethernet is its chip's: no (nic …) but an ESP32's or a C3's (nic wifi)";
 		} else if (m->network || m->segment_count != 0u || m->port_count != 0u) {
 			return "a board's serial port is its one way in: no network, segments or ports";
 		}
@@ -1529,6 +1573,7 @@ static void exec_board(const hull_machine *m, const board *b)
 	int   n = 0;
 	int   monitor_fd;
 	int   wifi = m->nic != NULL && strcmp(m->nic, "wifi") == 0;
+	const char *wifi_model = b != NULL && b->chip != NULL && strcmp(b->chip, "esp32c3") == 0 ? "esp32c3_wifi" : "esp32_wifi";
 
 	/* s51: the UART on descriptors 3 and 4, the machine's stdin and
 	 * stdout; its command console on a pipe whose writing end it holds
@@ -1638,7 +1683,7 @@ static void exec_board(const hull_machine *m, const board *b)
 		argv[n++] = drive;
 		if (esp_emulator(b, emulator, sizeof emulator) != 0)
 			return;
-		if (wifi && esp_lora_emulator(lora_emulator, sizeof lora_emulator) != 0)
+		if (wifi && esp_wifi_emulator(b, lora_emulator, sizeof lora_emulator) != 0)
 			return;
 		argv[0] = m->lora != NULL || wifi ? lora_emulator : emulator;
 		/* Its WiFi's MAC, from the efuse esp_efuse made. */
@@ -1648,7 +1693,9 @@ static void exec_board(const hull_machine *m, const board *b)
 			argv[n++] = "-drive";
 			argv[n++] = efuse;
 			argv[n++] = "-global";
-			argv[n++] = "driver=nvram.esp32.efuse,property=drive,value=efuse";
+			argv[n++] = strcmp(b->chip, "esp32c3") == 0 ?
+			            "driver=nvram.esp32c3.efuse,property=drive,value=efuse" :
+			            "driver=nvram.esp32.efuse,property=drive,value=efuse";
 		}
 	} else {
 		argv[n++] = (char *)b->load;
@@ -1659,7 +1706,7 @@ static void exec_board(const hull_machine *m, const board *b)
 	 * is the machine's own and no -device. */
 	if (b->nic != NULL && m->network) {
 		size_t at = (size_t)snprintf(nic, sizeof nic, "user,model=%s",
-		                             wifi ? "esp32_wifi" : b->nic);
+		                             wifi ? wifi_model : b->nic);
 
 		for (unsigned i = 0u; i < m->port_count && at < sizeof nic; i++)
 			at += (size_t)snprintf(nic + at, sizeof nic - at, ",hostfwd=%s:%s:%u-:%u",
@@ -1678,7 +1725,7 @@ static void exec_board(const hull_machine *m, const board *b)
 		hull_access_segment_mac(m->address, m->segment[0], 0u, mac);
 		snprintf(netdev, sizeof netdev, "stream,id=s0,addr.type=fd,addr.str=%d", fd);
 		snprintf(nic, sizeof nic, "nic,model=%s,netdev=s0,"
-		         "macaddr=%02x:%02x:%02x:%02x:%02x:%02x", wifi ? "esp32_wifi" : b->nic,
+		         "macaddr=%02x:%02x:%02x:%02x:%02x:%02x", wifi ? wifi_model : b->nic,
 		         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 		argv[n++] = "-netdev";
 		argv[n++] = netdev;
