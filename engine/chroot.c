@@ -3070,12 +3070,15 @@ static void start_cgroup(hull_machine *m)
 		    mkdir(m->cgroup, 0755) == 0) {
 			snprintf(procs, sizeof procs, "%s/cgroup.procs", m->cgroup);
 			snprintf(pid_text, sizeof pid_text, "%ld", (long)m->pid);
-			if ((fd = open(procs, O_WRONLY | O_CLOEXEC)) >= 0 &&
-			    write(fd, pid_text, strlen(pid_text)) == (ssize_t)strlen(pid_text) &&
-			    close(fd) == 0)
-				return;
-			if (fd >= 0)
-				close(fd);
+			/* Closed once whatever the write did: a second close of
+			 * a descriptor another thread of the core may since have
+			 * been given would close that one. */
+			if ((fd = open(procs, O_WRONLY | O_CLOEXEC)) >= 0) {
+				int wrote = write(fd, pid_text, strlen(pid_text)) == (ssize_t)strlen(pid_text);
+
+				if (close(fd) == 0 && wrote)
+					return;
+			}
 			rmdir(m->cgroup);
 		}
 		m->cgroup[0] = '\0';
