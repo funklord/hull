@@ -429,7 +429,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: esp-qemu-lora check-tsan
-.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-windows kernel-check check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-disk check-usb check-usbredir check-vhost vhost-device dosemu2 cross-ppc64le qemu-ppc check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-windows kernel-check kernel-cves check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-disk check-usb check-usbredir check-vhost vhost-device dosemu2 cross-ppc64le qemu-ppc check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -530,6 +530,7 @@ help:
 	@echo '  limine    build Limine $(LIMINE_VERSION) from source, for BIOS-bootable exports'
 	@echo '  kernel    build the vm kernel of hull'"'"'s own, vmlinuz-hull, from Linux $(KERNEL_VERSION)'
 	@echo '  kernel-check  whether that Linux is the newest of its longterm series, by kernel.org'"'"'s signed sums'
+	@echo '  kernel-cves   which of the kernel'"'"'s CVEs apply to that Linux as built here'
 	@echo '  nss       build the NSS module, libnss_hull.so.2, for *.hull names'
 	@echo '  gui       build hull-gui, the machine manager, and with vendor/qtty its --tui'
 	@echo '  root      build root mode'"'"'s helper, hull-root'
@@ -712,6 +713,19 @@ kernel: $(KERNEL_BIN) $(KERNEL_ELF) $(KERNEL_MODULES)/modules.dep $(KERNEL_ARM64
 # sums (kernel/autosigner.asc); prints the two lines that move it.
 kernel-check:
 	python3 tool/kernel_stable.py '$(KERNEL_VERSION)' '$(KERNEL_SHA256)'
+
+# Which of the kernel CNA's CVEs apply to it as built: affecting this
+# stable, in a file the config compiles. The records, a shallow clone of
+# vulns.git, are kept in $(BUILD_DIR)/kernel/vulns and brought up to date.
+KERNEL_VULNS = $(BUILD_DIR)/kernel/vulns
+kernel-cves: $(KERNEL_BIN)
+	if [ -d '$(KERNEL_VULNS)/.git' ]; then \
+		git -C '$(KERNEL_VULNS)' fetch -q --depth 1 origin && git -C '$(KERNEL_VULNS)' reset -q --hard FETCH_HEAD; \
+	else \
+		git clone -q --depth 1 https://git.kernel.org/pub/scm/linux/security/vulns.git '$(KERNEL_VULNS)'; \
+	fi
+	python3 tool/kernel_cves.py '$(KERNEL_VULNS)' '$(KERNEL_VERSION)' '$(KERNEL_SRC)' \
+		$(if $(wildcard $(KERNEL_A64_SRC)/vmlinux),'$(KERNEL_A64_SRC)')
 
 $(KERNEL_TAR):
 	@mkdir -p '$(@D)'
