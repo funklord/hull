@@ -512,6 +512,53 @@ static int esp_flash(hull_machine *m, const board *b)
 	return 0;
 }
 
+/* The ESP32 ROM's CRC-8 of a MAC, which ESP-IDF checks the efuse's
+ * against: Dallas's, reflected, 0x8c. */
+static uint8_t esp_mac_crc(const uint8_t mac[6])
+{
+	uint8_t crc = 0u;
+
+	for (unsigned i = 0u; i < 6u; i++) {
+		crc ^= mac[i];
+		for (unsigned bit = 0u; bit < 8u; bit++)
+			crc = (crc & 1u) != 0u ? (uint8_t)((crc >> 1) ^ 0x8cu) : (uint8_t)(crc >> 1);
+	}
+	return crc;
+}
+
+/*
+ * An ESP32's efuse for this run, efuse.bin: its factory MAC, which the
+ * WiFi station takes, the machine's own as its Ethernet's is. Without
+ * one Espressif's qemu gives a blank efuse, a MAC of zeros, which slirp
+ * answers but which every board shares: two on one segment each sent
+ * from 00:00:00:00:00:00, and the second's ARP reply went to itself.
+ * The 124 bytes are the efuse's read registers in order, BLK0's seven
+ * words then BLK1 to 3; the MAC is BLK0's bits 32 to 79, its bytes the
+ * other way round, the ROM's CRC-8 of it at 80. 0, or -1 with m->why.
+ */
+static int esp_efuse(hull_machine *m)
+{
+	uint8_t efuse[124] = { 0 };
+	uint8_t mac[6];
+	int     out;
+	int     good;
+
+	hull_access_segment_mac(m->address, m->segment_count > 0u ? m->segment[0] : "wifi", 0u, mac);
+	for (unsigned i = 0u; i < 6u; i++)
+		efuse[4u + i] = mac[5u - i];
+	efuse[10] = esp_mac_crc(mac);
+	if ((out = open(run_file(m, "efuse.bin"), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0) {
+		snprintf(m->why, sizeof m->why, "the board's efuse could not be made in the run directory\n");
+		return -1;
+	}
+	good = write(out, efuse, sizeof efuse) == (ssize_t)sizeof efuse;
+	if (close(out) != 0 || !good) {
+		snprintf(m->why, sizeof m->why, "the board's efuse could not be made in the run directory\n");
+		return -1;
+	}
+	return 0;
+}
+
 /* The files swtpm keeps in its state directory, by name, for copying and
  * removing them. */
 static const char *const tpm_files[] = { "tpm2-00.permall", ".lock" };
@@ -577,8 +624,11 @@ static int prepare_state(hull_machine *m)
 		}
 		return 0;
 	}
-	if (is_esp(b))
-		return esp_flash(m, b);
+	if (is_esp(b)) {
+		if (esp_flash(m, b) != 0)
+			return -1;
+		return m->nic != NULL && strcmp(m->nic, "wifi") == 0 ? esp_efuse(m) : 0;
+	}
 	if (m->state != NULL && m->direct && mkdir(m->state, 0700) != 0 && errno != EEXIST) {
 		snprintf(m->why, sizeof m->why, "%s: %s\n", m->state, strerror(errno));
 		return -1;
@@ -670,6 +720,7 @@ static void release_state(hull_machine *m)
 	unlink(run_file(m, "OVMF_VARS.fd"));
 	unlink(run_file(m, "firmware.ihx"));
 	unlink(run_file(m, "flash.bin"));
+	unlink(run_file(m, "efuse.bin"));
 	unlink(run_file(m, "display.qmp"));
 	/* 86Box's, where it ran from the run's directory: its settings, its
 	 * log and its CMOS, nvr/ITS-MACHINE.nvr. */
@@ -1466,6 +1517,7 @@ static char *option(const char *prefix, const char *text)
 static void exec_board(const hull_machine *m, const board *b)
 {
 	char  drive[4500];
+	char  efuse[4500];
 	char  emulator[4200];
 	char  lora_emulator[4200];
 	char  rom[4200];
@@ -1473,7 +1525,7 @@ static void exec_board(const hull_machine *m, const board *b)
 	char  nic[96u + PC_MAX_PORTS * 64u];
 	char  netdev[64];
 	char  monitor[48];
-	char *argv[28];
+	char *argv[32];
 	int   n = 0;
 	int   monitor_fd;
 	int   wifi = m->nic != NULL && strcmp(m->nic, "wifi") == 0;
@@ -1589,6 +1641,15 @@ static void exec_board(const hull_machine *m, const board *b)
 		if (wifi && esp_lora_emulator(lora_emulator, sizeof lora_emulator) != 0)
 			return;
 		argv[0] = m->lora != NULL || wifi ? lora_emulator : emulator;
+		/* Its WiFi's MAC, from the efuse esp_efuse made. */
+		if (wifi) {
+			snprintf(efuse, sizeof efuse, "file=%.4400s,if=none,format=raw,id=efuse",
+			         run_file(m, "efuse.bin"));
+			argv[n++] = "-drive";
+			argv[n++] = efuse;
+			argv[n++] = "-global";
+			argv[n++] = "driver=nvram.esp32.efuse,property=drive,value=efuse";
+		}
 	} else {
 		argv[n++] = (char *)b->load;
 		argv[n++] = (char *)m->media[0].path;

@@ -273,6 +273,15 @@ if [ -n "${LORA_FW:-}" ] && [ -n "${LORA_QEMU:-}" ] && [ -n "${esp:-}" ] && [ -L
 	out=$(cd "$root" && timeout 30 "$hull" run -f "$root/noqemu.conf" 2>&1)
 	printf '%s\n' "$out" | grep -q 'make esp-qemu-lora' ||
 		fail "a radio with no qemu built for it was not refused naming the build" "$out"
+else
+	printf 'board: no LoRa tried: no xtensa-esp32-elf-gcc, no make esp-qemu-lora, or no ESP32 fetched\n'
+fi
+# The WiFi needs no firmware built here, so not Espressif's GCC: the qemu
+# make esp-qemu-lora builds, which carries lcgamboa's WiFi, and the
+# published MicroPython image.
+if [ -n "${LORA_QEMU:-}" ] && [ -n "${esp:-}" ] && [ -L "$root/cache/hull/${esp##*/}" ]; then
+	mkdir -p "$root/run-lora"
+	chmod 700 "$root/run-lora"
 	# An ESP32's WiFi, (nic wifi): MicroPython's published image for the
 	# ESP32, fetched once and checked, its station joining the open access
 	# point hull's patched qemu models, by the console, and given an
@@ -308,11 +317,33 @@ open(sys.argv[2], "wb").write(img + b"\xff" * (4 * 1024 * 1024 - len(img)))' "$m
 		cases=$((cases + 1))
 		printf '%s\n' "$said" | grep -q '^wifi True 10\.0\.2\.15' ||
 			fail "an ESP32 running MicroPython did not join the WiFi and get an address" "$said"
+		# Two on one segment by WiFi: each joins the access point in its
+		# own qemu, which is bridged onto the segment, so a datagram from
+		# one reaches the other over the air and the wire between.
+		cp "$root/mp.fw" "$root/mpb.fw"
+		printf '(machines\n  (mpa (backend pc) (source "image:./mp.fw") (segments "air") (tuning (pc (machine heltec-wifi-lora-32) (nic wifi))))\n  (mpb (backend pc) (source "image:./mpb.fw") (segments "air") (tuning (pc (machine heltec-wifi-lora-32) (nic wifi)))))\n' \
+			> "$root/air.conf"
+		(cd "$root" && XDG_RUNTIME_DIR=$root/run-lora HULL_ESP_LORA_QEMU=$LORA_QEMU \
+			exec timeout -k 2 200 "$hull" run -f "$root/air.conf" > "$root/air.out" 2>&1) &
+		runner=$!
+		tries=0
+		until [ "$(grep -ac 'MicroPython v' "$root/air.out" 2> /dev/null)" -ge 2 ] || [ "$tries" -ge 120 ]; do
+			tries=$((tries + 1))
+			sleep 0.5
+		done
+		sleep 2
+		said=$(XDG_RUNTIME_DIR=$root/run-lora timeout 170 python3 -I "$(cd "$(dirname "$0")" && pwd)/board/mp_wire.py" "$hull" mpa mpb 2>&1)
+		XDG_RUNTIME_DIR=$root/run-lora timeout 30 "$hull" stop mpa > /dev/null 2>&1
+		XDG_RUNTIME_DIR=$root/run-lora timeout 30 "$hull" stop mpb > /dev/null 2>&1
+		wait "$runner"
+		cases=$((cases + 1))
+		printf '%s\n' "$said" | grep -q "^heard b'over the air'" ||
+			fail "two ESP32s on one segment by WiFi did not hear each other" "$said"
 	else
 		printf 'board: no WiFi tried: MicroPython for the ESP32 not fetched\n'
 	fi
 else
-	printf 'board: no LoRa tried: no xtensa-esp32-elf-gcc, no make esp-qemu-lora, or no ESP32 fetched\n'
+	printf 'board: no WiFi tried: no make esp-qemu-lora, or no ESP32 fetched\n'
 fi
 printf '(machine (backend pc) (source "image:none.fw") (tuning (pc (machine esp32c3) (lora "field"))))\n' \
 	> "$root/noradio.conf"

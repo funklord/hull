@@ -371,7 +371,7 @@ new file mode 100644
 index 0000000..bf001d3
 --- /dev/null
 +++ b/hw/misc/esp32_wifi.c
-@@ -0,0 +1,446 @@
+@@ -0,0 +1,454 @@
 +#include "qemu/osdep.h"
 +#include "qemu/log.h"
 +#include "qemu/error-report.h"
@@ -684,6 +684,14 @@ index 0000000..bf001d3
 +            }
 +    }
 +    s->mem[addr/4]=value;
++    /* The station's MAC, as the guest writes it from its efuse: the
++     * model's s->macaddr was never set, so a frame from the network
++     * reached the station addressed to 00:00:00:00:00:00, which its own
++     * filter drops. slirp answers any MAC, so it showed only when two
++     * boards met on one wire (hull). */
++    if (addr == A_WIFI_MAC_ADDR_FST_0 || addr == A_WIFI_MAC_ADDR_SND_0) {
++        memcpy(s->macaddr, (uint8_t *)s->mem + A_WIFI_MAC_ADDR_FST_0, 6);
++    }
 +}
 +
 +static int match_mac_address(uint8_t *a1,uint8_t *a2) {
