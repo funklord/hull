@@ -164,8 +164,10 @@ AGENT_SOURCES  = $(patsubst $(BUILD_DIR)/%.o,%.c,$(patsubst $(BUILD_DIR)/situ/si
 # compiler is installed: vmlinuz-hull-arm64 and modules-hull-arm64, from a
 # source tree of its own. Built by `make kernel` alone, it being a long
 # build and a download.
-KERNEL_VERSION = 6.12.107
-KERNEL_SHA256  = a5f8c5be3fde2d6d9ca14e9631642cf1f44487143f11059da730dcd5892e307a
+# The newest of its longterm series, the one `make kernel-check` asks
+# kernel.org for.
+KERNEL_VERSION = 6.12.118
+KERNEL_SHA256  = 08308460320e852ac0745b2be3c7ae1cd81bdad713506ed7d817ba1ec9e1a5a5
 KERNEL_TAR     = $(BUILD_DIR)/kernel/linux-$(KERNEL_VERSION).tar.xz
 KERNEL_SRC     = $(BUILD_DIR)/kernel/linux-$(KERNEL_VERSION)
 KERNEL_BIN     = $(BUILD_DIR)/vmlinuz-hull
@@ -427,7 +429,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: esp-qemu-lora check-tsan
-.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-windows check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-disk check-usb check-usbredir check-vhost vhost-device dosemu2 cross-ppc64le qemu-ppc check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-windows kernel-check check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-disk check-usb check-usbredir check-vhost vhost-device dosemu2 cross-ppc64le qemu-ppc check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -527,6 +529,7 @@ help:
 	@echo '  all       build the libraries, build/hull and its agent (the default)'
 	@echo '  limine    build Limine $(LIMINE_VERSION) from source, for BIOS-bootable exports'
 	@echo '  kernel    build the vm kernel of hull'"'"'s own, vmlinuz-hull, from Linux $(KERNEL_VERSION)'
+	@echo '  kernel-check  whether that Linux is the newest of its longterm series, by kernel.org'"'"'s signed sums'
 	@echo '  nss       build the NSS module, libnss_hull.so.2, for *.hull names'
 	@echo '  gui       build hull-gui, the machine manager, and with vendor/qtty its --tui'
 	@echo '  root      build root mode'"'"'s helper, hull-root'
@@ -705,6 +708,11 @@ $(AGENT_BIN): $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
 
 kernel: $(KERNEL_BIN) $(KERNEL_ELF) $(KERNEL_MODULES)/modules.dep $(KERNEL_ARM64)
 
+# Whether the pin is the newest of its series, by kernel.org's signed
+# sums (kernel/autosigner.asc); prints the two lines that move it.
+kernel-check:
+	python3 tool/kernel_stable.py '$(KERNEL_VERSION)' '$(KERNEL_SHA256)'
+
 $(KERNEL_TAR):
 	@mkdir -p '$(@D)'
 	curl -sSfL -o '$@.part' 'https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$(KERNEL_VERSION).tar.xz'
@@ -730,9 +738,14 @@ $(KERNEL_ELF): $(KERNEL_BIN)
 	strip -o '$@' '$(KERNEL_SRC)/vmlinux'
 
 # Stripped, and indexed by depmod; the kernel's install clears an earlier
-# set's kernel/ first, so no module of it stays behind.
+# set's kernel/ first, so no module of it stays behind. Another release's
+# set, from before the pin moved, goes too: the engine takes arm64's by
+# the one release it finds, which could be the old one, whose modules
+# the new kernel refuses. lib/modules is this rule's alone.
 $(KERNEL_MODULES)/modules.dep: $(KERNEL_BIN)
 	$(MAKE) -C '$(KERNEL_SRC)' $(KERNEL_STAMP) modules
+	test ! -d '$(BUILD_DIR)/modules-hull/lib/modules' || find '$(BUILD_DIR)/modules-hull/lib/modules' \
+		-mindepth 1 -maxdepth 1 ! -name '$(KERNEL_VERSION)' -print -exec rm -rf {} +
 	$(MAKE) -C '$(KERNEL_SRC)' INSTALL_MOD_PATH='$(abspath $(BUILD_DIR))/modules-hull' \
 		INSTALL_MOD_STRIP=1 modules_install > /dev/null
 	touch '$@'
@@ -754,6 +767,8 @@ $(KERNEL_A64_BIN): $(KERNEL_TAR) kernel/common.config kernel/arm64.config
 
 $(KERNEL_A64_MOD)/modules.dep: $(KERNEL_A64_BIN)
 	$(MAKE) -C '$(KERNEL_A64_SRC)' $(KERNEL_A64) $(KERNEL_STAMP) modules
+	test ! -d '$(BUILD_DIR)/modules-hull-arm64/lib/modules' || find '$(BUILD_DIR)/modules-hull-arm64/lib/modules' \
+		-mindepth 1 -maxdepth 1 ! -name '$(KERNEL_VERSION)' -print -exec rm -rf {} +
 	$(MAKE) -C '$(KERNEL_A64_SRC)' $(KERNEL_A64) INSTALL_MOD_PATH='$(abspath $(BUILD_DIR))/modules-hull-arm64' \
 		INSTALL_MOD_STRIP=1 modules_install > /dev/null
 	touch '$@'
