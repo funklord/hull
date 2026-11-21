@@ -1189,3 +1189,241 @@ done:
 	}
 	return result;
 }
+
+/*
+ * `hull setup msdos [--size MB] BOOT DIR`: MS-DOS or PC DOS installed from
+ * the user's own boot floppy, by the floppy's own FORMAT. DOS's FDISK has
+ * no unattended mode before Windows 9x's, so the table is hull's: one
+ * primary partition, active, from the first track to the disk's last
+ * cylinder, of type 04h under 65536 sectors and 06h above -- the two every
+ * DOS from 3.3 on reads, where hull's own `(disk ...)` writes FAT16 as
+ * 0Eh, LBA, which no DOS before 7 knows -- with its CHS in 16 heads and 63
+ * sectors, the geometry qemu then takes from the table, and SYSLINUX's
+ * MBR code to start the active partition. A copy of the floppy carries an
+ * AUTOEXEC.BAT that runs `FORMAT C: /S` with its two answers from a file,
+ * copies the floppy into C:\DOS and powers off by APM.
+ *
+ * Measured 2026-11-21 on MS-DOS 4.00 built from Microsoft's MIT-licensed
+ * source (test/legacy_test.sh): FORMAT reading Y and the label from
+ * HULLY.TXT, the system transferred, and the disk alone booting to its
+ * own AUTOEXEC.BAT.
+ */
+
+/* APM by INT 15h: connect the real-mode interface (5301h), say version
+ * 1.2 (530Eh), set all devices off (5307h, BX=1, CX=3); INT 20h if the
+ * BIOS has no APM. SeaBIOS's off is ACPI's sleep state 5. No zero byte,
+ * put() writing a string: BX by XOR and INC, CX by XOR and MOV CL. */
+static const char msdos_off[] =
+    "\270\001\123\061\333\315\025"          /* mov ax,5301h; xor bx,bx; int 15h */
+    "\270\016\123\061\333\271\002\001\315\025"  /* mov ax,530Eh; xor bx,bx; mov cx,0102h */
+    "\270\007\123\061\333\103\061\311\261\003\315\025"  /* 5307h, bx=1, cx=3 */
+    "\315\040";                                /* int 20h */
+
+static const char msdos_answers[] = "Y\r\nMSDOS\r\n";
+
+static const char msdos_auto[] =
+    "@ECHO OFF\r\n"
+    "VER >COM1\r\n"
+    "ECHO hull setup: formatting C: with the system >COM1\r\n"
+    "FORMAT C: /S <A:\\HULLY.TXT >COM1\r\n"
+    "IF ERRORLEVEL 1 GOTO FAILED\r\n"
+    "ECHO hull setup: copying the floppy into C:\\DOS >COM1\r\n"
+    "MD C:\\DOS\r\n"
+    "COPY A:\\*.* C:\\DOS >NUL\r\n"
+    "COPY A:\\HULLAUTO.BAT C:\\AUTOEXEC.BAT >NUL\r\n"
+    "ECHO hull setup: done >COM1\r\n"
+    "A:\\HULLOFF.COM\r\n"
+    ":FAILED\r\n"
+    "ECHO hull setup: FORMAT failed >COM1\r\n"
+    "A:\\HULLOFF.COM\r\n";
+
+static const char msdos_disk_auto[] =
+    "@ECHO OFF\r\n"
+    "PATH C:\\DOS;C:\\\r\n"
+    "PROMPT $P$G\r\n";
+
+/* The MBR: SYSLINUX's code, one partition from track 1 to the last whole
+ * cylinder, active. `sectors` is the disk's. */
+static int msdos_table(int fd, uint32_t sectors, char *why, size_t cap)
+{
+	static const char code_path[] = "/usr/lib/syslinux/mbr/mbr.bin";
+	unsigned char     mbr[512] = { 0 };
+	uint32_t          start = 63u, end = sectors - 1u, count = sectors - 63u;
+	int               code = open(code_path, O_RDONLY | O_CLOEXEC);
+	ssize_t           n;
+
+	if (code < 0) {
+		snprintf(why, cap, "%s: %s: Debian's syslinux-common has the MBR code", code_path,
+		         strerror(errno));
+		return -1;
+	}
+	n = read(code, mbr, 440);
+	close(code);
+	if (n != 440) {
+		snprintf(why, cap, "%s: not 440 bytes of MBR code", code_path);
+		return -1;
+	}
+	{
+		unsigned char *e = mbr + 446;
+		uint32_t       at[2] = { start, end };
+
+		e[0] = 0x80;
+		for (unsigned i = 0u; i < 2u; i++) {
+			uint32_t       c = at[i] / (16u * 63u), h = at[i] / 63u % 16u, s = at[i] % 63u + 1u;
+			unsigned char *chs = e + (i == 0u ? 1 : 5);
+
+			chs[0] = (unsigned char)h;
+			chs[1] = (unsigned char)(s | ((c >> 2) & 0xc0u));
+			chs[2] = (unsigned char)(c & 0xffu);
+		}
+		e[4] = count < 65536u ? 0x04 : 0x06;
+		for (unsigned i = 0u; i < 4u; i++) {
+			e[8 + i] = (unsigned char)(start >> (8u * i));
+			e[12 + i] = (unsigned char)(count >> (8u * i));
+		}
+	}
+	mbr[510] = 0x55;
+	mbr[511] = 0xaa;
+	if (pwrite(fd, mbr, sizeof mbr, 0) != (ssize_t)sizeof mbr) {
+		snprintf(why, cap, "the disk's table could not be written: %s", strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+int hull_setup_msdos(const char *boot, const char *dir, unsigned megabytes, char *why, size_t cap)
+{
+	static const off_t sizes[] = { 368640, 737280, 1228800, 1474560, 2949120 };
+	char               floppy[PATH_MAX];
+	char               disk[PATH_MAX];
+	char               stage[PATH_MAX];
+	struct stat        st;
+	uint32_t           sectors;
+	int                fd = -1;
+	int                result = -1;
+	int                sized = 0;
+
+	if (megabytes < 2u || megabytes > 504u) {
+		snprintf(why, cap, "DOS's disk is 2 to 504 MB, one primary partition under 1024 cylinders "
+		         "of 16 heads (MS-DOS before 4.0 reads 32 MB at most)");
+		return -1;
+	}
+	if (stat(boot, &st) == 0 && S_ISREG(st.st_mode))
+		for (size_t i = 0u; i < sizeof sizes / sizeof sizes[0]; i++)
+			sized |= st.st_size == sizes[i];
+	if (!sized) {
+		snprintf(why, cap, "%s: not a floppy image of 360 KB to 2.88 MB", boot);
+		return -1;
+	}
+	/* DOS's system and its FORMAT, by mtools: a floppy without them is
+	 * not one this can install from. */
+	{
+		char *system[] = { "mdir", "-a", "-b", "-i", (char *)boot, "::IO.SYS", NULL };
+		char *ibm[] = { "mdir", "-a", "-b", "-i", (char *)boot, "::IBMBIO.COM", NULL };
+		char *format[] = { "mdir", "-b", "-i", (char *)boot, "::FORMAT.COM", NULL };
+
+		if ((run_code(system) != 0 && run_code(ibm) != 0) || run_code(format) != 0) {
+			snprintf(why, cap, "%s: not a DOS boot floppy with FORMAT.COM: no IO.SYS or "
+			         "IBMBIO.COM, or no FORMAT.COM, at its root", boot);
+			return -1;
+		}
+	}
+	if (mkdir(dir, 0755) != 0) {
+		snprintf(why, cap, "%s: %s%s", dir, strerror(errno),
+		         errno == EEXIST ? ": setup makes a directory of its own" : "");
+		return -1;
+	}
+	snprintf(floppy, sizeof floppy, "%s/setup.img", dir);
+	snprintf(disk, sizeof disk, "%s/disk.img", dir);
+	snprintf(stage, sizeof stage, "%s/setup", dir);
+	if (mkdir(stage, 0755) != 0) {
+		snprintf(why, cap, "%s: %s", stage, strerror(errno));
+		goto done;
+	}
+	/* The user's floppy copied, theirs left as it was. */
+	{
+		char *copy[] = { "cp", (char *)boot, floppy, NULL };
+
+		if (run(copy) != 0 || chmod(floppy, 0644) != 0) {
+			snprintf(why, cap, "%s could not be copied", boot);
+			goto done;
+		}
+	}
+	if (put(stage, "HULLOFF.COM", msdos_off, 0644, why, cap) != 0 ||
+	    put(stage, "HULLY.TXT", msdos_answers, 0644, why, cap) != 0 ||
+	    put(stage, "AUTOEXEC.BAT", msdos_auto, 0644, why, cap) != 0 ||
+	    put(stage, "HULLAUTO.BAT", msdos_disk_auto, 0644, why, cap) != 0)
+		goto done;
+	for (const char *const *f = (const char *const[]){ "HULLOFF.COM", "HULLY.TXT", "AUTOEXEC.BAT",
+	                                                   "HULLAUTO.BAT", NULL }; *f != NULL; f++) {
+		char  from[PATH_MAX + 32];
+		char  to[64];
+		char *copy[] = { "mcopy", "-o", "-i", floppy, from, to, NULL };
+
+		snprintf(from, sizeof from, "%s/%s", stage, *f);
+		snprintf(to, sizeof to, "::%s", *f);
+		if (run(copy) != 0) {
+			snprintf(why, cap, "mtools' mcopy could not put %s on the floppy: is there room?", *f);
+			goto done;
+		}
+	}
+	/* Whole cylinders of 16 heads and 63 sectors. */
+	sectors = (uint32_t)((uint64_t)megabytes * 1024u * 1024u / 512u / (16u * 63u) * (16u * 63u));
+	if ((fd = open(disk, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0 ||
+	    ftruncate(fd, (off_t)sectors * 512) != 0) {
+		snprintf(why, cap, "%s: %s", disk, strerror(errno));
+		goto done;
+	}
+	if (msdos_table(fd, sectors, why, cap) != 0)
+		goto done;
+	if (close(fd) != 0) {
+		fd = -1;
+		snprintf(why, cap, "%s: %s", disk, strerror(errno));
+		goto done;
+	}
+	fd = -1;
+	if (put(dir, "install.conf",
+	    "; Installs DOS onto disk.img from the floppy, unattended (hull setup\n"
+	    "; msdos): its own FORMAT makes C: with the system, the floppy is\n"
+	    "; copied into C:\\DOS, and it powers off. Its COM1 is the run's\n"
+	    "; output. Then machine.conf boots the disk.\n"
+	    "(machine\n"
+	    "  (backend pc)\n"
+	    "  (hostname \"msdos\")\n"
+	    "  (source \"media:floppy\")\n"
+	    "  (mutable direct)\n"
+	    "  (memory \"32M\")\n"
+	    "  (media\n"
+	    "    (medium (type floppy) (source \"image:./setup.img\"))\n"
+	    "    (medium (type disk) (source \"image:./disk.img\"))))\n", 0644, why, cap) != 0 ||
+	    put(dir, "machine.conf",
+	    "; DOS as hull setup msdos installed it.\n"
+	    "(machine\n"
+	    "  (backend pc)\n"
+	    "  (hostname \"msdos\")\n"
+	    "  (source \"media:disk\")\n"
+	    "  (mutable direct)\n"
+	    "  (memory \"32M\")\n"
+	    "  (media\n"
+	    "    (medium (type disk) (source \"image:./disk.img\"))))\n", 0644, why, cap) != 0)
+		goto done;
+	result = 0;
+done:
+	if (fd >= 0)
+		close(fd);
+	/* Refused, nothing of it left: what it made, by name, and DIR. */
+	if (result != 0) {
+		char path[PATH_MAX + 32];
+
+		for (const char *const *f = (const char *const[]){ "setup/HULLOFF.COM", "setup/HULLY.TXT",
+		                                                   "setup/AUTOEXEC.BAT", "setup/HULLAUTO.BAT",
+		                                                   "setup.img", "disk.img", "install.conf",
+		                                                   "machine.conf", NULL }; *f != NULL; f++) {
+			snprintf(path, sizeof path, "%s/%s", dir, *f);
+			unlink(path);
+		}
+		rmdir(stage);
+		rmdir(dir);
+	}
+	return result;
+}

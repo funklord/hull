@@ -5012,6 +5012,59 @@ assert any("PreventDeviceEncryption /t REG_DWORD /d 1" in p for p in paths), pat
 	cases=$((cases + 1))
 	[ ! -e "$root/setup/r1" ] && [ ! -e "$root/setup/r2" ] ||
 		fail "a refused reactos setup left a directory" "$(ls -R "$root/setup/r1" "$root/setup/r2" 2>&1)"
+	# hull setup msdos, its install measured by check-legacy on MS-DOS
+	# 4.00: on a floppy shaped as a DOS boot floppy, the table read by a
+	# reader sharing no code with hull -- one active partition from track 1
+	# to the last whole cylinder of 16 heads and 63 sectors, its CHS saying
+	# the same, 04h under 65536 sectors and 06h above, SYSLINUX's code --
+	# the copy's AUTOEXEC.BAT running the floppy's FORMAT, and the user's
+	# floppy as it was; a file not a floppy, a floppy with no FORMAT.COM
+	# and a disk past 504 MB refused, leaving nothing.
+	if [ -f /usr/lib/syslinux/mbr/mbr.bin ]; then
+		mformat -C -f 1440 -i "$root/setup/dos.img" ::
+		printf 'io' > "$root/setup/IO.SYS"
+		printf 'format' > "$root/setup/FORMAT.COM"
+		mcopy -i "$root/setup/dos.img" "$root/setup/IO.SYS" ::IO.SYS
+		mattrib -i "$root/setup/dos.img" +s +h +r ::IO.SYS
+		cp "$root/setup/dos.img" "$root/setup/noformat.img"
+		mcopy -i "$root/setup/dos.img" "$root/setup/FORMAT.COM" ::FORMAT.COM
+		cp "$root/setup/dos.img" "$root/setup/dos.orig"
+		expect 0 'install.conf installs DOS' "$hull" setup msdos "$root/setup/dos.img" "$root/setup/d"
+		expect 0 '^80 06 63 524097 0 1 1 519 15 63 syslinux$' python3 -I -c '
+import struct, sys
+mbr = open(sys.argv[1], "rb").read(512)
+e = mbr[446:462]
+def chs(b): return (b[2] | (b[1] & 0xc0) << 2, b[0], b[1] & 0x3f)
+start, count = struct.unpack("<II", e[8:16])
+code = open("/usr/lib/syslinux/mbr/mbr.bin", "rb").read()[:440] == mbr[:440]
+assert mbr[510:] == b"\x55\xaa" and mbr[462:510] == bytes(48)
+assert (start + count) * 512 == len(open(sys.argv[1], "rb").read())
+print("%02x %02x %d %d %d %d %d %d %d %d %s" % ((e[0], e[4], start, count) + chs(e[1:4]) + chs(e[5:8])
+      + ("syslinux" if code else "other",)))' "$root/setup/d/disk.img"
+		expect 0 '^FORMAT C: /S <A:\\HULLY.TXT >COM1' mtype -i "$root/setup/d/setup.img" ::AUTOEXEC.BAT
+		expect 0 '^Y' mtype -i "$root/setup/d/setup.img" ::HULLY.TXT
+		# The power-off: INT 15h's 5307h with BX=1 and CX=3, then INT 20h.
+		expect 0 'b8 07 53 31 db 43 31 c9 b1 03 cd 15 cd 20 ?$' \
+			sh -c 'mtype -i "$1" ::HULLOFF.COM | od -An -tx1 | tr -s " \n" " "' sh "$root/setup/d/setup.img"
+		cases=$((cases + 1))
+		cmp -s "$root/setup/dos.img" "$root/setup/dos.orig" ||
+			fail "hull setup msdos changed the user's own floppy" "$(cmp "$root/setup/dos.img" "$root/setup/dos.orig")"
+		expect 0 'machine on qemu-pc \(pc\): ok$' "$hull" check -f "$root/setup/d/install.conf" --backend pc
+		expect 0 'machine on qemu-pc \(pc\): ok$' "$hull" check -f "$root/setup/d/machine.conf" --backend pc
+		expect 0 'install.conf installs DOS' "$hull" setup msdos --size 16 "$root/setup/dos.img" "$root/setup/d16"
+		expect 0 '^80 04 63 32193$' python3 -I -c '
+import struct, sys
+e = open(sys.argv[1], "rb").read(512)[446:462]
+print("%02x %02x %d %d" % ((e[0], e[4]) + struct.unpack("<II", e[8:16])))' "$root/setup/d16/disk.img"
+		expect 1 'not a floppy image' "$hull" setup msdos "$root/setup/win.iso" "$root/setup/d1"
+		expect 1 'no FORMAT.COM' "$hull" setup msdos "$root/setup/noformat.img" "$root/setup/d2"
+		expect 1 'DOS.s disk is 2 to 504 MB' "$hull" setup msdos --size 600 "$root/setup/dos.img" "$root/setup/d3"
+		cases=$((cases + 1))
+		[ ! -e "$root/setup/d1" ] && [ ! -e "$root/setup/d2" ] && [ ! -e "$root/setup/d3" ] ||
+			fail "a refused msdos setup left a directory" "$(ls -R "$root/setup/d1" "$root/setup/d2" "$root/setup/d3" 2>&1)"
+	else
+		printf 'cli: hull setup msdos not tried: no SYSLINUX MBR code\n'
+	fi
 	rm -rf "${root:?}/setup"
 else
 	printf 'cli: hull setup windows not tried: no mtools or qemu-img\n'

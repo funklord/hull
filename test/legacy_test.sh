@@ -38,6 +38,12 @@ media=$(cd "$BUILD_DIR/legacy-media" && pwd)
 XDG_RUNTIME_DIR=$(mktemp -d /dev/shm/hull-legacy.XXXXXX)
 trap 'rm -rf "$XDG_RUNTIME_DIR"' EXIT
 trap 'exit 1' INT TERM
+# dosemu2 where `make dosemu2` built it, in the user's cache, before the
+# cache is the suite's: on the PATH, which the core and so the engine
+# inherit. MS-DOS is built under it below.
+user_cache=${XDG_CACHE_HOME:-$HOME/.cache}
+[ ! -x "$user_cache/hull/dosemu2-7e7f3da/bin/dosemu" ] ||
+	PATH=$user_cache/hull/dosemu2-7e7f3da/bin:$PATH
 XDG_CACHE_HOME=$root/cache
 XDG_DATA_HOME=$root/data
 HULL_CORE_IDLE=2
@@ -448,6 +454,67 @@ with zipfile.ZipFile(sys.argv[1]) as archive, archive.open("ReactOS-0.4.16-i386.
 	fi
 else
 	printf 'legacy: %s not fetched, ReactOS not tried\n' "$ros"
+fi
+
+# --- hull setup msdos: MS-DOS 4.00, built from Microsoft's source ------------
+
+# Microsoft's MS-DOS repository, MIT-licensed, at the commit that published
+# 4.00 (2024-04-25), pinned by git's own hash of it. msdos_source.py puts
+# the tree right to build, as published it does not; hull's dos class
+# builds it under dosemu2, the tree its C:; and the floppy made of the
+# build is the user's own boot floppy to hull setup msdos, whose install
+# runs its FORMAT and whose disk then boots alone.
+commit=2d04cacc5322951f187bb17e017c12920ac8ebe2
+if [ ! -d "$media/ms-dos/.git" ]; then
+	rm -rf "$media/ms-dos"
+	git init -q "$media/ms-dos" &&
+		timeout 600 git -C "$media/ms-dos" fetch -q --depth 1 https://github.com/microsoft/MS-DOS.git "$commit" ||
+		rm -rf "$media/ms-dos"
+fi
+if [ ! -d "$media/ms-dos/.git" ]; then
+	printf 'legacy: the MS-DOS repository not fetched, MS-DOS not tried\n'
+elif ! command -v dosemu > /dev/null; then
+	printf 'legacy: no dosemu2 (make dosemu2) to build MS-DOS under, MS-DOS not tried\n'
+else
+	rm -rf "$root/msdos"
+	mkdir -p "$root/msdos"
+	git -C "$media/ms-dos" archive "$commit" v4.0 | tar -x -C "$root/msdos"
+	cases=$((cases + 1))
+	[ "$(git -C "$media/ms-dos" rev-parse "$commit^{commit}" 2>&1)" = "$commit" ] ||
+		fail 'the MS-DOS source is the commit pinned' "$(git -C "$media/ms-dos" log -1 --oneline 2>&1)"
+	python3 -I "$here/msdos_source.py" repair "$root/msdos/v4.0"
+	printf '(machine (backend dosemu) (source "dir:./v4.0") (mutable direct) (command "BUILD.BAT"))\n' \
+		> "$root/msdos/hull.conf"
+	(cd / && timeout -k 5 1800 "$hull" run -f "$root/msdos/hull.conf" < /dev/null > "$root/msdos/build.out" 2>&1)
+	status 'MS-DOS 4.00 builds under dosemu2' "$?" 0 "$(tail -30 "$root/msdos/build.out")"
+	cases=$((cases + 1))
+	[ -f "$root/msdos/v4.0/bin/io.sys" ] && [ -f "$root/msdos/v4.0/bin/format.com" ] ||
+		fail 'the build has IO.SYS and FORMAT.COM' "$(ls "$root/msdos/v4.0/bin" 2>&1)"
+	python3 -I "$here/msdos_source.py" floppy "$root/msdos/v4.0" "$root/msdos/boot.img"
+	before=$(sha256sum < "$root/msdos/boot.img")
+	out=$(timeout 60 "$hull" setup msdos "$root/msdos/boot.img" "$root/msdos/m" 2>&1)
+	status 'hull setup msdos' "$?" 0 "$out"
+	cases=$((cases + 1))
+	[ "$(sha256sum < "$root/msdos/boot.img")" = "$before" ] ||
+		fail "hull setup msdos changed the user's own floppy" "$(ls -l "$root/msdos/boot.img")"
+	(cd / && timeout -k 5 300 "$hull" run -f "$root/msdos/m/install.conf" < /dev/null > "$root/msdos/m.out" 2>&1)
+	got=$?
+	out=$(tr -d '\r' < "$root/msdos/m.out")
+	status 'its install ran to its power-off' "$got" 0 "$(printf '%s\n' "$out" | tail -30)"
+	says 'from MS-DOS 4.00' "$out" 'MS-DOS Version 4.00'
+	says 'its FORMAT making C: with the system' "$out" 'System transferred'
+	says 'the floppy copied' "$out" 'hull setup: done'
+	out=$(mdir -b -i "$root/msdos/m/disk.img@@32256" ::/DOS/FORMAT.COM 2>&1)
+	says 'the disk holds DOS' "$out" 'DOS/FORMAT.COM'
+	printf '@ECHO OFF\r\nECHO hull: C: started its own AUTOEXEC >COM1\r\nVER >COM1\r\nC:\\DOS\\HULLOFF.COM\r\n' \
+		> "$root/msdos/off.bat"
+	mcopy -o -i "$root/msdos/m/disk.img@@32256" "$root/msdos/off.bat" ::/AUTOEXEC.BAT
+	(cd / && timeout -k 5 120 "$hull" run -f "$root/msdos/m/machine.conf" < /dev/null > "$root/msdos/m.out" 2>&1)
+	got=$?
+	out=$(tr -d '\r' < "$root/msdos/m.out")
+	status 'the installed disk boots alone' "$got" 0 "$(printf '%s\n' "$out" | tail -30)"
+	says 'to its own AUTOEXEC.BAT' "$out" 'hull: C: started its own AUTOEXEC'
+	says 'MS-DOS, from its own disk' "$out" 'MS-DOS Version 4.00'
 fi
 
 printf 'legacy: %s cases, %s failed\n' "$cases" "$failures"

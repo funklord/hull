@@ -29,4 +29,12 @@ int hull_setup_freedos(const char *boot, const char *dir, unsigned megabytes, co
  * with `why`; DIR must not exist. */
 int hull_setup_reactos(const char *iso, const char *dir, unsigned megabytes, char *why, size_t cap);
 
+/* A machine directory DIR that installs MS-DOS or PC DOS onto a disk of
+ * `megabytes` from the user's own DOS boot floppy BOOT, with nobody at it:
+ * the disk's table written here, one active partition DOS reads, and a
+ * copy of the floppy whose AUTOEXEC.BAT runs the floppy's own FORMAT C: /S,
+ * copies the floppy into C:\DOS and powers off. 0, or -1 with `why`; DIR
+ * must not exist. */
+int hull_setup_msdos(const char *boot, const char *dir, unsigned megabytes, char *why, size_t cap);
+
 #endif

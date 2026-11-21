@@ -175,6 +175,7 @@ static void usage(FILE *out)
 	      "       hull setup windows [--index N] [--user NAME] ISO DIR\n"
 	      "       hull setup freedos [--size MB] [--packages IMAGE] BOOT DIR\n"
 	      "       hull setup reactos [--size MB] ISO DIR\n"
+	      "       hull setup msdos [--size MB] FLOPPY DIR\n"
 	      "       hull up [-f COMPOSE-FILE] [--backend B] [--profile P]... [NAME]\n"
 	      "       hull core\n"
 	      "       hull engines | hull doctor\n"
@@ -8961,6 +8962,34 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		printf("%s: hull run -f %s/install.conf installs ReactOS, unattended, and powers off; "
+		       "then hull run -f %s/machine.conf\n", argv[at + 1], argv[at + 1], argv[at + 1]);
+		return 0;
+	}
+	/* `hull setup msdos [--size MB] FLOPPY DIR` (setup.c). */
+	if (strcmp(command, "setup") == 0 && argc >= 5 && strcmp(argv[2], "msdos") == 0) {
+		char          why[4400] = "";
+		unsigned long size = 256ul;
+		int           at = 3;
+
+		if (argc == 7 && strcmp(argv[3], "--size") == 0) {
+			char *end = NULL;
+
+			size = strtoul(argv[4], &end, 10);
+			if (end == argv[4] || *end != '\0' || size > 65535ul) {
+				fprintf(stderr, "hull: setup: --size is the disk's megabytes\n");
+				return 2;
+			}
+			at = 5;
+		}
+		if (at + 2 != argc) {
+			fprintf(stderr, "usage: hull setup msdos [--size MB] FLOPPY DIR\n");
+			return 2;
+		}
+		if (hull_setup_msdos(argv[at], argv[at + 1], (unsigned)size, why, sizeof why) != 0) {
+			fprintf(stderr, "hull: setup: %s\n", why);
+			return 1;
+		}
+		printf("%s: hull run -f %s/install.conf installs DOS, unattended, and powers off; "
 		       "then hull run -f %s/machine.conf\n", argv[at + 1], argv[at + 1], argv[at + 1]);
 		return 0;
 	}

@@ -379,7 +379,7 @@ TAR
 		else
 			check 'the owned disk runs' "$got" 0 "$out"
 			printf '%s\n' "$out" | grep -q '^owner=101:102 0644$' &&
-				printf '%s\n' "$out" | grep -Eq '^owner=0:5 2?755$'
+				printf '%s\n' "$out" | grep -Eq '^owner=0:5 [02]?755$'
 			check 'and its owners are the disk'"'"'s' "$?" 0 "$out"
 		fi
 	else
