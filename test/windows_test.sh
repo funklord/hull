@@ -247,19 +247,9 @@ if python3 -c 'import gi; gi.require_version("Gio", "2.0")' 2> /dev/null; then
 	printf '%s\n' "$out" | grep -q "^frame $mode\$" && [ "${lit:-0}" -gt 0 ] ||
 		fail "hull-gui's D-Bus display gives Windows' frame, $mode, drawn" "$out"
 	# The service sets a mode only in a logged-on user's session, where it
-	# starts viogpuap (Red Hat's viogpusc, WTSQueryUserToken), and the
-	# installed machine waits at its sign-in. So the account logs on at the
-	# console, as somebody at hull-gui's window would: the test's own
-	# automatic logon and a restart, then viogpuap running.
-	logon=$(printf "\$k = 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon'
-Set-ItemProperty \$k AutoAdminLogon '1'; Set-ItemProperty \$k DefaultUserName 'hull'
-Set-ItemProperty \$k DefaultPassword '%s'
-Remove-ItemProperty \$k AutoLogonCount -ErrorAction SilentlyContinue; 'logon set'" "$(cat "$root/w/password")" |
-		iconv -t UTF-16LE | base64 -w 0)
-	out=$(door powershell -NoProfile -EncodedCommand "$logon")
-	says 'the account is set to log on at the console' "$out" 'logon set'
-	door shutdown /r /t 0 > /dev/null
-	sleep 60
+	# starts viogpuap (Red Hat's viogpusc, WTSQueryUserToken): setup's
+	# script leaves the account logging on at the console at every boot,
+	# so with nobody signing in the account is there and viogpuap runs.
 	out=
 	for _ in $(seq 60); do
 		out=$(door 'tasklist /fi "imagename eq viogpuap.exe"')
@@ -267,7 +257,9 @@ Remove-ItemProperty \$k AutoLogonCount -ErrorAction SilentlyContinue; 'logon set
 		[ -d "/proc/$run" ] || break
 		sleep 10
 	done
-	says 'after a restart, viogpuap runs in its session' "$out" 'viogpuap.exe'
+	says 'with nobody signing in, viogpuap runs in the account'"'"'s session' "$out" 'viogpuap.exe'
+	out=$(door 'query user')
+	says 'the account it runs for is logged on at the console' "$out" 'console'
 	# The desktop following the window: the size hull-gui asks for its
 	# window, by SetUIInfo, becomes Windows' own mode, seen in the frames
 	# and from inside. 1000x700, as screen_test.sh's Linux guest takes.

@@ -4957,6 +4957,20 @@ assert any("PreventDeviceEncryption /t REG_DWORD /d 1" in p for p in paths), pat
 	grep -qx 'ssh-ed25519 .* hull-setup-test' "$root/setup/w/answer/authorized_keys" ||
 		fail "the user's public key is not what the machine's OpenSSH server lets in" \
 			"$(cat "$root/setup/w/answer/authorized_keys")"
+	# The account logging on at the console at every boot, set by the
+	# first logon's script before it powers off: the answer's one logon
+	# counts down, so its count goes.
+	cases=$((cases + 1))
+	tr -d '\r' < "$root/setup/w/answer/hull-setup.ps1" |
+		awk -v pw="$(cat "$root/setup/w/password")" '
+		    /^Set-ItemProperty \$logon AutoAdminLogon .1.$/ { a = NR }
+		    $0 == "Set-ItemProperty $logon DefaultUserName '"'ann'"'" { u = NR }
+		    $0 == "Set-ItemProperty $logon DefaultPassword '"'"'" pw "'"'"'" { p = NR }
+		    /^Remove-ItemProperty \$logon AutoLogonCount / { c = NR }
+		    /^Stop-Computer/ { s = NR }
+		    END { exit !(a && u && p && c && c < s && a < s) }' ||
+		fail "the first logon's script does not leave the account logging on at every boot" \
+			"$(cat "$root/setup/w/answer/hull-setup.ps1")"
 	cases=$((cases + 1))
 	[ "$(stat -c %a "$root/setup/w/password")" = 600 ] ||
 		fail "the account's password is open to others" "$(ls -l "$root/setup/w/password")"

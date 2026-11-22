@@ -31,7 +31,9 @@
  *                   good at one of Setup's restarts, two of them on
  *                   virtio-vga and one not (project.md section 5.0);
  *   password        the account's, which the answer file must carry for
- *                   its one automatic logon, 0600.
+ *                   its automatic logon, 0600. The account logs on at the
+ *                   console at every boot, as hull-gui's window wants: the
+ *                   first logon's script sets it, the password in Winlogon.
  *
  * Both specs ask what Windows 11 asks of a PC (measured by fmake under pc,
  * 2026-11-12): q35, the host's CPU, a TPM 2.0, Secure Boot with Microsoft's
@@ -210,6 +212,20 @@ static const char script[] =
     "Stop-Transcript\r\n"
     "Stop-Computer -Force\r\n";
 
+/* Before the script's end, the account logging on at the console at every
+ * boot from now on, not only the answer file's one time: a machine at
+ * hull-gui's window shows a desktop rather than a sign-in, and
+ * virtio-win's resolution service sets a mode only in a logged-on session.
+ * The answer's AutoLogon counts down to nothing, so its count goes; the
+ * password is Winlogon's DefaultPassword, as plain as the password file
+ * beside the spec. Format: the account, the password. */
+static const char script_logon[] =
+    "$logon = 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon'\r\n"
+    "Set-ItemProperty $logon AutoAdminLogon '1'\r\n"
+    "Set-ItemProperty $logon DefaultUserName '%s'\r\n"
+    "Set-ItemProperty $logon DefaultPassword '%s'\r\n"
+    "Remove-ItemProperty $logon AutoLogonCount -ErrorAction SilentlyContinue\r\n";
+
 /* With --drivers, before the script's end: the display driver from
  * whichever drive holds viogpudo -- the stick -- for this Windows' release,
  * and the resolution service copied off it -- it registers its own path
@@ -385,17 +401,24 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 		snprintf(why, cap, "out of memory");
 		goto done;
 	}
-	/* The script, the drivers' part before its end where asked. */
+	/* The script: the logon, then the drivers' part where asked, before
+	 * its end. */
 	{
 		const char *end = strstr(script, "Stop-Transcript\r\n");
 		size_t      head = (size_t)(end - script);
+		char       *logon = NULL;
 
-		if (asprintf(&full_script, "%.*s%s%s", (int)head, script,
+		if (asprintf(&logon, script_logon, user, secret) < 0)
+			logon = NULL;
+		if (logon == NULL ||
+		    asprintf(&full_script, "%.*s%s%s%s", (int)head, script, logon,
 		             driver_disc[0] != '\0' ? script_drivers : "", end) < 0) {
 			full_script = NULL;
+			free(logon);
 			snprintf(why, cap, "out of memory");
 			goto done;
 		}
+		free(logon);
 	}
 	if (mkdir(stage, 0700) != 0) {
 		snprintf(why, cap, "%s: %s", stage, strerror(errno));
