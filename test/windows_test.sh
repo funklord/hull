@@ -122,10 +122,47 @@ status 'hull setup windows' "$?" 0 "$out"
 # The install: Setup from the disc, its answer from the stick, two
 # restarts, the first logon installing OpenSSH Server (Windows fetches it)
 # and powering off. fmake measured 73 minutes by qemu directly.
+#
+# A stall -- three runs on 2026-11-21 and 22 hung for good at one of
+# Setup's restarts, the screen black and the disk unwritten for hours, and
+# four made to repeat them did not (project.md section 5.0) -- ends the
+# run after 30 minutes with the disk unwritten, rather than at the
+# timeout, and leaves what can be seen from outside: how many times the
+# firmware started a boot, the qemu threads' states and CPU time (named,
+# "CPU 0/KVM"), twice a minute apart, and the screen.
 start=$(date +%s)
-(cd / && timeout -k 10 10800 "$hull" run -f "$root/w/install.conf" < /dev/null > "$root/install.out" 2>&1)
+(cd / && timeout -k 10 10800 "$hull" run -f "$root/w/install.conf" < /dev/null > "$root/install.out" 2>&1) &
+install=$!
+stalled=
+while [ -d "/proc/$install" ]; do
+	sleep 60
+	written=$(stat -c %Y "$root/w/disk.qcow2" 2>/dev/null || echo 0)
+	[ $(($(date +%s) - written)) -ge 1800 ] || continue
+	stalled=$(($(date +%s) - start))
+	for qemu in $(pgrep -x qemu-system-x86); do
+		# Its arguments are NUL-separated, which grep does not match across.
+		tr '\0' '\n' < "/proc/$qemu/cmdline" 2> /dev/null | grep -qF "$media/$disc" || continue
+		for pass in 1 2; do
+			for task in "/proc/$qemu/task/"*; do
+				printf '%s: %s %s\n' "$(cat "$task/comm")" "$(sed 's/.*) //' "$task/stat" | awk '{ print $1, $12 + $13 }')" "$(cat "$task/wchan")"
+			done
+			[ "$pass" = 2 ] || sleep 60
+		done > "$root/stall-threads.txt" 2>&1
+	done
+	id=$("$hull" ps 2> /dev/null | awk '$5 == "running" { print $1; exit }')
+	[ -n "$id" ] && timeout 30 "$hull" screenshot "$id" "$root/stall.png" > /dev/null 2>&1
+	[ -n "$id" ] && "$hull" stop "$id" > /dev/null 2>&1
+	break
+done
+wait "$install"
 got=$?
 printf 'windows: the install took %s s\n' "$(($(date +%s) - start))"
+if [ -n "$stalled" ]; then
+	cases=$((cases + 1))
+	fail "the install stalled, its disk unwritten for 30 minutes, at $stalled s after $(grep -ac 'BdsDxe: starting' "$root/install.out") firmware boots" \
+		"$(cat "$root/stall-threads.txt" 2> /dev/null)"
+	finish
+fi
 status 'the install ran to its power-off' "$got" 0 "$(tail -40 "$root/install.out")"
 [ "$failures" = 0 ] || finish
 

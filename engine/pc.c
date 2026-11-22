@@ -1884,9 +1884,18 @@ static void exec_pc(const hull_machine *m)
 		argv[n++] = m->machine_type != NULL && strcmp(m->machine_type, "q35") == 0 ?
 		            "tpm-crb,tpmdev=tpm0" : "tpm-tis,tpmdev=tpm0";
 	}
+	/* Its threads named too, "CPU 0/KVM" and the rest: a machine that
+	 * has stopped shows from /proc, as the user and touching nothing,
+	 * whether its vCPUs spin or sleep (project.md section 5.0). */
 	if (m->name != NULL) {
+		char *named = option("", m->name);
+		char *full = named == NULL ? NULL : malloc(strlen(named) + sizeof ",debug-threads=on");
+
+		if (full != NULL)
+			strcpy(stpcpy(full, named), ",debug-threads=on");
+		free(named);
 		argv[n++] = "-name";
-		argv[n++] = option("", m->name);
+		argv[n++] = full;
 	}
 	if (m->memory != NULL) {
 		argv[n++] = "-m";
