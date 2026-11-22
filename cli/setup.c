@@ -18,6 +18,18 @@
  *                   script is done;
  *   machine.conf    the machine that runs it, from its disk, port 22 at
  *                   2222 of its address;
+ *   --drivers       the user's virtio-win disc, whose display files go on
+ *                   the stick: the first logon installs Red Hat's virtio-gpu
+ *                   display driver, viogpudo, and registers vgpusrv, the
+ *                   service setting the mode the host asks for, and
+ *                   machine.conf is on virtio-vga -- so the desktop follows
+ *                   hull-gui's window, once somebody has logged on, which
+ *                   Windows' Basic Display Adapter on qemu's standard VGA
+ *                   cannot. The install itself is on the standard VGA, and
+ *                   the driver waits in the store for the device: with the
+ *                   disc as a second CD, three installs of four hung for
+ *                   good at one of Setup's restarts, two of them on
+ *                   virtio-vga and one not (project.md section 5.0);
  *   password        the account's, which the answer file must carry for
  *                   its one automatic logon, 0600.
  *
@@ -198,6 +210,28 @@ static const char script[] =
     "Stop-Transcript\r\n"
     "Stop-Computer -Force\r\n";
 
+/* With --drivers, before the script's end: the display driver from
+ * whichever drive holds viogpudo -- the stick -- for this Windows' release,
+ * and the resolution service copied off it -- it registers its own path
+ * -- and registered, starting with every boot. Beside it viogpuap, which
+ * the service starts by bare name in a logged-on user's session and which
+ * sets the mode the driver signals: without it nothing resizes. The driver
+ * is signed by Microsoft's hardware programme, so Secure Boot takes it
+ * unasked. */
+static const char script_drivers[] =
+    "$os = if ([Environment]::OSVersion.Version.Build -ge 22000) { 'w11' } else { 'w10' }\r\n"
+    "$gpu = Get-PSDrive -PSProvider FileSystem | ForEach-Object { Join-Path $_.Root \"viogpudo\\$os\\amd64\" } |\r\n"
+    "  Where-Object { Test-Path (Join-Path $_ 'viogpudo.inf') } | Select-Object -First 1\r\n"
+    "if ($gpu) {\r\n"
+    "  pnputil /add-driver (Join-Path $gpu 'viogpudo.inf') /install\r\n"
+    "  $bin = Join-Path $env:ProgramFiles 'hull'\r\n"
+    "  New-Item -ItemType Directory -Force -Path $bin | Out-Null\r\n"
+    "  Copy-Item (Join-Path $gpu 'vgpusrv.exe'), (Join-Path $gpu 'viogpuap.exe') $bin\r\n"
+    "  & (Join-Path $bin 'vgpusrv.exe') -i\r\n"
+    "} else {\r\n"
+    "  Write-Output 'hull: no virtio-win disc with viogpudo found'\r\n"
+    "}\r\n";
+
 /* The answer file: the disk wiped and partitioned for UEFI, the edition at
  * `index`, the EULA and the online-account pages passed, an
  * administrator `user` logged on once, which runs hull-setup.ps1 from the
@@ -287,10 +321,15 @@ static char *answer(unsigned index, const char *user, const char *secret)
 	return text;
 }
 
+static int virtio_win_disc(const char *iso, char *path, char *why, size_t cap);
+static int virtio_win_stage(const char *iso, const char *stage, char *why, size_t cap);
+
 int hull_setup_windows(const char *iso, const char *dir, unsigned index, const char *user,
-                       char *why, size_t cap)
+                       const char *drivers, char *why, size_t cap)
 {
 	char        disc[PATH_MAX];
+	char        driver_disc[PATH_MAX] = "";
+	char       *full_script = NULL;
 	char        stage[PATH_MAX];
 	char        image[PATH_MAX];
 	char        disk[PATH_MAX];
@@ -322,6 +361,8 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 		snprintf(why, cap, "%s: a path with a quote or a backslash cannot be written to a spec", disc);
 		return -1;
 	}
+	if (drivers != NULL && virtio_win_disc(drivers, driver_disc, why, cap) != 0)
+		return -1;
 	if ((keys = public_keys()) == NULL) {
 		snprintf(why, cap, "no public key in ~/.ssh to open the machine's OpenSSH server to: "
 		         "make one with ssh-keygen");
@@ -344,13 +385,26 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 		snprintf(why, cap, "out of memory");
 		goto done;
 	}
+	/* The script, the drivers' part before its end where asked. */
+	{
+		const char *end = strstr(script, "Stop-Transcript\r\n");
+		size_t      head = (size_t)(end - script);
+
+		if (asprintf(&full_script, "%.*s%s%s", (int)head, script,
+		             driver_disc[0] != '\0' ? script_drivers : "", end) < 0) {
+			full_script = NULL;
+			snprintf(why, cap, "out of memory");
+			goto done;
+		}
+	}
 	if (mkdir(stage, 0700) != 0) {
 		snprintf(why, cap, "%s: %s", stage, strerror(errno));
 		goto done;
 	}
 	if (put(stage, "autounattend.xml", xml, 0600, why, cap) != 0 ||
-	    put(stage, "hull-setup.ps1", script, 0600, why, cap) != 0 ||
-	    put(stage, "authorized_keys", keys, 0600, why, cap) != 0)
+	    put(stage, "hull-setup.ps1", full_script, 0600, why, cap) != 0 ||
+	    put(stage, "authorized_keys", keys, 0600, why, cap) != 0 ||
+	    (driver_disc[0] != '\0' && virtio_win_stage(driver_disc, stage, why, cap) != 0))
 		goto done;
 	{
 		char *line = NULL;
@@ -362,7 +416,8 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 		free(line);
 	}
 	/* The stick: 8 MiB of FAT by mtools, the three files at its root with
-	 * their long names. */
+	 * their long names, and with --drivers the virtio-win files, 1.5 MB,
+	 * under viogpudo as on their disc. */
 	{
 		int   fd = open(image, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
 		char  label[] = "ANSWER";
@@ -380,9 +435,14 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 			goto done;
 		}
 		for (const char *const *f = (const char *const[]){ "autounattend.xml", "hull-setup.ps1",
-		                                                   "authorized_keys", NULL }; *f != NULL; f++) {
+		                                                   "authorized_keys", "viogpudo", NULL };
+		     *f != NULL; f++) {
 			char  from[PATH_MAX + 32];
-			char *copy[] = { "mcopy", "-i", image, from, "::/", NULL };
+			char  recurse[] = "-s";
+			char *copy[] = { "mcopy", recurse, "-i", image, from, "::/", NULL };
+
+			if (strcmp(*f, "viogpudo") == 0 && driver_disc[0] == '\0')
+				break;
 
 			snprintf(from, sizeof from, "%s/%s", stage, *f);
 			if (run(copy) != 0) {
@@ -420,7 +480,9 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 	    "              (state \"./\") (nic e1000e) (boot_key 30))))\n", disc) < 0 ||
 	    put(dir, "install.conf", spec, 0644, why, cap) != 0)
 		goto done;
-	if (put(dir, "machine.conf",
+	free(spec);
+	spec = NULL;
+	if (asprintf(&spec,
 	    "; Windows as hull setup windows installed it: ssh -p 2222 to the\n"
 	    "; machine's address, the account in the answer, your own keys.\n"
 	    "(machine\n"
@@ -433,13 +495,20 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 	    "  (network nat)\n"
 	    "  (ports (port (host 2222) (guest 22)))\n"
 	    "  (tuning (pc (machine q35) (cpu host) (tpm true) (firmware uefi-secure)\n"
-	    "              (state \"./\") (nic e1000e))))\n", 0644, why, cap) != 0)
+	    "              (state \"./\") (nic e1000e)%s)))\n",
+	    driver_disc[0] != '\0' ? " (vga virtio)" : "") < 0) {
+		spec = NULL;
+		snprintf(why, cap, "out of memory");
+		goto done;
+	}
+	if (put(dir, "machine.conf", spec, 0644, why, cap) != 0)
 		goto done;
 	result = 0;
 done:
 	free(keys);
 	free(xml);
 	free(spec);
+	free(full_script);
 	return result;
 }
 
@@ -986,6 +1055,99 @@ static char *disc_read(int fd, const char *path)
 	}
 	text[file.length] = '\0';
 	return text;
+}
+
+/* What --drivers takes off a virtio-win disc, for both releases' amd64:
+ * the display driver, its catalogue, the resolution service and the
+ * program the service starts in a user's session -- not the debug
+ * symbols beside them, 30 MB of the disc. */
+static const char *const virtio_win_files[] = {
+	"viogpudo/w11/amd64/viogpudo.inf", "viogpudo/w11/amd64/viogpudo.sys",
+	"viogpudo/w11/amd64/viogpudo.cat", "viogpudo/w11/amd64/vgpusrv.exe",
+	"viogpudo/w11/amd64/viogpuap.exe",
+	"viogpudo/w10/amd64/viogpudo.inf", "viogpudo/w10/amd64/viogpudo.sys",
+	"viogpudo/w10/amd64/viogpudo.cat", "viogpudo/w10/amd64/vgpusrv.exe",
+	"viogpudo/w10/amd64/viogpuap.exe", NULL
+};
+
+/* --drivers' disc: a virtio-win disc, Red Hat's, holding the display
+ * driver and its service for both releases' amd64, its real path in `path`
+ * (PATH_MAX): 0, or -1 with `why`. Read here rather than an hour into the
+ * install, where a wrong disc would leave the plain VGA silently. */
+static int virtio_win_disc(const char *iso, char *path, char *why, size_t cap)
+{
+	struct stat st;
+	int         fd;
+
+	if (stat(iso, &st) != 0 || !S_ISREG(st.st_mode) || realpath(iso, path) == NULL) {
+		snprintf(why, cap, "%s: not a disc image", iso);
+		return -1;
+	}
+	if (strchr(path, '"') != NULL || strchr(path, '\\') != NULL) {
+		snprintf(why, cap, "%s: a path with a quote or a backslash cannot be written to a spec", path);
+		return -1;
+	}
+	if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0) {
+		snprintf(why, cap, "%s: %s", path, strerror(errno));
+		return -1;
+	}
+	for (const char *const *w = virtio_win_files; *w != NULL; w++) {
+		struct disc_file file;
+
+		if (disc_find(fd, *w, &file) != 0 || file.length > (1u << 20)) {
+			snprintf(why, cap, "%s: not a virtio-win disc: no %s on it", iso, *w);
+			close(fd);
+			return -1;
+		}
+	}
+	close(fd);
+	return 0;
+}
+
+/* virtio_win_files copied off the disc into `stage`, at the disc's own
+ * paths, for the answer stick: 0, or -1 with `why`. */
+static int virtio_win_stage(const char *iso, const char *stage, char *why, size_t cap)
+{
+	int fd = open(iso, O_RDONLY | O_CLOEXEC);
+
+	if (fd < 0) {
+		snprintf(why, cap, "%s: %s", iso, strerror(errno));
+		return -1;
+	}
+	for (const char *const *w = virtio_win_files; *w != NULL; w++) {
+		struct disc_file file;
+		char             to[PATH_MAX];
+		char            *bytes = NULL;
+		int              out = -1;
+
+		/* Its directories, each made on the way. */
+		for (const char *slash = strchr(*w, '/'); slash != NULL; slash = strchr(slash + 1, '/')) {
+			int at = snprintf(to, sizeof to, "%s/%.*s", stage, (int)(slash - *w), *w);
+
+			if (at < 0 || (size_t)at >= sizeof to || (mkdir(to, 0700) != 0 && errno != EEXIST)) {
+				snprintf(why, cap, "%s: %s", to, at < 0 || (size_t)at >= sizeof to ?
+				         "too long a path" : strerror(errno));
+				close(fd);
+				return -1;
+			}
+		}
+		if (snprintf(to, sizeof to, "%s/%s", stage, *w) >= (int)sizeof to ||
+		    disc_find(fd, *w, &file) != 0 || file.length > (1u << 20) ||
+		    (bytes = malloc(file.length + 1u)) == NULL ||
+		    pread(fd, bytes, file.length, (off_t)file.extent * DISC_SECTOR) != (ssize_t)file.length ||
+		    (out = open(to, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0 ||
+		    write(out, bytes, file.length) != (ssize_t)file.length || close(out) != 0) {
+			snprintf(why, cap, "%s: %s could not be copied to the answer stick", iso, *w);
+			if (out >= 0)
+				close(out);
+			free(bytes);
+			close(fd);
+			return -1;
+		}
+		free(bytes);
+	}
+	close(fd);
+	return 0;
 }
 
 /* `path` rewritten as `text`, which must fit its sectors: 0, or -1 with

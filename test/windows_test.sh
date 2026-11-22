@@ -2,14 +2,17 @@
 # windows_test.sh -- `hull setup windows` end to end on Windows itself:
 # Microsoft's Windows 11 Enterprise evaluation, the disc fmake pinned on
 # 2026-11-12 (its section 633, the holder's choice of image), installed
-# with nobody at it on the pc class and then logged into by ssh. Not part
+# with nobody at it on the pc class and then logged into by ssh, Red Hat's
+# virtio-win disc given as --drivers so that its desktop follows a viewer's
+# window. Not part
 # of `make check`, needing the network once, 8 GB of disc, about 30 GB of
 # disk while it runs and over an hour: `make check-windows` runs it. Its
 # argument is build/hull.
 #
 # The disc is fetched once into $BUILD_DIR/legacy-media and held to the
 # digest fmake measured, Microsoft publishing none for its evaluation
-# images. Everything else is under $BUILD_DIR/test/windows, removed at the
+# images; so is virtio-win 0.1.302, Fedora's build, whose digest is as
+# fetched on 2026-11-21, Fedora publishing md5s of its RPMs alone. Everything else is under $BUILD_DIR/test/windows, removed at the
 # start and on success, left on failure; the runtime directory is a tmpfs
 # directory of its own. Every run is under `timeout`, and the core is the
 # test's, whose idle clock is two seconds.
@@ -94,7 +97,25 @@ if ! printf '%s  %s\n' "$sum" "$media/$disc" | sha256sum -c --quiet > /dev/null 
 	finish
 fi
 
-out=$(timeout 120 "$hull" setup windows "$media/$disc" "$root/w" 2>&1)
+drivers=virtio-win-0.1.302.iso
+drivers_sum=303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d
+if [ ! -f "$media/$drivers" ]; then
+	curl -fsSL -m 1800 -A hull -o "$media/$drivers.part" \
+		'https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.302-1/virtio-win-0.1.302.iso' &&
+		mv "$media/$drivers.part" "$media/$drivers"
+	rm -f "$media/$drivers.part"
+fi
+if [ ! -f "$media/$drivers" ]; then
+	printf 'windows: %s not fetched, nothing tried\n' "$drivers"
+	exit 0
+fi
+cases=$((cases + 1))
+if ! printf '%s  %s\n' "$drivers_sum" "$media/$drivers" | sha256sum -c --quiet > /dev/null 2>&1; then
+	fail 'the virtio-win disc is the one pinned' "$(ls -l "$media/$drivers")"
+	finish
+fi
+
+out=$(timeout 120 "$hull" setup windows --drivers "$media/$drivers" "$media/$disc" "$root/w" 2>&1)
 status 'hull setup windows' "$?" 0 "$out"
 [ "$failures" = 0 ] || finish
 
@@ -116,7 +137,7 @@ status 'the install ran to its power-off' "$got" 0 "$(tail -40 "$root/install.ou
 sed 's/^  (ports /  (display vnc)\n  (ports /' "$root/w/machine.conf" > "$root/w/screen.conf"
 cases=$((cases + 1))
 grep -q '(display vnc)' "$root/w/screen.conf" || fail 'the screen spec was not made' "$(cat "$root/w/screen.conf")"
-(cd / && timeout -k 10 1800 "$hull" run -f "$root/w/screen.conf" < /dev/null > "$root/machine.out" 2>&1) &
+(cd / && timeout -k 10 2700 "$hull" run -f "$root/w/screen.conf" < /dev/null > "$root/machine.out" 2>&1) &
 run=$!
 address=
 id=
@@ -165,6 +186,12 @@ out=$(door powershell -NoProfile -EncodedCommand "$query")
 cases=$((cases + 1))
 mode=$(printf '%s\n' "$out" | tr -d '\r' | grep -Eo '[1-9][0-9]{2,4}x[1-9][0-9]{2,4}' | head -1)
 [ -n "$mode" ] || fail 'Windows runs a display adapter in a mode' "$out"
+# --drivers': Red Hat's driver on virtio-vga, and the service that sets the
+# mode a viewer asks for, running.
+says "the display adapter is virtio-win's" "$out" 'Red Hat VirtIO GPU DOD controller'
+out=$(door sc query vgpusrv)
+says 'its resolution service runs' "$out" 'RUNNING'
+
 cases=$((cases + 1))
 if [ -n "$id" ] && timeout 30 "$hull" screenshot "$id" "$root/screen.png" > /dev/null 2>&1; then
 	seen=$(python3 -I -c '
@@ -219,6 +246,36 @@ if python3 -c 'import gi; gi.require_version("Gio", "2.0")' 2> /dev/null; then
 	lit=$(printf '%s\n' "$out" | sed -n 's/^lit //p')
 	printf '%s\n' "$out" | grep -q "^frame $mode\$" && [ "${lit:-0}" -gt 0 ] ||
 		fail "hull-gui's D-Bus display gives Windows' frame, $mode, drawn" "$out"
+	# The service sets a mode only in a logged-on user's session, where it
+	# starts viogpuap (Red Hat's viogpusc, WTSQueryUserToken), and the
+	# installed machine waits at its sign-in. So the account logs on at the
+	# console, as somebody at hull-gui's window would: the test's own
+	# automatic logon and a restart, then viogpuap running.
+	logon=$(printf "\$k = 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon'
+Set-ItemProperty \$k AutoAdminLogon '1'; Set-ItemProperty \$k DefaultUserName 'hull'
+Set-ItemProperty \$k DefaultPassword '%s'
+Remove-ItemProperty \$k AutoLogonCount -ErrorAction SilentlyContinue; 'logon set'" "$(cat "$root/w/password")" |
+		iconv -t UTF-16LE | base64 -w 0)
+	out=$(door powershell -NoProfile -EncodedCommand "$logon")
+	says 'the account is set to log on at the console' "$out" 'logon set'
+	door shutdown /r /t 0 > /dev/null
+	sleep 60
+	out=
+	for _ in $(seq 60); do
+		out=$(door 'tasklist /fi "imagename eq viogpuap.exe"')
+		case $out in *viogpuap.exe*) break ;; esac
+		[ -d "/proc/$run" ] || break
+		sleep 10
+	done
+	says 'after a restart, viogpuap runs in its session' "$out" 'viogpuap.exe'
+	# The desktop following the window: the size hull-gui asks for its
+	# window, by SetUIInfo, becomes Windows' own mode, seen in the frames
+	# and from inside. 1000x700, as screen_test.sh's Linux guest takes.
+	out=$(timeout 60 python3 "$(cd "$(dirname "$0")" && pwd)/display_client.py" \
+		"$XDG_RUNTIME_DIR/hull/display/$address" 45 1000x700 2>&1)
+	says "a window's size asked by hull-gui's D-Bus display becomes Windows' frame" "$out" 'resized 1000x700'
+	out=$(door powershell -NoProfile -EncodedCommand "$query")
+	says "and Windows' own mode" "$out" '1000x700'
 fi
 door shutdown /s /t 0 > /dev/null
 # A machine that never answered is stopped rather than left to its timeout.

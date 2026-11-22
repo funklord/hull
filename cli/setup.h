@@ -8,10 +8,12 @@
 /* A machine directory DIR that installs Windows from the user's own ISO
  * unattended and then runs it with an OpenSSH server the user's keys open:
  * its answer files on a USB stick, the install's spec and the machine's.
- * `index` is the edition's image in the ISO, `user` the account made.
+ * `index` is the edition's image in the ISO, `user` the account made;
+ * `drivers`, NULL or the user's virtio-win disc, whose display driver and
+ * resolution service the install takes, the machine then on virtio-vga.
  * 0, or -1 with `why`; DIR must not exist. */
 int hull_setup_windows(const char *iso, const char *dir, unsigned index, const char *user,
-                       char *why, size_t cap);
+                       const char *drivers, char *why, size_t cap);
 
 /* A machine directory DIR that installs FreeDOS onto a blank disk of
  * `megabytes` from the user's own FreeDOS boot floppy BOOT, with nobody at

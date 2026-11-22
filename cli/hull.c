@@ -172,7 +172,7 @@ static void usage(FILE *out)
 	      "       hull key ID KEY... | hull type ID TEXT | hull screenshot ID FILE\n"
 	      "       hull board ls POOL | hull board fix NAME\n"
 	      "       hull vagrant box add NAME FILE\n"
-	      "       hull setup windows [--index N] [--user NAME] ISO DIR\n"
+	      "       hull setup windows [--index N] [--user NAME] [--drivers VIRTIO-WIN.iso] ISO DIR\n"
 	      "       hull setup freedos [--size MB] [--packages IMAGE] BOOT DIR\n"
 	      "       hull setup reactos [--size MB] ISO DIR\n"
 	      "       hull setup msdos [--size MB] FLOPPY DIR\n"
@@ -8993,11 +8993,13 @@ int main(int argc, char **argv)
 		       "then hull run -f %s/machine.conf\n", argv[at + 1], argv[at + 1], argv[at + 1]);
 		return 0;
 	}
-	/* `hull setup windows [--index N] [--user NAME] ISO DIR` (setup.c). */
+	/* `hull setup windows [--index N] [--user NAME] [--drivers VIRTIO-WIN.iso]
+	 * ISO DIR` (setup.c). */
 	if (strcmp(command, "setup") == 0 && argc >= 5 && strcmp(argv[2], "windows") == 0) {
 		char          why[4400] = "";
 		unsigned long index = 1ul;
 		const char   *user = "hull";
+		const char   *drivers = NULL;
 		int           at = 3;
 
 		for (; at + 2 < argc; at += 2) {
@@ -9011,15 +9013,19 @@ int main(int argc, char **argv)
 				}
 			} else if (strcmp(argv[at], "--user") == 0) {
 				user = argv[at + 1];
+			} else if (strcmp(argv[at], "--drivers") == 0) {
+				drivers = argv[at + 1];
 			} else {
 				break;
 			}
 		}
 		if (at + 2 != argc) {
-			fprintf(stderr, "usage: hull setup windows [--index N] [--user NAME] ISO DIR\n");
+			fprintf(stderr, "usage: hull setup windows [--index N] [--user NAME] "
+			        "[--drivers VIRTIO-WIN.iso] ISO DIR\n");
 			return 2;
 		}
-		if (hull_setup_windows(argv[at], argv[at + 1], (unsigned)index, user, why, sizeof why) != 0) {
+		if (hull_setup_windows(argv[at], argv[at + 1], (unsigned)index, user, drivers, why,
+		                       sizeof why) != 0) {
 			fprintf(stderr, "hull: setup: %s\n", why);
 			return 1;
 		}

@@ -5,11 +5,14 @@ of a socket pair is handed to qemu by getfd and add_client, D-Bus is
 spoken on the other, a listener is registered on the first console, and
 its first frame awaited.
 
-Usage: display_client.py LINK SECONDS. Prints `console WIDTHxHEIGHT`, then
-`frame WIDTHxHEIGHT` for the first Scanout, then `dmabuf FOURCC` where it
-was a GPU's buffer (a 3D machine's), else `lit N` -- how many of
-its bytes are not zero -- and exits 0; exits 1, saying why, otherwise.
-Bounded: every wait ends at SECONDS."""
+Usage: display_client.py LINK SECONDS [WIDTHxHEIGHT]. Prints `console
+WIDTHxHEIGHT`, then `frame WIDTHxHEIGHT` for the first Scanout, then `dmabuf
+FOURCC` where it was a GPU's buffer (a 3D machine's), else `lit N` -- how
+many of its bytes are not zero -- and exits 0; exits 1, saying why,
+otherwise. Given a size, it then asks the console for it as hull-gui does
+for its window, by SetUIInfo, and prints `resized WIDTHxHEIGHT` for the
+first frame of that size, or `not resized, last WIDTHxHEIGHT`. Bounded:
+every wait ends at SECONDS."""
 import socket
 import sys
 
@@ -58,6 +61,7 @@ def qmp(monitor, command, fds=()):
 
 def main():
 	link, seconds = sys.argv[1], float(sys.argv[2])
+	want = tuple(int(n) for n in sys.argv[3].split('x')) if len(sys.argv) > 3 else None
 	monitor = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 	monitor.settimeout(seconds)
 	monitor.connect(link)
@@ -91,6 +95,13 @@ def main():
 	got = {}
 
 	def called(conn, sender, path, interface, method, params, invocation):
+		if method in ('Scanout', 'ScanoutDMABUF'):
+			size = (params.get_child_value(1 if method == 'ScanoutDMABUF' else 0).unpack(),
+			        params.get_child_value(2 if method == 'ScanoutDMABUF' else 1).unpack())
+			got['last'] = size
+			if 'frame' in got and size == want:
+				got['resized'] = size
+				loop.quit()
 		if method == 'ScanoutDMABUF' and 'frame' not in got:
 			_handle, w, h, _stride, fourcc, _modifier, _top = params.unpack()
 			got['frame'] = (w, h, None, fourcc)
@@ -124,7 +135,7 @@ def main():
 	listener.register_object('/org/qemu/Display1/Listener', node.interfaces[0], called,
 	                         interfaces, None)
 	listener.start_message_processing()
-	GLib.timeout_add(int(seconds * 1000), loop.quit)
+	timer = GLib.timeout_add(int(seconds * 1000), loop.quit)
 	loop.run()
 	if 'frame' not in got:
 		raise SystemExit('display: no frame within %g s' % seconds)
@@ -134,6 +145,20 @@ def main():
 		print('dmabuf %s' % fourcc)
 	else:
 		print('lit %u' % got['frame'][2])
+	if want is None:
+		return
+	GLib.source_remove(timer)
+	# Millimetres at 96 dots an inch, as hull-gui says them.
+	console.call_sync('SetUIInfo', GLib.Variant('(qqiiuu)', (int(want[0] * 25.4 / 96),
+	                                                       int(want[1] * 25.4 / 96), 0, 0,
+	                                                       want[0], want[1])),
+	                  Gio.DBusCallFlags.NONE, int(seconds * 1000), None)
+	GLib.timeout_add(int(seconds * 1000), loop.quit)
+	loop.run()
+	if 'resized' in got:
+		print('resized %ux%u' % got['resized'], flush=True)
+	else:
+		print('not resized, last %ux%u' % got.get('last', (0, 0)), flush=True)
 
 
 main()

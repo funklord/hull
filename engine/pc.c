@@ -3309,6 +3309,7 @@ static const hull_cap_entry entries[] = {
 	{ "pc.vga.std", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.vga.cirrus", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.vga.vmware", HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.vga.virtio", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.vga.none", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.accel.auto", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.accel.kvm", HULL_SUP_NATIVE, NULL, NULL },

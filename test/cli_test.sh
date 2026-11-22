@@ -4970,8 +4970,53 @@ assert any("PreventDeviceEncryption /t REG_DWORD /d 1" in p for p in paths), pat
 		env HOME="$root/setup/home" "$hull" setup windows --user 'a b' "$root/setup/win.iso" "$root/setup/w3"
 	expect 1 'not a disc image' \
 		env HOME="$root/setup/home" "$hull" setup windows "$root/setup/nope.iso" "$root/setup/w4"
+	# --drivers: a virtio-win disc (iso_tree.py, the display driver and its
+	# service for both releases) whose files go on the stick, not a second
+	# CD of the install; the install on the standard VGA, machine.conf on
+	# virtio-vga, and the first logon's script installing them before it
+	# powers off; a disc without them refused, leaving nothing.
+	vw=
+	for os in w11 w10; do
+		for f in viogpudo.inf viogpudo.sys viogpudo.cat vgpusrv.exe viogpuap.exe; do
+			vw="$vw viogpudo/$os/amd64/$f"
+		done
+	done
+	python3 -I "$(dirname "$0")/iso_tree.py" "$root/setup/vw.iso" $vw
+	expect 0 'install.conf installs Windows' \
+		env HOME="$root/setup/home" "$hull" setup windows --drivers "$root/setup/vw.iso" "$root/setup/win.iso" "$root/setup/w5"
 	cases=$((cases + 1))
-	[ ! -e "$root/setup/w2" ] && [ ! -e "$root/setup/w3" ] && [ ! -e "$root/setup/w4" ] ||
+	! grep -q 'vw\.iso' "$root/setup/w5/install.conf" ||
+		fail 'the driver disc is a second CD of the install' "$(cat "$root/setup/w5/install.conf")"
+	# Each file on the stick at the disc's path, its bytes the disc's: the
+	# fake disc's files name themselves.
+	for f in $vw; do
+		expect 0 "^$f" mtype -i "$root/setup/w5/answer.img" "::/$f"
+	done
+	cases=$((cases + 1))
+	! grep -q vga "$root/setup/w5/install.conf" ||
+		fail 'the install is on virtio-vga' "$(cat "$root/setup/w5/install.conf")"
+	expect 0 '\(vga virtio\)\)\)\)$' cat "$root/setup/w5/machine.conf"
+	expect 0 'machine on qemu-pc \(pc\): ok$' "$hull" check -f "$root/setup/w5/install.conf" --backend pc
+	expect 0 'machine on qemu-pc \(pc\): ok$' "$hull" check -f "$root/setup/w5/machine.conf" --backend pc
+	cases=$((cases + 1))
+	tr -d '\r' < "$root/setup/w5/answer/hull-setup.ps1" |
+		awk '/pnputil \/add-driver/ { d = NR } /vgpusrv.exe.\) -i$/ { v = NR } /^Stop-Computer/ { s = NR }
+		     END { exit !(d && v && d < v && v < s) }' ||
+		fail "the first logon's script does not install the driver and its service before powering off" \
+			"$(cat "$root/setup/w5/answer/hull-setup.ps1")"
+	cases=$((cases + 1))
+	! grep -q 'vga\|vw.iso' "$root/setup/w/install.conf" "$root/setup/w/machine.conf" &&
+		! grep -q pnputil "$root/setup/w/answer/hull-setup.ps1" &&
+		! mdir -i "$root/setup/w/answer.img" ::/viogpudo > /dev/null 2>&1 ||
+		fail "a setup without --drivers took a driver disc's part" "$(cat "$root/setup/w/install.conf")"
+	python3 -I "$(dirname "$0")/iso_tree.py" "$root/setup/vw2.iso" viogpudo/w11/amd64/viogpudo.inf
+	expect 1 'not a virtio-win disc: no viogpudo/w11/amd64/viogpudo.sys' \
+		env HOME="$root/setup/home" "$hull" setup windows --drivers "$root/setup/vw2.iso" "$root/setup/win.iso" "$root/setup/w6"
+	expect 1 'not a virtio-win disc' \
+		env HOME="$root/setup/home" "$hull" setup windows --drivers "$root/setup/win.iso" "$root/setup/win.iso" "$root/setup/w7"
+	cases=$((cases + 1))
+	[ ! -e "$root/setup/w2" ] && [ ! -e "$root/setup/w3" ] && [ ! -e "$root/setup/w4" ] &&
+		[ ! -e "$root/setup/w6" ] && [ ! -e "$root/setup/w7" ] ||
 		fail "a refused setup left a directory" "$(ls "$root/setup")"
 	# hull setup freedos, its install measured by check-legacy: a file not
 	# a 1.44 MB floppy, and a disk FAT16 cannot be, refused.
