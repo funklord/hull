@@ -687,3 +687,222 @@ int hull_export_hosted(hull_store *store, const char *name, const char *image,
 {
 	return export_image(store, name, image, "", host, why, cap);
 }
+
+/* --- an appliance, .ova -------------------------------------------------- */
+
+/* The OVF of one machine: a disk on a SATA controller, an E1000 on NAT,
+ * BIOS firmware, as plain OVF gives both VirtualBox and VMware. */
+static int write_ovf(const char *path, const char *title, const char *disk,
+                     unsigned long long capacity, unsigned long long disk_bytes,
+                     unsigned long memory_mib, unsigned cpus)
+{
+	FILE *out = fopen(path, "wxe");
+	int   ok;
+
+	if (out == NULL)
+		return -1;
+	fprintf(out,
+	    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+	    "<Envelope ovf:version=\"1.0\" xml:lang=\"en-US\""
+	    " xmlns=\"http://schemas.dmtf.org/ovf/envelope/1\""
+	    " xmlns:ovf=\"http://schemas.dmtf.org/ovf/envelope/1\""
+	    " xmlns:rasd=\"http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ResourceAllocationSettingData\""
+	    " xmlns:vssd=\"http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_VirtualSystemSettingData\""
+	    " xmlns:vmw=\"http://www.vmware.com/schema/ovf\">\n"
+	    "  <References>\n"
+	    "    <File ovf:id=\"file1\" ovf:href=\"%s\" ovf:size=\"%llu\"/>\n"
+	    "  </References>\n"
+	    "  <DiskSection>\n"
+	    "    <Info>The machine's disk</Info>\n"
+	    "    <Disk ovf:capacity=\"%llu\" ovf:diskId=\"vmdisk1\" ovf:fileRef=\"file1\""
+	    " ovf:format=\"http://www.vmware.com/interfaces/specifications/vmdk.html#streamOptimized\"/>\n"
+	    "  </DiskSection>\n"
+	    "  <NetworkSection>\n"
+	    "    <Info>Its network</Info>\n"
+	    "    <Network ovf:name=\"NAT\"><Description>NAT</Description></Network>\n"
+	    "  </NetworkSection>\n"
+	    "  <VirtualSystem ovf:id=\"%s\">\n"
+	    "    <Info>A machine hull exported</Info>\n"
+	    "    <Name>%s</Name>\n"
+	    "    <OperatingSystemSection ovf:id=\"101\" vmw:osType=\"otherLinux64Guest\">\n"
+	    "      <Info>Linux, 64-bit</Info>\n"
+	    "    </OperatingSystemSection>\n"
+	    "    <VirtualHardwareSection>\n"
+	    "      <Info>Its hardware</Info>\n"
+	    "      <System>\n"
+	    "        <vssd:ElementName>Virtual Hardware Family</vssd:ElementName>\n"
+	    "        <vssd:InstanceID>0</vssd:InstanceID>\n"
+	    "        <vssd:VirtualSystemIdentifier>%s</vssd:VirtualSystemIdentifier>\n"
+	    "        <vssd:VirtualSystemType>vmx-10</vssd:VirtualSystemType>\n"
+	    "      </System>\n"
+	    "      <Item>\n"
+	    "        <rasd:ElementName>%u virtual CPU</rasd:ElementName>\n"
+	    "        <rasd:InstanceID>1</rasd:InstanceID>\n"
+	    "        <rasd:ResourceType>3</rasd:ResourceType>\n"
+	    "        <rasd:VirtualQuantity>%u</rasd:VirtualQuantity>\n"
+	    "      </Item>\n"
+	    "      <Item>\n"
+	    "        <rasd:AllocationUnits>byte * 2^20</rasd:AllocationUnits>\n"
+	    "        <rasd:ElementName>%lu MB of memory</rasd:ElementName>\n"
+	    "        <rasd:InstanceID>2</rasd:InstanceID>\n"
+	    "        <rasd:ResourceType>4</rasd:ResourceType>\n"
+	    "        <rasd:VirtualQuantity>%lu</rasd:VirtualQuantity>\n"
+	    "      </Item>\n"
+	    "      <Item>\n"
+	    "        <rasd:ElementName>sataController0</rasd:ElementName>\n"
+	    "        <rasd:InstanceID>3</rasd:InstanceID>\n"
+	    "        <rasd:ResourceSubType>AHCI</rasd:ResourceSubType>\n"
+	    "        <rasd:ResourceType>20</rasd:ResourceType>\n"
+	    "      </Item>\n"
+	    "      <Item>\n"
+	    "        <rasd:AutomaticAllocation>true</rasd:AutomaticAllocation>\n"
+	    "        <rasd:Connection>NAT</rasd:Connection>\n"
+	    "        <rasd:ElementName>ethernet0</rasd:ElementName>\n"
+	    "        <rasd:InstanceID>4</rasd:InstanceID>\n"
+	    "        <rasd:ResourceSubType>E1000</rasd:ResourceSubType>\n"
+	    "        <rasd:ResourceType>10</rasd:ResourceType>\n"
+	    "      </Item>\n"
+	    "      <Item>\n"
+	    "        <rasd:AddressOnParent>0</rasd:AddressOnParent>\n"
+	    "        <rasd:ElementName>disk0</rasd:ElementName>\n"
+	    "        <rasd:HostResource>ovf:/disk/vmdisk1</rasd:HostResource>\n"
+	    "        <rasd:InstanceID>5</rasd:InstanceID>\n"
+	    "        <rasd:Parent>3</rasd:Parent>\n"
+	    "        <rasd:ResourceType>17</rasd:ResourceType>\n"
+	    "      </Item>\n"
+	    "    </VirtualHardwareSection>\n"
+	    "  </VirtualSystem>\n"
+	    "</Envelope>\n",
+	    disk, disk_bytes, capacity, title, title, title, cpus, cpus, memory_mib, memory_mib);
+	ok = !ferror(out);
+	return fclose(out) == 0 && ok ? 0 : -1;
+}
+
+/* qemu-img writes a random content id into a VMDK's descriptor, so two
+ * exports of one tree would differ: the line rewritten with one of the
+ * tree's, inside the descriptor's own sectors, the rest of which are
+ * zeroes. 0, or -1. */
+static int fix_cid(const char *path, const char *name)
+{
+	uint8_t   head[512];
+	char     *text = NULL;
+	char     *cid;
+	char     *end;
+	char      line[16];
+	uint64_t  offset;
+	uint64_t  sectors;
+	uint32_t  hash = 2166136261u;
+	size_t    bytes;
+	int       fd = open(path, O_RDWR | O_CLOEXEC);
+	int       status = -1;
+
+	if (fd < 0 || pread(fd, head, sizeof head, 0) != (ssize_t)sizeof head ||
+	    memcmp(head, "KDMV", 4u) != 0)
+		goto done;
+	memcpy(&offset, head + 28, 8u);
+	memcpy(&sectors, head + 36, 8u);
+	if (offset == 0u || sectors == 0u || sectors > 64u)
+		goto done;
+	bytes = (size_t)sectors * 512u;
+	if ((text = calloc(1u, bytes + 1u)) == NULL ||
+	    pread(fd, text, bytes, (off_t)(offset * 512u)) != (ssize_t)bytes ||
+	    (cid = strstr(text, "\nCID=")) == NULL || (end = strchr(cid + 1, '\n')) == NULL)
+		goto done;
+	for (const char *c = name; *c != '\0'; c++)
+		hash = (hash ^ (uint8_t)*c) * 16777619u;
+	/* Not ffffffff, which a parentCID means as none. */
+	snprintf(line, sizeof line, "\nCID=%08x", hash == 0xffffffffu ? 0u : hash);
+	{
+		size_t tail = strlen(end);
+
+		if ((size_t)(cid - text) + strlen(line) + tail > bytes)
+			goto done;
+		memmove(cid + strlen(line), end, tail + 1u);
+		memcpy(cid, line, strlen(line));
+		memset(cid + strlen(line) + tail, 0, bytes - (size_t)(cid - text) - strlen(line) - tail);
+	}
+	if (pwrite(fd, text, bytes, (off_t)(offset * 512u)) == (ssize_t)bytes)
+		status = 0;
+done:
+	free(text);
+	if (fd >= 0 && close(fd) != 0)
+		status = -1;
+	return status;
+}
+
+int hull_export_ova(hull_store *store, const char *name, const char *ova, const char *init,
+                    const char *title, unsigned long memory_mib, unsigned cpus, char *why,
+                    size_t cap)
+{
+	char        built[4200];
+	char        work[4300];
+	char        raw[4400];
+	char        disk[4400];
+	char        ovf[4400];
+	char        disk_name[300];
+	char        ovf_name[300];
+	const char *slash = strrchr(ova, '/');
+	int         status = -1;
+
+	/* Plain OVF names no firmware, which both hypervisors take as BIOS. */
+	if (limine_built(built, sizeof built) != 0) {
+		snprintf(why, cap, "an .ova boots by BIOS, as VirtualBox and VMware read a plain OVF, "
+		         "and only Limine built from source installs that: `make limine` builds it");
+		return -1;
+	}
+	if (title[0] == '\0' || strpbrk(title, "<>&\"'/") != NULL) {
+		snprintf(why, cap, "the appliance's name, %s, is not a plain word", title);
+		return -1;
+	}
+	if (slash != NULL)
+		snprintf(work, sizeof work, "%.*s.ova-XXXXXX", (int)(slash - ova) + 1, ova);
+	else
+		snprintf(work, sizeof work, ".ova-XXXXXX");
+	if (mkdtemp(work) == NULL) {
+		snprintf(why, cap, "%s: %s", work, strerror(errno));
+		return -1;
+	}
+	snprintf(disk_name, sizeof disk_name, "%s-disk1.vmdk", title);
+	snprintf(ovf_name, sizeof ovf_name, "%s.ovf", title);
+	path_of(raw, sizeof raw, work, "disk.raw");
+	path_of(disk, sizeof disk, work, disk_name);
+	path_of(ovf, sizeof ovf, work, ovf_name);
+	if (export_image(store, name, raw, init, NULL, why, cap) != 0)
+		goto done;
+	{
+		const char *const argv[] = { "qemu-img", "convert", "-f", "raw", "-O", "vmdk", "-o",
+		                             "subformat=streamOptimized", raw, disk, NULL };
+
+		if (run(argv, "qemu-img could not make the appliance's VMDK", why, cap) != 0)
+			goto done;
+	}
+	if (fix_cid(disk, name) != 0) {
+		snprintf(why, cap, "the appliance's VMDK has no descriptor its content id can be set in");
+		goto done;
+	}
+	if (write_ovf(ovf, title, disk_name, file_size(raw), file_size(disk), memory_mib,
+	              cpus) != 0) {
+		snprintf(why, cap, "%s could not be written: %s", ovf, strerror(errno));
+		goto done;
+	}
+	/* The descriptor first, as OVF requires of an .ova, ustar with no
+	 * owner or time of this host's in it. */
+	unlink(ova);
+	{
+		const char *const argv[] = { "tar", "--format=ustar", "--owner=0", "--group=0",
+		                             "--numeric-owner", "--mode=a=r,u+w", "--mtime=@946684800", "-cf", ova, "-C",
+		                             work, ovf_name, disk_name, NULL };
+
+		if (run(argv, "tar could not write the appliance", why, cap) != 0) {
+			unlink(ova);
+			goto done;
+		}
+	}
+	status = 0;
+done:
+	unlink(raw);
+	unlink(disk);
+	unlink(ovf);
+	rmdir(work);
+	return status;
+}

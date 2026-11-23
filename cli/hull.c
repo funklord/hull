@@ -138,13 +138,13 @@ static void usage(FILE *out)
 	      "       hull broker DIR | hull broker-dial --dir DIR [--as NAME]\n"
 	      "       hull pack [--against DIR|REF] DIR|REF FILE | hull unpack FILE|- DIR\n"
 	      "       hull export --tar DIR|REF FILE|-\n"
-	      "       hull export --bootable DIR|REF IMAGE [--init PATH | --host TTY]\n"
+	      "       hull export --bootable DIR|REF IMAGE|X.ova [--init PATH | --host TTY]\n"
 	      "       hull kernel fetch [--arch ARCH]\n"
 	      "       hull sshd fetch [--arch ARCH]\n"
 	      "       hull virtualbox fetch\n"
 	      "       hull esp fetch\n"
 	      "       hull 86box fetch\n"
-	      "       hull export --bootable -f FILE [NAME] IMAGE\n"
+	      "       hull export --bootable -f FILE [NAME] IMAGE|X.ova\n"
 	      "       hull build [-f FILE] [--check] REF\n"
 	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
@@ -6590,19 +6590,68 @@ static int media_export(const char *dir, const char *out)
  * /sbin/init unless said. */
 /* `host`: `--host TTY`, the hosted form (hull_export_hosted), whose agent
  * waits on that UART for an engine's core rather than booting the tree. */
-static int export_bootable(const char *source, const char *image, const char *init,
-                           const char *host)
+/* An IMAGE ending .ova is the appliance VirtualBox and VMware import
+ * (hull_export_ova): named `title`, or for its source, with the spec's
+ * memory and processors where it was exported from one, else 1 GiB and
+ * one. */
+typedef struct appliance {
+	const char   *title;
+	unsigned long memory_mib;
+	unsigned      cpus;
+} appliance;
+
+static int is_ova(const char *image)
+{
+	size_t n = strlen(image);
+
+	return n > 4u && strcmp(image + n - 4u, ".ova") == 0;
+}
+
+static int export_bootable_as(const char *source, const char *image, const char *init,
+                              const char *host, const appliance *machine)
 {
 	hull_store store;
 	char       name[200];
+	char       title[64] = "";
 	char       why[4400] = "";
 	int        status;
 
 	if ((status = open_store(&store, 1)) != 0)
 		return status;
+	if (host == NULL && is_ova(image)) {
+		/* Its title a plain word: the machine's hostname, or its source's
+		 * last name, lowercase letters, digits and '-'. */
+		const char *from = machine != NULL && machine->title != NULL ? machine->title : source;
+		const char *slash;
+		size_t      n = 0u;
+		size_t      length = strlen(from);
+
+		while (length > 1u && from[length - 1u] == '/')
+			length--;
+		for (slash = from + length; slash > from && slash[-1] != '/'; slash--)
+			;
+		for (; slash < from + length && n + 1u < sizeof title; slash++) {
+			unsigned char c = (unsigned char)*slash;
+
+			if (isalnum(c))
+				title[n++] = (char)tolower(c);
+			else if (n > 0u && title[n - 1u] != '-')
+				title[n++] = '-';
+		}
+		while (n > 0u && title[n - 1u] == '-')
+			n--;
+		title[n] = '\0';
+		if (n == 0u)
+			strcpy(title, "machine");
+	}
 	if (tree_name(&store, source, name, sizeof name, why, sizeof why) != 0 ||
 	    (host != NULL ? hull_export_hosted(&store, name, image, host, why, sizeof why) :
-	                    hull_export_bootable(&store, name, image, init, why, sizeof why)) != 0) {
+	     is_ova(image) ?
+	     hull_export_ova(&store, name, image, init, title,
+	                     machine != NULL && machine->memory_mib != 0u ? machine->memory_mib : 1024u,
+	                     machine != NULL && machine->cpus != 0u ? machine->cpus : 1u,
+	                     why, sizeof why) :
+	     hull_export_bootable(&store, name, image, init, why, sizeof why)) != 0) {
 		hull_store_close(&store);
 		fprintf(stderr, "hull: export: %s\n", why);
 		return 1;
@@ -6610,6 +6659,12 @@ static int export_bootable(const char *source, const char *image, const char *in
 	hull_store_close(&store);
 	printf("%s\n", image);
 	return 0;
+}
+
+static int export_bootable(const char *source, const char *image, const char *init,
+                           const char *host)
+{
+	return export_bootable_as(source, image, init, host, NULL);
 }
 
 /* The one value of `key` in the spec's machine, allocated, or NULL. */
@@ -6630,6 +6685,8 @@ static char *spec_value(hull_spec *spec, const hull_sexpr_form *machine, const c
  * and init, from its spec -- a dir: source relative to the file, as a run
  * reads it, committed first; a tar: or pack: one committed as a run
  * commits it; a stored ref as it is. */
+static uint64_t spec_bytes(const char *text);
+
 static int export_machine(const char *file, const char *name, const char *image)
 {
 	hull_spec       spec;
@@ -6639,6 +6696,10 @@ static int export_machine(const char *file, const char *name, const char *image)
 	size_t          length;
 	char           *source;
 	char           *init;
+	char           *hostname;
+	char           *memory;
+	char           *cpus;
+	appliance       shape = { 0 };
 	char            path[4400];
 	int             status;
 
@@ -6666,6 +6727,12 @@ static int export_machine(const char *file, const char *name, const char *image)
 	}
 	source = spec_value(&spec, &machine, "source");
 	init   = spec_value(&spec, &machine, "init");
+	hostname = spec_value(&spec, &machine, "hostname");
+	memory   = spec_value(&spec, &machine, "memory");
+	cpus     = spec_value(&spec, &machine, "cpus");
+	shape.title = hostname != NULL ? hostname : name;
+	shape.memory_mib = memory != NULL ? (unsigned long)(spec_bytes(memory) >> 20) : 0u;
+	shape.cpus = cpus != NULL ? (unsigned)strtoul(cpus, NULL, 10) : 0u;
 	if (source == NULL) {
 		fprintf(stderr, "%s: the machine names no source\n", file);
 		status = 125;
@@ -6674,13 +6741,17 @@ static int export_machine(const char *file, const char *name, const char *image)
 
 		snprintf(path, sizeof path, "%.*s%s", slash != NULL ? (int)(slash - file + 1) : 0,
 		         file, source + 4);
-		status = export_bootable(path, image, init != NULL ? init : "/sbin/init", NULL);
+		status = export_bootable_as(path, image, init != NULL ? init : "/sbin/init", NULL,
+		                            &shape);
 	} else {
-		status = export_bootable(strncmp(source, "dir:", 4u) == 0 ? source + 4 : source, image,
-		                         init != NULL ? init : "/sbin/init", NULL);
+		status = export_bootable_as(strncmp(source, "dir:", 4u) == 0 ? source + 4 : source,
+		                            image, init != NULL ? init : "/sbin/init", NULL, &shape);
 	}
 	free(source);
 	free(init);
+	free(hostname);
+	free(memory);
+	free(cpus);
 	free(data);
 	return status;
 }

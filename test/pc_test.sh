@@ -1,8 +1,8 @@
 #!/bin/sh
 # pc_test.sh -- the pc class (project.md section 5.0): a whole PC whose
 # system is its own, booted by its firmware from its media. Not part of
-# `make check`, which needs no qemu: `make check-pc` runs it. Its argument
-# is build/hull. The system booted is test/pc_boot.asm, a sector that says
+# `make check`, which needs no qemu: `make check-pc` runs it. Its arguments
+# are build/hull and the static probe. The system booted is test/pc_boot.asm, a sector that says
 # on COM1 where it came from, and for the last cases a Linux of
 # `hull export --bootable`. It writes only under $BUILD_DIR/test/pc,
 # removed at its start and left on failure, what it starts is under
@@ -11,6 +11,7 @@
 set -u
 
 hull=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+probe=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
 dir=${BUILD_DIR:?}/test/pc
 case $dir in
 */test/pc) ;;
@@ -295,6 +296,41 @@ out=$(timeout 60 "$hull" gc 2>&1)
 says 'hull gc takes an unpacked .ova once it has changed' "$out" 'removed 1 unpacked appliance whose .ova is gone or changed'
 cases=$((cases + 1))
 [ -z "$(ls -A "$root/cache/hull/ova")" ] || fail 'and its files are gone' "$(ls -R "$root/cache/hull/ova")"
+
+# And the way out: a tree exported as an .ova, `hull export --bootable -f
+# FILE X.ova`, its title, memory and processors the spec's, the same
+# bytes twice, its descriptor first; read back as a machine, which boots
+# the image by BIOS on q35's AHCI, its init the probe. VirtualBox's own
+# import of it is test/virtualbox_test.sh's. Without Limine built from
+# source no .ova is made, which is said and not counted.
+mkdir -p "$root/ovaroot/sbin" "$root/ovaroot/etc" "$root/ovaroot/dev" "$root/ovaroot/proc" \
+	"$root/ovaroot/sys" "$root/ovaroot/run"
+cp "$probe" "$root/ovaroot/sbin/booted"
+printf '(machine (source "dir:./ovaroot") (hostname "hull-box") (memory "512M") (cpus 2) %s)\n' \
+	'(init "/sbin/booted")' > "$root/ova.conf"
+out=$(timeout 300 "$hull" export --bootable -f "$root/ova.conf" "$root/ovf/out.ova" 2>&1)
+got=$?
+if [ "$got" -ne 0 ] && printf '%s\n' "$out" | grep -q 'make limine'; then
+	printf 'pc: no .ova exported: %s\n' "$out"
+else
+	status 'a tree exported as an .ova' "$got" 0 "$out"
+	timeout 300 "$hull" export --bootable -f "$root/ova.conf" "$root/ovf/again.ova" > /dev/null 2>&1
+	cases=$((cases + 1))
+	cmp -s "$root/ovf/out.ova" "$root/ovf/again.ova" ||
+		fail 'two .ova exports of one tree differ' "$(cmp "$root/ovf/out.ova" "$root/ovf/again.ova" 2>&1)"
+	out=$(tar -tf "$root/ovf/out.ova" 2>&1)
+	cases=$((cases + 1))
+	[ "$(printf '%s\n' "$out" | tr '\n' ' ')" = 'hull-box.ovf hull-box-disk1.vmdk ' ] ||
+		fail 'the .ova holds its descriptor first, then its disk' "$out"
+	out=$("$hull" plan --resolved -f "$root/ovf/out.ova" 2>&1)
+	says 'the .ova read back as its machine' "$out" '(hostname "hull-box") (source "media:disk") (memory "512M") (cpus 2) (network nat)'
+	out=$(timeout 180 "$hull" run -f "$root/ovf/out.ova" 2>&1)
+	got=$?
+	status 'the exported .ova boots' "$got" 0 "$out"
+	says 'by BIOS, its init the probe' "$out" 'booted pid=1 root=ext4'
+	rm -f "$root/ovf/out.ova" "$root/ovf/again.ova"
+	timeout 60 "$hull" gc > /dev/null 2>&1
+fi
 ovf vmware.ovf ovf:/disk/vmdisk1 20 '<vmw:Config ovf:required="false" vmw:key="firmware" vmw:value="efi"/>'
 out=$("$hull" plan --resolved -f "$root/ovf/vmware.ovf" 2>&1)
 says "VMware's shape: SATA, q35, UEFI" "$out" '(tuning (pc (machine q35) (cpu max) (firmware uefi) (nic e1000)))'

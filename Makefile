@@ -1034,8 +1034,8 @@ check-virtualbox: $(HULL) $(AGENT_BIN) $(PROBE)
 check-remote: $(HULL) $(AGENT_BIN) $(PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/remote_test.sh '$(HULL)' '$(PROBE)'
 
-check-pc: $(HULL) $(AGENT_BIN)
-	BUILD_DIR='$(BUILD_DIR)' sh test/pc_test.sh '$(HULL)'
+check-pc: $(HULL) $(AGENT_BIN) $(PROBE)
+	BUILD_DIR='$(BUILD_DIR)' sh test/pc_test.sh '$(HULL)' '$(PROBE)'
 
 check-hw: $(HULL) $(AGENT_BIN) $(PROBE)
 	BUILD_DIR='$(BUILD_DIR)' sh test/hw_test.sh '$(HULL)' '$(PROBE)'
@@ -1126,7 +1126,7 @@ SANITIZE_FLAGS = -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 # TSan cannot be, and they link objects hull shares. The suites run that
 # hull with this build's firmware.
 TSAN_FLAGS = -O1 -g -fsanitize=thread -fno-omit-frame-pointer
-check-tsan: $(AGENT_BIN) $(BOARD_AVR) $(BOARD_ARM) $(BOARD_8051) $(BOARD_ESP) $(BOARD_LM3S) \
+check-tsan: $(AGENT_BIN) $(PROBE) $(BOARD_AVR) $(BOARD_ARM) $(BOARD_8051) $(BOARD_ESP) $(BOARD_LM3S) \
             $(BOARD_LORA)
 	test -n '$(BUILD_DIR)'
 	$(MAKE) BUILD_DIR='$(BUILD_DIR)/tsan' CFLAGS='$(TSAN_FLAGS)' '$(BUILD_DIR)/tsan/hull'
@@ -1134,7 +1134,7 @@ check-tsan: $(AGENT_BIN) $(BOARD_AVR) $(BOARD_ARM) $(BOARD_8051) $(BOARD_ESP) $(
 	rm -rf '$(BUILD_DIR)/tsan-report'
 	mkdir -p '$(BUILD_DIR)/tsan-report'
 	TSAN_OPTIONS='halt_on_error=0 log_path=$(abspath $(BUILD_DIR))/tsan-report/tsan' \
-		BUILD_DIR='$(BUILD_DIR)' sh test/pc_test.sh '$(BUILD_DIR)/tsan/hull'
+		BUILD_DIR='$(BUILD_DIR)' sh test/pc_test.sh '$(BUILD_DIR)/tsan/hull' '$(PROBE)'
 	TSAN_OPTIONS='halt_on_error=0 log_path=$(abspath $(BUILD_DIR))/tsan-report/tsan' \
 		BUILD_DIR='$(BUILD_DIR)' LM3S_NET='$(if $(BOARD_LM3S),$(BUILD_DIR)/test/board-fw)' \
 		LORA_FW='$(if $(BOARD_LORA),$(BUILD_DIR)/test/board-fw)' \

@@ -295,5 +295,68 @@ else
 	rm -rf -- "${sshrt:?}" "${root:?}/sshhome/.ssh"
 fi
 
+# An appliance hull exported, `hull export --bootable -f FILE X.ova`, as
+# VirtualBox's own VBoxManage imports it, then booted by VBoxHeadless in
+# an outer vm of the host's tree, set up as the engine's own, its first
+# serial port a file: the probe, its init, says it booted, and VirtualBox
+# read the machine's memory, processors, BIOS, AHCI and E1000 from the
+# OVF. Without Limine built from source no .ova is made, which is said
+# and not counted.
+mkdir -p "$root/ovaroot/sbin" "$root/ovaroot/etc" "$root/ovaroot/dev" "$root/ovaroot/proc" \
+	"$root/ovaroot/sys" "$root/ovaroot/run" "$root/ovashare"
+cp "$probe" "$root/ovaroot/sbin/booted"
+printf '(machine (source "dir:./ovaroot") (hostname "hull-box") (memory "512M") (cpus 2) %s)\n' \
+	'(init "/sbin/booted")' > "$root/ova.conf"
+rm -f "$root/ovashare/box.ova" "$root/ovashare/console.log" "$root/ovashare/info.txt"
+out=$(timeout 300 "$hull" export --bootable -f "$root/ova.conf" "$root/ovashare/box.ova" 2>&1)
+if [ $? -ne 0 ] && printf '%s\n' "$out" | grep -q 'make limine'; then
+	printf 'virtualbox: no .ova exported: %s\n' "$out"
+else
+	cases=$((cases + 1))
+	[ -f "$root/ovashare/box.ova" ] || fail "the .ova was not exported" "$out"
+	cat > "$root/ovashare/run.sh" <<'EOF'
+#!/bin/sh
+release=$(uname -r)
+insmod /lib/modules/$release/misc/vboxdrv.ko || exit 1
+cp -a /vbox/usr/lib/virtualbox /usr/lib/virtualbox.hull || exit 1
+rm -rf /usr/lib/virtualbox
+mv /usr/lib/virtualbox.hull /usr/lib/virtualbox || exit 1
+chown -R 0:0 /usr/lib/virtualbox
+chmod -R go-w /usr/lib/virtualbox
+for f in VBoxHeadless VBoxNetDHCP VBoxNetNAT VBoxNetAdpCtl; do chmod 4511 /usr/lib/virtualbox/$f; done
+chown 0:0 / /usr /usr/lib
+chmod 755 / /usr /usr/lib
+export HOME=/root VBOX_USER_HOME=/tmp/vbox
+mkdir -p /root $VBOX_USER_HOME
+manage=/usr/lib/virtualbox/VBoxManage
+$manage import /share/box.ova --vsys 0 --vmname box --basefolder /tmp/vbox || exit 1
+$manage showvminfo box --machinereadable > /share/info.txt
+$manage modifyvm box --uart1 0x3f8 4 --uart-mode1 file /share/console.log --audio-driver none || exit 1
+/usr/lib/virtualbox/VBoxHeadless --startvm box > /share/headless.log 2>&1 &
+i=0
+while [ $i -lt 180 ] && ! grep -q 'booted' /share/console.log 2>/dev/null; do
+	sleep 1
+	i=$((i + 1))
+done
+$manage controlvm box poweroff > /dev/null 2>&1
+wait
+EOF
+	printf '(machine (backend vm) (source "dir:/") (mutable overlay) %s\n %s\n %s\n %s)\n' \
+		'(tuning (vm (profile full))) (memory "2048M") (cpus 2)' \
+		"(volumes (volume (host \"$work\") (guest \"/vbox\") (mode ro))" \
+		"(volume (host \"$root/ovashare\") (guest \"/share\")))" \
+		'(command "/bin/sh" "/share/run.sh")' > "$root/ovaouter.conf"
+	out=$(cd / && timeout -k 10 400 "$hull" run -f "$root/ovaouter.conf" 2>&1)
+	cases=$((cases + 1))
+	grep -aq '^booted pid=1 root=ext4' "$root/ovashare/console.log" 2>/dev/null ||
+		fail "VirtualBox did not boot the exported .ova" \
+			"$out; $(cat "$root/ovashare/console.log" "$root/ovashare/headless.log" 2>&1 | tail -20)"
+	cases=$((cases + 1))
+	info=$(grep -E '^(memory|cpus|firmware|storagecontrollertype0|nictype1)=' \
+		"$root/ovashare/info.txt" 2>/dev/null | sort | tr '\n' ' ')
+	[ "$info" = 'cpus=2 firmware="BIOS" memory=512 nictype1="82545EM" storagecontrollertype0="IntelAhci" ' ] ||
+		fail "VirtualBox read the .ova's machine otherwise" "$info"
+fi
+
 printf 'virtualbox: %d cases, %d failures\n' "$cases" "$failures"
 [ "$failures" -eq 0 ]

@@ -19,4 +19,13 @@ int hull_export_bootable(hull_store *store, const char *name, const char *image,
 int hull_export_hosted(hull_store *store, const char *name, const char *image,
                        const char *host, char *why, size_t cap);
 
+/* The same image as an appliance, `ova`: a streamOptimized VMDK and an
+ * OVF naming the machine `title`, its memory and processors, a SATA disk
+ * and an E1000 on NAT, tarred, the descriptor first. Needs Limine built
+ * from source, the image then booting by BIOS, which a plain OVF gives in
+ * VirtualBox and VMware alike. 0, or -1 with `why`. */
+int hull_export_ova(hull_store *store, const char *name, const char *ova, const char *init,
+                    const char *title, unsigned long memory_mib, unsigned cpus, char *why,
+                    size_t cap);
+
 #endif
