@@ -657,6 +657,25 @@ static const char *ovf_lookup(const ovf_ref *refs, unsigned count, const char *i
 	return NULL;
 }
 
+/* Whether an OVF href names a file of the package: relative, no ".."
+ * among its parts, not a URL. */
+static int inside_package(const char *href)
+{
+	const char *part = href;
+
+	if (href[0] == '\0' || href[0] == '/' || strstr(href, "://") != NULL)
+		return 0;
+	while (*part != '\0') {
+		size_t n = strcspn(part, "/");
+
+		if (n == 2u && part[0] == '.' && part[1] == '.')
+			return 0;
+		part += n;
+		part += strspn(part, "/");
+	}
+	return 1;
+}
+
 /* An item of the hardware section, as it closes. */
 static void ovf_hardware(machine *m, const ovf_item *item, const ovf_item *controllers,
                          unsigned controller_count, const ovf_ref *files, unsigned file_count,
@@ -734,6 +753,15 @@ static void ovf_hardware(machine *m, const ovf_item *item, const ovf_item *contr
 	if (href == NULL) {
 		snprintf(said, sizeof said, "a drive names %.200s, which the appliance does not hold",
 		         item->resource);
+		refuse(m, said);
+		return;
+	}
+	/* An appliance is a package handed on: its images are its own files,
+	 * beside its descriptor or below it. A path out of it -- absolute, up
+	 * through "..", or a URL -- would give its guest a file of the user's
+	 * as a drive to read. */
+	if (!inside_package(href)) {
+		snprintf(said, sizeof said, "a drive's image, %.200s, is outside the appliance", href);
 		refuse(m, said);
 		return;
 	}
@@ -871,6 +899,7 @@ static int run_tool(const char *const *argv)
  * KEY the appliance's real path, size and mtime: a later read of the
  * same file finds it there. Into `dir`; 0, or -1 having said why. */
 static int ova_cache(char *out, size_t cap);
+static int only_files(int dir, unsigned depth);
 
 static int unpack_ova(const char *path, char *dir, size_t cap)
 {
@@ -916,7 +945,7 @@ static int unpack_ova(const char *path, char *dir, size_t cap)
 	}
 	{
 		const char *const argv[] = { "tar", "-xf", real, "-C", work, "--no-same-owner", NULL };
-		char              source[PATH_MAX + 64];
+		char              source[2 * PATH_MAX];
 		FILE             *said;
 		int               written;
 
@@ -924,6 +953,12 @@ static int unpack_ova(const char *path, char *dir, size_t cap)
 		 * the appliance is still there as it was. */
 		snprintf(source, sizeof source, "%s/" SOURCE_NAME, work);
 		written = run_tool(argv) == 0;
+		if (written && !only_files(open(work, O_RDONLY | O_DIRECTORY | O_CLOEXEC), 16u)) {
+			fprintf(stderr, "%s: holds a link or a device among its files, which an "
+			        "appliance's are not\n", path);
+			hull_store_remove_tree(AT_FDCWD, work);
+			return -1;
+		}
 		unlink(source);
 		if (written && (said = fopen(source, "wxe")) != NULL) {
 			written = fprintf(said, "%s\n%lld\n%lld\n", real, (long long)st.st_size,
@@ -940,6 +975,39 @@ static int unpack_ova(const char *path, char *dir, size_t cap)
 		}
 	}
 	return 0;
+}
+
+/* Whether an unpacked appliance holds only files and directories, `depth`
+ * levels deep at most. A symbolic link among them would name a file of
+ * the user's under a name the descriptor may give as a drive's image;
+ * tar makes one wherever the archive says, so it is looked for after. */
+static int only_files(int dir, unsigned depth)
+{
+	DIR           *list = fdopendir(dir);
+	struct dirent *entry;
+	int            plain = list != NULL;
+
+	if (list == NULL) {
+		close(dir);
+		return 0;
+	}
+	while (plain && (entry = readdir(list)) != NULL) {
+		struct stat st;
+
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue;
+		if (fstatat(dirfd(list), entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+			plain = 0;
+		else if (S_ISDIR(st.st_mode))
+			plain = depth > 0u &&
+			        only_files(openat(dirfd(list), entry->d_name,
+			                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC),
+			                   depth - 1u);
+		else if (!S_ISREG(st.st_mode))
+			plain = 0;
+	}
+	closedir(list);
+	return plain;
 }
 
 /* The .ovf among an unpacked appliance's files, into `out`: 0, or -1. */
@@ -1073,10 +1141,12 @@ char *hull_vmconf_form(const char *path, FILE *notes)
 	/* An appliance's files unpacked once, and its .ovf read there, its
 	 * images by their paths in the cache. */
 	if (appliance) {
-		if (m == NULL || unpack_ova(path, unpacked, sizeof unpacked) != 0 ||
-		    find_ovf(unpacked, descriptor, sizeof descriptor) != 0) {
-			if (m != NULL)
-				fprintf(stderr, "%s: holds no .ovf to say what its machine is\n", path);
+		if (m == NULL || unpack_ova(path, unpacked, sizeof unpacked) != 0) {
+			free(m);
+			return NULL;
+		}
+		if (find_ovf(unpacked, descriptor, sizeof descriptor) != 0) {
+			fprintf(stderr, "%s: holds no .ovf to say what its machine is\n", path);
 			free(m);
 			return NULL;
 		}
@@ -1127,7 +1197,7 @@ static int ova_cache(char *out, size_t cap)
  * its source file's path, size and mtime as recorded. */
 static int ova_current(const char *dir)
 {
-	char        path[PATH_MAX + 64];
+	char        path[2 * PATH_MAX];
 	char        real[PATH_MAX + 2];
 	long long   size = -1;
 	long long   mtime = -1;

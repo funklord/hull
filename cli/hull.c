@@ -6071,6 +6071,20 @@ static const char *container_format(const char *image)
 static int media_import(const char *image, const char *dir);
 static int run_child(const char *const *argv);
 
+/* Whether `path`, a disk found in an archive just unpacked, is a file of
+ * the archive's own: tar makes a symbolic link wherever the archive says,
+ * and one taken as the disk would import a file of the user's. */
+static int archive_file(const char *path, const char *archive)
+{
+	struct stat st;
+
+	if (lstat(path, &st) == 0 && S_ISREG(st.st_mode))
+		return 1;
+	fprintf(stderr, "hull: %s: its disk, %s, is a link or a device, which an archive's is not\n",
+	        archive, strrchr(path, '/') + 1);
+	return 0;
+}
+
 static int ova_import(const char *image, const char *dir)
 {
 	char           work[4300];
@@ -6113,7 +6127,8 @@ static int ova_import(const char *image, const char *dir)
 	if (disks > 1u)
 		fprintf(stderr, "hull: media import: %s holds %u disks, and only %s is taken\n", image,
 		        disks, strrchr(disk, '/') + 1);
-	status = media_import(disk, dir);
+	if (archive_file(disk, image))
+		status = media_import(disk, dir);
 done:
 	hull_store_remove_tree(AT_FDCWD, work);
 	return status;
@@ -6236,6 +6251,8 @@ static int vagrant_box_add(const char *name, const char *file)
 		fprintf(stderr, "hull: vagrant: %s holds no disk\n", file);
 		goto done;
 	}
+	if (!archive_file(disk, file))
+		goto done;
 	snprintf(collection, sizeof collection, "%s/collection", work);
 	{
 		const char *const argv[] = { self, "media", "import", disk, collection, NULL };

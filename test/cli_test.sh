@@ -5135,5 +5135,40 @@ else
 	printf 'cli: hull setup windows not tried: no mtools or qemu-img\n'
 fi
 
+# An appliance is a package handed on, so its images are its own files: an
+# href out of it, up through "..", is refused, and so is an .ova holding a
+# symbolic link, which would give the guest a file of the user's as a drive
+# to read; nothing of the refused .ova is left in the cache.
+mkdir -p "$root/appliance"
+cat > "$root/appliance/out.ovf" <<'OVF'
+<Envelope xmlns="http://schemas.dmtf.org/ovf/envelope/1" xmlns:ovf="http://schemas.dmtf.org/ovf/envelope/1" xmlns:rasd="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ResourceAllocationSettingData">
+<References><File ovf:id="f1" ovf:href="../secret.img"/></References>
+<DiskSection><Disk ovf:diskId="d1" ovf:fileRef="f1"/></DiskSection>
+<VirtualSystem ovf:id="out"><VirtualHardwareSection>
+<Item><rasd:HostResource>ovf:/disk/d1</rasd:HostResource><rasd:ResourceType>17</rasd:ResourceType></Item>
+</VirtualHardwareSection></VirtualSystem></Envelope>
+OVF
+sed 's|\.\./secret\.img|disk.img|' "$root/appliance/out.ovf" > "$root/appliance/link.ovf"
+ln -s ../secret.img "$root/appliance/disk.img"
+: > "$root/secret.img"
+(cd "$root/appliance" && tar -cf link.ova link.ovf disk.img)
+expect 2 "out\.ovf: a drive's image, \.\./secret\.img, is outside the appliance" \
+	"$hull" plan -f "$root/appliance/out.ovf"
+expect 2 'link\.ova: holds a link or a device among its files' \
+	env XDG_CACHE_HOME="$root/appliance/cache" "$hull" plan -f "$root/appliance/link.ova"
+expect 0 'source "image:\./disk\.img"' "$hull" plan --resolved -f "$root/appliance/link.ovf"
+# hull media import takes an .ova's disk apart into the user's files, so a
+# disk that is a link is refused there too, and nothing is made.
+ln -s ../secret.img "$root/appliance/box-disk1.vmdk"
+(cd "$root/appliance" && tar -cf box.ova link.ovf box-disk1.vmdk)
+expect 1 'its disk, box-disk1\.vmdk, is a link or a device' \
+	"$hull" media import "$root/appliance/box.ova" "$root/appliance/taken"
+cases=$((cases + 1))
+[ ! -e "$root/appliance/taken" ] || fail 'a refused .ova import made its directory' "$(ls -A "$root/appliance/taken")"
+cases=$((cases + 1))
+[ -z "$(ls -A "$root/appliance/cache/hull/ova" 2>/dev/null)" ] ||
+	fail 'a refused .ova was left in the cache' "$(ls -AR "$root/appliance/cache")"
+rm -rf "${root:?}/appliance" "${root:?}/secret.img"
+
 printf 'cli: %u cases, %u failed\n' "$cases" "$failures"
 [ "$failures" -eq 0 ]
