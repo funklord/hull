@@ -59,6 +59,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sched.h>
 #include <sys/un.h>
 #include <signal.h>
 #include <stdio.h>
@@ -3188,6 +3189,389 @@ static int wait_nics(const char *first, const char *count, char **command)
 	return errno == ENOENT ? 127 : 126;
 }
 
+/* --- (init PATH) in a container ------------------------------------------ */
+
+/* The process signals are passed to, and the one that was signalled. */
+static volatile sig_atomic_t passed_signal;
+
+static void note_signal(int signum)
+{
+	passed_signal = signum;
+}
+
+/* The signals a stop or `hull kill` sends, caught to be passed on. */
+static void catch_passed(void)
+{
+	static const int which[] = { SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2 };
+	struct sigaction on = { 0 };
+
+	on.sa_handler = note_signal;
+	sigemptyset(&on.sa_mask);
+	for (unsigned i = 0u; i < sizeof which / sizeof which[0]; i++)
+		sigaction(which[i], &on, NULL);
+}
+
+/* A wait status as a shell gives it: the code, or 128 and the signal. */
+static int status_code(int status)
+{
+	if (WIFEXITED(status))
+		return WEXITSTATUS(status);
+	return WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 125;
+}
+
+static int write_map(const char *path, const char *text)
+{
+	int     fd = open(path, O_WRONLY | O_CLOEXEC);
+	ssize_t wrote = fd >= 0 ? write(fd, text, strlen(text)) : -1;
+
+	if (fd >= 0)
+		close(fd);
+	return wrote == (ssize_t)strlen(text) ? 0 : -1;
+}
+
+/* Among `pid`'s children, the one named `name`: hull's init beside the
+ * image's, which a stop's signal is for. 0 where there is none. */
+static pid_t child_named(pid_t pid, const char *name)
+{
+	char  path[64];
+	char  list[512];
+	FILE *file;
+	pid_t found = 0;
+
+	snprintf(path, sizeof path, "/proc/%ld/task/%ld/children", (long)pid, (long)pid);
+	if ((file = fopen(path, "re")) == NULL)
+		return 0;
+	if (fgets(list, sizeof list, file) == NULL)
+		list[0] = '\0';
+	fclose(file);
+	for (char *save = NULL, *word = strtok_r(list, " \n", &save); word != NULL && found == 0;
+	     word = strtok_r(NULL, " \n", &save)) {
+		char comm[32] = "";
+
+		snprintf(path, sizeof path, "/proc/%s/comm", word);
+		if ((file = fopen(path, "re")) == NULL)
+			continue;
+		if (fgets(comm, sizeof comm, file) != NULL)
+			comm[strcspn(comm, "\n")] = '\0';
+		fclose(file);
+		if (strcmp(comm, name) == 0)
+			found = (pid_t)strtol(word, NULL, 10);
+	}
+	return found;
+}
+
+/* hull's init, the image's init's child: the workload run and waited for,
+ * a stop's signal passed to it, its code written to `report`, and then
+ * the image's own shutdown asked for, the namespace ended after the
+ * grace as the chroot engine's init ends it (section 4.8). */
+static void handed_init(char **command, int report)
+{
+	pid_t workload;
+	int   status = 0;
+	char  code;
+
+	prctl(PR_SET_CHILD_SUBREAPER, 1L, 0L, 0L, 0L);
+	prctl(PR_SET_NAME, "hull-init", 0L, 0L, 0L);
+	catch_passed();
+	workload = fork();
+	if (workload == 0) {
+		sigset_t none;
+
+		sigemptyset(&none);
+		sigprocmask(SIG_SETMASK, &none, NULL);
+		signal(SIGTERM, SIG_DFL);
+		signal(SIGINT, SIG_DFL);
+		signal(SIGHUP, SIG_DFL);
+		signal(SIGQUIT, SIG_DFL);
+		signal(SIGUSR1, SIG_DFL);
+		signal(SIGUSR2, SIG_DFL);
+		execvp(command[0], command);
+		fprintf(stderr, "hull: %s: %s\n", command[0], strerror(errno));
+		_exit(errno == ENOENT ? 127 : 126);
+	}
+	for (;;) {
+		pid_t ended = wait(&status);
+
+		if (ended == workload)
+			break;
+		if (ended < 0 && errno == EINTR) {
+			if (passed_signal != 0 && workload > 0)
+				kill(workload, passed_signal);
+			passed_signal = 0;
+			continue;
+		}
+		if (ended < 0 && errno == ECHILD) {
+			status = 125 << 8;
+			break;
+		}
+	}
+	code = (char)status_code(workload > 0 ? status : 125 << 8);
+	if (write(report, &code, 1u) != 1) {
+		/* the outer process then reads PID 1's end instead */
+	}
+	close(report);
+	{
+		pid_t asked = fork();
+
+		if (asked == 0) {
+			char *const argv[] = { "poweroff", NULL };
+
+			execv("/sbin/poweroff", argv);
+			_exit(127);
+		}
+	}
+	for (int i = 0; i < SHUTDOWN_GRACE * 4; i++) {
+		struct timespec quarter = { 0, 250000000L };
+
+		nanosleep(&quarter, NULL);
+	}
+	reboot(RB_POWER_OFF);
+	_exit(0);
+}
+
+/*
+ * `hull-agent init PATH -- COMMAND...`, a docker machine's entrypoint
+ * under (init PATH), run as the user: a user namespace in which the user
+ * is root, and PID and mount namespaces of its own, as the chroot engine
+ * makes them without root (section 4.8). Its PID 1 execs the image's
+ * init, `container=hull` its environment; its child goes on as
+ * hull-init, running the command. This process stays outside, passing a
+ * stop's signal to hull-init and ending with the command's code.
+ */
+static int init_in_container(const char *init, char **command)
+{
+	char  map[64];
+	int   report[2];
+	pid_t first;
+	int   status = 0;
+	char  code;
+	uid_t uid = getuid();
+	gid_t gid = getgid();
+
+	if (command[0] == NULL) {
+		fprintf(stderr, "hull: the machine has no command, and its image none\n");
+		return 125;
+	}
+	if (pipe2(report, O_CLOEXEC) != 0 ||
+	    unshare(CLONE_NEWUSER | CLONE_NEWPID) != 0) {
+		fprintf(stderr, "hull: (init ...): the container may not make a user namespace: %s\n",
+		        strerror(errno));
+		return 125;
+	}
+	snprintf(map, sizeof map, "0 %u 1", (unsigned)uid);
+	if (write_map("/proc/self/uid_map", map) != 0 || write_map("/proc/self/setgroups", "deny") != 0) {
+		fprintf(stderr, "hull: (init ...): the user namespace could not be mapped: %s\n",
+		        strerror(errno));
+		return 125;
+	}
+	snprintf(map, sizeof map, "0 %u 1", (unsigned)gid);
+	if (write_map("/proc/self/gid_map", map) != 0) {
+		fprintf(stderr, "hull: (init ...): the user namespace could not be mapped: %s\n",
+		        strerror(errno));
+		return 125;
+	}
+	first = fork();
+	if (first < 0) {
+		perror("hull: fork");
+		return 125;
+	}
+	if (first == 0) {
+		int   execed[2];
+		pid_t agent;
+		char  failed;
+
+		close(report[0]);
+		/* The namespace's own /proc, its PID 1 this one, in a mount
+		 * namespace of its own: this process, outside, still reads the
+		 * container's, where it finds hull-init to pass a signal to. */
+		if (unshare(CLONE_NEWNS) != 0 || mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0 ||
+		    mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) != 0) {
+			fprintf(stderr, "hull: (init ...): the machine's /proc could not be mounted: %s\n",
+			        strerror(errno));
+			_exit(125);
+		}
+		if (access(init, X_OK) != 0) {
+			fprintf(stderr, "hull: the machine has no init it can run at its (init ...) path\n");
+			_exit(125);
+		}
+		if (pipe2(execed, O_CLOEXEC) != 0 || (agent = fork()) < 0)
+			_exit(125);
+		if (agent > 0) {
+			char *const argv[] = { (char *)init, NULL };
+			char *const envp[] = { (char *)"container=hull", NULL };
+			sigset_t    none;
+
+			close(execed[0]);
+			close(report[1]);
+			sigemptyset(&none);
+			sigprocmask(SIG_SETMASK, &none, NULL);
+			syscall(SYS_close_range, 3u, ~0u, CLOSE_RANGE_CLOEXEC);
+			execve(init, argv, envp);
+			if (write(execed[1], "x", 1u) != 1) {
+				/* hull's init reads the pipe's end alone */
+			}
+			for (;;)
+				if (wait(NULL) < 0)
+					pause();
+		}
+		/* Not before the image's init is PID 1: its exec closes the
+		 * pipe, and a failed one says so on it. */
+		close(execed[1]);
+		{
+			ssize_t got;
+
+			while ((got = read(execed[0], &failed, 1u)) < 0 && errno == EINTR)
+				;
+			close(execed[0]);
+			if (got > 0) {
+				char given = 125;
+
+				fprintf(stderr, "hull: the image's init could not be run as PID 1\n");
+				if (write(report[1], &given, 1u) != 1) {
+					/* PID 1's end is read instead */
+				}
+				reboot(RB_POWER_OFF);
+				_exit(125);
+			}
+		}
+		handed_init(command, report[1]);
+	}
+	close(report[1]);
+	catch_passed();
+	for (;;) {
+		pid_t ended = waitpid(first, &status, 0);
+
+		if (ended == first)
+			break;
+		if (ended < 0 && errno == EINTR) {
+			pid_t handed = child_named(first, "hull-init");
+
+			if (passed_signal != 0 && handed > 0)
+				kill(handed, passed_signal);
+			passed_signal = 0;
+			continue;
+		}
+		if (ended < 0)
+			return 125;
+	}
+	if (read(report[0], &code, 1u) == 1)
+		return (unsigned char)code;
+	/* PID 1 ended under its workload: the image's init gave up, as
+	 * systemd does where the cgroup it would make is not the user's to
+	 * write, which a rootful daemon's container never is. */
+	fprintf(stderr, "hull: the machine's init ended, %s %d, before its workload did\n",
+	        WIFSIGNALED(status) ? "by signal" : "status",
+	        WIFSIGNALED(status) ? WTERMSIG(status) : WEXITSTATUS(status));
+	return 125;
+}
+
+/* The PID 1 of the namespace `init_in_container` made, seen from the
+ * container: the one process whose NSpid ends in 1 one level down. */
+static pid_t machine_init(void)
+{
+	DIR           *proc = opendir("/proc");
+	struct dirent *entry;
+	pid_t          found = 0;
+
+	if (proc == NULL)
+		return 0;
+	while (found == 0 && (entry = readdir(proc)) != NULL) {
+		char  path[300];
+		char  line[256];
+		FILE *file;
+
+		if (entry->d_name[0] < '1' || entry->d_name[0] > '9')
+			continue;
+		snprintf(path, sizeof path, "/proc/%s/status", entry->d_name);
+		if ((file = fopen(path, "re")) == NULL)
+			continue;
+		while (fgets(line, sizeof line, file) != NULL) {
+			long outer;
+			long inner;
+			int  at = 0;
+
+			if (strncmp(line, "NSpid:", 6u) != 0)
+				continue;
+			if (sscanf(line + 6, "%ld %ld %n", &outer, &inner, &at) == 2 && inner == 1 &&
+			    line[6 + at] == '\0')
+				found = (pid_t)outer;
+			break;
+		}
+		fclose(file);
+	}
+	closedir(proc);
+	return found;
+}
+
+/*
+ * `hull-agent enter -- COMMAND...`, an exec into a docker machine under
+ * (init PATH): its user, mount and PID namespaces entered, as the
+ * workload sees them, the command run in a child, a signal passed to
+ * it, and its code this one's.
+ */
+static int enter_machine(char **command)
+{
+	static const char *const kinds[] = { "user", "mnt", "pid" };
+	pid_t init = machine_init();
+	int   fds[3];
+	char  cwd[4096];
+	pid_t child;
+	int   status = 0;
+
+	if (command[0] == NULL)
+		return 125;
+	if (init == 0) {
+		fprintf(stderr, "hull: the machine's init is not running\n");
+		return 125;
+	}
+	if (getcwd(cwd, sizeof cwd) == NULL)
+		strcpy(cwd, "/");
+	for (unsigned i = 0u; i < 3u; i++) {
+		char path[64];
+
+		snprintf(path, sizeof path, "/proc/%ld/ns/%s", (long)init, kinds[i]);
+		if ((fds[i] = open(path, O_RDONLY | O_CLOEXEC)) < 0) {
+			fprintf(stderr, "hull: the machine's %s namespace: %s\n", kinds[i], strerror(errno));
+			return 125;
+		}
+	}
+	for (unsigned i = 0u; i < 3u; i++) {
+		if (setns(fds[i], 0) != 0) {
+			fprintf(stderr, "hull: the machine's %s namespace could not be entered: %s\n",
+			        kinds[i], strerror(errno));
+			return 125;
+		}
+		close(fds[i]);
+	}
+	if (chdir(cwd) != 0 && chdir("/") != 0) {
+		/* the root is there */
+	}
+	child = fork();
+	if (child < 0)
+		return 125;
+	if (child == 0) {
+		/* Not left in the machine when the exec is ended by a KILL. */
+		prctl(PR_SET_PDEATHSIG, SIGKILL, 0L, 0L, 0L);
+		execvp(command[0], command);
+		fprintf(stderr, "hull: %s: %s\n", command[0], strerror(errno));
+		_exit(errno == ENOENT ? 127 : 126);
+	}
+	catch_passed();
+	for (;;) {
+		pid_t ended = waitpid(child, &status, 0);
+
+		if (ended == child)
+			return status_code(status);
+		if (ended < 0 && errno == EINTR) {
+			if (passed_signal != 0)
+				kill(child, passed_signal);
+			passed_signal = 0;
+			continue;
+		}
+		return 125;
+	}
+}
+
 int main(int argc, char **argv)
 {
 	sigset_t       mask;
@@ -3209,6 +3593,10 @@ int main(int argc, char **argv)
 		return nics(argv[2], argv[3], argc - 4, argv + 4);
 	if (argc >= 5 && strcmp(argv[1], "wait-nics") == 0 && strcmp(argv[4], "--") == 0)
 		return wait_nics(argv[2], argv[3], argv + 5);
+	if (argc >= 4 && strcmp(argv[1], "init") == 0 && strcmp(argv[3], "--") == 0)
+		return init_in_container(argv[2], argv + 4);
+	if (argc >= 3 && strcmp(argv[1], "enter") == 0 && strcmp(argv[2], "--") == 0)
+		return enter_machine(argv + 3);
 	if (getpid() != 1) {
 		fprintf(stderr, "hull agent: runs as a machine's init, PID 1\n");
 		return 2;

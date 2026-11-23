@@ -119,8 +119,8 @@ them has:
   own small kernel, with the modules network tests load --
   `mac80211_hwsim` radios, `pppoe`, nftables -- or the host's kernel
   with every module it has, or a kernel given as a file or carried by
-  the image, and the image's own init can run as PID 1 on a vm or on
-  chroot.
+  the image, and the image's own init can run as PID 1 on a vm, on
+  chroot or on docker.
 - **The host's devices.** USB by vendor and product or by port, serial
   and parallel ports, and PCI by VFIO, each held by one machine at a
   time.
@@ -430,8 +430,11 @@ machine on docker with the same machine on chroot or vm.
   file at the top of the tree, or in a directory docker mounts something
   in such as `/etc`, is refused there. An overlay is a `docker import`
   of the tree, kept by its hash.
-- No `(init …)`: an image's init wants root, which chroot gives a
-  machine without one. `(segments …)` work, a tap in the container made
+- `(init …)` without root: hull's agent makes a user namespace in the
+  user's own container and the image's init is PID 1 there, as on
+  chroot, with docker's seccomp and AppArmor profiles left off for it.
+  busybox init, OpenRC and sysvinit run; systemd does not, the
+  container's cgroup being the daemon's root's. `(segments …)` work, a tap in the container made
   by hull-agent as its root, the container given `NET_ADMIN` and
   `/dev/net/tun` that its workload, the user, does not hold.
 

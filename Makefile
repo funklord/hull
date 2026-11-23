@@ -227,7 +227,7 @@ CLI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/cli/, ref.conf dir.conf inotify.c
                  shown.conf failing.conf nofile.conf big.conf sealed.conf norun.conf \
                  stored.conf stored-direct.conf unstored.conf idle/hull/core.log idle/hull/core.lock \
                  searched.conf denied.conf unfound.conf rootfs/srv/searchme rootfs/bin/searchme \
-                 listen.out nethost.conf netnone.conf netexec.conf netexec.out vmhost.conf tools/squashfuse segmented.conf nested.conf nestover.conf inited.conf pathless.conf pathed.conf owned.conf ownedin.conf exported.conf exported.tar exported.view exportin.conf owners.list owned_back.conf rootfs/given ownedin_back.conf ownedrun.tar ownedrun.conf layered.conf relayered.conf layeredin.conf sharedupper.conf \
+                 listen.out nethost.conf netnone.conf netexec.conf netexec.out vmhost.conf tools/squashfuse segmented.conf nested.conf nestover.conf inited.conf blocked.conf pathless.conf pathed.conf owned.conf ownedin.conf exported.conf exported.tar exported.view exportin.conf owners.list owned_back.conf rootfs/given ownedin_back.conf ownedrun.tar ownedrun.conf layered.conf relayered.conf layeredin.conf sharedupper.conf \
                  whole.conf quit.conf refused.conf devs.conf devroot/probe hostdev.conf cut.conf cut.out counts.out impair.err pausing.conf pausing.out cutin.conf cutin.out cutin.counts offwire.conf tam.conf tam.out tam.err tam.counts badtam.conf injhear.conf injhear.out inj.err \
                  named.conf inplace.conf dosroot/HELLO.COM dosroot/EXIT3.COM dosroot/LOOP.COM dosvol/IN.TXT doshello.conf dosexit.conf dosvol.conf dosenv.conf dosnone.conf dosloop.conf dosmnt.conf dosport.conf dosown.conf doscopy.conf dosroot/CDCHK.COM doscd/files/README.TXT doscd.iso doscddir.conf doscdtype.conf doscdiso.conf doscdnone.conf dosbatch.conf dosfile dosfilevol.conf dosroot/AUDINFO.COM doscdx/files/README.TXT doscdx/files/DATA/SUB.TXT doscdx/tracks/02.wav doscdx/media.conf doscdq/files/README.TXT doscdquirk.conf doscdaudio.conf doscdsub.conf held.conf held.err stuck.conf placed.conf $(foreach n,1 2 3 4 5 6 7 8,lines$(n).conf lines$(n).want lines$(n).out) grouped.conf grouproot/probe grouproot/etc/motd grouproot/etc/resolv.conf groupdata/given twosub.conf half.conf dnsfirst.conf dnstcp.conf wide.conf \
                  full.conf full.out full.counts another.conf widened.conf barejoin.conf \
@@ -326,7 +326,9 @@ DOCKER_TEST_FILES = $(addprefix $(BUILD_DIR)/test/docker/, run.conf vol.conf vol
                     direct/out direct/live direct/root/srv/new direct/root/probe \
                     direct/root/etc/motd direct/root/sbin dexported.conf dvolumed.conf \
                     nested.conf nest/b/in \
-                    root.conf root.log rootcap.conf rootheld.conf rootkept.conf)
+                    root.conf root.log rootcap.conf rootheld.conf rootkept.conf \
+                    dinit.conf dinitexec.conf dinitexec.out dnoinit.conf dinitgone.conf \
+                    dinituser.conf)
 
 # What test/qemu_test.sh writes.
 QEMU_TEST_FILES = $(addprefix $(BUILD_DIR)/test/qemu/, run.conf vbuilt.conf die.conf nope.conf write.conf \

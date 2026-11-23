@@ -80,6 +80,7 @@ struct hull_machine {
 	char            *body;       /* the create request */
 	char             name[96];
 	char             user[128];  /* (user ...), or "" for the invoking user */
+	char             init[256];  /* (init PATH), or "" */
 	char             id[80];     /* the container, once created */
 	int              attach;     /* the attach stream, once started */
 	pthread_t        reader;
@@ -1337,8 +1338,9 @@ done:
 	return result;
 }
 
-/* `,"Entrypoint":[...],"Cmd":[...]` for a machine on segments: hull-agent
- * waiting for its NICs ahead of the image's entrypoint, and its command
+/* `,"Entrypoint":[...],"Cmd":[...]` for a machine on segments or under
+ * (init ...): hull-agent waiting for its NICs, or handing PID 1 to the
+ * image's init, or both, ahead of the image's entrypoint, and its command
  * or the image's. Docker clears an image's Cmd where the Entrypoint is
  * set, so the image's is given again. A reason, or NULL. */
 static const char *wrap_command(hull_machine *m, text *body, const hull_sexpr_doc *doc,
@@ -1353,8 +1355,15 @@ static const char *wrap_command(hull_machine *m, text *body, const hull_sexpr_do
 		free(cmd.data);
 		return "the image's entrypoint cannot be read from the daemon";
 	}
-	addf(body, ",\"Entrypoint\":[\"" AGENT_GUEST "\",\"wait-nics\",\"%u\",\"%u\",\"--\"",
-	     m->routed ? 1u : 0u, m->segment_count);
+	add_text(body, ",\"Entrypoint\":[");
+	if (m->segment_count != 0u)
+		addf(body, "\"" AGENT_GUEST "\",\"wait-nics\",\"%u\",\"%u\",\"--\"%s",
+		     m->routed ? 1u : 0u, m->segment_count, m->init[0] != '\0' ? "," : "");
+	if (m->init[0] != '\0') {
+		add_text(body, "\"" AGENT_GUEST "\",\"init\",");
+		add_json(body, m->init);
+		add_text(body, ",\"--\"");
+	}
 	if (entry.length != 0u) {
 		add_text(body, ",");
 		add_all(body, &entry);
@@ -1406,7 +1415,7 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 	add_text(&body, "{\"Image\":");
 	add_json(&body, image);
 
-	if (m->segment_count != 0u) {
+	if (m->segment_count != 0u || m->init[0] != '\0') {
 		if ((reason = wrap_command(m, &body, doc, machine, image)) != NULL) {
 			free(body.data);
 			return reason;
@@ -1751,28 +1760,34 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 		}
 	}
 	/* On segments: hull-agent, which waits for the NICs and makes them,
-	 * and the directory its socket is made in. */
-	if (reason == NULL && m->segment_count != 0u) {
+	 * and the directory its socket is made in; under (init ...), the
+	 * agent alone, which hands PID 1 to the image's init. */
+	if (reason == NULL && (m->segment_count != 0u || m->init[0] != '\0')) {
 		char agent[PATH_MAX];
 		text bind = { 0 };
 
 		if (agent_beside(agent, sizeof agent) != 0)
-			reason = "a docker machine on a segment runs hull-agent, beside hull, and there is "
-			         "none: `make` builds it";
+			reason = m->segment_count != 0u ?
+			         "a docker machine on a segment runs hull-agent, beside hull, and there is "
+			         "none: `make` builds it" :
+			         "a docker machine under (init ...) runs hull-agent, beside hull, and there "
+			         "is none: `make` builds it";
 		else {
 			add_text(&bind, agent);
 			add_text(&bind, ":" AGENT_GUEST ":ro");
 			if (binds.length != 0u)
 				add_text(&binds, ",");
 			add_json(&binds, bind.data != NULL ? bind.data : "");
+		}
+		if (reason == NULL && m->segment_count != 0u) {
 			bind.length = 0u;
 			add_text(&bind, m->nic_dir);
 			add_text(&bind, ":" NIC_GUEST);
 			add_text(&binds, ",");
 			add_json(&binds, bind.data != NULL ? bind.data : "");
-			binds.failed |= bind.failed;
-			free(bind.data);
 		}
+		binds.failed |= bind.failed;
+		free(bind.data);
 	}
 	if (binds.length != 0u) {
 		add_text(&body, ",\"Binds\":[");
@@ -1830,9 +1845,31 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 			                "\"CgroupPermissions\":\"rwm\"}");
 		add_text(&body, "]");
 	}
+	/* Under (init ...), no path of /proc masked or made read-only: the
+	 * kernel mounts a PID namespace's own /proc only where no mount hides
+	 * part of the one there (section 4.8's docker entry). */
+	if (m->init[0] != '\0') {
+		int any = 0;
+
+		add_text(&body, ",\"MaskedPaths\":[],\"ReadonlyPaths\":[");
+		for (unsigned k = 0u; k < m->stack_count; k++) {
+			text guest = { 0 };
+
+			if (!m->stacks[k].stack.readonly)
+				continue;
+			add_text(&guest, "/");
+			add_text(&guest, m->stacks[k].guest);
+			if (any++)
+				add_text(&body, ",");
+			add_json(&body, guest.data != NULL ? guest.data : "/");
+			body.failed |= guest.failed;
+			free(guest.data);
+		}
+		add_text(&body, "]");
+	}
 	/* A read-only stack is its guest path made read-only, ReadonlyPaths,
 	 * which replaces docker's own list, so that list is given too. */
-	for (unsigned i = 0u; i < m->stack_count; i++) {
+	for (unsigned i = 0u; i < m->stack_count && m->init[0] == '\0'; i++) {
 		if (!m->stacks[i].stack.readonly)
 			continue;
 		add_text(&body, ",\"ReadonlyPaths\":[\"/proc/bus\",\"/proc/fs\",\"/proc/irq\","
@@ -1852,11 +1889,29 @@ static const char *build(hull_machine *m, const hull_sexpr_doc *doc,
 		add_text(&body, "]");
 		break;
 	}
-	if (hull_access_find(doc, machine, "security", &entry)) {
-		if (hull_access_true(doc, &entry, "readonly_root"))
-			add_text(&body, ",\"ReadonlyRootfs\":true");
-		if (hull_access_true(doc, &entry, "no_new_privs"))
-			add_text(&body, ",\"SecurityOpt\":[\"no-new-privileges\"]");
+	{
+		int no_new_privs = 0;
+
+		if (hull_access_find(doc, machine, "security", &entry)) {
+			if (hull_access_true(doc, &entry, "readonly_root"))
+				add_text(&body, ",\"ReadonlyRootfs\":true");
+			no_new_privs = hull_access_true(doc, &entry, "no_new_privs");
+		}
+		/* Under (init ...), the user namespace the agent makes, which
+		 * docker's seccomp profile refuses without CAP_SYS_ADMIN and its
+		 * AppArmor profile's mount rules would then deny inside: neither
+		 * is applied. What runs is the user's uid with no capabilities
+		 * in the daemon's namespace, held to the kernel's rules for any
+		 * user's process, as on chroot. */
+		if (no_new_privs || m->init[0] != '\0') {
+			add_text(&body, ",\"SecurityOpt\":[");
+			if (no_new_privs)
+				add_text(&body, m->init[0] != '\0' ? "\"no-new-privileges\"," :
+				                                     "\"no-new-privileges\"");
+			if (m->init[0] != '\0')
+				add_text(&body, "\"seccomp=unconfined\",\"apparmor=unconfined\"");
+			add_text(&body, "]");
+		}
 	}
 	add_text(&body, "}}");
 	free(exposed.data);
@@ -3551,6 +3606,31 @@ static hull_status docker_create(hull_core *core, hull_buf plan, hull_machine **
 			snprintf(m->user, sizeof m->user, "%s", user);
 		free(user);
 	}
+	{
+		char *init = hull_access_value(&doc, &machine, "init");
+
+		if (init != NULL && (init[0] != '/' || strlen(init) >= sizeof m->init)) {
+			free(init);
+			release(m);
+			return fail(error, HULL_ERR_UNSUPPORTED, "(init ...) is an absolute path");
+		}
+		if (init != NULL && m->user[0] != '\0') {
+			free(init);
+			release(m);
+			return fail(error, HULL_ERR_UNSUPPORTED,
+			            "(user ...) is whom a command runs as; an (init ...) starts its own");
+		}
+		if (init != NULL && hull_access_ssh(&doc, &machine) != 0) {
+			free(init);
+			release(m);
+			return fail(error, HULL_ERR_UNSUPPORTED,
+			            "(ssh true) beside (init ...) on docker: its sessions would start outside "
+			            "the init's namespaces, where the machine's processes are not");
+		}
+		if (init != NULL)
+			snprintf(m->init, sizeof m->init, "%s", init);
+		free(init);
+	}
 
 	reason = read_stacks(m, &doc, &machine);
 	if (reason == NULL)
@@ -4263,6 +4343,9 @@ static hull_status docker_exec(hull_core *core, hull_machine *m, hull_buf spec,
 	} else {
 		addf(&body, "\"User\":\"%u:%u\",\"Cmd\":[", (unsigned)getuid(), (unsigned)getgid());
 	}
+	/* Under (init ...), into the namespaces the workload runs in. */
+	if (m->init[0] != '\0')
+		add_text(&body, "\"" AGENT_GUEST "\",\"enter\",\"--\",");
 	add_strings(&body, &doc, &argv);
 	add_text(&body, "]}");
 	st = calloc(1u, sizeof *st);
@@ -4591,9 +4674,10 @@ static const hull_cap_entry entries[] = {
 	  "the user's", NULL },
 	{ "owners",             HULL_SUP_EMULATED,
 	  "given in the dir's import, its tar carrying each listed owner", NULL },
-	{ "init",               HULL_SUP_REJECTED,
-	  "the workload runs as the user, and an image's init wants root as PID 1, which root "
-	  "mode does not offer, chroot and the vm giving it without root", NULL },
+	{ "init",               HULL_SUP_EMULATED,
+	  "PID 1 of a user namespace hull-agent makes in the container, the user its root, as on "
+	  "chroot; docker's seccomp and AppArmor profiles not applied, and its network docker's, "
+	  "which that root may not configure", NULL },
 	{ "segments",           HULL_SUP_NATIVE,
 	  "a tap in the container on the core's switch, made by hull-agent as the container's root, "
 	  "the container given NET_ADMIN and /dev/net/tun, which its workload, the user, does not "

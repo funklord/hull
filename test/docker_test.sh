@@ -1187,6 +1187,51 @@ printf '(machine (source "dir:./rootfs") (backend docker) (mutable overlay) (on_
 	"$segnet" > "$root/segkeep.conf"
 expect 125 'cannot outlive the core, whose switch the segment is' segkeep
 
+# (init PATH), as on chroot: PID 1 of a user namespace hull-agent makes,
+# the user its root, is alpine's busybox init, and hull's init beside it
+# runs the workload, which is not PID 1; its code is the machine's, and
+# the image's /sbin/poweroff ends the machine at once rather than after
+# the grace. An exec sees the same machine, and a stop reaches the
+# workload by hull's init, well inside its timeout. An init not there is
+# refused; one that ends under its workload is said; (user ...) beside it
+# is refused.
+conf dinit '(init "/sbin/init")' \
+	'(command "sh" "-c" "echo pid1=$(tr \"\\0\" \" \" < /proc/1/cmdline) me=$$ uid=$(id -u); exit 3")'
+started=$(date +%s)
+expect 3 '^pid1=/sbin/init  *me=([2-9]|[1-9][0-9]+) uid=0$' dinit
+took=$(( $(date +%s) - started ))
+cases=$((cases + 1))
+[ "$took" -lt 15 ] || fail "a docker machine handed to its init took ${took}s to end, its poweroff unused" "$out"
+conf dinitexec '(init "/sbin/init")' \
+	'(command "sh" "-c" "trap \"echo got-term; exit 0\" TERM; echo ready; while :; do sleep 1; done")'
+rm -f "$root/dinitexec.out"
+(cd / && exec timeout 60 "$hull" run -f "$root/dinitexec.conf" > "$root/dinitexec.out" 2>&1) &
+dinitexec=$!
+tries=0
+until grep -q '^ready$' "$root/dinitexec.out" 2>/dev/null || [ "$tries" -ge 80 ]; do
+	tries=$((tries + 1))
+	sleep 0.25
+done
+cases=$((cases + 1))
+out=$(timeout 20 "$hull" exec dtest sh -c 'echo pid1=$(tr "\0" " " < /proc/1/cmdline) uid=$(id -u); ps -o comm | grep -c hull-init' 2>&1)
+printf '%s\n' "$out" | grep -Eq '^pid1=/sbin/init  *uid=0$' && printf '%s\n' "$out" | grep -q '^1$' ||
+	fail "an exec into a docker machine under its init did not see that machine" "$out"
+started=$(date +%s)
+timeout 30 "$hull" stop --timeout 8 dtest > /dev/null 2>&1
+took=$(( $(date +%s) - started ))
+wait "$dinitexec"
+cases=$((cases + 1))
+[ "$took" -lt 7 ] && grep -q '^got-term$' "$root/dinitexec.out" ||
+	fail "a stop of a docker machine under its init took ${took}s: its TERM missed the workload" \
+		"$(cat "$root/dinitexec.out")"
+rm -f "$root/dinitexec.out"
+conf dnoinit '(init "/sbin/nothing")' '(command "echo" "never")'
+expect 125 'no init it can run' dnoinit
+conf dinitgone '(init "/bin/false")' '(command "sh" "-c" "sleep 10; echo outlived")'
+expect 125 "the machine's init ended, status 1, before its workload did" dinitgone
+conf dinituser '(init "/sbin/init")' '(user "4321")' '(command "true")'
+expect 125 'an \(init \.\.\.\) starts its own' dinituser
+
 # Nothing left on the daemon.
 cases=$((cases + 1))
 left=$(timeout 10 docker ps -a --filter name=hull-dtest- --format '{{.Names}}')

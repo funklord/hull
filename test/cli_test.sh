@@ -78,7 +78,7 @@ printf '%s\n' '(machine (source "debian:13") (ports (port (host 8080) (guest 80)
 printf '%s\n' '(machine (source "dir:./rootfs"))' > "$dir/dir.conf"
 printf '%s\n' '(machine (source "dir:.") (fidelity inotify))' > "$dir/inotify.conf"
 printf '%s\n' '(machine (source "debian:13") (arch mips64el))' > "$dir/foreign.conf"
-printf '%s\n' '(machines (web (source "debian:13")) (db (source "dir:./db") (init "/sbin/init")))' \
+printf '%s\n' '(machines (web (source "debian:13")) (db (source "dir:./db") (volumes (volume (block "./db.img") (guest "/img")))))' \
 	> "$dir/machines.conf"
 printf '%s\n' '(build (base "debian:13"))' > "$dir/build.conf"
 printf '%s\n' '(machine (sauce "a"))' > "$dir/bad.conf"
@@ -638,13 +638,19 @@ expect 0 'segments: native: a tap in the container on the core.s switch, made by
 	"$hull" plan --explain -f "$dir/segmented.conf" --backend docker
 expect 0 'machine on qemu \(vm\): ok|segments: native' \
 	"$hull" plan --explain -f "$dir/segmented.conf" --backend vm
-# Handing PID 1 to the image's init is chroot's and qemu's, not docker's.
+# Handing PID 1 to the image's init is chroot's and qemu's, and docker's
+# in a user namespace of the agent's; an image file as a volume is not
+# docker's.
 printf '%s\n' '(machine (source "dir:./rootfs") (init "/sbin/init"))' > "$dir/inited.conf"
 expect 0 'init: native: the image.s init is PID 1, the engine.s a child of it' \
 	"$hull" plan --explain -f "$dir/inited.conf" --backend chroot
-expect 1 'init: rejected: the workload runs as the user, and an image.s init wants root' \
+expect 0 'init: emulated: PID 1 of a user namespace hull-agent makes in the container' \
 	"$hull" plan -f "$dir/inited.conf" --backend docker
-expect 1 'machine on docker \(ns\): rejected, 1 field$' "$hull" plan -f "$dir/inited.conf" --backend docker
+printf '%s\n' '(machine (source "dir:./rootfs") (volumes (volume (block "./disk.img") (guest "/img"))))' \
+	> "$dir/blocked.conf"
+expect 1 'volumes\.block: rejected: docker mounts no image file' \
+	"$hull" plan -f "$dir/blocked.conf" --backend docker
+expect 1 'machine on docker \(ns\): rejected, 1 field$' "$hull" plan -f "$dir/blocked.conf" --backend docker
 expect 2 'plan takes one backend' "$hull" plan -f "$dir/ref.conf" --backend ns,vm
 expect 0 '^\(machine \(source "debian:13"\) \(ports \(port \(host 8080\) \(guest 80\) \(proto tcp\)\)\) .*\(projection bind\)\)$' \
 	"$hull" plan --resolved -f "$dir/ref.conf" --backend docker
@@ -658,12 +664,12 @@ expect 1 'fidelity\.inotify: rejected: .* \(--accept vm:inotify-poll honours it\
 	"$hull" plan -f "$dir/inotify.conf" --backend vm
 expect 0 'fidelity\.inotify: accepted' \
 	"$hull" plan -f "$dir/inotify.conf" --backend vm --accept vm:inotify-poll
-expect 1 'init: rejected' \
-	"$hull" plan -f "$dir/inited.conf" --backend docker --accept vm:inotify-poll
+expect 1 'volumes\.block: rejected' \
+	"$hull" plan -f "$dir/blocked.conf" --backend docker --accept vm:inotify-poll
 
 # check: every backend listed, and the worst of them decides.
-expect 1 'machine on qemu \(vm\): ok$' "$hull" check -f "$dir/inited.conf" --backend docker,vm
-expect 1 'machine on docker \(ns\): rejected' "$hull" check -f "$dir/inited.conf" --backend docker,vm
+expect 1 'machine on qemu \(vm\): ok$' "$hull" check -f "$dir/blocked.conf" --backend docker,vm
+expect 1 'machine on docker \(ns\): rejected' "$hull" check -f "$dir/blocked.conf" --backend docker,vm
 expect 0 'machine on chroot \(ns\): ok$' "$hull" check -f "$dir/dir.conf" --backend ns,vm
 expect 0 'machine on qemu \(emu\): ok$' "$hull" check -f "$dir/dir.conf" --backend vm,emu
 expect 1 'machine on qemu \(vm\): arch: rejected: only the emu class' \
