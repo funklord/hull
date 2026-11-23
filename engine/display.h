@@ -41,4 +41,11 @@ void hull_display_unlink(char *link, const char *monitor);
  * while qemu is a zombie not yet reaped, so its pid cannot be another's. */
 void hull_display_end_session(pid_t leader);
 
+/* Why (gpu venus) cannot run on this host, as a refusal's text, or NULL
+ * where it can: the guest's memory reaches the host's GPU through
+ * /dev/udmabuf, which must be the user's, and virglrenderer runs Venus in
+ * its render server, a program of its own the library execs. The qemu and
+ * pc engines both refuse with it before anything is made. */
+const char *hull_display_venus_refusal(void);
+
 #endif

@@ -11,8 +11,9 @@
 # the GPU's dmabufs, and serving no VNC. Its 3D: (tuning (qemu (gpu
 # virgl))) a guest's OpenGL rendered by the host's GPU through
 # virglrenderer, its renderer read in the guest;
-# (gpu venus) its Vulkan by Venus where /dev/udmabuf is open to the user,
-# and refused naming it where it is not; 3D without a screen refused at
+# (gpu venus) its Vulkan by Venus where /dev/udmabuf is open to the user
+# and virglrenderer's render server installed, and refused naming the one
+# missing where either is; 3D without a screen refused at
 # plan. The pc class's (gpu virgl): the Mesa tree exported bootable and
 # booted as a pc, its renderer read, and refused without a screen or
 # beside another VGA card. And no qemu, nor anything it forked, left after
@@ -174,7 +175,17 @@ cases=$((cases + 1))
 
 out=$(machine gpuvk venus 'vulkaninfo --summary 2>&1 | grep -i deviceName')
 cases=$((cases + 1))
-if [ -r /dev/udmabuf ] && [ -w /dev/udmabuf ]; then
+server=${RENDER_SERVER_EXEC_PATH:-/usr/libexec/virgl_render_server}
+[ -x "$server" ] || [ -x /usr/local/libexec/virgl_render_server ] || server=
+if ! [ -r /dev/udmabuf ] || ! [ -w /dev/udmabuf ]; then
+	printf '%s\n' "$out" | grep -q '/dev/udmabuf, which is not open to this user' ||
+		fail "(gpu venus) was not refused naming /dev/udmabuf" "$out"
+	printf 'screen: Venus not run: /dev/udmabuf is not open to this user\n'
+elif [ -z "$server" ]; then
+	printf '%s\n' "$out" | grep -q 'virgl_render_server, which is not on this host' ||
+		fail "(gpu venus) was not refused naming the render server" "$out"
+	printf 'screen: Venus not run: no virgl_render_server (Debian: virgl-server)\n'
+else
 	printf '%s\n' "$out" | grep -q 'Venus' ||
 		fail "a guest's Vulkan did not reach the host's GPU through Venus" "$out"
 	sleep 2
@@ -182,10 +193,6 @@ if [ -r /dev/udmabuf ] && [ -w /dev/udmabuf ]; then
 	[ "$(left)" = 0 ] ||
 		fail "Venus's render server, or its qemu, was left after its machine ended" \
 			"$(ps -eo pid,ppid,args | grep '[q]emu-system')"
-else
-	printf '%s\n' "$out" | grep -q '/dev/udmabuf, which is not open to this user' ||
-		fail "(gpu venus) was not refused naming /dev/udmabuf" "$out"
-	printf 'screen: Venus not run: /dev/udmabuf is not open to this user\n'
 fi
 
 # A pc's 3D, (tuning (pc (gpu virgl))): the same tree exported as a

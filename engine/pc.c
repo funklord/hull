@@ -2314,14 +2314,11 @@ static int launch(hull_machine *m)
 	int  *in = fds, *monitor = fds + 2, *out = fds + 4, *err = fds + 6;
 	pid_t parent = getpid();
 	pid_t child;
+	const char *venus;
 
-	/* Venus's blobs are dma-bufs qemu makes through /dev/udmabuf, as on a
-	 * vm: without it the guest's Vulkan fails (section 5). */
-	if (m->gpu == 2 && access("/dev/udmabuf", R_OK | W_OK) != 0) {
-		snprintf(m->why, sizeof m->why, "(gpu venus) hands the guest's memory to the host's "
-		         "GPU through /dev/udmabuf, which is not open to this user: on Debian it is "
-		         "the kvm group's, mode 660, where /dev/kvm is 666 -- the kvm group, or a udev "
-		         "rule opening it as /dev/kvm is; (gpu virgl) needs neither\n");
+	/* Venus's needs on the host, as on a vm (engine/display.c). */
+	if (m->gpu == 2 && (venus = hull_display_venus_refusal()) != NULL) {
+		snprintf(m->why, sizeof m->why, "%s\n", venus);
 		return -1;
 	}
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, in) != 0 ||
@@ -3392,7 +3389,8 @@ static const hull_cap_entry entries[] = {
 	  "needs Mesa's virgl driver, which Windows has none of", NULL },
 	{ "pc.gpu.venus", HULL_SUP_NATIVE,
 	  "virtio-vga-gl with Venus, Vulkan forwarded to the host's GPU and driver; the guest needs "
-	  "Mesa's Venus driver, and its memory is a shared memfd", NULL },
+	  "Mesa's Venus driver, and its memory is a shared memfd; the host /dev/udmabuf the user's "
+	  "and virglrenderer's render server", NULL },
 	{ "pc.accel.auto", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.accel.kvm", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.accel.tcg", HULL_SUP_NATIVE, NULL, NULL },

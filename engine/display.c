@@ -109,6 +109,36 @@ void hull_display_unlink(char *link, const char *monitor)
 }
 
 /*
+ * Venus's two needs on the host, each measured on an RTX 3060 with
+ * NVIDIA's 615 driver and Debian 13's virglrenderer 1.1.0. Without
+ * /dev/udmabuf the user's every blob is refused (2026-11-13). Without the
+ * render server -- Debian's virgl-server package, which libvirglrenderer1
+ * does not pull in -- the same: the guest's kernel logs response 0x1200 to
+ * RESOURCE_CREATE_BLOB, Mesa "failed to allocate/map ring shmem", and
+ * vkCreateInstance fails ERROR_OUT_OF_HOST_MEMORY, though the machine
+ * boots and its capsets name Venus (2026-11-23, /dev/udmabuf open). The
+ * library execs RENDER_SERVER_EXEC_PATH where set, else the path its
+ * build named, /usr/libexec on Debian and Fedora.
+ */
+const char *hull_display_venus_refusal(void)
+{
+	const char *server = getenv("RENDER_SERVER_EXEC_PATH");
+
+	if (access("/dev/udmabuf", R_OK | W_OK) != 0)
+		return "(gpu venus) hands the guest's memory to the host's GPU through "
+		       "/dev/udmabuf, which is not open to this user: on Debian it is the kvm "
+		       "group's, mode 660, where /dev/kvm is 666 -- the kvm group, or a udev rule "
+		       "opening it as /dev/kvm is; (gpu virgl) needs neither";
+	if (server != NULL && *server != '\0' ? access(server, X_OK) != 0 :
+	    access("/usr/libexec/virgl_render_server", X_OK) != 0 &&
+	    access("/usr/local/libexec/virgl_render_server", X_OK) != 0)
+		return "(gpu venus) runs in virglrenderer's render server, virgl_render_server, "
+		       "which is not on this host: on Debian it is the virgl-server package, which "
+		       "libvirglrenderer1 does not pull in; (gpu virgl) needs no server";
+	return NULL;
+}
+
+/*
  * Every process left in the session qemu led, killed: what qemu forked and
  * did not end with it. virglrenderer's Venus render server is one, a fork
  * of qemu in a process group of its own, which went on spinning under init

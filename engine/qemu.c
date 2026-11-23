@@ -4660,6 +4660,7 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 {
 	struct utsname name;
 	const char    *reason;
+	const char    *venus;          /* why (gpu venus) cannot run here */
 	const char    *kernel;         /* the -kernel file */
 	char           mbuf[4300] = "";   /* its modules, the host's or the fetched kernel's */
 	char           kbuf[4300];     /* the host kernel's path, for bundled */
@@ -4701,15 +4702,11 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 	}
 	if (!m->emu && access("/dev/kvm", R_OK | W_OK) != 0)
 		return fail(error, HULL_ERR_RUNTIME, "/dev/kvm is not open to this user");
-	/* Venus's blobs are the guest's memory handed to the host's GPU as
-	 * dma-bufs, which qemu makes through /dev/udmabuf: without it every
-	 * blob is refused and the guest's Vulkan fails with
-	 * ERROR_OUT_OF_HOST_MEMORY, measured 2026-11-13. */
-	if (m->gpu == 2 && access("/dev/udmabuf", R_OK | W_OK) != 0)
-		return fail(error, HULL_ERR_RUNTIME, "(gpu venus) hands the guest's memory to the host's "
-		            "GPU through /dev/udmabuf, which is not open to this user: on Debian it is "
-		            "the kvm group's, mode 660, where /dev/kvm is 666 -- the kvm group, or a udev "
-		            "rule opening it as /dev/kvm is; (gpu virgl) needs neither");
+	/* Venus's needs on the host: /dev/udmabuf and the render server
+	 * (engine/display.c), without either of which the machine boots and
+	 * the guest's Vulkan fails. */
+	if (m->gpu == 2 && (venus = hull_display_venus_refusal()) != NULL)
+		return fail(error, HULL_ERR_RUNTIME, venus);
 	if (m->transport == 1 && access("/dev/vhost-vsock", R_OK | W_OK) != 0)
 		return fail(error, HULL_ERR_RUNTIME, "(transport vsock), and /dev/vhost-vsock is not "
 		            "open to this user: (transport auto) takes a serial port instead");
@@ -6290,7 +6287,8 @@ static const hull_cap_entry entries[] = {
 	  "virgl driver", NULL },
 	{ "qemu.gpu.venus",        HULL_SUP_NATIVE,
 	  "Vulkan forwarded by Venus to the host's GPU and driver, shared, near native; the guest "
-	  "needs Mesa's Venus driver, and its memory is a shared memfd", NULL },
+	  "needs Mesa's Venus driver, and its memory is a shared memfd; the host /dev/udmabuf the "
+	  "user's and virglrenderer's render server", NULL },
 	{ "qemu.iommu",            HULL_SUP_NATIVE,
 	  "q35's intel-iommu, with interrupt remapping and caching mode, the guest booted "
 	  "intel_iommu=on: its root may give a device to vfio-pci; x86 alone", NULL },
