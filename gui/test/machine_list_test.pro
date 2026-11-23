@@ -11,7 +11,12 @@ CONFIG -= app_bundle
 
 isEmpty(HULL_BUILD): error("machine_list_test.pro: HULL_BUILD is not set; build with `make check-gui`")
 DESTDIR = $$HULL_BUILD/test/gui
-QMAKE_CXXFLAGS += -Wall -Wextra
+# The sources under test compiled as gui.pro ships them, -Os and the
+# size rule's sections: qmake's default -O2 would test other code.
+QMAKE_CXXFLAGS_RELEASE -= -O2
+QMAKE_CXXFLAGS_RELEASE += -Os
+QMAKE_CXXFLAGS += -ffunction-sections -fdata-sections -Wall -Wextra
+QMAKE_LFLAGS += -Wl,--gc-sections
 INCLUDEPATH += $$PWD/../src
 
 SOURCES += machine_list_test.cpp ../src/machine_list.cpp

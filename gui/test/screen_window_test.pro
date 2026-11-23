@@ -11,7 +11,12 @@ PKGCONFIG += gio-unix-2.0 egl
 
 isEmpty(HULL_BUILD): error("screen_window_test.pro: HULL_BUILD is not set; build with `make check-screen`")
 DESTDIR = $$HULL_BUILD/test/screen-build
-QMAKE_CXXFLAGS += -Wall -Wextra
+# The sources under test compiled as gui.pro ships them, -Os and the
+# size rule's sections: qmake's default -O2 would test other code.
+QMAKE_CXXFLAGS_RELEASE -= -O2
+QMAKE_CXXFLAGS_RELEASE += -Os
+QMAKE_CXXFLAGS += -ffunction-sections -fdata-sections -Wall -Wextra
+QMAKE_LFLAGS += -Wl,--gc-sections
 INCLUDEPATH += $$PWD/../src
 
 SOURCES += screen_window_test.cpp ../src/screen_window.cpp ../src/dmabuf_view.cpp
