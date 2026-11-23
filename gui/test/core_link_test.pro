@@ -20,7 +20,7 @@ QMAKE_LFLAGS += -Wl,--gc-sections
 
 ROOT = $$PWD/../..
 INCLUDEPATH += $$PWD/../src $$ROOT/core $$ROOT/agent $$ROOT/sexpr $$HULL_BUILD/gen \
-	$$ROOT/vendor/situ/runtime/c
+	$$ROOT/situ/runtime/c
 LIBS += $$HULL_BUILD/libhull_client.a
 PRE_TARGETDEPS += $$HULL_BUILD/libhull_client.a
 

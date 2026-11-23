@@ -3,7 +3,7 @@
 #
 # Built by the root Makefile's `make gui`, which builds what this links
 # first and hands qmake two paths: HULL_BUILD, the build directory of the
-# C (libhull_client.a and the generated headers), and, where vendor/qtty
+# C (libhull_client.a and the generated headers), and, where qtty/
 # is checked out, QTTY_LIB_DIR, where libqtty.a was built. Not by a bare
 # `make`, which builds hull and its agent and nothing around them.
 #
@@ -35,7 +35,7 @@ PKGCONFIG += gio-unix-2.0 egl
 QT += openglwidgets
 
 ROOT = $$PWD/..
-INCLUDEPATH += $$ROOT/core $$ROOT/agent $$ROOT/sexpr $$HULL_BUILD/gen $$ROOT/vendor/situ/runtime/c
+INCLUDEPATH += $$ROOT/core $$ROOT/agent $$ROOT/sexpr $$HULL_BUILD/gen $$ROOT/situ/runtime/c
 LIBS += $$HULL_BUILD/libhull_client.a
 PRE_TARGETDEPS += $$HULL_BUILD/libhull_client.a
 DEFINES += HULL_VERSION=\\\"$$cat($$ROOT/VERSION, singleline)\\\"
@@ -43,7 +43,7 @@ DEFINES += HULL_VERSION=\\\"$$cat($$ROOT/VERSION, singleline)\\\"
 # qtty: the same window on a terminal. Optional, as the Makefile decides:
 # without it, hull-gui is the window alone and says so when asked for --tui.
 !isEmpty(QTTY_LIB_DIR):exists($$QTTY_LIB_DIR/libqtty.a) {
-	include($$ROOT/vendor/qtty/qtty.pri)
+	include($$ROOT/qtty/qtty.pri)
 	DEFINES += HULL_QTTY
 	LIBS += -L$$QTTY_LIB_DIR -lqtty
 	PRE_TARGETDEPS += $$QTTY_LIB_DIR/libqtty.a

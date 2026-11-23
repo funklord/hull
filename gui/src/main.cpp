@@ -79,7 +79,7 @@ int main(int argc, char **argv)
 #else
 	if (tui) {
 		fprintf(stderr, "hull-tui: this build has no terminal frontend: it is compiled in where "
-		        "qtty is (vendor/qtty, `make gui` builds it); the window is hull-gui\n");
+		        "the qtty/ submodule is (`make gui` builds it); the window is hull-gui\n");
 		return 2;
 	}
 #endif

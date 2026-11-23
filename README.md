@@ -818,7 +818,7 @@ A C11 compiler, Python 3, and OpenSSL's and zlib's development files,
 `libssl-dev` and `zlib1g-dev` on Debian, which `hull pull` links.
 
 ```sh
-make         # build/hull and its agent; fetches vendor/situ the first time
+make         # build/hull and its agent; fetches the situ/ submodule the first time
 fmake        # ./hull, ./hull-agent and ./libnss_hull.so, as fmake.toml describes
 make check   # the style gate, the situ contracts, then the tests
 make check-qemu    # the vm and emu engines, booting real guests

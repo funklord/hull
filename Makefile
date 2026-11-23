@@ -16,7 +16,7 @@ BUILD_DIR ?= build
 # never through PATH: the packaged situc of 2026-08-05 prints the same
 # `situc 1.0` as the source tree does, so nothing could tell an old one was
 # running.
-SITU_DIR  = vendor/situ
+SITU_DIR  = situ
 SITU_MARK = $(SITU_DIR)/bin/situc
 SITUC     = $(PYTHON) $(SITU_MARK)
 
@@ -452,7 +452,7 @@ root: $(ROOT_BIN)
 # which moc does not fit a pattern rule for, out of the tree.
 #
 # qtty draws the same window on a terminal (`hull-gui --tui`). Optional:
-# vendor/qtty is fetched for `make gui` where it was never checked out, and
+# qtty/ is fetched for `make gui` where it was never checked out, and
 # without it hull-gui is the window alone and says so when asked for a
 # terminal. Built out of the tree too, so the submodule's checkout stays
 # as it was cloned.
@@ -460,7 +460,7 @@ QMAKE      ?= qmake6
 CLIENT_LIB  = $(BUILD_DIR)/libhull_client.a
 GUI_BIN     = $(BUILD_DIR)/hull-gui
 GUI_SOURCES = $(wildcard gui/src/*.cpp gui/src/*.h)
-QTTY_DIR    = vendor/qtty
+QTTY_DIR    = qtty
 QTTY_LIB    = $(BUILD_DIR)/qtty/lib/libqtty.a
 
 ifneq ($(filter gui check-gui,$(MAKECMDGOALS)),)
@@ -476,7 +476,18 @@ $(CLIENT_LIB): $(WIRE_OBJS) $(SEXPR_OBJS)
 	@rm -f '$@'
 	$(AR) rcs '$@' $^
 
-$(BUILD_DIR)/qtty/Makefile: $(QTTY_DIR)/src/src.pro $(QTTY_DIR)/qtty.pri
+# Where the sources qmake is told of lie: its generated Makefiles name
+# them by absolute path and rerun qmake only for a changed .pro, so when a
+# submodule moved -- vendor/qtty to qtty/, 2026-11-23 -- a build tree made
+# before kept compiling paths no longer there. Written again only when a
+# path changes, so a second make writes nothing.
+QMAKE_PATHS = $(BUILD_DIR)/qmake-paths
+$(QMAKE_PATHS): FORCE
+	@mkdir -p '$(@D)'
+	@printf '%s\n' '$(abspath $(QTTY_DIR))' '$(abspath $(SITU_DIR))' '$(CURDIR)' > '$@.new'
+	@if cmp -s '$@.new' '$@'; then rm -f '$@.new'; else mv '$@.new' '$@'; fi
+
+$(BUILD_DIR)/qtty/Makefile: $(QTTY_DIR)/src/src.pro $(QTTY_DIR)/qtty.pri $(QMAKE_PATHS)
 	@mkdir -p '$(@D)'
 	cd '$(@D)' && $(QMAKE) '$(CURDIR)/$(QTTY_DIR)/src/src.pro' \
 	    QTTY_LIB_DIR='$(abspath $(BUILD_DIR))/qtty/lib'
@@ -485,7 +496,7 @@ $(QTTY_LIB): $(BUILD_DIR)/qtty/Makefile FORCE
 	$(MAKE) -C '$(BUILD_DIR)/qtty'
 
 # Written again only when the project, or whether qtty is there, changes.
-$(BUILD_DIR)/gui/Makefile: gui/gui.pro $(GUI_QTTY)
+$(BUILD_DIR)/gui/Makefile: gui/gui.pro $(GUI_QTTY) $(QMAKE_PATHS)
 	@mkdir -p '$(@D)'
 	cd '$(@D)' && $(QMAKE) '$(CURDIR)/gui/gui.pro' HULL_BUILD='$(abspath $(BUILD_DIR))' \
 	    $(if $(GUI_QTTY),QTTY_LIB_DIR='$(abspath $(BUILD_DIR))/qtty/lib')
@@ -502,7 +513,7 @@ GUI_TEST_FILES = $(addprefix $(BUILD_DIR)/test/gui/, a.conf b.conf c.conf d.conf
                    run.out wire.out wire.pcap spin.img swap.img pc.conf pc.out gui-pc-screen.png rootfs/probe run/hull/core.log run/hull/core.lock)
 LIST_TEST = $(BUILD_DIR)/test/gui/machine_list_test
 
-$(BUILD_DIR)/test/gui-list/Makefile: gui/test/machine_list_test.pro
+$(BUILD_DIR)/test/gui-list/Makefile: gui/test/machine_list_test.pro $(QMAKE_PATHS)
 	@mkdir -p '$(@D)'
 	cd '$(@D)' && $(QMAKE) '$(CURDIR)/gui/test/machine_list_test.pro' \
 	    HULL_BUILD='$(abspath $(BUILD_DIR))'
@@ -511,7 +522,7 @@ $(LIST_TEST): $(BUILD_DIR)/test/gui-list/Makefile gui/test/machine_list_test.cpp
               gui/src/machine_list.cpp gui/src/machine_list.h
 	$(MAKE) -C '$(BUILD_DIR)/test/gui-list'
 
-$(BUILD_DIR)/test/gui-build/Makefile: gui/test/core_link_test.pro
+$(BUILD_DIR)/test/gui-build/Makefile: gui/test/core_link_test.pro $(QMAKE_PATHS)
 	@mkdir -p '$(@D)'
 	cd '$(@D)' && $(QMAKE) '$(CURDIR)/gui/test/core_link_test.pro' \
 	    HULL_BUILD='$(abspath $(BUILD_DIR))'
@@ -521,7 +532,7 @@ $(LINK_TEST): $(BUILD_DIR)/test/gui-build/Makefile $(CLIENT_LIB) gui/test/core_l
 	$(MAKE) -C '$(BUILD_DIR)/test/gui-build'
 
 check-gui: $(HULL) $(GUI_BIN) $(LINK_TEST) $(LIST_TEST) $(PROBE)
-	@if [ -z '$(GUI_QTTY)' ]; then echo 'check-gui: needs vendor/qtty, for the snapshot' >&2; \
+	@if [ -z '$(GUI_QTTY)' ]; then echo 'check-gui: needs qtty/, for the snapshot' >&2; \
 	    exit 1; fi
 	BUILD_DIR='$(BUILD_DIR)' sh test/gui_test.sh '$(abspath $(HULL))' '$(abspath $(GUI_BIN))' \
 	    '$(abspath $(LINK_TEST))' '$(abspath $(PROBE))' '$(abspath $(LIST_TEST))'
@@ -534,7 +545,7 @@ help:
 	@echo '  kernel-check  whether that Linux is the newest of its longterm series, by kernel.org'"'"'s signed sums'
 	@echo '  kernel-cves   which of the kernel'"'"'s CVEs apply to that Linux as built here'
 	@echo '  nss       build the NSS module, libnss_hull.so.2, for *.hull names'
-	@echo '  gui       build hull-gui, the machine manager, and with vendor/qtty its --tui'
+	@echo '  gui       build hull-gui, the machine manager, and with qtty its --tui'
 	@echo '  root      build root mode'"'"'s helper, hull-root'
 	@echo '  check     style, the situ contracts, then the tests'
 	@echo '  check-docker  hull run on the docker adapter, against the local daemon'
@@ -871,6 +882,13 @@ install-apparmor: packaging/apparmor/hull.in
 $(GEN_DIR)/%.o: $(GEN_DIR)/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
+# A tree built before situ moved from vendor/situ, 2026-11-23, holds .d
+# files naming the old path as an object's source, which -MP covers only
+# for headers: as nothing, each such object is rebuilt once and its .d
+# then names the path it is now at.
+vendor/situ/%: ;
+vendor/qtty/%: ;
+
 $(BUILD_DIR)/situ/situ.o: $(SITU_DIR)/runtime/c/situ.c
 	@mkdir -p '$(@D)'
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
@@ -1059,7 +1077,7 @@ check-86box: $(HULL) $(AGENT_BIN)
 # KVM, a render node, and the network the first time, for Debian and Mesa.
 SCREEN_TEST = $(BUILD_DIR)/test/screen-build/screen_window_test
 
-$(BUILD_DIR)/test/screen-build/Makefile: gui/test/screen_window_test.pro
+$(BUILD_DIR)/test/screen-build/Makefile: gui/test/screen_window_test.pro $(QMAKE_PATHS)
 	@mkdir -p '$(@D)'
 	cd '$(@D)' && $(QMAKE) '$(CURDIR)/gui/test/screen_window_test.pro' \
 	    HULL_BUILD='$(abspath $(BUILD_DIR))'
@@ -1551,7 +1569,7 @@ clean:
 	        $(BUILD_DIR)/test/ppc64le/rootfs/probe \
 	        $(DOCKER_TEST_FILES) $(QEMU_TEST_FILES) $(ROOT_TEST_FILES) $(ROOTVM_TEST_FILES) $(SYSTEMD_TEST_FILES) $(VFIO_TEST_FILES) $(USB_TEST_FILES) $(BOARD_TEST_FILES) \
 	        $(FUZZ_FILES) \
-	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor $(CLIENT_LIB) $(GUI_BIN) \
+	        $(FLIP_TEST_FILES) $(NSS_LIB) $(BUILD_DIR)/hull.apparmor $(CLIENT_LIB) $(GUI_BIN) $(QMAKE_PATHS) \
 	        $(GUI_TEST_FILES)
 	@# qmake's builds, each cleaned by its own Makefile, which names its files.
 	@# The guard shares the line: make runs a line holding $(MAKE) even under
