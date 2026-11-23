@@ -7484,6 +7484,17 @@ static int collect(void)
 		}
 		hull_store_close(&store);
 	}
+	{
+		unsigned appliances = 0u;
+
+		if (hull_vmconf_gc(&appliances, why, sizeof why) != 0) {
+			fprintf(stderr, "hull: gc: the appliances unpacked: %s\n", why);
+			result = 1;
+		} else if (appliances != 0u) {
+			printf("cache: removed %u unpacked appliance%s whose .ova is gone or changed\n",
+			       appliances, appliances == 1u ? "" : "s");
+		}
+	}
 	if (connect_core(&wire, 1) != 0)
 		return 2;
 	send_request(&wire, "(2:gc", 1u, NULL, NULL);

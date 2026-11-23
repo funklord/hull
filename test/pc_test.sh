@@ -239,6 +239,71 @@ got=$?
 status 'a snapshot differencing disk is refused' "$got" 2 "$out"
 says 'naming the way round' "$out" 'VBoxManage clonemedium'
 
+# An appliance: its .ovf read as a pc machine, VirtualBox's export shape
+# -- a streamOptimized VMDK, an IDE controller, an E1000 -- and the .ova
+# around it unpacked once into the cache, then booted from there.
+# VMware's shape: a disk on SATA by ovf:/disk/, UEFI by its extra
+# configuration. A drive naming what the appliance lacks is refused.
+mkdir -p "$root/ovf"
+qemu-img convert -f raw -O vmdk -o subformat=streamOptimized "$root/raw.img" \
+	"$root/ovf/box-disk001.vmdk"
+ovf() { # FILE DISK-RESOURCE CONTROLLER-TYPE EXTRA
+	cat > "$root/ovf/$1" <<EOF
+<?xml version="1.0"?>
+<Envelope ovf:version="1.0" xmlns="http://schemas.dmtf.org/ovf/envelope/1" xmlns:ovf="http://schemas.dmtf.org/ovf/envelope/1" xmlns:rasd="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ResourceAllocationSettingData" xmlns:vmw="http://www.vmware.com/schema/ovf">
+  <References>
+    <File ovf:id="file1" ovf:href="box-disk001.vmdk"/>
+  </References>
+  <DiskSection>
+    <Disk ovf:capacity="1048576" ovf:diskId="vmdisk1" ovf:fileRef="file1"/>
+  </DiskSection>
+  <VirtualSystem ovf:id="Exported Box">
+    <VirtualHardwareSection>
+      <Item><rasd:InstanceID>1</rasd:InstanceID><rasd:ResourceType>3</rasd:ResourceType><rasd:VirtualQuantity>2</rasd:VirtualQuantity></Item>
+      <Item><rasd:AllocationUnits>byte * 2^20</rasd:AllocationUnits><rasd:InstanceID>2</rasd:InstanceID><rasd:ResourceType>4</rasd:ResourceType><rasd:VirtualQuantity>192</rasd:VirtualQuantity></Item>
+      <Item><rasd:InstanceID>3</rasd:InstanceID><rasd:ResourceType>$3</rasd:ResourceType></Item>
+      <Item><rasd:InstanceID>5</rasd:InstanceID><rasd:ResourceSubType>E1000</rasd:ResourceSubType><rasd:ResourceType>10</rasd:ResourceType></Item>
+      <Item><rasd:HostResource>$2</rasd:HostResource><rasd:InstanceID>7</rasd:InstanceID><rasd:Parent>3</rasd:Parent><rasd:ResourceType>17</rasd:ResourceType></Item>
+      <Item><rasd:InstanceID>8</rasd:InstanceID><rasd:Parent>3</rasd:Parent><rasd:ResourceType>15</rasd:ResourceType></Item>
+      $4
+    </VirtualHardwareSection>
+  </VirtualSystem>
+</Envelope>
+EOF
+}
+ovf box.ovf /disk/vmdisk1 5 ''
+out=$("$hull" plan --resolved -f "$root/ovf/box.ovf" 2>&1)
+says 'an .ovf is a pc machine of its name' "$out" '(hostname "exported-box") (source "media:disk") (memory "192M") (cpus 2) (network nat)'
+says 'its disk by its file' "$out" '(medium (type disk) (source "image:./box-disk001.vmdk"))'
+says 'on IDE, an i440FX' "$out" '(tuning (pc (machine pc) (cpu max) (nic e1000)))'
+(cd "$root/ovf" && tar -cf box.ova box.ovf box-disk001.vmdk)
+out=$(timeout 120 "$hull" run -f "$root/ovf/box.ova" 2>&1)
+got=$?
+status 'an .ova boots' "$got" 0 "$out"
+says 'its streamOptimized disk' "$out" 'word: fresh'
+"$hull" plan -f "$root/ovf/box.ova" > /dev/null 2>&1
+cases=$((cases + 1))
+[ "$(ls "$root/cache/hull/ova" | wc -l)" = 1 ] && [ -f "$root/cache/hull/ova/$(ls "$root/cache/hull/ova")/box.ovf" ] ||
+	fail 'an .ova unpacked once into the cache' "$(ls -R "$root/cache/hull/ova")"
+# Kept while the .ova is as it was, and taken by hull gc once it is not:
+# what a machine leaves is counted after the kill, below.
+out=$(timeout 60 "$hull" gc 2>&1)
+cases=$((cases + 1))
+[ "$(ls "$root/cache/hull/ova" | wc -l)" = 1 ] || fail 'hull gc kept an unpacked .ova still there' "$out"
+touch -d '2001-01-01' "$root/ovf/box.ova"
+out=$(timeout 60 "$hull" gc 2>&1)
+says 'hull gc takes an unpacked .ova once it has changed' "$out" 'removed 1 unpacked appliance whose .ova is gone or changed'
+cases=$((cases + 1))
+[ -z "$(ls -A "$root/cache/hull/ova")" ] || fail 'and its files are gone' "$(ls -R "$root/cache/hull/ova")"
+ovf vmware.ovf ovf:/disk/vmdisk1 20 '<vmw:Config ovf:required="false" vmw:key="firmware" vmw:value="efi"/>'
+out=$("$hull" plan --resolved -f "$root/ovf/vmware.ovf" 2>&1)
+says "VMware's shape: SATA, q35, UEFI" "$out" '(tuning (pc (machine q35) (cpu max) (firmware uefi) (nic e1000)))'
+ovf lacking.ovf /disk/vmdisk9 5 ''
+out=$("$hull" plan -f "$root/ovf/lacking.ovf" 2>&1)
+got=$?
+status 'a drive the appliance lacks is refused' "$got" 2 "$out"
+says 'and named' "$out" 'names /disk/vmdisk9, which the appliance does not hold'
+
 # --- a floppy ----------------------------------------------------------------
 
 image 1440K "$root/floppy.img"

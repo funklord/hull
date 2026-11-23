@@ -1,6 +1,6 @@
 /*
- * vmconf.c -- VMware's .vmx and VirtualBox's .vbox as a hull machine
- * (vmconf.h, project.md section 3.13).
+ * vmconf.c -- VMware's .vmx, VirtualBox's .vbox and an appliance's .ovf
+ * or .ova as a hull machine (vmconf.h, project.md section 3.13).
  *
  * Each file says what its machine is -- memory, processors, firmware, a
  * TPM, a network card, and which disk and disc image sits on which port
@@ -16,10 +16,20 @@
 #define _GNU_SOURCE
 
 #include <ctype.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
 
+#include "store.h"
 #include "vmconf.h"
 
 #define MAX_BYTES   (4u << 20)
@@ -47,6 +57,7 @@ typedef struct machine {
 	int         boot_cdrom;
 	medium      media[MAX_MEDIA];
 	unsigned    media_count;
+	const char *base;       /* where an .ova's files were unpacked, or NULL */
 	int         failed;
 } machine;
 
@@ -115,7 +126,10 @@ static void add_medium(machine *m, const char *type, const char *path, int ide)
 	}
 	d = &m->media[m->media_count++];
 	snprintf(d->type, sizeof d->type, "%s", type);
-	snprintf(d->path, sizeof d->path, "%s", path);
+	if (m->base != NULL && path[0] != '/')
+		snprintf(d->path, sizeof d->path, "%s/%s", m->base, path);
+	else
+		snprintf(d->path, sizeof d->path, "%s", path);
 	d->ide = ide;
 }
 
@@ -565,6 +579,393 @@ static void read_vbox(machine *m, char *text)
 	free(images);
 }
 
+/* --- OVF, an appliance's .ovf and the .ova around it ---------------------- */
+
+/* A name without its namespace's prefix: rasd:ResourceType's ResourceType. */
+static const char *local_name(const char *name)
+{
+	const char *colon = strrchr(name, ':');
+
+	return colon != NULL ? colon + 1 : name;
+}
+
+/* An attribute by its local name, whatever prefix the file gives it. */
+static int any_attribute(const tag *t, const char *name, char *out, size_t cap)
+{
+	static const char *const prefixes[] = { "ovf:", "vmw:", "vbox:", "" };
+	char full[64];
+
+	for (size_t i = 0u; i < sizeof prefixes / sizeof prefixes[0]; i++) {
+		snprintf(full, sizeof full, "%s%s", prefixes[i], name);
+		if (attribute(t, full, out, cap))
+			return 1;
+	}
+	return 0;
+}
+
+/* The text after a tag, to the next one, its entities unescaped. */
+static void element_text(const char *at, char *out, size_t cap)
+{
+	size_t n = 0u;
+
+	while (isspace((unsigned char)*at))
+		at++;
+	for (; *at != '\0' && *at != '<'; at++) {
+		char c = *at;
+
+		if (strncmp(at, "&amp;", 5u) == 0) {
+			c = '&';
+			at += 4;
+		} else if (strncmp(at, "&lt;", 4u) == 0) {
+			c = '<';
+			at += 3;
+		} else if (strncmp(at, "&gt;", 4u) == 0) {
+			c = '>';
+			at += 3;
+		} else if (strncmp(at, "&quot;", 6u) == 0) {
+			c = '"';
+			at += 5;
+		}
+		if (n + 1u < cap)
+			out[n++] = c;
+	}
+	while (n > 0u && isspace((unsigned char)out[n - 1u]))
+		n--;
+	out[n] = '\0';
+}
+
+typedef struct ovf_item {
+	char type[8];
+	char quantity[32];
+	char units[64];
+	char resource[256];
+	char subtype[64];
+	char instance[16];
+	char parent[16];
+} ovf_item;
+
+typedef struct ovf_ref {
+	char id[128];
+	char href[4096];
+} ovf_ref;
+
+static const char *ovf_lookup(const ovf_ref *refs, unsigned count, const char *id)
+{
+	for (unsigned i = 0u; i < count; i++)
+		if (strcmp(refs[i].id, id) == 0)
+			return refs[i].href;
+	return NULL;
+}
+
+/* An item of the hardware section, as it closes. */
+static void ovf_hardware(machine *m, const ovf_item *item, const ovf_item *controllers,
+                         unsigned controller_count, const ovf_ref *files, unsigned file_count,
+                         const ovf_ref *disks, unsigned disk_count)
+{
+	int         type = atoi(item->type);
+	const char *href = NULL;
+	char        said[4400];
+
+	switch (type) {
+	case 3:
+		m->cpus = (unsigned)strtoul(item->quantity, NULL, 10);
+		return;
+	case 4: {
+		unsigned long quantity = strtoul(item->quantity, NULL, 10);
+
+		/* Megabytes unless the units say otherwise, as OVF's own
+		 * examples give them: "byte * 2^20" or "MegaBytes". */
+		if (strstr(item->units, "2^30") != NULL || strcasestr(item->units, "giga") != NULL)
+			quantity *= 1024u;
+		else if (strstr(item->units, "2^10") != NULL || strcasestr(item->units, "kilo") != NULL)
+			quantity /= 1024u;
+		else if (strcmp(item->units, "byte") == 0 || strcmp(item->units, "bytes") == 0)
+			quantity /= 1024u * 1024u;
+		m->memory = quantity;
+		return;
+	}
+	case 10:
+		if (m->network) {
+			note(m, "only the first network adapter is given a card");
+			return;
+		}
+		m->network = 1;
+		if (strcasecmp(item->subtype, "PCNet32") == 0)
+			strcpy(m->nic, "pcnet");
+		else if (strcasecmp(item->subtype, "E1000e") == 0)
+			strcpy(m->nic, "e1000e");
+		else if (strcasecmp(item->subtype, "virtio") == 0)
+			strcpy(m->nic, "virtio");
+		else {
+			strcpy(m->nic, "e1000");
+			if (item->subtype[0] != '\0' && strcasecmp(item->subtype, "E1000") != 0) {
+				snprintf(said, sizeof said, "its network adapter, %.40s, is given as an e1000",
+				         item->subtype);
+				note(m, said);
+			}
+		}
+		return;
+	case 14:
+	case 15:
+	case 16:
+	case 17:
+		break;
+	default:
+		return;
+	}
+	/* A drive: its image by the disk or file the resource names. */
+	if (item->resource[0] == '\0')
+		return;
+	{
+		const char *resource = strncmp(item->resource, "ovf:", 4u) == 0 ? item->resource + 4 :
+		                       item->resource;
+		const char *id = strrchr(resource, '/');
+
+		/* A disk's id names a file's, whose href is the image; a file's
+		 * id, a disc's say, names it directly. */
+		if (id != NULL && strncmp(resource, "/disk/", 6u) == 0) {
+			const char *file = ovf_lookup(disks, disk_count, id + 1);
+
+			href = file != NULL ? ovf_lookup(files, file_count, file) : NULL;
+		} else if (id != NULL && strncmp(resource, "/file/", 6u) == 0) {
+			href = ovf_lookup(files, file_count, id + 1);
+		}
+	}
+	if (href == NULL) {
+		snprintf(said, sizeof said, "a drive names %.200s, which the appliance does not hold",
+		         item->resource);
+		refuse(m, said);
+		return;
+	}
+	{
+		int ide = 0;
+
+		for (unsigned i = 0u; i < controller_count; i++)
+			if (strcmp(controllers[i].instance, item->parent) == 0)
+				ide = strcmp(controllers[i].type, "5") == 0;
+		add_medium(m, type == 17 ? "disk" : type == 14 ? "floppy" : "cdrom", href, ide);
+	}
+}
+
+static void read_ovf(machine *m, char *text)
+{
+	ovf_ref  *files = calloc(MAX_IMAGES, sizeof *files);
+	ovf_ref  *disks = calloc(MAX_IMAGES, sizeof *disks);
+	ovf_item *controllers = calloc(MAX_MEDIA, sizeof *controllers);
+	ovf_item  item;
+	unsigned  file_count = 0u;
+	unsigned  disk_count = 0u;
+	unsigned  controller_count = 0u;
+	int       in_item = 0;
+	int       in_system = 0;
+	int       systems = 0;
+	char      value[4096];
+	char     *at = text;
+	tag       t;
+
+	if (files == NULL || disks == NULL || controllers == NULL) {
+		refuse(m, "out of memory");
+		goto done;
+	}
+	memset(&item, 0, sizeof item);
+	while (!m->failed && next_tag(&at, &t)) {
+		const char *name = local_name(t.name);
+
+		if (t.closing) {
+			if (in_item && (strcmp(name, "Item") == 0 || strcmp(name, "StorageItem") == 0 ||
+			                strcmp(name, "EthernetPortItem") == 0)) {
+				int type = atoi(item.type);
+
+				in_item = 0;
+				/* Controllers first in the section, and remembered. */
+				if ((type == 5 || type == 6 || type == 20) && controller_count < MAX_MEDIA)
+					controllers[controller_count++] = item;
+				else
+					ovf_hardware(m, &item, controllers, controller_count, files, file_count,
+					             disks, disk_count);
+			} else if (strcmp(name, "VirtualSystem") == 0) {
+				in_system = 0;
+			}
+			continue;
+		}
+		if (strcmp(name, "File") == 0 && file_count < MAX_IMAGES) {
+			if (any_attribute(&t, "id", files[file_count].id, sizeof files[file_count].id) &&
+			    any_attribute(&t, "href", files[file_count].href, sizeof files[file_count].href))
+				file_count++;
+		} else if (strcmp(name, "Disk") == 0 && disk_count < MAX_IMAGES) {
+			if (any_attribute(&t, "diskId", disks[disk_count].id, sizeof disks[disk_count].id) &&
+			    any_attribute(&t, "fileRef", disks[disk_count].href, sizeof disks[disk_count].href))
+				disk_count++;
+		} else if (strcmp(name, "VirtualSystem") == 0) {
+			if (++systems > 1) {
+				note(m, "the appliance holds more than one machine, and only its first is given");
+				break;
+			}
+			in_system = 1;
+			if (any_attribute(&t, "id", value, sizeof value))
+				hostname_of(m, value);
+		} else if (in_system && !in_item && strcmp(name, "Name") == 0 && !t.empty) {
+			element_text(at, value, sizeof value);
+			if (value[0] != '\0')
+				hostname_of(m, value);
+		} else if (strcmp(name, "Item") == 0 || strcmp(name, "StorageItem") == 0 ||
+		           strcmp(name, "EthernetPortItem") == 0) {
+			in_item = !t.empty;
+			memset(&item, 0, sizeof item);
+		} else if (in_item && !t.empty) {
+			static const struct { const char *name; size_t at; size_t cap; } fields[] = {
+				{ "ResourceType", offsetof(ovf_item, type), sizeof item.type },
+				{ "VirtualQuantity", offsetof(ovf_item, quantity), sizeof item.quantity },
+				{ "AllocationUnits", offsetof(ovf_item, units), sizeof item.units },
+				{ "HostResource", offsetof(ovf_item, resource), sizeof item.resource },
+				{ "ResourceSubType", offsetof(ovf_item, subtype), sizeof item.subtype },
+				{ "InstanceID", offsetof(ovf_item, instance), sizeof item.instance },
+				{ "InstanceId", offsetof(ovf_item, instance), sizeof item.instance },
+				{ "Parent", offsetof(ovf_item, parent), sizeof item.parent },
+			};
+
+			for (size_t i = 0u; i < sizeof fields / sizeof fields[0]; i++)
+				if (strcmp(name, fields[i].name) == 0)
+					element_text(at, (char *)&item + fields[i].at, fields[i].cap);
+		} else if (strcmp(name, "Config") == 0 && any_attribute(&t, "key", value, sizeof value)) {
+			/* VMware's extra configuration: its firmware, Secure Boot and TPM. */
+			char setting[64] = "";
+
+			any_attribute(&t, "value", setting, sizeof setting);
+			if (strcmp(value, "firmware") == 0)
+				m->uefi = strcmp(setting, "efi") == 0;
+			else if (strcmp(value, "uefi.secureBoot.enabled") == 0)
+				m->secure = strcmp(setting, "true") == 0;
+		} else if (strcmp(name, "Firmware") == 0) {
+			/* VirtualBox's own machine, carried inside its appliance. */
+			m->uefi = attribute(&t, "type", value, sizeof value) && strncmp(value, "EFI", 3u) == 0;
+		}
+	}
+	m->secure = m->secure && m->uefi;
+done:
+	free(files);
+	free(disks);
+	free(controllers);
+}
+
+/* Runs `argv`, its output on stderr; its status, or 1. */
+static int run_tool(const char *const *argv)
+{
+	int   status = 1;
+	pid_t pid = fork();
+
+	if (pid == 0) {
+		dup2(2, 1);
+		execvp(argv[0], (char *const *)argv);
+		_exit(127);
+	}
+	if (pid < 0 || waitpid(pid, &status, 0) < 0)
+		return 1;
+	return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
+/* The file in an unpacked appliance naming what it came from. */
+#define SOURCE_NAME ".hull-source"
+
+/* An .ova unpacked once into the cache, `$XDG_CACHE_HOME/hull/ova/KEY`,
+ * KEY the appliance's real path, size and mtime: a later read of the
+ * same file finds it there. Into `dir`; 0, or -1 having said why. */
+static int ova_cache(char *out, size_t cap);
+
+static int unpack_ova(const char *path, char *dir, size_t cap)
+{
+	char        real[PATH_MAX];
+	char        work[PATH_MAX + 64];
+	char        parent[PATH_MAX];
+	struct stat st;
+	uint64_t    key = 1469598103934665603ull;
+
+	if (realpath(path, real) == NULL || stat(real, &st) != 0) {
+		perror(path);
+		return -1;
+	}
+	for (const char *c = real; *c != '\0'; c++)
+		key = (key ^ (unsigned char)*c) * 1099511628211ull;
+	key = (key ^ (uint64_t)st.st_size) * 1099511628211ull;
+	key = (key ^ (uint64_t)st.st_mtime) * 1099511628211ull;
+	if (ova_cache(parent, sizeof parent) != 0) {
+		fprintf(stderr, "%s: no cache to unpack the appliance into: HOME is not set\n", path);
+		return -1;
+	}
+	if ((size_t)snprintf(dir, cap, "%s/%016llx", parent, (unsigned long long)key) >= cap) {
+		fprintf(stderr, "%s: the cache's path is too long\n", path);
+		return -1;
+	}
+	if (access(dir, F_OK) == 0)
+		return 0;
+	{
+		char made[PATH_MAX];
+
+		snprintf(made, sizeof made, "%s", parent);
+		for (char *slash = strchr(made + 1, '/'); slash != NULL; slash = strchr(slash + 1, '/')) {
+			*slash = '\0';
+			mkdir(made, 0700);
+			*slash = '/';
+		}
+		mkdir(made, 0700);
+	}
+	snprintf(work, sizeof work, "%s.unpacking-XXXXXX", dir);
+	if (mkdtemp(work) == NULL) {
+		perror(work);
+		return -1;
+	}
+	{
+		const char *const argv[] = { "tar", "-xf", real, "-C", work, "--no-same-owner", NULL };
+		char              source[PATH_MAX + 64];
+		FILE             *said;
+		int               written;
+
+		/* What it was unpacked from, which hull gc reads to know whether
+		 * the appliance is still there as it was. */
+		snprintf(source, sizeof source, "%s/" SOURCE_NAME, work);
+		written = run_tool(argv) == 0;
+		unlink(source);
+		if (written && (said = fopen(source, "wxe")) != NULL) {
+			written = fprintf(said, "%s\n%lld\n%lld\n", real, (long long)st.st_size,
+			                  (long long)st.st_mtime) > 0;
+			written = fclose(said) == 0 && written;
+		} else {
+			written = 0;
+		}
+		if (!written || rename(work, dir) != 0) {
+			if (access(dir, F_OK) != 0)
+				fprintf(stderr, "%s: is not an appliance's tar\n", path);
+			hull_store_remove_tree(AT_FDCWD, work);
+			return access(dir, F_OK) == 0 ? 0 : -1;
+		}
+	}
+	return 0;
+}
+
+/* The .ovf among an unpacked appliance's files, into `out`: 0, or -1. */
+static int find_ovf(const char *dir, char *out, size_t cap)
+{
+	DIR           *list = opendir(dir);
+	struct dirent *entry;
+	int            found = 0;
+
+	if (list == NULL)
+		return -1;
+	while ((entry = readdir(list)) != NULL) {
+		size_t n = strlen(entry->d_name);
+
+		if (n > 4u && strcasecmp(entry->d_name + n - 4u, ".ovf") == 0) {
+			/* The least name, should there be two. */
+			if (found && strcmp(strrchr(out, '/') + 1, entry->d_name) <= 0)
+				continue;
+			snprintf(out, cap, "%s/%s", dir, entry->d_name);
+			found = 1;
+		}
+	}
+	closedir(list);
+	return found ? 0 : -1;
+}
+
 /* --- the form ------------------------------------------------------------- */
 
 static void quoted(FILE *out, const char *text)
@@ -653,17 +1054,37 @@ int hull_vmconf_is_file(const char *path)
 {
 	size_t n = strlen(path);
 
-	return (n > 4u && strcasecmp(path + n - 4u, ".vmx") == 0) ||
+	return (n > 4u && (strcasecmp(path + n - 4u, ".vmx") == 0 ||
+	                   strcasecmp(path + n - 4u, ".ovf") == 0 ||
+	                   strcasecmp(path + n - 4u, ".ova") == 0)) ||
 	       (n > 5u && strcasecmp(path + n - 5u, ".vbox") == 0);
 }
 
 char *hull_vmconf_form(const char *path, FILE *notes)
 {
 	machine *m = calloc(1u, sizeof *m);
-	char    *text = read_all(path);
+	char    *text = NULL;
 	char    *form = NULL;
 	size_t   n = strlen(path);
+	char     unpacked[PATH_MAX];
+	char     descriptor[PATH_MAX + 300];
+	int      appliance = n > 4u && strcasecmp(path + n - 4u, ".ova") == 0;
 
+	/* An appliance's files unpacked once, and its .ovf read there, its
+	 * images by their paths in the cache. */
+	if (appliance) {
+		if (m == NULL || unpack_ova(path, unpacked, sizeof unpacked) != 0 ||
+		    find_ovf(unpacked, descriptor, sizeof descriptor) != 0) {
+			if (m != NULL)
+				fprintf(stderr, "%s: holds no .ovf to say what its machine is\n", path);
+			free(m);
+			return NULL;
+		}
+		m->base = unpacked;
+		text = read_all(descriptor);
+	} else {
+		text = read_all(path);
+	}
 	if (m == NULL || text == NULL) {
 		free(m);
 		free(text);
@@ -673,6 +1094,8 @@ char *hull_vmconf_form(const char *path, FILE *notes)
 	m->notes = notes;
 	if (n > 5u && strcasecmp(path + n - 5u, ".vbox") == 0)
 		read_vbox(m, text);
+	else if (appliance || strcasecmp(path + n - 4u, ".ovf") == 0)
+		read_ovf(m, text);
 	else
 		read_vmx(m, text);
 	if (!m->failed && m->media_count == 0u)
@@ -685,4 +1108,76 @@ char *hull_vmconf_form(const char *path, FILE *notes)
 	free(text);
 	free(m);
 	return form;
+}
+
+/* Where unpacked appliances are kept, into `out`; 0, or -1. */
+static int ova_cache(char *out, size_t cap)
+{
+	const char *cache = getenv("XDG_CACHE_HOME");
+	const char *home = getenv("HOME");
+
+	if (cache != NULL && cache[0] == '/')
+		return (size_t)snprintf(out, cap, "%s/hull/ova", cache) < cap ? 0 : -1;
+	if (home != NULL && home[0] == '/')
+		return (size_t)snprintf(out, cap, "%s/.cache/hull/ova", home) < cap ? 0 : -1;
+	return -1;
+}
+
+/* Whether the appliance unpacked at `dir` is still there as it was:
+ * its source file's path, size and mtime as recorded. */
+static int ova_current(const char *dir)
+{
+	char        path[PATH_MAX + 64];
+	char        real[PATH_MAX + 2];
+	long long   size = -1;
+	long long   mtime = -1;
+	FILE       *said;
+	struct stat st;
+	int         current = 0;
+
+	snprintf(path, sizeof path, "%s/" SOURCE_NAME, dir);
+	if ((said = fopen(path, "re")) == NULL)
+		return 0;
+	if (fgets(real, sizeof real, said) != NULL && fscanf(said, "%lld %lld", &size, &mtime) == 2) {
+		real[strcspn(real, "\n")] = '\0';
+		current = stat(real, &st) == 0 && (long long)st.st_size == size &&
+		          (long long)st.st_mtime == mtime;
+	}
+	fclose(said);
+	return current;
+}
+
+int hull_vmconf_gc(unsigned *removed, char *why, size_t cap)
+{
+	char           cache[PATH_MAX];
+	DIR           *list;
+	struct dirent *entry;
+	time_t         now = time(NULL);
+
+	*removed = 0u;
+	if (ova_cache(cache, sizeof cache) != 0 || (list = opendir(cache)) == NULL)
+		return 0;
+	while ((entry = readdir(list)) != NULL) {
+		char        dir[PATH_MAX + 300];
+		struct stat st;
+		int         unpacking = strstr(entry->d_name, ".unpacking-") != NULL;
+
+		if (entry->d_name[0] == '.')
+			continue;
+		snprintf(dir, sizeof dir, "%s/%s", cache, entry->d_name);
+		if (lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode))
+			continue;
+		/* One being unpacked is another reader's, unless a day old, when
+		 * the reader that made it has died. */
+		if (unpacking ? now - st.st_mtime < 86400 : ova_current(dir))
+			continue;
+		if (hull_store_remove_tree(AT_FDCWD, dir) != 0) {
+			snprintf(why, cap, "%s could not be removed", dir);
+			closedir(list);
+			return -1;
+		}
+		(*removed)++;
+	}
+	closedir(list);
+	return 0;
 }
