@@ -230,7 +230,11 @@ int hull_vbox_host(const char *work, const char *root, const char *agent, const 
 		say("the outer vm's spec cannot be written");
 		return 1;
 	}
+	/* The host's own kernel, (profile full): the outer vm loads the host's
+	 * vboxdrv.ko, built for it, which hull's own kernel -- a vm's default
+	 * wherever `make kernel` has built it -- could never take. */
 	fprintf(file, "(machine (backend vm) (source \"dir:/\") (mutable overlay)\n"
+	        " (tuning (vm (profile full)))\n"
 	        " (memory \"%luM\") (cpus %lu)\n"
 	        " (volumes (volume (host \"%s\") (guest \"/vbox\") (mode ro))\n"
 	        "          (volume (host \"%s\") (guest \"/share\"))\n",
