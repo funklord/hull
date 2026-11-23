@@ -9,6 +9,8 @@
 #include "display.h"
 
 #include <dirent.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,4 +106,49 @@ void hull_display_unlink(char *link, const char *monitor)
 	if (length > 0 && (target[length] = '\0', strcmp(target, monitor) == 0))
 		unlink(link);
 	link[0] = '\0';
+}
+
+/*
+ * Every process left in the session qemu led, killed: what qemu forked and
+ * did not end with it. virglrenderer's Venus render server is one, a fork
+ * of qemu in a process group of its own, which went on spinning under init
+ * after its machine had ended, measured 2026-11-13 on an RTX 3060 with
+ * NVIDIA's 615 driver. Called while qemu is a zombie not yet reaped, so
+ * its pid, the session's id, cannot have been given to another.
+ */
+void hull_display_end_session(pid_t leader)
+{
+	DIR           *proc = opendir("/proc");
+	struct dirent *entry;
+
+	if (proc == NULL)
+		return;
+	while ((entry = readdir(proc)) != NULL) {
+		char  path[300];
+		char  stat[1024];
+		char *close_paren;
+		long  pid = strtol(entry->d_name, NULL, 10);
+		int   fd;
+		ssize_t got;
+		long  ppid, pgrp, session;
+		char  state;
+
+		if (pid <= 0 || pid == leader)
+			continue;
+		snprintf(path, sizeof path, "/proc/%ld/stat", pid);
+		if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0)
+			continue;
+		got = read(fd, stat, sizeof stat - 1u);
+		close(fd);
+		if (got <= 0)
+			continue;
+		stat[got] = '\0';
+		/* After the command's name, which may hold anything, its ')'. */
+		if ((close_paren = strrchr(stat, ')')) == NULL ||
+		    sscanf(close_paren + 1, " %c %ld %ld %ld", &state, &ppid, &pgrp, &session) != 4)
+			continue;
+		if (session == (long)leader)
+			kill((pid_t)pid, SIGKILL);
+	}
+	closedir(proc);
 }

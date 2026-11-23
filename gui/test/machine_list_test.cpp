@@ -138,6 +138,22 @@ int main(int argc, char **argv)
 			check(said.contains(QString::fromLatin1(entry)), entry, said);
 	}
 
+	/* A pc's 3D and sound in its own (tuning (pc ...)). */
+	{
+		new_machine m;
+		QString     why;
+
+		m.source = QStringLiteral("image:./disk.img");
+		m.backend = QStringLiteral("pc");
+		m.display = QStringLiteral("vnc");
+		m.gpu = QStringLiteral("virgl");
+		m.sound = true;
+		const QString text = spec_text(m, &why);
+
+		check(text.contains(QStringLiteral("(tuning (pc (sound hda) (gpu virgl)))")),
+		      "a pc's 3D written as its own tuning", text + why);
+	}
+
 	/* What the writer refuses, each with a reason. */
 	{
 		new_machine m;

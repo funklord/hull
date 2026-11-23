@@ -619,6 +619,7 @@ static const key pc_keys[] = {
 	{ .name = "state",   .type = STRING, .value = nonempty },
 	{ .name = "boot_key", .type = COUNT },
 	{ .name = "lora",    .type = STRING, .value = nonempty },
+	{ .name = "gpu",     .type = CHOICE, .choices = gpu_values },
 };
 static const schema pc = TABLE(pc_keys);
 

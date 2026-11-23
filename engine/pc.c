@@ -122,6 +122,7 @@ struct hull_machine {
 	char           *cpus;
 	char           *machine_type;
 	char           *vga;
+	int             gpu;            /* (tuning (pc (gpu ...))): 0 2d, 1 virgl, 2 venus */
 	char           *cpu;        /* (tuning (pc (cpu ...))), or NULL for qemu's own */
 	char           *accel;
 	char           *sound;          /* (tuning (pc (sound ...))), or NULL */
@@ -1443,6 +1444,14 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 		if (hull_access_find(doc, &entry, "pc", &pc)) {
 			m->machine_type = hull_access_value(doc, &pc, "machine");
 			m->vga          = hull_access_value(doc, &pc, "vga");
+			{
+				char *text = hull_access_value(doc, &pc, "gpu");
+
+				if (text != NULL) {
+					m->gpu = strcmp(text, "venus") == 0 ? 2 : strcmp(text, "virgl") == 0;
+					free(text);
+				}
+			}
 			m->cpu          = hull_access_value(doc, &pc, "cpu");
 			m->tpm          = hull_access_true(doc, &pc, "tpm");
 			{
@@ -1517,7 +1526,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 		} else if (m->network || m->segment_count != 0u || m->port_count != 0u) {
 			return "a board's serial port is its one way in: no network, segments or ports";
 		}
-		if (m->vnc || m->display != NULL || m->vga != NULL || m->sound != NULL)
+		if (m->vnc || m->display != NULL || m->vga != NULL || m->sound != NULL || m->gpu != 0)
 			return "a board has no screen or sound of qemu's: its serial port is what it says";
 		if (m->memory != NULL || m->cpus != NULL || m->cpu != NULL)
 			return "a board's memory and CPU are its microcontroller's";
@@ -1527,6 +1536,14 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 	}
 	if (m->vnc && m->address[0] == '\0')
 		return "the plan gives (display vnc) no address";
+	/* (gpu virgl|venus): the display card is virtio-vga-gl, a VGA card
+	 * for the firmware and the boot, and the host's GPU behind it for a
+	 * guest with Mesa's virgl or Venus driver, as on a vm (section 5). */
+	if (m->gpu != 0 && m->display == NULL && !m->vnc && !m->local)
+		return "(gpu virgl) and (gpu venus) are a screen's 3D: the machine needs "
+		       "(display window) or (display vnc), or (display local)";
+	if (m->gpu != 0 && m->vga != NULL && strcmp(m->vga, "virtio") != 0)
+		return "(gpu virgl) and (gpu venus) are virtio-vga's: (vga virtio), or no (vga ...)";
 	if ((wrong = read_media(m, doc, machine)) != NULL)
 		return wrong;
 	for (unsigned i = 0u; m->box && i < m->media_count; i++)
@@ -1789,8 +1806,14 @@ static void exec_pc(const hull_machine *m)
 		argv[n++] = strcmp(m->cpu, "host") == 0 ? (strcmp(accel, "kvm") == 0 ? "host" : "max") :
 		            strcmp(m->cpu, "skylake") == 0 ? "Skylake-Client" : m->cpu;
 	}
+	/* 3D: virtio-vga-gl, VGA for the firmware and the boot, the guest's
+	 * OpenGL (virgl) or Vulkan (Venus) rendered on the host's GPU. */
 	argv[n++] = "-vga";
-	argv[n++] = m->vga != NULL ? m->vga : "std";
+	argv[n++] = m->gpu != 0 ? "none" : m->vga != NULL ? m->vga : "std";
+	if (m->gpu != 0) {
+		argv[n++] = "-device";
+		argv[n++] = m->gpu == 2 ? "virtio-vga-gl,venus=on,blob=on,hostmem=4G" : "virtio-vga-gl";
+	}
 	/* A card on q35 goes behind a PCIe root port of its own, as a card in
 	 * a real slot is: a driver reading its link from the bridge above it,
 	 * ib_qib's among them, oopsed on the root bus, where there is none
@@ -1816,8 +1839,18 @@ static void exec_pc(const hull_machine *m)
 	/* A screen by VNC is qemu's D-Bus display as well, for hull-gui to
 	 * show without VNC's copies (section 5.2): its monitor display.qmp in
 	 * the run's directory, linked as hull/display/ADDRESS. */
+	/* With 3D, the window renders by OpenGL, and VNC's frames are
+	 * rendered headless by EGL on the host's render node; hull-gui's
+	 * screen takes each frame as a dmabuf, which excludes VNC. */
 	argv[n++] = "-display";
-	argv[n++] = m->local_display ? "dbus,p2p=yes" : m->vnc ? vnc : m->display != NULL ? "sdl" : "none";
+	argv[n++] = m->local_display ? (m->gpu != 0 ? "dbus,p2p=yes,gl=on" : "dbus,p2p=yes") :
+	            m->gpu != 0 ? (m->vnc ? "egl-headless" : "sdl,gl=on") :
+	            m->vnc ? vnc : m->display != NULL ? "sdl" : "none";
+	if (m->gpu != 0 && !m->local_display && m->vnc) {
+		snprintf(vnc, sizeof vnc, "%s:0", m->address);
+		argv[n++] = "-vnc";
+		argv[n++] = vnc;
+	}
 	if (m->local_display) {
 		if (m->vnc) {
 			snprintf(vnc, sizeof vnc, "%s:0", m->address);
@@ -1900,9 +1933,21 @@ static void exec_pc(const hull_machine *m)
 		argv[n++] = "-name";
 		argv[n++] = full;
 	}
-	if (m->memory != NULL) {
+	if (m->memory != NULL || m->gpu == 2) {
 		argv[n++] = "-m";
-		argv[n++] = m->memory;
+		argv[n++] = m->memory != NULL ? m->memory : "128M";
+	}
+	/* Venus's blobs are the guest's memory mapped by the host, so it is
+	 * a shared memfd, as on a vm. */
+	if (m->gpu == 2) {
+		static __thread char shared_memory[96];
+
+		snprintf(shared_memory, sizeof shared_memory, "memory-backend-memfd,id=mem,size=%s,share=on",
+		         m->memory != NULL ? m->memory : "128M");
+		argv[n++] = "-object";
+		argv[n++] = shared_memory;
+		argv[n++] = "-machine";
+		argv[n++] = "memory-backend=mem";
 	}
 	if (m->cpus != NULL) {
 		snprintf(smp, sizeof smp, "%s", m->cpus);
@@ -2236,6 +2281,15 @@ static void read_machine(hull_machine *m)
 			}
 		}
 	}
+	/* What qemu forked and left, Venus's render server, ended while
+	 * qemu is still a zombie and its session's id cannot be reused. */
+	{
+		siginfo_t info;
+
+		while (waitid(P_PID, (id_t)m->pid, &info, WEXITED | WNOWAIT) < 0 && errno == EINTR)
+			;
+		hull_display_end_session(m->pid);
+	}
 	while (waitpid(m->pid, &status, 0) < 0 && errno == EINTR)
 		;
 	finish(m, WIFSIGNALED(status) ? -1 : WEXITSTATUS(status),
@@ -2261,6 +2315,15 @@ static int launch(hull_machine *m)
 	pid_t parent = getpid();
 	pid_t child;
 
+	/* Venus's blobs are dma-bufs qemu makes through /dev/udmabuf, as on a
+	 * vm: without it the guest's Vulkan fails (section 5). */
+	if (m->gpu == 2 && access("/dev/udmabuf", R_OK | W_OK) != 0) {
+		snprintf(m->why, sizeof m->why, "(gpu venus) hands the guest's memory to the host's "
+		         "GPU through /dev/udmabuf, which is not open to this user: on Debian it is "
+		         "the kvm group's, mode 660, where /dev/kvm is 666 -- the kvm group, or a udev "
+		         "rule opening it as /dev/kvm is; (gpu virgl) needs neither\n");
+		return -1;
+	}
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, in) != 0 ||
 	    socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, monitor) != 0) {
 		snprintf(m->why, sizeof m->why, "a socket for the machine could not be made\n");
@@ -2310,7 +2373,7 @@ static int launch(hull_machine *m)
 		}
 	}
 	m->monitor_peer = monitor[1];
-	m->local_display = (m->vnc || m->local) && m->run_state_made &&
+	m->local_display = ((m->vnc && m->gpu == 0) || m->local) && m->run_state_made &&
 	                   hull_display_fits(run_file(m, "display.qmp"));
 	if (m->local && !m->local_display) {
 		snprintf(m->why, sizeof m->why, "(display local) needs its monitor's socket in the "
@@ -3323,6 +3386,13 @@ static const hull_cap_entry entries[] = {
 	{ "pc.vga.vmware", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.vga.virtio", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.vga.none", HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.gpu.2d", HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.gpu.virgl", HULL_SUP_NATIVE,
+	  "virtio-vga-gl, OpenGL forwarded by virglrenderer to the host's GPU, shared; the guest "
+	  "needs Mesa's virgl driver, which Windows has none of", NULL },
+	{ "pc.gpu.venus", HULL_SUP_NATIVE,
+	  "virtio-vga-gl with Venus, Vulkan forwarded to the host's GPU and driver; the guest needs "
+	  "Mesa's Venus driver, and its memory is a shared memfd", NULL },
 	{ "pc.accel.auto", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.accel.kvm", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.accel.tcg", HULL_SUP_NATIVE, NULL, NULL },

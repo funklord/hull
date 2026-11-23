@@ -151,15 +151,16 @@ QString spec_text(const new_machine &machine, QString *why)
 		text += QStringLiteral("  (ssh true)\n");
 	if (!machine.display.isEmpty())
 		text += QStringLiteral("  (display %1)\n").arg(machine.display);
-	/* One (tuning ...): a pc's card is its own key, a vm's qemu's. */
+	/* One (tuning ...): a pc's keys are its own, a vm's qemu's. */
 	if (machine.backend == QStringLiteral("pc")) {
+		QString pc;
+
 		if (machine.sound)
-			text += QStringLiteral("  (tuning (pc (sound hda)))\n");
-		if (!machine.gpu.isEmpty()) {
-			*why = QStringLiteral("a pc's 3D is a card of its own, (devices (pci ...)): "
-			                      "virgl and Venus are a vm's");
-			return QString();
-		}
+			pc += QStringLiteral(" (sound hda)");
+		if (!machine.gpu.isEmpty())
+			pc += QStringLiteral(" (gpu %1)").arg(machine.gpu);
+		if (!pc.isEmpty())
+			text += QStringLiteral("  (tuning (pc%1))\n").arg(pc);
 	} else if (!machine.gpu.isEmpty() || machine.sound) {
 		QString qemu;
 

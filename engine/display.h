@@ -10,6 +10,7 @@
 #define HULL_ENGINE_DISPLAY_H
 
 #include <stddef.h>
+#include <sys/types.h>
 
 /* Whether `monitor`, the monitor's path, fits a unix socket's address. */
 int hull_display_fits(const char *monitor);
@@ -34,5 +35,10 @@ void hull_display_adopt(const char *monitor, const char *address, char *link, si
 /* Remove `link` where it still names `monitor`, a later machine at the
  * same address having replaced it otherwise; `link` becomes "". */
 void hull_display_unlink(char *link, const char *monitor);
+
+/* Every process left in the session qemu led, `leader`, killed: what qemu
+ * forked and did not end with it, Venus's render server among them. Call
+ * while qemu is a zombie not yet reaped, so its pid cannot be another's. */
+void hull_display_end_session(pid_t leader);
 
 #endif

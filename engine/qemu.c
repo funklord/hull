@@ -1684,6 +1684,14 @@ static const char *write_initramfs(const hull_machine *m, const char *modules, i
 	 * which they have no /dev/input/event node for a guest's X, Wayland or
 	 * anything else to read -- Debian builds it as a module, and a key
 	 * typed into the screen reached nothing until it was loaded. */
+	/* A bootable export has one wherever it is booted with a virtio-vga,
+	 * a pc's with (gpu virgl) among them: its 3D is the guest's Mesa on
+	 * that card. Optional, a machine with no such card loading nothing. */
+	if (m->exported && !m->screen && load_modules && extra_count + 3u <= MAX_MODULES) {
+		extra[extra_count++] = "?virtio_gpu";
+		extra[extra_count++] = "?virtio_input";
+		extra[extra_count++] = "?evdev";
+	}
 	if (m->screen && load_modules && extra_count + 3u <= MAX_MODULES) {
 		extra[extra_count++] = "virtio_gpu";
 		extra[extra_count++] = "?virtio_input";
@@ -3411,51 +3419,6 @@ static int expect(hull_machine *m, const char *type)
 	return 0;
 }
 
-/*
- * Every process left in the session qemu led, killed: what qemu forked and
- * did not end with it. virglrenderer's Venus render server is one, a fork
- * of qemu in a process group of its own, which went on spinning under init
- * after its machine had ended, measured 2026-11-13 on an RTX 3060 with
- * NVIDIA's 615 driver. Called while qemu is a zombie not yet reaped, so
- * its pid, the session's id, cannot have been given to another.
- */
-static void end_session(pid_t leader)
-{
-	DIR           *proc = opendir("/proc");
-	struct dirent *entry;
-
-	if (proc == NULL)
-		return;
-	while ((entry = readdir(proc)) != NULL) {
-		char  path[300];
-		char  stat[1024];
-		char *close_paren;
-		long  pid = strtol(entry->d_name, NULL, 10);
-		int   fd;
-		ssize_t got;
-		long  ppid, pgrp, session;
-		char  state;
-
-		if (pid <= 0 || pid == leader)
-			continue;
-		snprintf(path, sizeof path, "/proc/%ld/stat", pid);
-		if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0)
-			continue;
-		got = read(fd, stat, sizeof stat - 1u);
-		close(fd);
-		if (got <= 0)
-			continue;
-		stat[got] = '\0';
-		/* After the command's name, which may hold anything, its ')'. */
-		if ((close_paren = strrchr(stat, ')')) == NULL ||
-		    sscanf(close_paren + 1, " %c %ld %ld %ld", &state, &ppid, &pgrp, &session) != 4)
-			continue;
-		if (session == (long)leader)
-			kill((pid_t)pid, SIGKILL);
-	}
-	closedir(proc);
-}
-
 static void reap(hull_machine *m)
 {
 	siginfo_t info;
@@ -3474,7 +3437,7 @@ static void reap(hull_machine *m)
 	}
 	while (waitid(P_PID, (id_t)m->qemu, &info, WEXITED | WNOWAIT) < 0 && errno == EINTR)
 		;
-	end_session(m->qemu);
+	hull_display_end_session(m->qemu);
 	pthread_mutex_lock(&m->lock);
 	waitpid(m->qemu, NULL, 0);
 	m->done = 1;

@@ -62,7 +62,7 @@ new_machine_dialog::new_machine_dialog(const QStringList &images, const QString 
 	gpu->addItem(QStringLiteral("OpenGL on this host's GPU (virgl)"), QStringLiteral("virgl"));
 	gpu->addItem(QStringLiteral("Vulkan on this host's GPU (Venus)"), QStringLiteral("venus"));
 	sound = new QCheckBox(QStringLiteral("So&und, heard where the screen is shown here"));
-	gpu->setToolTip(QStringLiteral("A vm's 3D, the guest needing Mesa's driver; Venus needs "
+	gpu->setToolTip(QStringLiteral("The screen's 3D on a vm or a pc, the guest needing Mesa's driver; Venus needs "
 	                               "/dev/udmabuf open to the user"));
 	problem = new QLabel;
 	problem->setWordWrap(true);

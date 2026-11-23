@@ -13,7 +13,10 @@
 # virglrenderer, its renderer read in the guest;
 # (gpu venus) its Vulkan by Venus where /dev/udmabuf is open to the user,
 # and refused naming it where it is not; 3D without a screen refused at
-# plan. And no qemu, nor anything it forked, left after any of it. Not
+# plan. The pc class's (gpu virgl): the Mesa tree exported bootable and
+# booted as a pc, its renderer read, and refused without a screen or
+# beside another VGA card. And no qemu, nor anything it forked, left after
+# any of it. Not
 # part of `make check`, needing KVM, a host GPU with a render node, and the
 # network once: `make check-screen`.
 #
@@ -184,6 +187,45 @@ else
 		fail "(gpu venus) was not refused naming /dev/udmabuf" "$out"
 	printf 'screen: Venus not run: /dev/udmabuf is not open to this user\n'
 fi
+
+# A pc's 3D, (tuning (pc (gpu virgl))): the same tree exported as a
+# bootable disk, whose initramfs loads virtio_gpu wherever there is one,
+# booted by UEFI on the pc class's virtio-vga-gl, its init reading the
+# renderer onto the serial console and powering off.
+cat > "$root/pcgl.conf" <<'EOF'
+(build (base "gpu/mesa")
+  (steps
+    (step (name "probe")
+      (run "printf '#!/bin/sh\\neglinfo.x86_64-linux-gnu -B -p surfaceless 2>&1 | grep -i renderer\\necho o > /proc/sysrq-trigger\\nsleep 30\\n' > /sbin/glprobe && chmod 755 /sbin/glprobe"))))
+EOF
+cases=$((cases + 1))
+if ! out=$(cd "$root" && timeout 600 "$hull" build -f "$root/pcgl.conf" gpu/mesa-pc 2>&1) ||
+	! out=$(timeout 600 "$hull" export --bootable gpu/mesa-pc "$root/mesa.img" --init /sbin/glprobe 2>&1); then
+	fail "the Mesa tree was not exported as a bootable disk" "$out"
+else
+	printf '(machine (backend pc) (source "image:./mesa.img") (memory "2G") (hostname "pcgl") (display vnc) (tuning (pc (gpu virgl) (firmware uefi))))\n' \
+		> "$root/pcgl-run.conf"
+	out=$(cd "$root" && timeout -k 2 300 "$hull" run -f "$root/pcgl-run.conf" 2>&1)
+	cases=$((cases + 1))
+	printf '%s\n' "$out" | grep -q 'renderer: virgl (' ||
+		fail "a pc guest's OpenGL was not rendered by the host's GPU through virgl" "$out"
+	sleep 2
+	cases=$((cases + 1))
+	[ "$(left)" = 0 ] ||
+		fail "a pc's qemu was left after its machine ended" "$(ps -eo pid,ppid,args | grep '[q]emu-system')"
+	rm -f "$root/mesa.img"
+fi
+# And its refusals: 3D with no screen, and beside another VGA card.
+printf '(machine (backend pc) (source "image:./pcgl.conf") (tuning (pc (gpu virgl))))\n' > "$root/pcnoscreen.conf"
+cases=$((cases + 1))
+out=$(cd "$root" && timeout 60 "$hull" run -f "$root/pcnoscreen.conf" 2>&1)
+printf '%s\n' "$out" | grep -q 'needs (display window) or (display vnc)' ||
+	fail "a pc's 3D without a screen was not refused" "$out"
+printf '(machine (backend pc) (source "image:./pcgl.conf") (display vnc) (tuning (pc (gpu virgl) (vga std))))\n' > "$root/pcvga.conf"
+cases=$((cases + 1))
+out=$(cd "$root" && timeout 60 "$hull" run -f "$root/pcvga.conf" 2>&1)
+printf '%s\n' "$out" | grep -q "are virtio-vga's" ||
+	fail "a pc's 3D beside (vga std) was not refused" "$out"
 
 printf '(machine (source "gpu/mesa") (backend vm) (tuning (qemu (gpu virgl))) (command "/bin/true"))\n' \
 	> "$root/noscreen.conf"
