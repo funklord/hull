@@ -139,6 +139,106 @@ says 'its word read through the container' "$out" 'word: fresh'
 cases=$((cases + 1))
 [ "$(sha256sum < "$root/old.vmdk")" = "$before" ] || fail 'an attached overlay left it alone' ''
 
+# --- another hypervisor's machine file, as it stands --------------------------
+
+# A .vmx is read as a pc machine: its memory, processors and name, its
+# disk where it attaches it -- here VMware's descriptor and flat extent,
+# which qemu follows -- and what it cannot carry said. Its disk boots, and
+# an overlay leaves the extent alone.
+mkdir -p "$root/vmware"
+qemu-img convert -f raw -O vmdk -o subformat=monolithicFlat "$root/raw.img" "$root/vmware/old.vmdk"
+cat > "$root/vmware/Old Box.vmx" <<'EOF'
+.encoding = "UTF-8"
+displayName = "Old Box"
+memsize = "256"
+numvcpus = "2"
+sata0.present = "TRUE"
+sata0:0.present = "TRUE"
+sata0:0.fileName = "old.vmdk"
+sata0:1.present = "TRUE"
+sata0:1.deviceType = "cdrom-raw"
+sata0:1.fileName = "auto detect"
+ethernet0.present = "TRUE"
+ethernet0.virtualDev = "vmxnet3"
+EOF
+before=$(sha256sum < "$root/vmware/old-flat.vmdk")
+out=$("$hull" plan --resolved -f "$root/vmware/Old Box.vmx" 2>&1)
+says 'a .vmx is a pc machine of its name' "$out" '(hostname "old-box") (source "media:disk") (memory "256M") (cpus 2) (network nat)'
+says 'its disk where it was' "$out" '(medium (type disk) (source "image:./old.vmdk"))'
+says 'a machine of SATA is a q35' "$out" '(tuning (pc (machine q35) (cpu max) (nic e1000)))'
+says 'a card qemu lacks said' "$out" 'ethernet0, vmxnet3, is given as an e1000'
+says 'a host drive said' "$out" "sata0:1, the host's own drive, is not given"
+out=$(timeout 120 "$hull" run -f "$root/vmware/Old Box.vmx" 2>&1)
+got=$?
+status 'a .vmx boots' "$got" 0 "$out"
+says 'its disk through the descriptor' "$out" 'word: fresh'
+cases=$((cases + 1))
+[ "$(sha256sum < "$root/vmware/old-flat.vmdk")" = "$before" ] || fail 'a .vmx run left its disk alone' ''
+# UEFI, Secure Boot and a vTPM carried as q35's.
+cat > "$root/vmware/efi.vmx" <<'EOF'
+firmware = "efi"
+uefi.secureBoot.enabled = "TRUE"
+vtpm.present = "TRUE"
+nvme0.present = "TRUE"
+nvme0:0.present = "TRUE"
+nvme0:0.fileName = "old.vmdk"
+EOF
+out=$("$hull" plan --resolved -f "$root/vmware/efi.vmx" 2>&1)
+says 'Secure Boot and a TPM carried' "$out" '(tuning (pc (machine q35) (cpu max) (firmware uefi-secure) (tpm true)))'
+says 'and the TPM keys left behind said' "$out" "its TPM's keys stay with its own hypervisor"
+printf 'displayName = "empty"\n' > "$root/vmware/empty.vmx"
+out=$("$hull" plan -f "$root/vmware/empty.vmx" 2>&1)
+got=$?
+status 'a .vmx with no disk is refused' "$got" 2 "$out"
+says 'and said' "$out" 'names no disk or disc image'
+
+# A .vbox: its media registry's VDI where its IDE controller attaches it,
+# an i440FX for a disk of that age; a snapshot's differencing image is
+# refused, naming the way round.
+mkdir -p "$root/vbox"
+qemu-img convert -f raw -O vdi "$root/raw.img" "$root/vbox/old.vdi"
+vbox() { # FILE DISK-ELEMENTS
+	cat > "$root/vbox/$1" <<EOF
+<?xml version="1.0"?>
+<VirtualBox xmlns="http://www.virtualbox.org/" version="1.19-linux">
+  <Machine uuid="{11111111-2222-3333-4444-555555555555}" name="Old &amp; VBox" OSType="Linux_64">
+    <MediaRegistry>
+      <HardDisks>
+$2
+      </HardDisks>
+    </MediaRegistry>
+    <Hardware>
+      <CPU count="1"/>
+      <Memory RAMSize="128"/>
+      <Boot><Order position="1" device="HardDisk"/></Boot>
+      <Network><Adapter slot="0" enabled="true" type="82540EM"><NAT/></Adapter></Network>
+      <StorageControllers>
+        <StorageController name="IDE" type="PIIX4" PortCount="2">
+          <AttachedDevice type="HardDisk" port="0" device="0"><Image uuid="{aaaaaaaa-0000-0000-0000-00000000000$3}"/></AttachedDevice>
+          <AttachedDevice passthrough="false" type="DVD" port="1" device="0"/>
+        </StorageController>
+      </StorageControllers>
+    </Hardware>
+  </Machine>
+</VirtualBox>
+EOF
+}
+vbox old.vbox '        <HardDisk uuid="{aaaaaaaa-0000-0000-0000-000000000001}" location="old.vdi" format="VDI" type="Normal"/>' 1
+out=$("$hull" plan --resolved -f "$root/vbox/old.vbox" 2>&1)
+says 'a .vbox is a pc machine of its name' "$out" '(hostname "old-vbox") (source "media:disk") (memory "128M") (network nat)'
+says 'an IDE disk is an i440FX' "$out" '(tuning (pc (machine pc) (cpu max) (nic e1000)))'
+out=$(timeout 120 "$hull" run -f "$root/vbox/old.vbox" 2>&1)
+got=$?
+status 'a .vbox boots' "$got" 0 "$out"
+says 'its VDI' "$out" 'word: fresh'
+vbox snap.vbox '        <HardDisk uuid="{aaaaaaaa-0000-0000-0000-000000000001}" location="old.vdi" format="VDI" type="Normal">
+          <HardDisk uuid="{aaaaaaaa-0000-0000-0000-000000000002}" location="Snapshots/{b}.vdi" format="VDI"/>
+        </HardDisk>' 2
+out=$("$hull" plan -f "$root/vbox/snap.vbox" 2>&1)
+got=$?
+status 'a snapshot differencing disk is refused' "$got" 2 "$out"
+says 'naming the way round' "$out" 'VBoxManage clonemedium'
+
 # --- a floppy ----------------------------------------------------------------
 
 image 1440K "$root/floppy.img"

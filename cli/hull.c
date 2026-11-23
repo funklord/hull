@@ -66,6 +66,7 @@
 #include "media.h"
 #include "hw.h"
 #include "vagrant.h"
+#include "vmconf.h"
 #include "vbox_fetch.h"
 #include "vbox_host.h"
 #include "esp_fetch.h"
@@ -333,9 +334,11 @@ static uint8_t *read_file(const char *path, size_t *length)
 }
 
 /* A spec's text: the file at `path`, or where it is a compose file, the
- * (machines ...) form section 9's compose dialect translates it to, in a
- * buffer of MAX_FILE as read_file()'s is. What it leaves out is said on
- * stderr, once in a process however often the file is read. */
+ * (machines ...) form section 9's compose dialect translates it to, or
+ * where it is a .vmx or .vbox, the (machine ...) form section 3.13's
+ * Attach reads it as, in a buffer of MAX_FILE as read_file()'s is. What
+ * it leaves out is said on stderr, once in a process however often the
+ * file is read. */
 static uint8_t *spec_text(const char *path, size_t *length)
 {
 	static int said;
@@ -343,9 +346,11 @@ static uint8_t *spec_text(const char *path, size_t *length)
 	char      *text;
 	size_t     n;
 
-	if (!hull_import_is_compose(path) && !hull_vagrant_is_file(path))
+	if (!hull_import_is_compose(path) && !hull_vagrant_is_file(path) &&
+	    !hull_vmconf_is_file(path))
 		return read_file(path, length);
 	text = hull_vagrant_is_file(path) ? hull_vagrant_form(path, said ? NULL : stderr) :
+	       hull_vmconf_is_file(path) ? hull_vmconf_form(path, said ? NULL : stderr) :
 	       hull_import_compose(path, said ? NULL : stderr);
 	said = 1;
 	if (text == NULL)
@@ -6047,7 +6052,7 @@ static const char *container_format(const char *image)
 		return NULL;
 	if (memcmp(head, "QFI\xfb", 4u) == 0)
 		return "qcow2";
-	if (memcmp(head, "KDMV", 4u) == 0)
+	if (memcmp(head, "KDMV", 4u) == 0 || memcmp(head, "# Disk DescriptorFile", 21u) == 0)
 		return "vmdk";
 	if (memcmp(head, "vhdxfile", 8u) == 0)
 		return "vhdx";

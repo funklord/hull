@@ -809,7 +809,10 @@ static void read_format(medium *d)
 	if (read(fd, buffer, sizeof buffer) == (ssize_t)sizeof buffer) {
 		if (memcmp(buffer, "QFI\xfb", 4u) == 0)
 			strcpy(d->format, "qcow2");
-		else if (memcmp(buffer, "KDMV", 4u) == 0)
+		/* VMware's own disk is often a descriptor, text naming its
+		 * extents beside it, which qemu follows. */
+		else if (memcmp(buffer, "KDMV", 4u) == 0 ||
+		         memcmp(buffer, "# Disk DescriptorFile", 21u) == 0)
 			strcpy(d->format, "vmdk");
 		else if (memcmp(buffer, "conectix", 8u) == 0)
 			strcpy(d->format, "vpc");
