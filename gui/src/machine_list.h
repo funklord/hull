@@ -28,6 +28,10 @@ struct added_machine {
 	}
 };
 
+/* Where machines are kept, one folder each: ~/hull, as VirtualBox keeps
+ * ~/VirtualBox VMs. */
+QString machines_home();
+
 QList<added_machine> load_added();
 void                 save_added(const QList<added_machine> &list);
 

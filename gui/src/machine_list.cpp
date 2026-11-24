@@ -4,6 +4,8 @@
 
 #include "machine_list.h"
 
+#include <QDir>
+
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QSettings>
@@ -13,6 +15,11 @@ static QSettings &settings()
 	static QSettings stored(QStringLiteral("hull"), QStringLiteral("hull-gui"));
 
 	return stored;
+}
+
+QString machines_home()
+{
+	return QDir::homePath() + QStringLiteral("/hull");
 }
 
 QList<added_machine> load_added()

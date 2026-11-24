@@ -769,12 +769,17 @@ void main_window::ask_add()
 		if (!given)
 			return;
 	} else {
+		/* From the machines' folder where there is one; a VirtualBox or
+		 * VMware machine's own file or appliance is a machine too, which
+		 * the CLI runs as the pc class (project.md section 3.13). */
 		file = QFileDialog::getOpenFileName(this, QStringLiteral("Add Machine"),
-		                                    QDir::currentPath(),
+		                                    QDir(machines_home()).exists() ? machines_home()
+		                                                                   : QDir::currentPath(),
 		                                    QStringLiteral("Machines (hull.conf *.conf compose.yaml "
 		                                                   "compose.yml docker-compose.yaml "
 		                                                   "docker-compose.yml *.yaml *.yml "
-		                                                   "Vagrantfile);;All files (*)"));
+		                                                   "Vagrantfile *.vbox *.vmx *.ovf *.ova);;"
+		                                                   "All files (*)"));
 	}
 	if (file.isEmpty())
 		return;

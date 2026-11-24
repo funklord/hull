@@ -80,6 +80,9 @@ int main(int argc, char **argv)
 	                    QString())
 	              .size() == 63,
 	      "id at most 63");
+	/* Machines are kept under ~/hull, one folder each. */
+	check(machines_home() == QDir::homePath() + QStringLiteral("/hull"),
+	      "machines are kept in ~/hull", machines_home());
 	check(hostname_in(QStringLiteral("(machine (source \"dir:.\") (hostname \"gui-a\") (x y))")) ==
 	          QStringLiteral("gui-a"),
 	      "hostname read from a resolved line");

@@ -83,7 +83,9 @@ here=$(cd "$(dirname "$0")" && pwd)
 keys() {
 	work=$1
 	shift
-	timeout 90 python3 -I "$here/gui_keys.py" "$gui" "$hull" "$work" "$dir/screen.txt" "$@" \
+	# A home of the test's own: New writes under ~/hull, the user's
+	# machines, which a run here once did.
+	HOME=$dir/home timeout 90 python3 -I "$here/gui_keys.py" "$gui" "$hull" "$work" "$dir/screen.txt" "$@" \
 		> /dev/null 2>&1
 	out=$(tr -s ' ' < "$dir/screen.txt")
 }
@@ -142,12 +144,13 @@ if timeout 10 "$hull" ps 2>/dev/null | grep -q gui-c; then
 	fail "declined, gui-c ran" "$(timeout 10 "$hull" ps 2>&1)"
 fi
 
-# New: a name and a command typed, Enter, and the file written and listed.
-mkdir -p "$dir/newm/rootfs"
+# New: a name and a command typed, Enter, and the file written, in the
+# machine's own folder under ~/hull, named as it was typed, and listed.
+mkdir -p "$dir/home/hull/gui-n/rootfs" "$dir/newm"
 keys "$dir/newm" "b'\\x0e'" "b'gui-n'" "b'\\t\\t\\t\\t/probe say made-by-new'" "b'\\r'"
 cases=$((cases + 1))
-if ! grep -q '(command "/probe" "say" "made-by-new")' "$dir/newm/hull.conf" 2>/dev/null; then
-	fail "New wrote no such command" "$(cat "$dir/newm/hull.conf" 2>&1)"
+if ! grep -q '(command "/probe" "say" "made-by-new")' "$dir/home/hull/gui-n/hull.conf" 2>/dev/null; then
+	fail "New wrote no such command in ~/hull/gui-n" "$(ls -R "$dir/home" "$dir/newm" 2>&1)"
 fi
 has "$out" 'gui-n' "New's machine listed"
 

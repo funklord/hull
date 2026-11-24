@@ -27,9 +27,17 @@ new_machine_dialog::new_machine_dialog(const QStringList &images, const QString 
 
 	name = new QLineEdit;
 	name->setPlaceholderText(QStringLiteral("web"));
-	folder = new QLineEdit(QDir::currentPath());
-	folder->setToolTip(QStringLiteral("Where hull.conf is written; a dir: source is relative "
-	                                  "to it"));
+	/* A machine's folder of its own under ~/hull, named for it, as
+	 * VirtualBox keeps ~/VirtualBox VMs/NAME: it follows the name until
+	 * the folder is typed in. */
+	folder = new QLineEdit(machines_home());
+	folder->setToolTip(QStringLiteral("Where hull.conf is written, ~/hull/NAME unless given; a "
+	                                  "dir: source is relative to it"));
+	connect(name, &QLineEdit::textEdited, this, [this](const QString &text) {
+		if (!folder->isModified())
+			folder->setText(machines_home() + (text.trimmed().isEmpty() ? QString()
+			                                   : QLatin1Char('/') + text.trimmed()));
+	});
 	source = new QComboBox;
 	source->setEditable(true);
 	source->addItem(QStringLiteral("dir:./rootfs"));
