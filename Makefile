@@ -431,7 +431,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: esp-qemu-lora check-tsan
-.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-windows kernel-check kernel-cves check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-root check-systemd check-vfio check-disk check-usb check-usbredir check-vhost vhost-device dosemu2 cross-ppc64le qemu-ppc check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-windows kernel-check kernel-cves check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-ppc64le-host check-root check-systemd check-vfio check-disk check-usb check-usbredir check-vhost vhost-device dosemu2 cross-ppc64le qemu-ppc check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -555,6 +555,7 @@ help:
 	@echo '  check-arm64-host  hull built and make test run on arm64, under emu'
 	@echo '  check-riscv64-host  hull built and make test run on riscv64, under emu'
 	@echo '  check-s390x-host  hull built and make test run on s390x, big-endian, under emu'
+	@echo '  check-ppc64le-host  hull built and make test run on ppc64le (POWER), under emu'
 	@echo '  check-pc      a whole PC booting its own media, as the user'
 	@echo '  check-legacy  FreeDOS, fetched and pinned, on a pc: screen and ssh door'
 	@echo '  check-windows Windows 11'"'"'s evaluation installed by hull setup windows, then ssh'
@@ -1105,6 +1106,13 @@ check-riscv64-host: $(HULL) $(AGENT_RISCV64)
 # s390x-linux-gnu-gcc builds.
 check-s390x-host: $(HULL) $(AGENT_S390X)
 	BUILD_DIR='$(BUILD_DIR)' sh test/s390x_host_test.sh '$(HULL)'
+
+# hull on a ppc64le (POWER) host the same way: a ppc64le Debian under
+# emu, hull built and tested there. Needs qemu-system-ppc64, installed or
+# unpacked by `make qemu-ppc`, and the agent clang builds once `make
+# cross-ppc64le` has unpacked Debian's ppc64el libc.
+check-ppc64le-host: $(HULL) $(AGENT_PPC64LE)
+	BUILD_DIR='$(BUILD_DIR)' sh test/ppc64le_host_test.sh '$(HULL)'
 
 # The unit tests, and the store and pull suites, built and run with
 # AddressSanitizer and UndefinedBehaviorSanitizer, in a build directory

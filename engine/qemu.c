@@ -2925,8 +2925,12 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		/* An s390x guest's PCI is zPCI, which loads no option ROM, and
 		 * s390x Debian's qemu ships none: without romfile= qemu looked
 		 * for efi-virtio.rom and would not start (the s390x host's own
-		 * machine, 2026-11-13). */
-		argv[n++] = m->s390x ? "virtio-net-pci,netdev=net,romfile=" : "virtio-net-pci,netdev=net";
+		 * machine, 2026-11-13). pseries the same: SLOF drives virtio-net
+		 * itself, and ppc64el Debian's qemu ships no ROM either (the
+		 * ppc64le host's own machine, 2026-11-24). On an x86 host the
+		 * ROM is there, x86's qemu's, and hid both. */
+		argv[n++] = m->s390x || m->ppc64le ? "virtio-net-pci,netdev=net,romfile=" :
+		            "virtio-net-pci,netdev=net";
 	}
 	/* After passt's, so that eth0 is its, and each segment the next. */
 	for (unsigned i = 0u; i < m->segment_count; i++) {
@@ -2936,7 +2940,7 @@ static pid_t spawn(hull_machine *m, const char *kernel, const char *modules_dir,
 		snprintf(segment_netdev[i], sizeof segment_netdev[i],
 		         "stream,id=s%u,addr.type=fd,addr.str=%u", i, SEGMENT_FD + i);
 		snprintf(segment_device[i], sizeof segment_device[i], "virtio-net-pci,netdev=s%u,mac=%s%s",
-		         i, mac, m->s390x ? ",romfile=" : "");
+		         i, mac, m->s390x || m->ppc64le ? ",romfile=" : "");
 		argv[n++] = "-netdev";
 		argv[n++] = segment_netdev[i];
 		argv[n++] = "-device";
@@ -4676,9 +4680,10 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		return hosted_start(core, m, error);
 	if (uname(&name) != 0 ||
 	    (strcmp(name.machine, "x86_64") != 0 && strcmp(name.machine, "aarch64") != 0 &&
-	     strcmp(name.machine, "riscv64") != 0 && strcmp(name.machine, "s390x") != 0))
+	     strcmp(name.machine, "riscv64") != 0 && strcmp(name.machine, "s390x") != 0 &&
+	     strcmp(name.machine, "ppc64le") != 0))
 		return fail(error, HULL_ERR_RUNTIME, "the qemu engine boots on x86_64, aarch64, "
-		            "riscv64 and s390x hosts");
+		            "riscv64, s390x and ppc64le hosts");
 	/* ppc64le's qemu: Debian's qemu-system-ppc where it is installed,
 	 * else the same package unpacked into the user's cache by `make
 	 * qemu-ppc`, whose firmware, SLOF, every Debian qemu ships. */
