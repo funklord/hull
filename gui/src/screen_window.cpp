@@ -227,11 +227,19 @@ static void called(GDBusConnection *, const gchar *, const gchar *, const gchar 
 		guint32   stride, format;
 		GVariant *data;
 
+		gsize       size = 0u;
+		const void *bytes;
+
+		/* A region's pixels, where qemu cannot share the guest's
+		 * framebuffer: XP's own video mode, found 2026-11-24, after which
+		 * the window had shown only what it held at the last Scanout. */
 		g_variant_get(parameters, "(iiiiuu@ay)", &x, &y, &w, &h, &stride, &format, &data);
+		bytes = g_variant_get_fixed_array(data, &size, 1u);
+		if (w > 0 && h > 0 && (format == PIXMAN_X8R8G8B8 || format == PIXMAN_A8R8G8B8) &&
+		    (guint64)stride >= (guint64)w * 4u && size >= (gsize)stride * (gsize)(h - 1) + (gsize)w * 4u)
+			window->update_pixels(QPoint(x, y), QImage(static_cast<const uchar *>(bytes), w, h,
+			                                           (qsizetype)stride, QImage::Format_RGB32));
 		g_variant_unref(data);
-		(void)stride;
-		(void)format;
-		window->update_rect(QRect(x, y, w, h));
 	} else if (strcmp(method, "UpdateMap") == 0) {
 		gint32 x, y, w, h;
 
@@ -285,6 +293,13 @@ static void called(GDBusConnection *, const gchar *, const gchar *, const gchar 
 	g_dbus_method_invocation_return_value(invocation, nullptr);
 }
 
+/* qemu's end of the display closed: the machine has ended, or its qemu
+ * with it. */
+static void closed(GDBusConnection *, gboolean, GError *, gpointer data)
+{
+	static_cast<screen_link *>(data)->window->lost(QStringLiteral("the machine has ended"));
+}
+
 static GVariant *property(GDBusConnection *, const gchar *, const gchar *, const gchar *,
                           const gchar *, GError **, gpointer)
 {
@@ -308,6 +323,7 @@ screen_window::screen_window(const QString &id_, const QString &monitor_, QWidge
 
 screen_window::~screen_window()
 {
+	release();
 	if (link != nullptr) {
 		g_cancellable_cancel(link->cancel);
 		for (guint id_ : link->registered)
@@ -318,6 +334,8 @@ screen_window::~screen_window()
 			g_object_unref(link->listener);
 		}
 		if (link->bus != nullptr) {
+			/* Its closing is ours, not the machine's ending. */
+			g_signal_handlers_disconnect_by_func(link->bus, (gpointer)closed, link);
 			g_dbus_connection_close_sync(link->bus, nullptr, nullptr);
 			g_object_unref(link->bus);
 		}
@@ -377,6 +395,8 @@ bool screen_window::open(QString *why)
 	link->window = this;
 	link->cancel = g_cancellable_new();
 	link->bus = peer(pair[0], false, &error);
+	if (link->bus != nullptr)
+		g_signal_connect(link->bus, "closed", G_CALLBACK(closed), link);
 	if (link->bus != nullptr)
 		link->console = g_dbus_proxy_new_sync(link->bus, G_DBUS_PROXY_FLAGS_NONE, nullptr, nullptr,
 		                                      "/org/qemu/Display1/Console_0",
@@ -451,6 +471,21 @@ void screen_window::scanout(QImage image, void *mapped, size_t length)
 	if (view != nullptr)
 		view->hide();
 	update();
+}
+
+/* A region's pixels into the frame held, which is a copy of its own
+ * whenever the pixels come this way, then shown. */
+void screen_window::update_pixels(const QPoint &at, const QImage &pixels)
+{
+	if (frame.isNull() || map != nullptr)
+		return;
+	{
+		QPainter painter(&frame);
+
+		painter.setCompositionMode(QPainter::CompositionMode_Source);
+		painter.drawImage(at, pixels);
+	}
+	update_rect(QRect(at, pixels.size()));
 }
 
 void screen_window::update_rect(const QRect &rect)
@@ -549,9 +584,17 @@ void screen_window::disable()
 	update();
 }
 
+/* The machine has gone: its last frame is not left standing as though it
+ * were still running, which read as a hang (2026-11-24). The window
+ * closes, as VirtualBox's does when its machine powers off; it is closed
+ * from the event loop, not from inside GLib's callback that said so. */
 void screen_window::lost(const QString &why)
 {
+	release();
+	frame = QImage();
 	setWindowTitle(QStringLiteral("%1 -- %2").arg(id, why));
+	update();
+	QTimer::singleShot(0, this, &QWidget::close);
 }
 
 /* Where the frame is painted: the window, its aspect kept. */
@@ -608,6 +651,13 @@ void screen_window::key(QKeyEvent *event, bool down)
 		setWindowState(windowState() ^ Qt::WindowFullScreen);
 		return;
 	}
+	/* Right Ctrl is the host key, VirtualBox's: it gives the keyboard and
+	 * mouse back and is never the guest's. evdev's KEY_RIGHTCTRL, 97. */
+	if (event->nativeScanCode() == 97u + 8u) {
+		if (down && captured)
+			release();
+		return;
+	}
 	/* xcb's and Wayland's codes are evdev's plus 8. */
 	code = event->nativeScanCode() > 8u ? qemu_key(event->nativeScanCode() - 8u) : 0u;
 	if (link == nullptr || code == 0u)
@@ -643,6 +693,19 @@ void screen_window::mouseMoveEvent(QMouseEvent *event)
 
 	if (link == nullptr || source.isEmpty() || at.width() == 0 || at.height() == 0)
 		return;
+	/* Captured with a relative mouse: each move from the window's centre
+	 * is the guest's delta, and the pointer goes back to the centre. */
+	if (captured && relative) {
+		const QPoint centre = rect().center();
+		const QPoint delta = event->position().toPoint() - centre;
+
+		if (!delta.isNull()) {
+			g_dbus_proxy_call(link->mouse, "RelMotion", g_variant_new("(ii)", delta.x(), delta.y()),
+			                  G_DBUS_CALL_FLAGS_NONE, -1, link->cancel, nullptr, nullptr);
+			QCursor::setPos(mapToGlobal(centre));
+		}
+		return;
+	}
 	absolute = g_dbus_proxy_get_cached_property(link->mouse, "IsAbsolute");
 	if (absolute != nullptr && g_variant_get_boolean(absolute)) {
 		int x = qBound(0, p.x() * source.width() / at.width(), source.width() - 1);
@@ -674,7 +737,97 @@ void screen_window::button(QMouseEvent *event, bool down)
 
 void screen_window::mousePressEvent(QMouseEvent *event)
 {
+	/* The click that captures a relative mouse is not the guest's, as in
+	 * VirtualBox; a tablet's is, its pointer already where it was. */
+	if (!captured && link != nullptr) {
+		capture();
+		if (relative)
+			return;
+	} else if (captured && relative && absolute()) {
+		/* The guest took a tablet since: its pointer follows ours now,
+		 * so the mouse goes back, the keyboard staying captured. */
+		releaseMouse();
+		relative = false;
+	}
 	button(event, true);
+}
+
+/* Whether the guest's pointer takes positions: a tablet's, which follows
+ * the viewer's own and needs nothing grabbed. */
+bool screen_window::absolute() const
+{
+	GVariant *value;
+	GVariant *reply;
+	bool      is = false;
+
+	if (link == nullptr || link->mouse == nullptr)
+		return false;
+	/* Asked of qemu, not the proxy's cache: a guest's tablet becomes the
+	 * pointer when its driver loads, after the window opened, and a cache
+	 * that missed the change captured a mouse qemu then refused every
+	 * delta of (XP's tablet, found 2026-11-24). The answer is cached. */
+	reply = g_dbus_connection_call_sync(g_dbus_proxy_get_connection(link->mouse), nullptr,
+	                                    "/org/qemu/Display1/Console_0",
+	                                    "org.freedesktop.DBus.Properties", "Get",
+	                                    g_variant_new("(ss)", "org.qemu.Display1.Mouse", "IsAbsolute"),
+	                                    G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, 500, nullptr,
+	                                    nullptr);
+	if (reply != nullptr) {
+		g_variant_get(reply, "(v)", &value);
+		g_dbus_proxy_set_cached_property(link->mouse, "IsAbsolute", value);
+		is = g_variant_get_boolean(value);
+		g_variant_unref(value);
+		g_variant_unref(reply);
+	} else if ((value = g_dbus_proxy_get_cached_property(link->mouse, "IsAbsolute")) != nullptr) {
+		is = g_variant_get_boolean(value);
+		g_variant_unref(value);
+	}
+	return is;
+}
+
+void screen_window::capture()
+{
+	if (captured || !isActiveWindow())
+		return;
+	relative = !absolute();
+	grabKeyboard();
+	if (relative) {
+		grabMouse(Qt::BlankCursor);
+		QCursor::setPos(mapToGlobal(rect().center()));
+	}
+	captured = true;
+	setWindowTitle(QStringLiteral("%1 -- hull -- captured: Right Ctrl releases").arg(id));
+}
+
+void screen_window::release()
+{
+	if (!captured)
+		return;
+	releaseKeyboard();
+	if (relative)
+		releaseMouse();
+	captured = false;
+	relative = false;
+	setWindowTitle(QStringLiteral("%1 -- hull").arg(id));
+}
+
+void screen_window::focusOutEvent(QFocusEvent *event)
+{
+	release();
+	QWidget::focusOutEvent(event);
+}
+
+void screen_window::hideEvent(QHideEvent *event)
+{
+	release();
+	QWidget::hideEvent(event);
+}
+
+void screen_window::changeEvent(QEvent *event)
+{
+	if (event->type() == QEvent::ActivationChange && !isActiveWindow())
+		release();
+	QWidget::changeEvent(event);
 }
 
 void screen_window::mouseReleaseEvent(QMouseEvent *event)

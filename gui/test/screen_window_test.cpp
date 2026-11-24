@@ -6,7 +6,9 @@
  * (test/screen_test.sh looks at both).
  *
  * Usage: screen_window_test MONITOR SECONDS. Prints `frame WxH shared` or
- * `frame WxH copied`, then `typed` and `resized`, and exits 0; exits 1
+ * `frame WxH copied`, then `typed` and `resized`, then `closed` once the
+ * machine has ended and the window closed with it (`left open` where it
+ * did not), and exits 0; exits 1
  * saying why.
  * Every wait ends at SECONDS. Run with QT_QPA_PLATFORM=offscreen.
  */
@@ -65,5 +67,13 @@ int main(int argc, char **argv)
 	while (clock.elapsed() < 1500)
 		application.processEvents(QEventLoop::WaitForMoreEvents, 100);
 	printf("resized\n");
+	fflush(stdout);
+
+	/* The machine ends a few seconds later, its guest done: the window
+	 * closes with it rather than leaving its last frame up. */
+	clock.restart();
+	while (window.isVisible() && clock.elapsed() < limit)
+		application.processEvents(QEventLoop::WaitForMoreEvents, 100);
+	printf(window.isVisible() ? "left open\n" : "closed\n");
 	return 0;
 }

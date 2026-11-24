@@ -540,8 +540,10 @@ void main_window::update_actions()
 
 	remove_action->setEnabled(any && !rows[i].added.file.isEmpty());
 	edit_action->setEnabled(any && !rows[i].added.file.isEmpty());
-	start_action->setEnabled(any && !rows[i].is_held && rows[i].run == nullptr &&
-	                         !rows[i].added.file.isEmpty());
+	/* An exited machine the core still lists is started again: the core
+	 * takes a new run of the id beside it, as `hull run` does. */
+	start_action->setEnabled(any && (!rows[i].is_held || rows[i].held.state == QStringLiteral("exited")) &&
+	                         rows[i].run == nullptr && !rows[i].added.file.isEmpty());
 	stop_action->setEnabled(held);
 	kill_action->setEnabled(held);
 	pause_action->setEnabled(held && state != QStringLiteral("paused"));
@@ -874,7 +876,8 @@ void main_window::start()
 		for (int k = 0; k < rows.size(); k++)
 			if (rows[k].added == which)
 				at = k;
-		if (at < 0 || rows[at].is_held || rows[at].run != nullptr)
+		if (at < 0 || (rows[at].is_held && rows[at].held.state != QStringLiteral("exited")) ||
+		    rows[at].run != nullptr)
 			return;
 		rows[at].accepted << asked;
 		plan_of(at);

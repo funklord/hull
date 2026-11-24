@@ -4,7 +4,11 @@
  * qemu's D-Bus display (project.md section 5.2), its framebuffer shared
  * by a memfd where qemu offers one, so nothing is copied but the paint.
  * Keyboard and mouse go back to the guest; Ctrl+Alt+Enter toggles
- * fullscreen, VMware's chord.
+ * fullscreen, VMware's chord. Input is captured as VirtualBox captures
+ * it: a click in the screen takes the keyboard, and the mouse too where
+ * the guest's pointer moves by deltas (a PS/2 mouse), and Right Ctrl, the
+ * host key, gives both back; so does the window losing focus, hiding or
+ * closing, so the desktop can never be left without them.
  *
  * Reached by the machine's monitor, linked as
  * $XDG_RUNTIME_DIR/hull/display/ADDRESS: local machines only. A remote
@@ -44,6 +48,7 @@ public:
 	/* The listener's calls, from screen_window.cpp's GLib callbacks. */
 	void scanout(QImage image, void *map, size_t map_length);
 	void update_rect(const QRect &rect);
+	void update_pixels(const QPoint &at, const QImage &pixels);
 	void disable();
 	void lost(const QString &why);
 	void cursor(const QImage &image, const QPoint &hot);
@@ -62,8 +67,14 @@ protected:
 	void mouseReleaseEvent(QMouseEvent *event) override;
 	void wheelEvent(QWheelEvent *event) override;
 	bool focusNextPrevChild(bool next) override;
+	void focusOutEvent(QFocusEvent *event) override;
+	void hideEvent(QHideEvent *event) override;
+	void changeEvent(QEvent *event) override;
 
 private:
+	bool  absolute() const;
+	void  capture();
+	void  release();
 	QRect shown() const;
 	QSize source_size() const;
 	void  key(QKeyEvent *event, bool down);
@@ -80,6 +91,8 @@ private:
 	bool         cursor_on = true;
 	dmabuf_view *view = nullptr;     /* a 3D machine's frames, or null */
 	QTimer      *resized = nullptr;  /* the size told once it settles */
+	bool         captured = false;   /* the keyboard, and a relative mouse, grabbed */
+	bool         relative = false;   /* the mouse grabbed too, moved by deltas */
 };
 
 #endif

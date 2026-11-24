@@ -5,7 +5,8 @@
 # GIO client (test/display_client.py) and by hull-gui's own screen window
 # (gui/test/screen_window_test), which must get qemu's framebuffer shared
 # rather than copied, whose typed key the guest must read from its own
-# keyboard, and whose new size the guest must take as its preferred mode;
+# keyboard, whose new size the guest must take as its preferred mode, and
+# which must close when its machine ends;
 # the same machine's (sound virtio) card seen by its guest.
 # A (display local) machine with (gpu virgl) handing its frames over as
 # the GPU's dmabufs, and serving no VNC. Its 3D: (tuning (qemu (gpu
@@ -118,6 +119,9 @@ out=$(QT_QPA_PLATFORM=offscreen timeout 30 "$window_test" "$link" 20 2>&1)
 cases=$((cases + 1))
 printf '%s\n' "$out" | grep -q '^frame [0-9]*x[0-9]* shared$' ||
 	fail "hull-gui's screen window had no frame of qemu's shared memory" "$out"
+cases=$((cases + 1))
+printf '%s\n' "$out" | grep -q '^closed$' ||
+	fail "hull-gui's screen window was left open, its last frame up, after its machine ended" "$out"
 wait "$runner"
 cases=$((cases + 1))
 grep -q '^key-a-read$' "$root/local.out" ||
