@@ -54,6 +54,8 @@ typedef struct machine {
 	int         tpm;
 	int         network;
 	char        nic[16];
+	char        sound[8];   /* the pc's card, "" for none */
+	int         tablet;     /* USB there: a tablet, the pointer where the viewer's is */
 	int         boot_cdrom;
 	medium      media[MAX_MEDIA];
 	unsigned    media_count;
@@ -267,6 +269,14 @@ static void read_vmx(machine *m, char *text)
 		m->secure = vmx_true(v, "uefi.secureboot.enabled");
 	}
 	m->tpm = vmx_true(v, "vtpm.present");
+	/* Its sound card, by the nearest qemu has: VMware's default is
+	 * Ensoniq's AudioPCI, an ES1371, whose ES1370 sibling qemu makes. */
+	if (vmx_true(v, "sound.present")) {
+		value = vmx_get(v, "sound.virtualdev");
+		strcpy(m->sound, value != NULL && strcasecmp(value, "hdaudio") == 0 ? "hda" :
+		                 value != NULL && strcasecmp(value, "sb16") == 0 ? "sb16" : "es1370");
+	}
+	m->tablet = vmx_true(v, "usb.present");
 	if (vmx_true(v, "ethernet0.present")) {
 		m->network = 1;
 		value = vmx_get(v, "ethernet0.virtualdev");
@@ -507,6 +517,23 @@ static void read_vbox(machine *m, char *text)
 			if (first_boot[0] == '\0' && attribute(&t, "position", value, sizeof value) &&
 			    strcmp(value, "1") == 0)
 				attribute(&t, "device", first_boot, sizeof first_boot);
+		} else if (strcmp(name, "AudioAdapter") == 0) {
+			/* AC'97 where the file names no controller, VirtualBox's
+			 * default: Intel's 82801AA, the chip qemu's ac97 is, so the
+			 * guest's driver for it is already installed. */
+			if (!attribute(&t, "enabled", value, sizeof value) || strcmp(value, "false") != 0) {
+				if (!attribute(&t, "controller", value, sizeof value))
+					strcpy(value, "AC97");
+				strcpy(m->sound, strcmp(value, "HDA") == 0 ? "hda" :
+				                 strcmp(value, "SB16") == 0 ? "sb16" : "ac97");
+			}
+		} else if (strcmp(name, "Controller") == 0 || (strcmp(name, "HID") == 0 &&
+		           attribute(&t, "Pointing", value, sizeof value) &&
+		           strncmp(value, "USB", 3u) == 0)) {
+			/* A USB controller, or a USB pointer: the guest drives USB,
+			 * so a tablet's absolute pointer stands in for the Guest
+			 * Additions' mouse integration, which qemu has none of. */
+			m->tablet = 1;
 		} else if (strcmp(name, "Adapter") == 0) {
 			in_adapter = !t.empty;
 			if (attribute(&t, "enabled", value, sizeof value) && strcmp(value, "true") == 0 &&
@@ -1110,6 +1137,10 @@ static char *write_form(machine *m)
 		fputs(" (tpm true)", out);
 	if (m->network)
 		fprintf(out, " (nic %s)", m->nic);
+	if (m->sound[0] != '\0')
+		fprintf(out, " (sound %s)", m->sound);
+	if (m->tablet)
+		fputs(" (pointer tablet)", out);
 	fputs(")))\n", out);
 	if (fclose(out) != 0) {
 		free(text);

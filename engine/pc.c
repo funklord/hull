@@ -126,6 +126,7 @@ struct hull_machine {
 	char           *cpu;        /* (tuning (pc (cpu ...))), or NULL for qemu's own */
 	char           *accel;
 	char           *sound;          /* (tuning (pc (sound ...))), or NULL */
+	int             tablet;         /* (tuning (pc (pointer tablet))): a USB tablet */
 	char           *firmware;       /* OVMF's path, for (firmware uefi), or NULL for SeaBIOS */
 	int             secure;         /* (firmware uefi-secure): OVMF's secure boot, Microsoft's keys */
 	int             tpm;            /* (tpm true): a TPM 2.0 of swtpm's */
@@ -1478,6 +1479,12 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 			m->nic          = hull_access_value(doc, &pc, "nic");
 			m->sound        = hull_access_value(doc, &pc, "sound");
 			m->lora         = hull_access_value(doc, &pc, "lora");
+			{
+				char *pointer = hull_access_value(doc, &pc, "pointer");
+
+				m->tablet = pointer != NULL && strcmp(pointer, "tablet") == 0;
+				free(pointer);
+			}
 			if ((wrong = read_firmware(m, doc, &pc)) != NULL)
 				return wrong;
 		}
@@ -1526,7 +1533,8 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 		} else if (m->network || m->segment_count != 0u || m->port_count != 0u) {
 			return "a board's serial port is its one way in: no network, segments or ports";
 		}
-		if (m->vnc || m->display != NULL || m->vga != NULL || m->sound != NULL || m->gpu != 0)
+		if (m->vnc || m->display != NULL || m->vga != NULL || m->sound != NULL || m->gpu != 0 ||
+		    m->tablet)
 			return "a board has no screen or sound of qemu's: its serial port is what it says";
 		if (m->memory != NULL || m->cpus != NULL || m->cpu != NULL)
 			return "a board's memory and CPU are its microcontroller's";
@@ -1863,6 +1871,16 @@ static void exec_pc(const hull_machine *m)
 		argv[n++] = display_monitor;
 		argv[n++] = "-mon";
 		argv[n++] = "chardev=display,mode=control";
+	}
+	/* A USB tablet: a pointer at absolute positions, as hull-gui's screen
+	 * and VNC give them, where a PS/2 mouse moves by deltas alone and a
+	 * guest's pointer drifts from the viewer's. On a UHCI of its own, the
+	 * one every Windows from 98 and every Linux drives, on q35 too. */
+	if (m->tablet) {
+		argv[n++] = "-device";
+		argv[n++] = "piix3-usb-uhci,id=pointer";
+		argv[n++] = "-device";
+		argv[n++] = "usb-tablet,bus=pointer.0";
 	}
 	argv[n++] = "-boot";
 	argv[n++] = boot;
@@ -3309,6 +3327,10 @@ static const hull_cap_entry entries[] = {
 	  "its frames shared", NULL },
 	{ "memory",             HULL_SUP_NATIVE,   NULL, NULL },
 	{ "cpus",               HULL_SUP_NATIVE,   NULL, NULL },
+	{ "pc.pointer.ps2",    HULL_SUP_NATIVE, "a PS/2 mouse, moved by deltas: hull-gui's screen "
+	  "captures it, Right Ctrl releasing", NULL },
+	{ "pc.pointer.tablet", HULL_SUP_NATIVE, "a USB tablet on a UHCI of its own, the pointer where "
+	  "the viewer's is, nothing captured", NULL },
 	{ "pc.sound.none",  HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.sound.sb16",  HULL_SUP_NATIVE, "a Sound Blaster 16", NULL },
 	{ "pc.sound.adlib", HULL_SUP_NATIVE, "an AdLib's OPL2", NULL },

@@ -604,6 +604,7 @@ static const char *const pc_cpu_values[]     = { "host", "max", "qemu64", "486",
 
 static const char *const pc_firmware_values[] = { "bios", "uefi", "uefi-secure", NULL };
 
+static const char *const pc_pointer_values[] = { "ps2", "tablet", NULL };
 static const char *const pc_sound_values[] = { "none", "sb16", "adlib", "gus", "es1370", "ac97",
                                                "hda", NULL };
 
@@ -620,6 +621,7 @@ static const key pc_keys[] = {
 	{ .name = "boot_key", .type = COUNT },
 	{ .name = "lora",    .type = STRING, .value = nonempty },
 	{ .name = "gpu",     .type = CHOICE, .choices = gpu_values },
+	{ .name = "pointer", .type = CHOICE, .choices = pc_pointer_values },
 };
 static const schema pc = TABLE(pc_keys);
 

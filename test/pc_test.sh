@@ -169,6 +169,12 @@ says 'its disk where it was' "$out" '(medium (type disk) (source "image:./old.vm
 says 'a machine of SATA is a q35' "$out" '(tuning (pc (machine q35) (cpu max) (nic e1000)))'
 says 'a card qemu lacks said' "$out" 'ethernet0, vmxnet3, is given as an e1000'
 says 'a host drive said' "$out" "sata0:1, the host's own drive, is not given"
+# Its sound and USB: VMware's default ES1371 is qemu's ES1370, and USB a
+# tablet.
+{ cat "$root/vmware/Old Box.vmx"; printf 'sound.present = "TRUE"\nusb.present = "TRUE"\n'; } \
+	> "$root/vmware/sound.vmx"
+out=$("$hull" plan --resolved -f "$root/vmware/sound.vmx" 2>&1)
+says "VMware's sound card and a tablet for its USB" "$out" '(nic e1000) (sound es1370) (pointer tablet)))'
 out=$(timeout 120 "$hull" run -f "$root/vmware/Old Box.vmx" 2>&1)
 got=$?
 status 'a .vmx boots' "$got" 0 "$out"
@@ -239,6 +245,22 @@ out=$("$hull" plan -f "$root/vbox/snap.vbox" 2>&1)
 got=$?
 status 'a snapshot differencing disk is refused' "$got" 2 "$out"
 says 'naming the way round' "$out" 'VBoxManage clonemedium'
+# Its sound card and its USB: AC'97 where the AudioAdapter names no
+# controller, VirtualBox's default and the chip qemu's ac97 is, and a USB
+# controller a tablet, the pointer where the viewer's is (the holder's
+# Windows XP, 2026-11-24); booted with both, the probe's disk as before.
+sed 's|      <Boot>|      <AudioAdapter driver="ALSA" enabled="true"/>\n      <USB><Controllers><Controller name="OHCI" type="OHCI"/></Controllers></USB>\n      <Boot>|' \
+	"$root/vbox/old.vbox" > "$root/vbox/av.vbox"
+out=$("$hull" plan --resolved -f "$root/vbox/av.vbox" 2>&1)
+says "its AC'97 and a tablet for its USB" "$out" '(nic e1000) (sound ac97) (pointer tablet)))'
+sed 's|<AudioAdapter driver="ALSA" enabled="true"/>|<AudioAdapter controller="HDA" enabled="true"/>|' \
+	"$root/vbox/av.vbox" > "$root/vbox/hda.vbox"
+out=$("$hull" plan --resolved -f "$root/vbox/hda.vbox" 2>&1)
+says 'an HDA card by name' "$out" '(sound hda)'
+out=$(timeout 120 "$hull" run -f "$root/vbox/av.vbox" 2>&1)
+got=$?
+status 'a .vbox with its sound and a tablet boots' "$got" 0 "$out"
+says 'its VDI, beside a UHCI and its tablet' "$out" 'word: fresh'
 
 # An appliance: its .ovf read as a pc machine, VirtualBox's export shape
 # -- a streamOptimized VMDK, an IDE controller, an E1000 -- and the .ova
