@@ -198,12 +198,14 @@ fi
 # A pc's 3D, (tuning (pc (gpu virgl))): the same tree exported as a
 # bootable disk, whose initramfs loads virtio_gpu wherever there is one,
 # booted by UEFI on the pc class's virtio-vga-gl, its init reading the
-# renderer onto the serial console and powering off.
+# OpenGL renderer and the Vulkan devices onto the serial console and
+# powering off; then (gpu venus) on the same disk, where the vm's Venus
+# ran.
 cat > "$root/pcgl.conf" <<'EOF'
 (build (base "gpu/mesa")
   (steps
     (step (name "probe")
-      (run "printf '#!/bin/sh\\neglinfo.x86_64-linux-gnu -B -p surfaceless 2>&1 | grep -i renderer\\necho o > /proc/sysrq-trigger\\nsleep 30\\n' > /sbin/glprobe && chmod 755 /sbin/glprobe"))))
+      (run "printf '#!/bin/sh\\neglinfo.x86_64-linux-gnu -B -p surfaceless 2>&1 | grep -i renderer\\nvulkaninfo --summary 2>&1 | grep -i deviceName\\necho o > /proc/sysrq-trigger\\nsleep 30\\n' > /sbin/glprobe && chmod 755 /sbin/glprobe"))))
 EOF
 cases=$((cases + 1))
 if ! out=$(cd "$root" && timeout 600 "$hull" build -f "$root/pcgl.conf" gpu/mesa-pc 2>&1) ||
@@ -220,6 +222,18 @@ else
 	cases=$((cases + 1))
 	[ "$(left)" = 0 ] ||
 		fail "a pc's qemu was left after its machine ended" "$(ps -eo pid,ppid,args | grep '[q]emu-system')"
+	if [ -r /dev/udmabuf ] && [ -w /dev/udmabuf ] && [ -n "$server" ]; then
+		sed 's/(gpu virgl)/(gpu venus)/; s/"pcgl"/"pcvk"/' "$root/pcgl-run.conf" > "$root/pcvk-run.conf"
+		out=$(cd "$root" && timeout -k 2 300 "$hull" run -f "$root/pcvk-run.conf" 2>&1)
+		cases=$((cases + 1))
+		printf '%s\n' "$out" | grep -q 'deviceName *= Virtio-GPU Venus (' ||
+			fail "a pc guest's Vulkan did not reach the host's GPU through Venus" "$out"
+		sleep 2
+		cases=$((cases + 1))
+		[ "$(left)" = 0 ] ||
+			fail "Venus's render server, or a pc's qemu, was left after its machine ended" \
+				"$(ps -eo pid,ppid,args | grep -E '[q]emu-system|[v]irgl_render')"
+	fi
 	rm -f "$root/mesa.img"
 fi
 # And its refusals: 3D with no screen, and beside another VGA card.
