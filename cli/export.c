@@ -844,8 +844,15 @@ int hull_export_ova(hull_store *store, const char *name, const char *ova, const 
 	const char *slash = strrchr(ova, '/');
 	int         status = -1;
 
-	/* Plain OVF names no firmware, which both hypervisors take as BIOS. */
-	if (limine_built(built, sizeof built) != 0) {
+	/* Plain OVF names no firmware, which both hypervisors take as BIOS:
+	 * Limine's BIOS stage and the tool that installs it must be there,
+	 * not only the place they would be, or the image boots by UEFI alone
+	 * and an appliance of it hangs at its firmware. */
+	if (limine_built(built, sizeof built) != 0 ||
+	    snprintf(raw, sizeof raw, "%s/limine-bios.sys", built) >= (int)sizeof raw ||
+	    access(raw, R_OK) != 0 ||
+	    snprintf(raw, sizeof raw, "%s/limine", built) >= (int)sizeof raw ||
+	    access(raw, X_OK) != 0) {
 		snprintf(why, cap, "an .ova boots by BIOS, as VirtualBox and VMware read a plain OVF, "
 		         "and only Limine built from source installs that: `make limine` builds it");
 		return -1;
