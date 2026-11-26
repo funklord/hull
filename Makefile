@@ -5,7 +5,17 @@
 PYTHON    ?= python3
 # Each function and datum a section of its own, and the linker keeping only
 # what is reached: -Os works a function at a time and cannot see the rest.
-CFLAGS    ?= -Os -g -ffunction-sections -fdata-sections -Wl,--gc-sections
+# -Os, and the linker dropping what nothing calls, the size rule: the
+# sections are what the code needs and stay whatever CFLAGS says, so a
+# package build's CFLAGS and LDFLAGS (dpkg's -O2, -g and hardening) add to
+# them rather than replace them; DEB_CFLAGS_MAINT_APPEND gives -Os back.
+# The static guest binaries -- the agents, the probe -- take neither: a
+# host's hardening means nothing to a cross compiler, and they are the
+# guest's, not the host's.
+CFLAGS       ?= -Os -g
+SECTIONS      = -ffunction-sections -fdata-sections -Wl,--gc-sections
+HOST_CFLAGS   = $(SECTIONS) $(CFLAGS) $(LDFLAGS)
+GUEST_CFLAGS ?= -Os -g $(SECTIONS)
 WARNINGS   = -std=c11 -Wall -Wextra -Wconversion -Wsign-conversion
 DEPFLAGS   = -MMD -MP
 BUILD_DIR ?= build
@@ -635,36 +645,36 @@ $(AGENT_GEN) &: agent/message.situ $(SITU_COMPILER)
 # change to one should rebuild what includes it.
 $(BUILD_DIR)/sexpr/%.o: sexpr/%.c | $(GEN_HEADERS)
 	@mkdir -p '$(@D)'
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(HOST_CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/agent/%.o: agent/%.c | $(GEN_HEADERS) $(AGENT_GEN) $(FRONTEND_GEN) $(PROTOCOL_GEN)
 	@mkdir -p '$(@D)'
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(HOST_CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/spec/%.o: spec/%.c | $(GEN_HEADERS)
 	@mkdir -p '$(@D)'
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(HOST_CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/plan/%.o: plan/%.c | $(GEN_HEADERS)
 	@mkdir -p '$(@D)'
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(HOST_CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/engine/%.o: engine/%.c | $(GEN_HEADERS) $(AGENT_GEN) $(DISC_GEN)
 	@mkdir -p '$(@D)'
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(HOST_CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/store/%.o: store/%.c | $(GEN_HEADERS)
 	@mkdir -p '$(@D)'
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(HOST_CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/oci/%.o: oci/%.c
 	@mkdir -p '$(@D)'
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(HOST_CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/core/%.o: core/%.c VERSION | $(GEN_HEADERS) $(AGENT_GEN) $(FRONTEND_GEN) \
                                           $(PROTOCOL_GEN) $(FRAME_GEN)
 	@mkdir -p '$(@D)'
-	$(CC) $(CPPFLAGS) -DHULL_VERSION='"$(VERSION)"' $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) -DHULL_VERSION='"$(VERSION)"' $(HOST_CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
 # The commit hull is built from, for --version, so that a result can name
 # the hull it rested on without guessing from where the binary sits. The
@@ -690,38 +700,38 @@ $(BUILD_DIR)/agent/agent.o: $(GEN_DIR)/commit.h
 # The version is a prerequisite, so a new number rebuilds what prints it.
 $(BUILD_DIR)/cli/%.o: cli/%.c VERSION | $(GEN_HEADERS) $(AGENT_GEN) $(FRONTEND_GEN)
 	@mkdir -p '$(@D)'
-	$(CC) $(CPPFLAGS) -DHULL_VERSION='"$(VERSION)"' $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) -DHULL_VERSION='"$(VERSION)"' $(HOST_CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
 $(PROBE): test/probe.c
 	@mkdir -p '$(@D)'
-	$(CC) -static $(CFLAGS) -o $@ $<
+	$(CC) -static $(GUEST_CFLAGS) -o $@ $<
 
 $(BUILD_DIR)/test/arm64/rootfs/probe: test/probe.c
 	@mkdir -p '$(@D)/proc' '$(@D)/dev'
-	$(ARM64_CC) -static $(CFLAGS) -o $@ $<
+	$(ARM64_CC) -static $(GUEST_CFLAGS) -o $@ $<
 
 $(BUILD_DIR)/test/riscv64/rootfs/probe: test/probe.c
 	@mkdir -p '$(@D)/proc' '$(@D)/dev'
-	$(RISCV64_CC) -static $(CFLAGS) -o $@ $<
+	$(RISCV64_CC) -static $(GUEST_CFLAGS) -o $@ $<
 
 $(BUILD_DIR)/test/s390x/rootfs/probe: test/probe.c
 	@mkdir -p '$(@D)/proc' '$(@D)/dev'
-	$(S390X_CC) -static $(CFLAGS) -o $@ $<
+	$(S390X_CC) -static $(GUEST_CFLAGS) -o $@ $<
 
 $(BUILD_DIR)/test/arm/rootfs/probe: test/probe.c
 	@mkdir -p '$(@D)/proc' '$(@D)/dev'
-	$(ARM_CC) -static $(CFLAGS) -o $@ $<
+	$(ARM_CC) -static $(GUEST_CFLAGS) -o $@ $<
 
 $(BUILD_DIR)/test/ppc64le/rootfs/probe: test/probe.c
 	@mkdir -p '$(@D)/proc' '$(@D)/dev'
-	$(PPC64LE_CC) -static $(CFLAGS) -o $@ $<
+	$(PPC64LE_CC) -static $(GUEST_CFLAGS) -o $@ $<
 
 $(HULL): $(CLI_OBJS) $(CORE_OBJS) $(ENGINE_OBJS) $(STORE_OBJS) $(OCI_OBJS) $(PLAN_OBJS) \
          $(SPEC_OBJS) $(SEXPR_OBJS)
-	$(CC) $(CFLAGS) -pthread -o $@ $^ $(PULL_LIBS)
+	$(CC) $(HOST_CFLAGS) -pthread -o $@ $^ $(PULL_LIBS)
 
 $(AGENT_BIN): $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
-	$(CC) -static $(CFLAGS) -o $@ $^
+	$(CC) -static $(GUEST_CFLAGS) -o $@ $^
 
 kernel: $(KERNEL_BIN) $(KERNEL_ELF) $(KERNEL_MODULES)/modules.dep $(KERNEL_ARM64)
 
@@ -824,27 +834,27 @@ $(LIMINE_FILES): $(LIMINE_SRC)/bin/limine
 
 # Its native objects first, which make the generated sources and headers.
 $(BUILD_DIR)/hull-agent-arm64: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
-	$(ARM64_CC) -static $(CPPFLAGS) $(CFLAGS) -o $@ $(AGENT_SOURCES)
+	$(ARM64_CC) -static $(CPPFLAGS) $(GUEST_CFLAGS) -o $@ $(AGENT_SOURCES)
 
 $(BUILD_DIR)/hull-agent-riscv64: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
-	$(RISCV64_CC) -static $(CPPFLAGS) $(CFLAGS) -o $@ $(AGENT_SOURCES)
+	$(RISCV64_CC) -static $(CPPFLAGS) $(GUEST_CFLAGS) -o $@ $(AGENT_SOURCES)
 
 $(BUILD_DIR)/hull-agent-s390x: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
-	$(S390X_CC) -static $(CPPFLAGS) $(CFLAGS) -o $@ $(AGENT_SOURCES)
+	$(S390X_CC) -static $(CPPFLAGS) $(GUEST_CFLAGS) -o $@ $(AGENT_SOURCES)
 
 $(BUILD_DIR)/hull-agent-arm: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
-	$(ARM_CC) -static $(CPPFLAGS) $(CFLAGS) -o $@ $(AGENT_SOURCES)
+	$(ARM_CC) -static $(CPPFLAGS) $(GUEST_CFLAGS) -o $@ $(AGENT_SOURCES)
 
 $(BUILD_DIR)/hull-agent-ppc64le: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
-	$(PPC64LE_CC) -static $(CPPFLAGS) $(CFLAGS) -o $@ $(AGENT_SOURCES)
+	$(PPC64LE_CC) -static $(CPPFLAGS) $(GUEST_CFLAGS) -o $@ $(AGENT_SOURCES)
 
 $(BUILD_DIR)/hull-agent-amd64: $(AGENT_BIN_OBJS) $(SEXPR_OBJS)
-	$(AMD64_CC) -static $(CPPFLAGS) $(CFLAGS) -o $@ $(AGENT_SOURCES)
+	$(AMD64_CC) -static $(CPPFLAGS) $(GUEST_CFLAGS) -o $@ $(AGENT_SOURCES)
 
 # One file, its own: only the _nss_hull_ entry points are visible.
 $(NSS_LIB): nss/nss_hull.c
 	@mkdir -p '$(@D)'
-	$(CC) $(CFLAGS) $(WARNINGS) -fPIC -fvisibility=hidden -shared -Wl,-soname,libnss_hull.so.2 \
+	$(CC) $(HOST_CFLAGS) $(WARNINGS) -fPIC -fvisibility=hidden -shared -Wl,-soname,libnss_hull.so.2 \
 	      -o $@ $<
 
 # The one step of section 8.1's names that needs root, and the only target
@@ -858,7 +868,7 @@ install-nss: $(NSS_LIB)
 # setuid program holds, the less there is to trust.
 $(ROOT_BIN): root/hull_root.c engine/sha256.c engine/hostnet.c engine/sha256.h engine/hostnet.h
 	@mkdir -p '$(@D)'
-	$(CC) -Iengine $(CFLAGS) $(WARNINGS) -pthread -o $@ $(filter %.c,$^)
+	$(CC) -Iengine $(HOST_CFLAGS) $(WARNINGS) -pthread -o $@ $(filter %.c,$^)
 
 # Root mode (project.md section 7), run as root: the helper setuid, and the
 # directories of its listing and its log, root's alone, which it refuses to
@@ -883,7 +893,7 @@ install-apparmor: packaging/apparmor/hull.in
 	@echo 'load it (as root): apparmor_parser -r $(DESTDIR)$(APPARMOR_DIR)/hull'
 
 $(GEN_DIR)/%.o: $(GEN_DIR)/%.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(HOST_CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
 # A tree built before situ moved from vendor/situ, 2026-11-23, holds .d
 # files naming the old path as an object's source, which -MP covers only
@@ -894,68 +904,68 @@ vendor/qtty/%: ;
 
 $(BUILD_DIR)/situ/situ.o: $(SITU_DIR)/runtime/c/situ.c
 	@mkdir -p '$(@D)'
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(HOST_CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/test/%.o: test/%.c | $(GEN_HEADERS) $(AGENT_GEN) $(DISC_GEN) $(FRAME_GEN)
 	@mkdir -p '$(@D)'
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(HOST_CFLAGS) $(WARNINGS) $(DEPFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/test/sexpr_test: $(TEST_SEXPR_OBJS) $(SEXPR_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(HOST_CFLAGS) -o $@ $^
 
 $(BUILD_DIR)/test/framing_test: $(TEST_FRAMING_OBJS) $(AGENT_OBJS) $(SEXPR_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(HOST_CFLAGS) -o $@ $^
 
 $(BUILD_DIR)/test/spec_test: $(TEST_SPEC_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(HOST_CFLAGS) -o $@ $^
 
 $(BUILD_DIR)/test/matrix_test: $(TEST_MATRIX_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS) \
                               $(BUILD_DIR)/engine/sha256.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(HOST_CFLAGS) -o $@ $^
 
 $(BUILD_DIR)/test/registry_test: $(TEST_REGISTRY_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS) \
                               $(BUILD_DIR)/engine/sha256.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(HOST_CFLAGS) -o $@ $^
 
 $(BUILD_DIR)/test/plan_test: $(TEST_PLAN_OBJS) $(PLAN_OBJS) $(SPEC_OBJS) $(SEXPR_OBJS) \
                               $(BUILD_DIR)/engine/sha256.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(HOST_CFLAGS) -o $@ $^
 
 $(BUILD_DIR)/test/wire_test: $(TEST_WIRE_OBJS) $(WIRE_OBJS) $(SEXPR_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(HOST_CFLAGS) -o $@ $^
 
 $(BUILD_DIR)/test/idmap_test: $(TEST_IDMAP_OBJS) $(BUILD_DIR)/engine/idmap.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(HOST_CFLAGS) -o $@ $^
 
 $(BUILD_DIR)/test/sha256_test: $(TEST_SHA256_OBJS) $(BUILD_DIR)/engine/sha256.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(HOST_CFLAGS) -o $@ $^
 
 $(BUILD_DIR)/test/verity_test: $(TEST_VERITY_OBJS) $(BUILD_DIR)/engine/verity.o $(BUILD_DIR)/engine/sha256.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(HOST_CFLAGS) -o $@ $^
 
 $(BUILD_DIR)/test/tree_tar: $(TEST_TREE_OBJS) $(BUILD_DIR)/engine/tree.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(HOST_CFLAGS) -o $@ $^
 
 $(BUILD_DIR)/test/json_test: $(TEST_JSON_OBJS) $(BUILD_DIR)/oci/json.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(HOST_CFLAGS) -o $@ $^
 
 $(BUILD_DIR)/test/runtime_test: $(TEST_RUNTIME_OBJS) $(BUILD_DIR)/cli/runtime.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(HOST_CFLAGS) -o $@ $^
 
 $(BUILD_DIR)/test/segment_test: $(TEST_SEGMENT_OBJS) $(BUILD_DIR)/core/segment.o \
                                 $(GEN_DIR)/frame.o $(GEN_DIR)/frame_derived.o \
                                 $(BUILD_DIR)/situ/situ.o
-	$(CC) $(CFLAGS) -o $@ $^ -pthread
+	$(CC) $(HOST_CFLAGS) -o $@ $^ -pthread
 
 $(BUILD_DIR)/test/hostdev_test: $(TEST_HOSTDEV_OBJS) $(BUILD_DIR)/engine/hostdev.o
-	$(CC) $(CFLAGS) -o $@ $^ -pthread
+	$(CC) $(HOST_CFLAGS) -o $@ $^ -pthread
 
 $(BUILD_DIR)/test/take_test: $(TEST_TAKE_OBJS) $(BUILD_DIR)/engine/media.o $(BUILD_DIR)/engine/sha256.o
-	$(CC) $(CFLAGS) -o $@ $^ -pthread
+	$(CC) $(HOST_CFLAGS) -o $@ $^ -pthread
 
 $(BUILD_DIR)/test/iso_test: $(TEST_ISO_OBJS) $(BUILD_DIR)/engine/iso.o $(GEN_DIR)/disc.o \
                             $(BUILD_DIR)/situ/situ.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(HOST_CFLAGS) -o $@ $^
 
 -include $(SEXPR_OBJS:.o=.d) $(AGENT_OBJS:.o=.d) $(SPEC_OBJS:.o=.d) $(PLAN_OBJS:.o=.d) \
          $(ENGINE_OBJS:.o=.d) $(STORE_OBJS:.o=.d) $(OCI_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(CORE_OBJS:.o=.d) \
