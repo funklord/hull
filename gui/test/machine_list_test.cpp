@@ -199,5 +199,61 @@ int main(int argc, char **argv)
 		save_added({});
 		check(load_added().isEmpty(), "the list emptied");
 	}
+
+	/* A clone's hostname: the one form replaced, its quotes and
+	 * backslashes escaped; none, the text as it was; two, refused. */
+	{
+		const QString one = QStringLiteral("; a (comment)\n(machine (backend pc) (hostname \"winxp\")\n"
+		                                   "  (memory \"1G\"))\n");
+
+		check(with_hostname(one, QStringLiteral("winxp-clone")) ==
+		          QStringLiteral("; a (comment)\n(machine (backend pc) (hostname \"winxp-clone\")\n"
+		                         "  (memory \"1G\"))\n"),
+		      "a clone's hostname", with_hostname(one, QStringLiteral("winxp-clone")));
+		check(with_hostname(QStringLiteral("(machine (hostname \"a\\\"b\"))"), QStringLiteral("q\"r")) ==
+		          QStringLiteral("(machine (hostname \"q\\\"r\"))"),
+		      "an escaped hostname read and written",
+		      with_hostname(QStringLiteral("(machine (hostname \"a\\\"b\"))"), QStringLiteral("q\"r")));
+		check(with_hostname(QStringLiteral("(machine (backend pc))"), QStringLiteral("x")) ==
+		          QStringLiteral("(machine (backend pc))"),
+		      "no hostname, the folder's name serves");
+		check(with_hostname(QStringLiteral("(machines (a (hostname \"a\")) (b (hostname \"b\")))"),
+		                    QStringLiteral("x")).isEmpty(),
+		      "two hostnames refused");
+	}
+
+	/* The machines' home: each NAME/hull.conf found, in name order; one
+	 * added already, one removed, a folder with no hull.conf and a file
+	 * beside the folders passed over. */
+	{
+		const QString home = scratch + QStringLiteral("/home-hull");
+
+		for (const char *folder : { "b", "a", "added", "gone", "empty" })
+			QDir().mkpath(home + QLatin1Char('/') + QLatin1String(folder));
+		for (const char *folder : { "b", "a", "added", "gone" }) {
+			QFile conf(home + QLatin1Char('/') + QLatin1String(folder) +
+			           QStringLiteral("/hull.conf"));
+
+			conf.open(QIODevice::WriteOnly);
+		}
+		QFile stray(home + QStringLiteral("/hull.conf"));
+
+		stray.open(QIODevice::WriteOnly);
+		const QList<added_machine> found =
+		    found_in(home, { { home + QStringLiteral("/added/hull.conf"), QStringLiteral("db") } },
+		             { home + QStringLiteral("/gone/hull.conf") });
+
+		check(found.size() == 2 && found[0].file == home + QStringLiteral("/a/hull.conf") &&
+		          found[1].file == home + QStringLiteral("/b/hull.conf") && found[0].name.isEmpty(),
+		      "the home's machines found, the added and removed passed over",
+		      found.isEmpty() ? QString() : found[0].file);
+		check(found_in(scratch + QStringLiteral("/no-such-home"), {}, {}).isEmpty(),
+		      "no home, nothing found");
+		save_removed({ QStringLiteral("/h/x/hull.conf") });
+		check(load_removed() == QStringList{ QStringLiteral("/h/x/hull.conf") },
+		      "a removal remembered");
+		save_removed({});
+		check(load_removed().isEmpty(), "and forgotten");
+	}
 	return failures != 0;
 }

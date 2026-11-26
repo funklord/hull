@@ -32,7 +32,7 @@ export XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME
 export HULL_CORE_IDLE=1
 DOCKER_HOST=unix://$XDG_RUNTIME_DIR/no-docker.sock
 export DOCKER_HOST
-rm -rf "${dir:?}/config" "${dir:?}/rootfs" "${dir:?}/data" "${dir:?}/newm"
+rm -rf "${dir:?}/config" "${dir:?}/rootfs" "${dir:?}/data" "${dir:?}/newm" "${dir:?}/home"
 mkdir -p "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME" "$dir/rootfs"
 chmod 700 "$XDG_RUNTIME_DIR"
 cp "$probe" "$dir/rootfs/probe"
@@ -90,8 +90,12 @@ keys() {
 	out=$(tr -s ' ' < "$dir/screen.txt")
 }
 
+# HOME the test's, as for keys: the window lists ~/hull's machines, and
+# the user's own would be rows of every snapshot.
 snapshot() {
-	(cd "$dir" && timeout 60 "$gui" --hull "$hull" --tui --snapshot 110x26 "$@" 2>/dev/null)
+	mkdir -p "$dir/home"
+	(cd "$dir" && HOME=$dir/home timeout 60 "$gui" --hull "$hull" --tui --snapshot 110x26 "$@" \
+		2>/dev/null)
 }
 
 # A core of an earlier run gone first, as it goes a second after its
@@ -338,6 +342,14 @@ if command -v qemu-system-i386 > /dev/null 2>&1; then
 else
 	printf 'gui_test: no qemu-system-i386, Change Medium not tried\n'
 fi
+
+# A machine put in a folder of ~/hull by hand -- copied, or imported by
+# the CLI -- is listed when the window opens, nobody having added it.
+mkdir -p "$dir/home/hull/gui-found"
+printf '%s\n' '(machine (hostname "gui-found") (source "dir:../../../rootfs") (command "/probe"))' \
+	> "$dir/home/hull/gui-found/hull.conf"
+out=$(snapshot)
+has "$out" 'gui-found +stopped +chroot' "a machine in ~/hull listed unasked"
 
 rm -rf "${dir:?}/config" "${dir:?}/new" "${dir:?}/newm" "${dir:?}/data" "${dir:?}/screen.txt" \
 	"${dir:?}/wire.pcap" "${dir:?}/spin.img" "${dir:?}/swap.img" "${dir:?}/pc.conf" \

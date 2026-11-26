@@ -78,7 +78,9 @@ private:
 	void run_for(const QStringList &arguments, const QString &done);
 	void edit_spec();
 	void remove_machine();
+	void clone_machine();
 	void ask_add();
+	void ask_import();
 	void ask_new(const QString &source = QString());
 	void show_images();
 	void say(const QString &text);
@@ -107,7 +109,9 @@ private:
 	QTimer         *poll;
 	QAction        *new_action;
 	QAction        *add_action;
+	QAction        *import_action;
 	QAction        *remove_action;
+	QAction        *clone_action;
 	QAction        *start_action;
 	QAction        *stop_action;
 	QAction        *kill_action;

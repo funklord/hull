@@ -262,6 +262,36 @@ got=$?
 status 'a .vbox with its sound and a tablet boots' "$got" 0 "$out"
 says 'its VDI, beside a UHCI and its tablet' "$out" 'word: fresh'
 
+# Imported, as hull-gui's Import is: the .vbox copied into a folder of
+# its own, its VDI converted to qcow2 there and its hull.conf saying so,
+# changes kept in the copy; the copy boots, the VDI is as it was, a
+# second import into the folder and a file of no hypervisor's refused.
+before=$(sha256sum < "$root/vbox/old.vdi")
+out=$("$hull" import --machine "$root/vbox/av.vbox" "$root/imported" 2>&1)
+got=$?
+status 'a .vbox imported into a folder' "$got" 0 "$out"
+conf=$(cat "$root/imported/hull.conf" 2>&1)
+says 'its hull.conf names the copy' "$conf" '(medium (type disk) (source "image:./old.qcow2"))'
+says 'kept in place' "$conf" '(mutable direct)'
+says 'and its sound and tablet still' "$conf" '(sound ac97) (pointer tablet)'
+says 'the copy is a qcow2' "$(qemu-img info "$root/imported/old.qcow2" 2>&1)" 'file format: qcow2'
+out=$(timeout 120 "$hull" run -f "$root/imported/hull.conf" 2>&1)
+got=$?
+status 'the imported machine boots' "$got" 0 "$out"
+says 'from its copy' "$out" 'word: fresh'
+cases=$((cases + 1))
+[ "$(sha256sum < "$root/vbox/old.vdi")" = "$before" ] ||
+	fail 'the VDI imported from is unchanged' "$(qemu-img info "$root/vbox/old.vdi")"
+out=$("$hull" import --machine "$root/vbox/av.vbox" "$root/imported" 2>&1)
+got=$?
+status 'an import into a folder holding a machine is refused' "$got" 1 "$out"
+says 'and said' "$out" 'a machine is there already'
+out=$("$hull" import --machine "$root/imported/hull.conf" "$root/again" 2>&1)
+got=$?
+status 'a file of no hypervisor is refused' "$got" 2 "$out"
+cases=$((cases + 1))
+[ ! -e "$root/again" ] || fail 'and no folder made for it' "$(ls -la "$root/again")"
+
 # An appliance: its .ovf read as a pc machine, VirtualBox's export shape
 # -- a streamOptimized VMDK, an IDE controller, an E1000 -- and the .ova
 # around it unpacked once into the cache, then booted from there.

@@ -3,10 +3,13 @@
  * spec file each and the name of one of its machines where it holds
  * several, and those the core holds now, whoever started them.
  *
- * The added ones are the only thing saved, `QSettings` under
- * hull/hull-gui, and they are the user's choices: a file is listed
- * because somebody added it, never because it was found. A machine the
- * core holds is shown for as long as it does, saved by nobody.
+ * The added ones are saved, `QSettings` under hull/hull-gui, and they
+ * are the user's choices. The one place a file is found rather than
+ * added is the machines' home, ~/hull, as VirtualBox's manager shows the
+ * machines of its own folder: a NAME/hull.conf there is listed, and
+ * added, unless the user removed it from the list, which is remembered
+ * as that choice. A machine the core holds is shown for as long as it
+ * does, saved by nobody.
  */
 
 #ifndef HULL_GUI_MACHINE_LIST_H
@@ -35,6 +38,15 @@ QString machines_home();
 QList<added_machine> load_added();
 void                 save_added(const QList<added_machine> &list);
 
+/* The machines' home's files the user took off the list, by path. */
+QStringList load_removed();
+void        save_removed(const QStringList &files);
+
+/* Each HOME/NAME/hull.conf, in name order, neither in `added` nor in
+ * `removed`: the machines found in the home. */
+QList<added_machine> found_in(const QString &home, const QList<added_machine> &added,
+                              const QStringList &removed);
+
 /*
  * The id a run of `machine` gets, by the CLI's rule (cli/hull.c,
  * machine_id()): its name where given, else its hostname, else its file's
@@ -42,6 +54,12 @@ void                 save_added(const QList<added_machine> &list);
  * "" where it has none. "" where nothing is left of any.
  */
 QString machine_id_of(const added_machine &machine, const QString &hostname);
+
+/* A clone's hull.conf: `text` with its one `(hostname "...")` saying
+ * `hostname`, so the copy's id is not the original's; `text` as it is
+ * where it names none, its id then its folder's. "" where it names more
+ * than one, a file of several machines, which Clone does not copy. */
+QString with_hostname(const QString &text, const QString &hostname);
 
 /* The hostname a `hull plan --resolved` line says, "" where none. */
 QString hostname_in(const QString &resolved);

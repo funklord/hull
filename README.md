@@ -487,7 +487,7 @@ and installing from a disc then booting the disk is one changed line.
 | | |
 |---|---|
 | Boots | `media:cdrom`, `media:disk`, `media:floppy`, or `image:./old.vmdk` attached as it came |
-| Other hypervisors' machines | `hull run -f Old.vmx`, `-f Old.vbox`, or an exported `-f Box.ova` or `.ovf`, runs a VMware or VirtualBox machine from its own file: memory, processors, firmware, TPM, network card and every disk and disc where it attached them, what cannot be carried said; `hull plan --resolved -f` prints the spec to keep |
+| Other hypervisors' machines | `hull run -f Old.vmx`, `-f Old.vbox`, or an exported `-f Box.ova` or `.ovf`, runs a VMware or VirtualBox machine from its own file: memory, processors, firmware, TPM, network card and every disk and disc where it attached them, what cannot be carried said; `hull plan --resolved -f` prints the spec to keep, and `hull import --machine Old.vbox ~/hull/old` copies it into a folder of hull's own, its disks converted to qcow2 |
 | And back | `hull export --bootable -f hull.conf box.ova` writes a machine's tree as an appliance VirtualBox and VMware import, booting by BIOS (`make limine` once) |
 | Media | an `image:` file (raw, qcow2, vmdk, vhd, vhdx, vdi), or a `dir:` collection of `hull media import`, its hash checked; a disk's served from its files, no image made |
 | Writes | thrown away with the machine by default; `(mutable direct)` writes the image, or a collection's files: what the guest wrote is taken into them each time it pauses, only the MiB it touched read again |

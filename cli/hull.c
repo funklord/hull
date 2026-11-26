@@ -167,6 +167,7 @@ static void usage(FILE *out)
 	      "       hull load FILE [REF]\n"
 	      "       hull import [--build-arg N=V]... [--target STAGE] DOCKERFILE\n"
 	      "       hull import COMPOSE-FILE | hull import IMAGE DIR\n"
+	      "       hull import --machine X.vbox|X.vmx|X.ovf|X.ova DIR\n"
 	      "       hull media import IMAGE DIR | verify DIR | export DIR IMAGE\n"
 	      "       hull media change ID DRIVE [IMAGE]\n"
 	      "       hull disk write FILE DEVICE|IMAGE\n"
@@ -9277,6 +9278,14 @@ int main(int argc, char **argv)
 	if ((strcmp(command, "media") == 0 && argc == 5 && strcmp(argv[2], "import") == 0) ||
 	    (strcmp(command, "import") == 0 && argc == 4))
 		return media_import(argv[argc - 2], argv[argc - 1]);
+	if (strcmp(command, "import") == 0 && argc == 5 && strcmp(argv[2], "--machine") == 0) {
+		if (!hull_vmconf_is_file(argv[3])) {
+			fprintf(stderr, "hull: import --machine takes a .vbox, .vmx, .ovf or .ova, "
+			        "not %s\n", argv[3]);
+			return 2;
+		}
+		return hull_vmconf_import(argv[3], argv[4], stderr) == 0 ? 0 : 1;
+	}
 	if (strcmp(command, "import") == 0 && argc >= 5 && strncmp(argv[2], "--", 2u) == 0)
 		return import_flags(argc, argv);
 	if (strcmp(command, "import") == 0 && argc == 3)

@@ -17,6 +17,7 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stddef.h>
@@ -60,6 +61,7 @@ typedef struct machine {
 	medium      media[MAX_MEDIA];
 	unsigned    media_count;
 	const char *base;       /* where an .ova's files were unpacked, or NULL */
+	int         direct;     /* imported: its own copies, written in place */
 	int         failed;
 } machine;
 
@@ -1141,7 +1143,12 @@ static char *write_form(machine *m)
 		fprintf(out, " (sound %s)", m->sound);
 	if (m->tablet)
 		fputs(" (pointer tablet)", out);
-	fputs(")))\n", out);
+	fputs("))", out);
+	/* An imported machine's disks are its own copies, so its changes are
+	 * kept in them, as its hypervisor kept them. */
+	if (m->direct)
+		fputs("\n  (mutable direct)", out);
+	fputs(")\n", out);
 	if (fclose(out) != 0) {
 		free(text);
 		return NULL;
@@ -1159,20 +1166,20 @@ int hull_vmconf_is_file(const char *path)
 	       (n > 5u && strcasecmp(path + n - 5u, ".vbox") == 0);
 }
 
-char *hull_vmconf_form(const char *path, FILE *notes)
+/* The machine file at `path` read into a new machine, `unpacked` its
+ * appliance's directory where it is an .ova; NULL, having said why. */
+static machine *read_machine(const char *path, FILE *notes, char *unpacked)
 {
 	machine *m = calloc(1u, sizeof *m);
 	char    *text = NULL;
-	char    *form = NULL;
 	size_t   n = strlen(path);
-	char     unpacked[PATH_MAX];
 	char     descriptor[PATH_MAX + 300];
 	int      appliance = n > 4u && strcasecmp(path + n - 4u, ".ova") == 0;
 
 	/* An appliance's files unpacked once, and its .ovf read there, its
 	 * images by their paths in the cache. */
 	if (appliance) {
-		if (m == NULL || unpack_ova(path, unpacked, sizeof unpacked) != 0) {
+		if (m == NULL || unpack_ova(path, unpacked, PATH_MAX) != 0) {
 			free(m);
 			return NULL;
 		}
@@ -1199,16 +1206,145 @@ char *hull_vmconf_form(const char *path, FILE *notes)
 		read_ovf(m, text);
 	else
 		read_vmx(m, text);
+	free(text);
 	if (!m->failed && m->media_count == 0u)
 		refuse(m, "names no disk or disc image a machine could boot from");
 	if (!m->failed && m->tpm)
 		note(m, "its TPM's keys stay with its own hypervisor: swtpm's TPM starts empty, so what "
 		        "the guest sealed to it, BitLocker's key say, is not there");
-	if (!m->failed && (form = write_form(m)) == NULL)
+	if (m->failed) {
+		free(m);
+		return NULL;
+	}
+	return m;
+}
+
+char *hull_vmconf_form(const char *path, FILE *notes)
+{
+	char     unpacked[PATH_MAX];
+	machine *m = read_machine(path, notes, unpacked);
+	char    *form;
+
+	if (m == NULL)
+		return NULL;
+	if ((form = write_form(m)) == NULL)
 		fprintf(stderr, "%s: out of memory\n", path);
-	free(text);
 	free(m);
 	return form;
+}
+
+/* `name`'s last component with its extension replaced by `.qcow2`, unique
+ * among the first `count` of `taken`, into `out`. */
+static void copy_name(const char *path, char taken[][256], unsigned count, char *out, size_t cap)
+{
+	const char *base = strrchr(path, '/') != NULL ? strrchr(path, '/') + 1 : path;
+	char        stem[200];
+	char       *dot;
+
+	snprintf(stem, sizeof stem, "%.190s", base);
+	if ((dot = strrchr(stem, '.')) != NULL && dot != stem)
+		*dot = '\0';
+	snprintf(out, cap, "%s.qcow2", stem);
+	for (unsigned n = 2u, i = 0u; i < count; i++)
+		if (strcmp(taken[i], out) == 0) {
+			snprintf(out, cap, "%s-%u.qcow2", stem, n++);
+			i = (unsigned)-1;
+		}
+}
+
+int hull_vmconf_import(const char *path, const char *dir, FILE *notes)
+{
+	char        unpacked[PATH_MAX];
+	char        from[PATH_MAX];
+	char        conf[PATH_MAX + 16];
+	char        taken[MAX_MEDIA][256];
+	unsigned    copies = 0u;
+	machine    *m;
+	char       *form = NULL;
+	char       *slash;
+	FILE       *out;
+	int         fd;
+	int         status = 1;
+
+	/* The file's own directory, which its relative image paths are from. */
+	if (realpath(path, from) == NULL) {
+		perror(path);
+		return 1;
+	}
+	if ((slash = strrchr(from, '/')) != NULL)
+		*slash = '\0';
+	if (mkdir(dir, 0777) != 0 && errno != EEXIST) {
+		perror(dir);
+		return 1;
+	}
+	snprintf(conf, sizeof conf, "%s/hull.conf", dir);
+	if (access(conf, F_OK) == 0) {
+		fprintf(stderr, "%s: a machine is there already; import into another folder\n", conf);
+		return 1;
+	}
+	if ((m = read_machine(path, notes, unpacked)) == NULL)
+		return 1;
+	for (unsigned i = 0u; i < m->media_count; i++) {
+		medium *d = &m->media[i];
+		char    source[sizeof d->path];
+		char    target[PATH_MAX + 300];
+
+		if ((size_t)snprintf(source, sizeof source, "%s%s%s", d->path[0] == '/' ? "" : from,
+		                     d->path[0] == '/' ? "" : "/", d->path) >= sizeof source) {
+			fprintf(stderr, "%s: the path of %s is too long\n", path, d->path);
+			goto done;
+		}
+		/* A disc or floppy is read, not written: it stays where it is,
+		 * named by its whole path. */
+		if (strcmp(d->type, "disk") != 0) {
+			memcpy(d->path, source, sizeof d->path);
+			continue;
+		}
+		copy_name(source, taken, copies, taken[copies], sizeof taken[copies]);
+		snprintf(target, sizeof target, "%s/%s", dir, taken[copies]);
+		fprintf(stderr, "%s: converting %s to %s\n", path, source, target);
+		{
+			const char *const argv[] = { "qemu-img", "convert", "-O", "qcow2", source, target,
+			                             NULL };
+
+			if (run_tool(argv) != 0) {
+				fprintf(stderr, "%s: qemu-img could not convert %s\n", path, source);
+				unlink(target);
+				goto done;
+			}
+		}
+		snprintf(d->path, sizeof d->path, "./%s", taken[copies]);
+		copies++;
+	}
+	m->direct = 1;
+	if ((form = write_form(m)) == NULL) {
+		fprintf(stderr, "%s: out of memory\n", path);
+		goto done;
+	}
+	if ((fd = open(conf, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666)) < 0 ||
+	    (out = fdopen(fd, "w")) == NULL) {
+		perror(conf);
+		goto done;
+	}
+	fprintf(out, "; Imported by `hull import --machine` from %s; its disks converted to\n"
+	        "; qcow2 beside this file, where its changes are kept.\n", path);
+	fputs(form, out);
+	if (fclose(out) != 0) {
+		perror(conf);
+		goto done;
+	}
+	status = 0;
+done:
+	/* A failed import leaves nothing of its own in the folder. */
+	for (unsigned i = 0u; status != 0 && i < copies; i++) {
+		char made[PATH_MAX + 300];
+
+		snprintf(made, sizeof made, "%s/%s", dir, taken[i]);
+		unlink(made);
+	}
+	free(form);
+	free(m);
+	return status;
 }
 
 /* Where unpacked appliances are kept, into `out`; 0, or -1. */

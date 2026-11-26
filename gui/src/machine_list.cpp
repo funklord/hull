@@ -57,6 +57,69 @@ void save_added(const QList<added_machine> &list)
 	s.sync();
 }
 
+QString with_hostname(const QString &text, const QString &hostname)
+{
+	static const QRegularExpression form(QStringLiteral("\\(hostname\\s+\"(?:[^\"\\\\]|\\\\.)*\"\\)"));
+	QRegularExpressionMatchIterator it = form.globalMatch(text);
+	QRegularExpressionMatch         first;
+	int                             count = 0;
+	QString                         escaped = hostname;
+
+	while (it.hasNext()) {
+		QRegularExpressionMatch match = it.next();
+
+		if (count++ == 0)
+			first = match;
+	}
+	if (count == 0)
+		return text;
+	if (count > 1)
+		return QString();
+	escaped.replace(QLatin1Char('\\'), QStringLiteral("\\\\"));
+	escaped.replace(QLatin1Char('"'), QStringLiteral("\\\""));
+	return QString(text).replace(first.capturedStart(), first.capturedLength(),
+	                             QStringLiteral("(hostname \"%1\")").arg(escaped));
+}
+
+QStringList load_removed()
+{
+	return settings().value(QStringLiteral("removed")).toStringList();
+}
+
+void save_removed(const QStringList &files)
+{
+	QSettings &s = settings();
+
+	if (files.isEmpty())
+		s.remove(QStringLiteral("removed"));
+	else
+		s.setValue(QStringLiteral("removed"), files);
+	s.sync();
+}
+
+QList<added_machine> found_in(const QString &home, const QList<added_machine> &added,
+                              const QStringList &removed)
+{
+	QList<added_machine> found;
+	const QStringList    folders = QDir(home).entryList(QDir::Dirs | QDir::NoDotAndDotDot,
+	                                                    QDir::Name);
+
+	for (const QString &folder : folders) {
+		added_machine machine;
+		bool          listed = false;
+
+		machine.file = QDir(home).absoluteFilePath(folder + QStringLiteral("/hull.conf"));
+		if (!QFileInfo(machine.file).isFile() || removed.contains(machine.file))
+			continue;
+		/* Listed already under any of its machines' names. */
+		for (const added_machine &a : added)
+			listed = listed || a.file == machine.file;
+		if (!listed)
+			found.append(machine);
+	}
+	return found;
+}
+
 QString machine_id_of(const added_machine &machine, const QString &hostname)
 {
 	QString from = machine.name;

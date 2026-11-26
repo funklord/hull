@@ -29,6 +29,7 @@
 #include <QDesktopServices>
 #include <QUrl>
 #include <QDir>
+#include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFontDatabase>
@@ -67,6 +68,14 @@
 
 /* Under qtty there is no window system: a file dialog of icons and a
  * mouse is the wrong question to put on a terminal, so a path is asked. */
+/* Whether `file` is a machine's hull.conf in a folder of its own in the
+ * machines' home, as New, Import and Clone make. */
+static bool in_own_folder(const QString &file)
+{
+	return !file.isEmpty() && QFileInfo(file).fileName() == QStringLiteral("hull.conf") &&
+	       QFileInfo(QFileInfo(file).absolutePath()).absolutePath() == machines_home();
+}
+
 static bool on_terminal()
 {
 	return QGuiApplication::platformName() == QStringLiteral("offscreen");
@@ -119,6 +128,17 @@ main_window::main_window(const QString &hull_program, QWidget *parent)
 
 	build_actions();
 
+	/* The machines' home's folders join the list, as VirtualBox's own
+	 * folder's machines are in its manager. */
+	{
+		QList<added_machine>       added = load_added();
+		const QList<added_machine> found = found_in(machines_home(), added, load_removed());
+
+		if (!found.isEmpty()) {
+			added.append(found);
+			save_added(added);
+		}
+	}
 	for (const added_machine &machine : load_added()) {
 		row r;
 
@@ -170,11 +190,20 @@ void main_window::build_actions()
 	add_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+O")));
 	add_action->setToolTip(QStringLiteral("Add a machine's hull.conf to the list"));
 	connect(add_action, &QAction::triggered, this, &main_window::ask_add);
+	import_action = new QAction(QStringLiteral("Import..."), this);
+	import_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+I")));
+	import_action->setToolTip(QStringLiteral("Copy a VirtualBox or VMware machine or an "
+	                                         "appliance into a folder of its own in ~/hull"));
+	connect(import_action, &QAction::triggered, this, &main_window::ask_import);
 	edit_action = new QAction(QStringLiteral("Edit hull.conf"), this);
 	edit_action->setShortcut(QKeySequence(QStringLiteral("F4")));
 	edit_action->setToolTip(QStringLiteral("The machine's file in an editor, planned again after"));
 	connect(edit_action, &QAction::triggered, this, &main_window::edit_spec);
-	remove_action = new QAction(QStringLiteral("Remove from List"), this);
+	clone_action = new QAction(QStringLiteral("Clone..."), this);
+	clone_action->setToolTip(QStringLiteral("Copy a machine in ~/hull, its disks with it, "
+	                                        "into a folder of its own"));
+	connect(clone_action, &QAction::triggered, this, &main_window::clone_machine);
+	remove_action = new QAction(QStringLiteral("Remove..."), this);
 	connect(remove_action, &QAction::triggered, this, &main_window::remove_machine);
 	start_action = new QAction(QStringLiteral("Start"), this);
 	start_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+S")));
@@ -239,7 +268,9 @@ void main_window::build_actions()
 	QMenu *machine = menuBar()->addMenu(QStringLiteral("&Machine"));
 	machine->addAction(new_action);
 	machine->addAction(add_action);
+	machine->addAction(import_action);
 	machine->addAction(edit_action);
+	machine->addAction(clone_action);
 	machine->addAction(remove_action);
 	machine->addSeparator();
 	machine->addAction(start_action);
@@ -555,6 +586,8 @@ void main_window::update_actions()
 	const bool held = state == QStringLiteral("running") || state == QStringLiteral("paused");
 
 	remove_action->setEnabled(any && !rows[i].added.file.isEmpty());
+	clone_action->setEnabled(any && in_own_folder(rows[i].added.file) &&
+	                         rows[i].added.name.isEmpty() && !held && rows[i].run == nullptr);
 	edit_action->setEnabled(any && !rows[i].added.file.isEmpty());
 	/* An exited machine the core still lists is started again: the core
 	 * takes a new run of the id beside it, as `hull run` does. */
@@ -725,6 +758,13 @@ void main_window::add_machine(const QString &given, const QString &name)
 	QList<added_machine> added = load_added();
 	QStringList names;
 
+	/* Added again after being taken off: no longer a removal to keep. */
+	{
+		QStringList removed = load_removed();
+
+		if (removed.removeAll(file) > 0)
+			save_removed(removed);
+	}
 	if (name.isEmpty()) {
 		/* A file of (machines ...) is one row each, as `hull plan` names
 		 * them: "FILE: NAME on ENGINE (CLASS): ok". */
@@ -806,6 +846,85 @@ void main_window::ask_add()
 	add_machine(file, QString());
 }
 
+/* Import, as VirtualBox's Import Appliance: another hypervisor's machine
+ * copied into ~/hull/NAME by `hull import --machine`, its disks converted
+ * to qcow2 there, then added. Add runs such a file where it stands;
+ * Import gives hull its own copy. The conversion can take minutes, so
+ * the CLI runs beside the window and what it says is the status line. */
+void main_window::ask_import()
+{
+	QString file;
+	bool    given = false;
+
+	if (on_terminal()) {
+		file = QInputDialog::getText(this, QStringLiteral("Import Machine"),
+		                             QStringLiteral("A .vbox, .vmx, .ovf or .ova:"),
+		                             QLineEdit::Normal, QString(), &given);
+		if (!given)
+			return;
+	} else {
+		file = QFileDialog::getOpenFileName(this, QStringLiteral("Import Machine"),
+		                                    QDir::homePath(),
+		                                    QStringLiteral("Virtual machines (*.vbox *.vmx *.ovf "
+		                                                   "*.ova);;All files (*)"));
+	}
+	if (file.isEmpty())
+		return;
+	if (!QFileInfo(file).isFile()) {
+		say(QStringLiteral("%1: no such file").arg(file));
+		return;
+	}
+	/* The folder named as the machine's file is, which for VirtualBox and
+	 * VMware is the machine's own name. */
+	const QString name = QInputDialog::getText(this, QStringLiteral("Import Machine"),
+	                                           QStringLiteral("Its folder in %1:")
+	                                               .arg(machines_home()),
+	                                           QLineEdit::Normal,
+	                                           QFileInfo(file).completeBaseName(), &given)
+	                         .trimmed();
+
+	if (!given || name.isEmpty())
+		return;
+	if (name.contains(QLatin1Char('/')) || name == QStringLiteral(".") ||
+	    name == QStringLiteral("..")) {
+		say(QStringLiteral("%1: a folder's name, not a path").arg(name));
+		return;
+	}
+	const QString dir = machines_home() + QLatin1Char('/') + name;
+
+	if (QFileInfo::exists(dir + QStringLiteral("/hull.conf"))) {
+		say(QStringLiteral("%1 holds a machine already").arg(dir));
+		return;
+	}
+	QDir().mkpath(machines_home());
+
+	QProcess *import = new QProcess(this);
+
+	import->setStandardInputFile(QProcess::nullDevice());
+	import->setProcessChannelMode(QProcess::MergedChannels);
+	connect(import, &QProcess::readyRead, this, [this, import]() {
+		const QList<QByteArray> lines = import->readAll().trimmed().split('\n');
+
+		if (!lines.isEmpty())
+			say(QString::fromUtf8(lines.last()));
+		import->setProperty("said", QString::fromUtf8(lines.last()));
+	});
+	connect(import, &QProcess::finished, this, [this, import, dir, name](int code,
+	                                                                     QProcess::ExitStatus how) {
+		import->deleteLater();
+		if (how != QProcess::NormalExit || code != 0) {
+			QMessageBox::warning(this, QStringLiteral("Import Machine"),
+			                     QStringLiteral("%1 was not imported: %2")
+			                         .arg(name, import->property("said").toString()));
+			return;
+		}
+		add_machine(dir + QStringLiteral("/hull.conf"), QString());
+		say(QStringLiteral("imported into %1").arg(dir));
+	});
+	say(QStringLiteral("importing %1 into %2").arg(file, dir));
+	import->start(hull, { QStringLiteral("import"), QStringLiteral("--machine"), file, dir });
+}
+
 /* New: the store's refs offered as sources, `hull images`' first column,
  * then the file the dialog wrote added as any other. */
 void main_window::show_images()
@@ -841,16 +960,137 @@ void main_window::ask_new(const QString &source)
 	}
 }
 
+/* Clone, VirtualBox's full clone: the machine's folder in ~/hull copied
+ * whole, its disks with it -- reflinked where the filesystem can, so a
+ * clone costs nothing until it writes -- its hostname the clone's name,
+ * so the two have different ids and both can run, then added. A copy
+ * runs beside the window, a disk taking minutes. */
+void main_window::clone_machine()
+{
+	const int i = current();
+
+	if (i < 0 || i >= rows.size() || !in_own_folder(rows[i].added.file))
+		return;
+	const QString from = QFileInfo(rows[i].added.file).absolutePath();
+	bool          given = false;
+	const QString name = QInputDialog::getText(this, QStringLiteral("Clone Machine"),
+	                                           QStringLiteral("The clone's name, its folder "
+	                                                          "in %1:").arg(machines_home()),
+	                                           QLineEdit::Normal,
+	                                           QFileInfo(from).fileName() +
+	                                               QStringLiteral("-clone"), &given)
+	                         .trimmed();
+
+	if (!given || name.isEmpty())
+		return;
+	if (name.contains(QLatin1Char('/')) || name == QStringLiteral(".") ||
+	    name == QStringLiteral("..")) {
+		say(QStringLiteral("%1: a folder's name, not a path").arg(name));
+		return;
+	}
+	const QString to = machines_home() + QLatin1Char('/') + name;
+	QFile         original(rows[i].added.file);
+	QString       text;
+
+	if (QFileInfo::exists(to)) {
+		say(QStringLiteral("%1 is there already").arg(to));
+		return;
+	}
+	if (!original.open(QIODevice::ReadOnly)) {
+		say(QStringLiteral("%1 cannot be read").arg(original.fileName()));
+		return;
+	}
+	text = with_hostname(QString::fromUtf8(original.readAll()), name);
+	if (text.isEmpty()) {
+		say(QStringLiteral("%1 names several hostnames, so its clone's cannot be chosen; "
+		                   "copy it by hand").arg(original.fileName()));
+		return;
+	}
+
+	QProcess *copy = new QProcess(this);
+
+	copy->setStandardInputFile(QProcess::nullDevice());
+	copy->setProcessChannelMode(QProcess::MergedChannels);
+	connect(copy, &QProcess::finished, this, [this, copy, to, text](int code,
+	                                                               QProcess::ExitStatus how) {
+		const QString said = QString::fromUtf8(copy->readAll()).trimmed();
+		QFile         conf(to + QStringLiteral("/hull.conf"));
+
+		copy->deleteLater();
+		if (how != QProcess::NormalExit || code != 0) {
+			QMessageBox::warning(this, QStringLiteral("Clone Machine"),
+			                     QStringLiteral("The copy into %1 failed: %2").arg(to, said));
+			return;
+		}
+		if (!conf.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+		    conf.write(text.toUtf8()) < 0 || !conf.flush()) {
+			say(QStringLiteral("%1 could not be written").arg(conf.fileName()));
+			return;
+		}
+		conf.close();
+		add_machine(conf.fileName(), QString());
+		say(QStringLiteral("cloned into %1").arg(to));
+	});
+	say(QStringLiteral("cloning %1 into %2").arg(from, to));
+	/* --no-target-directory: `to` is the copy, never a folder inside it. */
+	copy->start(QStringLiteral("cp"), { QStringLiteral("-a"), QStringLiteral("--reflink=auto"),
+	                                    QStringLiteral("--no-target-directory"), from, to });
+}
+
 void main_window::remove_machine()
 {
 	const int i = current();
 
 	if (i < 0 || i >= rows.size() || rows[i].added.file.isEmpty())
 		return;
+	const QString file = rows[i].added.file;
+	const QString folder = QFileInfo(file).absolutePath();
+	/* A machine in a folder of its own in the home, as New and Import
+	 * make: VirtualBox's question, its files kept or deleted. Deleted is
+	 * to the desktop's trash, which gives them back. */
+	const bool own_folder = in_own_folder(file);
+	bool       deleted = false;
+
+	if (own_folder) {
+		QMessageBox ask(QMessageBox::Question, QStringLiteral("Remove Machine"),
+		                QStringLiteral("Remove %1 from the list, or delete its folder, %2, "
+		                               "with its disks?")
+		                    .arg(rows[i].id, folder),
+		                QMessageBox::Cancel, this);
+		QPushButton *remove_only = ask.addButton(QStringLiteral("Remove Only"),
+		                                         QMessageBox::AcceptRole);
+		QPushButton *delete_all = ask.addButton(QStringLiteral("Delete All Files"),
+		                                        QMessageBox::DestructiveRole);
+
+		ask.setDefaultButton(remove_only);
+		ask.exec();
+		if (ask.clickedButton() == delete_all) {
+			if (rows[i].run != nullptr || rows[i].is_held) {
+				say(QStringLiteral("%1 is running: stop it before deleting its files")
+				        .arg(rows[i].id));
+				return;
+			}
+			if (!QFile::moveToTrash(folder)) {
+				say(QStringLiteral("%1 could not be moved to the trash").arg(folder));
+				return;
+			}
+			deleted = true;
+		} else if (ask.clickedButton() != remove_only) {
+			return;
+		}
+	}
 	QList<added_machine> added = load_added();
 
 	added.removeAll(rows[i].added);
 	save_added(added);
+	/* Kept, it would be found again at the next start: the choice is
+	 * remembered, as the file's own removal does by itself. */
+	if (own_folder && !deleted) {
+		QStringList removed = load_removed();
+
+		if (!removed.contains(file))
+			save_removed(removed << file);
+	}
 	if (rows[i].run != nullptr || rows[i].is_held) {
 		/* Still running: the core's row it stays, until it ends. */
 		rows[i].added = added_machine();

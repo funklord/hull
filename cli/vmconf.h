@@ -20,6 +20,13 @@ int hull_vmconf_is_file(const char *path);
  * why, where the file cannot be read or names what qemu cannot run. */
 char *hull_vmconf_form(const char *path, FILE *notes);
 
+/* `hull import --machine PATH DIR`: the machine file at `path` copied
+ * into the folder `dir`, made where absent: each disk converted to qcow2
+ * beside DIR/hull.conf, which says the machine with its disks there and
+ * (mutable direct); a disc or floppy named where it is. 0, or 1 having
+ * said why; a folder already holding a hull.conf is refused. */
+int hull_vmconf_import(const char *path, const char *dir, FILE *notes);
+
 /* `hull gc`'s part: each appliance an .ova was unpacked into the cache
  * for, whose .ova is no longer there as it was, removed, and one left
  * half unpacked a day ago. How many into `removed`; 0, or -1 with `why`. */
