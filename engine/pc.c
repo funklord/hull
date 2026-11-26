@@ -300,6 +300,33 @@ static int has_second_uart(const hull_machine *m)
 	return b != NULL && strncmp(b->emulator, "qemu-", 5u) == 0;
 }
 
+/* Whether the machine is a PowerPC Mac -- mac99, a G4 as Mac OS X 10.x
+ * ran on, or g3beige -- on qemu-system-ppc under TCG, OpenBIOS its
+ * firmware, rather than a PC. */
+static int is_mac(const char *machine_type)
+{
+	return machine_type != NULL &&
+	       (strcmp(machine_type, "mac99") == 0 || strcmp(machine_type, "g3beige") == 0);
+}
+
+/* qemu-system-ppc, Debian's where installed, else the package `make
+ * qemu-ppc` unpacks into the user's cache, as a ppc64le vm finds it
+ * (engine/qemu.c). 0, or -1 where neither is there. */
+static int mac_emulator(char *out, size_t cap)
+{
+	const char *cache = getenv("XDG_CACHE_HOME");
+	const char *home = getenv("HOME");
+
+	snprintf(out, cap, "/usr/bin/qemu-system-ppc");
+	if (access(out, X_OK) == 0)
+		return 0;
+	if (cache != NULL && cache[0] == '/')
+		snprintf(out, cap, "%s/hull/qemu-system-ppc/usr/bin/qemu-system-ppc", cache);
+	else if (home != NULL && home[0] == '/')
+		snprintf(out, cap, "%s/.cache/hull/qemu-system-ppc/usr/bin/qemu-system-ppc", home);
+	return access(out, X_OK) == 0 ? 0 : -1;
+}
+
 static const hull_host_ops *host;
 
 static hull_status fail(hull_error *error, hull_status code, const char *detail)
@@ -1576,6 +1603,15 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 	}
 	if (m->vnc && m->address[0] == '\0')
 		return "the plan gives (display vnc) no address";
+	/* A PowerPC Mac: OpenBIOS its firmware, its parts a G4's or a G3's,
+	 * none of a PC's. */
+	if (is_mac(m->machine_type)) {
+		if (m->cpu != NULL || m->smc != NULL || m->tpm || m->firmware != NULL || m->secure)
+			return "a PowerPC Mac's processor and firmware are its own, OpenBIOS: no (cpu ...), "
+			       "(smc ...), (tpm ...) or (firmware ...)";
+		if (m->sound != NULL || m->gpu != 0)
+			return "a PowerPC Mac here has no sound card or 3D of qemu's";
+	}
 	/* (gpu virgl|venus): the display card is virtio-vga-gl, a VGA card
 	 * for the firmware and the boot, and the host's GPU behind it for a
 	 * guest with Mesa's virgl or Venus driver, as on a vm (section 5). */
@@ -1589,6 +1625,9 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 	for (unsigned i = 0u; m->box && i < m->media_count; i++)
 		if (m->media[i].type == 'u')
 			return "86Box is given no USB stick here: its media are IDE disks, a CD and floppies";
+	for (unsigned i = 0u; is_mac(m->machine_type) && i < m->media_count; i++)
+		if (m->media[i].type == 'f')
+			return "a PowerPC Mac has no floppy drive: its media are IDE disks and CDs";
 	for (unsigned i = 0u; i < m->media_count; i++)
 		if (m->media[i].type == wanted)
 			return NULL;
@@ -1832,12 +1871,20 @@ static void exec_pc(const hull_machine *m)
 	char     boot[16];
 	const char *accel = m->accel != NULL ? m->accel : "auto";
 
+	static __thread char mac_qemu[4200];
+	const int            mac = is_mac(m->machine_type);
+
 	if (strcmp(accel, "auto") == 0)
-		accel = access("/dev/kvm", R_OK | W_OK) == 0 ? "kvm" : "tcg";
-	snprintf(machine, sizeof machine, "%s,accel=%s%s",
-	         m->machine_type != NULL ? m->machine_type : "pc", accel, m->secure ? ",smm=on" : "");
+		accel = access("/dev/kvm", R_OK | W_OK) == 0 && !mac ? "kvm" : "tcg";
+	/* A Mac's: its PMU's ADB keyboard and mouse, as Mac OS X expects. */
+	snprintf(machine, sizeof machine, "%s%s,accel=%s%s",
+	         m->machine_type != NULL ? m->machine_type : "pc",
+	         mac && strcmp(m->machine_type, "mac99") == 0 ? ",via=pmu" : "", accel,
+	         m->secure ? ",smm=on" : "");
 	snprintf(boot, sizeof boot, "order=%c", m->boot);
-	argv[n++] = "qemu-system-x86_64";
+	if (mac && mac_emulator(mac_qemu, sizeof mac_qemu) != 0)
+		return;
+	argv[n++] = mac ? mac_qemu : "qemu-system-x86_64";
 	argv[n++] = "-nodefaults";
 	argv[n++] = "-no-user-config";
 	argv[n++] = "-machine";
@@ -1952,7 +1999,7 @@ static void exec_pc(const hull_machine *m)
 	 * is on its xHCI, above. */
 	if (m->tablet && m->smc == NULL) {
 		argv[n++] = "-device";
-		argv[n++] = "piix3-usb-uhci,id=pointer";
+		argv[n++] = mac ? "pci-ohci,id=pointer" : "piix3-usb-uhci,id=pointer";
 		argv[n++] = "-device";
 		argv[n++] = "usb-tablet,bus=pointer.0";
 	}
@@ -2053,7 +2100,8 @@ static void exec_pc(const hull_machine *m)
 
 		if (nic == NULL)
 			return;
-		at = (size_t)snprintf(nic, cap, "user,model=%s", m->nic != NULL ? m->nic : "ne2k_pci");
+		at = (size_t)snprintf(nic, cap, "user,model=%s", m->nic != NULL ? m->nic :
+		                      mac && strcmp(m->machine_type, "mac99") == 0 ? "sungem" : "ne2k_pci");
 		for (unsigned i = 0u; i < m->port_count; i++)
 			at += (size_t)snprintf(nic + at, cap - at, ",hostfwd=%s:%s:%u-:%u",
 			                       m->port_udp[i] ? "udp" : "tcp", m->address, m->port_host[i],
@@ -2442,6 +2490,16 @@ static int launch(hull_machine *m)
 	}
 	if (m->smc != NULL && read_osk(m) != 0)
 		return -1;
+	if (is_mac(m->machine_type)) {
+		char emulator[4200];
+
+		if (mac_emulator(emulator, sizeof emulator) != 0) {
+			snprintf(m->why, sizeof m->why, "a PowerPC Mac runs under qemu-system-ppc, Debian's "
+			         "qemu-system-ppc, which is not installed: `make qemu-ppc` unpacks it into "
+			         "the user's cache\n");
+			return -1;
+		}
+	}
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, in) != 0 ||
 	    socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, monitor) != 0) {
 		snprintf(m->why, sizeof m->why, "a socket for the machine could not be made\n");
@@ -3586,6 +3644,13 @@ static const hull_cap_entry entries[] = {
 	{ "pc.machine.pc", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.machine.q35", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.machine.isapc", HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.machine.mac99", HULL_SUP_EMULATED,
+	  "a PowerPC G4 Mac, as Mac OS X 10.x ran on, OpenBIOS its firmware, its keyboard and mouse "
+	  "on ADB, a sungem card unless (nic ...) says otherwise: qemu-system-ppc under TCG, `make "
+	  "qemu-ppc`'s where Debian's is not installed", NULL },
+	{ "pc.machine.g3beige", HULL_SUP_EMULATED,
+	  "a PowerPC G3 Mac, Mac OS 9's and early OS X's, OpenBIOS its firmware: qemu-system-ppc under "
+	  "TCG", NULL },
 	{ "pc.machine.arduino-uno", HULL_SUP_NATIVE, BOARD_NOTE, NULL },
 	{ "pc.machine.arduino-duemilanove", HULL_SUP_NATIVE, BOARD_NOTE, NULL },
 	{ "pc.machine.arduino-mega", HULL_SUP_NATIVE, BOARD_NOTE, NULL },

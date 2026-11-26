@@ -293,6 +293,48 @@ status 'a board with an SMC is refused' "$got" 125 "$out"
 says 'and said' "$out" 'no Apple SMC'
 rm -f "$root/osk.txt" "$root/mac.img"
 
+# A PowerPC Mac, mac99, on qemu-system-ppc -- Debian's, or `make
+# qemu-ppc`'s in the cache: planned emulated; a CPU model and a floppy
+# refused; a blank disk reaching OpenBIOS, which says so on the serial
+# port, and the machine stopped.
+# The user's copy is linked into the test's own cache, where the core looks.
+if [ ! -x /usr/bin/qemu-system-ppc ] &&
+   [ -x "$HOME/.cache/hull/qemu-system-ppc/usr/bin/qemu-system-ppc" ]; then
+	mkdir -p "$root/cache/hull"
+	ln -sfn "$HOME/.cache/hull/qemu-system-ppc" "$root/cache/hull/qemu-system-ppc"
+fi
+if [ -x /usr/bin/qemu-system-ppc ] ||
+   [ -x "$root/cache/hull/qemu-system-ppc/usr/bin/qemu-system-ppc" ]; then
+	truncate -s 16M "$root/ppc.img"
+	conf '(hostname "pc-g4") (source "media:disk") (memory "512M")' \
+		'(media (medium (type disk) (source "image:./ppc.img"))) (tuning (pc (machine mac99)))'
+	out=$("$hull" plan --explain -f "$root/hull.conf" 2>&1)
+	says 'a G4 Mac planned' "$out" 'pc.machine.mac99: emulated'
+	conf '(source "media:disk") (media (medium (type disk) (source "image:./ppc.img")))' \
+		'(tuning (pc (machine mac99) (cpu host)))'
+	run
+	status 'a CPU model on a Mac is refused' "$got" 125 "$out"
+	conf '(source "media:floppy") (media (medium (type floppy) (source "image:./ppc.img")))' \
+		'(tuning (pc (machine mac99)))'
+	run
+	status 'a floppy on a Mac is refused' "$got" 125 "$out"
+	conf '(hostname "pc-g4") (source "media:disk") (memory "512M")' \
+		'(media (medium (type disk) (source "image:./ppc.img"))) (tuning (pc (machine mac99)))'
+	(cd "$root" && exec timeout 120 "$hull" run -f "$root/hull.conf" > "$root/ppc.out" 2>&1) &
+	ppc_pid=$!
+	tries=0
+	until grep -q 'OpenBIOS' "$root/ppc.out" 2> /dev/null || [ "$tries" -ge 60 ]; do
+		tries=$((tries + 1))
+		sleep 1
+	done
+	timeout 30 "$hull" stop pc-g4 > /dev/null 2>&1
+	wait "$ppc_pid"
+	says 'a G4 Mac boots OpenBIOS' "$(cat "$root/ppc.out")" 'OpenBIOS'
+	rm -f "$root/ppc.img" "$root/ppc.out"
+else
+	printf 'pc: no qemu-system-ppc (make qemu-ppc), the PowerPC Mac not tried\n'
+fi
+
 # Imported, as hull-gui's Import is: the .vbox copied into a folder of
 # its own, its VDI converted to qcow2 there and its hull.conf saying so,
 # changes kept in the copy; the copy boots, the VDI is as it was, a

@@ -584,7 +584,7 @@ static const schema qemu = TABLE(qemu_keys);
 /* A PC's machine type, or a microcontroller board booted from its
  * firmware, on qemu or s51 (engine/pc.c's boards). */
 static const char *const pc_machine_values[] = {
-	"pc", "q35", "isapc",
+	"pc", "q35", "isapc", "mac99", "g3beige",
 	"arduino-uno", "arduino-duemilanove", "arduino-mega", "arduino-mega-2560-v3",
 	"stm32vldiscovery", "netduino2", "netduinoplus2", "olimex-stm32-h405", "lm3s6965evb",
 	"lm3s811evb", "microbit", "mps2-an385", "b-l475e-iot01a", "at89c51ed2",
