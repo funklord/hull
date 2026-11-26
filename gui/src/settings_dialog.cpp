@@ -11,6 +11,8 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QHBoxLayout>
+#include <QInputDialog>
+#include <QLineEdit>
 #include <QListWidget>
 #include <QPushButton>
 #include <QFormLayout>
@@ -75,38 +77,62 @@ settings_dialog::settings_dialog(const QString &file_path, bool pc, QWidget *par
 		    { QStringLiteral("tablet"), QStringLiteral("ps2") }, false, false);
 
 		/* Its disks and discs, as VirtualBox's Storage page: each record
-		 * shown by its type and source, a new one added by its image, one
-		 * removed; a record of another shape kept as it was written. */
-		auto *row = new QHBoxLayout;
+		 * shown by its type and source, a new one added by its image. */
 		auto *add_disk = new QPushButton(QStringLiteral("Add &Disk..."));
 		auto *add_disc = new QPushButton(QStringLiteral("Add D&isc..."));
-		auto *remove = new QPushButton(QStringLiteral("&Remove"));
 
-		media = new QListWidget;
-		media_was = spec_forms(text, { QStringLiteral("media") });
-		for (const QString &record : media_was) {
-			const QString wrapped = QStringLiteral("(machine ") + record + QLatin1Char(')');
-			const QString type = spec_value(wrapped, { QStringLiteral("medium"),
-			                                           QStringLiteral("type") });
-			const QString source = spec_value(wrapped, { QStringLiteral("medium"),
-			                                             QStringLiteral("source") });
-			auto *item = new QListWidgetItem(type.isEmpty() || source.isEmpty() ?
-			                                 record.simplified() :
-			                                 QStringLiteral("%1  %2").arg(type, source));
+		media = record_list(QStringLiteral("Disks and discs:"), QStringLiteral("media"),
+		                    [](const QString &record) {
+			                    const QString w = QStringLiteral("(machine ") + record + QLatin1Char(')');
+			                    const QString type = spec_value(w, { QStringLiteral("medium"),
+			                                                         QStringLiteral("type") });
+			                    const QString source = spec_value(w, { QStringLiteral("medium"),
+			                                                           QStringLiteral("source") });
 
-			item->setData(Qt::UserRole, record);
-			media->addItem(item);
-		}
-		media->setAccessibleName(QStringLiteral("Disks and discs"));
-		media->setCurrentRow(0);
+			                    return type.isEmpty() || source.isEmpty() ? QString() :
+			                           QStringLiteral("%1  %2").arg(type, source);
+		                    },
+		                    { add_disk, add_disc });
 		connect(add_disk, &QPushButton::clicked, this, [this]() { add_medium(QStringLiteral("disk")); });
 		connect(add_disc, &QPushButton::clicked, this, [this]() { add_medium(QStringLiteral("cdrom")); });
-		connect(remove, &QPushButton::clicked, this, [this]() { delete media->currentItem(); });
-		row->addWidget(add_disk);
-		row->addWidget(add_disc);
-		row->addWidget(remove);
-		form->addRow(QStringLiteral("Disks and discs:"), media);
-		form->addRow(QString(), row);
+	}
+	/* Every class's: VirtualBox's Port Forwarding and Shared Folders. */
+	{
+		auto *add_port_button = new QPushButton(QStringLiteral("Add P&ort..."));
+		auto *add_folder_button = new QPushButton(QStringLiteral("Add &Folder..."));
+
+		ports = record_list(QStringLiteral("Forwarded ports:"), QStringLiteral("ports"),
+		                    [](const QString &record) {
+			                    const QString w = QStringLiteral("(machine ") + record + QLatin1Char(')');
+			                    const QString host = spec_value(w, { QStringLiteral("port"),
+			                                                         QStringLiteral("host") });
+			                    const QString guest = spec_value(w, { QStringLiteral("port"),
+			                                                          QStringLiteral("guest") });
+
+			                    return host.isEmpty() || guest.isEmpty() ? QString() :
+			                           QStringLiteral("%1 on the machine's address to %2 in it")
+			                               .arg(host, guest);
+		                    },
+		                    { add_port_button });
+		connect(add_port_button, &QPushButton::clicked, this, &settings_dialog::add_port);
+		folders = record_list(QStringLiteral("Shared folders:"), QStringLiteral("volumes"),
+		                      [](const QString &record) {
+			                      const QString w = QStringLiteral("(machine ") + record +
+			                                        QLatin1Char(')');
+			                      const QString host = spec_value(w, { QStringLiteral("volume"),
+			                                                           QStringLiteral("host") });
+			                      const QString guest = spec_value(w, { QStringLiteral("volume"),
+			                                                            QStringLiteral("guest") });
+			                      const QString mode = spec_value(w, { QStringLiteral("volume"),
+			                                                           QStringLiteral("mode") });
+
+			                      return host.isEmpty() || guest.isEmpty() ? QString() :
+			                             QStringLiteral("%1 at %2%3").arg(host, guest,
+			                                 mode == QStringLiteral("ro") ? QStringLiteral(", read-only")
+			                                                             : QString());
+		                      },
+		                      { add_folder_button });
+		connect(add_folder_button, &QPushButton::clicked, this, &settings_dialog::add_folder);
 	}
 	error = new QLabel;
 	error->setWordWrap(true);
@@ -143,46 +169,138 @@ void settings_dialog::add(const QString &label, const QStringList &path, const Q
 	fields.append(f);
 }
 
-/* A disk or disc image chosen, named from the machine's folder where it
- * is inside it, as hull.conf's own media are. */
-void settings_dialog::add_medium(const QString &type)
+QListWidget *settings_dialog::record_list(const QString &label, const QString &key,
+                                          const std::function<QString(const QString &)> &describe,
+                                          const QList<QPushButton *> &adds)
+{
+	auto *form = static_cast<QFormLayout *>(layout()->itemAt(0)->layout());
+	auto *list = new QListWidget;
+	auto *row = new QHBoxLayout;
+	auto *remove = new QPushButton(QStringLiteral("&Remove"));
+	const QStringList was = spec_forms(text, { key });
+
+	for (const QString &record : was) {
+		const QString shown = describe(record);
+
+		/* A record of another shape kept as it was written, shown so. */
+		add_record(list, record, shown.isEmpty() ? record.simplified() : shown);
+	}
+	list->setAccessibleName(QString(label).remove(QLatin1Char(':')));
+	list->setCurrentRow(0);
+	for (QPushButton *add : adds)
+		row->addWidget(add);
+	row->addWidget(remove);
+	connect(remove, &QPushButton::clicked, this, [list]() { delete list->currentItem(); });
+	form->addRow(label, list);
+	form->addRow(QString(), row);
+	lists.append({ key, list, was });
+	return list;
+}
+
+void settings_dialog::add_record(QListWidget *list, const QString &record, const QString &shown)
+{
+	auto *item = new QListWidgetItem(shown);
+
+	item->setData(Qt::UserRole, record);
+	list->addItem(item);
+}
+
+/* A path chosen in a dialog, named from the machine's folder where it is
+ * inside it, as hull.conf's own are; "" with the error said where it
+ * cannot be written in a string here. */
+QString settings_dialog::folder_path(const QString &chosen)
 {
 	const QString folder = QFileInfo(file).absolutePath();
-	const QString image = QFileDialog::getOpenFileName(
-	    this, type == QStringLiteral("disk") ? QStringLiteral("Add Disk") : QStringLiteral("Add Disc"),
-	    folder, type == QStringLiteral("disk") ?
-	            QStringLiteral("Disk images (*.qcow2 *.img *.raw *.vdi *.vmdk *.vhd *.vhdx);;All files (*)") :
-	            QStringLiteral("Disc images (*.iso);;All files (*)"));
-
-	if (image.isEmpty())
-		return;
-	QString path = QDir(folder).relativeFilePath(image);
+	QString       path = QDir(folder).relativeFilePath(chosen);
 
 	if (path.startsWith(QStringLiteral("../")) || QFileInfo(path).isAbsolute())
-		path = QFileInfo(image).absoluteFilePath();
+		path = QFileInfo(chosen).absoluteFilePath();
 	else
 		path = QStringLiteral("./") + path;
 	if (path.contains(QLatin1Char('"')) || path.contains(QLatin1Char('\\'))) {
 		error->setText(QStringLiteral("%1: a path with a quote or a backslash is not written here; "
 		                              "Edit hull.conf takes it").arg(path));
-		return;
+		return QString();
 	}
-	const QString record = QStringLiteral("(medium (type %1) (source \"image:%2\"))").arg(type, path);
-	auto         *item = new QListWidgetItem(QStringLiteral("%1  \"image:%2\"").arg(type, path));
-
-	item->setData(Qt::UserRole, record);
-	media->addItem(item);
+	return path;
 }
 
-/* The (media ...) form's inside as the list now has it, a record a line;
- * "" for none. */
-QString settings_dialog::media_value() const
+/* A disk or disc image, by a file dialog. */
+void settings_dialog::add_medium(const QString &type)
 {
-	QStringList records;
+	const QString image = QFileDialog::getOpenFileName(
+	    this, type == QStringLiteral("disk") ? QStringLiteral("Add Disk") : QStringLiteral("Add Disc"),
+	    QFileInfo(file).absolutePath(), type == QStringLiteral("disk") ?
+	            QStringLiteral("Disk images (*.qcow2 *.img *.raw *.vdi *.vmdk *.vhd *.vhdx);;All files (*)") :
+	            QStringLiteral("Disc images (*.iso);;All files (*)"));
+	const QString path = image.isEmpty() ? QString() : folder_path(image);
 
-	for (int i = 0; i < media->count(); i++)
-		records << media->item(i)->data(Qt::UserRole).toString();
-	return records.join(QStringLiteral("\n    "));
+	if (path.isEmpty())
+		return;
+	add_record(media, QStringLiteral("(medium (type %1) (source \"image:%2\"))").arg(type, path),
+	           QStringLiteral("%1  \"image:%2\"").arg(type, path));
+}
+
+/* A port of the machine's address forwarded to one in it, as
+ * VirtualBox's Port Forwarding rule. */
+void settings_dialog::add_port()
+{
+	bool      given = false;
+	const int host_port = QInputDialog::getInt(this, QStringLiteral("Add Port"),
+	                                           QStringLiteral("Port on the machine's address:"),
+	                                           8080, 1, 65535, 1, &given);
+
+	if (!given)
+		return;
+	const int guest_port = QInputDialog::getInt(this, QStringLiteral("Add Port"),
+	                                            QStringLiteral("Port in the machine:"), host_port, 1,
+	                                            65535, 1, &given);
+
+	if (!given)
+		return;
+	add_record(ports, QStringLiteral("(port (host %1) (guest %2))").arg(host_port).arg(guest_port),
+	           QStringLiteral("%1 on the machine's address to %2 in it").arg(host_port).arg(guest_port));
+}
+
+/* A folder of the host's at a path in the machine, as VirtualBox's Shared
+ * Folders: read and write, or read-only. */
+void settings_dialog::add_folder()
+{
+	const QString chosen = QFileDialog::getExistingDirectory(this, QStringLiteral("Add Folder"),
+	                                                         QFileInfo(file).absolutePath());
+	const QString host_path = chosen.isEmpty() ? QString() : folder_path(chosen);
+	bool          given = false;
+
+	if (host_path.isEmpty())
+		return;
+	const QString guest = QInputDialog::getText(this, QStringLiteral("Add Folder"),
+	                                            QStringLiteral("Its path in the machine:"),
+	                                            QLineEdit::Normal,
+	                                            QLatin1Char('/') + QFileInfo(chosen).fileName(), &given)
+	                          .trimmed();
+
+	if (!given || !guest.startsWith(QLatin1Char('/')) || guest.contains(QLatin1Char('"')) ||
+	    guest.contains(QLatin1Char('\\'))) {
+		if (given)
+			error->setText(QStringLiteral("%1: a path in the machine starts with / and holds no "
+			                              "quote or backslash").arg(guest));
+		return;
+	}
+	const QString mode = QInputDialog::getItem(this, QStringLiteral("Add Folder"),
+	                                           QStringLiteral("The machine may:"),
+	                                           { QStringLiteral("read and write"),
+	                                             QStringLiteral("only read") },
+	                                           0, false, &given);
+
+	if (!given)
+		return;
+	const bool ro = mode == QStringLiteral("only read");
+
+	add_record(folders,
+	           QStringLiteral("(volume (host \"%1\") (guest \"%2\")%3)")
+	               .arg(host_path, guest, ro ? QStringLiteral(" (mode ro)") : QString()),
+	           QStringLiteral("\"%1\" at \"%2\"%3")
+	               .arg(host_path, guest, ro ? QStringLiteral(", read-only") : QString()));
 }
 
 void settings_dialog::accept()
@@ -211,16 +329,17 @@ void settings_dialog::accept()
 		if (changed.isNull())
 			break;
 	}
-	/* The media written only where the list changed, whole, so its other
-	 * records keep their text. */
-	if (media != nullptr && problem.isEmpty() && !changed.isNull()) {
+	/* Each list written only where it changed, whole, a record a line, so
+	 * its other records keep their text. */
+	for (const records &r : lists) {
 		QStringList now;
 
-		for (int i = 0; i < media->count(); i++)
-			now << media->item(i)->data(Qt::UserRole).toString();
-		if (now != media_was)
-			changed = spec_with(changed, { QStringLiteral("media") },
-			                    now.isEmpty() ? QString() : media_value(), &problem);
+		if (!problem.isEmpty() || changed.isNull())
+			break;
+		for (int i = 0; i < r.list->count(); i++)
+			now << r.list->item(i)->data(Qt::UserRole).toString();
+		if (now != r.was)
+			changed = spec_with(changed, { r.key }, now.join(QStringLiteral("\n    ")), &problem);
 	}
 	if (!problem.isEmpty() || changed.isNull()) {
 		error->setText(problem);

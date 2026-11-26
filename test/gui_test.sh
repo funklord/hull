@@ -162,7 +162,8 @@ cases=$((cases + 1))
 [ "$(stat -c %Y "$dir/settings.conf")" = "$(date -d '2020-01-01' +%s)" ] ||
 	fail "Settings untouched wrote the file" "$(cat "$dir/settings.conf")"
 # And a pc's disks and discs: the first record, selected as the page
-# opens, removed by Tab to Remove and Space, then OK, the disc kept.
+# opens, removed by Tab to Remove and Space, then OK past the ports' and
+# folders' lists, the disc kept.
 printf '(machine (backend pc) (hostname "gui-media") (source "media:disk")\n  (media\n    (medium (type disk) (source "image:./a.img"))\n    (medium (type cdrom) (source "image:./b.iso"))))\n' \
 	> "$dir/settings.conf"
 rm -rf "${dir:?}/settings/config"
@@ -171,9 +172,23 @@ truncate -s 1M "$dir/settings/a.img" "$dir/settings/b.iso"
 ln -sf settings/a.img "$dir/a.img"
 ln -sf settings/b.iso "$dir/b.iso"
 keys "$dir" "b'\\x1bOR'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
-	"b'\\t'" "b'\\t'" "b' '" "b'\\t'" "b' '" -- "$dir/settings.conf"
+	"b'\\t'" "b'\\t'" "b' '" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
+	"b' '" -- "$dir/settings.conf"
 has "$(cat "$dir/settings.conf")" '^  \(media \(medium \(type cdrom\) \(source "image:\./b\.iso"\)\)\)\)$' \
 	"Settings removed a disk and kept the disc"
+# Every class's ports and shared folders: on a chroot machine the port's
+# Remove is the sixth Tab from Memory, the folder kept.
+printf '(machine (hostname "gui-ports") (source "dir:./rootfs")\n  (ports (port (host 8080) (guest 80)))\n  (volumes (volume (host "./rootfs") (guest "/data") (mode ro))))\n' \
+	> "$dir/settings.conf"
+rm -rf "${dir:?}/settings/config"
+mkdir -p "$dir/settings/config"
+keys "$dir" "b'\\x1bOR'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b' '" \
+	"b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b' '" -- "$dir/settings.conf"
+cases=$((cases + 1))
+if grep -q '(ports' "$dir/settings.conf" || ! grep -q '(volume (host "./rootfs") (guest "/data") (mode ro))' \
+	"$dir/settings.conf"; then
+	fail "Settings did not remove the port and keep the folder" "$(cat "$dir/settings.conf")"
+fi
 XDG_CONFIG_HOME=$config_saved
 rm -rf "${dir:?}/settings" "${dir:?}/settings.conf" "${dir:?}/a.img" "${dir:?}/b.iso"
 

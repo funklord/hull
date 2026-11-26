@@ -15,9 +15,12 @@
 #include <QList>
 #include <QStringList>
 
+#include <functional>
+
 class QComboBox;
 class QLabel;
 class QListWidget;
+class QPushButton;
 
 class settings_dialog : public QDialog {
 	Q_OBJECT
@@ -43,14 +46,30 @@ private:
 
 	void add(const QString &label, const QStringList &path, const QStringList &choices,
 	         bool editable, bool quoted);
+	/* A form of records, `key`'s -- (media ...), (ports ...), (volumes
+	 * ...) -- listed one a line as `describe` says, with `adds` and a
+	 * Remove beside it; written back whole where the list changed. */
+	QListWidget *record_list(const QString &label, const QString &key,
+	                         const std::function<QString(const QString &)> &describe,
+	                         const QList<QPushButton *> &adds);
+	void         add_record(QListWidget *list, const QString &record, const QString &shown);
+	QString      folder_path(const QString &chosen);
 	void add_medium(const QString &type);
-	QString media_value() const;
+	void add_port();
+	void add_folder();
 
 	QString      file;
 	QString      text;
 	QList<field> fields;
-	QListWidget *media = nullptr;  /* a pc's disks and discs, each its record's text */
-	QStringList  media_was;
+	struct records {
+		QString      key;
+		QListWidget *list;
+		QStringList  was;
+	};
+	QList<records> lists;
+	QListWidget   *media = nullptr;    /* a pc's disks and discs */
+	QListWidget   *ports = nullptr;    /* its forwarded ports */
+	QListWidget   *folders = nullptr;  /* its shared folders, (volumes ...) */
 	QLabel      *error;
 	bool         ok = false;
 	QString      why;
