@@ -275,6 +275,22 @@ void main_window::build_actions()
 		dialog.exec();
 	});
 
+	QMenu   *help = menuBar()->addMenu(QStringLiteral("&Help"));
+	QAction *about = help->addAction(QStringLiteral("About hull-gui..."));
+
+	connect(about, &QAction::triggered, this, [this]() {
+		/* Rich text: the address escaped, or it is read as a tag and
+		 * dropped (project-attribution). */
+		QMessageBox::about(this, QStringLiteral("About hull-gui"),
+		                   QStringLiteral("<p><b>hull-gui %1</b></p><p>hull's machine manager: "
+		                                  "containers, virtual machines and emulated systems "
+		                                  "from one spec, started and watched from one window."
+		                                  "</p><p>%2</p>")
+		                       .arg(QApplication::applicationVersion(),
+		                            QStringLiteral("Copyright (C) 2026 Nabeel Sowan "
+		                                           "<nabeel@vibes.se>").toHtmlEscaped()));
+	});
+
 	QToolBar *bar = addToolBar(QStringLiteral("Machine"));
 	bar->setObjectName(QStringLiteral("machine"));
 	bar->setToolButtonStyle(Qt::ToolButtonTextOnly);

@@ -11,6 +11,7 @@
 #include <QCommandLineParser>
 #include <QDir>
 #include <QFileInfo>
+#include <QIcon>
 #include <QProcess>
 #include <QStandardPaths>
 #include <QTimer>
@@ -18,6 +19,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+
+#include <qtkit/theme.h>
 
 #include "main_window.h"
 
@@ -100,6 +103,14 @@ int main(int argc, char **argv)
 #endif
 	QApplication::setApplicationName(QStringLiteral("hull-gui"));
 	QApplication::setApplicationVersion(QStringLiteral(HULL_VERSION));
+	/* Matched to its desktop entry and icon by a taskbar or compositor;
+	 * the icon also compiled in, for a desktop that has none installed. */
+	QGuiApplication::setDesktopFileName(QStringLiteral("se.vibes.hull-gui"));
+	QApplication::setWindowIcon(QIcon(QStringLiteral(":/se.vibes.hull-gui.svg")));
+	/* The desktop's dark or light, followed; HULL_THEME=dark|light
+	 * overrides. A terminal has its own colours. */
+	if (!tui)
+		qtkit_follow_desktop(application, "HULL_THEME");
 
 	QCommandLineParser parser;
 	parser.setApplicationDescription(

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- hull-gui's icon: a ship's hull carrying three machines. Flat fills
+     only: TDE draws an SVG with its own engine, which does not do
+     patterns or bounding-box gradients (desktop-entry skill). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect x="4" y="4" width="120" height="120" rx="22" fill="#1f3b57"/>
+  <rect x="22" y="30" width="24" height="30" rx="3" fill="#e8b04a"/>
+  <rect x="52" y="22" width="24" height="38" rx="3" fill="#6fc2a8"/>
+  <rect x="82" y="34" width="24" height="26" rx="3" fill="#d96c5f"/>
+  <path d="M12 66 H116 L100 102 H28 Z" fill="#e9eef3"/>
+  <rect x="12" y="66" width="104" height="7" fill="#9fb3c6"/>
+</svg>

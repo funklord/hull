@@ -1,0 +1,97 @@
+.TH HULL 1 "2026-11-26" "hull 0.1" "User Commands"
+.SH NAME
+hull \- run one machine spec as a container, a virtual machine or an emulation
+.SH SYNOPSIS
+.B hull plan
+.RB [ \-f
+.IR FILE ]
+.RB [ \-\-backend
+.IR B ]
+.RB [ \-\-explain ]
+.RB [ \-\-resolved ]
+.br
+.B hull run
+.RB [ \-f
+.IR FILE ]
+.RB [ \-\-backend
+.IR B ]
+.RI [ NAME ]
+.br
+.B hull exec
+.RB [ \-t ]
+.I ID
+.B \-\-
+.IR COMMAND ...
+.br
+.B hull stop
+.I ID
+.br
+.B hull ps
+.br
+.B hull import \-\-machine
+.I X.vbox|X.vmx|X.ovf|X.ova DIR
+.br
+.B hull doctor
+.br
+.B hull \-\-help
+|
+.B \-\-version
+.SH DESCRIPTION
+.B hull
+reads a machine from
+.IR hull.conf ,
+a plain file beside the directory it runs, and runs it on the engine its
+.B (backend ...)
+names: in user namespaces
+.RB ( chroot ),
+under KVM
+.RB ( vm ),
+in full software emulation
+.RB ( emu ),
+under Docker, VirtualBox, or as a whole PC or microcontroller board of its
+own
+.RB ( pc ).
+Changing that one line moves the same files from one to another.
+Nothing runs as root: the resident part is a per-user core, started when
+needed and gone when idle.
+.PP
+.B hull plan
+says what each engine does with every field of the spec \(em native,
+emulated, or refused \(em before anything runs.
+.B hull run
+starts the machine, its output on stdout and its exit status the
+command's.
+.B hull exec \-t ID \-\- console
+joins a terminal to a pc or board machine's serial port;
+.B console 2
+is a board's second UART.
+.PP
+VirtualBox and VMware machines and appliances run from their own files
+.RB ( "hull run \-f Old.vbox" ),
+or are copied into a folder of hull's own by
+.BR "hull import \-\-machine" ,
+their disks converted to qcow2.
+.PP
+.B hull \-\-help
+lists every command.
+.SH FILES
+.TP
+.I hull.conf
+the machine, read from the current directory unless
+.B \-f
+names another.
+.TP
+.I /usr/libexec/hull/
+hull itself and what it reads beside itself: the guest agents, and hull's
+own kernel where it was built.
+.TP
+.I $XDG_RUNTIME_DIR/hull/
+the core's socket and the running machines.
+.TP
+.I $XDG_DATA_HOME/hull/
+the optional image store.
+.SH SEE ALSO
+.BR hull-gui (1),
+.BR qemu (1)
+.SH AUTHOR
+Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>

@@ -827,7 +827,13 @@ make check-virtualbox  # a machine under VirtualBox, inside a vm
 make check-flip    # one project, unchanged, on chroot, vm, emu and docker
 make check-docker  # the docker adapter, against the daemon
 make hooks   # install the commit-msg hook
+make install PREFIX=~/.local   # hull, its agents, kernel and hull-gui; /usr/local by default
 ```
+
+`make install` puts hull and what it reads beside itself in
+`PREFIX/libexec/hull`, with `PREFIX/bin/hull` linking there, and, where
+Qt is, hull-gui with its menu entry and icon; `make uninstall` removes
+exactly those.
 
 `web.hull` and every other machine's name resolve, for any program on
 the host, once `build/libnss_hull.so.2`, which `make nss` builds, is

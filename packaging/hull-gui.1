@@ -1,0 +1,54 @@
+.TH HULL-GUI 1 "2026-11-26" "hull 0.1" "User Commands"
+.SH NAME
+hull-gui, hull-tui \- manage hull's machines from one window, on the desktop or a terminal
+.SH SYNOPSIS
+.B hull-gui
+.RB [ \-\-hull
+.IR PATH ]
+.RB [ \-\-tui | \-\-gui ]
+.RI [ FILE ...]
+.br
+.B hull-tui
+.RI [ FILE ...]
+.br
+.B hull-gui \-\-version
+.SH DESCRIPTION
+.B hull-gui
+lists the machines added to it, those in folders of their own in
+.IR ~/hull ,
+and those hull's core is running, and starts, stops, pauses and watches
+them: their plan, their output, their resources and their networks, a
+machine's terminal and its screen. New writes a machine into
+.IR ~/hull/NAME ;
+Import copies a VirtualBox or VMware machine or an appliance there, its
+disks converted; Clone copies one; Remove takes one off the list or deletes
+its folder to the desktop's trash.
+.PP
+.B hull-tui
+is the same window drawn on the terminal. Each
+.I FILE
+given is a
+.I hull.conf
+or another hypervisor's machine file added to the list.
+.SH OPTIONS
+.TP
+.BI \-\-hull " PATH"
+the hull to run machines with; by default the one beside hull-gui, else
+hull on the PATH.
+.TP
+.B \-\-tui
+draw on the terminal.
+.TP
+.B \-\-gui
+draw on the desktop.
+.SH ENVIRONMENT
+.TP
+.B HULL_THEME
+.B dark
+or
+.B light
+overrides the desktop's own scheme.
+.SH SEE ALSO
+.BR hull (1)
+.SH AUTHOR
+Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>

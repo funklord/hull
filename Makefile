@@ -443,7 +443,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: esp-qemu-lora check-tsan
-.PHONY: all gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-windows kernel-check kernel-cves check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-ppc64le-host check-root check-systemd check-vfio check-disk check-usb check-usbredir check-vhost vhost-device dosemu2 cross-ppc64le qemu-ppc check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all install uninstall gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-windows kernel-check kernel-cves check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-ppc64le-host check-root check-systemd check-vfio check-disk check-usb check-usbredir check-vhost vhost-device dosemu2 cross-ppc64le qemu-ppc check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -474,12 +474,24 @@ GUI_BIN     = $(BUILD_DIR)/hull-gui
 GUI_SOURCES = $(wildcard gui/src/*.cpp gui/src/*.h)
 QTTY_DIR    = qtty
 QTTY_LIB    = $(BUILD_DIR)/qtty/lib/libqtty.a
+# qtkit, the GUIs' shared pieces (the desktop's palette followed), compiled
+# into hull-gui by its .pri: not optional, so fetched like qtty and the
+# build stopped where it cannot be.
+QTKIT_DIR   = qtkit
 
-ifneq ($(filter gui check-gui,$(MAKECMDGOALS)),)
+ifneq ($(filter gui check-gui install,$(MAKECMDGOALS)),)
 ifeq ($(wildcard $(QTTY_DIR)/qtty.pri),)
 QTTY_FETCH := $(shell $(call SUBMODULE_FETCH_SH,$(QTTY_DIR),qtty))
 endif
+ifeq ($(wildcard $(QTKIT_DIR)/qtkit.pri),)
+QTKIT_FETCH := $(shell $(call SUBMODULE_FETCH_SH,$(QTKIT_DIR),qtkit))
 endif
+ifeq ($(wildcard $(QTKIT_DIR)/qtkit.pri),)
+$(error qtkit/ is empty and could not be fetched: hull-gui is built with it)
+endif
+endif
+GUI_SOURCES += $(wildcard $(QTKIT_DIR)/src/*.cpp $(QTKIT_DIR)/src/*.h $(QTKIT_DIR)/include/qtkit/*.h) \
+               gui/hull-gui.qrc packaging/se.vibes.hull-gui.svg
 GUI_QTTY = $(if $(wildcard $(QTTY_DIR)/qtty.pri),$(QTTY_LIB))
 
 gui: $(HULL) $(GUI_BIN)
@@ -496,7 +508,8 @@ $(CLIENT_LIB): $(WIRE_OBJS) $(SEXPR_OBJS)
 QMAKE_PATHS = $(BUILD_DIR)/qmake-paths
 $(QMAKE_PATHS): FORCE
 	@mkdir -p '$(@D)'
-	@printf '%s\n' '$(abspath $(QTTY_DIR))' '$(abspath $(SITU_DIR))' '$(CURDIR)' > '$@.new'
+	@printf '%s\n' '$(abspath $(QTTY_DIR))' '$(abspath $(SITU_DIR))' '$(abspath $(QTKIT_DIR))' \
+	    '$(CURDIR)' > '$@.new'
 	@if cmp -s '$@.new' '$@'; then rm -f '$@.new'; else mv '$@.new' '$@'; fi
 
 $(BUILD_DIR)/qtty/Makefile: $(QTTY_DIR)/src/src.pro $(QTTY_DIR)/qtty.pri $(QMAKE_PATHS)
@@ -508,7 +521,7 @@ $(QTTY_LIB): $(BUILD_DIR)/qtty/Makefile FORCE
 	$(MAKE) -C '$(BUILD_DIR)/qtty'
 
 # Written again only when the project, or whether qtty is there, changes.
-$(BUILD_DIR)/gui/Makefile: gui/gui.pro $(GUI_QTTY) $(QMAKE_PATHS)
+$(BUILD_DIR)/gui/Makefile: gui/gui.pro $(QTKIT_DIR)/qtkit.pri $(GUI_QTTY) $(QMAKE_PATHS)
 	@mkdir -p '$(@D)'
 	cd '$(@D)' && $(QMAKE) '$(CURDIR)/gui/gui.pro' HULL_BUILD='$(abspath $(BUILD_DIR))' \
 	    $(if $(GUI_QTTY),QTTY_LIB_DIR='$(abspath $(BUILD_DIR))/qtty/lib')
@@ -599,6 +612,8 @@ help:
 	@echo '  style     the indentation and whitespace gate'
 	@echo '  contract  the schemas'"'"' capability maps against the committed ones'
 	@echo '  hooks     install the commit-msg hook from tool/hooks/'
+	@echo '  install   hull, what it reads beside itself and hull-gui, under PREFIX'
+	@echo '  uninstall what install wrote, by name'
 	@echo '  install-nss  as root: libnss_hull.so.2 into NSS_LIBDIR, for *.hull names'
 	@echo '  install-apparmor  as root: a profile letting hull make user namespaces'
 	@echo '  install-root  as root: hull-root setuid into ROOT_HELPER, and its listing'"'"'s'
@@ -857,9 +872,87 @@ $(NSS_LIB): nss/nss_hull.c
 	$(CC) $(HOST_CFLAGS) $(WARNINGS) -fPIC -fvisibility=hidden -shared -Wl,-soname,libnss_hull.so.2 \
 	      -o $@ $<
 
-# The one step of section 8.1's names that needs root, and the only target
-# that writes outside the tree: run it as root, then put `hull` on the
-# hosts line of /etc/nsswitch.conf, before `dns`.
+# hull installed under PREFIX, as the user into a prefix of their own or
+# as root into /usr/local: hull and whatever it reads beside itself --
+# the agents, hull's kernel and modules, Limine -- in HULL_LIBEXEC, each
+# copied where it was built, with bin/hull a link to it, so hull still
+# finds them beside itself by /proc/self/exe. hull-gui too where Qt is,
+# with its desktop entry and icon (desktop-entry skill). The setuid
+# helper and the NSS module are root's, install-root and install-nss.
+PREFIX       ?= /usr/local
+HULL_LIBEXEC ?= $(PREFIX)/libexec/hull
+GUI_ID        = se.vibes.hull-gui
+ICON_SIZES    = 16 22 32 48 64 128
+INSTALL_FILES = hull hull-agent hull-agent-arm64 hull-agent-riscv64 hull-agent-s390x \
+                hull-agent-ppc64le hull-agent-arm vmlinuz-hull vmlinuz-hull-arm64 vmlinux-hull
+INSTALL_DIRS  = modules-hull modules-hull-arm64 limine
+INSTALL_GUI   = $(if $(shell command -v $(QMAKE) 2>/dev/null),$(GUI_BIN))
+
+install: all $(INSTALL_GUI)
+	@for f in $(INSTALL_FILES) $(if $(INSTALL_GUI),hull-gui); do \
+		[ -e '$(BUILD_DIR)'/$$f ] || continue; \
+		case $$f in vmlinu*) mode=0644 ;; *) mode=0755 ;; esac; \
+		echo "install $(DESTDIR)$(HULL_LIBEXEC)/$$f"; \
+		install -D -m $$mode '$(BUILD_DIR)'/$$f '$(DESTDIR)$(HULL_LIBEXEC)'/$$f || exit 1; \
+	done
+	@for d in $(INSTALL_DIRS); do \
+		[ -d '$(BUILD_DIR)'/$$d ] || continue; \
+		echo "install $(DESTDIR)$(HULL_LIBEXEC)/$$d/"; \
+		mkdir -p '$(DESTDIR)$(HULL_LIBEXEC)' && \
+		cp -R '$(BUILD_DIR)'/$$d '$(DESTDIR)$(HULL_LIBEXEC)'/ || exit 1; \
+	done
+	install -d '$(DESTDIR)$(PREFIX)/bin'
+	ln -sf '$(HULL_LIBEXEC)/hull' '$(DESTDIR)$(PREFIX)/bin/hull'
+	install -D -m 0644 packaging/hull.1 '$(DESTDIR)$(PREFIX)/share/man/man1/hull.1'
+ifneq ($(INSTALL_GUI),)
+	ln -sf '$(HULL_LIBEXEC)/hull-gui' '$(DESTDIR)$(PREFIX)/bin/hull-gui'
+	ln -sf '$(HULL_LIBEXEC)/hull-gui' '$(DESTDIR)$(PREFIX)/bin/hull-tui'
+	install -D -m 0644 packaging/hull-gui.1 '$(DESTDIR)$(PREFIX)/share/man/man1/hull-gui.1'
+	install -D -m 0644 packaging/hull-tui.1 '$(DESTDIR)$(PREFIX)/share/man/man1/hull-tui.1'
+	install -D -m 0644 packaging/$(GUI_ID).desktop \
+	    '$(DESTDIR)$(PREFIX)/share/applications/$(GUI_ID).desktop'
+	install -D -m 0644 packaging/$(GUI_ID).svg \
+	    '$(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/$(GUI_ID).svg'
+	@for n in $(ICON_SIZES); do \
+		install -D -m 0644 packaging/icon/$$n.png \
+		    '$(DESTDIR)$(PREFIX)'/share/icons/hicolor/$${n}x$${n}/apps/$(GUI_ID).png || exit 1; \
+	done
+	@if [ -z '$(DESTDIR)' ]; then \
+		command -v update-desktop-database > /dev/null && \
+		    update-desktop-database -q '$(PREFIX)/share/applications'; \
+		command -v gtk-update-icon-cache > /dev/null && \
+		    gtk-update-icon-cache -q -t -f '$(PREFIX)/share/icons/hicolor'; \
+		command -v tdebuildsycoca > /dev/null && tdebuildsycoca > /dev/null 2>&1; \
+		true; \
+	fi
+endif
+
+# What install wrote, by name. The three directories are the ones it
+# copied, each removed by its full name under a HULL_LIBEXEC checked
+# first to be absolute and to end in /hull.
+uninstall:
+	@case '$(HULL_LIBEXEC)' in /?*/hull) ;; \
+	*) echo "uninstall: refusing HULL_LIBEXEC '$(HULL_LIBEXEC)', not /.../hull" >&2; exit 1 ;; esac
+	rm -f '$(DESTDIR)$(PREFIX)/bin/hull' '$(DESTDIR)$(PREFIX)/bin/hull-gui' \
+	    '$(DESTDIR)$(PREFIX)/bin/hull-tui' \
+	    '$(DESTDIR)$(PREFIX)/share/man/man1/hull.1' '$(DESTDIR)$(PREFIX)/share/man/man1/hull-gui.1' \
+	    '$(DESTDIR)$(PREFIX)/share/man/man1/hull-tui.1' \
+	    '$(DESTDIR)$(PREFIX)/share/applications/$(GUI_ID).desktop' \
+	    '$(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/$(GUI_ID).svg'
+	@for n in $(ICON_SIZES); do \
+		echo "rm -f $(DESTDIR)$(PREFIX)/share/icons/hicolor/$${n}x$${n}/apps/$(GUI_ID).png"; \
+		rm -f '$(DESTDIR)$(PREFIX)'/share/icons/hicolor/$${n}x$${n}/apps/$(GUI_ID).png; \
+	done
+	@for f in $(INSTALL_FILES) hull-gui; do \
+		echo "rm -f $(DESTDIR)$(HULL_LIBEXEC)/$$f"; rm -f '$(DESTDIR)$(HULL_LIBEXEC)'/$$f; \
+	done
+	@for d in $(INSTALL_DIRS); do \
+		echo "rm -rf $(DESTDIR)$(HULL_LIBEXEC)/$$d"; rm -rf '$(DESTDIR)$(HULL_LIBEXEC)'/$$d; \
+	done
+	-rmdir '$(DESTDIR)$(HULL_LIBEXEC)' 2> /dev/null
+
+# The one step of section 8.1's names that needs root: run it as root,
+# then put `hull` on the hosts line of /etc/nsswitch.conf, before `dns`.
 install-nss: $(NSS_LIB)
 	install -D -m 0644 $(NSS_LIB) '$(DESTDIR)$(NSS_LIBDIR)/libnss_hull.so.2'
 

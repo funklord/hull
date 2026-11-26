@@ -50,6 +50,15 @@ DEFINES += HULL_VERSION=\\\"$$cat($$ROOT/VERSION, singleline)\\\"
 	QT += dbus
 }
 
+# qtkit, vendored at the root: the desktop's dark or light palette
+# followed, as every GUI here does (harmonization.md). QtDBus is said
+# before the include, so qtkit asks the portal as well as the files.
+QT += dbus
+include($$ROOT/qtkit/qtkit.pri)
+
+# The window's icon, compiled in from the one the desktop entry names.
+RESOURCES += hull-gui.qrc
+
 SOURCES += \
 	src/core_link.cpp \
 	src/images_dialog.cpp \

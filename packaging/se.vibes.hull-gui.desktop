@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Hull
+GenericName=Machine manager
+Comment=Run containers, virtual machines and emulated systems from one spec
+Exec=hull-gui %F
+Icon=se.vibes.hull-gui
+Terminal=false
+Categories=System;Emulator;
+Keywords=virtual machine;container;emulator;qemu;vm;
+MimeType=application/x-virtualbox-vbox;application/x-virtualbox-ova;application/x-virtualbox-ovf;
+StartupNotify=true
+StartupWMClass=hull-gui
