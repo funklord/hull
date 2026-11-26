@@ -723,7 +723,13 @@ void main_window::show_details()
 			text += QStringLiteral("%1 %2\n").arg(QString::fromLatin1(key), -10).arg(value);
 	};
 	line("Id", r.id);
-	line("File", r.added.file);
+	/* Under the home, as ~/..., the way a person names it. */
+	{
+		const QString home = QDir::homePath() + QLatin1Char('/');
+
+		line("File", r.added.file.startsWith(home) ? QStringLiteral("~/") + r.added.file.mid(home.size())
+		                                           : r.added.file);
+	}
 	line("Name", r.added.name);
 	line("State", r.is_held ? r.held.state : QStringLiteral("stopped"));
 	if (r.is_held) {

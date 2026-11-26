@@ -734,6 +734,8 @@ for a whole shell, and `ps`, `exec`, `logs` and `stop` go with it.
 
 ## A window, or the same on a terminal
 
+![hull-gui listing three machines -- board and winxp on qemu-pc, web on chroot -- with web's plan in the Details tab: each field of its hull.conf and whether the engine runs it natively or emulates it](doc/screenshot/hull-gui.png)
+
 `make gui` builds `hull-gui`, a manager in the shape of VirtualBox's:
 
 - the machines you added, a `hull.conf` each, those in folders of their
@@ -833,6 +835,7 @@ make check-docker  # the docker adapter, against the daemon
 make hooks   # install the commit-msg hook
 make install PREFIX=~/.local   # hull, its agents, kernel and hull-gui; /usr/local by default
 make deb     # Debian packages of hull and hull-gui, into build/deb
+make screenshots   # the picture above, from this build, into doc/screenshot
 ```
 
 `make install` puts hull and what it reads beside itself in

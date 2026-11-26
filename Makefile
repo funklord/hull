@@ -443,7 +443,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: esp-qemu-lora check-tsan
-.PHONY: all install uninstall deb deb-clean gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-windows kernel-check kernel-cves check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-ppc64le-host check-root check-systemd check-vfio check-disk check-usb check-usbredir check-vhost vhost-device dosemu2 cross-ppc64le qemu-ppc check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all install uninstall deb deb-clean screenshots gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-windows kernel-check kernel-cves check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-ppc64le-host check-root check-systemd check-vfio check-disk check-usb check-usbredir check-vhost vhost-device dosemu2 cross-ppc64le qemu-ppc check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -558,6 +558,13 @@ $(LINK_TEST): $(BUILD_DIR)/test/gui-build/Makefile $(CLIENT_LIB) gui/test/core_l
               gui/src/core_link.cpp gui/src/core_link.h
 	$(MAKE) -C '$(BUILD_DIR)/test/gui-build'
 
+# The README's picture (harmonization.md, "Show it"): hull-gui's window
+# drawn headless on demo machines in a home of the script's own, so none
+# of the user's is in it. Overwritten, not added to, when the window
+# changes visibly.
+screenshots: $(HULL) $(GUI_BIN)
+	BUILD_DIR='$(BUILD_DIR)' sh tool/screenshots.sh '$(HULL)' '$(GUI_BIN)' doc/screenshot
+
 check-gui: $(HULL) $(GUI_BIN) $(LINK_TEST) $(LIST_TEST) $(PROBE)
 	@if [ -z '$(GUI_QTTY)' ]; then echo 'check-gui: needs qtty/, for the snapshot' >&2; \
 	    exit 1; fi
@@ -617,6 +624,7 @@ help:
 	@echo '  install   hull, what it reads beside itself and hull-gui, under PREFIX'
 	@echo '  uninstall what install wrote, by name'
 	@echo '  deb       Debian packages of hull and hull-gui, into DEB_DIR (build/deb)'
+	@echo '  screenshots  the README'"'"'s picture of hull-gui, from this build, into doc/screenshot'
 	@echo '  install-nss  as root: libnss_hull.so.2 into NSS_LIBDIR, for *.hull names'
 	@echo '  install-apparmor  as root: a profile letting hull make user namespaces'
 	@echo '  install-root  as root: hull-root setuid into ROOT_HELPER, and its listing'"'"'s'
