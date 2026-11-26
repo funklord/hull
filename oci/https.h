@@ -27,6 +27,7 @@ typedef struct hull_https_response {
 	char      authenticate[2048];  /* WWW-Authenticate, or empty */
 	char      content_type[256];
 	char      digest[128];         /* Docker-Content-Digest, or empty */
+	char      cookie[1024];        /* the first Set-Cookie's NAME=VALUE, or empty */
 } hull_https_response;
 
 /* What the body is given to as it arrives: 0 to go on, or -1 to stop the
@@ -62,6 +63,14 @@ int hull_https_host(const char *url, char *out, size_t cap);
 /* Take plain HTTP from a loopback peer, in this process: a registry
  * session's to say. Nothing else that fetches over this does. */
 void hull_https_allow_loopback(void);
+
+/* Take http:// from any host, on this thread, while `on`: for a download
+ * the caller checks before using a byte, against something it trusts
+ * that did not come over that connection -- Apple's recovery images,
+ * whose CDN has no certificate for its name: the chunklist signed by
+ * Apple's ROM key, the image held to it chunk by chunk. A caller sets it
+ * around that one request and clears it after. */
+void hull_https_plain_digested(int on);
 
 /* Whether `host`, a URL's, was met in plain HTTP by this process: the only
  * registry whose redirects and realm may name an http:// URL. */

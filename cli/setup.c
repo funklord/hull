@@ -1612,3 +1612,499 @@ done:
 	}
 	return result;
 }
+
+/* --- macOS -------------------------------------------------------------- */
+
+/* The holder's decision of 2026-11-24 (project.md section 9's macOS
+ * entry): macOS on this machine, as the OSX-KVM projects boot it -- a q35
+ * PC under OVMF, OpenCore its loader, Apple's SMC, a Penryn by Intel's
+ * name -- so a project's Mac builds can be tested on hull, older releases
+ * beside newer.
+ *
+ *   OpenCore.qcow2  OSX-KVM's OpenCore disk, pinned by commit and sha256;
+ *                   its picker offers the recovery image and, once
+ *                   installed, the system;
+ *   recovery.img    a FAT disk holding com.apple.recovery.boot/, Apple's
+ *                   BaseSystem.dmg and its chunklist, which OpenCore boots
+ *                   as macrecovery's USB stick is booted -- no conversion,
+ *                   so no dmg codec of qemu's is needed;
+ *   macos.qcow2     the disk macOS is installed to, sparse;
+ *   hull.conf       the machine: the installer is the user's to run on
+ *                   its screen, macOS's setup having no answer file.
+ *
+ * The recovery image is Apple's, asked for as macrecovery asks: a session
+ * from osrecovery.apple.com over https, then the version's board id, and
+ * Apple's answer names the image and its chunklist. Its CDN has no
+ * certificate for its own name, so both come over plain HTTP
+ * (hull_https_plain_digested) and are checked as macrecovery checks them:
+ * the chunklist's RSA signature against Apple's EFI ROM key, and each
+ * chunk of the image against the chunklist's sha256 as it arrives, so
+ * nothing unverified is kept. The answer's AH and CH lines are no
+ * digests of the files -- they change with each request while the files
+ * do not, measured -- and are not used. Apple's SMC key is not here and
+ * never written by hull: (smc PATH) names the user's own file. */
+
+#include <sys/random.h>
+
+#include <openssl/bn.h>
+
+#include "https.h"
+#include "kernel_fetch.h"
+#include "sha256.h"
+
+#define OPENCORE_URL \
+	"https://raw.githubusercontent.com/kholia/OSX-KVM/4c378a4b5e0b219783683012bec680325eb40719/" \
+	"OpenCore/OpenCore.qcow2"
+#define OPENCORE_SHA256 "6ed36c0c2a4206ccc695f6b1a734a1cc6f94d288b0517c705d351c63cb92a6f3"
+#define RECOVERY_AGENT "User-Agent: InternetRecovery/1.0"
+
+/* Each release Apple's recovery service serves, by the board id and MLB
+ * OSX-KVM's fetch-macOS-v2.py asks with at the commit pinned above, and
+ * whether it wants AVX2, which Ventura on requires and a Westmere lacks. */
+static const struct mac_release {
+	const char *name;
+	const char *board;
+	const char *mlb;
+	const char *os;
+	int         avx2;
+} mac_releases[] = {
+	{ "high-sierra", "Mac-7BA5B2D9E42DDD94", "00000000000J80300", "default", 0 },
+	{ "mojave",      "Mac-7BA5B2DFE22DDD8C", "00000000000KXPG00", "default", 0 },
+	{ "catalina",    "Mac-00BE6ED71E35EB86", "00000000000000000", "default", 0 },
+	{ "big-sur",     "Mac-2BD1B31983FE1663", "00000000000000000", "default", 0 },
+	{ "monterey",    "Mac-B809C3757DA9BB8D", "00000000000000000", "latest",  0 },
+	{ "ventura",     "Mac-4B682C642B45593E", "00000000000000000", "latest",  1 },
+	{ "sonoma",      "Mac-827FAC58A8FDFA22", "00000000000000000", "default", 1 },
+	{ "sequoia",     "Mac-7BA5B2D9E42DDD94", "00000000000000000", "default", 1 },
+	{ "tahoe",       "Mac-CFF7D910A743CAAF", "00000000000000000", "latest",  1 },
+};
+
+/* An answer's body, kept whole, at most 64 KiB. */
+typedef struct recovery_answer {
+	char   text[65536];
+	size_t n;
+} recovery_answer;
+
+static int keep_answer(void *context, const uint8_t *data, size_t n, char *why, size_t cap)
+{
+	recovery_answer *a = context;
+
+	if (n >= sizeof a->text - a->n) {
+		snprintf(why, cap, "Apple's recovery service answered with more than 64 KiB");
+		return -1;
+	}
+	memcpy(a->text + a->n, data, n);
+	a->n += n;
+	a->text[a->n] = '\0';
+	return 0;
+}
+
+/* `n` random bytes as upper-case hex into `out`. */
+static int random_hex(char *out, size_t n)
+{
+	uint8_t bytes[32];
+
+	if (n > sizeof bytes || getrandom(bytes, n, 0) != (ssize_t)n)
+		return -1;
+	for (size_t i = 0u; i < n; i++)
+		sprintf(out + 2u * i, "%02X", bytes[i]);
+	return 0;
+}
+
+/* The value of the answer's line `key: value`, into `out`. */
+static int answer_line(const char *text, const char *key, char *out, size_t cap)
+{
+	size_t n = strlen(key);
+
+	for (const char *line = text; line != NULL && *line != '\0';
+	     line = strchr(line, '\n') != NULL ? strchr(line, '\n') + 1 : NULL) {
+		size_t len = strcspn(line, "\r\n");
+
+		if (len > n + 2u && strncmp(line, key, n) == 0 && line[n] == ':' && line[n + 1u] == ' ' &&
+		    len - n - 2u < cap) {
+			memcpy(out, line + n + 2u, len - n - 2u);
+			out[len - n - 2u] = '\0';
+			return 0;
+		}
+	}
+	return -1;
+}
+
+/* Apple's EFI ROM public key, RSA-2048 with exponent 65537, which signs a
+ * recovery image's chunklist: public, as macrecovery and OSX-KVM carry it. */
+static const char apple_rom_key[] =
+    "C3E748CAD9CD384329E10E25A91E43E1A762FF529ADE578C935BDDF9B13F2179D4855E6FC89E9E29CA1251"
+    "7D17DFA1EDCE0BEBF0EA7B461FFE61D94E2BDF72C196F89ACD3536B644064014DAE25A15DB6BB0852ECBD1"
+    "20916318D1CCDEA3C84C92ED743FC176D0BACA920D3FCF3158AFF731F88CE0623182A8ED67E650515F7574"
+    "5909F07D415F55FC15A35654D118C55A462D37A3ACDA08612F3F3F6571761EFCCBCC299AEE99B3A4FD6212"
+    "CCFFF5EF37A2C334E871191F7E1C31960E010A54E86FA3F62E6D6905E1CD57732410A3EB0C6B4DEFDABE9F"
+    "59BF1618758C751CD56CEF851D1C0EAA1C558E37AC108DA9089863D20E2E7E4BF475EC66FE6B3EFDCF";
+
+/* A chunklist, `CNKL`: a 0x24-byte header, then each chunk's size and
+ * sha256, then Apple's signature over both. */
+#define CHUNKLIST_HEADER 0x24u
+#define CHUNK_ENTRY      0x24u
+#define CHUNKS_MAX       65536u
+
+/* Whether the chunklist `list` of `n` bytes is Apple's: its header and
+ * entries hashed, and the signature after them, a little-endian RSA
+ * number, raised to 65537 modulo Apple's key, PKCS #1 v1.5's padding of
+ * that sha256. Its chunk count into `chunks`. 0, or -1 with `why`. */
+static int chunklist_signed(const uint8_t *list, size_t n, uint64_t *chunks, char *why, size_t cap)
+{
+	static const uint8_t prefix[] = { 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+	                                  0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20 };
+	uint8_t     expected[256];
+	uint8_t     digest[32];
+	uint8_t     got[256];
+	hull_sha256 hash;
+	uint64_t    count, offset, signature;
+	BIGNUM     *key = NULL, *e = NULL, *sig = NULL, *out = NULL;
+	BN_CTX     *ctx = NULL;
+	int         good = 0;
+
+	if (n < CHUNKLIST_HEADER || memcmp(list, "CNKL", 4u) != 0 || list[8] != 1u || list[9] != 1u) {
+		snprintf(why, cap, "the chunklist is not one");
+		return -1;
+	}
+	memcpy(&count, list + 12, 8u);
+	memcpy(&offset, list + 20, 8u);
+	memcpy(&signature, list + 28, 8u);
+	if (list[10] != 1u || count == 0u || count > CHUNKS_MAX || offset != CHUNKLIST_HEADER ||
+	    signature != offset + CHUNK_ENTRY * count || n < signature + 256u) {
+		snprintf(why, cap, "the chunklist is not one Apple signs with its ROM key");
+		return -1;
+	}
+	hull_sha256_init(&hash);
+	hull_sha256_update(&hash, list, (size_t)signature);
+	hull_sha256_final(&hash, digest);
+	/* 0x00 0x01, 0xff to fill, 0x00, the DigestInfo, the digest. */
+	memset(expected, 0xff, sizeof expected);
+	expected[0] = 0x00;
+	expected[1] = 0x01;
+	expected[256 - 32 - sizeof prefix - 1] = 0x00;
+	memcpy(expected + 256 - 32 - sizeof prefix, prefix, sizeof prefix);
+	memcpy(expected + 256 - 32, digest, 32u);
+	if ((ctx = BN_CTX_new()) != NULL && BN_hex2bn(&key, apple_rom_key) > 0 &&
+	    BN_dec2bn(&e, "65537") > 0 && (sig = BN_lebin2bn(list + signature, 256, NULL)) != NULL &&
+	    (out = BN_new()) != NULL && BN_mod_exp(out, sig, e, key, ctx) == 1 &&
+	    BN_bn2binpad(out, got, sizeof got) == (int)sizeof got)
+		good = memcmp(got, expected, sizeof got) == 0;
+	BN_free(key);
+	BN_free(e);
+	BN_free(sig);
+	BN_free(out);
+	BN_CTX_free(ctx);
+	if (!good) {
+		snprintf(why, cap, "the chunklist's signature is not Apple's");
+		return -1;
+	}
+	*chunks = count;
+	return 0;
+}
+
+/* An image streamed to its file, each chunk held to the chunklist's
+ * sha256 as it ends. */
+typedef struct chunked {
+	int            fd;
+	const uint8_t *entries;   /* the chunklist's, each size and sha256 */
+	uint64_t       count;
+	uint64_t       at;        /* the chunk being read */
+	uint32_t       left;      /* its bytes still to come */
+	hull_sha256    hash;
+} chunked;
+
+static int next_chunk(chunked *c)
+{
+	if (c->at >= c->count)
+		return -1;
+	memcpy(&c->left, c->entries + CHUNK_ENTRY * c->at, 4u);
+	hull_sha256_init(&c->hash);
+	return 0;
+}
+
+static int write_chunked(void *context, const uint8_t *data, size_t n, char *why, size_t cap)
+{
+	chunked *c = context;
+
+	while (n > 0u) {
+		size_t  take;
+		ssize_t put;
+
+		if (c->left == 0u && next_chunk(c) != 0) {
+			snprintf(why, cap, "the image is longer than its chunklist says");
+			return -1;
+		}
+		take = n < c->left ? n : c->left;
+		hull_sha256_update(&c->hash, data, take);
+		for (size_t done = 0u; done < take; done += (size_t)put) {
+			put = write(c->fd, data + done, take - done);
+			if (put < 0 && errno == EINTR) {
+				put = 0;
+				continue;
+			}
+			if (put <= 0) {
+				snprintf(why, cap, "the image could not be written: %s", strerror(errno));
+				return -1;
+			}
+		}
+		data += take;
+		n -= take;
+		c->left -= (uint32_t)take;
+		if (c->left == 0u) {
+			uint8_t digest[32];
+
+			hull_sha256_final(&c->hash, digest);
+			if (memcmp(digest, c->entries + CHUNK_ENTRY * c->at + 4u, 32u) != 0) {
+				snprintf(why, cap, "the image's chunk %llu is not the chunklist's",
+				         (unsigned long long)c->at + 1u);
+				return -1;
+			}
+			c->at++;
+		}
+	}
+	return 0;
+}
+
+/* GET `url` with Apple's asset `token`, plain HTTP being taken because
+ * what comes is checked: the body to `body`. */
+static int fetch_checked(const char *url, const char *token, hull_https_body body, void *context,
+                         char *why, size_t cap)
+{
+	char                cookie[2100];
+	const char         *headers[] = { RECOVERY_AGENT, cookie, NULL };
+	hull_https_response got = { 0 };
+	int                 asked;
+
+	snprintf(cookie, sizeof cookie, "Cookie: AssetToken=%s", token);
+	hull_https_plain_digested(1);
+	asked = hull_https_get(url, headers, &got, body, context, why, cap);
+	hull_https_plain_digested(0);
+	if (asked == 0 && got.status != 200) {
+		snprintf(why, cap, "%s answered %d", url, got.status);
+		return -1;
+	}
+	return asked;
+}
+
+/* Whether this host's processors have AVX2. */
+static int host_has_avx2(void)
+{
+	FILE *in = fopen("/proc/cpuinfo", "re");
+	char  line[8192];
+	int   has = 0;
+
+	while (in != NULL && !has && fgets(line, sizeof line, in) != NULL)
+		if (strncmp(line, "flags", 5u) == 0)
+			has = strstr(line, " avx2") != NULL;
+	if (in != NULL)
+		fclose(in);
+	return has;
+}
+
+/* Apple's recovery image for `release` into DIR as BaseSystem.dmg and
+ * BaseSystem.chunklist, as macrecovery fetches it. 0, or -1 with `why`. */
+static int fetch_recovery(const struct mac_release *release, const char *dir, char *why,
+                          size_t cap)
+{
+	static recovery_answer said;
+	const char         *agent[] = { RECOVERY_AGENT, NULL };
+	hull_https_response got = { 0 };
+	char                cid[17], k[65], fg[65];
+	char                body[512];
+	char                cookie[1100];
+	const char         *ask[] = { RECOVERY_AGENT, cookie, "Content-Type: text/plain", NULL };
+	hull_https_upload   up = { 0 };
+	char                image[2048], image_token[2048];
+	char                list[2048], list_token[2048];
+	char                path[PATH_MAX];
+	static uint8_t      entries[CHUNK_ENTRY * CHUNKS_MAX];
+	chunked             chunks = { 0 };
+	int                 fd;
+	int                 status;
+
+	said.n = 0u;
+	if (hull_https_get("https://osrecovery.apple.com/", agent, &got, keep_answer, &said, why,
+	                   cap) != 0)
+		return -1;
+	if (got.cookie[0] == '\0') {
+		snprintf(why, cap, "Apple's recovery service gave no session (answered %d)", got.status);
+		return -1;
+	}
+	snprintf(cookie, sizeof cookie, "Cookie: %s", got.cookie);
+	if (random_hex(cid, 8u) != 0 || random_hex(k, 32u) != 0 || random_hex(fg, 32u) != 0) {
+		snprintf(why, cap, "no random bytes for the request");
+		return -1;
+	}
+	snprintf(body, sizeof body, "cid=%s\nsn=%s\nbid=%s\nk=%s\nfg=%s\nos=%s", cid, release->mlb,
+	         release->board, k, fg, release->os);
+	up.data = (const uint8_t *)body;
+	up.length = (long long)strlen(body);
+	memset(&got, 0, sizeof got);
+	said.n = 0u;
+	if (hull_https_request("POST", "https://osrecovery.apple.com/InstallationPayload/RecoveryImage",
+	                       ask, &up, &got, keep_answer, &said, why, cap) != 0)
+		return -1;
+	if (got.status != 200 || answer_line(said.text, "AU", image, sizeof image) != 0 ||
+	    answer_line(said.text, "AT", image_token, sizeof image_token) != 0 ||
+	    answer_line(said.text, "CU", list, sizeof list) != 0 ||
+	    answer_line(said.text, "CT", list_token, sizeof list_token) != 0) {
+		snprintf(why, cap, "Apple's recovery service named no image for %s (answered %d)",
+		         release->name, got.status);
+		return -1;
+	}
+	/* The chunklist first, Apple's signature on it checked; then the
+	 * image, each of its chunks held to the chunklist as it comes. */
+	said.n = 0u;
+	if (fetch_checked(list, list_token, keep_answer, &said, why, cap) != 0 ||
+	    chunklist_signed((const uint8_t *)said.text, said.n, &chunks.count, why, cap) != 0)
+		return -1;
+	memcpy(entries, said.text + CHUNKLIST_HEADER, (size_t)(CHUNK_ENTRY * chunks.count));
+	chunks.entries = entries;
+	snprintf(path, sizeof path, "%s/BaseSystem.chunklist", dir);
+	if ((fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0 ||
+	    write(fd, said.text, said.n) != (ssize_t)said.n || close(fd) != 0) {
+		snprintf(why, cap, "%s: %s", path, strerror(errno));
+		return -1;
+	}
+	fprintf(stderr, "hull: fetching macOS %s's recovery image from Apple, about 700 MB, each "
+	        "chunk checked against its signed chunklist: %s\n", release->name, image);
+	snprintf(path, sizeof path, "%s/BaseSystem.dmg", dir);
+	if ((chunks.fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)) < 0) {
+		snprintf(why, cap, "%s: %s", path, strerror(errno));
+		return -1;
+	}
+	status = fetch_checked(image, image_token, write_chunked, &chunks, why, cap);
+	close(chunks.fd);
+	if (status == 0 && (chunks.at != chunks.count || chunks.left != 0u)) {
+		snprintf(why, cap, "the image ended at chunk %llu of %llu",
+		         (unsigned long long)chunks.at, (unsigned long long)chunks.count);
+		status = -1;
+	}
+	if (status != 0)
+		unlink(path);
+	return status;
+}
+
+int hull_setup_macos(const char *version, const char *dir, const char *osk, unsigned gigabytes,
+                     char *why, size_t cap)
+{
+	const struct mac_release *release = NULL;
+	char                      key[PATH_MAX];
+	char                      path[PATH_MAX + 64];
+	char                      dmg[PATH_MAX + 64], list[PATH_MAX + 64];
+	char                      sectors[32], size[32];
+	char                     *spec = NULL;
+	struct stat               st;
+	int                       result = -1;
+
+	for (size_t i = 0u; i < sizeof mac_releases / sizeof mac_releases[0]; i++)
+		if (strcmp(mac_releases[i].name, version) == 0)
+			release = &mac_releases[i];
+	if (release == NULL) {
+		snprintf(why, cap, "%s is no release of macOS this knows: high-sierra, mojave, catalina, "
+		         "big-sur, monterey, ventura, sonoma, sequoia or tahoe", version);
+		return -1;
+	}
+	if (release->avx2 && !host_has_avx2()) {
+		snprintf(why, cap, "macOS %s needs AVX2, from Ventura on, and this host's processors "
+		         "have none: Monterey is the newest that runs here", version);
+		return -1;
+	}
+	if (realpath(osk, key) == NULL || stat(key, &st) != 0 || !S_ISREG(st.st_mode) ||
+	    strpbrk(key, "\"\\\n") != NULL) {
+		snprintf(why, cap, "%s: Apple's SMC key, your own, is read from this file as the "
+		         "machine starts, and there is no such file", osk);
+		return -1;
+	}
+	if (mkdir(dir, 0755) != 0) {
+		snprintf(why, cap, "%s: %s", dir, strerror(errno));
+		return -1;
+	}
+	snprintf(path, sizeof path, "%s/OpenCore.qcow2", dir);
+	fprintf(stderr, "hull: fetching OpenCore, OSX-KVM's, 19 MB: %s\n", OPENCORE_URL);
+	if (hull_fetch_file(OPENCORE_URL, OPENCORE_SHA256, path, why, cap) != 0 ||
+	    chmod(path, 0644) != 0 || fetch_recovery(release, dir, why, cap) != 0)
+		goto done;
+	/* The recovery stick: FAT32 with no table, a little over what it
+	 * holds, made and filled by mtools as the user. */
+	snprintf(dmg, sizeof dmg, "%s/BaseSystem.dmg", dir);
+	snprintf(list, sizeof list, "%s/BaseSystem.chunklist", dir);
+	if (stat(dmg, &st) != 0) {
+		snprintf(why, cap, "%s: %s", dmg, strerror(errno));
+		goto done;
+	}
+	snprintf(sectors, sizeof sectors, "%lld",
+	         ((long long)st.st_size / 512 + 2 * 65536 + 2047) / 2048 * 2048);
+	snprintf(path, sizeof path, "%s/recovery.img", dir);
+	{
+		char *format[] = { "mformat", "-C", "-F", "-T", sectors, "-v", "RECOVERY", "-i", path,
+		                   "::", NULL };
+		char *folder[] = { "mmd", "-i", path, "::com.apple.recovery.boot", NULL };
+		char *copy[] = { "mcopy", "-i", path, dmg, list, "::com.apple.recovery.boot/", NULL };
+
+		if (run(format) != 0 || run(folder) != 0 || run(copy) != 0) {
+			snprintf(why, cap, "the recovery disk could not be made with mtools (mformat, mmd, "
+			         "mcopy): is the mtools package installed?");
+			goto done;
+		}
+	}
+	unlink(dmg);
+	unlink(list);
+	snprintf(path, sizeof path, "%s/macos.qcow2", dir);
+	snprintf(size, sizeof size, "%uG", gigabytes);
+	{
+		char *make[] = { "qemu-img", "create", "-q", "-f", "qcow2", path, size, NULL };
+
+		if (run(make) != 0) {
+			snprintf(why, cap, "qemu-img could not make %s", path);
+			goto done;
+		}
+	}
+	if (asprintf(&spec,
+	    "; macOS %s's installer, as hull setup macos made it. Its screen is\n"
+	    "; hull-gui's (Screen): in OpenCore's picker press Space and choose\n"
+	    "; RECOVERY (dmg); then Disk Utility erases the %u GB disk as APFS and\n"
+	    "; Reinstall macOS installs onto it. After, the picker boots the disk,\n"
+	    "; and recovery.img may leave (media ...). Apple's SMC key is read\n"
+	    "; from your own file as the machine starts.\n"
+	    "(machine\n"
+	    "  (backend pc)\n"
+	    "  (hostname \"macos-%s\")\n"
+	    "  (source \"media:disk\")\n"
+	    "  (mutable direct)\n"
+	    "  (memory \"4G\")\n"
+	    "  (cpus 4)\n"
+	    "  (network nat)\n"
+	    "  (display local)\n"
+	    "  (media\n"
+	    "    (medium (type disk) (source \"image:./OpenCore.qcow2\"))\n"
+	    "    (medium (type disk) (source \"image:./recovery.img\"))\n"
+	    "    (medium (type disk) (source \"image:./macos.qcow2\")))\n"
+	    "  (tuning (pc (machine q35) (firmware uefi) (cpu penryn) (vga vmware) (nic vmxnet3)\n"
+	    "              (pointer tablet) (smc \"%s\"))))\n",
+	    release->name, gigabytes, release->name, key) < 0) {
+		spec = NULL;
+		snprintf(why, cap, "out of memory");
+		goto done;
+	}
+	if (put(dir, "hull.conf", spec, 0644, why, cap) != 0)
+		goto done;
+	result = 0;
+done:
+	/* A setup that failed leaves nothing: what it made, by name, and the
+	 * folder it made, so it can be run again. */
+	if (result != 0) {
+		static const char *const made[] = { "OpenCore.qcow2", "BaseSystem.chunklist",
+		                                     "BaseSystem.dmg", "recovery.img", "macos.qcow2",
+		                                     "hull.conf" };
+
+		for (size_t i = 0u; i < sizeof made / sizeof made[0]; i++) {
+			snprintf(path, sizeof path, "%s/%s", dir, made[i]);
+			unlink(path);
+		}
+		rmdir(dir);
+	}
+	free(spec);
+	return result;
+}

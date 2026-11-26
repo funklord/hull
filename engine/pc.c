@@ -79,7 +79,7 @@
 #include "86box.h"
 
 #define PC_MAX_MEDIA 6u    /* four on IDE, two floppy drives */
-#define PC_MAX_ARGS  148u  /* a USB stick takes four, an IDE medium two, a card four */
+#define PC_MAX_ARGS  160u  /* a USB stick takes four, an IDE medium two, a card four */
 #define PC_MAX_CARDS 4u    /* (devices (pci ...)), within PC_MAX_ARGS */
 #define SECURE_CODE  "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"
 #define SECURE_VARS  "/usr/share/OVMF/OVMF_VARS_4M.ms.fd"
@@ -148,6 +148,8 @@ struct hull_machine {
 	char           *segment[PC_MAX_SEGMENTS];  /* Appendix D's wires, by name */
 	int             segment_fd[PC_MAX_SEGMENTS];
 	char           *lora;           /* (tuning (pc (lora NAME))): the air its radio is on */
+	char           *smc;            /* (tuning (pc (smc PATH))): the file holding Apple's SMC key */
+	char            osk[65];        /* and the key, read from it as the machine starts */
 	int             lora_fd;        /* the air's port on the core's switch */
 	unsigned        segment_count;
 	char           *display;        /* the run's X display, or NULL */
@@ -341,6 +343,7 @@ static void release(hull_machine *m)
 	free(m->firmware);
 	free(m->nic);
 	free(m->lora);
+	free(m->smc);
 	if (m->lora_fd >= 0)
 		close(m->lora_fd);
 	hull_hostdev_unclaim(m);
@@ -1483,6 +1486,16 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 				}
 			}
 			{
+				char *smc = hull_access_value(doc, &pc, "smc");
+
+				if (smc != NULL) {
+					m->smc = hull_access_path(doc, smc);
+					free(smc);
+					if (m->smc == NULL)
+						return "the SMC key's path cannot be read";
+				}
+			}
+			{
 				char *state = hull_access_value(doc, &pc, "state");
 
 				if (state != NULL) {
@@ -1553,6 +1566,8 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 		if (m->vnc || m->display != NULL || m->vga != NULL || m->sound != NULL || m->gpu != 0 ||
 		    m->tablet)
 			return "a board has no screen or sound of qemu's: its serial port is what it says";
+		if (m->smc != NULL)
+			return "a board has no Apple SMC: (smc PATH) is a Mac's, on a q35 PC";
 		if (m->memory != NULL || m->cpus != NULL || m->cpu != NULL)
 			return "a board's memory and CPU are its microcontroller's";
 		if (m->tpm || m->firmware != NULL || m->secure || m->state != NULL || m->boot_key != 0)
@@ -1845,7 +1860,32 @@ static void exec_pc(const hull_machine *m)
 	if (m->cpu != NULL) {
 		argv[n++] = "-cpu";
 		argv[n++] = strcmp(m->cpu, "host") == 0 ? (strcmp(accel, "kvm") == 0 ? "host" : "max") :
-		            strcmp(m->cpu, "skylake") == 0 ? "Skylake-Client" : m->cpu;
+		            strcmp(m->cpu, "skylake") == 0 ? "Skylake-Client" :
+		            /* macOS's, as the OSX-KVM projects give it: Intel's by
+		             * vendor, its TSC invariant and its frequency told. */
+		            strcmp(m->cpu, "penryn") != 0 ? m->cpu :
+		            strcmp(accel, "kvm") == 0 ?
+		            "Penryn,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,+ssse3,"
+		            "+sse4.2,+popcnt" :
+		            "Penryn,vendor=GenuineIntel,+ssse3,+sse4.2,+popcnt";
+	}
+	/* Apple's SMC, which macOS asks for its key before it boots, the key
+	 * the user's (read in launch()); and its keyboard and pointer on an
+	 * xHCI, macOS having no PS/2 driver and, since Big Sur, no UHCI. */
+	if (m->smc != NULL) {
+		static __thread char smc[96];
+
+		snprintf(smc, sizeof smc, "isa-applesmc,osk=%s", m->osk);
+		argv[n++] = "-device";
+		argv[n++] = smc;
+		argv[n++] = "-smbios";
+		argv[n++] = "type=2";
+		argv[n++] = "-device";
+		argv[n++] = "qemu-xhci,id=apple";
+		argv[n++] = "-device";
+		argv[n++] = "usb-kbd,bus=apple.0";
+		argv[n++] = "-device";
+		argv[n++] = "usb-tablet,bus=apple.0";
 	}
 	/* 3D: virtio-vga-gl, VGA for the firmware and the boot, the guest's
 	 * OpenGL (virgl) or Vulkan (Venus) rendered on the host's GPU. */
@@ -1908,8 +1948,9 @@ static void exec_pc(const hull_machine *m)
 	/* A USB tablet: a pointer at absolute positions, as hull-gui's screen
 	 * and VNC give them, where a PS/2 mouse moves by deltas alone and a
 	 * guest's pointer drifts from the viewer's. On a UHCI of its own, the
-	 * one every Windows from 98 and every Linux drives, on q35 too. */
-	if (m->tablet) {
+	 * one every Windows from 98 and every Linux drives, on q35 too; a Mac's
+	 * is on its xHCI, above. */
+	if (m->tablet && m->smc == NULL) {
 		argv[n++] = "-device";
 		argv[n++] = "piix3-usb-uhci,id=pointer";
 		argv[n++] = "-device";
@@ -2359,6 +2400,33 @@ static void close_all(int *fds, unsigned n)
  * of it left open, the core living on past a failure. Forked from the
  * thread that lives as long as it, PR_SET_PDEATHSIG going by the thread
  * and not the process. */
+/* Apple's SMC key from the user's file: 64 printable characters, a line
+ * end after them allowed. Apple's, so never in hull's tree or its plans;
+ * read as the machine starts, into m->osk. 0, or -1 with m->why. */
+static int read_osk(hull_machine *m)
+{
+	char    key[80];
+	FILE   *in = fopen(m->smc, "re");
+	size_t  got = in != NULL ? fread(key, 1u, sizeof key - 1u, in) : 0u;
+
+	if (in != NULL)
+		fclose(in);
+	while (got > 0u && (key[got - 1u] == '\n' || key[got - 1u] == '\r'))
+		got--;
+	key[got] = '\0';
+	for (size_t i = 0u; i < got; i++)
+		if (key[i] < 0x20 || key[i] > 0x7e || key[i] == ',')
+			got = 0u;
+	if (in == NULL || got != 64u) {
+		snprintf(m->why, sizeof m->why, "(smc %s): Apple's SMC key is 64 characters, read from "
+		         "this file, the user's own: %s\n", m->smc,
+		         in == NULL ? strerror(errno) : "it holds no such key");
+		return -1;
+	}
+	memcpy(m->osk, key, 65u);
+	return 0;
+}
+
 static int launch(hull_machine *m)
 {
 	int   fds[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
@@ -2372,6 +2440,8 @@ static int launch(hull_machine *m)
 		snprintf(m->why, sizeof m->why, "%s\n", venus);
 		return -1;
 	}
+	if (m->smc != NULL && read_osk(m) != 0)
+		return -1;
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, in) != 0 ||
 	    socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, monitor) != 0) {
 		snprintf(m->why, sizeof m->why, "a socket for the machine could not be made\n");
@@ -3581,6 +3651,8 @@ static const hull_cap_entry entries[] = {
 	{ "pc.nic.rtl8139", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.nic.e1000", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.nic.e1000e", HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.nic.vmxnet3", HULL_SUP_NATIVE,
+	  "VMware's paravirtual card, which macOS drives from 10.11 on", NULL },
 	{ "pc.cpu.host", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.cpu.max", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.cpu.qemu64", HULL_SUP_NATIVE, NULL, NULL },
@@ -3589,6 +3661,11 @@ static const hull_cap_entry entries[] = {
 	{ "pc.cpu.pentium3", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.cpu.core2duo", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.cpu.skylake", HULL_SUP_NATIVE, NULL, NULL },
+	{ "pc.cpu.penryn", HULL_SUP_NATIVE,
+	  "Intel's Penryn as macOS is booted on it, GenuineIntel, its TSC invariant under KVM", NULL },
+	{ "pc.smc.path", HULL_SUP_NATIVE,
+	  "Apple's SMC, qemu's isa-applesmc, its key read from the file as the machine starts, "
+	  "with a USB keyboard and tablet on an xHCI, macOS having no PS/2 or UHCI driver", NULL },
 	{ "pc.nic.virtio", HULL_SUP_NATIVE, NULL, NULL },
 	{ "pc.nic.wifi", HULL_SUP_NATIVE,
 	  "an ESP32's WiFi, ESP-IDF's own driver against the chip's MAC, joined to an open access "

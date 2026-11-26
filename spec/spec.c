@@ -598,9 +598,9 @@ static const char *const pc_machine_values[] = {
 static const char *const pc_vga_values[]     = { "std", "cirrus", "vmware", "virtio", "none", NULL };
 
 static const char *const pc_nic_values[]     = { "ne2k_pci", "ne2k_isa", "pcnet", "rtl8139",
-                                                 "e1000", "e1000e", "virtio", "wifi", NULL };
+                                                 "e1000", "e1000e", "virtio", "vmxnet3", "wifi", NULL };
 static const char *const pc_cpu_values[]     = { "host", "max", "qemu64", "486", "pentium",
-                                                 "pentium3", "core2duo", "skylake", NULL };
+                                                 "pentium3", "core2duo", "skylake", "penryn", NULL };
 
 static const char *const pc_firmware_values[] = { "bios", "uefi", "uefi-secure", NULL };
 
@@ -622,6 +622,7 @@ static const key pc_keys[] = {
 	{ .name = "lora",    .type = STRING, .value = nonempty },
 	{ .name = "gpu",     .type = CHOICE, .choices = gpu_values },
 	{ .name = "pointer", .type = CHOICE, .choices = pc_pointer_values },
+	{ .name = "smc",     .type = STRING, .value = nonempty },
 };
 static const schema pc = TABLE(pc_keys);
 

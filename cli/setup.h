@@ -39,4 +39,14 @@ int hull_setup_reactos(const char *iso, const char *dir, unsigned megabytes, cha
  * must not exist. */
 int hull_setup_msdos(const char *boot, const char *dir, unsigned megabytes, char *why, size_t cap);
 
+/* A machine directory DIR for macOS VERSION -- high-sierra to tahoe --
+ * from Apple's own recovery image, booted by OSX-KVM's OpenCore, both
+ * fetched and held to their sha256: a recovery disk, a blank disk of
+ * `gigabytes`, and hull.conf, whose installer the user runs on its screen.
+ * `osk` is the user's file holding Apple's SMC key, which the machine
+ * reads as it starts and hull never copies. 0, or -1 with `why`; DIR must
+ * not exist. */
+int hull_setup_macos(const char *version, const char *dir, const char *osk, unsigned gigabytes,
+                     char *why, size_t cap);
+
 #endif

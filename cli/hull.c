@@ -178,6 +178,7 @@ static void usage(FILE *out)
 	      "       hull setup freedos [--size MB] [--packages IMAGE] BOOT DIR\n"
 	      "       hull setup reactos [--size MB] ISO DIR\n"
 	      "       hull setup msdos [--size MB] FLOPPY DIR\n"
+	      "       hull setup macos [--size GB] --osk FILE VERSION DIR\n"
 	      "       hull up [-f COMPOSE-FILE] [--backend B] [--profile P]... [NAME]\n"
 	      "       hull core\n"
 	      "       hull engines | hull doctor\n"
@@ -9068,6 +9069,44 @@ int main(int argc, char **argv)
 		}
 		printf("%s: hull run -f %s/install.conf installs ReactOS, unattended, and powers off; "
 		       "then hull run -f %s/machine.conf\n", argv[at + 1], argv[at + 1], argv[at + 1]);
+		return 0;
+	}
+	/* `hull setup macos [--size GB] --osk FILE VERSION DIR` (setup.c). */
+	if (strcmp(command, "setup") == 0 && argc >= 5 && strcmp(argv[2], "macos") == 0) {
+		char          why[4400] = "";
+		unsigned long size = 64ul;
+		const char   *osk = NULL;
+		int           at = 3;
+
+		while (at + 1 < argc && strncmp(argv[at], "--", 2u) == 0) {
+			if (strcmp(argv[at], "--osk") == 0) {
+				osk = argv[at + 1];
+			} else if (strcmp(argv[at], "--size") == 0) {
+				char *end = NULL;
+
+				size = strtoul(argv[at + 1], &end, 10);
+				if (end == argv[at + 1] || *end != '\0' || size < 20ul || size > 8192ul) {
+					fprintf(stderr, "hull: setup: --size is the disk's gigabytes, 20 or more\n");
+					return 2;
+				}
+			} else {
+				break;
+			}
+			at += 2;
+		}
+		if (osk == NULL || at + 2 != argc) {
+			fprintf(stderr, "usage: hull setup macos [--size GB] --osk FILE VERSION DIR\n"
+			        "  FILE holds Apple's SMC key, your own; VERSION is high-sierra, mojave,\n"
+			        "  catalina, big-sur, monterey, ventura, sonoma, sequoia or tahoe\n");
+			return 2;
+		}
+		if (hull_setup_macos(argv[at], argv[at + 1], osk, (unsigned)size, why, sizeof why) != 0) {
+			fprintf(stderr, "hull: setup: %s\n", why);
+			return 1;
+		}
+		printf("%s: hull run -f %s/hull.conf; on its screen, in hull-gui, press Space in "
+		       "OpenCore's picker and choose RECOVERY (dmg) to install\n", argv[at + 1],
+		       argv[at + 1]);
 		return 0;
 	}
 	/* `hull setup msdos [--size MB] FLOPPY DIR` (setup.c). */

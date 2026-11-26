@@ -59,6 +59,14 @@ void hull_https_allow_loopback(void)
 	plain_allowed = 1;
 }
 
+/* And a digested download's, on its thread alone (https.h). */
+static __thread int plain_digested;
+
+void hull_https_plain_digested(int on)
+{
+	plain_digested = on;
+}
+
 static int parse_url(const char *text, url *out)
 {
 	const char *at;
@@ -66,7 +74,7 @@ static int parse_url(const char *text, url *out)
 	const char *colon;
 	size_t      n;
 
-	out->plain = plain_allowed && strncmp(text, "http://", 7u) == 0;
+	out->plain = (plain_allowed || plain_digested) && strncmp(text, "http://", 7u) == 0;
 	if (!out->plain && strncmp(text, "https://", 8u) != 0)
 		return -1;
 	at = text + (out->plain ? 7 : 8);
@@ -285,7 +293,7 @@ static int open_conn(conn *c, const url *u, char *why, size_t cap)
 		return -1;
 	if (u->plain || (plain_allowed && known_plain(u))) {
 		c->plain = 1;
-		return peer_is_loopback(c->fd) ? 0 :
+		return plain_digested || peer_is_loopback(c->fd) ? 0 :
 		       say(why, cap, u->host, "plain HTTP is taken from this machine's loopback alone");
 	}
 	if ((c->ssl = SSL_new(ctx)) == NULL || SSL_set_fd(c->ssl, c->fd) != 1)
@@ -522,6 +530,7 @@ int hull_https_request(const char *method, const char *text, const char *const *
                        hull_https_body body, void *context, char *why, size_t cap)
 {
 	int    sends = strcmp(method, "POST") == 0 || strcmp(method, "PUT") == 0;
+	int    agent_given = 0;
 	url    u;
 	conn   c;
 	char  *request;
@@ -549,11 +558,15 @@ int hull_https_request(const char *method, const char *text, const char *const *
 		free(request);
 		return say(why, cap, method, "not a method this sends");
 	}
+	/* hull's agent, unless the caller names one: Apple's recovery service
+	 * answers its own alone. */
+	for (const char *const *h = headers; h != NULL && *h != NULL && !agent_given; h++)
+		agent_given = strncasecmp(*h, "User-Agent:", 11u) == 0;
 	length = (size_t)snprintf(request, room,
-	                          "%s %s HTTP/1.1\r\nHost: %s%s%s\r\nUser-Agent: hull\r\n"
+	                          "%s %s HTTP/1.1\r\nHost: %s%s%s\r\n%s"
 	                          "Accept-Encoding: identity\r\nConnection: close\r\n",
 	                          method, u.path, u.host, u.port_given ? ":" : "",
-	                          u.port_given ? u.port : "");
+	                          u.port_given ? u.port : "", agent_given ? "" : "User-Agent: hull\r\n");
 	for (const char *const *h = headers; h != NULL && *h != NULL; h++)
 		length += (size_t)snprintf(request + length, room - length, "%s\r\n", *h);
 	if (sends)
@@ -590,6 +603,10 @@ int hull_https_request(const char *method, const char *text, const char *const *
 		header_value(line, "WWW-Authenticate", out->authenticate, sizeof out->authenticate);
 		header_value(line, "Content-Type", out->content_type, sizeof out->content_type);
 		header_value(line, "Docker-Content-Digest", out->digest, sizeof out->digest);
+		header_value(line, "Set-Cookie", out->cookie, sizeof out->cookie);
+		/* NAME=VALUE alone, its attributes no part of what is sent back. */
+		if (out->cookie[0] != '\0' && strchr(out->cookie, ';') != NULL)
+			*strchr(out->cookie, ';') = '\0';
 	}
 	if (content_length[0] != '\0') {
 		char *end;

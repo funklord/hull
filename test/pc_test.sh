@@ -262,6 +262,37 @@ got=$?
 status 'a .vbox with its sound and a tablet boots' "$got" 0 "$out"
 says 'its VDI, beside a UHCI and its tablet' "$out" 'word: fresh'
 
+# A Mac's devices (hull setup macos's machine): Apple's SMC, its key read
+# from the user's file as the machine starts, a Penryn by Intel's name
+# and VMware's card, all planned native; no key file, and a key not 64
+# characters, refused at the start naming the file; a key of 64 (not
+# Apple's) and the test's sector boots on q35 with all of them there; a
+# board with an SMC refused.
+image 1M "$root/mac.img"
+conf '(source "media:disk") (network nat) (media (medium (type disk) (source "image:./mac.img")))' \
+	'(tuning (pc (machine q35) (cpu penryn) (nic vmxnet3) (smc "./osk.txt")))'
+out=$("$hull" plan --explain -f "$root/hull.conf" 2>&1)
+says "a Mac's SMC planned" "$out" 'pc.smc.path: native'
+says 'a Penryn planned' "$out" 'pc.cpu.penryn: native'
+says "VMware's card planned" "$out" 'pc.nic.vmxnet3: native'
+rm -f "$root/osk.txt"
+run
+status 'no SMC key file is refused' "$got" 125 "$out"
+says 'naming what it wants' "$out" "Apple's SMC key is 64 characters"
+printf 'too short\n' > "$root/osk.txt"
+run
+status 'an SMC key not 64 characters is refused' "$got" 125 "$out"
+printf '%064d\n' 0 > "$root/osk.txt"
+run
+status 'a machine with an SMC boots' "$got" 0 "$out"
+says 'from its drive' "$out" 'booted from a drive'
+printf '(machine (backend pc) (source "image:./mac.img") (tuning (pc (machine arduino-uno) (smc "./osk.txt"))))\n' \
+	> "$root/hull.conf"
+run
+status 'a board with an SMC is refused' "$got" 125 "$out"
+says 'and said' "$out" 'no Apple SMC'
+rm -f "$root/osk.txt" "$root/mac.img"
+
 # Imported, as hull-gui's Import is: the .vbox copied into a folder of
 # its own, its VDI converted to qcow2 there and its hull.conf saying so,
 # changes kept in the copy; the copy boots, the VDI is as it was, a
