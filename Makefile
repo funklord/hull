@@ -443,7 +443,7 @@ TEST_BINS = $(BUILD_DIR)/test/sexpr_test $(BUILD_DIR)/test/framing_test \
 CPPFLAGS += -I. -Isexpr -Iagent -Ispec -Iplan -Iengine -Istore -Ioci -Icli -Icore -I$(GEN_DIR) -I$(SITU_DIR)/runtime/c
 
 .PHONY: esp-qemu-lora check-tsan
-.PHONY: all install uninstall gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-windows kernel-check kernel-cves check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-ppc64le-host check-root check-systemd check-vfio check-disk check-usb check-usbredir check-vhost vhost-device dosemu2 cross-ppc64le qemu-ppc check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
+.PHONY: all install uninstall deb deb-clean gui check-gui kernel limine nss root install-root check check-docker check-pc check-hw check-broker check-broker-wire check-virtiofs check-images check-legacy check-windows kernel-check kernel-cves check-remote check-qemu check-screen check-86box check-arm64-host check-riscv64-host check-s390x-host check-ppc64le-host check-root check-systemd check-vfio check-disk check-usb check-usbredir check-vhost vhost-device dosemu2 cross-ppc64le qemu-ppc check-board check-sanitize sanitize-run check-fuzz check-flip test vectors style style-source style-tool style-docs contract hooks clean help install-nss install-apparmor FORCE
 
 # The software: hull, and the agent its vm and emu engines boot. The NSS
 # module is a helper beside it, which nothing in hull needs to run and
@@ -515,7 +515,8 @@ $(QMAKE_PATHS): FORCE
 $(BUILD_DIR)/qtty/Makefile: $(QTTY_DIR)/src/src.pro $(QTTY_DIR)/qtty.pri $(QMAKE_PATHS)
 	@mkdir -p '$(@D)'
 	cd '$(@D)' && $(QMAKE) '$(CURDIR)/$(QTTY_DIR)/src/src.pro' \
-	    QTTY_LIB_DIR='$(abspath $(BUILD_DIR))/qtty/lib'
+	    QTTY_LIB_DIR='$(abspath $(BUILD_DIR))/qtty/lib' \
+	    "QMAKE_CXXFLAGS+=$$GUI_HANDED_CXXFLAGS" "QMAKE_LFLAGS+=$$GUI_HANDED_LFLAGS"
 
 $(QTTY_LIB): $(BUILD_DIR)/qtty/Makefile FORCE
 	$(MAKE) -C '$(BUILD_DIR)/qtty'
@@ -524,7 +525,8 @@ $(QTTY_LIB): $(BUILD_DIR)/qtty/Makefile FORCE
 $(BUILD_DIR)/gui/Makefile: gui/gui.pro $(QTKIT_DIR)/qtkit.pri $(GUI_QTTY) $(QMAKE_PATHS)
 	@mkdir -p '$(@D)'
 	cd '$(@D)' && $(QMAKE) '$(CURDIR)/gui/gui.pro' HULL_BUILD='$(abspath $(BUILD_DIR))' \
-	    $(if $(GUI_QTTY),QTTY_LIB_DIR='$(abspath $(BUILD_DIR))/qtty/lib')
+	    $(if $(GUI_QTTY),QTTY_LIB_DIR='$(abspath $(BUILD_DIR))/qtty/lib') \
+	    "QMAKE_CXXFLAGS+=$$GUI_HANDED_CXXFLAGS" "QMAKE_LFLAGS+=$$GUI_HANDED_LFLAGS"
 
 $(GUI_BIN): $(BUILD_DIR)/gui/Makefile $(CLIENT_LIB) $(GUI_QTTY) $(GUI_SOURCES)
 	$(MAKE) -C '$(BUILD_DIR)/gui'
@@ -614,6 +616,7 @@ help:
 	@echo '  hooks     install the commit-msg hook from tool/hooks/'
 	@echo '  install   hull, what it reads beside itself and hull-gui, under PREFIX'
 	@echo '  uninstall what install wrote, by name'
+	@echo '  deb       Debian packages of hull and hull-gui, into DEB_DIR (build/deb)'
 	@echo '  install-nss  as root: libnss_hull.so.2 into NSS_LIBDIR, for *.hull names'
 	@echo '  install-apparmor  as root: a profile letting hull make user namespaces'
 	@echo '  install-root  as root: hull-root setuid into ROOT_HELPER, and its listing'"'"'s'
@@ -950,6 +953,35 @@ uninstall:
 		echo "rm -rf $(DESTDIR)$(HULL_LIBEXEC)/$$d"; rm -rf '$(DESTDIR)$(HULL_LIBEXEC)'/$$d; \
 	done
 	-rmdir '$(DESTDIR)$(HULL_LIBEXEC)' 2> /dev/null
+
+# Debian packages, hull and hull-gui, by dpkg-buildpackage driving the dh
+# rules in debian/ (debian-packaging skill), into DEB_DIR. The package build
+# keeps its own object tree, DEB_BUILD_DIR, dpkg's flags not being a plain
+# build's; -nc so a second `make deb` compiles nothing, with the stamp and
+# debhelper's working state removed first, or dh would package what the
+# last build left and its -dbgsym would gather every build's debug files.
+# A from-clean package is `make clean deb`.
+DEB_DIR       ?= $(BUILD_DIR)/deb
+DEB_BUILD_DIR ?= build-deb
+DEB_PACKAGES   = hull hull-dbgsym hull-gui hull-gui-dbgsym
+
+deb:
+	rm -f debian/debhelper-build-stamp
+	rm -rf debian/.debhelper
+	env -u CFLAGS -u LDFLAGS dpkg-buildpackage -b -us -uc -nc
+	@mkdir -p '$(DEB_DIR)'
+	@for f in $(foreach p,$(DEB_PACKAGES),../$(p)_$(VERSION)_*.deb) \
+	          ../hull_$(VERSION)_*.buildinfo ../hull_$(VERSION)_*.changes; do \
+		[ -e "$$f" ] && mv -f "$$f" '$(DEB_DIR)/' || true; \
+	done
+	@ls -1 '$(DEB_DIR)'/*.deb
+
+# The package's own object tree, by its name; what debian/rules clean
+# runs, so a bare dpkg-buildpackage leaves the plain build alone.
+deb-clean:
+	@case '$(DEB_BUILD_DIR)' in ''|/*|*..*|.|./) \
+		echo "deb-clean: refusing DEB_BUILD_DIR '$(DEB_BUILD_DIR)'" >&2; exit 1 ;; esac
+	rm -rf '$(DEB_BUILD_DIR)'
 
 # The one step of section 8.1's names that needs root: run it as root,
 # then put `hull` on the hosts line of /etc/nsswitch.conf, before `dns`.
@@ -1674,7 +1706,7 @@ hooks:
 	echo "hooks: commit-msg installed from tool/hooks/ into $$dir/hooks/"
 
 # Named files only, each printed as it goes. The directories stay.
-clean:
+clean: deb-clean
 	@rm -fv $(TEST_BINS) $(TEST_OBJS) $(TEST_OBJS:.o=.d) \
 	        $(SEXPR_OBJS) $(SEXPR_OBJS:.o=.d) $(GEN_SOURCES) $(GEN_HEADERS) \
 	        $(AGENT_OBJS) $(AGENT_OBJS:.o=.d) $(AGENT_GEN) \

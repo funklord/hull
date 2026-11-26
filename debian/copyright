@@ -1,0 +1,14 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: hull
+Source: https://github.com/funklord/hull
+
+Files: *
+Copyright: 2026 Nabeel Sowan <nabeel@vibes.se>
+License: UNDECIDED
+ No licence has been declared for this source tree: there is no LICENSE
+ file. Under copyright law the default in that situation is that no rights
+ are granted, so these packages are built for local evaluation and are not
+ distributable as they stand.
+ .
+ This file is the packaging stating what it found rather than choosing on
+ the project's behalf.

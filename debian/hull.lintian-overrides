@@ -1,0 +1,4 @@
+# The guest agent runs inside each machine, whose root is any tree at
+# all -- busybox, Alpine's musl, a Debian of another release -- so it can
+# rely on no libc of the guest's: static on purpose (project.md, Appendix B).
+hull: statically-linked-binary [usr/libexec/hull/hull-agent]

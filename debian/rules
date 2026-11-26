@@ -1,0 +1,52 @@
+#!/usr/bin/make -f
+#
+# hull and hull-gui by dh, from the root Makefile's own targets.
+
+# -Os, the size rule, which dpkg's -O2 would replace: appended, so it
+# comes last and wins. The section flags are outside CFLAGS and stay.
+export DEB_CFLAGS_MAINT_APPEND = -Os
+
+# The window's: dpkg's flags handed to qmake through the environment,
+# which the root Makefile passes on as QMAKE_CXXFLAGS+= and QMAKE_LFLAGS+=,
+# -O dropped for gui.pro's -Os. Never CXXFLAGS on a make command line,
+# which would replace qmake's own line.
+export GUI_HANDED_CXXFLAGS = $(filter-out -O%,$(CPPFLAGS) $(CXXFLAGS))
+export GUI_HANDED_LFLAGS = $(LDFLAGS)
+
+include /usr/share/dpkg/architecture.mk
+
+# The package's own object tree, not build/: dpkg's flags are not a plain
+# build's. Cross compilers named empty: a package carries the agent for
+# its own architecture, a foreign one being another architecture's binary
+# in it, which lintian refuses.
+DEB_BUILD_DIR ?= build-deb
+HULL_TREE = BUILD_DIR='$(DEB_BUILD_DIR)' ARM64_CC= RISCV64_CC= S390X_CC= ARM_CC= PPC64LE_CC= \
+            AMD64_CC=
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) all nss gui $(HULL_TREE)
+
+override_dh_auto_install:
+	$(MAKE) install DESTDIR=$(CURDIR)/debian/tmp PREFIX=/usr $(HULL_TREE)
+	$(MAKE) install-nss DESTDIR=$(CURDIR)/debian/tmp NSS_LIBDIR=/usr/lib/$(DEB_HOST_MULTIARCH) \
+	    $(HULL_TREE)
+
+# dh_auto_clean would run the Makefile's clean, the plain build's objects
+# with it; the package's own tree alone. `make deb` passes -nc and runs
+# none of this.
+override_dh_auto_clean:
+	$(MAKE) deb-clean DEB_BUILD_DIR='$(DEB_BUILD_DIR)'
+
+# The suites are `make test` and the check- targets: they start machines,
+# which a package build has no business doing.
+override_dh_auto_test:
+
+# dh_clean deletes every *.orig, *.rej and *~ in the tree, and build/
+# holds the crates cargo fetched for vhost-device, each with the
+# Cargo.toml.orig it was published with: the plain build is not the
+# package's to touch.
+override_dh_clean:
+	dh_clean -Xbuild/

@@ -828,6 +828,7 @@ make check-flip    # one project, unchanged, on chroot, vm, emu and docker
 make check-docker  # the docker adapter, against the daemon
 make hooks   # install the commit-msg hook
 make install PREFIX=~/.local   # hull, its agents, kernel and hull-gui; /usr/local by default
+make deb     # Debian packages of hull and hull-gui, into build/deb
 ```
 
 `make install` puts hull and what it reads beside itself in

@@ -1,0 +1,36 @@
+Source: hull
+Section: admin
+Priority: optional
+Maintainer: Nabeel Sowan <nabeel@vibes.se>
+Homepage: https://github.com/funklord/hull
+Build-Depends: debhelper-compat (= 13), python3, gcc, make, libssl-dev, zlib1g-dev,
+ libzstd-dev, liblzma-dev, qt6-base-dev, qmake6, g++, libgio-2.0-dev, libegl-dev
+Rules-Requires-Root: no
+
+Package: hull
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: qemu-system-x86, qemu-utils, passt
+Suggests: virtiofsd, hull-gui
+Description: runs one machine spec as a container, a VM or an emulation
+ hull reads a machine from a plain hull.conf beside the directory it runs,
+ and runs it in user namespaces, under KVM, in full software emulation,
+ under Docker or VirtualBox, or as a whole PC or microcontroller board of
+ its own, by changing one line. Nothing runs as root: the resident part is
+ a per-user core, started when needed and gone when idle. Images are an
+ optional store; a directory is enough.
+ .
+ This package carries hull, its guest agent for the host's architecture
+ and the NSS module that names machines, which /etc/nsswitch.conf must
+ list to be used. hull's own guest kernel is `make kernel`'s and is not
+ packaged: a vm boots the host's kernel until it is built.
+
+Package: hull-gui
+Architecture: any
+Depends: hull (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}
+Description: machine manager window for hull, on the desktop or a terminal
+ hull-gui lists hull's machines -- those added to it, those in ~/hull and
+ those running -- and starts, stops and watches them, with their plans,
+ output, resources, networks, terminals and screens. It imports and clones
+ VirtualBox and VMware machines into folders of their own. hull-tui is the
+ same window drawn on a terminal.

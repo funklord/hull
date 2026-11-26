@@ -1,0 +1,5 @@
+hull (0.1) unstable; urgency=medium
+
+  * Package with debhelper: hull, its agent and NSS module, and hull-gui.
+
+ -- Nabeel Sowan <nabeel@vibes.se>  Thu, 26 Nov 2026 21:30:00 +0000

@@ -7,3 +7,13 @@ build/
 /hull-agent
 /libnss_hull.so
 /nss_hull.pc
+# What dpkg-buildpackage leaves: the package's object tree and debhelper's.
+/build-deb/
+/debian/.debhelper/
+/debian/debhelper-build-stamp
+/debian/files
+/debian/*.substvars
+/debian/*.debhelper.log
+/debian/tmp/
+/debian/hull/
+/debian/hull-gui/

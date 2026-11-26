@@ -1,0 +1,7 @@
+usr/bin/hull-gui
+usr/bin/hull-tui
+usr/libexec/hull/hull-gui
+usr/share/applications/se.vibes.hull-gui.desktop
+usr/share/icons/hicolor/*/apps/se.vibes.hull-gui.*
+usr/share/man/man1/hull-gui.1
+usr/share/man/man1/hull-tui.1

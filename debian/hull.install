@@ -1,0 +1,5 @@
+usr/bin/hull
+usr/libexec/hull/hull
+usr/libexec/hull/hull-agent
+usr/lib/*/libnss_hull.so.2
+usr/share/man/man1/hull.1
