@@ -177,6 +177,7 @@ struct hull_machine {
 	int              profile_full; /* (profile full): a q35 machine whatever the kernel */
 	int              micro;        /* this start is a microvm: virtio-mmio, no PCI */
 	char            *volume_host[MAX_VOLUMES];
+	char            *volume_guest[MAX_VOLUMES];  /* where the guest mounts it */
 	int              volume_readonly[MAX_VOLUMES];
 	hull_stack       volume_stack[MAX_VOLUMES];  /* a volume of (layers ...), or count 0 */
 	const char      *volume_block[MAX_VOLUMES];  /* (block ...): its filesystem's module, else NULL */
@@ -480,8 +481,10 @@ static void release(hull_machine *m)
 	free(m->xauthority);
 	free(m->composefs);
 	free(m->verity_disk);
-	for (unsigned i = 0u; i < m->volume_count; i++)
+	for (unsigned i = 0u; i < m->volume_count; i++) {
 		free(m->volume_host[i]);
+		free(m->volume_guest[i]);
+	}
 	for (unsigned i = 0u; i < m->volume_count; i++)
 		hull_stack_release(&m->volume_stack[i]);
 	for (unsigned i = 0u; i < m->segment_count; i++)
@@ -973,6 +976,7 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc)
 			}
 			unsigned    i = m->volume_count++;
 
+			m->volume_guest[i] = hull_access_value(doc, &item, "guest");
 			m->volume_readonly[i] = mode != NULL && strcmp(mode, "ro") == 0;
 			free(mode);
 			if ((why = hull_access_stack(doc, &item, m->volume_readonly[i],
@@ -4660,6 +4664,47 @@ static int launch(hull_machine *m, const char *kernel, const char *mbuf, int sha
 	return dial(m, cid);
 }
 
+/* A volume at /lib/modules, /usr/lib/modules or above either covers the
+ * modules hull shares there for its own kernel, and modprobe then finds
+ * the volume's trees, for other kernels, and not the one booted: netcfgd's
+ * `veth` "Unknown device type" (inbox 20261124T1905Z), its conf mounting
+ * the host's /lib/modules for the host's kernel. Said on the machine's
+ * stderr as it starts, the volume being the file's to drop. */
+static void warn_covered_modules(hull_machine *m, const char *modules)
+{
+	static const char *const shared[] = { "/lib/modules", "/usr/lib/modules" };
+	const char              *release = strrchr(modules, '/') != NULL ? strrchr(modules, '/') + 1 :
+	                                   modules;
+
+	for (unsigned i = 0u; i < m->volume_count; i++) {
+		const char *guest = m->volume_guest[i];
+		size_t      n;
+
+		if (guest == NULL)
+			continue;
+		n = strlen(guest);
+		while (n > 1u && guest[n - 1u] == '/')
+			n--;
+		for (unsigned k = 0u; k < 2u; k++) {
+			char line[900];
+			int  said;
+
+			if (strncmp(shared[k], guest, n) != 0 ||
+			    (shared[k][n] != '\0' && shared[k][n] != '/'))
+				continue;
+			said = snprintf(line, sizeof line, "hull: the volume at %.*s covers the modules of "
+			                "the kernel this machine boots, %s, which hull gives it at %s: "
+			                "modprobe will find the volume's and not its own. Drop the "
+			                "volume, or boot the host's kernel by (tuning (vm (profile full)))\n",
+			                (int)n, guest, release, shared[k]);
+			if (said > 0)
+				host->on_data(m->core, NULL, 2, (const uint8_t *)line,
+				              (size_t)said < sizeof line ? (size_t)said : sizeof line - 1u);
+			break;
+		}
+	}
+}
+
 static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *error)
 {
 	struct utsname name;
@@ -4923,6 +4968,8 @@ static hull_status qemu_start(hull_core *core, hull_machine *m, hull_error *erro
 		}
 		break;
 	}
+	if (share_modules && m->kernel_hull)
+		warn_covered_modules(m, mbuf);
 	if ((reason = make_dir(m)) != NULL ||
 	    (reason = start_redirects(m)) != NULL ||
 	    (reason = start_vhost(m)) != NULL ||

@@ -2876,6 +2876,33 @@ if [ -r "$(dirname "$hull")/vmlinuz-hull" ]; then
 	else
 		printf 'qemu: hull'"'"'s own modules not tried: `make kernel` built none\n'
 	fi
+	# A volume over the modules hull shares for its kernel is said as the
+	# machine starts (netcfgd's veth, inbox 20261124T1905Z): the host's
+	# /lib/modules at /usr/lib/modules, and at /lib, each named; one at
+	# /srv, and the same volume on the host's kernel, whose modules it is,
+	# say nothing.
+	for at in /usr/lib/modules /lib /srv; do
+		printf '(machine (source "dir:./rootfs") (backend vm) (mutable overlay) %s %s %s)\n' \
+			'(tuning (vm (kernel hull)))' \
+			"(volumes (volume (host \"/lib/modules\") (guest \"$at\") (mode ro)))" \
+			'(command "/probe" "say" "covered" "exit" "4")' > "$root/khcover.conf"
+		name="a volume at $at on hull's own kernel"
+		out=$(cd / && XDG_RUNTIME_DIR=$khrun timeout 60 "$hull" run -f "$root/khcover.conf" 2>&1)
+		got=$?
+		if [ "$at" = /srv ]; then
+			has 4 '^covered$'
+			refute_out 'covers the modules'
+		else
+			has 4 "^hull: the volume at $at covers the modules of the kernel this machine boots"
+		fi
+	done
+	sed 's|(kernel hull)|(profile full)|' "$root/khcover.conf" | sed 's|"/srv"|"/usr/lib/modules"|' \
+		> "$root/khfull.conf"
+	name='a volume over /usr/lib/modules on the host'"'"'s kernel'
+	out=$(cd / && XDG_RUNTIME_DIR=$khrun timeout 60 "$hull" run -f "$root/khfull.conf" 2>&1)
+	got=$?
+	has 4 '^covered$'
+	refute_out 'covers the modules'
 	# The micro profile (section 5.2): on hull's kernel a machine is a
 	# microvm, its devices on virtio-mmio and its PCI bus empty; a pin, TCG,
 	# no ELF of the kernel, or more volumes than there are slots, is q35, and
