@@ -134,6 +134,82 @@ if [ -n "${3:-}" ] && command -v qemu-system-arm > /dev/null; then
 else
 	printf 'board: the STM32VLDISCOVERY not tried: no clang and lld or qemu-system-arm\n'
 fi
+# raw NAME FIRMWARE: an MPS2 AN385 echoing every byte on both UARTs
+# (test/board/raw_mps2.c), its consoles held by a program on pipes, no
+# terminal, as fuzznet's bridge holds one: every value 0x00 to 0xff both
+# ways on the first, unpaced random bytes too; UART1's boot line waiting
+# for `console 2` and every value echoed there; `console 3` refused.
+raw() {
+	cp "$2" "$root/$1.fw"
+	printf '(machine (source "image:%s.fw") (backend pc) (hostname "%s") (tuning (pc (machine mps2-an385))))\n' \
+		"$1" "$1" > "$root/$1.conf"
+	(cd "$root" && exec timeout -k 2 90 "$hull" run -f "$root/$1.conf" > "$root/$1.out" 2>&1) &
+	runner=$!
+	tries=0
+	until grep -q '^ready' "$root/$1.out" 2> /dev/null || [ "$tries" -ge 60 ]; do
+		tries=$((tries + 1))
+		sleep 0.5
+	done
+	said=$(timeout 60 python3 -I - "$hull" "$1" <<'PY'
+import os, subprocess, sys, time
+hull, name = sys.argv[1], sys.argv[2]
+
+def console(*port):
+	p = subprocess.Popen([hull, "exec", name, "--", "console", *port], stdin=subprocess.PIPE,
+	                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	os.set_blocking(p.stdout.fileno(), False)
+	return p
+
+def drain(p, want, secs):
+	got = b""
+	end = time.monotonic() + secs
+	while len(got) < want and time.monotonic() < end:
+		try:
+			chunk = os.read(p.stdout.fileno(), 65536)
+		except BlockingIOError:
+			time.sleep(0.02)
+			continue
+		if not chunk:
+			break
+		got += chunk
+	return got
+
+every = bytes(range(256)) * 4
+first = console()
+time.sleep(0.5)
+for at in range(0, len(every), 16):
+	first.stdin.write(every[at:at + 16])
+	first.stdin.flush()
+	time.sleep(0.01)
+print("first clean" if drain(first, len(every), 10) == every else "first altered")
+burst = os.urandom(8192)
+first.stdin.write(burst)
+first.stdin.flush()
+print("burst clean" if drain(first, len(burst), 20) == burst else "burst altered")
+first.kill()
+first.wait()
+second = console("2")
+print("held" if drain(second, 18, 5) == b"uart1 says hello\r\n" else "not held")
+second.stdin.write(bytes(range(256)))
+second.stdin.flush()
+print("second clean" if drain(second, 256, 10) == bytes(range(256)) else "second altered")
+second.kill()
+second.wait()
+third = subprocess.run([hull, "exec", name, "--", "console", "3"], capture_output=True,
+                       stdin=subprocess.DEVNULL, timeout=10)
+print("third refused" if third.returncode != 0 and b"1 or 2" in third.stderr else "third taken")
+PY
+)
+	timeout 30 "$hull" stop "$1" > /dev/null 2>&1
+	wait "$runner"
+	for word in "first clean" "burst clean" held "second clean" "third refused"; do
+		cases=$((cases + 1))
+		printf '%s\n' "$said" | grep -qx "$word" ||
+			fail "the MPS2's consoles: not \"$word\"" "$said
+$(cat "$root/$1.out")"
+	done
+}
+
 # The LM3S6965's own MAC, qemu's stellaris_enet, and the MPS2 AN385's
 # LAN9118: firmware of the same protocol as the ESP32-C3's,
 # test/board/lm3s_net.c and mps2_net.c, in LM3S_NET.
@@ -142,6 +218,7 @@ if [ -n "${LM3S_NET:-}" ] && command -v qemu-system-arm > /dev/null; then
 	on_wire lm3s6965evb lm3s6965evb "$LM3S_NET/lm3s-net-wire-a.elf" "$LM3S_NET/lm3s-net-wire-b.elf"
 	on_nat natmps mps2-an385 "$LM3S_NET/mps2-net-nat.elf"
 	on_wire mps2-an385 mps2-an385 "$LM3S_NET/mps2-net-wire-a.elf" "$LM3S_NET/mps2-net-wire-b.elf"
+	raw raw "$LM3S_NET/raw_mps2.elf"
 else
 	printf 'board: the LM3S6965 and MPS2 not tried on a network: no clang and lld or qemu-system-arm\n'
 fi

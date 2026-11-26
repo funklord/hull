@@ -108,6 +108,7 @@ struct hull_stream {
 	int           from;     /* the console's end of its pipe */
 	int           to;       /* the reader's, or -1 once the console has ended */
 	int           socket;   /* a dial's connection, or -1 for the console */
+	int           second;   /* joined to a board's second UART, `console 2` */
 	pid_t         child;    /* a door's sshd, or 0 */
 	pthread_t     thread;
 };
@@ -173,6 +174,9 @@ struct hull_machine {
 	char            monitor_why[512];  /* qemu's refusal, kept past the call for the core */
 	pthread_mutex_t monitor_lock;
 	hull_stream    *console;        /* the one joined to COM1, or NULL */
+	int             serial2;        /* a qemu board's second UART, a socket, or -1 */
+	int             serial2_peer;   /* its other end, for qemu to take */
+	hull_stream    *console2;       /* the one joined to it, or NULL */
 	char           *ssh_dir;        /* (ssh true): the core's material, door.conf beside it */
 	char            sshd[64];       /* and the host's sshd */
 	pthread_t       reader;
@@ -285,6 +289,15 @@ static const board *board_named(const char *name)
 	return NULL;
 }
 
+/* Whether the machine is a board on qemu, which is given a second serial
+ * port for its second UART; s51's 8051 and a PC are given one. */
+static int has_second_uart(const hull_machine *m)
+{
+	const board *b = m->box ? NULL : board_named(m->machine_type);
+
+	return b != NULL && strncmp(b->emulator, "qemu-", 5u) == 0;
+}
+
 static const hull_host_ops *host;
 
 static hull_status fail(hull_error *error, hull_status code, const char *detail)
@@ -346,6 +359,10 @@ static void release(hull_machine *m)
 		close(m->input);
 	if (m->monitor >= 0)
 		close(m->monitor);
+	if (m->serial2 >= 0)
+		close(m->serial2);
+	if (m->serial2_peer >= 0)
+		close(m->serial2_peer);
 	pthread_mutex_destroy(&m->monitor_lock);
 	pthread_mutex_destroy(&m->lock);
 	pthread_cond_destroy(&m->done_cond);
@@ -1597,7 +1614,8 @@ static void exec_board(const hull_machine *m, const board *b)
 	char  nic[96u + PC_MAX_PORTS * 64u];
 	char  netdev[64];
 	char  monitor[48];
-	char *argv[32];
+	char  serial2[48];
+	char *argv[40];
 	int   n = 0;
 	int   monitor_fd;
 	int   wifi = m->nic != NULL && strcmp(m->nic, "wifi") == 0;
@@ -1701,6 +1719,21 @@ static void exec_board(const hull_machine *m, const board *b)
 	argv[n++] = "none";
 	argv[n++] = "-serial";
 	argv[n++] = "stdio";
+	/* The second UART, `hull exec ID -- console 2`: a socket nobody reads
+	 * until a console joins it, so what the board says there waits, as
+	 * far as the socket holds, rather than being lost. A board with one
+	 * UART leaves qemu's second serial port unused. */
+	if (m->serial2_peer >= 0) {
+		int fd = fcntl(m->serial2_peer, F_DUPFD, 3);
+
+		if (fd < 0)
+			return;
+		snprintf(serial2, sizeof serial2, "socket,id=serial2,fd=%d", fd);
+		argv[n++] = "-chardev";
+		argv[n++] = serial2;
+		argv[n++] = "-serial";
+		argv[n++] = "chardev:serial2";
+	}
 	argv[n++] = "-chardev";
 	argv[n++] = monitor;
 	argv[n++] = "-mon";
@@ -2350,6 +2383,17 @@ static int launch(hull_machine *m)
 		close_all(fds, 8u);
 		return -1;
 	}
+	if (has_second_uart(m)) {
+		int pair[2];
+
+		if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) {
+			snprintf(m->why, sizeof m->why, "a socket for the machine could not be made\n");
+			close_all(fds, 8u);
+			return -1;
+		}
+		m->serial2      = pair[0];
+		m->serial2_peer = pair[1];
+	}
 	/* Its cards as the host has them now, each bound to vfio-pci with its
 	 * whole group and one machine's at a time; and the guest's memory,
 	 * which VFIO pins for their DMA, within what the user may lock --
@@ -2420,6 +2464,10 @@ static int launch(hull_machine *m)
 	close(out[1]);
 	close(err[1]);
 	close(monitor[1]);
+	if (m->serial2_peer >= 0) {
+		close(m->serial2_peer);
+		m->serial2_peer = -1;
+	}
 	for (unsigned i = 0u; i < m->segment_count; i++) {
 		close(m->segment_fd[i]);
 		m->segment_fd[i] = -1;
@@ -2546,6 +2594,8 @@ static hull_status create(hull_core *core, hull_buf plan, int box, hull_machine 
 	m->input = -1;
 	m->monitor = -1;
 	m->lora_fd = -1;
+	m->serial2 = -1;
+	m->serial2_peer = -1;
 	pthread_mutex_init(&m->lock, NULL);
 	pthread_mutex_init(&m->monitor_lock, NULL);
 	pthread_cond_init(&m->done_cond, NULL);
@@ -2911,6 +2961,91 @@ static void *deliver_console(void *arg)
 	return NULL;
 }
 
+/* `console 2`'s thread: the board's second UART to the stream, until the
+ * machine ends it or the stream's close says so on `from`; the socket is
+ * the machine's and stays open for the next console. */
+static void *deliver_second(void *arg)
+{
+	hull_stream *st = arg;
+	uint8_t      buffer[4096];
+
+	for (;;) {
+		struct pollfd fds[2] = { { st->machine->serial2, POLLIN, 0 }, { st->from, POLLIN, 0 } };
+		ssize_t       n;
+
+		if (poll(fds, 2u, -1) < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (fds[1].revents != 0)
+			break;
+		if (fds[0].revents == 0)
+			continue;
+		n = read(st->machine->serial2, buffer, sizeof buffer);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;
+		host->on_data(st->core, st, 1, buffer, (size_t)n);
+	}
+	host->on_exit(st->core, st->machine, st, 0, 0);
+	return NULL;
+}
+
+/* `hull exec ID -- console 2`: a stream joined to a board's second UART,
+ * one at a time, the same terminal and no more as the first's. */
+static hull_status join_second(hull_core *core, hull_machine *m, hull_stream **out,
+                               hull_error *error)
+{
+	hull_stream *st;
+	int          ends[2];
+
+	if (!has_second_uart(m))
+		return fail(error, HULL_ERR_UNSUPPORTED, "only a board on qemu has a second serial "
+		            "port, `console 2`: this machine has its first alone");
+	if ((st = calloc(1u, sizeof *st)) == NULL)
+		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+	if (pipe2(ends, O_CLOEXEC) != 0) {
+		free(st);
+		return fail(error, HULL_ERR_RUNTIME, "a pipe for the console could not be made");
+	}
+	st->machine = m;
+	st->core    = core;
+	st->from    = ends[0];
+	st->to      = ends[1];
+	st->socket  = -1;
+	st->second  = 1;
+	pthread_mutex_lock(&m->lock);
+	/* Its socket is made before qemu starts and is read once the input is
+	 * set, under this lock, as the first port's is. */
+	if (m->done || m->console2 != NULL || m->input < 0) {
+		int gone = m->done;
+		int early = m->input < 0;
+
+		pthread_mutex_unlock(&m->lock);
+		close(ends[0]);
+		close(ends[1]);
+		free(st);
+		return gone ? fail(error, HULL_ERR_GONE, "the machine is not running") :
+		       fail(error, HULL_ERR_BUSY, early ? "the machine is still starting" :
+		            "the second serial port has a console joined to it already");
+	}
+	m->console2 = st;
+	pthread_mutex_unlock(&m->lock);
+	if (pthread_create(&st->thread, NULL, deliver_second, st) != 0) {
+		pthread_mutex_lock(&m->lock);
+		m->console2 = NULL;
+		pthread_mutex_unlock(&m->lock);
+		close(ends[0]);
+		close(ends[1]);
+		free(st);
+		return fail(error, HULL_ERR_INTERNAL, "the console's thread could not start");
+	}
+	*out = st;
+	return HULL_OK;
+}
+
 static void *deliver_socket(void *arg);
 
 /* A stream with nothing to say: a socket whose far end has gone, so it ends
@@ -2990,6 +3125,19 @@ static hull_status pc_exec(hull_core *core, hull_machine *m, hull_buf spec, hull
 		return done == HULL_OK ? finished_stream(core, m, out, error) : done;
 	}
 	asked = words[0] != NULL && strcmp(words[0], "console") == 0;
+	/* `console 2` is the second serial port, `console 1` the first's
+	 * name in full; counted as the ports are, whatever the board calls
+	 * them -- an MPS2's UART1, an STM32's USART2, a PC's COM2. */
+	if (asked && words[1] != NULL && strcmp(words[1], "1") != 0) {
+		int second = strcmp(words[1], "2") == 0 && words[2] == NULL;
+
+		for (unsigned i = 0u; i < count; i++)
+			free(words[i]);
+		if (!second)
+			return fail(error, HULL_ERR_UNSUPPORTED, "`console` takes the serial port's "
+			            "number, 1 or 2, and nothing else");
+		return join_second(core, m, out, error);
+	}
 	for (unsigned i = 0u; i < count; i++)
 		free(words[i]);
 	if (!asked)
@@ -3172,7 +3320,8 @@ static void wake_board(hull_machine *m)
 static hull_status pc_stream_write(hull_core *core, hull_stream *st, const uint8_t *data,
                                    size_t length, hull_error *error)
 {
-	int to = st->socket >= 0 ? st->socket : st->machine->input;
+	int to = st->socket >= 0 ? st->socket : st->second ? st->machine->serial2 :
+	         st->machine->input;
 
 	(void)core;
 	while (length > 0u) {
@@ -3214,6 +3363,16 @@ static hull_status pc_stream_close(hull_core *core, hull_stream *st, hull_error 
 			kill(st->child, SIGTERM);
 			waitpid(st->child, NULL, 0);
 		}
+		free(st);
+		return HULL_OK;
+	}
+	if (st->second) {
+		close(st->to);
+		pthread_join(st->thread, NULL);
+		pthread_mutex_lock(&m->lock);
+		m->console2 = NULL;
+		pthread_mutex_unlock(&m->lock);
+		close(st->from);
 		free(st);
 		return HULL_OK;
 	}

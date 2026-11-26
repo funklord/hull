@@ -259,7 +259,8 @@ BOARD_AVR  := $(if $(shell command -v $(BOARD_AVR_CC) 2>/dev/null),$(BUILD_DIR)/
 BOARD_ARM  := $(if $(and $(shell command -v $(BOARD_ARM_CC) 2>/dev/null),$(BOARD_ARM_LD)),$(BUILD_DIR)/test/board-fw/echo_stm32.elf)
 BOARD_8051 := $(if $(shell command -v $(SDCC) 2>/dev/null),$(BUILD_DIR)/test/board-fw/echo_8051.ihx)
 LM3S_NETS   = nat wire-a wire-b
-BOARD_LM3S := $(if $(BOARD_ARM),$(foreach b,lm3s mps2,$(foreach w,$(LM3S_NETS),$(BUILD_DIR)/test/board-fw/$(b)-net-$(w).elf)))
+BOARD_LM3S := $(if $(BOARD_ARM),$(foreach b,lm3s mps2,$(foreach w,$(LM3S_NETS),$(BUILD_DIR)/test/board-fw/$(b)-net-$(w).elf)) \
+              $(BUILD_DIR)/test/board-fw/raw_mps2.elf)
 # Two Heltec WiFi LoRa 32s talking by radio: firmware by Espressif's GCC
 # where it is installed, on Espressif's qemu built with hull's SX1276 by
 # `make esp-qemu-lora`, which fetches its source at the release hull pins.
@@ -300,6 +301,7 @@ BOARD_TEST_FILES = $(addprefix $(BUILD_DIR)/test/board-fw/, echo_avr.elf echo_st
                    echo_8051.lst echo_8051.rst echo_8051.sym echo_8051.asm \
                    $(foreach n,$(ESP_ALL),$(n).flash $(n).o $(n).elf $(n).bin $(n).s) \
                    $(foreach b,lm3s mps2,$(foreach w,$(LM3S_NETS),$(b)-net-$(w).elf $(b)-net-$(w).o)) \
+                   raw_mps2.elf raw_mps2.o \
                    $(foreach r,first second,lora-$(r).flash lora-$(r).elf lora-$(r).text lora-$(r).data))
 # What check-fuzz writes, but for what it finds, in $(FUZZ_DIR)/found,
 # which is kept: a crash's input is what reproduces it.
@@ -1370,6 +1372,14 @@ $(BUILD_DIR)/test/board-fw/echo_stm32.elf: test/board/echo_stm32.c test/board/st
 	$(BOARD_ARM_CC) --target=thumbv7m-none-eabi -mcpu=cortex-m3 -mthumb -ffreestanding -nostdlib \
 		-Os -Wall -Wextra -c -o $(@D)/echo_stm32.o $<
 	$(BOARD_ARM_LD) -T test/board/stm32f100.ld --entry=reset -o $@ $(@D)/echo_stm32.o
+
+# An MPS2 AN385 echoing every byte on both its UARTs, for the console
+# held 8-bit clean and the second UART, `console 2`.
+$(BUILD_DIR)/test/board-fw/raw_mps2.elf: test/board/raw_mps2.c test/board/lm3s6965.ld
+	@mkdir -p '$(@D)'
+	$(BOARD_ARM_CC) --target=thumbv7m-none-eabi -mcpu=cortex-m3 -mthumb -ffreestanding -nostdlib \
+		-Os -Wall -Wextra -c -o $(@D)/raw_mps2.o $<
+	$(BOARD_ARM_LD) -T test/board/lm3s6965.ld --entry=reset -o $@ $(@D)/raw_mps2.o
 
 $(BUILD_DIR)/test/board-fw/echo_8051.ihx: test/board/echo_8051.c
 	@mkdir -p '$(@D)'

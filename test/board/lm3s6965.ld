@@ -1,5 +1,6 @@
 /* lm3s6965.ld -- the LM3S6965's flash and RAM, for lm3s_net.c; the MPS2
- * AN385's code memory and RAM hold the same, for mps2_net.c. */
+ * AN385's code memory and RAM hold the same, for mps2_net.c and
+ * raw_mps2.c. */
 MEMORY
 {
 	FLASH (rx)  : ORIGIN = 0x00000000, LENGTH = 256K
