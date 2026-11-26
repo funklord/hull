@@ -1461,8 +1461,12 @@ static const char *make_swap(hull_machine *m)
 	snprintf(path, sizeof path, "%s/swap.img", m->dir);
 	if ((fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)) < 0)
 		return "the swap's image cannot be made";
-	memcpy(page + 1024, &version, 4u);
-	memcpy(page + 1028, &last, 4u);
+	/* The guest's order, an x86's (sleep is q35's alone): little-endian,
+	 * whatever the host's. */
+	for (unsigned i = 0u; i < 4u; i++) {
+		page[1024 + i] = (unsigned char)(version >> (8u * i));
+		page[1028 + i] = (unsigned char)(last >> (8u * i));
+	}
 	if (getrandom(page + 1036, 16u, 0) != 16)
 		memset(page + 1036, 0x5a, 16u);
 	memcpy(page + 4086, "SWAPSPACE2", 10u);

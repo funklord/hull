@@ -1746,6 +1746,17 @@ static const char apple_rom_key[] =
 #define CHUNK_ENTRY      0x24u
 #define CHUNKS_MAX       65536u
 
+/* A little-endian number of `n` bytes at `at`, as the chunklist writes
+ * them whatever the host's order: hull runs on s390x too. */
+static uint64_t little(const uint8_t *at, unsigned n)
+{
+	uint64_t value = 0u;
+
+	while (n-- > 0u)
+		value = value << 8 | at[n];
+	return value;
+}
+
 /* Whether the chunklist `list` of `n` bytes is Apple's: its header and
  * entries hashed, and the signature after them, a little-endian RSA
  * number, raised to 65537 modulo Apple's key, PKCS #1 v1.5's padding of
@@ -1767,9 +1778,9 @@ static int chunklist_signed(const uint8_t *list, size_t n, uint64_t *chunks, cha
 		snprintf(why, cap, "the chunklist is not one");
 		return -1;
 	}
-	memcpy(&count, list + 12, 8u);
-	memcpy(&offset, list + 20, 8u);
-	memcpy(&signature, list + 28, 8u);
+	count = little(list + 12, 8u);
+	offset = little(list + 20, 8u);
+	signature = little(list + 28, 8u);
 	if (list[10] != 1u || count == 0u || count > CHUNKS_MAX || offset != CHUNKLIST_HEADER ||
 	    signature != offset + CHUNK_ENTRY * count || n < signature + 256u) {
 		snprintf(why, cap, "the chunklist is not one Apple signs with its ROM key");
@@ -1818,7 +1829,7 @@ static int next_chunk(chunked *c)
 {
 	if (c->at >= c->count)
 		return -1;
-	memcpy(&c->left, c->entries + CHUNK_ENTRY * c->at, 4u);
+	c->left = (uint32_t)little(c->entries + CHUNK_ENTRY * c->at, 4u);
 	hull_sha256_init(&c->hash);
 	return 0;
 }

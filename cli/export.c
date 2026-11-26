@@ -799,8 +799,12 @@ static int fix_cid(const char *path, const char *name)
 	if (fd < 0 || pread(fd, head, sizeof head, 0) != (ssize_t)sizeof head ||
 	    memcmp(head, "KDMV", 4u) != 0)
 		goto done;
-	memcpy(&offset, head + 28, 8u);
-	memcpy(&sectors, head + 36, 8u);
+	/* VMDK's header is little-endian, whatever the host's order. */
+	offset = sectors = 0u;
+	for (unsigned i = 8u; i-- > 0u;) {
+		offset = offset << 8 | head[28 + i];
+		sectors = sectors << 8 | head[36 + i];
+	}
 	if (offset == 0u || sectors == 0u || sectors > 64u)
 		goto done;
 	bytes = (size_t)sectors * 512u;
