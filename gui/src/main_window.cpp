@@ -431,6 +431,10 @@ void main_window::rebuild()
 		    (keep_file.isEmpty() && !keep_id.isEmpty() && r.added.file.isEmpty() &&
 		     r.id == keep_id))
 			select = item;
+		if (!wanted.isEmpty() && r.id == wanted) {
+			select = item;
+			wanted.clear();
+		}
 	}
 	for (int c = 0; c < 2; c++)
 		tree->resizeColumnToContents(c);

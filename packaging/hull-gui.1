@@ -18,11 +18,14 @@ lists the machines added to it, those in folders of their own in
 .IR ~/hull ,
 and those hull's core is running, and starts, stops, pauses and watches
 them: their plan, their output, their resources and their networks, a
-machine's terminal and its screen. New writes a machine into
+machine's terminal, and its screen in a tab beside them or a window of its
+own. New writes a machine into
 .IR ~/hull/NAME ;
 Import copies a VirtualBox or VMware machine or an appliance there, its
-disks converted; Clone copies one; Remove takes one off the list or deletes
-its folder to the desktop's trash.
+disks converted; Settings edits its hardware, disks and discs in its
+.I hull.conf
+in place, writing only what changed; Clone copies one; Remove takes one
+off the list or deletes its folder to the desktop's trash.
 .PP
 .B hull-tui
 is the same window drawn on the terminal. Each

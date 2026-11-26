@@ -144,6 +144,11 @@ int main(int argc, char **argv)
 	parser.addOption(snapshot_option);
 	parser.addOption(picture_option);
 	parser.addOption(tab_option);
+	QCommandLineOption select_option(
+	    QStringLiteral("select"),
+	    QStringLiteral("With --picture or --snapshot: the machine selected, by its id. For tests."),
+	    QStringLiteral("id"));
+	parser.addOption(select_option);
 	parser.addPositionalArgument(QStringLiteral("file"),
 	                             QStringLiteral("A hull.conf to add to the list."),
 	                             QStringLiteral("[file...]"));
@@ -152,6 +157,8 @@ int main(int argc, char **argv)
 	main_window window(hull_program(parser.value(hull_option)));
 	for (const QString &file : parser.positionalArguments())
 		window.add_machine(file, QString());
+	if (parser.isSet(select_option))
+		window.select_machine(parser.value(select_option));
 	if (parser.isSet(tab_option) && !window.show_tab(parser.value(tab_option))) {
 		fprintf(stderr, "hull-gui: no tab %s\n", parser.value(tab_option).toLocal8Bit().constData());
 		return 2;

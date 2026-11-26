@@ -257,6 +257,27 @@ int main(int argc, char **argv)
 		      "a file of several machines refused", why);
 	}
 
+	/* Settings' disks and discs: the (media ...) records listed, and the
+	 * form rewritten whole from a list, a record a line. */
+	{
+		const QString pc = QStringLiteral("(machine (backend pc)\n"
+		                                  "  (media\n"
+		                                  "    (medium (type disk) (source \"image:./a.qcow2\"))\n"
+		                                  "    ; the installer\n"
+		                                  "    (medium (type cdrom) (source \"image:./b (1).iso\"))))\n");
+		const QStringList forms = spec_forms(pc, { QStringLiteral("media") });
+		QString why;
+
+		check(forms == QStringList{ QStringLiteral("(medium (type disk) (source \"image:./a.qcow2\"))"),
+		                            QStringLiteral("(medium (type cdrom) (source \"image:./b (1).iso\"))") },
+		      "the media's records listed, past a comment", forms.join(QLatin1Char('|')));
+		check(spec_forms(pc, { QStringLiteral("volumes") }).isEmpty(), "no form, no records");
+		check(spec_with(pc, { QStringLiteral("media") }, forms[0], &why) ==
+		          QStringLiteral("(machine (backend pc)\n"
+		                         "  (media (medium (type disk) (source \"image:./a.qcow2\"))))\n"),
+		      "the disc removed from the media", spec_with(pc, { QStringLiteral("media") }, forms[0], &why));
+	}
+
 	/* A clone's hostname: the one form replaced, its quotes and
 	 * backslashes escaped; none, the text as it was; two, refused. */
 	{

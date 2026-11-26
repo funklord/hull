@@ -76,6 +76,10 @@ QString with_hostname(const QString &text, const QString &hostname);
  * one machine's.
  */
 QString spec_value(const QString &text, const QStringList &path);
+
+/* The forms inside the form at `path`, each its text as written -- a
+ * (media ...)'s (medium ...) records -- in order; none where it is absent. */
+QStringList spec_forms(const QString &text, const QStringList &path);
 QString spec_with(const QString &text, const QStringList &path, const QString &value,
                   QString *why);
 

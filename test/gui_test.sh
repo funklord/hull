@@ -161,8 +161,21 @@ keys "$dir" "b'\\x1bOR'" "b'\\r'"
 cases=$((cases + 1))
 [ "$(stat -c %Y "$dir/settings.conf")" = "$(date -d '2020-01-01' +%s)" ] ||
 	fail "Settings untouched wrote the file" "$(cat "$dir/settings.conf")"
+# And a pc's disks and discs: the first record, selected as the page
+# opens, removed by Tab to Remove and Space, then OK, the disc kept.
+printf '(machine (backend pc) (hostname "gui-media") (source "media:disk")\n  (media\n    (medium (type disk) (source "image:./a.img"))\n    (medium (type cdrom) (source "image:./b.iso"))))\n' \
+	> "$dir/settings.conf"
+rm -rf "${dir:?}/settings/config"
+mkdir -p "$dir/settings/config"
+truncate -s 1M "$dir/settings/a.img" "$dir/settings/b.iso"
+ln -sf settings/a.img "$dir/a.img"
+ln -sf settings/b.iso "$dir/b.iso"
+keys "$dir" "b'\\x1bOR'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
+	"b'\\t'" "b'\\t'" "b' '" "b'\\t'" "b' '" -- "$dir/settings.conf"
+has "$(cat "$dir/settings.conf")" '^  \(media \(medium \(type cdrom\) \(source "image:\./b\.iso"\)\)\)\)$' \
+	"Settings removed a disk and kept the disc"
 XDG_CONFIG_HOME=$config_saved
-rm -rf "${dir:?}/settings" "${dir:?}/settings.conf"
+rm -rf "${dir:?}/settings" "${dir:?}/settings.conf" "${dir:?}/a.img" "${dir:?}/b.iso"
 
 # Start on it offers the token that would honour the refusal; Esc
 # declines, and nothing runs.
@@ -375,6 +388,44 @@ printf '%s\n' '(machine (hostname "gui-found") (source "dir:../../../rootfs") (c
 	> "$dir/home/hull/gui-found/hull.conf"
 out=$(snapshot)
 has "$out" 'gui-found +stopped +chroot' "a machine in ~/hull listed unasked"
+
+# The Screen tab, pictured on a real X server, Xvfb's: a pc of (display
+# local) booting a blank disk, SeaBIOS's text in it -- the grey of VGA
+# text, which Qt's minimal platform painted white -- its row the only one,
+# the list and home being the case's own and the row chosen by its id,
+# the core still listing earlier cases' machines.
+if command -v xvfb-run > /dev/null && command -v qemu-system-x86_64 > /dev/null &&
+   python3 -I -c 'import PIL' 2> /dev/null; then
+	truncate -s 1M "$dir/blank.img"
+	printf '(machine (hostname "gui-scr") (backend pc) (source "media:disk") (display local) %s)\n' \
+		'(media (medium (type disk) (source "image:./blank.img")))' > "$dir/scr.conf"
+	(cd "$dir" && exec timeout 120 "$hull" run -f scr.conf > "$dir/scr.out" 2>&1) &
+	scr_pid=$!
+	tries=0
+	until timeout 10 "$hull" ps 2>/dev/null | grep -q 'gui-scr .*running' || [ "$tries" -ge 30 ]; do
+		tries=$((tries + 1))
+		sleep 1
+	done
+	sleep 6
+	mkdir -p "$dir/scr-config" "$dir/scr-home"
+	(cd "$dir" && HOME=$dir/scr-home XDG_CONFIG_HOME=$dir/scr-config timeout 60 \
+		xvfb-run -a -s '-screen 0 1280x800x24' env QT_QPA_PLATFORM=xcb \
+		"$gui" --hull "$hull" --gui --select gui-scr --tab Screen --picture "$dir/scr.png" \
+		> /dev/null 2>&1)
+	grey=$(python3 -I -c 'import sys
+from PIL import Image
+print(sum(1 for p in Image.open(sys.argv[1]).convert("RGB").getdata() if p == (168, 168, 168)))' \
+		"$dir/scr.png" 2>&1)
+	cases=$((cases + 1))
+	[ "$grey" -gt 200 ] 2>/dev/null ||
+		fail "the Screen tab under Xvfb shows no SeaBIOS text (grey pixels: $grey)" "$(cat "$dir/scr.out")"
+	timeout 30 "$hull" stop gui-scr > /dev/null 2>&1
+	wait "$scr_pid" 2>/dev/null
+	rm -rf "${dir:?}/scr-config" "${dir:?}/scr-home" "${dir:?}/blank.img" "${dir:?}/scr.conf" \
+		"${dir:?}/scr.out" "${dir:?}/scr.png"
+else
+	printf 'gui_test: no xvfb-run, qemu-system-x86_64 or PIL, the Screen tab not pictured\n'
+fi
 
 rm -rf "${dir:?}/config" "${dir:?}/new" "${dir:?}/newm" "${dir:?}/data" "${dir:?}/screen.txt" \
 	"${dir:?}/wire.pcap" "${dir:?}/spin.img" "${dir:?}/swap.img" "${dir:?}/pc.conf" \

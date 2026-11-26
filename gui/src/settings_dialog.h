@@ -17,6 +17,7 @@
 
 class QComboBox;
 class QLabel;
+class QListWidget;
 
 class settings_dialog : public QDialog {
 	Q_OBJECT
@@ -42,10 +43,14 @@ private:
 
 	void add(const QString &label, const QStringList &path, const QStringList &choices,
 	         bool editable, bool quoted);
+	void add_medium(const QString &type);
+	QString media_value() const;
 
 	QString      file;
 	QString      text;
 	QList<field> fields;
+	QListWidget *media = nullptr;  /* a pc's disks and discs, each its record's text */
+	QStringList  media_was;
 	QLabel      *error;
 	bool         ok = false;
 	QString      why;

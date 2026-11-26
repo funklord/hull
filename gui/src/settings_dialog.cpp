@@ -6,7 +6,13 @@
 
 #include <QComboBox>
 #include <QDialogButtonBox>
+#include <QDir>
 #include <QFile>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QHBoxLayout>
+#include <QListWidget>
+#include <QPushButton>
 #include <QFormLayout>
 #include <QLabel>
 #include <QRegularExpression>
@@ -18,7 +24,7 @@
 static const QString default_choice = QStringLiteral("Default");
 
 settings_dialog::settings_dialog(const QString &file_path, bool pc, QWidget *parent)
-	: QDialog(parent), file(file_path)
+    : QDialog(parent), file(file_path)
 {
 	QFile in(file);
 
@@ -67,6 +73,40 @@ settings_dialog::settings_dialog(const QString &file_path, bool pc, QWidget *par
 		add(QStringLiteral("&Pointer:"),
 		    { QStringLiteral("tuning"), QStringLiteral("pc"), QStringLiteral("pointer") },
 		    { QStringLiteral("tablet"), QStringLiteral("ps2") }, false, false);
+
+		/* Its disks and discs, as VirtualBox's Storage page: each record
+		 * shown by its type and source, a new one added by its image, one
+		 * removed; a record of another shape kept as it was written. */
+		auto *row = new QHBoxLayout;
+		auto *add_disk = new QPushButton(QStringLiteral("Add &Disk..."));
+		auto *add_disc = new QPushButton(QStringLiteral("Add D&isc..."));
+		auto *remove = new QPushButton(QStringLiteral("&Remove"));
+
+		media = new QListWidget;
+		media_was = spec_forms(text, { QStringLiteral("media") });
+		for (const QString &record : media_was) {
+			const QString wrapped = QStringLiteral("(machine ") + record + QLatin1Char(')');
+			const QString type = spec_value(wrapped, { QStringLiteral("medium"),
+			                                           QStringLiteral("type") });
+			const QString source = spec_value(wrapped, { QStringLiteral("medium"),
+			                                             QStringLiteral("source") });
+			auto *item = new QListWidgetItem(type.isEmpty() || source.isEmpty() ?
+			                                 record.simplified() :
+			                                 QStringLiteral("%1  %2").arg(type, source));
+
+			item->setData(Qt::UserRole, record);
+			media->addItem(item);
+		}
+		media->setAccessibleName(QStringLiteral("Disks and discs"));
+		media->setCurrentRow(0);
+		connect(add_disk, &QPushButton::clicked, this, [this]() { add_medium(QStringLiteral("disk")); });
+		connect(add_disc, &QPushButton::clicked, this, [this]() { add_medium(QStringLiteral("cdrom")); });
+		connect(remove, &QPushButton::clicked, this, [this]() { delete media->currentItem(); });
+		row->addWidget(add_disk);
+		row->addWidget(add_disc);
+		row->addWidget(remove);
+		form->addRow(QStringLiteral("Disks and discs:"), media);
+		form->addRow(QString(), row);
 	}
 	error = new QLabel;
 	error->setWordWrap(true);
@@ -103,6 +143,48 @@ void settings_dialog::add(const QString &label, const QStringList &path, const Q
 	fields.append(f);
 }
 
+/* A disk or disc image chosen, named from the machine's folder where it
+ * is inside it, as hull.conf's own media are. */
+void settings_dialog::add_medium(const QString &type)
+{
+	const QString folder = QFileInfo(file).absolutePath();
+	const QString image = QFileDialog::getOpenFileName(
+	    this, type == QStringLiteral("disk") ? QStringLiteral("Add Disk") : QStringLiteral("Add Disc"),
+	    folder, type == QStringLiteral("disk") ?
+	            QStringLiteral("Disk images (*.qcow2 *.img *.raw *.vdi *.vmdk *.vhd *.vhdx);;All files (*)") :
+	            QStringLiteral("Disc images (*.iso);;All files (*)"));
+
+	if (image.isEmpty())
+		return;
+	QString path = QDir(folder).relativeFilePath(image);
+
+	if (path.startsWith(QStringLiteral("../")) || QFileInfo(path).isAbsolute())
+		path = QFileInfo(image).absoluteFilePath();
+	else
+		path = QStringLiteral("./") + path;
+	if (path.contains(QLatin1Char('"')) || path.contains(QLatin1Char('\\'))) {
+		error->setText(QStringLiteral("%1: a path with a quote or a backslash is not written here; "
+		                              "Edit hull.conf takes it").arg(path));
+		return;
+	}
+	const QString record = QStringLiteral("(medium (type %1) (source \"image:%2\"))").arg(type, path);
+	auto         *item = new QListWidgetItem(QStringLiteral("%1  \"image:%2\"").arg(type, path));
+
+	item->setData(Qt::UserRole, record);
+	media->addItem(item);
+}
+
+/* The (media ...) form's inside as the list now has it, a record a line;
+ * "" for none. */
+QString settings_dialog::media_value() const
+{
+	QStringList records;
+
+	for (int i = 0; i < media->count(); i++)
+		records << media->item(i)->data(Qt::UserRole).toString();
+	return records.join(QStringLiteral("\n    "));
+}
+
 void settings_dialog::accept()
 {
 	QString changed = text;
@@ -128,6 +210,17 @@ void settings_dialog::accept()
 		changed = spec_with(changed, f.path, value, &problem);
 		if (changed.isNull())
 			break;
+	}
+	/* The media written only where the list changed, whole, so its other
+	 * records keep their text. */
+	if (media != nullptr && problem.isEmpty() && !changed.isNull()) {
+		QStringList now;
+
+		for (int i = 0; i < media->count(); i++)
+			now << media->item(i)->data(Qt::UserRole).toString();
+		if (now != media_was)
+			changed = spec_with(changed, { QStringLiteral("media") },
+			                    now.isEmpty() ? QString() : media_value(), &problem);
 	}
 	if (!problem.isEmpty() || changed.isNull()) {
 		error->setText(problem);

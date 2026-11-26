@@ -736,10 +736,14 @@ for a whole shell, and `ps`, `exec`, `logs` and `stop` go with it.
 
 `make gui` builds `hull-gui`, a manager in the shape of VirtualBox's:
 
-- the machines you added, a `hull.conf` each, and every machine the core
-  runs, whoever started it;
-- each one's plan, state, address, output and what it spends;
-- Start, Stop, Power Off, Pause, Resume and a Terminal into it.
+- the machines you added, a `hull.conf` each, those in folders of their
+  own in `~/hull`, and every machine the core runs, whoever started it;
+- each one's plan, state, address, output and what it spends, and its
+  screen in a tab beside them;
+- Start, Stop, Power Off, Pause, Resume and a Terminal into it;
+- New, Import of a VirtualBox or VMware machine or appliance into
+  `~/hull`, Settings for its hardware, disks and discs, Clone, and Remove
+  with its files to the trash, as VirtualBox's manager does.
 
 It is a frontend of the same core as the CLI, and starts machines with
 `hull run`. The same window draws on a terminal with

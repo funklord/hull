@@ -172,6 +172,36 @@ QString spec_value(const QString &text, const QStringList &path)
 	return text.mid(start, end - start).trimmed();
 }
 
+QStringList spec_forms(const QString &text, const QStringList &path)
+{
+	QStringList forms;
+	int         at = machine_form(text, nullptr);
+
+	for (const QString &head : path) {
+		if (at < 0)
+			return forms;
+		at = child_of(text, at, head);
+	}
+	if (at < 0)
+		return forms;
+	for (int i = skip_atom(text, skip_space(text, at + 1)); i >= 0;) {
+		i = skip_space(text, i);
+		if (i >= text.size() || text[i] == QLatin1Char(')'))
+			break;
+		if (text[i] == QLatin1Char('(')) {
+			const int end = skip_form(text, i);
+
+			if (end < 0)
+				break;
+			forms << text.mid(i, end - i);
+			i = end;
+		} else {
+			i = skip_atom(text, i);
+		}
+	}
+	return forms;
+}
+
 QString spec_with(const QString &text, const QStringList &path, const QString &value,
                   QString *why)
 {

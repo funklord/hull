@@ -41,6 +41,9 @@ public:
 	/* The tab named `name`, its mnemonic aside, shown; false where none is. */
 	bool show_tab(const QString &name);
 
+	/* The machine `id` selected once the list holds it, for a picture. */
+	void select_machine(const QString &id) { wanted = id; }
+
 	/* Ask the core what it holds now; `after` runs once it has answered. */
 	void refresh(std::function<void()> after = nullptr);
 
@@ -104,6 +107,7 @@ private:
 	QLabel         *screen_note;  /* what the tab says when it shows none */
 	QPointer<class screen_window> embedded;  /* the screen in it, while shown */
 	QString         embedded_id;
+	QString         wanted;       /* select_machine()'s, until it is listed */
 	QPlainTextEdit *details;
 	QPlainTextEdit *output;
 	QPlainTextEdit *usage;
