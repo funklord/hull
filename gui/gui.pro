@@ -67,6 +67,7 @@ SOURCES += \
 	src/main_window.cpp \
 	src/new_machine_dialog.cpp \
 	src/pools_dialog.cpp \
+	src/settings_dialog.cpp \
 	src/screen_window.cpp \
 	src/dmabuf_view.cpp
 
@@ -77,5 +78,6 @@ HEADERS += \
 	src/main_window.h \
 	src/new_machine_dialog.h \
 	src/pools_dialog.h \
+	src/settings_dialog.h \
 	src/screen_window.h \
 	src/dmabuf_view.h

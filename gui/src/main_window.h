@@ -12,6 +12,7 @@
 
 #include <QHash>
 #include <QMainWindow>
+#include <QPointer>
 
 #include "core_link.h"
 #include "machine_list.h"
@@ -36,6 +37,9 @@ public:
 
 	/* Add `file` (and `name` of its machines) to the list, saved. */
 	void add_machine(const QString &file, const QString &name);
+
+	/* The tab named `name`, its mnemonic aside, shown; false where none is. */
+	bool show_tab(const QString &name);
 
 	/* Ask the core what it holds now; `after` runs once it has answered. */
 	void refresh(std::function<void()> after = nullptr);
@@ -71,12 +75,14 @@ private:
 	void pause_machine(bool paused);
 	void open_terminal();
 	void open_screen();
+	void update_screen_tab();
 	void commit_machine();
 	void change_medium();
 	void insert_ctrl_alt_del();
 	void take_screenshot();
 	void run_for(const QStringList &arguments, const QString &done);
 	void edit_spec();
+	void edit_settings();
 	void remove_machine();
 	void clone_machine();
 	void ask_add();
@@ -94,6 +100,10 @@ private:
 	QList<row>      rows;
 	QTreeWidget    *tree;
 	QTabWidget     *tabs;
+	QWidget        *screen_tab;   /* the selected machine's screen, here */
+	QLabel         *screen_note;  /* what the tab says when it shows none */
+	QPointer<class screen_window> embedded;  /* the screen in it, while shown */
+	QString         embedded_id;
 	QPlainTextEdit *details;
 	QPlainTextEdit *output;
 	QPlainTextEdit *usage;
@@ -125,6 +135,7 @@ private:
 	QAction        *screenshot_action;
 	QAction        *screen_action;
 	QAction        *edit_action;
+	QAction        *settings_action;
 	core_request   *logs = nullptr;    /* following the selected machine's */
 	QString         logs_of;
 	bool            listing = false;

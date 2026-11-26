@@ -137,8 +137,13 @@ int main(int argc, char **argv)
 	    QStringLiteral("Draw the window once the core and the plans have answered, as a PNG "
 	                   "in FILE, and exit. For tests and pictures of it."),
 	    QStringLiteral("file"));
+	QCommandLineOption tab_option(
+	    QStringLiteral("tab"),
+	    QStringLiteral("With --picture or --snapshot: the tab shown, Details by default. For tests."),
+	    QStringLiteral("name"));
 	parser.addOption(snapshot_option);
 	parser.addOption(picture_option);
+	parser.addOption(tab_option);
 	parser.addPositionalArgument(QStringLiteral("file"),
 	                             QStringLiteral("A hull.conf to add to the list."),
 	                             QStringLiteral("[file...]"));
@@ -147,14 +152,19 @@ int main(int argc, char **argv)
 	main_window window(hull_program(parser.value(hull_option)));
 	for (const QString &file : parser.positionalArguments())
 		window.add_machine(file, QString());
+	if (parser.isSet(tab_option) && !window.show_tab(parser.value(tab_option))) {
+		fprintf(stderr, "hull-gui: no tab %s\n", parser.value(tab_option).toLocal8Bit().constData());
+		return 2;
+	}
 
 	if (parser.isSet(picture_option)) {
 		const QString file = parser.value(picture_option);
+		const int     settle = parser.isSet(tab_option) ? 2000 : 0;
 		QTimer       *wait = new QTimer(&window);
 		int           waited = 0;
 
 		/* As --snapshot waits: the plans run, and a list asked after. */
-		QObject::connect(wait, &QTimer::timeout, &window, [&window, wait, &waited, file]() {
+		QObject::connect(wait, &QTimer::timeout, &window, [&window, wait, &waited, file, settle]() {
 			bool busy = false;
 
 			for (QProcess *p : window.findChildren<QProcess *>())
@@ -162,8 +172,12 @@ int main(int argc, char **argv)
 			if (busy && ++waited < 100)
 				return;
 			wait->stop();
-			window.refresh([&window, file]() {
-				QCoreApplication::exit(window.grab().save(file, "PNG") ? 0 : 1);
+			/* A tab asked for is given two seconds to draw: a screen's
+			 * first frame comes from qemu after it is connected. */
+			window.refresh([&window, file, settle]() {
+				QTimer::singleShot(settle, &window, [&window, file]() {
+					QCoreApplication::exit(window.grab().save(file, "PNG") ? 0 : 1);
+				});
 			});
 		});
 		window.resize(900, 560);

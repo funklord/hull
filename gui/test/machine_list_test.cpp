@@ -200,6 +200,63 @@ int main(int argc, char **argv)
 		check(load_added().isEmpty(), "the list emptied");
 	}
 
+	/* Settings' editor: one form read, set, made or taken out, the rest of
+	 * the file -- its comment, its layout -- byte for byte as it was. */
+	{
+		const QString xp = QStringLiteral("; XP, kept here\n"
+		                                  "(machine (backend pc) (hostname \"winxp\")\n"
+		                                  "  (memory \"1024M\") (cpus 6)\n"
+		                                  "  (command \"a)b\")\n"
+		                                  "  (tuning (pc (machine pc) (nic e1000)))\n"
+		                                  "  (mutable direct))\n");
+		QString why;
+
+		check(spec_value(xp, { QStringLiteral("memory") }) == QStringLiteral("\"1024M\""),
+		      "a value read", spec_value(xp, { QStringLiteral("memory") }));
+		check(spec_value(xp, { QStringLiteral("tuning"), QStringLiteral("pc"), QStringLiteral("nic") }) ==
+		          QStringLiteral("e1000"), "a nested value read");
+		check(spec_value(xp, { QStringLiteral("tuning"), QStringLiteral("pc"), QStringLiteral("sound") })
+		          .isEmpty(), "an absent one, the default");
+		check(spec_value(QStringLiteral("(machine ; (memory \"9G\")\n (backend pc))"),
+		                 { QStringLiteral("memory") }).isEmpty(), "a form in a comment is no form");
+		check(spec_with(xp, { QStringLiteral("memory") }, QStringLiteral("\"2G\""), &why) ==
+		          QString(xp).replace(QStringLiteral("\"1024M\""), QStringLiteral("\"2G\"")),
+		      "a value replaced, nothing else", spec_with(xp, { QStringLiteral("memory") },
+		                                                  QStringLiteral("\"2G\""), &why));
+		check(spec_with(xp, { QStringLiteral("tuning"), QStringLiteral("pc"), QStringLiteral("sound") },
+		                QStringLiteral("ac97"), &why) ==
+		          QString(xp).replace(QStringLiteral("(nic e1000)"),
+		                              QStringLiteral("(nic e1000) (sound ac97)")),
+		      "a form made in its parent");
+		check(spec_with(xp, { QStringLiteral("network") }, QStringLiteral("nat"), &why) ==
+		          QString(xp).replace(QStringLiteral("(mutable direct))"),
+		                              QStringLiteral("(mutable direct)\n  (network nat))")),
+		      "a form made in the machine, on a line of its own",
+		      spec_with(xp, { QStringLiteral("network") }, QStringLiteral("nat"), &why));
+		check(spec_with(xp, { QStringLiteral("mutable") }, QString(), &why) ==
+		          QString(xp).replace(QStringLiteral("\n  (mutable direct))"), QStringLiteral(")")),
+		      "a last form taken out, the paren rejoining its line",
+		      spec_with(xp, { QStringLiteral("mutable") }, QString(), &why));
+		check(spec_with(xp, { QStringLiteral("cpus") }, QString(), &why) ==
+		          QString(xp).replace(QStringLiteral(" (cpus 6)"), QString()),
+		      "a form beside another taken out", spec_with(xp, { QStringLiteral("cpus") },
+		                                                     QString(), &why));
+		check(spec_with(xp, { QStringLiteral("command") }, QString(), &why) ==
+		          QString(xp).replace(QStringLiteral("  (command \"a)b\")\n"), QString()),
+		      "a form alone on its line taken out with the line, a paren in its string");
+		check(spec_with(xp, { QStringLiteral("sound") }, QString(), &why) == xp,
+		      "an absent form taken out: nothing changes");
+		check(spec_with(QStringLiteral("(machine (backend pc))\n"),
+		                { QStringLiteral("tuning"), QStringLiteral("pc"), QStringLiteral("sound") },
+		                QStringLiteral("hda"), &why) ==
+		          QStringLiteral("(machine (backend pc)\n  (tuning (pc (sound hda))))\n"),
+		      "the forms above it made too");
+		why.clear();
+		check(spec_with(QStringLiteral("(machines (a (backend pc)))"), { QStringLiteral("memory") },
+		                QStringLiteral("\"1G\""), &why).isEmpty() && why.contains(QStringLiteral("several")),
+		      "a file of several machines refused", why);
+	}
+
 	/* A clone's hostname: the one form replaced, its quotes and
 	 * backslashes escaped; none, the text as it was; two, refused. */
 	{

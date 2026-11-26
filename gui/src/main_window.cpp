@@ -15,6 +15,7 @@
 #include "images_dialog.h"
 #include "pools_dialog.h"
 #include "new_machine_dialog.h"
+#include "settings_dialog.h"
 #include "screen_window.h"
 
 #include <QAction>
@@ -114,7 +115,35 @@ main_window::main_window(const QString &hull_program, QWidget *parent)
 	tabs->addTab(output, QStringLiteral("&Output"));
 	tabs->addTab(usage, QStringLiteral("&Usage"));
 	tabs->addTab(build_network(), QStringLiteral("&Network"));
-	connect(tabs, &QTabWidget::currentChanged, this, [this]() { ask_ports(); });
+	/* The screen beside the list, as the holder asked of VirtualBox's
+	 * layout (project.md section 4.14): shown while this tab is, and only
+	 * then connected, so a screen nobody looks at costs qemu nothing;
+	 * Detach gives it a window of its own, which F8 opens too. */
+	screen_tab = new QWidget;
+	{
+		auto *layout = new QVBoxLayout(screen_tab);
+		auto *row = new QHBoxLayout;
+		auto *detach = new QPushButton(QStringLiteral("&Detach"));
+
+		screen_note = new QLabel;
+		screen_note->setWordWrap(true);
+		row->addWidget(screen_note, 1);
+		row->addWidget(detach);
+		layout->addLayout(row);
+		layout->setContentsMargins(0, 0, 0, 0);
+		connect(detach, &QPushButton::clicked, this, [this]() {
+			delete embedded;
+			embedded_id.clear();
+			tabs->setCurrentIndex(0);
+			open_screen();
+		});
+	}
+	if (!on_terminal())
+		tabs->addTab(screen_tab, QStringLiteral("Scr&een"));
+	connect(tabs, &QTabWidget::currentChanged, this, [this]() {
+		ask_ports();
+		update_screen_tab();
+	});
 
 	QSplitter *split = new QSplitter;
 	split->addWidget(tree);
@@ -199,6 +228,11 @@ void main_window::build_actions()
 	edit_action->setShortcut(QKeySequence(QStringLiteral("F4")));
 	edit_action->setToolTip(QStringLiteral("The machine's file in an editor, planned again after"));
 	connect(edit_action, &QAction::triggered, this, &main_window::edit_spec);
+	settings_action = new QAction(QStringLiteral("Settings..."), this);
+	settings_action->setShortcut(QKeySequence(QStringLiteral("F3")));
+	settings_action->setToolTip(QStringLiteral("The machine's hardware in a form, written back "
+	                                           "into its hull.conf"));
+	connect(settings_action, &QAction::triggered, this, &main_window::edit_settings);
 	clone_action = new QAction(QStringLiteral("Clone..."), this);
 	clone_action->setToolTip(QStringLiteral("Copy a machine in ~/hull, its disks with it, "
 	                                        "into a folder of its own"));
@@ -269,6 +303,7 @@ void main_window::build_actions()
 	machine->addAction(new_action);
 	machine->addAction(add_action);
 	machine->addAction(import_action);
+	machine->addAction(settings_action);
 	machine->addAction(edit_action);
 	machine->addAction(clone_action);
 	machine->addAction(remove_action);
@@ -408,6 +443,7 @@ void main_window::rebuild()
 	else {
 		update_actions();
 		show_details();
+		update_screen_tab();
 	}
 }
 
@@ -574,6 +610,62 @@ void main_window::selected_changed()
 	ask_stats();
 	ports->clear();
 	ask_ports();
+	update_screen_tab();
+}
+
+bool main_window::show_tab(const QString &name)
+{
+	for (int t = 0; t < tabs->count(); t++)
+		if (tabs->tabText(t).remove(QLatin1Char('&')).compare(name, Qt::CaseInsensitive) == 0) {
+			tabs->setCurrentIndex(t);
+			return true;
+		}
+	return false;
+}
+
+/* The Screen tab follows the selection while it is the tab shown; any
+ * other time it holds no screen, its listener dropped with it. */
+void main_window::update_screen_tab()
+{
+	const int     i = current();
+	const bool    showing = tabs->currentWidget() == screen_tab;
+	const bool    running = i >= 0 && i < rows.size() && rows[i].is_held &&
+	                        !rows[i].held.address.isEmpty();
+	const QString id = running ? rows[i].id : QString();
+
+	if (embedded != nullptr && (!showing || id != embedded_id)) {
+		delete embedded;
+		embedded_id.clear();
+	}
+	if (!showing || embedded != nullptr)
+		return;
+	if (!running) {
+		screen_note->setText(QStringLiteral("The machine is not running."));
+		return;
+	}
+	const QString runtime = QString::fromLocal8Bit(qgetenv("XDG_RUNTIME_DIR"));
+	const QString local = runtime + QStringLiteral("/hull/display/") + rows[i].held.address;
+
+	if (runtime.isEmpty() || !QFileInfo::exists(local)) {
+		screen_note->setText(QStringLiteral("%1 has no screen shown here: (display local) or "
+		                                    "(display window) gives one; (display vnc) is a VNC "
+		                                    "client's, F8").arg(id));
+		return;
+	}
+	auto   *screen = new screen_window(id, local, screen_tab);
+	QString why;
+
+	if (!screen->open(&why)) {
+		delete screen;
+		screen_note->setText(QStringLiteral("%1's screen cannot be shown: %2").arg(id, why));
+		return;
+	}
+	embedded = screen;
+	embedded_id = id;
+	screen_note->setText(QStringLiteral("%1 -- a click captures the keyboard, Right Ctrl "
+	                                    "gives it back").arg(id));
+	static_cast<QVBoxLayout *>(screen_tab->layout())->addWidget(screen, 1);
+	screen->show();
 }
 
 void main_window::update_actions()
@@ -589,6 +681,10 @@ void main_window::update_actions()
 	clone_action->setEnabled(any && in_own_folder(rows[i].added.file) &&
 	                         rows[i].added.name.isEmpty() && !held && rows[i].run == nullptr);
 	edit_action->setEnabled(any && !rows[i].added.file.isEmpty());
+	/* A running machine keeps the hardware it started with: changed
+	 * after it stops, as VirtualBox greys its own out. */
+	settings_action->setEnabled(any && !rows[i].added.file.isEmpty() && rows[i].added.name.isEmpty() &&
+	                            !held && rows[i].run == nullptr);
 	/* An exited machine the core still lists is started again: the core
 	 * takes a new run of the id beside it, as `hull run` does. */
 	start_action->setEnabled(any && (!rows[i].is_held || rows[i].held.state == QStringLiteral("exited")) &&
@@ -1035,6 +1131,28 @@ void main_window::clone_machine()
 	/* --no-target-directory: `to` is the copy, never a folder inside it. */
 	copy->start(QStringLiteral("cp"), { QStringLiteral("-a"), QStringLiteral("--reflink=auto"),
 	                                    QStringLiteral("--no-target-directory"), from, to });
+}
+
+/* Settings: the hardware in a form, written into the file in place, and
+ * the machine planned again, as after Edit. */
+void main_window::edit_settings()
+{
+	const int i = current();
+
+	if (i < 0 || i >= rows.size() || rows[i].added.file.isEmpty())
+		return;
+	const bool      pc = rows[i].resolved.contains(QStringLiteral("(backend pc)")) ||
+	                     rows[i].resolved.contains(QStringLiteral("(backend qemu-pc)"));
+	settings_dialog dialog(rows[i].added.file, pc, this);
+
+	if (!dialog.usable()) {
+		say(dialog.problem());
+		return;
+	}
+	if (dialog.exec() == QDialog::Accepted) {
+		plan_of(i);
+		refresh();
+	}
 }
 
 void main_window::remove_machine()

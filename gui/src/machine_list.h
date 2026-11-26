@@ -61,6 +61,24 @@ QString machine_id_of(const added_machine &machine, const QString &hostname);
  * than one, a file of several machines, which Clone does not copy. */
 QString with_hostname(const QString &text, const QString &hostname);
 
+/*
+ * Settings' editor, a file of one (machine ...) changed in one place and
+ * nowhere else, its comments and layout kept: `path` the forms' heads
+ * from the machine down, {"memory"} or {"tuning", "pc", "nic"}.
+ *
+ * spec_value: what follows the head of the form at `path`, as written --
+ * `"2G"`, `e1000` -- or "" where the file says nothing there, the
+ * default holding.
+ *
+ * spec_with: `text` with that form saying `value`, made with the forms
+ * above it where they are missing; with `value` "" the form taken out,
+ * so the default holds again. "" with `why` said where the file is not
+ * one machine's.
+ */
+QString spec_value(const QString &text, const QStringList &path);
+QString spec_with(const QString &text, const QStringList &path, const QString &value,
+                  QString *why);
+
 /* The hostname a `hull plan --resolved` line says, "" where none. */
 QString hostname_in(const QString &resolved);
 

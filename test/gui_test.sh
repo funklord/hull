@@ -139,6 +139,31 @@ has "$out" 'gui-web +stopped +chroot' "a compose file's first service added"
 has "$out" 'gui-db +stopped +chroot' "and its second"
 rm -rf "${dir:?}/compose"
 
+# Settings (F3): Memory moved from Default down to 512M and written into
+# the file on a line of its own, the comment kept; moved back to Default,
+# the file byte for byte as it was; OK on a form nobody touched writing
+# nothing. A list of its own, so the file is the only row and selected.
+mkdir -p "$dir/settings/config"
+printf '; kept\n(machine (hostname "gui-set") (source "dir:./rootfs")\n  (command "/probe"))\n' \
+	> "$dir/settings.conf"
+cp "$dir/settings.conf" "$dir/settings/orig.conf"
+config_saved=$XDG_CONFIG_HOME
+XDG_CONFIG_HOME=$dir/settings/config
+keys "$dir" "b'\\x1bOR'" "b'\\x1b[B'" "b'\\x1b[B'" "b'\\r'" -- "$dir/settings.conf"
+has "$(cat "$dir/settings.conf")" '^  \(memory "512M"\)\)$' "Settings wrote the memory chosen"
+has "$(cat "$dir/settings.conf")" '^; kept$' "and kept the file's comment"
+keys "$dir" "b'\\x1bOR'" "b'\\x1b[A'" "b'\\x1b[A'" "b'\\r'"
+cases=$((cases + 1))
+cmp -s "$dir/settings.conf" "$dir/settings/orig.conf" ||
+	fail "Settings back to Default did not give the file back" "$(cat "$dir/settings.conf")"
+touch -d '2020-01-01' "$dir/settings.conf"
+keys "$dir" "b'\\x1bOR'" "b'\\r'"
+cases=$((cases + 1))
+[ "$(stat -c %Y "$dir/settings.conf")" = "$(date -d '2020-01-01' +%s)" ] ||
+	fail "Settings untouched wrote the file" "$(cat "$dir/settings.conf")"
+XDG_CONFIG_HOME=$config_saved
+rm -rf "${dir:?}/settings" "${dir:?}/settings.conf"
+
 # Start on it offers the token that would honour the refusal; Esc
 # declines, and nothing runs.
 keys "$dir" "b'\\x1b[B'" "b'\\x13'" "b'\\x1b'"

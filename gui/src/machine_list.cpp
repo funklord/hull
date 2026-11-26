@@ -57,6 +57,180 @@ void save_added(const QList<added_machine> &list)
 	s.sync();
 }
 
+/* --- Settings' editor ------------------------------------------------ */
+
+namespace {
+
+/* The first position at or after `i` that is not space or a comment. */
+int skip_space(const QString &text, int i)
+{
+	while (i < text.size()) {
+		if (text[i].isSpace()) {
+			i++;
+		} else if (text[i] == QLatin1Char(';')) {
+			while (i < text.size() && text[i] != QLatin1Char('\n'))
+				i++;
+		} else {
+			break;
+		}
+	}
+	return i;
+}
+
+/* Past the atom or string at `i`. */
+int skip_atom(const QString &text, int i)
+{
+	if (i < text.size() && text[i] == QLatin1Char('"')) {
+		for (i++; i < text.size() && text[i] != QLatin1Char('"'); i++)
+			if (text[i] == QLatin1Char('\\'))
+				i++;
+		return i < text.size() ? i + 1 : -1;
+	}
+	while (i < text.size() && !text[i].isSpace() && text[i] != QLatin1Char('(') &&
+	       text[i] != QLatin1Char(')') && text[i] != QLatin1Char(';'))
+		i++;
+	return i;
+}
+
+/* Past the form opening at `open`, its ')' the one before; -1 unclosed. */
+int skip_form(const QString &text, int open)
+{
+	int i = open + 1;
+
+	for (;;) {
+		i = skip_space(text, i);
+		if (i >= text.size())
+			return -1;
+		if (text[i] == QLatin1Char(')'))
+			return i + 1;
+		i = text[i] == QLatin1Char('(') ? skip_form(text, i) : skip_atom(text, i);
+		if (i < 0)
+			return -1;
+	}
+}
+
+/* The head of the form opening at `open`. */
+QString head_at(const QString &text, int open)
+{
+	const int start = skip_space(text, open + 1);
+	const int end = skip_atom(text, start);
+
+	return end > start ? text.mid(start, end - start) : QString();
+}
+
+/* The child of the form at `open` whose head is `head`: its open, or -1. */
+int child_of(const QString &text, int open, const QString &head)
+{
+	int i = skip_atom(text, skip_space(text, open + 1));
+
+	while (i >= 0) {
+		i = skip_space(text, i);
+		if (i >= text.size() || text[i] == QLatin1Char(')'))
+			return -1;
+		if (text[i] == QLatin1Char('(')) {
+			if (head_at(text, i) == head)
+				return i;
+			i = skip_form(text, i);
+		} else {
+			i = skip_atom(text, i);
+		}
+	}
+	return -1;
+}
+
+/* The (machine ...) form's open, or -1 with `why`. */
+int machine_form(const QString &text, QString *why)
+{
+	const int i = skip_space(text, 0);
+
+	if (i < text.size() && text[i] == QLatin1Char('(') &&
+	    head_at(text, i) == QStringLiteral("machine") && skip_form(text, i) > 0)
+		return i;
+	if (why != nullptr)
+		*why = i < text.size() && head_at(text, i) == QStringLiteral("machines") ?
+		       QStringLiteral("the file holds several machines; Settings edits one") :
+		       QStringLiteral("the file is not one (machine ...) form");
+	return -1;
+}
+
+} // namespace
+
+QString spec_value(const QString &text, const QStringList &path)
+{
+	int at = machine_form(text, nullptr);
+
+	for (const QString &head : path) {
+		if (at < 0)
+			return QString();
+		at = child_of(text, at, head);
+	}
+	if (at < 0)
+		return QString();
+	const int start = skip_space(text, skip_atom(text, skip_space(text, at + 1)));
+	const int end = skip_form(text, at) - 1;
+
+	return text.mid(start, end - start).trimmed();
+}
+
+QString spec_with(const QString &text, const QStringList &path, const QString &value,
+                  QString *why)
+{
+	int     parent = machine_form(text, why);
+	int     depth = 0;
+	QString result = text;
+
+	if (parent < 0 || path.isEmpty())
+		return QString();
+	/* Down as far as the forms are there. */
+	for (; depth < path.size(); depth++) {
+		const int child = child_of(text, parent, path[depth]);
+
+		if (child < 0)
+			break;
+		parent = child;
+	}
+	if (depth == path.size()) {
+		const int end = skip_form(text, parent);
+
+		if (!value.isEmpty())
+			return result.replace(parent, end - parent,
+			                      QStringLiteral("(%1 %2)").arg(path.last(), value));
+		/* Out with the spaces before it; where it began a line, the line
+		 * too if nothing else is on it, or else the newline before it, so
+		 * a closing paren after it rejoins the line above. */
+		int from = parent;
+		int to = end;
+
+		while (from > 0 && (text[from - 1] == QLatin1Char(' ') || text[from - 1] == QLatin1Char('\t')))
+			from--;
+		if (from > 0 && text[from - 1] == QLatin1Char('\n')) {
+			int after = end;
+
+			while (after < text.size() &&
+			       (text[after] == QLatin1Char(' ') || text[after] == QLatin1Char('\t')))
+				after++;
+			if (after < text.size() && text[after] == QLatin1Char('\n'))
+				to = after + 1;
+			else
+				from--;
+		}
+		return result.remove(from, to - from);
+	}
+	if (value.isEmpty())
+		return result;
+	/* The missing forms made, innermost first, and put before the closing
+	 * paren of the deepest one there: on a line of its own in the machine,
+	 * after a space below it. */
+	QString made = QStringLiteral("(%1 %2)").arg(path.last(), value);
+
+	for (int i = path.size() - 2; i >= depth; i--)
+		made = QStringLiteral("(%1 %2)").arg(path[i], made);
+	const int close = skip_form(text, parent) - 1;
+
+	return result.insert(close, depth == 0 ? QStringLiteral("\n  ") + made :
+	                                          QLatin1Char(' ') + made);
+}
+
 QString with_hostname(const QString &text, const QString &hostname)
 {
 	static const QRegularExpression form(QStringLiteral("\\(hostname\\s+\"(?:[^\"\\\\]|\\\\.)*\"\\)"));
