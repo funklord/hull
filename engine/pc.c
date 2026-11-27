@@ -48,6 +48,7 @@
 #include <dirent.h>
 #include <ftw.h>
 #include <limits.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -2895,11 +2896,21 @@ static hull_status pc_signal(hull_core *core, hull_machine *m, hull_stream *stre
 /* One line of QMP's answer read into `why`: 1 for a return, 0 for an error
  * whose words are in `why`, -1 for no answer within the time. Events and the
  * greeting pass by, an answer being the only line opening with these. */
+static int monitor_answer_for(hull_machine *m, char *why, size_t cap, long left, char *said,
+                              size_t said_cap);
+
 static int monitor_answer(hull_machine *m, char *why, size_t cap)
+{
+	return monitor_answer_for(m, why, cap, 5000, NULL, 0u);
+}
+
+/* The same, waiting `left` ms, and a return's value, where it is a string
+ * -- what a human-monitor-command printed -- into `said`. */
+static int monitor_answer_for(hull_machine *m, char *why, size_t cap, long left, char *said,
+                              size_t said_cap)
 {
 	char   line[2048];
 	size_t have = 0u;
-	long   left = 5000;
 
 	while (left > 0) {
 		struct pollfd   p = { .fd = m->monitor, .events = POLLIN };
@@ -2928,8 +2939,15 @@ static int monitor_answer(hull_machine *m, char *why, size_t cap)
 			const char *desc;
 
 			*end = '\0';
-			if (strncmp(line, "{\"return\"", 9u) == 0)
+			if (strncmp(line, "{\"return\"", 9u) == 0) {
+				const char *text = strstr(line, "\"return\": \"");
+
+				if (said != NULL && said_cap > 0u)
+					snprintf(said, said_cap, "%.*s",
+					         text != NULL ? (int)strcspn(text + 11, "\"\\") : 0,
+					         text != NULL ? text + 11 : "");
 				return 1;
+			}
 			if (strncmp(line, "{\"error\"", 8u) == 0) {
 				desc = strstr(line, "\"desc\": \"");
 				snprintf(why, cap, "%.*s", desc != NULL ? (int)strcspn(desc + 9, "\"") : 0,
@@ -3245,6 +3263,68 @@ static hull_status finished_stream(hull_core *core, hull_machine *m, hull_stream
 	return HULL_OK;
 }
 
+/* `hull snapshot take|restore|delete ID NAME` of a running PC: its disks
+ * and its memory, as VirtualBox's Take Snapshot of a running machine
+ * keeps it, by the monitor's savevm, loadvm and delvm, inside its qcow2s
+ * where `qemu-img snapshot` finds them too. A machine kept as it was,
+ * under (mutable overlay), writes into qemu's throwaway file, so a
+ * snapshot there would go with it: refused. savevm stops the guest while
+ * its memory is written, so it is given minutes. */
+static hull_status live_snapshot(hull_machine *m, const char *verb, const char *name,
+                                 hull_error *error)
+{
+	const char *hmp = strcmp(verb, "take") == 0 ? "savevm" :
+	                  strcmp(verb, "restore") == 0 ? "loadvm" :
+	                  strcmp(verb, "delete") == 0 ? "delvm" : NULL;
+	char        command[256];
+	char        said[512] = "";
+	const char *wrong;
+
+	if (hmp == NULL)
+		return fail(error, HULL_ERR_UNSUPPORTED, "a snapshot is taken, restored or deleted");
+	for (const char *c = name; *c != '\0'; c++)
+		if (!isalnum((unsigned char)*c) && strchr("._-", *c) == NULL)
+			return fail(error, HULL_ERR_RUNTIME, "a snapshot's name is a plain word");
+	if (name[0] == '\0' || strlen(name) > 64u)
+		return fail(error, HULL_ERR_RUNTIME, "a snapshot's name is a plain word");
+	if (!m->direct)
+		return fail(error, HULL_ERR_UNSUPPORTED, "a machine under (mutable overlay) writes into "
+		            "qemu's throwaway file, which a snapshot would go with: (mutable direct) "
+		            "keeps one");
+	pthread_mutex_lock(&m->lock);
+	if (m->done || m->monitor < 0 || m->paused) {
+		int paused = m->paused && !m->done;
+
+		pthread_mutex_unlock(&m->lock);
+		return paused ? fail(error, HULL_ERR_BUSY, "the machine is paused") :
+		       fail(error, HULL_ERR_GONE, "the machine is not running");
+	}
+	pthread_mutex_unlock(&m->lock);
+	snprintf(command, sizeof command,
+	         "{\"execute\":\"human-monitor-command\",\"arguments\":{\"command-line\":\"%s %s\"}}\n",
+	         hmp, name);
+	pthread_mutex_lock(&m->monitor_lock);
+	wrong = monitor_say(m, "{\"execute\":\"query-status\"}\n", m->monitor_why,
+	                    sizeof m->monitor_why);
+	if (wrong == NULL) {
+		if (send(m->monitor, command, strlen(command), MSG_NOSIGNAL) < 0)
+			wrong = "the machine is not running";
+		else if (monitor_answer_for(m, m->monitor_why, sizeof m->monitor_why, 600000L, said,
+		                            sizeof said) != 1)
+			wrong = m->monitor_why;
+	}
+	pthread_mutex_unlock(&m->monitor_lock);
+	if (wrong != NULL)
+		return fail(error, HULL_ERR_RUNTIME, wrong);
+	/* The human monitor's own failure is a return of its words: an
+	 * "Error:" line, or a device it could not snapshot. */
+	if (said[0] != '\0') {
+		snprintf(m->monitor_why, sizeof m->monitor_why, "%s", said);
+		return fail(error, HULL_ERR_RUNTIME, m->monitor_why);
+	}
+	return HULL_OK;
+}
+
 static hull_status pc_exec(hull_core *core, hull_machine *m, hull_buf spec, hull_stream **out,
                            hull_error *error)
 {
@@ -3266,6 +3346,7 @@ static hull_status pc_exec(hull_core *core, hull_machine *m, hull_buf spec, hull
 	}
 	/* 86Box has no monitor of qemu's to ask. */
 	if (m->box && words[0] != NULL && (strcmp(words[0], "change") == 0 ||
+	                                   strcmp(words[0], "snapshot") == 0 ||
 	                                   strcmp(words[0], "key") == 0 ||
 	                                   strcmp(words[0], "screen") == 0)) {
 		for (unsigned i = 0u; i < count; i++)
@@ -3280,6 +3361,16 @@ static hull_status pc_exec(hull_core *core, hull_machine *m, hull_buf spec, hull
 		for (unsigned i = 0u; i < count; i++)
 			free(words[i]);
 		return changed == HULL_OK ? finished_stream(core, m, out, error) : changed;
+	}
+	/* `hull snapshot VERB ID NAME`, likewise. */
+	if (words[0] != NULL && strcmp(words[0], "snapshot") == 0) {
+		hull_status done = words[1] == NULL || words[2] == NULL ?
+		                   fail(error, HULL_ERR_RUNTIME, "a snapshot is a verb and a name") :
+		                   live_snapshot(m, words[1], words[2], error);
+
+		for (unsigned i = 0u; i < count; i++)
+			free(words[i]);
+		return done == HULL_OK ? finished_stream(core, m, out, error) : done;
 	}
 	/* `hull key`, `hull type` and `hull screenshot`, likewise. */
 	if (words[0] != NULL && (strcmp(words[0], "key") == 0 || strcmp(words[0], "screen") == 0)) {

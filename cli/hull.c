@@ -170,7 +170,7 @@ static void usage(FILE *out)
 	      "       hull import --machine X.vbox|X.vmx|X.ovf|X.ova DIR\n"
 	      "       hull media import IMAGE DIR | verify DIR | export DIR IMAGE\n"
 	      "       hull media change ID DRIVE [IMAGE]\n"
-	      "       hull snapshot ls FILE | hull snapshot take|restore|delete FILE NAME\n"
+	      "       hull snapshot ls FILE | hull snapshot take|restore|delete FILE|ID NAME\n"
 	      "       hull disk write FILE DEVICE|IMAGE\n"
 	      "       hull key ID KEY... | hull type ID TEXT | hull screenshot ID FILE\n"
 	      "       hull board ls POOL | hull board fix NAME\n"
@@ -7047,10 +7047,19 @@ static int snapshot_table(const char *path, char *out, size_t cap)
 	return hull_hostnet_run(argv, out, cap);
 }
 
+static int snapshot_held(const char *table, const char *name, char *when, size_t cap, int *memory);
+
 /* Whether `table`, qemu-img's, holds a snapshot named `name`: its rows
  * are an id, the tag, then sizes and times. The date and time of it into
  * `when` where it does. */
 static int snapshot_in(const char *table, const char *name, char *when, size_t cap)
+{
+	return snapshot_held(table, name, when, cap, NULL);
+}
+
+/* The same, and whether it holds a running machine's memory, a VM_SIZE
+ * not 0, into `*memory` where that is not NULL. */
+static int snapshot_held(const char *table, const char *name, char *when, size_t cap, int *memory)
 {
 	for (const char *line = table; *line != '\0';) {
 		const char *end = strchr(line, '\n');
@@ -7072,6 +7081,8 @@ static int snapshot_in(const char *table, const char *name, char *when, size_t c
 				snprintf(when, cap, "%s %s", unit, date);
 			else
 				snprintf(when, cap, "%s %s", date, clock);
+			if (memory != NULL)
+				*memory = strcmp(size, "0") != 0;
 			return 1;
 		}
 		line += n + (end != NULL);
@@ -7122,11 +7133,34 @@ static int snapshot(const char *verb, const char *file, const char *name)
 	unsigned        count;
 	unsigned        left;
 	int             status = 1;
+	int             memory = 0;
 
 	if (name != NULL && !snapshot_word(name)) {
 		fprintf(stderr, "hull: snapshot: a name is letters, digits, '.', '_' and '-', at most "
 		        "64 of them\n");
 		return 2;
+	}
+	/* Not a file: a running machine's id, whose engine takes it with its
+	 * memory, as VirtualBox's Take Snapshot of a running machine does. */
+	if (access(file, F_OK) != 0 && strchr(file, '/') == NULL) {
+		char  arch[32];
+		char *words[3] = { "snapshot", (char *)verb, (char *)name };
+
+		if (name == NULL) {
+			fprintf(stderr, "hull: snapshot: ls reads the machine's file, which a running "
+			        "machine's are read from too\n");
+			return 2;
+		}
+		if (list_machines(file, arch, sizeof arch) != 0) {
+			fprintf(stderr, "hull: snapshot: no file or running machine %s\n", file);
+			return 125;
+		}
+		if (strcmp(listed_engine, "qemu-pc") != 0) {
+			fprintf(stderr, "hull: snapshot: %s is on %s; a snapshot is of a pc machine's "
+			        "disks\n", file, listed_engine);
+			return 125;
+		}
+		return exec_in(file, words, 3, 0, 0u);
 	}
 	if ((data = spec_text(file, &length)) == NULL)
 		return 125;
@@ -7198,7 +7232,7 @@ static int snapshot(const char *verb, const char *file, const char *name)
 			fprintf(stderr, "hull: snapshot: %s: %s\n", paths[i], table);
 			return 1;
 		}
-		held = snapshot_in(table, name, when, sizeof when);
+		held = snapshot_held(table, name, when, sizeof when, i == 0u ? &memory : NULL);
 		if (strcmp(verb, "take") == 0 && held) {
 			fprintf(stderr, "hull: snapshot: the machine has a snapshot %s already\n", name);
 			return 1;
@@ -7235,6 +7269,14 @@ static int snapshot(const char *verb, const char *file, const char *name)
 		fprintf(stderr, "hull: snapshot: %s\n", why);
 		return 1;
 	}
+	/* One taken of a running machine holds its memory, which only the
+	 * running machine takes back: on a stopped one the disks are as they
+	 * were mid-run, as after a power cut. */
+	if (strcmp(verb, "restore") == 0 && memory)
+		fprintf(stderr, "hull: snapshot: %s was taken of the machine running; its disks are "
+		        "back as they were then, and it boots from them as after a power cut. "
+		        "Restored on the running machine, `hull snapshot restore ID %s`, it carries on "
+		        "where it was\n", name, name);
 	return 0;
 }
 

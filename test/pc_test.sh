@@ -361,7 +361,65 @@ wait "$spin_pid"
 cases=$((cases + 1))
 [ "$took" -ge 3 ] && [ "$took" -le 8 ] ||
 	fail "a PC's stop waits its grace on the power button: took ${took}s" "$(cat "$root/spin.out")"
-rm -f "$root/spin.img" "$root/spin.out"
+# A snapshot of the running machine, its memory with its disk, as
+# VirtualBox takes one: by its id, listed from its file while it runs,
+# restored and deleted on it; restored on the stopped machine, said to be
+# as after a power cut. Under (mutable overlay), refused: qemu's
+# throwaway file would take it.
+qemu-img convert -O qcow2 "$root/spin.img" "$root/spin.qcow2"
+conf '(hostname "pc-live") (source "media:disk") (mutable direct) (stop_grace "1s")' \
+	'(media (medium (type disk) (source "image:./spin.qcow2")))'
+live() {
+	(cd "$root" && exec timeout 120 "$hull" run -f "$root/hull.conf" > "$root/spin.out" 2>&1) &
+	spin_pid=$!
+	tries=0
+	until timeout 10 "$hull" ps 2>/dev/null | grep -q 'pc-live .*running' || [ "$tries" -ge 100 ]; do
+		tries=$((tries + 1))
+		sleep 0.1
+	done
+}
+live
+out=$("$hull" snapshot take pc-live running 2>&1)
+got=$?
+status 'a running machine snapshot taken' "$got" 0 "$out"
+says 'listed from its file as it runs' "$("$hull" snapshot ls "$root/hull.conf" 2>&1)" 'running	'
+# qemu-img's VM_SIZE, the machine state, not 0 B.
+held=$(qemu-img snapshot -U -l "$root/spin.qcow2" 2>&1 | grep ' running ')
+cases=$((cases + 1))
+case $held in
+''|*' 0 B '*) fail 'its memory in it' "$held" ;;
+esac
+out=$("$hull" snapshot restore pc-live running 2>&1)
+got=$?
+status 'and restored on it' "$got" 0 "$out"
+out=$("$hull" snapshot restore pc-live none 2>&1)
+got=$?
+status 'a name it lacks is refused' "$got" 125 "$out"
+timeout 30 "$hull" stop pc-live > /dev/null 2>&1
+wait "$spin_pid"
+out=$("$hull" snapshot restore "$root/hull.conf" running 2>&1)
+got=$?
+status 'restored on the stopped machine' "$got" 0 "$out"
+says 'said as after a power cut' "$out" 'as after a power cut'
+live
+out=$("$hull" snapshot delete pc-live running 2>&1)
+got=$?
+status 'and deleted on the running machine' "$got" 0 "$out"
+timeout 30 "$hull" stop pc-live > /dev/null 2>&1
+wait "$spin_pid"
+cases=$((cases + 1))
+[ -z "$("$hull" snapshot ls "$root/hull.conf" 2>&1)" ] ||
+	fail 'a deleted live snapshot is listed no more' "$("$hull" snapshot ls "$root/hull.conf" 2>&1)"
+conf '(hostname "pc-live") (source "media:disk") (mutable overlay) (stop_grace "1s")' \
+	'(media (medium (type disk) (source "image:./spin.qcow2")))'
+live
+out=$("$hull" snapshot take pc-live running 2>&1)
+got=$?
+status 'a running machine under overlay is refused a snapshot' "$got" 125 "$out"
+says 'saying why' "$out" '(mutable direct) keeps one'
+timeout 30 "$hull" stop pc-live > /dev/null 2>&1
+wait "$spin_pid"
+rm -f "$root/spin.img" "$root/spin.out" "$root/spin.qcow2"
 
 # Imported, as hull-gui's Import is: the .vbox copied into a folder of
 # its own, its VDI converted to qcow2 there and its hull.conf saying so,
