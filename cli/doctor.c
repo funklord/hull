@@ -514,6 +514,7 @@ int hull_doctor(const char *runtime_why)
 	virtiofs();
 	own_kernel();
 	tool("qemu-system-x86_64", "vm and emu machines on x86_64");
+	tool("qemu-img", "a pc machine's disks imported, exported, snapshotted and grown");
 	tool("docker", "the docker engine");
 	tool("mkfs.ext4", "an ext4 image made from a directory, -d, with no loop mount");
 	tool("mkfs.erofs", "an EROFS image made from a directory");
