@@ -75,6 +75,7 @@ private:
 	void start();
 	void stop();
 	void kill_machine();
+	void save_state();
 	void pause_machine(bool paused);
 	void open_terminal();
 	void open_screen();
@@ -128,6 +129,7 @@ private:
 	QAction        *add_action;
 	QAction        *import_action;
 	QAction        *export_action;
+	QAction        *save_action;
 	QAction        *snapshots_action;
 	QAction        *remove_action;
 	QAction        *clone_action;

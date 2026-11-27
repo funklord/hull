@@ -257,6 +257,11 @@ void main_window::build_actions()
 	stop_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+T")));
 	stop_action->setToolTip(QStringLiteral("Stop: TERM, then KILL after the machine's grace"));
 	connect(stop_action, &QAction::triggered, this, &main_window::stop);
+	save_action = new QAction(QStringLiteral("Save State"), this);
+	save_action->setShortcut(QKeySequence(QStringLiteral("F11")));
+	save_action->setToolTip(QStringLiteral("A running PC's memory and disks kept, then off: its "
+	                                       "next start carries on where it was"));
+	connect(save_action, &QAction::triggered, this, &main_window::save_state);
 	kill_action = new QAction(QStringLiteral("Power Off"), this);
 	kill_action->setToolTip(QStringLiteral("KILL the workload at once"));
 	connect(kill_action, &QAction::triggered, this, &main_window::kill_machine);
@@ -323,6 +328,7 @@ void main_window::build_actions()
 	machine->addSeparator();
 	machine->addAction(start_action);
 	machine->addAction(stop_action);
+	machine->addAction(save_action);
 	machine->addAction(kill_action);
 	machine->addAction(pause_action);
 	machine->addAction(resume_action);
@@ -716,6 +722,9 @@ void main_window::update_actions()
 	start_action->setEnabled(any && (!rows[i].is_held || rows[i].held.state == QStringLiteral("exited")) &&
 	                         rows[i].run == nullptr && !rows[i].added.file.isEmpty());
 	stop_action->setEnabled(held);
+	/* A running PC on qemu: its monitor saves the state. */
+	save_action->setEnabled(state == QStringLiteral("running") &&
+	                        rows[i].held.engine == QStringLiteral("qemu-pc"));
 	kill_action->setEnabled(held);
 	pause_action->setEnabled(held && state != QStringLiteral("paused"));
 	resume_action->setEnabled(held && state == QStringLiteral("paused"));
@@ -1494,6 +1503,34 @@ void main_window::stop()
 		                                      : QStringLiteral("%1: %2").arg(id, reason));
 		        refresh();
 	        });
+}
+
+/* Save State, as VirtualBox's Close > Save the machine state: `hull stop
+ * --save ID`, the running PC's memory and disks kept as hull-saved and
+ * the machine off; Start carries on from there. Beside the window, as a
+ * large memory takes a while to write. */
+void main_window::save_state()
+{
+	const int i = current();
+
+	if (i < 0 || i >= rows.size() || !rows[i].is_held)
+		return;
+	const QString id = rows[i].id;
+	QProcess     *saving = new QProcess(this);
+
+	saving->setStandardInputFile(QProcess::nullDevice());
+	saving->setProcessChannelMode(QProcess::MergedChannels);
+	connect(saving, &QProcess::finished, this, [this, saving, id](int code, QProcess::ExitStatus how) {
+		const QString said = QString::fromUtf8(saving->readAll()).trimmed().section(QLatin1Char('\n'), -1);
+
+		saving->deleteLater();
+		say(how == QProcess::NormalExit && code == 0
+		        ? QStringLiteral("%1 saved: Start carries on where it was").arg(id)
+		        : QStringLiteral("%1 was not saved: %2").arg(id, said));
+		refresh();
+	});
+	say(QStringLiteral("saving %1").arg(id));
+	saving->start(hull, { QStringLiteral("stop"), QStringLiteral("--save"), id });
 }
 
 void main_window::kill_machine()

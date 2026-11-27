@@ -488,6 +488,10 @@ if command -v qemu-system-x86_64 > /dev/null && command -v qemu-img > /dev/null;
 	keys "$dir" "b'gui-live'" "b'\\x1bOQ'" "b'\\t'" "b' '" "b'\\r'" "b'\\x1b'" -- live.conf
 	has "$("$hull" snapshot ls "$dir/live.conf" 2>&1)" '^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}	' \
 		"Snapshots took one of the running machine"
+	# Save State (F11): its memory kept as hull-saved, the machine off.
+	keys "$dir" "b'gui-live'" "b'\\x1b[23~'" "b''" -- live.conf
+	has "$("$hull" snapshot ls "$dir/live.conf" 2>&1)" '^hull-saved	' "Save State kept the machine's state"
+	has "$out" 'gui-live saved' "and said so"
 	timeout 30 "$hull" stop gui-live > /dev/null 2>&1
 	wait "$run_pid" 2>/dev/null
 	run_pid=
