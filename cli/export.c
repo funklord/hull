@@ -690,32 +690,56 @@ int hull_export_hosted(hull_store *store, const char *name, const char *image,
 
 /* --- an appliance, .ova -------------------------------------------------- */
 
-/* The OVF of one machine: a disk on a SATA controller, an E1000 on NAT,
- * BIOS firmware, as plain OVF gives both VirtualBox and VMware. */
-static int write_ovf(const char *path, const char *title, const char *disk,
-                     unsigned long long capacity, unsigned long long disk_bytes,
-                     unsigned long memory_mib, unsigned cpus)
+/* An appliance's shape: its disks, as named in the package, each with its
+ * capacity and its file's size; its controller, IDE or SATA; its NIC as
+ * OVF's ResourceSubType; and its firmware, plain OVF's BIOS or VMware's
+ * own EFI setting, which VirtualBox reads as well. */
+typedef struct ova_shape {
+	const char         *title;
+	unsigned long       memory_mib;
+	unsigned            cpus;
+	const char         *nic;
+	int                 ide;
+	int                 uefi;
+	int                 secure;
+	const char         *sound;
+	int                 usb;
+	unsigned            count;
+	char                names[HULL_OVA_DISKS][300];
+	unsigned long long  capacity[HULL_OVA_DISKS];
+	unsigned long long  bytes[HULL_OVA_DISKS];
+} ova_shape;
+
+/* The OVF of one machine: its disks on one controller, an adapter on NAT,
+ * as plain OVF gives both VirtualBox and VMware. */
+static int write_ovf(const char *path, const ova_shape *shape)
 {
 	FILE *out = fopen(path, "wxe");
 	int   ok;
 
 	if (out == NULL)
 		return -1;
+	fputs("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+	      "<Envelope ovf:version=\"1.0\" xml:lang=\"en-US\""
+	      " xmlns=\"http://schemas.dmtf.org/ovf/envelope/1\""
+	      " xmlns:ovf=\"http://schemas.dmtf.org/ovf/envelope/1\""
+	      " xmlns:rasd=\"http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ResourceAllocationSettingData\""
+	      " xmlns:vssd=\"http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_VirtualSystemSettingData\""
+	      " xmlns:vmw=\"http://www.vmware.com/schema/ovf\">\n"
+	      "  <References>\n", out);
+	for (unsigned i = 0u; i < shape->count; i++)
+		fprintf(out, "    <File ovf:id=\"file%u\" ovf:href=\"%s\" ovf:size=\"%llu\"/>\n",
+		        i + 1u, shape->names[i], shape->bytes[i]);
+	/* "disk" for one, as it was before a PC's several, so a tree's
+	 * appliance is the same bytes from one version to the next. */
+	fprintf(out, "  </References>\n"
+	             "  <DiskSection>\n"
+	             "    <Info>The machine's disk%s</Info>\n", shape->count == 1u ? "" : "s");
+	for (unsigned i = 0u; i < shape->count; i++)
+		fprintf(out, "    <Disk ovf:capacity=\"%llu\" ovf:diskId=\"vmdisk%u\" ovf:fileRef=\"file%u\""
+		        " ovf:format=\"http://www.vmware.com/interfaces/specifications/vmdk.html#streamOptimized\"/>\n",
+		        shape->capacity[i], i + 1u, i + 1u);
 	fprintf(out,
-	    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-	    "<Envelope ovf:version=\"1.0\" xml:lang=\"en-US\""
-	    " xmlns=\"http://schemas.dmtf.org/ovf/envelope/1\""
-	    " xmlns:ovf=\"http://schemas.dmtf.org/ovf/envelope/1\""
-	    " xmlns:rasd=\"http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ResourceAllocationSettingData\""
-	    " xmlns:vssd=\"http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_VirtualSystemSettingData\""
-	    " xmlns:vmw=\"http://www.vmware.com/schema/ovf\">\n"
-	    "  <References>\n"
-	    "    <File ovf:id=\"file1\" ovf:href=\"%s\" ovf:size=\"%llu\"/>\n"
-	    "  </References>\n"
-	    "  <DiskSection>\n"
-	    "    <Info>The machine's disk</Info>\n"
-	    "    <Disk ovf:capacity=\"%llu\" ovf:diskId=\"vmdisk1\" ovf:fileRef=\"file1\""
-	    " ovf:format=\"http://www.vmware.com/interfaces/specifications/vmdk.html#streamOptimized\"/>\n"
 	    "  </DiskSection>\n"
 	    "  <NetworkSection>\n"
 	    "    <Info>Its network</Info>\n"
@@ -724,8 +748,8 @@ static int write_ovf(const char *path, const char *title, const char *disk,
 	    "  <VirtualSystem ovf:id=\"%s\">\n"
 	    "    <Info>A machine hull exported</Info>\n"
 	    "    <Name>%s</Name>\n"
-	    "    <OperatingSystemSection ovf:id=\"101\" vmw:osType=\"otherLinux64Guest\">\n"
-	    "      <Info>Linux, 64-bit</Info>\n"
+	    "    <OperatingSystemSection ovf:id=\"%s\" vmw:osType=\"%s\">\n"
+	    "      <Info>%s</Info>\n"
 	    "    </OperatingSystemSection>\n"
 	    "    <VirtualHardwareSection>\n"
 	    "      <Info>Its hardware</Info>\n"
@@ -747,33 +771,73 @@ static int write_ovf(const char *path, const char *title, const char *disk,
 	    "        <rasd:InstanceID>2</rasd:InstanceID>\n"
 	    "        <rasd:ResourceType>4</rasd:ResourceType>\n"
 	    "        <rasd:VirtualQuantity>%lu</rasd:VirtualQuantity>\n"
-	    "      </Item>\n"
-	    "      <Item>\n"
-	    "        <rasd:ElementName>sataController0</rasd:ElementName>\n"
-	    "        <rasd:InstanceID>3</rasd:InstanceID>\n"
-	    "        <rasd:ResourceSubType>AHCI</rasd:ResourceSubType>\n"
-	    "        <rasd:ResourceType>20</rasd:ResourceType>\n"
-	    "      </Item>\n"
+	    "      </Item>\n",
+	    shape->title, shape->title,
+	    /* Without a guest's own word, "other", 64-bit: Linux as before
+	     * for a tree hull made bootable, nothing claimed for a PC's. */
+	    shape->nic == NULL ? "101" : "102", shape->nic == NULL ? "otherLinux64Guest" : "other64Guest",
+	    shape->nic == NULL ? "Linux, 64-bit" : "Other, 64-bit",
+	    shape->title, shape->cpus, shape->cpus, shape->memory_mib, shape->memory_mib);
+	if (shape->ide)
+		fputs("      <Item>\n"
+		      "        <rasd:Address>0</rasd:Address>\n"
+		      "        <rasd:ElementName>ideController0</rasd:ElementName>\n"
+		      "        <rasd:InstanceID>3</rasd:InstanceID>\n"
+		      "        <rasd:ResourceSubType>PIIX4</rasd:ResourceSubType>\n"
+		      "        <rasd:ResourceType>5</rasd:ResourceType>\n"
+		      "      </Item>\n", out);
+	else
+		fputs("      <Item>\n"
+		      "        <rasd:ElementName>sataController0</rasd:ElementName>\n"
+		      "        <rasd:InstanceID>3</rasd:InstanceID>\n"
+		      "        <rasd:ResourceSubType>AHCI</rasd:ResourceSubType>\n"
+		      "        <rasd:ResourceType>20</rasd:ResourceType>\n"
+		      "      </Item>\n", out);
+	fprintf(out,
 	    "      <Item>\n"
 	    "        <rasd:AutomaticAllocation>true</rasd:AutomaticAllocation>\n"
 	    "        <rasd:Connection>NAT</rasd:Connection>\n"
 	    "        <rasd:ElementName>ethernet0</rasd:ElementName>\n"
 	    "        <rasd:InstanceID>4</rasd:InstanceID>\n"
-	    "        <rasd:ResourceSubType>E1000</rasd:ResourceSubType>\n"
+	    "        <rasd:ResourceSubType>%s</rasd:ResourceSubType>\n"
 	    "        <rasd:ResourceType>10</rasd:ResourceType>\n"
-	    "      </Item>\n"
-	    "      <Item>\n"
-	    "        <rasd:AddressOnParent>0</rasd:AddressOnParent>\n"
-	    "        <rasd:ElementName>disk0</rasd:ElementName>\n"
-	    "        <rasd:HostResource>ovf:/disk/vmdisk1</rasd:HostResource>\n"
-	    "        <rasd:InstanceID>5</rasd:InstanceID>\n"
-	    "        <rasd:Parent>3</rasd:Parent>\n"
-	    "        <rasd:ResourceType>17</rasd:ResourceType>\n"
-	    "      </Item>\n"
-	    "    </VirtualHardwareSection>\n"
-	    "  </VirtualSystem>\n"
-	    "</Envelope>\n",
-	    disk, disk_bytes, capacity, title, title, title, cpus, cpus, memory_mib, memory_mib);
+	    "      </Item>\n", shape->nic != NULL ? shape->nic : "E1000");
+	for (unsigned i = 0u; i < shape->count; i++)
+		fprintf(out,
+		    "      <Item>\n"
+		    "        <rasd:AddressOnParent>%u</rasd:AddressOnParent>\n"
+		    "        <rasd:ElementName>disk%u</rasd:ElementName>\n"
+		    "        <rasd:HostResource>ovf:/disk/vmdisk%u</rasd:HostResource>\n"
+		    "        <rasd:InstanceID>%u</rasd:InstanceID>\n"
+		    "        <rasd:Parent>3</rasd:Parent>\n"
+		    "        <rasd:ResourceType>17</rasd:ResourceType>\n"
+		    "      </Item>\n", i, i, i + 1u, i + 5u);
+	if (shape->sound != NULL)
+		fprintf(out,
+		    "      <Item>\n"
+		    "        <rasd:AutomaticAllocation>false</rasd:AutomaticAllocation>\n"
+		    "        <rasd:ElementName>sound</rasd:ElementName>\n"
+		    "        <rasd:InstanceID>%u</rasd:InstanceID>\n"
+		    "        <rasd:ResourceSubType>%s</rasd:ResourceSubType>\n"
+		    "        <rasd:ResourceType>35</rasd:ResourceType>\n"
+		    "      </Item>\n", shape->count + 5u, shape->sound);
+	if (shape->usb)
+		fprintf(out,
+		    "      <Item>\n"
+		    "        <rasd:Address>0</rasd:Address>\n"
+		    "        <rasd:ElementName>usb</rasd:ElementName>\n"
+		    "        <rasd:InstanceID>%u</rasd:InstanceID>\n"
+		    "        <rasd:ResourceSubType>OHCI</rasd:ResourceSubType>\n"
+		    "        <rasd:ResourceType>23</rasd:ResourceType>\n"
+		    "      </Item>\n", shape->count + 6u);
+	if (shape->uefi)
+		fputs("      <vmw:Config ovf:required=\"false\" vmw:key=\"firmware\" vmw:value=\"efi\"/>\n", out);
+	if (shape->secure)
+		fputs("      <vmw:Config ovf:required=\"false\" vmw:key=\"uefi.secureBoot.enabled\""
+		      " vmw:value=\"true\"/>\n", out);
+	fputs("    </VirtualHardwareSection>\n"
+	      "  </VirtualSystem>\n"
+	      "</Envelope>\n", out);
 	ok = !ferror(out);
 	return fclose(out) == 0 && ok ? 0 : -1;
 }
@@ -834,19 +898,119 @@ done:
 	return status;
 }
 
+/* The work directory beside `ova`, for its parts: 0, or -1 with `why`. */
+static int ova_work(const char *ova, char *work, size_t size, char *why, size_t cap)
+{
+	const char *slash = strrchr(ova, '/');
+
+	if (slash != NULL)
+		snprintf(work, size, "%.*s.ova-XXXXXX", (int)(slash - ova) + 1, ova);
+	else
+		snprintf(work, size, ".ova-XXXXXX");
+	if (mkdtemp(work) == NULL) {
+		snprintf(why, cap, "%s: %s", work, strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+/* `from`, an image qemu-img reads, as the package's streamOptimized VMDK
+ * `to`, its content id made of `name`: 0, or -1 with `why`. */
+static int ova_disk(const char *from, const char *format, const char *to, const char *name,
+                    char *why, size_t cap)
+{
+	const char *const with[] = { "qemu-img", "convert", "-f", format, "-O", "vmdk", "-o",
+	                             "subformat=streamOptimized", from, to, NULL };
+	const char *const probed[] = { "qemu-img", "convert", "-O", "vmdk", "-o",
+	                               "subformat=streamOptimized", from, to, NULL };
+
+	if (run(format != NULL ? with : probed, "qemu-img could not make the appliance's VMDK", why,
+	        cap) != 0)
+		return -1;
+	if (fix_cid(to, name) != 0) {
+		snprintf(why, cap, "the appliance's VMDK has no descriptor its content id can be set in");
+		return -1;
+	}
+	return 0;
+}
+
+/* A sparse VMDK's capacity, in bytes, from its header: 0 where unread. */
+static unsigned long long vmdk_capacity(const char *path)
+{
+	uint8_t            head[20];
+	unsigned long long sectors = 0u;
+	int                fd = open(path, O_RDONLY | O_CLOEXEC);
+	int                read_whole;
+
+	if (fd < 0)
+		return 0u;
+	read_whole = pread(fd, head, sizeof head, 0) == (ssize_t)sizeof head;
+	close(fd);
+	if (!read_whole || memcmp(head, "KDMV", 4u) != 0)
+		return 0u;
+	/* Little-endian, as fix_cid reads it. */
+	for (unsigned i = 8u; i-- > 0u;)
+		sectors = sectors << 8 | head[12 + i];
+	return sectors * 512u;
+}
+
+/* The descriptor written and the package tarred, the descriptor first, as
+ * OVF requires of an .ova, ustar with no owner or time of this host's in
+ * it: 0, or -1 with `why`. */
+static int ova_pack(const char *work, const char *ova, const ova_shape *shape, char *why,
+                    size_t cap)
+{
+	char        ovf_name[300];
+	char        ovf[4400];
+	const char *argv[16 + HULL_OVA_DISKS];
+	unsigned    n = 0u;
+	int         status;
+
+	snprintf(ovf_name, sizeof ovf_name, "%s.ovf", shape->title);
+	path_of(ovf, sizeof ovf, work, ovf_name);
+	if (write_ovf(ovf, shape) != 0) {
+		snprintf(why, cap, "%s could not be written: %s", ovf, strerror(errno));
+		unlink(ovf);
+		return -1;
+	}
+	unlink(ova);
+	for (const char *const *word = (const char *const[]){ "tar", "--format=ustar", "--owner=0",
+	                                 "--group=0", "--numeric-owner", "--mode=a=r,u+w",
+	                                 "--mtime=@946684800", "-cf", NULL }; *word != NULL; word++)
+		argv[n++] = *word;
+	argv[n++] = ova;
+	argv[n++] = "-C";
+	argv[n++] = work;
+	argv[n++] = ovf_name;
+	for (unsigned i = 0u; i < shape->count; i++)
+		argv[n++] = shape->names[i];
+	argv[n] = NULL;
+	status = run(argv, "tar could not write the appliance", why, cap);
+	if (status != 0)
+		unlink(ova);
+	unlink(ovf);
+	return status;
+}
+
+static int plain_title(const char *title, char *why, size_t cap)
+{
+	if (title[0] == '\0' || strlen(title) > 200u || strpbrk(title, "<>&\"'/") != NULL) {
+		snprintf(why, cap, "the appliance's name, %s, is not a plain word", title);
+		return 0;
+	}
+	return 1;
+}
+
 int hull_export_ova(hull_store *store, const char *name, const char *ova, const char *init,
                     const char *title, unsigned long memory_mib, unsigned cpus, char *why,
                     size_t cap)
 {
-	char        built[4200];
-	char        work[4300];
-	char        raw[4400];
-	char        disk[4400];
-	char        ovf[4400];
-	char        disk_name[300];
-	char        ovf_name[300];
-	const char *slash = strrchr(ova, '/');
-	int         status = -1;
+	static ova_shape shape;
+	char             built[4200];
+	char             work[4300];
+	char             raw[4400];
+	char             disk[4400];
+	int              status = -1;
 
 	/* Plain OVF names no firmware, which both hypervisors take as BIOS:
 	 * Limine's BIOS stage and the tool that installs it must be there,
@@ -861,59 +1025,79 @@ int hull_export_ova(hull_store *store, const char *name, const char *ova, const 
 		         "and only Limine built from source installs that: `make limine` builds it");
 		return -1;
 	}
-	if (title[0] == '\0' || strpbrk(title, "<>&\"'/") != NULL) {
-		snprintf(why, cap, "the appliance's name, %s, is not a plain word", title);
+	if (!plain_title(title, why, cap) || ova_work(ova, work, sizeof work, why, cap) != 0)
 		return -1;
-	}
-	if (slash != NULL)
-		snprintf(work, sizeof work, "%.*s.ova-XXXXXX", (int)(slash - ova) + 1, ova);
-	else
-		snprintf(work, sizeof work, ".ova-XXXXXX");
-	if (mkdtemp(work) == NULL) {
-		snprintf(why, cap, "%s: %s", work, strerror(errno));
-		return -1;
-	}
-	snprintf(disk_name, sizeof disk_name, "%s-disk1.vmdk", title);
-	snprintf(ovf_name, sizeof ovf_name, "%s.ovf", title);
+	memset(&shape, 0, sizeof shape);
+	shape.title = title;
+	shape.memory_mib = memory_mib;
+	shape.cpus = cpus;
+	shape.count = 1u;
+	snprintf(shape.names[0], sizeof shape.names[0], "%s-disk1.vmdk", title);
 	path_of(raw, sizeof raw, work, "disk.raw");
-	path_of(disk, sizeof disk, work, disk_name);
-	path_of(ovf, sizeof ovf, work, ovf_name);
-	if (export_image(store, name, raw, init, NULL, why, cap) != 0)
+	path_of(disk, sizeof disk, work, shape.names[0]);
+	if (export_image(store, name, raw, init, NULL, why, cap) != 0 ||
+	    ova_disk(raw, "raw", disk, name, why, cap) != 0)
 		goto done;
-	{
-		const char *const argv[] = { "qemu-img", "convert", "-f", "raw", "-O", "vmdk", "-o",
-		                             "subformat=streamOptimized", raw, disk, NULL };
-
-		if (run(argv, "qemu-img could not make the appliance's VMDK", why, cap) != 0)
-			goto done;
-	}
-	if (fix_cid(disk, name) != 0) {
-		snprintf(why, cap, "the appliance's VMDK has no descriptor its content id can be set in");
-		goto done;
-	}
-	if (write_ovf(ovf, title, disk_name, file_size(raw), file_size(disk), memory_mib,
-	              cpus) != 0) {
-		snprintf(why, cap, "%s could not be written: %s", ovf, strerror(errno));
-		goto done;
-	}
-	/* The descriptor first, as OVF requires of an .ova, ustar with no
-	 * owner or time of this host's in it. */
-	unlink(ova);
-	{
-		const char *const argv[] = { "tar", "--format=ustar", "--owner=0", "--group=0",
-		                             "--numeric-owner", "--mode=a=r,u+w", "--mtime=@946684800", "-cf", ova, "-C",
-		                             work, ovf_name, disk_name, NULL };
-
-		if (run(argv, "tar could not write the appliance", why, cap) != 0) {
-			unlink(ova);
-			goto done;
-		}
-	}
-	status = 0;
+	shape.capacity[0] = file_size(raw);
+	shape.bytes[0] = file_size(disk);
+	status = ova_pack(work, ova, &shape, why, cap);
 done:
 	unlink(raw);
 	unlink(disk);
-	unlink(ovf);
+	rmdir(work);
+	return status;
+}
+
+int hull_export_ova_disks(const char *const *disks, unsigned count, const char *ova,
+                          const hull_ova_machine *machine, char *why, size_t cap)
+{
+	static ova_shape shape;
+	char             work[4300];
+	char             disk[4400];
+	char             id[300];
+	unsigned         made = 0u;
+	int              status = -1;
+
+	if (count == 0u || count > HULL_OVA_DISKS) {
+		snprintf(why, cap, count == 0u ? "the machine has no disk to export" :
+		         "an appliance of hull's holds at most %u disks", HULL_OVA_DISKS);
+		return -1;
+	}
+	if (!plain_title(machine->title, why, cap) || ova_work(ova, work, sizeof work, why, cap) != 0)
+		return -1;
+	memset(&shape, 0, sizeof shape);
+	shape.title = machine->title;
+	shape.memory_mib = machine->memory_mib;
+	shape.cpus = machine->cpus;
+	shape.nic = machine->nic;
+	shape.ide = machine->ide;
+	shape.uefi = machine->uefi;
+	shape.secure = machine->secure;
+	shape.sound = machine->sound;
+	shape.usb = machine->usb;
+	shape.count = count;
+	for (; made < count; made++) {
+		snprintf(shape.names[made], sizeof shape.names[made], "%s-disk%u.vmdk", machine->title,
+		         made + 1u);
+		snprintf(id, sizeof id, "%s/%u", machine->title, made + 1u);
+		path_of(disk, sizeof disk, work, shape.names[made]);
+		if (ova_disk(disks[made], NULL, disk, id, why, cap) != 0) {
+			made++;
+			goto done;
+		}
+		if ((shape.capacity[made] = vmdk_capacity(disk)) == 0u) {
+			snprintf(why, cap, "%s: qemu-img's VMDK names no capacity", disks[made]);
+			made++;
+			goto done;
+		}
+		shape.bytes[made] = file_size(disk);
+	}
+	status = ova_pack(work, ova, &shape, why, cap);
+done:
+	for (unsigned i = 0u; i < made; i++) {
+		path_of(disk, sizeof disk, work, shape.names[i]);
+		unlink(disk);
+	}
 	rmdir(work);
 	return status;
 }

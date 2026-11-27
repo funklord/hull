@@ -365,6 +365,52 @@ status 'a file of no hypervisor is refused' "$got" 2 "$out"
 cases=$((cases + 1))
 [ ! -e "$root/again" ] || fail 'and no folder made for it' "$(ls -la "$root/again")"
 
+# Exported, as hull-gui's Export Appliance is: the imported machine's own
+# disk as an appliance, VirtualBox's shape -- its i440FX's disk on IDE --
+# the same bytes twice, and imported back into a folder of its own, where
+# it boots. A board, and a pc machine exported as anything but an .ova,
+# are refused.
+out=$("$hull" export --bootable -f "$root/imported/hull.conf" "$root/back.ova" 2>&1)
+got=$?
+status 'a pc machine exported as an appliance' "$got" 0 "$out"
+ovf_text=$(tar xOf "$root/back.ova" old-vbox.ovf 2>&1)
+says 'its disk on IDE, as it was' "$ovf_text" '<rasd:ResourceSubType>PIIX4</rasd:ResourceSubType>'
+says 'its memory' "$ovf_text" '<rasd:VirtualQuantity>128</rasd:VirtualQuantity>'
+says 'the descriptor first' "$(tar tf "$root/back.ova" 2>&1 | head -1)" 'old-vbox.ovf'
+"$hull" export --bootable -f "$root/imported/hull.conf" "$root/back2.ova" > /dev/null 2>&1
+cases=$((cases + 1))
+cmp -s "$root/back.ova" "$root/back2.ova" || fail 'an appliance exported twice is the same bytes' ''
+cached=$(ls "$root/cache/hull/ova" 2>/dev/null)
+out=$("$hull" import --machine "$root/back.ova" "$root/reimported" 2>&1)
+got=$?
+status 'and imported back' "$got" 0 "$out"
+conf=$(cat "$root/reimported/hull.conf" 2>&1)
+says 'its controller read back' "$conf" '(machine pc)'
+says 'and its sound and tablet' "$conf" '(sound ac97) (pointer tablet)'
+out=$(timeout 120 "$hull" run -f "$root/reimported/hull.conf" 2>&1)
+got=$?
+status 'the appliance boots' "$got" 0 "$out"
+says 'from its own disk' "$out" 'booted from a drive'
+out=$("$hull" export --bootable -f "$root/imported/hull.conf" "$root/back.img" 2>&1)
+got=$?
+status 'a pc machine exported as an image is refused' "$got" 125 "$out"
+printf '(machine (backend pc) (source "image:./raw.img") (tuning (pc (machine mps2-an385))))\n' \
+	> "$root/board-export.conf"
+out=$("$hull" export --bootable -f "$root/board-export.conf" "$root/board.ova" 2>&1)
+got=$?
+status 'a board exported as an appliance is refused' "$got" 125 "$out"
+says 'and said' "$out" 'an appliance describes a PC'
+rm -rf "$root/reimported"
+rm -f "$root/back.ova" "$root/back2.ova" "$root/board-export.conf"
+# The cache the appliance was unpacked into, so the cases below count
+# their own alone.
+for entry in $(ls "$root/cache/hull/ova" 2>/dev/null); do
+	case " $(printf '%s ' $cached)" in
+	*" $entry "*) ;;
+	*) rm -rf "${root:?}/cache/hull/ova/${entry:?}" ;;
+	esac
+done
+
 # An appliance: its .ovf read as a pc machine, VirtualBox's export shape
 # -- a streamOptimized VMDK, an IDE controller, an E1000 -- and the .ova
 # around it unpacked once into the cache, then booted from there.

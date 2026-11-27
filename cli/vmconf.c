@@ -718,6 +718,25 @@ static void ovf_hardware(machine *m, const ovf_item *item, const ovf_item *contr
 	case 3:
 		m->cpus = (unsigned)strtoul(item->quantity, NULL, 10);
 		return;
+	case 23:
+		/* A USB controller: a tablet, the pointer where the viewer's is,
+		 * as a .vbox's USB gives one. */
+		m->tablet = 1;
+		return;
+	case 35:
+		/* Its sound card by VirtualBox's export names: AC'97 is written
+		 * as the Ensoniq 1371 that carries one. */
+		if (strcasecmp(item->subtype, "ensoniq1371") == 0)
+			strcpy(m->sound, "ac97");
+		else if (strcasecmp(item->subtype, "hdaudio") == 0)
+			strcpy(m->sound, "hda");
+		else if (strcasecmp(item->subtype, "soundblaster16") == 0)
+			strcpy(m->sound, "sb16");
+		else {
+			snprintf(said, sizeof said, "its sound card, %.40s, is left out", item->subtype);
+			note(m, said);
+		}
+		return;
 	case 4: {
 		unsigned long quantity = strtoul(item->quantity, NULL, 10);
 

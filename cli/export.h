@@ -28,4 +28,29 @@ int hull_export_ova(hull_store *store, const char *name, const char *ova, const 
                     const char *title, unsigned long memory_mib, unsigned cpus, char *why,
                     size_t cap);
 
+/* At most this many disks in an appliance of a PC's. */
+#define HULL_OVA_DISKS 8u
+
+/* A PC as an appliance names it: `title` a plain word, its NIC OVF's
+ * ResourceSubType (E1000, E1000e, PCNet32, virtio, VmxNet3), its disks on
+ * an IDE controller where `ide`, else SATA, and EFI where `uefi`. */
+typedef struct hull_ova_machine {
+	const char    *title;
+	unsigned long  memory_mib;
+	unsigned       cpus;
+	const char    *nic;
+	int            ide;
+	int            uefi;
+	int            secure;
+	const char    *sound;   /* OVF's: ensoniq1371, hdaudio, soundblaster16, or NULL */
+	int            usb;     /* a USB controller, for a tablet */
+} hull_ova_machine;
+
+/* A PC's own disks, any format qemu-img reads, as an appliance `ova`:
+ * each a streamOptimized VMDK, in the order given, the first the one it
+ * boots, with an OVF of `machine`. VirtualBox's Export Appliance, the
+ * reverse of `hull import --machine`. 0, or -1 with `why`. */
+int hull_export_ova_disks(const char *const *disks, unsigned count, const char *ova,
+                          const hull_ova_machine *machine, char *why, size_t cap);
+
 #endif

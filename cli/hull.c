@@ -6706,6 +6706,173 @@ static char *spec_value(hull_spec *spec, const hull_sexpr_form *machine, const c
  * commits it; a stored ref as it is. */
 static uint64_t spec_bytes(const char *text);
 
+/* The value of `(key value)` in `record`, escapes decoded, into `out`:
+ * 1, or 0 where it is absent or does not fit. */
+static int record_value(hull_spec *spec, const hull_sexpr_form *record, const char *key,
+                        char *out, size_t cap)
+{
+	hull_sexpr_form entry;
+	hull_sexpr_form head;
+	hull_sexpr_form value;
+	size_t          length;
+
+	out[0] = '\0';
+	if (!hull_spec_find(spec, record, key, &entry) || !hull_sexpr_child(&spec->doc, &entry, &head) ||
+	    !hull_sexpr_next(&spec->doc, &head, &value) ||
+	    hull_sexpr_value(&spec->doc, &value, (uint8_t *)out, cap - 1u, &length) != HULL_SEXPR_OK ||
+	    length >= cap || memchr(out, '\0', length) != NULL) {
+		out[0] = '\0';
+		return 0;
+	}
+	out[length] = '\0';
+	return 1;
+}
+
+/* An image: source as the path a run opens, relative to the spec's own
+ * directory: 1, or 0 where it is not an image of a file. */
+static int image_path(const char *file, const char *source, char *out, size_t cap)
+{
+	const char *slash = strrchr(file, '/');
+
+	if (strncmp(source, "image:", 6u) != 0 || source[6] == '\0')
+		return 0;
+	if (source[6] == '/')
+		return snprintf(out, cap, "%s", source + 6) < (int)cap;
+	return snprintf(out, cap, "%.*s%s", slash != NULL ? (int)(slash - file + 1) : 0, file,
+	                source + 6) < (int)cap;
+}
+
+/* `hull export --bootable -f FILE X.ova` of a pc machine: its own disks,
+ * which already boot, as VirtualBox's Export Appliance gives them -- each
+ * a VMDK, the first the one it boots, its memory, processors, adapter and
+ * firmware in the OVF; its discs and floppies left out, as VirtualBox
+ * leaves them unless asked, said on stderr. A board, a PowerPC Mac and
+ * anything else that is not a PC are refused: an OVF describes a PC. */
+static int export_pc(const char *file, hull_spec *spec, const hull_sexpr_form *machine,
+                     const char *name, const char *ova)
+{
+	static char      paths[HULL_OVA_DISKS][4400];
+	const char      *disks[HULL_OVA_DISKS];
+	hull_ova_machine shape = { 0 };
+	hull_sexpr_form  entry;
+	hull_sexpr_form  tuning;
+	hull_sexpr_form  pc;
+	char             text[4400];
+	char             board[64] = "";
+	char             nic[32] = "";
+	char             firmware[32] = "";
+	char             sound[16] = "";
+	char             pointer[16] = "";
+	char             hostname[200];
+	char             title[64];
+	char             why[4400] = "";
+	unsigned         count = 0u;
+	unsigned         left = 0u;
+	size_t           n = 0u;
+
+	if (!is_ova(ova)) {
+		fprintf(stderr, "%s: a pc machine is exported as an appliance, X.ova; its disks are "
+		        "already images\n", file);
+		return 125;
+	}
+	if (hull_spec_find(spec, machine, "tuning", &tuning) &&
+	    hull_spec_find(spec, &tuning, "pc", &pc)) {
+		record_value(spec, &pc, "machine", board, sizeof board);
+		record_value(spec, &pc, "nic", nic, sizeof nic);
+		record_value(spec, &pc, "firmware", firmware, sizeof firmware);
+		record_value(spec, &pc, "sound", sound, sizeof sound);
+		record_value(spec, &pc, "pointer", pointer, sizeof pointer);
+	}
+	if (board[0] != '\0' && strcmp(board, "pc") != 0 && strcmp(board, "q35") != 0) {
+		fprintf(stderr, "%s: an appliance describes a PC, and machine %s is not one\n", file,
+		        board);
+		return 125;
+	}
+	/* The source first, where it is an image of its own, then the disks of
+	 * (media ...) in order. */
+	if (record_value(spec, machine, "source", text, sizeof text) &&
+	    image_path(file, text, paths[count], sizeof paths[count]))
+		count++;
+	if (hull_spec_find(spec, machine, "media", &entry)) {
+		hull_sexpr_form medium;
+		hull_sexpr_form at;
+		int             more = hull_sexpr_child(&spec->doc, &entry, &at);
+
+		while (more && (more = hull_sexpr_next(&spec->doc, &at, &medium))) {
+			char type[16];
+
+			at = medium;
+
+			record_value(spec, &medium, "type", type, sizeof type);
+			if (strcmp(type, "disk") != 0) {
+				left++;
+				continue;
+			}
+			if (!record_value(spec, &medium, "source", text, sizeof text) ||
+			    count == HULL_OVA_DISKS ||
+			    !image_path(file, text, paths[count], sizeof paths[count])) {
+				fprintf(stderr, "%s: %s\n", file, count == HULL_OVA_DISKS ?
+				        "an appliance of hull's holds at most 8 disks" :
+				        "a disk's source is not an image: file, which an appliance needs");
+				return 125;
+			}
+			count++;
+		}
+	}
+	for (unsigned i = 0u; i < count; i++)
+		disks[i] = paths[i];
+	/* Its title a plain word, as a tree's appliance's is. */
+	if (!record_value(spec, machine, "hostname", hostname, sizeof hostname))
+		snprintf(hostname, sizeof hostname, "%s", name != NULL ? name : "machine");
+	for (const char *c = hostname; *c != '\0' && n + 1u < sizeof title; c++) {
+		if (isalnum((unsigned char)*c))
+			title[n++] = (char)tolower((unsigned char)*c);
+		else if (n > 0u && title[n - 1u] != '-')
+			title[n++] = '-';
+	}
+	while (n > 0u && title[n - 1u] == '-')
+		n--;
+	title[n] = '\0';
+	shape.title = n > 0u ? title : "machine";
+	shape.memory_mib = record_value(spec, machine, "memory", text, sizeof text) ?
+	                   (unsigned long)(spec_bytes(text) >> 20) : 0u;
+	if (shape.memory_mib == 0u)
+		shape.memory_mib = 1024u;
+	shape.cpus = record_value(spec, machine, "cpus", text, sizeof text) ?
+	             (unsigned)strtoul(text, NULL, 10) : 0u;
+	if (shape.cpus == 0u)
+		shape.cpus = 1u;
+	/* The adapter as OVF names it; one OVF has no word for is an E1000,
+	 * which every guest of a PC's age knows. */
+	shape.nic = strcmp(nic, "e1000e") == 0 ? "E1000e" : strcmp(nic, "pcnet") == 0 ? "PCNet32" :
+	            strcmp(nic, "virtio") == 0 ? "virtio" : strcmp(nic, "vmxnet3") == 0 ? "VmxNet3" :
+	            "E1000";
+	if (nic[0] != '\0' && strcmp(nic, "e1000") != 0 && strcmp(shape.nic, "E1000") == 0)
+		fprintf(stderr, "hull: export: its adapter, %s, is given as an E1000\n", nic);
+	/* An i440FX's disks on IDE, as `hull import --machine` reads them
+	 * back; anything later on SATA. */
+	shape.ide = strcmp(board, "pc") == 0;
+	shape.uefi = strncmp(firmware, "uefi", 4u) == 0;
+	shape.secure = strcmp(firmware, "uefi-secure") == 0;
+	/* Its sound card by the names VirtualBox exports and reads; its
+	 * tablet as the USB controller a .vbox gives one on. */
+	shape.sound = strcmp(sound, "ac97") == 0 ? "ensoniq1371" : strcmp(sound, "hda") == 0 ?
+	              "hdaudio" : strcmp(sound, "sb16") == 0 ? "soundblaster16" : NULL;
+	if (sound[0] != '\0' && strcmp(sound, "none") != 0 && shape.sound == NULL)
+		fprintf(stderr, "hull: export: its sound card, %s, has no name in an appliance and is "
+		        "left out\n", sound);
+	shape.usb = strcmp(pointer, "tablet") == 0;
+	if (left > 0u)
+		fprintf(stderr, "hull: export: %u %s left out, as an appliance holds disks\n", left,
+		        left == 1u ? "disc or floppy" : "discs and floppies");
+	if (hull_export_ova_disks(disks, count, ova, &shape, why, sizeof why) != 0) {
+		fprintf(stderr, "hull: export: %s\n", why);
+		return 1;
+	}
+	printf("%s\n", ova);
+	return 0;
+}
+
 static int export_machine(const char *file, const char *name, const char *image)
 {
 	hull_spec       spec;
@@ -6724,6 +6891,19 @@ static int export_machine(const char *file, const char *name, const char *image)
 
 	if ((data = spec_text(file, &length)) == NULL)
 		return 125;
+	/* A PC's own disks, which store_sources has no part in. */
+	if (hull_spec_open(&spec, data, length, &error) == HULL_SPEC_OK &&
+	    (spec.has_machine && name == NULL ? (machine = spec.machine, 1) :
+	     spec.has_machines && name != NULL && hull_spec_find(&spec, &spec.machines, name, &machine))) {
+		char backend[16];
+
+		if (record_value(&spec, &machine, "backend", backend, sizeof backend) &&
+		    strcmp(backend, "pc") == 0) {
+			status = export_pc(file, &spec, &machine, name, image);
+			free(data);
+			return status;
+		}
+	}
 	if (store_sources(file, data, &length, 1, NULL, 0u) != 0) {
 		free(data);
 		return 125;
