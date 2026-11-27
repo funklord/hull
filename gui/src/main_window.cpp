@@ -224,6 +224,11 @@ void main_window::build_actions()
 	import_action->setToolTip(QStringLiteral("Copy a VirtualBox or VMware machine or an "
 	                                         "appliance into a folder of its own in ~/hull"));
 	connect(import_action, &QAction::triggered, this, &main_window::ask_import);
+	export_action = new QAction(QStringLiteral("Export Appliance..."), this);
+	export_action->setShortcut(QKeySequence(QStringLiteral("Ctrl+X")));
+	export_action->setToolTip(QStringLiteral("The machine as an .ova, which VirtualBox and "
+	                                         "VMware import"));
+	connect(export_action, &QAction::triggered, this, &main_window::export_appliance);
 	edit_action = new QAction(QStringLiteral("Edit hull.conf"), this);
 	edit_action->setShortcut(QKeySequence(QStringLiteral("F4")));
 	edit_action->setToolTip(QStringLiteral("The machine's file in an editor, planned again after"));
@@ -303,6 +308,7 @@ void main_window::build_actions()
 	machine->addAction(new_action);
 	machine->addAction(add_action);
 	machine->addAction(import_action);
+	machine->addAction(export_action);
 	machine->addAction(settings_action);
 	machine->addAction(edit_action);
 	machine->addAction(clone_action);
@@ -685,6 +691,9 @@ void main_window::update_actions()
 	clone_action->setEnabled(any && in_own_folder(rows[i].added.file) &&
 	                         rows[i].added.name.isEmpty() && !held && rows[i].run == nullptr);
 	edit_action->setEnabled(any && !rows[i].added.file.isEmpty());
+	/* A stopped machine's disks: a running one's are being written. */
+	export_action->setEnabled(any && !rows[i].added.file.isEmpty() && !held &&
+	                          rows[i].run == nullptr);
 	/* A running machine keeps the hardware it started with: changed
 	 * after it stops, as VirtualBox greys its own out. */
 	settings_action->setEnabled(any && !rows[i].added.file.isEmpty() && rows[i].added.name.isEmpty() &&
@@ -1029,6 +1038,77 @@ void main_window::ask_import()
 	});
 	say(QStringLiteral("importing %1 into %2").arg(file, dir));
 	import->start(hull, { QStringLiteral("import"), QStringLiteral("--machine"), file, dir });
+}
+
+/* Export Appliance, as VirtualBox's: the machine as an .ova by `hull
+ * export --bootable -f FILE [NAME] X.ova` -- a PC's own disks, or a
+ * directory's tree made bootable -- for VirtualBox, VMware or Import to
+ * read. The CLI says why where a machine cannot be one, a board's say;
+ * the copy takes a while for a large disk, so it runs beside the window
+ * as Import does. */
+void main_window::export_appliance()
+{
+	const int i = current();
+
+	if (i < 0 || i >= rows.size() || rows[i].added.file.isEmpty())
+		return;
+	const added_machine machine = rows[i].added;
+	QString             base = machine.name;
+
+	if (base.isEmpty())
+		base = hostname_in(rows[i].resolved);
+	if (base.isEmpty())
+		base = QFileInfo(machine.file).absoluteDir().dirName();
+	const QString suggested = QDir::homePath() + QLatin1Char('/') + base + QStringLiteral(".ova");
+	QString       ova;
+	bool          given = false;
+
+	if (on_terminal()) {
+		ova = QInputDialog::getText(this, QStringLiteral("Export Appliance"),
+		                            QStringLiteral("The .ova to write:"), QLineEdit::Normal,
+		                            suggested, &given)
+		          .trimmed();
+		if (!given)
+			return;
+	} else {
+		ova = QFileDialog::getSaveFileName(this, QStringLiteral("Export Appliance"), suggested,
+		                                   QStringLiteral("Appliances (*.ova)"));
+	}
+	if (ova.isEmpty())
+		return;
+	if (!ova.endsWith(QStringLiteral(".ova")))
+		ova += QStringLiteral(".ova");
+
+	QProcess   *exporting = new QProcess(this);
+	QStringList arguments = { QStringLiteral("export"), QStringLiteral("--bootable"),
+	                          QStringLiteral("-f"), machine.file };
+
+	if (!machine.name.isEmpty())
+		arguments << machine.name;
+	arguments << ova;
+	exporting->setStandardInputFile(QProcess::nullDevice());
+	exporting->setProcessChannelMode(QProcess::MergedChannels);
+	connect(exporting, &QProcess::readyRead, this, [this, exporting]() {
+		const QList<QByteArray> lines = exporting->readAll().trimmed().split('\n');
+
+		if (!lines.isEmpty() && !lines.last().isEmpty()) {
+			say(QString::fromUtf8(lines.last()));
+			exporting->setProperty("said", QString::fromUtf8(lines.last()));
+		}
+	});
+	connect(exporting, &QProcess::finished, this, [this, exporting, ova](int code,
+	                                                                    QProcess::ExitStatus how) {
+		exporting->deleteLater();
+		if (how != QProcess::NormalExit || code != 0) {
+			QMessageBox::warning(this, QStringLiteral("Export Appliance"),
+			                     QStringLiteral("%1 was not written: %2")
+			                         .arg(ova, exporting->property("said").toString()));
+			return;
+		}
+		say(QStringLiteral("exported to %1").arg(ova));
+	});
+	say(QStringLiteral("exporting to %1").arg(ova));
+	exporting->start(hull, arguments);
 }
 
 /* New: the store's refs offered as sources, `hull images`' first column,

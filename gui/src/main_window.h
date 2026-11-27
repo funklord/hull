@@ -88,6 +88,7 @@ private:
 	void edit_settings();
 	void remove_machine();
 	void clone_machine();
+	void export_appliance();
 	void ask_add();
 	void ask_import();
 	void ask_new(const QString &source = QString());
@@ -124,6 +125,7 @@ private:
 	QAction        *new_action;
 	QAction        *add_action;
 	QAction        *import_action;
+	QAction        *export_action;
 	QAction        *remove_action;
 	QAction        *clone_action;
 	QAction        *start_action;

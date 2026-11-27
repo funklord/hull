@@ -189,6 +189,16 @@ if grep -q '(ports' "$dir/settings.conf" || ! grep -q '(volume (host "./rootfs")
 	"$dir/settings.conf"; then
 	fail "Settings did not remove the port and keep the folder" "$(cat "$dir/settings.conf")"
 fi
+# Export Appliance (Ctrl+X): a pc machine's disk as ~/NAME.ova, the path
+# offered taken with Enter, its descriptor first.
+printf '(machine (backend pc) (hostname "gui-export") (source "media:disk")\n  (media (medium (type disk) (source "image:./a.img"))))\n' \
+	> "$dir/settings.conf"
+rm -rf "${dir:?}/settings/config"
+mkdir -p "$dir/settings/config"
+keys "$dir" "b'\\x18'" "b'\\r'" -- "$dir/settings.conf"
+has "$(tar tf "$dir/home/gui-export.ova" 2>&1)" '^gui-export\.ovf$' "Export Appliance wrote the .ova"
+has "$(tar tf "$dir/home/gui-export.ova" 2>&1)" '^gui-export-disk1\.vmdk$' "with the machine's disk"
+rm -f "$dir/home/gui-export.ova"
 XDG_CONFIG_HOME=$config_saved
 rm -rf "${dir:?}/settings" "${dir:?}/settings.conf" "${dir:?}/a.img" "${dir:?}/b.iso"
 
