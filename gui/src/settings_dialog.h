@@ -13,6 +13,7 @@
 
 #include <QDialog>
 #include <QList>
+#include <QMap>
 #include <QStringList>
 
 #include <functional>
@@ -55,6 +56,7 @@ private:
 	void         add_record(QListWidget *list, const QString &record, const QString &shown);
 	QString      folder_path(const QString &chosen);
 	void add_medium(const QString &type);
+	void resize_medium();
 	void add_port();
 	void add_folder();
 
@@ -68,6 +70,8 @@ private:
 	};
 	QList<records> lists;
 	QListWidget   *media = nullptr;    /* a pc's disks and discs */
+	QMap<QString, qint64>  resizes;    /* a disk's path, and the bytes it grows to on OK */
+	QMap<QString, QString> formats;    /* and its format, as qemu-img named it */
 	QListWidget   *ports = nullptr;    /* its forwarded ports */
 	QListWidget   *folders = nullptr;  /* its shared folders, (volumes ...) */
 	QLabel      *error;

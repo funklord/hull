@@ -171,7 +171,7 @@ mkdir -p "$dir/settings/config"
 truncate -s 1M "$dir/settings/a.img" "$dir/settings/b.iso"
 ln -sf settings/a.img "$dir/a.img"
 ln -sf settings/b.iso "$dir/b.iso"
-keys "$dir" "b'\\x1bOR'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
+keys "$dir" "b'\\x1bOR'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
 	"b'\\t'" "b'\\t'" "b' '" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
 	"b' '" -- "$dir/settings.conf"
 has "$(cat "$dir/settings.conf")" '^  \(media \(medium \(type cdrom\) \(source "image:\./b\.iso"\)\)\)\)$' \
@@ -190,6 +190,20 @@ has "$(cat "$dir/settings.conf")" '\(tuning \(pc \(firmware uefi\)\)\)' "Setting
 keys "$dir" "b'\\x1bOR'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
 	"b'\\t'" "b'\\t'" "b'\\t'" "b'\\x1b[B'" "b'\\r'" -- "$dir/settings.conf"
 has "$(cat "$dir/settings.conf")" '\(source "media:cdrom"\)' "Settings set what a PC boots from"
+# Resize, VirtualBox's Media Manager's size: the disk row the twelfth
+# Tab, Resize three more, Up from 1 GiB to 2, Enter; then past Remove and
+# the ports' and folders' lists to OK, which grows the qcow2.
+if command -v qemu-img > /dev/null; then
+	qemu-img create -q -f qcow2 "$dir/settings/grow.qcow2" 1G
+	printf '(machine (backend pc) (hostname "gui-grow") (source "media:disk")\n  (media (medium (type disk) (source "image:./settings/grow.qcow2"))))\n' \
+		> "$dir/settings.conf"
+	rm -rf "${dir:?}/settings/config"
+	mkdir -p "$dir/settings/config"
+	keys "$dir" "b'\\x1bOR'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
+		"b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b' '" "b'\\x1b[A'" "b'\\r'" \
+		"b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b' '" -- "$dir/settings.conf"
+	has "$(qemu-img info "$dir/settings/grow.qcow2" 2>&1)" '^virtual size: 2 GiB' "Settings grew the disk"
+fi
 # Every class's ports and shared folders: on a chroot machine the port's
 # Remove is the sixth Tab from Memory, the folder kept.
 printf '(machine (hostname "gui-ports") (source "dir:./rootfs")\n  (ports (port (host 8080) (guest 80)))\n  (volumes (volume (host "./rootfs") (guest "/data") (mode ro))))\n' \

@@ -12,8 +12,11 @@
 #include <QFileInfo>
 #include <QHBoxLayout>
 #include <QInputDialog>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QProcess>
 #include <QPushButton>
 #include <QFormLayout>
 #include <QLabel>
@@ -115,6 +118,8 @@ settings_dialog::settings_dialog(const QString &file_path, bool pc, QWidget *par
 		 * shown by its type and source, a new one added by its image. */
 		auto *add_disk = new QPushButton(QStringLiteral("Add &Disk..."));
 		auto *add_disc = new QPushButton(QStringLiteral("Add D&isc..."));
+		/* VirtualBox's Media Manager's size: a disk grown, on OK. */
+		auto *resize_disk = new QPushButton(QStringLiteral("Resi&ze..."));
 
 		media = record_list(QStringLiteral("Disks and discs:"), QStringLiteral("media"),
 		                    [](const QString &record) {
@@ -127,7 +132,8 @@ settings_dialog::settings_dialog(const QString &file_path, bool pc, QWidget *par
 			                    return type.isEmpty() || source.isEmpty() ? QString() :
 			                           QStringLiteral("%1  %2").arg(type, source);
 		                    },
-		                    { add_disk, add_disc });
+		                    { add_disk, add_disc, resize_disk });
+		connect(resize_disk, &QPushButton::clicked, this, &settings_dialog::resize_medium);
 		connect(add_disk, &QPushButton::clicked, this, [this]() { add_medium(QStringLiteral("disk")); });
 		connect(add_disc, &QPushButton::clicked, this, [this]() { add_medium(QStringLiteral("cdrom")); });
 	}
@@ -276,6 +282,59 @@ void settings_dialog::add_medium(const QString &type)
 	           QStringLiteral("%1  \"image:%2\"").arg(type, path));
 }
 
+/* The selected disk grown, as VirtualBox's Media Manager grows one: its
+ * size asked in GiB, no smaller than it is -- shrinking loses what the
+ * guest keeps at its end -- and made on OK by qemu-img, before the file
+ * is written. The guest grows its own partition into the room. */
+void settings_dialog::resize_medium()
+{
+	QListWidgetItem *item = media != nullptr ? media->currentItem() : nullptr;
+
+	if (item == nullptr)
+		return;
+	const QString record = QStringLiteral("(machine ") + item->data(Qt::UserRole).toString() +
+	                       QLatin1Char(')');
+	const QString type = spec_value(record, { QStringLiteral("medium"), QStringLiteral("type") });
+	QString       source = spec_value(record, { QStringLiteral("medium"), QStringLiteral("source") });
+
+	if (source.size() >= 2 && source.startsWith(QLatin1Char('"')))
+		source = source.mid(1, source.size() - 2);
+	if (type != QStringLiteral("disk") || !source.startsWith(QStringLiteral("image:"))) {
+		error->setText(QStringLiteral("a disk of an image: file is what grows"));
+		return;
+	}
+	const QString path = QDir(QFileInfo(file).absolutePath()).absoluteFilePath(source.mid(6));
+	QProcess      info;
+
+	info.setStandardInputFile(QProcess::nullDevice());
+	info.start(QStringLiteral("qemu-img"), { QStringLiteral("info"), QStringLiteral("-U"),
+	                                         QStringLiteral("--output=json"), path });
+	const QJsonObject said = info.waitForFinished(30000) && info.exitCode() == 0 ?
+	                         QJsonDocument::fromJson(info.readAllStandardOutput()).object() :
+	                         QJsonObject();
+	const qint64 bytes = static_cast<qint64>(said.value(QStringLiteral("virtual-size")).toDouble());
+	const QString format = said.value(QStringLiteral("format")).toString();
+
+	if (bytes <= 0 || format.isEmpty()) {
+		error->setText(QStringLiteral("%1: qemu-img could not say its size").arg(path));
+		return;
+	}
+	const qint64 gib = qint64(1) << 30;
+	const int    now = static_cast<int>((resizes.value(path, bytes) + gib - 1) / gib);
+	bool         given = false;
+	const int    wanted = QInputDialog::getInt(this, QStringLiteral("Resize Disk"),
+	                                           QStringLiteral("%1, in GiB, no smaller than now:")
+	                                               .arg(QFileInfo(path).fileName()),
+	                                           now, now, 65536, 1, &given);
+
+	if (!given || qint64(wanted) * gib <= bytes)
+		return;
+	resizes[path] = qint64(wanted) * gib;
+	formats[path] = format;
+	item->setText(QStringLiteral("%1  (to %2 GiB on OK)").arg(item->text().section(QStringLiteral("  (to "), 0, 0))
+	                                                   .arg(wanted));
+}
+
 /* A port of the machine's address forwarded to one in it, as
  * VirtualBox's Port Forwarding rule. */
 void settings_dialog::add_port()
@@ -380,6 +439,24 @@ void settings_dialog::accept()
 		error->setText(problem);
 		return;
 	}
+	/* The disks grown first: a file written naming a disk not yet grown
+	 * would be no harm, but a failure is said before anything changes. */
+	for (auto at = resizes.cbegin(); at != resizes.cend(); ++at) {
+		QProcess grow;
+
+		grow.setProcessChannelMode(QProcess::MergedChannels);
+		grow.setStandardInputFile(QProcess::nullDevice());
+		grow.start(QStringLiteral("qemu-img"),
+		           { QStringLiteral("resize"), QStringLiteral("-f"), formats.value(at.key()),
+		             at.key(), QString::number(at.value()) });
+		if (!grow.waitForFinished(120000) || grow.exitStatus() != QProcess::NormalExit ||
+		    grow.exitCode() != 0) {
+			error->setText(QStringLiteral("%1 could not grow: %2")
+			                   .arg(at.key(), QString::fromUtf8(grow.readAll()).trimmed()));
+			return;
+		}
+	}
+	resizes.clear();
 	if (changed != text) {
 		QSaveFile out(file);
 
