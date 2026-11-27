@@ -27,7 +27,22 @@ cp "$probe" "$root/rootfs/probe"
 printf 'from the directory\n' > "$root/rootfs/etc/flip"
 cases=0
 failures=0
-work=${XDG_CACHE_HOME:-$HOME/.cache}/hull/virtualbox-$(sed -n 's/^#define HULL_VBOX_VERSION "\(.*\)"/\1/p' engine/vbox.h)
+# A cache of the test's own, each of the user's fetched things linked into
+# it but VirtualBox's runs: what the suite's machines leave there is its
+# own to count, beside a VirtualBox machine of the user's running.
+users_cache=${XDG_CACHE_HOME:-$HOME/.cache}
+version=$(sed -n 's/^#define HULL_VBOX_VERSION "\(.*\)"/\1/p' engine/vbox.h)
+rm -rf -- "${root:?}/cache"
+mkdir -p "$root/cache/hull"
+for entry in "$users_cache"/hull/*; do
+	case $entry in
+	*/virtualbox-"$version"-run|*/hull/\*) ;;
+	*) ln -s "$entry" "$root/cache/hull/" ;;
+	esac
+done
+XDG_CACHE_HOME=$root/cache
+export XDG_CACHE_HOME
+work=$XDG_CACHE_HOME/hull/virtualbox-$version
 
 fail() {
 	failures=$((failures + 1))
@@ -59,6 +74,7 @@ left() {
 	sleep 3
 	ps -eo pid=,args= | grep -F "$work-run/" | grep -v grep
 	ls -A "$work-run" 2>/dev/null
+	ls -d "$XDG_RUNTIME_DIR"/vbox-pc-* 2>/dev/null
 }
 
 # --- at plan ---------------------------------------------------------------
@@ -428,10 +444,16 @@ if command -v nasm > /dev/null; then
 		tries=$((tries + 1))
 		sleep 1
 	done
-	sleep 45
-	rm -f "$root/pcvb/screen.ppm"
-	python3 -I - "$(ls "$XDG_RUNTIME_DIR"/hull/display/* 2>/dev/null | head -1)" \
-		"$root/pcvb/screen.ppm" > /dev/null 2>&1 <<'PY'
+	# Taken until it is lit, for two minutes: VirtualBox's window comes a
+	# while after the link, longer on a loaded host.
+	lit=0
+	tries=0
+	while [ "${lit:-0}" -le 1000 ] && [ "$tries" -lt 24 ]; do
+		tries=$((tries + 1))
+		sleep 5
+		rm -f "$root/pcvb/screen.ppm"
+		python3 -I - "$(ls "$XDG_RUNTIME_DIR"/hull/display/* 2>/dev/null | head -1)" \
+			"$root/pcvb/screen.ppm" > /dev/null 2>&1 <<'PY'
 import json, os, socket, sys
 s = socket.socket(socket.AF_UNIX)
 s.settimeout(30)
@@ -444,10 +466,11 @@ for c in ({'execute': 'qmp_capabilities'},
 	f.flush()
 	f.readline()
 PY
-	lit=$(python3 -I -c 'import sys
+		lit=$(python3 -I -c 'import sys
 d = open(sys.argv[1], "rb").read()
 parts = d.split(b"\n", 3)
 print(sum(1 for b in parts[3] if b > 128))' "$root/pcvb/screen.ppm" 2>/dev/null)
+	done
 	timeout 60 "$hull" stop pcvb > /dev/null 2>&1
 	wait "$pcvb_pid"
 	cases=$((cases + 1))
@@ -456,6 +479,59 @@ print(sum(1 for b in parts[3] if b > 128))' "$root/pcvb/screen.ppm" 2>/dev/null)
 			"lit=${lit:-none}; $(tail -5 "$root/pcvb/out")"
 	cases=$((cases + 1))
 	[ -z "$(left)" ] || fail 'a VirtualBox PC with a screen left something' "$(left)"
+	# A USB stick beside the disk, on VirtualBox's USB storage behind an
+	# xHCI, under overlay VirtualBox's immutable kind: the disk still
+	# boots. And Secure Boot with a TPM on a q35 at plan.
+	truncate -s 8M "$root/pcvb/stick.img"
+	printf '(machine (backend virtualbox) (hostname "pcvb") (source "media:disk") %s %s)\n' \
+		'(stop_grace "3s")' \
+		'(media (medium (type disk) (source "image:./raw.img")) (medium (type usb) (source "image:./stick.img")))' \
+		> "$root/pcvb/hull.conf"
+	boot
+	cases=$((cases + 1))
+	printf '%s\n' "$out" | grep -q 'booted from a drive' ||
+		fail 'a USB stick beside the disk kept it from booting' "$out"
+	printf '(machine (backend virtualbox) (source "media:disk") (memory "4G") (cpus 2) %s %s)\n' \
+		'(media (medium (type disk) (source "image:./raw.img")))' \
+		'(tuning (pc (machine q35) (tpm true) (firmware uefi-secure) (boot_key 5)))' \
+		> "$root/pcvb/secure.conf"
+	cases=$((cases + 1))
+	out=$("$hull" plan --explain -f "$root/pcvb/secure.conf" 2>&1)
+	printf '%s\n' "$out" | grep -q 'pc.firmware.uefi-secure: native' &&
+		printf '%s\n' "$out" | grep -q 'pc.boot_key: native' ||
+		fail 'Secure Boot, a TPM and a boot key were not planned on virtualbox-pc' "$out"
+	# 3D: VirtualBox's VMSVGA 3D by its DXVK on the outer vm's Vulkan --
+	# the host's GPU by Venus where the host gives Venus (/dev/udmabuf the
+	# user's and virglrenderer's render server), else llvmpipe by virgl.
+	# VirtualBox names its adapter in its log as the machine starts.
+	gpu=virgl
+	if [ -w /dev/udmabuf ] && { [ -x /usr/libexec/virgl_render_server ] ||
+	                            [ -x /usr/local/libexec/virgl_render_server ]; }; then
+		gpu=venus
+	fi
+	printf '(machine (backend virtualbox) (hostname "pcvb") (source "media:disk") %s %s %s)\n' \
+		'(display local) (stop_grace "2s")' \
+		'(media (medium (type disk) (source "image:./empty.img")))' \
+		"(tuning (pc (gpu $gpu)))" > "$root/pcvb/hull.conf"
+	(cd "$root/pcvb" && exec timeout 300 "$hull" run -f hull.conf > out 2>&1) &
+	pcvb_pid=$!
+	adapter=
+	tries=0
+	until [ -n "$adapter" ] || [ "$tries" -ge 240 ]; do
+		tries=$((tries + 1))
+		sleep 1
+		adapter=$(cat "$work-run"/pc-*/share/vbox/hull/Logs/VBox.log 2>/dev/null |
+			grep -a 'VMSVGA: Adapter' | head -1)
+	done
+	timeout 60 "$hull" stop pcvb > /dev/null 2>&1
+	wait "$pcvb_pid"
+	cases=$((cases + 1))
+	case $gpu:$adapter in
+	venus:*Venus*|virgl:*llvmpipe*) ;;
+	*) fail "VirtualBox's 3D did not reach the outer vm's $gpu" "${adapter:-no adapter}; $(tail -5 "$root/pcvb/out")" ;;
+	esac
+	cases=$((cases + 1))
+	[ -z "$(left)" ] || fail 'a VirtualBox PC with 3D left something' "$(left)"
 	pcvb disk.qcow2 direct
 	cases=$((cases + 1))
 	out=$(timeout 60 "$hull" run -f "$root/pcvb/hull.conf" 2>&1)

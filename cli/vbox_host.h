@@ -25,7 +25,9 @@ int hull_vbox_host(const char *work, const char *root, const char *agent, const 
  * the TPM (yes or no), the first boot device (disk, dvd or floppy), the
  * screen (none, local or window: VirtualBox's window on X in the outer vm,
  * the outer vm's screen shown as `(display ...)` shows a vm's) and, for
- * local, where to link the outer vm's display monitor, else "-";
+ * local, where to link the outer vm's display monitor, else "-", and the
+ * seconds Enter is pressed for at the start, (boot_key N), "0" for none,
+ * and the 3D (none, virgl or venus: VMSVGA's 3D on the outer vm's own);
  * `mode` direct or overlay; `media` a type (disk, cdrom, floppy) and an
  * absolute path for each of `media_count`. `work` is made, and removed at
  * the end. Its status. */

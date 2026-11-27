@@ -9719,12 +9719,12 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	/* `hull virtualbox pc WORK AGENT MEMORY CPUS NETWORK FIRMWARE NIC
-	 * CHIPSET TPM BOOT SCREEN LINK MODE [TYPE PATH]...`, the virtualbox-pc
-	 * engine's. */
-	if (strcmp(command, "virtualbox") == 0 && argc >= 16 && argc % 2 == 0 &&
+	 * CHIPSET TPM BOOT SCREEN LINK KEY GPU MODE [TYPE PATH]...`, the
+	 * virtualbox-pc engine's. */
+	if (strcmp(command, "virtualbox") == 0 && argc >= 18 && argc % 2 == 0 &&
 	    strcmp(argv[2], "pc") == 0)
-		return hull_vbox_pc(argv[3], argv[4], (const char *const *)argv + 5, argv[15],
-		                    argv + 16, (unsigned)(argc - 16) / 2u);
+		return hull_vbox_pc(argv[3], argv[4], (const char *const *)argv + 5, argv[17],
+		                    argv + 18, (unsigned)(argc - 18) / 2u);
 	if (strcmp(command, "virtualbox") == 0 && argc >= 10 && argc % 2 == 0 &&
 	    strcmp(argv[2], "host") == 0)
 		return hull_vbox_host(argv[3], argv[4], argv[5], argv[6], argv[7], argv[8], argv[9],

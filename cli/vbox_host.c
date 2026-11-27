@@ -312,7 +312,7 @@ int hull_vbox_host(const char *work, const char *root, const char *agent, const 
 static const char pc_script[] =
     "#!/bin/sh\n"
     "memory=$1 cpus=$2 network=$3 firmware=$4 nic=$5 chipset=$6 tpm=$7 boot=$8 bus=$9\n"
-    "screen=${10}\n"
+    "screen=${10} key=${11} gpu=${12}\n"
     "release=$(uname -r)\n"
     "insmod /lib/modules/$release/misc/vboxdrv.ko || {\n"
     "	echo \"no vboxdrv.ko for $release: the host's VirtualBox builds it\"; exit 1; }\n"
@@ -337,8 +337,28 @@ static const char pc_script[] =
     "	--graphicscontroller vmsvga --vram 128 --boot1 $boot --boot2 disk --boot3 dvd \\\n"
     "	--uart1 0x3f8 4 --uart-mode1 server /tmp/uart.sock || exit 1\n"
     "[ \"$tpm\" = yes ] && { $manage modifyvm hull --tpm-type 2.0 || exit 1; }\n"
+    /* 3D: VMSVGA's, rendered by VirtualBox's DXVK on the outer vm's
+     * Vulkan, the host's GPU by Venus, or llvmpipe by virgl. */
+    "[ \"$gpu\" != none ] && { $manage modifyvm hull --accelerate-3d on || exit 1; }\n"
+    /* Secure Boot, as Windows 11 asks: VirtualBox's EFI variables made,
+     * Microsoft's keys and Oracle's platform key enrolled, enforced. */
+    "if [ \"$firmware\" = efi ] && [ -f /share/secure ]; then\n"
+    "	$manage modifynvram hull inituefivarstore || exit 1\n"
+    "	$manage modifynvram hull enrollmssignatures || exit 1\n"
+    "	$manage modifynvram hull enrollorclpk || exit 1\n"
+    "	$manage modifynvram hull secureboot --enable || exit 1\n"
+    "fi\n"
     "$manage storagectl hull --name disks --add $bus || exit 1\n"
     ". /share/media.sh\n"
+    /* (boot_key N): Enter once a second for N seconds from when VirtualBox
+     * has the machine running, as a person at the screen presses it for a
+     * disc's \"Press any key to boot from CD\". */
+    "if [ \"$key\" -gt 0 ]; then\n"
+    "	( until $manage showvminfo hull --machinereadable 2>/dev/null | grep -q '^VMState=\"running\"'; do\n"
+    "		sleep 1; done\n"
+    "	i=0; while [ $i -lt $key ]; do sleep 1; i=$((i + 1))\n"
+    "		$manage controlvm hull keyboardputscancode 1c 9c >/dev/null 2>&1; done ) &\n"
+    "fi\n"
     "if [ \"$screen\" = none ]; then\n"
     "	touch /share/up\n"
     "	exec /usr/lib/virtualbox/VBoxHeadless --startvm hull\n"
@@ -363,7 +383,10 @@ static const char pc_script[] =
     "	while [ $i -lt $n ]; do printf '\\tInputDevice \"in%s\"\\n' $i; i=$((i + 1)); done\n"
     "	printf 'EndSection\\n'\n"
     "} > /tmp/xorg.conf\n"
-    "HOME=/tmp Xorg :0 -config /tmp/xorg.conf -logfile /tmp/Xorg.log -nolisten tcp -noreset vt1 \\\n"
+    /* No screensaver and no DPMS: X would turn the screen off after ten
+     * idle minutes, while a guest installs with nobody at it. */
+    "HOME=/tmp Xorg :0 -config /tmp/xorg.conf -logfile /tmp/Xorg.log -nolisten tcp -noreset \\\n"
+    "	-s 0 -dpms vt1 \\\n"
     "	>/dev/null 2>&1 &\n"
     "i=0\n"
     "while ! DISPLAY=:0 xdpyinfo >/dev/null 2>&1 && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done\n"
@@ -447,10 +470,28 @@ int hull_vbox_pc(const char *work, const char *agent, const char *const *setting
 	snprintf(path, sizeof path, "%.*s", (int)(parent_end - work), work);
 	mkdir(path, 0700);
 	snprintf(share, sizeof share, "%s/share", work);
-	snprintf(runtime, sizeof runtime, "%s/run", work);
-	if (mkdir(work, 0700) != 0 || mkdir(share, 0700) != 0 || mkdir(runtime, 0700) != 0) {
+	if (mkdir(work, 0700) != 0 || mkdir(share, 0700) != 0) {
 		say("its work directory cannot be made");
 		return 1;
+	}
+	/* The outer vm's core in a runtime directory of its own, beside the
+	 * user's where there is one: its display monitor is a socket there,
+	 * whose path a deep cache would make too long for one (measured: no
+	 * screen, from a test's cache). */
+	{
+		const char *parent = getenv("XDG_RUNTIME_DIR");
+
+		/* Named for this process, as the work is, so the engine takes it
+		 * away after a machine killed at the end of its grace. */
+		if (parent != NULL && parent[0] == '/' && strlen(parent) < 60u)
+			snprintf(runtime, sizeof runtime, "%s/vbox-pc-%ld", parent, (long)getpid());
+		else
+			snprintf(runtime, sizeof runtime, "%s/run", work);
+		if (mkdir(runtime, 0700) != 0) {
+			say("its runtime directory cannot be made");
+			nftw(work, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
+			return 1;
+		}
 	}
 	setenv("XDG_RUNTIME_DIR", runtime, 1);
 	setenv("HULL_CORE_IDLE", "1", 1);
@@ -469,10 +510,13 @@ int hull_vbox_pc(const char *work, const char *agent, const char *const *setting
 		goto done;
 	}
 	fprintf(file, "(machine (backend vm) (source \"dir:/\") (mutable overlay)\n"
-	        " (tuning (vm (profile full)))%s\n"
+	        " (tuning (vm (profile full))%s%s%s)%s\n"
 	        " (memory \"%luM\") (cpus %lu)\n"
 	        " (volumes (volume (host \"%s\") (guest \"/vbox\") (mode ro))\n"
 	        "          (volume (host \"%s\") (guest \"/share\"))\n",
+	        strcmp(settings[11], "none") != 0 ? " (qemu (gpu " : "",
+	        strcmp(settings[11], "none") != 0 ? settings[11] : "",
+	        strcmp(settings[11], "none") != 0 ? "))" : "",
 	        strcmp(settings[8], "local") == 0 ? " (display local)" :
 	        strcmp(settings[8], "window") == 0 ? " (display window)" : "",
 	        strtoul(settings[0], NULL, 10) + OUTER_MEMORY, strtoul(settings[1], NULL, 10) + 1ul,
@@ -489,7 +533,8 @@ int hull_vbox_pc(const char *work, const char *agent, const char *const *setting
 		const char *slash = strrchr(file_path, '/');
 		const char *drive = strcmp(type, "cdrom") == 0 ? "dvddrive" :
 		                    strcmp(type, "floppy") == 0 ? "fdd" : "hdd";
-		int         writable = strcmp(type, "disk") == 0 && strcmp(mode, "direct") == 0;
+		int         writable = (strcmp(type, "disk") == 0 || strcmp(type, "usb") == 0) &&
+		                       strcmp(mode, "direct") == 0;
 		char        inner[4400];
 
 		if (slash == NULL || strpbrk(file_path, "\"\\'") != NULL) {
@@ -501,7 +546,7 @@ int hull_vbox_pc(const char *work, const char *agent, const char *const *setting
 		fprintf(file, "          (volume (host \"%.*s\") (guest \"/media/m%u\")%s)\n",
 		        (int)(slash - file_path), file_path, i, writable ? "" : " (mode ro)");
 		snprintf(inner, sizeof inner, "/media/m%u/%s", i, slash + 1);
-		if (strcmp(type, "disk") == 0 && !vbox_format(file_path)) {
+		if ((strcmp(type, "disk") == 0 || strcmp(type, "usb") == 0) && !vbox_format(file_path)) {
 			struct stat st;
 			FILE       *descriptor;
 
@@ -539,6 +584,17 @@ int hull_vbox_pc(const char *work, const char *agent, const char *const *setting
 			fclose(descriptor);
 			snprintf(inner, sizeof inner, "/share/raw%u.vmdk", i);
 		}
+		/* A USB stick: a disk on VirtualBox's USB storage, removable as
+		 * Windows Setup looks for its answer on, behind an xHCI. */
+		if (strcmp(type, "usb") == 0) {
+			fprintf(attach, "[ -n \"$stick\" ] || { $manage modifyvm hull --usb-xhci on && "
+			        "$manage storagectl hull --name stick --add usb; } || exit 1\n"
+			        "stick=$((${stick:--1} + 1))\n"
+			        "$manage storageattach hull --storagectl stick --port $stick --device 0 "
+			        "--type hdd --medium '%s'%s || exit 1\n", inner,
+			        writable ? "" : " --mtype immutable");
+			continue;
+		}
 		if (strcmp(drive, "fdd") == 0) {
 			fprintf(attach, "$manage storagectl hull --name floppy --add floppy 2>/dev/null\n"
 			        "$manage storageattach hull --storagectl floppy --port 0 --device 0 "
@@ -552,10 +608,22 @@ int hull_vbox_pc(const char *work, const char *agent, const char *const *setting
 		        strcmp(drive, "hdd") == 0 && !writable ? " --mtype immutable" : "");
 		disks++;
 	}
+	if (strcmp(settings[3], "efi-secure") == 0) {
+		FILE *marker;
+
+		snprintf(target, sizeof target, "%s/secure", share);
+		if ((marker = fopen(target, "w")) == NULL || fclose(marker) != 0) {
+			say("the outer vm's files cannot be written");
+			fclose(file);
+			goto done;
+		}
+	}
 	fprintf(file, " )\n (command \"/bin/sh\" \"/share/run.sh\"");
 	for (unsigned i = 0u; i < 8u; i++)
-		fprintf(file, " \"%s\"", settings[i]);
-	fprintf(file, " \"%s\" \"%s\"))\n", bus, settings[8]);
+		fprintf(file, " \"%s\"", i == 3u && strcmp(settings[3], "efi-secure") == 0 ? "efi" :
+		        settings[i]);
+	fprintf(file, " \"%s\" \"%s\" \"%s\" \"%s\"))\n", bus, settings[8], settings[10],
+	        settings[11]);
 	if (fclose(attach) != 0 || fclose(file) != 0) {
 		say("the outer vm's spec cannot be written");
 		goto done;
@@ -650,6 +718,7 @@ int hull_vbox_pc(const char *work, const char *agent, const char *const *setting
 	kill(link, SIGTERM);
 	finish(link);
 done:
+	nftw(runtime, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
 	nftw(work, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
 	return status;
 }

@@ -817,12 +817,19 @@ static void release_state(hull_machine *m)
 	if (m->box == 2 && m->vbox_child > 0) {
 		char dir[4096];
 
+		const char *runtime = getenv("XDG_RUNTIME_DIR");
+
 		if (hull_vbox_dir(dir, sizeof dir) == 0 &&
 		    snprintf(path, sizeof path, "%s-run/pc-%ld", dir, (long)m->vbox_child) <
 		    (int)sizeof path && access(path, F_OK) == 0) {
 			nftw(path, open_up, 16, FTW_PHYS);
 			nftw(path, take_away, 16, FTW_PHYS | FTW_DEPTH);
 		}
+		/* And its outer vm's runtime directory, beside the core's own. */
+		if (runtime != NULL && runtime[0] == '/' &&
+		    snprintf(path, sizeof path, "%s/vbox-pc-%ld", runtime, (long)m->vbox_child) <
+		    (int)sizeof path && access(path, F_OK) == 0)
+			nftw(path, take_away, 16, FTW_PHYS | FTW_DEPTH);
 		m->vbox_child = 0;
 	}
 
@@ -1275,9 +1282,8 @@ static const char *read_firmware(hull_machine *m, const hull_sexpr_doc *doc,
 	free(firmware);
 	/* VirtualBox's own EFI, nothing of the host's. */
 	if (m->box == 2) {
-		m->vbox_efi = uefi || secure;
-		return secure ? "VirtualBox's PC is given UEFI without Secure Boot here: (firmware uefi)" :
-		       NULL;
+		m->vbox_efi = secure ? 2 : uefi;
+		return NULL;
 	}
 	/* Secure boot, as Windows 11 asks: OVMF's secure-boot build, which
 	 * needs SMM and so q35, and a variable store enrolled with Microsoft's
@@ -1588,6 +1594,9 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 	 * path, its COM1 the run's console. A qcow2 it cannot open, qemu's
 	 * version 3 being past VirtualBox's reader. */
 	if (m->box == 2) {
+		if (m->gpu != 0 && m->display == NULL && !m->local)
+			return "(gpu virgl) and (gpu venus) are a screen's 3D: the machine needs "
+			       "(display local) or (display window)";
 		if ((wrong = read_media(m, doc, machine)) != NULL)
 			return wrong;
 		for (unsigned i = 0u; i < m->media_count; i++) {
@@ -1597,8 +1606,6 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 			if (m->media[i].path == NULL || m->media[i].path[0] != '/')
 				return "VirtualBox takes a medium as an image: file; a collection is not "
 				       "reassembled for it";
-			if (m->media[i].type == 'u')
-				return "VirtualBox is given no USB stick here: a disc carries what a stick would";
 			if (m->media[i].type == 'd' && (fd = open(m->media[i].path, O_RDONLY | O_CLOEXEC)) >= 0) {
 				ssize_t got = read(fd, head, sizeof head);
 
@@ -2411,7 +2418,8 @@ static void exec_vbox(const hull_machine *m)
 	static char work[4200];
 	static char memory[32];
 	static char cpus[32];
-	char       *argv[16u + 2u * PC_MAX_MEDIA];
+	static char key[24];
+	char       *argv[20u + 2u * PC_MAX_MEDIA];
 	unsigned    n = 0u;
 	ssize_t     length = readlink("/proc/self/exe", self, sizeof self - 1u);
 	const char *slash;
@@ -2450,7 +2458,7 @@ static void exec_vbox(const hull_machine *m)
 	argv[n++] = memory;
 	argv[n++] = cpus;
 	argv[n++] = m->network ? "nat" : "none";
-	argv[n++] = m->vbox_efi ? "efi" : "bios";
+	argv[n++] = m->vbox_efi == 2 ? "efi-secure" : m->vbox_efi ? "efi" : "bios";
 	argv[n++] = m->nic == NULL || strcmp(m->nic, "e1000") == 0 ? "82540EM" :
 	            strcmp(m->nic, "pcnet") == 0 ? "Am79C973" : "virtio";
 	argv[n++] = m->machine_type != NULL && strcmp(m->machine_type, "q35") == 0 ? "ich9" : "piix3";
@@ -2472,10 +2480,13 @@ static void exec_vbox(const hull_machine *m)
 		argv[n++] = "none";
 		argv[n++] = "-";
 	}
+	snprintf(key, sizeof key, "%ld", m->boot_key);
+	argv[n++] = key;
+	argv[n++] = m->gpu == 2 ? "venus" : m->gpu == 1 ? "virgl" : "none";
 	argv[n++] = m->direct ? "direct" : "overlay";
 	for (unsigned i = 0u; i < m->media_count; i++) {
 		argv[n++] = m->media[i].type == 'c' ? "cdrom" : m->media[i].type == 'f' ? "floppy" :
-		            "disk";
+		            m->media[i].type == 'u' ? "usb" : "disk";
 		argv[n++] = m->media[i].path;
 	}
 	argv[n] = NULL;
@@ -2912,7 +2923,8 @@ static void *run_machine(void *arg)
 	 * the next start boots, or resumes from a later save. */
 	if (m->resume)
 		drop_saved_state(m);
-	pressing = m->boot_key > 0 && pthread_create(&m->presser, NULL, press_keys, m) == 0;
+	/* qemu's monitor presses them; VirtualBox's outer vm, its own. */
+	pressing = m->boot_key > 0 && !m->box && pthread_create(&m->presser, NULL, press_keys, m) == 0;
 	read_machine(m);
 	if (pressing)
 		pthread_join(m->presser, NULL);
@@ -4242,7 +4254,8 @@ static const hull_cap_entry vbox_pc_entries[] = {
 	  NULL },
 	{ "writeback.none",     HULL_SUP_NATIVE,   NULL, NULL },
 	{ "media",              HULL_SUP_NATIVE,
-	  "disks and discs on IDE, or SATA on a q35, and a floppy drive", NULL },
+	  "disks and discs on IDE, or SATA on a q35, a floppy drive, and USB sticks on its USB "
+	  "storage behind an xHCI, removable", NULL },
 	{ "media.image",        HULL_SUP_NATIVE,
 	  "VDI, VMDK or VHD as it is, a raw disk by a VMDK descriptor naming it; not a qcow2",
 	  NULL },
@@ -4262,7 +4275,17 @@ static const hull_cap_entry vbox_pc_entries[] = {
 	  NULL },
 	{ "pc.firmware.bios",   HULL_SUP_NATIVE,   NULL, NULL },
 	{ "pc.firmware.uefi",   HULL_SUP_NATIVE,   "VirtualBox's EFI", NULL },
+	{ "pc.firmware.uefi-secure", HULL_SUP_NATIVE,
+	  "VirtualBox's EFI, Microsoft's keys and Oracle's platform key enrolled, Secure Boot on",
+	  NULL },
 	{ "pc.tpm",             HULL_SUP_NATIVE,   "VirtualBox's TPM 2.0", NULL },
+	{ "pc.gpu.virgl",       HULL_SUP_EMULATED,
+	  "VirtualBox's VMSVGA 3D by its DXVK on the outer vm's Vulkan, llvmpipe there", NULL },
+	{ "pc.gpu.venus",       HULL_SUP_EMULATED,
+	  "VirtualBox's VMSVGA 3D by its DXVK on the outer vm's Venus, the host's GPU: a Windows "
+	  "guest's Direct3D by its Guest Additions' WDDM driver", NULL },
+	{ "pc.boot_key",        HULL_SUP_NATIVE,
+	  "Enter by VBoxManage controlvm keyboardputscancode, once a second", NULL },
 	{ "pc.machine.pc",      HULL_SUP_NATIVE,   "VirtualBox's PIIX3, its media on IDE", NULL },
 	{ "pc.machine.q35",     HULL_SUP_NATIVE,   "VirtualBox's ICH9, its media on SATA", NULL },
 	{ "pc.nic.e1000",       HULL_SUP_NATIVE,   "VirtualBox's Intel PRO/1000 MT, 82540EM", NULL },
