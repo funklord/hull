@@ -79,6 +79,7 @@
 #include "hw.h"
 #include "86box.h"
 #include "hostnet.h"
+#include "vbox.h"
 
 #define PC_MAX_MEDIA 6u    /* four on IDE, two floppy drives */
 #define PC_MAX_ARGS  160u  /* a USB stick takes four, an IDE medium two, a card four */
@@ -120,6 +121,8 @@ struct hull_machine {
 	medium          media[PC_MAX_MEDIA];
 	unsigned        media_count;
 	char            boot;           /* -boot's letter */
+	int             vbox_efi;       /* virtualbox-pc's: (firmware uefi), VirtualBox's EFI */
+	pid_t           vbox_child;     /* and the process its work is named for */
 	int             direct;         /* (mutable direct) */
 	int             resume;         /* its disks hold its saved state, hull-saved */
 	char           *memory;         /* (memory ...), or NULL for qemu's own */
@@ -801,9 +804,27 @@ static int prepare_state(hull_machine *m)
 
 /* The run's directory gone, by name, and swtpm with it: it ends when qemu
  * goes, --terminate, and is reaped here. */
+static int open_up(const char *path, const struct stat *st, int type, struct FTW *ftw);
+static int take_away(const char *path, const struct stat *st, int type, struct FTW *ftw);
+
 static void release_state(hull_machine *m)
 {
 	char path[4400];
+
+	/* virtualbox-pc's work, which a machine killed at the end of its grace
+	 * could not take away itself: by the name exec_vbox gave it, under
+	 * the cache's VirtualBox runs and nowhere else. */
+	if (m->box == 2 && m->vbox_child > 0) {
+		char dir[4096];
+
+		if (hull_vbox_dir(dir, sizeof dir) == 0 &&
+		    snprintf(path, sizeof path, "%s-run/pc-%ld", dir, (long)m->vbox_child) <
+		    (int)sizeof path && access(path, F_OK) == 0) {
+			nftw(path, open_up, 16, FTW_PHYS);
+			nftw(path, take_away, 16, FTW_PHYS | FTW_DEPTH);
+		}
+		m->vbox_child = 0;
+	}
 
 	if (m->swtpm > 0) {
 		kill(m->swtpm, SIGTERM);
@@ -1252,6 +1273,12 @@ static const char *read_firmware(hull_machine *m, const hull_sexpr_doc *doc,
 	int   secure = firmware != NULL && strcmp(firmware, "uefi-secure") == 0;
 
 	free(firmware);
+	/* VirtualBox's own EFI, nothing of the host's. */
+	if (m->box == 2) {
+		m->vbox_efi = uefi || secure;
+		return secure ? "VirtualBox's PC is given UEFI without Secure Boot here: (firmware uefi)" :
+		       NULL;
+	}
 	/* Secure boot, as Windows 11 asks: OVMF's secure-boot build, which
 	 * needs SMM and so q35, and a variable store enrolled with Microsoft's
 	 * keys, the machine's own copy (prepare_state()). */
@@ -1556,6 +1583,33 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 		       "lilygo-t3-s3 (an SX1276 each) and heltec-wifi-lora-32-v3 (an SX1262) alone";
 	if (m->lora != NULL && (strlen(m->lora) > 64u || strchr(m->lora, '/') != NULL))
 		return "a LoRa air's name is at most 64 characters and has no /";
+	/* VirtualBox's PC, in a qemu vm of its own: its media image files it
+	 * opens -- VDI, VMDK, VHD, a raw disk by a descriptor -- by absolute
+	 * path, its COM1 the run's console. A qcow2 it cannot open, qemu's
+	 * version 3 being past VirtualBox's reader. */
+	if (m->box == 2) {
+		if ((wrong = read_media(m, doc, machine)) != NULL)
+			return wrong;
+		for (unsigned i = 0u; i < m->media_count; i++) {
+			uint8_t head[4] = { 0 };
+			int     fd;
+
+			if (m->media[i].path == NULL || m->media[i].path[0] != '/')
+				return "VirtualBox takes a medium as an image: file; a collection is not "
+				       "reassembled for it";
+			if (m->media[i].type == 'u')
+				return "VirtualBox is given no USB stick here: a disc carries what a stick would";
+			if (m->media[i].type == 'd' && (fd = open(m->media[i].path, O_RDONLY | O_CLOEXEC)) >= 0) {
+				ssize_t got = read(fd, head, sizeof head);
+
+				close(fd);
+				if (got == (ssize_t)sizeof head && memcmp(head, "QFI\xfb", 4u) == 0)
+					return "VirtualBox cannot open a qcow2: `qemu-img convert -O vdi` makes "
+					       "a VDI of it, which both run";
+			}
+		}
+		return NULL;
+	}
 	/* 86Box's machine: a PC of a period, in its window, its media images
 	 * by path, its COM1 the run's console. */
 	if (m->box) {
@@ -2348,8 +2402,76 @@ static void exec_86box(const hull_machine *m)
 	execl(app, app, "-P", vm, "-R", roms, "-N", "-L", path, (char *)NULL);
 }
 
+/* `hull virtualbox pc`, the outer vm and VirtualBox in it, COM1 its
+ * stdout. */
+static void exec_vbox(const hull_machine *m)
+{
+	static char self[PATH_MAX];
+	static char agent[PATH_MAX + 16];
+	static char work[4200];
+	static char memory[32];
+	static char cpus[32];
+	char       *argv[16u + 2u * PC_MAX_MEDIA];
+	unsigned    n = 0u;
+	ssize_t     length = readlink("/proc/self/exe", self, sizeof self - 1u);
+	const char *slash;
+	char        boot = 'd';
+
+	if (length <= 0)
+		return;
+	self[length] = '\0';
+	slash = strrchr(self, '/');
+	snprintf(agent, sizeof agent, "%.*s/hull-agent", (int)(slash != NULL ? slash - self : 0), self);
+	{
+		char dir[4096];
+
+		if (hull_vbox_dir(dir, sizeof dir) != 0)
+			return;
+		snprintf(work, sizeof work, "%s-run/pc-%ld", dir, (long)getpid());
+	}
+	/* The spec's size in MiB, VirtualBox's unit: a number, then K, M, G
+	 * or T, which the plan has checked. */
+	{
+		char              *end = NULL;
+		unsigned long long size = m->memory != NULL ? strtoull(m->memory, &end, 10) : 1024ull;
+
+		if (end != NULL)
+			size = *end == 'G' ? size << 10 : *end == 'T' ? size << 20 :
+			       *end == 'K' ? size >> 10 : *end == 'M' ? size : size >> 20;
+		snprintf(memory, sizeof memory, "%llu", size);
+	}
+	snprintf(cpus, sizeof cpus, "%s", m->cpus != NULL ? m->cpus : "1");
+	boot = m->boot == 'd' ? 'c' : m->boot == 'a' ? 'f' : 'd';
+	argv[n++] = self;
+	argv[n++] = "virtualbox";
+	argv[n++] = "pc";
+	argv[n++] = work;
+	argv[n++] = agent;
+	argv[n++] = memory;
+	argv[n++] = cpus;
+	argv[n++] = m->network ? "nat" : "none";
+	argv[n++] = m->vbox_efi ? "efi" : "bios";
+	argv[n++] = m->nic == NULL || strcmp(m->nic, "e1000") == 0 ? "82540EM" :
+	            strcmp(m->nic, "pcnet") == 0 ? "Am79C973" : "virtio";
+	argv[n++] = m->machine_type != NULL && strcmp(m->machine_type, "q35") == 0 ? "ich9" : "piix3";
+	argv[n++] = m->tpm ? "yes" : "no";
+	argv[n++] = boot == 'c' ? "dvd" : boot == 'f' ? "floppy" : "disk";
+	argv[n++] = m->direct ? "direct" : "overlay";
+	for (unsigned i = 0u; i < m->media_count; i++) {
+		argv[n++] = m->media[i].type == 'c' ? "cdrom" : m->media[i].type == 'f' ? "floppy" :
+		            "disk";
+		argv[n++] = m->media[i].path;
+	}
+	argv[n] = NULL;
+	execv(self, argv);
+}
+
 static void exec_qemu(const hull_machine *m)
 {
+	if (m->box == 2) {
+		exec_vbox(m);
+		return;
+	}
 	if (m->box) {
 		exec_86box(m);
 		return;
@@ -2585,6 +2707,9 @@ static int launch(hull_machine *m)
 		close_all(fds, 8u);
 		return -1;
 	}
+	/* virtualbox-pc's work is named for the process it runs in. */
+	if (child > 0 && m->box == 2)
+		m->vbox_child = child;
 	if (child == 0) {
 		if (dup2(in[1], 0) < 0 || dup2(out[1], 1) < 0 || dup2(err[1], 2) < 0 ||
 		    setsid() < 0 || prctl(PR_SET_PDEATHSIG, SIGKILL, 0L, 0L, 0L) != 0 ||
@@ -2785,6 +2910,12 @@ static hull_status create(hull_core *core, hull_buf plan, int box, hull_machine 
 static hull_status pc_create(hull_core *core, hull_buf plan, hull_machine **out, hull_error *error)
 {
 	return create(core, plan, 0, out, error);
+}
+
+static hull_status vbox_create(hull_core *core, hull_buf plan, hull_machine **out,
+                               hull_error *error)
+{
+	return create(core, plan, 2, out, error);
 }
 
 static hull_status box_create(hull_core *core, hull_buf plan, hull_machine **out, hull_error *error)
@@ -4077,6 +4208,90 @@ static const hull_engine box_engine = {
 	.caps        = &box_caps,
 	.ops         = &box_ops,
 };
+
+/* The virtualbox-pc engine: a PC of its own media under VirtualBox, in a
+ * qemu vm of its own as the virtualbox engine's machines are (section
+ * 5.0), for what VirtualBox gives that qemu does not: a Windows guest's
+ * Direct3D through its Guest Additions' driver. `(backend virtualbox)`
+ * names it for a machine of media (plan/registry.c). Headless, its COM1
+ * the run's console. */
+static const hull_cap_entry vbox_pc_entries[] = {
+	{ "source.media.overlay", HULL_SUP_NATIVE,
+	  "VirtualBox's immutable disks: the writes in a differencing image the next start drops",
+	  NULL },
+	{ "source.media.direct",  HULL_SUP_NATIVE,
+	  "VirtualBox's BIOS or EFI boots the drive named first; the disks' writes land in their "
+	  "image: files", NULL },
+	{ "projection.bind",    HULL_SUP_NATIVE,   "nothing projected: the media are the machine's",
+	  NULL },
+	{ "writeback.none",     HULL_SUP_NATIVE,   NULL, NULL },
+	{ "media",              HULL_SUP_NATIVE,
+	  "disks and discs on IDE, or SATA on a q35, and a floppy drive", NULL },
+	{ "media.image",        HULL_SUP_NATIVE,
+	  "VDI, VMDK or VHD as it is, a raw disk by a VMDK descriptor naming it; not a qcow2",
+	  NULL },
+	{ "network.none",       HULL_SUP_NATIVE,   NULL, NULL },
+	{ "network.nat",        HULL_SUP_NATIVE,
+	  "VirtualBox's NAT, inside the outer vm's own", NULL },
+	{ "memory",             HULL_SUP_NATIVE,   NULL, NULL },
+	{ "cpus",               HULL_SUP_NATIVE,   NULL, NULL },
+	{ "stop_grace",         HULL_SUP_NATIVE,
+	  "VirtualBox's ACPI power button, its guest given the grace, then the outer vm ended",
+	  NULL },
+	{ "pc.firmware.bios",   HULL_SUP_NATIVE,   NULL, NULL },
+	{ "pc.firmware.uefi",   HULL_SUP_NATIVE,   "VirtualBox's EFI", NULL },
+	{ "pc.tpm",             HULL_SUP_NATIVE,   "VirtualBox's TPM 2.0", NULL },
+	{ "pc.machine.pc",      HULL_SUP_NATIVE,   "VirtualBox's PIIX3, its media on IDE", NULL },
+	{ "pc.machine.q35",     HULL_SUP_NATIVE,   "VirtualBox's ICH9, its media on SATA", NULL },
+	{ "pc.nic.e1000",       HULL_SUP_NATIVE,   "VirtualBox's Intel PRO/1000 MT, 82540EM", NULL },
+	{ "pc.nic.pcnet",       HULL_SUP_NATIVE,   "VirtualBox's PCnet-FAST III", NULL },
+	{ "pc.nic.virtio",      HULL_SUP_NATIVE,   "VirtualBox's virtio-net", NULL },
+	{ "security.no_new_privs", HULL_SUP_NATIVE, NULL, NULL },
+	{ "on_disconnect.stop", HULL_SUP_NATIVE,   NULL, NULL },
+	{ "hostname",           HULL_SUP_NATIVE,   "the machine's name, its OS's own", NULL },
+	{ NULL, 0, NULL, NULL },
+};
+
+static const hull_capabilities vbox_pc_caps = {
+	.struct_size    = sizeof (hull_capabilities),
+	.engine_name    = "virtualbox-pc",
+	.engine_version = HULL_VBOX_VERSION,
+	.classes        = classes,
+	.entries        = vbox_pc_entries,
+	.media_types    = media,
+	.migration      = HULL_MIG_PINNED,
+	.arches         = NULL,
+	.requires_root  = 0,
+};
+
+static const hull_engine_ops vbox_pc_ops = {
+	.struct_size = sizeof (hull_engine_ops),
+	.create      = vbox_create,
+	.start       = pc_start,
+	.stop        = pc_stop,
+	.destroy     = pc_destroy,
+	.signal      = pc_signal,
+	.exec         = pc_exec,
+	.stream_write = pc_stream_write,
+	.stream_eof   = pc_stream_eof,
+	.stream_close = pc_stream_close,
+	.stats       = pc_stats,
+};
+
+static const hull_engine vbox_pc_engine = {
+	.struct_size = sizeof (hull_engine),
+	.abi_major   = HULL_ABI_MAJOR,
+	.abi_minor   = HULL_ABI_MINOR,
+	.caps        = &vbox_pc_caps,
+	.ops         = &vbox_pc_ops,
+};
+
+const hull_engine *hull_engine_virtualbox_pc(const hull_host_ops *host_ops)
+{
+	if (host_ops != NULL)
+		host = host_ops;
+	return &vbox_pc_engine;
+}
 
 const hull_engine *hull_engine_86box(const hull_host_ops *host_ops)
 {

@@ -163,6 +163,18 @@ static int foreign(const hull_registry *registry, const hull_spec *spec,
 	return registry->host_arch == NULL || !hull_sexpr_is(&spec->doc, &arch, registry->host_arch);
 }
 
+/* A machine of a PC's own media: `(media ...)`, or a `media:` source. */
+static int of_media(const hull_spec *spec, const hull_sexpr_form *machine)
+{
+	hull_sexpr_form entry;
+	hull_sexpr_form source;
+
+	if (hull_spec_find(spec, machine, "media", &entry))
+		return 1;
+	return value_of(spec, machine, "source", &source) && source.content_length > 6u &&
+	       memcmp(spec->doc.data + source.content, "media:", 6u) == 0;
+}
+
 hull_registry_status hull_registry_choose(const hull_registry *registry,
                                           const hull_spec *spec,
                                           const hull_sexpr_form *machine,
@@ -200,6 +212,22 @@ hull_registry_status hull_registry_choose(const hull_registry *registry,
 	if (engine == NULL) {
 		set_reason(reason, "no engine or class of that name is loaded");
 		return HULL_REGISTRY_ERR_UNKNOWN;
+	}
+	/* A PC of its own media named by an engine of another class runs on
+	 * that engine's PC sibling, NAME-pc, where there is one: `(backend
+	 * virtualbox)` with a Windows disc is virtualbox-pc's, as `(backend
+	 * qemu)` with one is qemu-pc's. */
+	if (!implements(engine, "pc") && of_media(spec, machine) && length + 3u < 64u) {
+		char               sibling[64];
+		const hull_engine *pc;
+
+		memcpy(sibling, name, length);
+		memcpy(sibling + length, "-pc", 3u);
+		if ((pc = find(registry, sibling, length + 3u)) != NULL && implements(pc, "pc")) {
+			choice->engine     = pc;
+			choice->class_name = "pc";
+			return HULL_REGISTRY_OK;
+		}
 	}
 	/* An engine runs a machine as the first class it lists, unless the
 	 * machine's arch is foreign and the engine can emulate. */

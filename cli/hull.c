@@ -9718,6 +9718,12 @@ int main(int argc, char **argv)
 		}
 		return 0;
 	}
+	/* `hull virtualbox pc WORK AGENT MEMORY CPUS NETWORK FIRMWARE NIC
+	 * CHIPSET TPM BOOT MODE [TYPE PATH]...`, the virtualbox-pc engine's. */
+	if (strcmp(command, "virtualbox") == 0 && argc >= 14 && argc % 2 == 0 &&
+	    strcmp(argv[2], "pc") == 0)
+		return hull_vbox_pc(argv[3], argv[4], (const char *const *)argv + 5, argv[13],
+		                    argv + 14, (unsigned)(argc - 14) / 2u);
 	if (strcmp(command, "virtualbox") == 0 && argc >= 10 && argc % 2 == 0 &&
 	    strcmp(argv[2], "host") == 0)
 		return hull_vbox_host(argv[3], argv[4], argv[5], argv[6], argv[7], argv[8], argv[9],
@@ -9968,6 +9974,7 @@ int main(int argc, char **argv)
 	    hull_registry_add(&registry, hull_engine_hw(NULL), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_qemu_pc(NULL), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_86box(NULL), &reason) != HULL_REGISTRY_OK ||
+	    hull_registry_add(&registry, hull_engine_virtualbox_pc(NULL), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_set_default(&registry, "ns", "chroot") != HULL_REGISTRY_OK ||
 	    hull_registry_set_default(&registry, "pc", "qemu-pc") != HULL_REGISTRY_OK) {
 		fprintf(stderr, "hull: a built-in engine is refused: %s\n", reason);

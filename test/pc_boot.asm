@@ -107,10 +107,20 @@ off:
 	hlt
 	jmp off
 
+; Each byte once the UART can take it, its line status saying the holding
+; register is empty: VirtualBox's 16550A, as a real one, drops what its
+; FIFO cannot hold, where qemu's waited for its reader.
 print:
 	lodsb
 	test al, al
 	jz .done
+	mov ah, al
+	mov dx, 0x3fd
+.wait:
+	in al, dx
+	test al, 0x20
+	jz .wait
+	mov al, ah
 	mov dx, 0x3f8
 	out dx, al
 	jmp print

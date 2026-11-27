@@ -18,8 +18,10 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -295,5 +297,290 @@ int hull_vbox_host(const char *work, const char *root, const char *agent, const 
 	}
 	status = finish(link);
 	finish(outer);
+	return status;
+}
+
+/* --- a PC of its own media, the virtualbox-pc engine's ------------------- */
+
+/* Run in the outer vm, as the hosted machine's script is, for a machine
+ * made of its own media: VirtualBox made root's, then the machine created
+ * with no agent in it, its drives attached by media.sh, its first serial
+ * port a socket the relay joins to the run's output. Its arguments: the
+ * memory, the processors, the network, the firmware, the card's type, the
+ * chipset, the TPM, the boot order's first and the controller. */
+static const char pc_script[] =
+    "#!/bin/sh\n"
+    "memory=$1 cpus=$2 network=$3 firmware=$4 nic=$5 chipset=$6 tpm=$7 boot=$8 bus=$9\n"
+    "release=$(uname -r)\n"
+    "insmod /lib/modules/$release/misc/vboxdrv.ko || {\n"
+    "	echo \"no vboxdrv.ko for $release: the host's VirtualBox builds it\"; exit 1; }\n"
+    "cp -a /vbox/usr/lib/virtualbox /usr/lib/virtualbox.hull || exit 1\n"
+    "rm -rf /usr/lib/virtualbox\n"
+    "mv /usr/lib/virtualbox.hull /usr/lib/virtualbox || exit 1\n"
+    "chown -R 0:0 /usr/lib/virtualbox\n"
+    "chmod -R go-w /usr/lib/virtualbox\n"
+    "for f in VBoxHeadless VBoxNetDHCP VBoxNetNAT VBoxNetAdpCtl; do\n"
+    "	chmod 4511 /usr/lib/virtualbox/$f\n"
+    "done\n"
+    "chown 0:0 / /usr /usr/lib\n"
+    "chmod 755 / /usr /usr/lib\n"
+    "export HOME=/root VBOX_USER_HOME=/share/vbox\n"
+    "mkdir -p /root $VBOX_USER_HOME\n"
+    "manage=/usr/lib/virtualbox/VBoxManage\n"
+    "$manage createvm --name hull --register --basefolder /share/vbox >/dev/null || exit 1\n"
+    "card='--nic1 none'\n"
+    "[ \"$network\" = nat ] && card=\"--nic1 nat --nic-type1 $nic\"\n"
+    "$manage modifyvm hull --memory $memory --cpus $cpus --ioapic on --firmware $firmware \\\n"
+    "	--chipset $chipset $card --audio-driver none --usb-ohci off \\\n"
+    "	--graphicscontroller vmsvga --vram 128 --boot1 $boot --boot2 disk --boot3 dvd \\\n"
+    "	--uart1 0x3f8 4 --uart-mode1 server /tmp/uart.sock || exit 1\n"
+    "[ \"$tpm\" = yes ] && { $manage modifyvm hull --tpm-type 2.0 || exit 1; }\n"
+    "$manage storagectl hull --name disks --add $bus || exit 1\n"
+    ". /share/media.sh\n"
+    "touch /share/up\n"
+    "exec /usr/lib/virtualbox/VBoxHeadless --startvm hull\n";
+
+static volatile sig_atomic_t pc_stopping;
+
+static void pc_stop_asked(int signum)
+{
+	(void)signum;
+	pc_stopping = 1;
+}
+
+/* The magic of an image VirtualBox opens as it is: VDI, VMDK, VHD; 0 for
+ * one it does not, raw or qcow2 among them. */
+static int vbox_format(const char *path)
+{
+	char    head[64] = "";
+	int     fd = open(path, O_RDONLY | O_CLOEXEC);
+	ssize_t n = fd >= 0 ? read(fd, head, sizeof head - 1u) : -1;
+
+	if (fd >= 0)
+		close(fd);
+	if (n <= 0)
+		return 0;
+	return strncmp(head, "<<< ", 4u) == 0 || strncmp(head, "KDMV", 4u) == 0 ||
+	       strncmp(head, "# Disk DescriptorFile", 21u) == 0 || strncmp(head, "conectix", 8u) == 0;
+}
+
+/* Everything under `dir`, then `dir`, for the work this process made. */
+static int remove_entry(const char *path, const struct stat *st, int type, struct FTW *ftw)
+{
+	(void)st;
+	(void)ftw;
+	return type == FTW_DP ? rmdir(path) : unlink(path);
+}
+
+int hull_vbox_pc(const char *work, const char *agent, const char *const *settings,
+                 const char *mode, char *const *media, unsigned media_count)
+{
+	char        self[PATH_MAX];
+	char        vbox[4096];
+	char        share[4300];
+	char        runtime[4300];
+	char        path[4400];
+	char        target[4400];
+	const char *parent_end = strrchr(work, '/');
+	const char *bus = strcmp(settings[5], "ich9") == 0 ? "sata" : "ide";
+	ssize_t     n = readlink("/proc/self/exe", self, sizeof self - 1u);
+	pid_t       outer;
+	pid_t       link;
+	time_t      deadline;
+	FILE       *file;
+	FILE       *attach;
+	int         status = 1;
+	unsigned    disks = 0u;
+
+	signal(SIGPIPE, SIG_IGN);
+	prctl(PR_SET_PDEATHSIG, SIGKILL);
+	if (n <= 0 || parent_end == NULL || hull_vbox_dir(vbox, sizeof vbox) != 0) {
+		say("this process's own paths cannot be found");
+		return 1;
+	}
+	self[n] = '\0';
+	snprintf(path, sizeof path, "%s/%s", vbox, HULL_VBOX_HEADLESS);
+	if (access(path, X_OK) != 0) {
+		say("no VirtualBox has been fetched: `hull virtualbox fetch` downloads it, once");
+		return 1;
+	}
+	snprintf(path, sizeof path, "%.*s", (int)(parent_end - work), work);
+	mkdir(path, 0700);
+	snprintf(share, sizeof share, "%s/share", work);
+	snprintf(runtime, sizeof runtime, "%s/run", work);
+	if (mkdir(work, 0700) != 0 || mkdir(share, 0700) != 0 || mkdir(runtime, 0700) != 0) {
+		say("its work directory cannot be made");
+		return 1;
+	}
+	setenv("XDG_RUNTIME_DIR", runtime, 1);
+	setenv("HULL_CORE_IDLE", "1", 1);
+
+	snprintf(path, sizeof path, "%s/hull-agent", share);
+	snprintf(target, sizeof target, "%s/run.sh", share);
+	if (copy_file(agent, path) != 0 || (file = fopen(target, "w")) == NULL ||
+	    fputs(pc_script, file) < 0 || fclose(file) != 0) {
+		say("the outer vm's files cannot be written");
+		goto done;
+	}
+	snprintf(path, sizeof path, "%s/hull.conf", share);
+	snprintf(target, sizeof target, "%s/media.sh", share);
+	if ((file = fopen(path, "w")) == NULL || (attach = fopen(target, "w")) == NULL) {
+		say("the outer vm's spec cannot be written");
+		goto done;
+	}
+	fprintf(file, "(machine (backend vm) (source \"dir:/\") (mutable overlay)\n"
+	        " (tuning (vm (profile full)))\n"
+	        " (memory \"%luM\") (cpus %lu)\n"
+	        " (volumes (volume (host \"%s\") (guest \"/vbox\") (mode ro))\n"
+	        "          (volume (host \"%s\") (guest \"/share\"))\n",
+	        strtoul(settings[0], NULL, 10) + OUTER_MEMORY, strtoul(settings[1], NULL, 10) + 1ul,
+	        vbox, share);
+	/* Each medium's folder a share of the outer vm's, read-only unless the
+	 * machine's writes are kept; each medium attached from there. A raw
+	 * disk is given by a VMDK descriptor naming it as a flat extent, the
+	 * one way VirtualBox opens a raw file; under (mutable overlay) a disk
+	 * is VirtualBox's immutable, its writes in a differencing image the
+	 * next start throws away. */
+	for (unsigned i = 0u; i < media_count; i++) {
+		const char *type = media[2u * i];
+		const char *file_path = media[2u * i + 1u];
+		const char *slash = strrchr(file_path, '/');
+		const char *drive = strcmp(type, "cdrom") == 0 ? "dvddrive" :
+		                    strcmp(type, "floppy") == 0 ? "fdd" : "hdd";
+		int         writable = strcmp(type, "disk") == 0 && strcmp(mode, "direct") == 0;
+		char        inner[4400];
+
+		if (slash == NULL || strpbrk(file_path, "\"\\'") != NULL) {
+			say("a medium's path is not absolute, or holds a quote or a backslash");
+			fclose(attach);
+			fclose(file);
+			goto done;
+		}
+		fprintf(file, "          (volume (host \"%.*s\") (guest \"/media/m%u\")%s)\n",
+		        (int)(slash - file_path), file_path, i, writable ? "" : " (mode ro)");
+		snprintf(inner, sizeof inner, "/media/m%u/%s", i, slash + 1);
+		if (strcmp(type, "disk") == 0 && !vbox_format(file_path)) {
+			struct stat st;
+			FILE       *descriptor;
+
+			snprintf(target, sizeof target, "%s/raw%u.vmdk", share, i);
+			if (stat(file_path, &st) != 0 || (descriptor = fopen(target, "w")) == NULL) {
+				say("a raw disk's descriptor cannot be written");
+				fclose(attach);
+				fclose(file);
+				goto done;
+			}
+			/* VirtualBox opens a descriptor only with an image UUID
+			 * of its own, written back otherwise and refused. */
+			{
+				uint8_t id[16] = { 0 };
+				int     random = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+
+				if (random >= 0) {
+					if (read(random, id, sizeof id) != (ssize_t)sizeof id)
+						id[0] ^= (uint8_t)i;
+					close(random);
+				}
+				id[6] = (uint8_t)((id[6] & 0x0fu) | 0x40u);
+				id[8] = (uint8_t)((id[8] & 0x3fu) | 0x80u);
+				fprintf(descriptor, "# Disk DescriptorFile\nversion=1\nCID=fffffffe\n"
+				        "parentCID=ffffffff\ncreateType=\"monolithicFlat\"\n\n"
+				        "RW %llu FLAT \"../media/m%u/%s\" 0\n\n"
+				        "ddb.virtualHWVersion = \"4\"\nddb.adapterType = \"ide\"\n"
+				        "ddb.uuid.image = \"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+				        "%02x%02x%02x%02x%02x%02x\"\n"
+				        "ddb.uuid.parent = \"00000000-0000-0000-0000-000000000000\"\n",
+				        (unsigned long long)st.st_size / 512u, i, slash + 1, id[0], id[1],
+				        id[2], id[3], id[4], id[5], id[6], id[7], id[8], id[9], id[10],
+				        id[11], id[12], id[13], id[14], id[15]);
+			}
+			fclose(descriptor);
+			snprintf(inner, sizeof inner, "/share/raw%u.vmdk", i);
+		}
+		if (strcmp(drive, "fdd") == 0) {
+			fprintf(attach, "$manage storagectl hull --name floppy --add floppy 2>/dev/null\n"
+			        "$manage storageattach hull --storagectl floppy --port 0 --device 0 "
+			        "--type fdd --medium '%s' || exit 1\n", inner);
+			continue;
+		}
+		fprintf(attach, "$manage storageattach hull --storagectl disks --port %u --device %u "
+		        "--type %s --medium '%s'%s || exit 1\n",
+		        strcmp(bus, "ide") == 0 ? disks / 2u : disks,
+		        strcmp(bus, "ide") == 0 ? disks % 2u : 0u, drive, inner,
+		        strcmp(drive, "hdd") == 0 && !writable ? " --mtype immutable" : "");
+		disks++;
+	}
+	fprintf(file, " )\n (command \"/bin/sh\" \"/share/run.sh\"");
+	for (unsigned i = 0u; i < 8u; i++)
+		fprintf(file, " \"%s\"", settings[i]);
+	fprintf(file, " \"%s\"))\n", bus);
+	if (fclose(attach) != 0 || fclose(file) != 0) {
+		say("the outer vm's spec cannot be written");
+		goto done;
+	}
+
+	{
+		const char *const argv[] = { self, "run", "-f", path, NULL };
+
+		if ((outer = start(argv, -1, -1)) < 0)
+			goto done;
+	}
+	snprintf(target, sizeof target, "%s/up", share);
+	deadline = time(NULL) + OUTER_LIMIT;
+	while (access(target, F_OK) != 0) {
+		struct timespec pause = { 0, 100000000L };
+
+		if (time(NULL) >= deadline || waitpid(outer, NULL, WNOHANG) != 0) {
+			say("the outer vm did not reach VirtualBox");
+			kill(outer, SIGTERM);
+			finish(outer);
+			goto done;
+		}
+		nanosleep(&pause, NULL);
+	}
+	/* A stop presses the machine's power button, as qemu-pc's does; the
+	 * engine's KILL after its grace takes everything else with this. */
+	{
+		struct sigaction asked = { .sa_handler = pc_stop_asked };
+
+		/* No SA_RESTART: the wait below must see the stop. */
+		sigaction(SIGTERM, &asked, NULL);
+	}
+	{
+		const char *const argv[] = { self, "exec", "share", "--", "/share/hull-agent", "relay",
+		                             "/tmp/uart.sock", NULL };
+
+		/* Its stdin the run's, typed into COM1; at its end it would end. */
+		if ((link = start(argv, 0, 1)) < 0) {
+			kill(outer, SIGTERM);
+			finish(outer);
+			goto done;
+		}
+	}
+	for (;;) {
+		int   gone;
+		pid_t ended = waitpid(-1, &gone, 0);
+
+		if (ended < 0 && errno == EINTR && pc_stopping == 1) {
+			const char *const argv[] = { self, "exec", "share", "--", "/bin/sh", "-c",
+			                             "HOME=/root VBOX_USER_HOME=/share/vbox "
+			                             "/usr/lib/virtualbox/VBoxManage controlvm hull "
+			                             "acpipowerbutton", NULL };
+
+			pc_stopping = 2;
+			start(argv, -1, -1);
+			continue;
+		}
+		if (ended < 0 && errno == EINTR)
+			continue;
+		if (ended < 0 || ended == outer) {
+			status = ended == outer && WIFEXITED(gone) ? WEXITSTATUS(gone) : 1;
+			break;
+		}
+	}
+	kill(link, SIGTERM);
+	finish(link);
+done:
+	nftw(work, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
 	return status;
 }

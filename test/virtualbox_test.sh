@@ -358,5 +358,71 @@ EOF
 		fail "VirtualBox read the .ova's machine otherwise" "$info"
 fi
 
+# --- a PC of its own media, virtualbox-pc -----------------------------------
+#
+# `(backend virtualbox)` with a PC's media is the virtualbox-pc engine's,
+# as `(backend qemu)` with them is qemu-pc's: the boot sector of the pc
+# suite, its COM1 the run's output, on a raw disk under overlay (by a VMDK
+# descriptor, its writes dropped) and on a VDI under (mutable direct),
+# whose write a second boot reads back. A qcow2 is refused, VirtualBox
+# being unable to open qemu's. Nothing is left after each.
+if command -v nasm > /dev/null; then
+	nasm -f bin -o "$root/boot.bin" test/pc_boot.asm
+	mkdir -p "$root/pcvb"
+	truncate -s 1M "$root/pcvb/raw.img"
+	dd if="$root/boot.bin" of="$root/pcvb/raw.img" conv=notrunc status=none
+	qemu-img convert -f raw -O vdi "$root/pcvb/raw.img" "$root/pcvb/disk.vdi"
+	qemu-img convert -f raw -O qcow2 "$root/pcvb/raw.img" "$root/pcvb/disk.qcow2"
+	pcvb() { # DISK MUTABLE
+		printf '(machine (backend virtualbox) (hostname "pcvb") (source "media:disk") %s %s)\n' \
+			"(mutable $2) (stop_grace \"3s\")" \
+			"(media (medium (type disk) (source \"image:./$1\")))" > "$root/pcvb/hull.conf"
+	}
+	pcvb raw.img overlay
+	cases=$((cases + 1))
+	out=$("$hull" plan -f "$root/pcvb/hull.conf" 2>&1)
+	printf '%s\n' "$out" | grep -q 'machine on virtualbox-pc (pc): ok' ||
+		fail 'a PC of media named virtualbox was not virtualbox-pc' "$out"
+	cases=$((cases + 1))
+	out=$("$hull" plan --backend qemu -f "$root/pcvb/hull.conf" 2>&1)
+	printf '%s\n' "$out" | grep -q 'machine on qemu-pc (pc): ok' ||
+		fail 'a PC of media named qemu was not qemu-pc' "$out"
+	# boot: the machine run until its word is said, then stopped.
+	boot() {
+		: > "$root/pcvb/out"
+		(cd "$root/pcvb" && exec timeout 300 "$hull" run -f hull.conf > out 2>&1) &
+		pcvb_pid=$!
+		tries=0
+		until grep -q 'word:' "$root/pcvb/out" 2>/dev/null || [ "$tries" -ge 240 ]; do
+			tries=$((tries + 1))
+			sleep 1
+		done
+		timeout 60 "$hull" stop pcvb > /dev/null 2>&1
+		wait "$pcvb_pid"
+		out=$(cat "$root/pcvb/out")
+	}
+	boot
+	cases=$((cases + 1))
+	printf '%s\n' "$out" | grep -q 'booted from a drive' && printf '%s\n' "$out" | grep -q 'word: fresh' ||
+		fail 'VirtualBox did not boot a raw disk, its COM1 the output' "$out"
+	cases=$((cases + 1))
+	[ -z "$(left)" ] || fail 'a VirtualBox PC left something' "$(left)"
+	pcvb disk.vdi direct
+	boot
+	boot
+	cases=$((cases + 1))
+	printf '%s\n' "$out" | grep -q 'word: written' ||
+		fail 'a VDI under (mutable direct) kept no write' "$out"
+	pcvb disk.qcow2 direct
+	cases=$((cases + 1))
+	out=$(timeout 60 "$hull" run -f "$root/pcvb/hull.conf" 2>&1)
+	[ $? -ne 0 ] && printf '%s\n' "$out" | grep -q 'qemu-img convert -O vdi' ||
+		fail 'a qcow2 was not refused, naming the conversion' "$out"
+	cases=$((cases + 1))
+	[ -z "$(left)" ] || fail 'a VirtualBox PC left something' "$(left)"
+else
+	printf 'virtualbox: no nasm, the PC of media not tried\n'
+fi
+
 printf 'virtualbox: %d cases, %d failures\n' "$cases" "$failures"
 [ "$failures" -eq 0 ]

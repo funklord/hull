@@ -17,4 +17,16 @@ int hull_vbox_host(const char *work, const char *root, const char *agent, const 
                    const char *cpus, const char *network, const char *ssh,
                    char *const *volumes, unsigned volume_count);
 
+/* `hull virtualbox pc`, the virtualbox-pc engine's: a PC of its own media
+ * under VirtualBox inside a qemu vm, as above but with no agent, its
+ * first serial port joined to stdout until it ends. `settings` are the
+ * memory in MiB, the processors, the network (nat or none), the firmware
+ * (bios or efi), the card's VirtualBox type, the chipset (piix3 or ich9),
+ * the TPM (yes or no) and the first boot device (disk, dvd or floppy);
+ * `mode` direct or overlay; `media` a type (disk, cdrom, floppy) and an
+ * absolute path for each of `media_count`. `work` is made, and removed at
+ * the end. Its status. */
+int hull_vbox_pc(const char *work, const char *agent, const char *const *settings,
+                 const char *mode, char *const *media, unsigned media_count);
+
 #endif

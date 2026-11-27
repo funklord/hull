@@ -5891,6 +5891,7 @@ static int core_loop(const char *host_arch, const char *broker_dir)
 	    hull_registry_add(&registry, hull_engine_hw(&host_ops), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_qemu_pc(&host_ops), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_add(&registry, hull_engine_86box(&host_ops), &reason) != HULL_REGISTRY_OK ||
+	    hull_registry_add(&registry, hull_engine_virtualbox_pc(&host_ops), &reason) != HULL_REGISTRY_OK ||
 	    hull_registry_set_default(&registry, "ns", "chroot") != HULL_REGISTRY_OK ||
 	    hull_registry_set_default(&registry, "pc", "qemu-pc") != HULL_REGISTRY_OK) {
 		fprintf(stderr, "hull core: a built-in engine is refused: %s\n", reason);
