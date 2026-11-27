@@ -185,6 +185,17 @@ mkdir -p "$dir/settings/config"
 keys "$dir" "b'\\x1bOR'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
 	"b'\\x1b[B'" "b'\\x1b[B'" "b'\\r'" -- "$dir/settings.conf"
 has "$(cat "$dir/settings.conf")" '\(tuning \(pc \(firmware uefi\)\)\)' "Settings set a PC's firmware"
+# The same form for a PC on VirtualBox, (backend virtualbox), its class
+# read from its plan's lines rather than from the backend's name.
+printf '(machine (backend virtualbox) (hostname "gui-vbs") (source "media:disk")\n  (media (medium (type disk) (source "image:./a.img"))))\n' \
+	> "$dir/settings.conf"
+rm -rf "${dir:?}/settings/config"
+mkdir -p "$dir/settings/config"
+keys "$dir" "b'\\x1bOR'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
+	"b'\\x1b[B'" "b'\\x1b[B'" "b'\\r'" -- "$dir/settings.conf"
+has "$(cat "$dir/settings.conf")" '\(tuning \(pc \(firmware uefi\)\)\)' "Settings set a VirtualBox PC's firmware"
+printf '(machine (backend pc) (hostname "gui-efi") (source "media:disk")\n  (media (medium (type disk) (source "image:./a.img"))) (tuning (pc (firmware uefi))))\n' \
+	> "$dir/settings.conf"
 # Boot from, VirtualBox's Boot Order, the eleventh Tab: the installer's
 # disc chosen with Down, written as the machine's source.
 keys "$dir" "b'\\x1bOR'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \

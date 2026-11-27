@@ -611,7 +611,7 @@ void main_window::plan_of(int index)
 				                                                    "exited %1)\n")
 				                                        .arg(code);
 				r.id = machine_id_of(r.added, hostname_in(resolved));
-				if (name.isEmpty() && resolved.contains(QStringLiteral("(backend pc)")))
+				if (name.isEmpty() && is_pc(r))
 					saved_of(file);
 			}
 		rebuild();
@@ -624,6 +624,14 @@ void main_window::plan_of(int index)
 		rebuild();
 	});
 	plan->start(hull, arguments);
+}
+
+/* Whether a row's machine is of the pc class, as its plan says on each of
+ * its lines, "machine on ENGINE (pc): ...", whichever engine runs it:
+ * qemu-pc, 86box or virtualbox-pc, which (backend virtualbox) names. */
+bool main_window::is_pc(const row &r)
+{
+	return r.explain.contains(QStringLiteral(" (pc): "));
 }
 
 /* Whether a pc machine's file names a disk holding a saved state, as
@@ -736,7 +744,7 @@ void main_window::update_actions()
 	 * VirtualBox takes either; the CLI says why where its disks keep
 	 * none. A paused one cannot answer. */
 	snapshots_action->setEnabled(any && !rows[i].added.file.isEmpty() && rows[i].added.name.isEmpty() &&
-	                             rows[i].resolved.contains(QStringLiteral("(backend pc)")) &&
+	                             is_pc(rows[i]) &&
 	                             state != QStringLiteral("paused"));
 	/* A stopped machine's disks: a running one's are being written. */
 	export_action->setEnabled(any && !rows[i].added.file.isEmpty() && !held &&
@@ -1303,8 +1311,7 @@ void main_window::edit_settings()
 
 	if (i < 0 || i >= rows.size() || rows[i].added.file.isEmpty())
 		return;
-	const bool      pc = rows[i].resolved.contains(QStringLiteral("(backend pc)")) ||
-	                     rows[i].resolved.contains(QStringLiteral("(backend qemu-pc)"));
+	const bool      pc = is_pc(rows[i]);
 	settings_dialog dialog(rows[i].added.file, pc, this);
 
 	if (!dialog.usable()) {

@@ -73,6 +73,7 @@ private:
 	void show_output();
 	void plan_of(int index);
 	void saved_of(const QString &file);
+	static bool is_pc(const row &r);
 	int  current() const;
 	void start();
 	void stop();
