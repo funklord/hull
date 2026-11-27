@@ -62,6 +62,7 @@ RESOURCES += hull-gui.qrc
 SOURCES += \
 	src/core_link.cpp \
 	src/images_dialog.cpp \
+	src/snapshots_dialog.cpp \
 	src/machine_list.cpp \
 	src/main.cpp \
 	src/main_window.cpp \
@@ -74,6 +75,7 @@ SOURCES += \
 HEADERS += \
 	src/core_link.h \
 	src/images_dialog.h \
+	src/snapshots_dialog.h \
 	src/machine_list.h \
 	src/main_window.h \
 	src/new_machine_dialog.h \

@@ -199,6 +199,18 @@ keys "$dir" "b'\\x18'" "b'\\r'" -- "$dir/settings.conf"
 has "$(tar tf "$dir/home/gui-export.ova" 2>&1)" '^gui-export\.ovf$' "Export Appliance wrote the .ova"
 has "$(tar tf "$dir/home/gui-export.ova" 2>&1)" '^gui-export-disk1\.vmdk$' "with the machine's disk"
 rm -f "$dir/home/gui-export.ova"
+# Snapshots (F2) on a pc machine of a qcow2: Tab to Take, Space, the
+# name offered taken with Enter, and `hull snapshot ls` then lists it.
+if command -v qemu-img > /dev/null; then
+	qemu-img create -q -f qcow2 "$dir/settings/snap.qcow2" 1M
+	printf '(machine (backend pc) (hostname "gui-snap") (source "media:disk")\n  (media (medium (type disk) (source "image:./settings/snap.qcow2"))))\n' \
+		> "$dir/settings.conf"
+	rm -rf "${dir:?}/settings/config"
+	mkdir -p "$dir/settings/config"
+	keys "$dir" "b'\\x1bOQ'" "b'\\t'" "b' '" "b'\\r'" "b'\\x1b'" -- "$dir/settings.conf"
+	has "$("$hull" snapshot ls "$dir/settings.conf" 2>&1)" '^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}	' \
+		"Snapshots took one, named by the time"
+fi
 XDG_CONFIG_HOME=$config_saved
 rm -rf "${dir:?}/settings" "${dir:?}/settings.conf" "${dir:?}/a.img" "${dir:?}/b.iso"
 

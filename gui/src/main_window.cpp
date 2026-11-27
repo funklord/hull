@@ -16,6 +16,7 @@
 #include "pools_dialog.h"
 #include "new_machine_dialog.h"
 #include "settings_dialog.h"
+#include "snapshots_dialog.h"
 #include "screen_window.h"
 
 #include <QAction>
@@ -238,6 +239,11 @@ void main_window::build_actions()
 	settings_action->setToolTip(QStringLiteral("The machine's hardware in a form, written back "
 	                                           "into its hull.conf"));
 	connect(settings_action, &QAction::triggered, this, &main_window::edit_settings);
+	snapshots_action = new QAction(QStringLiteral("Snapshots..."), this);
+	snapshots_action->setShortcut(QKeySequence(QStringLiteral("F2")));
+	snapshots_action->setToolTip(QStringLiteral("A stopped pc machine's disks kept as they are, "
+	                                            "to go back to"));
+	connect(snapshots_action, &QAction::triggered, this, &main_window::show_snapshots);
 	clone_action = new QAction(QStringLiteral("Clone..."), this);
 	clone_action->setToolTip(QStringLiteral("Copy a machine in ~/hull, its disks with it, "
 	                                        "into a folder of its own"));
@@ -311,6 +317,7 @@ void main_window::build_actions()
 	machine->addAction(export_action);
 	machine->addAction(settings_action);
 	machine->addAction(edit_action);
+	machine->addAction(snapshots_action);
 	machine->addAction(clone_action);
 	machine->addAction(remove_action);
 	machine->addSeparator();
@@ -691,6 +698,11 @@ void main_window::update_actions()
 	clone_action->setEnabled(any && in_own_folder(rows[i].added.file) &&
 	                         rows[i].added.name.isEmpty() && !held && rows[i].run == nullptr);
 	edit_action->setEnabled(any && !rows[i].added.file.isEmpty());
+	/* A pc machine's disks, stopped, as VirtualBox takes an offline
+	 * snapshot; the CLI says why where its disks keep none. */
+	snapshots_action->setEnabled(any && !rows[i].added.file.isEmpty() && rows[i].added.name.isEmpty() &&
+	                             rows[i].resolved.contains(QStringLiteral("(backend pc)")) && !held &&
+	                             rows[i].run == nullptr);
 	/* A stopped machine's disks: a running one's are being written. */
 	export_action->setEnabled(any && !rows[i].added.file.isEmpty() && !held &&
 	                          rows[i].run == nullptr);
@@ -1038,6 +1050,23 @@ void main_window::ask_import()
 	});
 	say(QStringLiteral("importing %1 into %2").arg(file, dir));
 	import->start(hull, { QStringLiteral("import"), QStringLiteral("--machine"), file, dir });
+}
+
+/* Snapshots, as VirtualBox's pane: a stopped pc machine's disks taken,
+ * restored and deleted together by `hull snapshot` on its file. */
+void main_window::show_snapshots()
+{
+	const int i = current();
+
+	if (i < 0 || i >= rows.size() || rows[i].added.file.isEmpty())
+		return;
+	QString title = hostname_in(rows[i].resolved);
+
+	if (title.isEmpty())
+		title = QFileInfo(rows[i].added.file).absoluteDir().dirName();
+	snapshots_dialog dialog(hull, rows[i].added.file, title, this);
+
+	dialog.exec();
 }
 
 /* Export Appliance, as VirtualBox's: the machine as an .ova by `hull

@@ -90,6 +90,7 @@ private:
 	void clone_machine();
 	void power_off(const QString &id);
 	void export_appliance();
+	void show_snapshots();
 	void ask_add();
 	void ask_import();
 	void ask_new(const QString &source = QString());
@@ -127,6 +128,7 @@ private:
 	QAction        *add_action;
 	QAction        *import_action;
 	QAction        *export_action;
+	QAction        *snapshots_action;
 	QAction        *remove_action;
 	QAction        *clone_action;
 	QAction        *start_action;
