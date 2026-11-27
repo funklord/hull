@@ -451,6 +451,35 @@ else
 	printf 'gui_test: no qemu-system-i386, Change Medium not tried\n'
 fi
 
+# Snapshots (F2) of a running pc, its memory with its disk: a boot sector
+# spinning on a qcow2 under (mutable direct), its row chosen by typing,
+# Tab to Take, Space and Enter; its file then lists the snapshot.
+if command -v qemu-system-x86_64 > /dev/null && command -v qemu-img > /dev/null; then
+	truncate -s 1M "$dir/live.img"
+	printf '\353\376' | dd of="$dir/live.img" conv=notrunc status=none
+	printf '\125\252' | dd of="$dir/live.img" bs=1 seek=510 conv=notrunc status=none
+	qemu-img convert -O qcow2 "$dir/live.img" "$dir/live.qcow2"
+	printf '%s\n' '(machine (hostname "gui-live") (backend pc) (source "media:disk") (mutable direct)' \
+		'  (stop_grace "1s") (media (medium (type disk) (source "image:./live.qcow2"))))' > "$dir/live.conf"
+	(cd "$dir" && exec timeout 120 "$hull" run -f live.conf > "$dir/live.out" 2>&1) &
+	run_pid=$!
+	tries=0
+	until timeout 10 "$hull" ps 2>/dev/null | grep -q 'gui-live .*running'; do
+		tries=$((tries + 1))
+		if [ "$tries" -gt 100 ]; then
+			break
+		fi
+		sleep 0.1
+	done
+	keys "$dir" "b'gui-live'" "b'\\x1bOQ'" "b'\\t'" "b' '" "b'\\r'" "b'\\x1b'" -- live.conf
+	has "$("$hull" snapshot ls "$dir/live.conf" 2>&1)" '^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}	' \
+		"Snapshots took one of the running machine"
+	timeout 30 "$hull" stop gui-live > /dev/null 2>&1
+	wait "$run_pid" 2>/dev/null
+	run_pid=
+	rm -f "$dir/live.img" "$dir/live.qcow2" "$dir/live.conf" "$dir/live.out"
+fi
+
 # A machine put in a folder of ~/hull by hand -- copied, or imported by
 # the CLI -- is listed when the window opens, nobody having added it.
 mkdir -p "$dir/home/hull/gui-found"

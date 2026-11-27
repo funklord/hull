@@ -698,11 +698,12 @@ void main_window::update_actions()
 	clone_action->setEnabled(any && in_own_folder(rows[i].added.file) &&
 	                         rows[i].added.name.isEmpty() && !held && rows[i].run == nullptr);
 	edit_action->setEnabled(any && !rows[i].added.file.isEmpty());
-	/* A pc machine's disks, stopped, as VirtualBox takes an offline
-	 * snapshot; the CLI says why where its disks keep none. */
+	/* A pc machine's disks, stopped, or running with its memory, as
+	 * VirtualBox takes either; the CLI says why where its disks keep
+	 * none. A paused one cannot answer. */
 	snapshots_action->setEnabled(any && !rows[i].added.file.isEmpty() && rows[i].added.name.isEmpty() &&
-	                             rows[i].resolved.contains(QStringLiteral("(backend pc)")) && !held &&
-	                             rows[i].run == nullptr);
+	                             rows[i].resolved.contains(QStringLiteral("(backend pc)")) &&
+	                             state != QStringLiteral("paused"));
 	/* A stopped machine's disks: a running one's are being written. */
 	export_action->setEnabled(any && !rows[i].added.file.isEmpty() && !held &&
 	                          rows[i].run == nullptr);
@@ -1052,8 +1053,9 @@ void main_window::ask_import()
 	import->start(hull, { QStringLiteral("import"), QStringLiteral("--machine"), file, dir });
 }
 
-/* Snapshots, as VirtualBox's pane: a stopped pc machine's disks taken,
- * restored and deleted together by `hull snapshot` on its file. */
+/* Snapshots, as VirtualBox's pane: a pc machine's disks taken, restored
+ * and deleted together by `hull snapshot` on its file, or on its id
+ * while it runs, its memory with them. */
 void main_window::show_snapshots()
 {
 	const int i = current();
@@ -1064,7 +1066,8 @@ void main_window::show_snapshots()
 
 	if (title.isEmpty())
 		title = QFileInfo(rows[i].added.file).absoluteDir().dirName();
-	snapshots_dialog dialog(hull, rows[i].added.file, title, this);
+	const bool       running = rows[i].is_held && rows[i].held.state == QStringLiteral("running");
+	snapshots_dialog dialog(hull, rows[i].added.file, title, running ? rows[i].id : QString(), this);
 
 	dialog.exec();
 }

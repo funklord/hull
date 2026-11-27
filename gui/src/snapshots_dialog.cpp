@@ -18,10 +18,12 @@
 #include <QVBoxLayout>
 
 snapshots_dialog::snapshots_dialog(const QString &hull_program, const QString &machine_file,
-                                   const QString &title, QWidget *parent)
-    : QDialog(parent), hull(hull_program), file(machine_file)
+                                   const QString &title, const QString &running, QWidget *parent)
+    : QDialog(parent), hull(hull_program), file(machine_file),
+      target(running.isEmpty() ? machine_file : running)
 {
-	setWindowTitle(QStringLiteral("Snapshots of %1").arg(title));
+	setWindowTitle(running.isEmpty() ? QStringLiteral("Snapshots of %1").arg(title)
+	                                 : QStringLiteral("Snapshots of %1, running").arg(title));
 	list = new QTreeWidget;
 	list->setColumnCount(2);
 	list->setHeaderLabels({ QStringLiteral("Name"), QStringLiteral("Taken") });
@@ -53,7 +55,7 @@ snapshots_dialog::snapshots_dialog(const QString &hull_program, const QString &m
 		                         .trimmed();
 
 		if (given && !name.isEmpty())
-			run({ QStringLiteral("snapshot"), QStringLiteral("take"), file, name });
+			run({ QStringLiteral("snapshot"), QStringLiteral("take"), target, name });
 	});
 	connect(restore_button, &QPushButton::clicked, this, [this]() {
 		QTreeWidgetItem *item = list->currentItem();
@@ -62,12 +64,15 @@ snapshots_dialog::snapshots_dialog(const QString &hull_program, const QString &m
 			return;
 		const QString name = item->text(0);
 
-		if (QMessageBox::question(this, QStringLiteral("Restore Snapshot"),
-		                          QStringLiteral("Put every disk back as %1 had it? What was "
-		                                         "written since is lost, unless a snapshot "
-		                                         "keeps it.")
-		                              .arg(name)) == QMessageBox::Yes)
-			run({ QStringLiteral("snapshot"), QStringLiteral("restore"), file, name });
+		const QString asked = target == file ?
+		    QStringLiteral("Put every disk back as %1 had it? What was written since is lost, "
+		                   "unless a snapshot keeps it.").arg(name) :
+		    QStringLiteral("Put the running machine back where it was at %1? What it did "
+		                   "since is lost, unless a snapshot keeps it.").arg(name);
+
+		if (QMessageBox::question(this, QStringLiteral("Restore Snapshot"), asked) ==
+		    QMessageBox::Yes)
+			run({ QStringLiteral("snapshot"), QStringLiteral("restore"), target, name });
 	});
 	connect(delete_button, &QPushButton::clicked, this, [this]() {
 		QTreeWidgetItem *item = list->currentItem();
@@ -80,7 +85,7 @@ snapshots_dialog::snapshots_dialog(const QString &hull_program, const QString &m
 		                          QStringLiteral("Delete the snapshot %1? The disks stay as "
 		                                         "they are.")
 		                              .arg(name)) == QMessageBox::Yes)
-			run({ QStringLiteral("snapshot"), QStringLiteral("delete"), file, name });
+			run({ QStringLiteral("snapshot"), QStringLiteral("delete"), target, name });
 	});
 
 	QHBoxLayout *buttons = new QHBoxLayout;
