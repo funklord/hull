@@ -373,10 +373,44 @@ says 'its hull.conf names the copy' "$conf" '(medium (type disk) (source "image:
 says 'kept in place' "$conf" '(mutable direct)'
 says 'and its sound and tablet still' "$conf" '(sound ac97) (pointer tablet)'
 says 'the copy is a qcow2' "$(qemu-img info "$root/imported/old.qcow2" 2>&1)" 'file format: qcow2'
+# A snapshot of its disk taken before it first boots, as VirtualBox's
+# Take Snapshot: listed; refused a second time and with a name that is no
+# word.
+out=$("$hull" snapshot take "$root/imported/hull.conf" clean 2>&1)
+got=$?
+status 'a snapshot taken' "$got" 0 "$out"
+says 'and listed' "$("$hull" snapshot ls "$root/imported/hull.conf" 2>&1)" 'clean	'
+out=$("$hull" snapshot take "$root/imported/hull.conf" clean 2>&1)
+got=$?
+status 'a snapshot of a name taken is refused' "$got" 1 "$out"
+out=$("$hull" snapshot take "$root/imported/hull.conf" 'no word' 2>&1)
+got=$?
+status 'a snapshot name that is no word is refused' "$got" 2 "$out"
 out=$(timeout 120 "$hull" run -f "$root/imported/hull.conf" 2>&1)
 got=$?
 status 'the imported machine boots' "$got" 0 "$out"
 says 'from its copy' "$out" 'word: fresh'
+# It wrote its word; booted again it says so. The snapshot restored, it
+# boots fresh, as it was; deleted, it is listed no more. A tree's machine
+# and a raw disk have no snapshot to take.
+out=$(timeout 120 "$hull" run -f "$root/imported/hull.conf" 2>&1)
+says 'its write kept' "$out" 'word: written'
+out=$("$hull" snapshot restore "$root/imported/hull.conf" clean 2>&1)
+got=$?
+status 'the snapshot restored' "$got" 0 "$out"
+out=$(timeout 120 "$hull" run -f "$root/imported/hull.conf" 2>&1)
+says 'the disk as the snapshot had it' "$out" 'word: fresh'
+out=$("$hull" snapshot delete "$root/imported/hull.conf" clean 2>&1)
+got=$?
+status 'the snapshot deleted' "$got" 0 "$out"
+cases=$((cases + 1))
+[ -z "$("$hull" snapshot ls "$root/imported/hull.conf" 2>&1)" ] ||
+	fail 'a deleted snapshot is listed no more' "$("$hull" snapshot ls "$root/imported/hull.conf" 2>&1)"
+conf '(source "image:./raw.img")'
+out=$("$hull" snapshot take "$root/hull.conf" clean 2>&1)
+got=$?
+status 'a raw disk has no snapshot' "$got" 125 "$out"
+says 'and is told how' "$out" 'qemu-img convert -O qcow2'
 cases=$((cases + 1))
 [ "$(sha256sum < "$root/vbox/old.vdi")" = "$before" ] ||
 	fail 'the VDI imported from is unchanged' "$(qemu-img info "$root/vbox/old.vdi")"

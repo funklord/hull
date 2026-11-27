@@ -493,6 +493,7 @@ and installing from a disc then booting the disk is one changed line.
 | Writes | thrown away with the machine by default; `(mutable direct)` writes the image, or a collection's files: what the guest wrote is taken into them each time it pauses, only the MiB it touched read again |
 | Growth | `(medium (type disk) (source "dir:./c") (size "8G"))` serves a collection larger, for the guest to grow its filesystem into |
 | Disk sets | `hull media change ID floppy next.img` swaps a floppy or CD while it runs; no image takes it out |
+| Snapshots | `hull snapshot take hull.conf before-update`, then `restore` or `delete` it, keeps a stopped machine's disks as they were, every one together, inside its qcow2s, as VirtualBox's Snapshots do |
 | Keyboard and screen | `hull type ID 'text'`, `hull key ID ctrl-alt-delete` and `hull screenshot ID now.png` drive an installer from a script; `(tuning (pc (boot_key 60)))` presses Enter for a disc's *Press any key* |
 | Installs | `hull setup windows ISO DIR`, `hull setup reactos ISO DIR`, `hull setup freedos BOOT DIR` and `hull setup msdos FLOPPY DIR` make a directory that installs the system from your own disc or floppy with nobody at it, then boots its disk; `hull setup macos --osk FILE monterey DIR` fetches Apple's recovery image, checked against its signed chunklist, and OpenCore, for an install on the machine's screen; `--drivers` with your virtio-win disc gives Windows a desktop that follows hull-gui's window |
 | Output | its first serial port is `hull run`'s output; powering off is exit 0 |

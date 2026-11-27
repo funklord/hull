@@ -170,6 +170,7 @@ static void usage(FILE *out)
 	      "       hull import --machine X.vbox|X.vmx|X.ovf|X.ova DIR\n"
 	      "       hull media import IMAGE DIR | verify DIR | export DIR IMAGE\n"
 	      "       hull media change ID DRIVE [IMAGE]\n"
+	      "       hull snapshot ls FILE | hull snapshot take|restore|delete FILE NAME\n"
 	      "       hull disk write FILE DEVICE|IMAGE\n"
 	      "       hull key ID KEY... | hull type ID TEXT | hull screenshot ID FILE\n"
 	      "       hull board ls POOL | hull board fix NAME\n"
@@ -6742,6 +6743,45 @@ static int image_path(const char *file, const char *source, char *out, size_t ca
 	                source + 6) < (int)cap;
 }
 
+/* A pc machine's disks, as paths a run opens: its image: source first,
+ * where it is one, then each (medium (type disk)) in order, at most
+ * HULL_OVA_DISKS, into `paths`, `*count` of them, and how many discs and
+ * floppies there are beside them into `*left`. NULL, or why not. */
+static const char *pc_disks(const char *file, hull_spec *spec, const hull_sexpr_form *machine,
+                            char paths[][4400], unsigned *count, unsigned *left)
+{
+	hull_sexpr_form entry;
+	char            text[4400];
+
+	*count = *left = 0u;
+	if (record_value(spec, machine, "source", text, sizeof text) &&
+	    image_path(file, text, paths[*count], 4400u))
+		(*count)++;
+	if (hull_spec_find(spec, machine, "media", &entry)) {
+		hull_sexpr_form medium;
+		hull_sexpr_form at;
+		int             more = hull_sexpr_child(&spec->doc, &entry, &at);
+
+		while (more && (more = hull_sexpr_next(&spec->doc, &at, &medium))) {
+			char type[16];
+
+			at = medium;
+			record_value(spec, &medium, "type", type, sizeof type);
+			if (strcmp(type, "disk") != 0) {
+				(*left)++;
+				continue;
+			}
+			if (*count == HULL_OVA_DISKS)
+				return "a machine of hull's here holds at most 8 disks";
+			if (!record_value(spec, &medium, "source", text, sizeof text) ||
+			    !image_path(file, text, paths[*count], 4400u))
+				return "a disk's source is not an image: file";
+			(*count)++;
+		}
+	}
+	return NULL;
+}
+
 /* `hull export --bootable -f FILE X.ova` of a pc machine: its own disks,
  * which already boot, as VirtualBox's Export Appliance gives them -- each
  * a VMDK, the first the one it boots, its memory, processors, adapter and
@@ -6754,7 +6794,6 @@ static int export_pc(const char *file, hull_spec *spec, const hull_sexpr_form *m
 	static char      paths[HULL_OVA_DISKS][4400];
 	const char      *disks[HULL_OVA_DISKS];
 	hull_ova_machine shape = { 0 };
-	hull_sexpr_form  entry;
 	hull_sexpr_form  tuning;
 	hull_sexpr_form  pc;
 	char             text[4400];
@@ -6766,6 +6805,7 @@ static int export_pc(const char *file, hull_spec *spec, const hull_sexpr_form *m
 	char             hostname[200];
 	char             title[64];
 	char             why[4400] = "";
+	const char      *wrong;
 	unsigned         count = 0u;
 	unsigned         left = 0u;
 	size_t           n = 0u;
@@ -6788,36 +6828,9 @@ static int export_pc(const char *file, hull_spec *spec, const hull_sexpr_form *m
 		        board);
 		return 125;
 	}
-	/* The source first, where it is an image of its own, then the disks of
-	 * (media ...) in order. */
-	if (record_value(spec, machine, "source", text, sizeof text) &&
-	    image_path(file, text, paths[count], sizeof paths[count]))
-		count++;
-	if (hull_spec_find(spec, machine, "media", &entry)) {
-		hull_sexpr_form medium;
-		hull_sexpr_form at;
-		int             more = hull_sexpr_child(&spec->doc, &entry, &at);
-
-		while (more && (more = hull_sexpr_next(&spec->doc, &at, &medium))) {
-			char type[16];
-
-			at = medium;
-
-			record_value(spec, &medium, "type", type, sizeof type);
-			if (strcmp(type, "disk") != 0) {
-				left++;
-				continue;
-			}
-			if (!record_value(spec, &medium, "source", text, sizeof text) ||
-			    count == HULL_OVA_DISKS ||
-			    !image_path(file, text, paths[count], sizeof paths[count])) {
-				fprintf(stderr, "%s: %s\n", file, count == HULL_OVA_DISKS ?
-				        "an appliance of hull's holds at most 8 disks" :
-				        "a disk's source is not an image: file, which an appliance needs");
-				return 125;
-			}
-			count++;
-		}
+	if ((wrong = pc_disks(file, spec, machine, paths, &count, &left)) != NULL) {
+		fprintf(stderr, "%s: %s\n", file, wrong);
+		return 125;
 	}
 	for (unsigned i = 0u; i < count; i++)
 		disks[i] = paths[i];
@@ -6985,6 +6998,238 @@ static int disk_text(hull_spec *spec, const hull_sexpr_form *record, const char 
 	memcpy(out, spec->doc.data + value.content, value.content_length);
 	out[value.content_length] = '\0';
 	return 1;
+}
+
+/* --- snapshots of a pc machine's disks (VirtualBox's Snapshots) ----------- */
+
+/* A snapshot's name: a plain word a person typed, which `qemu-img
+ * snapshot -l` gives back in a column of its own. */
+static int snapshot_word(const char *name)
+{
+	size_t n = strlen(name);
+
+	if (n == 0u || n > 64u)
+		return 0;
+	for (const char *c = name; *c != '\0'; c++)
+		if (!isalnum((unsigned char)*c) && strchr("._-", *c) == NULL)
+			return 0;
+	return 1;
+}
+
+/* Whether `path` is a qcow2, by its magic: the format internal snapshots
+ * are kept in. */
+static int is_qcow2(const char *path)
+{
+	uint8_t head[4];
+	int     fd = open(path, O_RDONLY | O_CLOEXEC);
+	int     read_whole;
+
+	if (fd < 0)
+		return 0;
+	read_whole = read(fd, head, sizeof head) == (ssize_t)sizeof head;
+	close(fd);
+	return read_whole && memcmp(head, "QFI\xfb", 4u) == 0;
+}
+
+/* `qemu-img snapshot -l`'s table of `path` into `out`: 0, or -1 with
+ * qemu-img's words in `out`. */
+static int snapshot_table(const char *path, char *out, size_t cap)
+{
+	const char *const argv[] = { "qemu-img", "snapshot", "-U", "-l", path, NULL };
+
+	memset(out, 0, cap);
+	return hull_hostnet_run(argv, out, cap);
+}
+
+/* Whether `table`, qemu-img's, holds a snapshot named `name`: its rows
+ * are an id, the tag, then sizes and times. The date and time of it into
+ * `when` where it does. */
+static int snapshot_in(const char *table, const char *name, char *when, size_t cap)
+{
+	for (const char *line = table; *line != '\0';) {
+		const char *end = strchr(line, '\n');
+		size_t      n = end != NULL ? (size_t)(end - line) : strlen(line);
+		char        row[512];
+		char        id[32];
+		char        tag[128];
+		char        size[32];
+		char        unit[16];
+		char        date[32];
+		char        clock[32];
+
+		snprintf(row, sizeof row, "%.*s", (int)(n < sizeof row ? n : sizeof row - 1u), line);
+		/* qemu 7 and later print the size with its unit apart, "0 B";
+		 * earlier ones joined, "0". Both are read. */
+		if (sscanf(row, "%31s %127s %31s %15s %31s %31s", id, tag, size, unit, date, clock) == 6 &&
+		    isdigit((unsigned char)id[0]) && strcmp(tag, name) == 0) {
+			if (!isalpha((unsigned char)unit[0]))
+				snprintf(when, cap, "%s %s", unit, date);
+			else
+				snprintf(when, cap, "%s %s", date, clock);
+			return 1;
+		}
+		line += n + (end != NULL);
+	}
+	return 0;
+}
+
+/* One qemu-img snapshot verb on `path`: 0, or -1 with why. */
+static int snapshot_verb(const char *verb, const char *name, const char *path, char *why,
+                         size_t cap)
+{
+	const char *const argv[] = { "qemu-img", "snapshot", verb, name, path, NULL };
+	char              said[600] = "";
+
+	if (hull_hostnet_run(argv, said, sizeof said) == 0)
+		return 0;
+	said[strcspn(said, "\n")] = '\0';
+	/* qemu holding the disk: the machine is running, or another tool. */
+	if (strstr(said, "\"write\" lock") != NULL)
+		snprintf(why, cap, "%s is in use, the machine running: a snapshot is of a stopped "
+		         "machine (%s)", path, said);
+	else
+		snprintf(why, cap, "%s: %s", path, said);
+	return -1;
+}
+
+/* `hull snapshot ls|take|restore|delete FILE [NAME]`: a stopped pc
+ * machine's disks, every one of them together, as VirtualBox's Snapshots
+ * pane keeps a machine's: qemu's internal snapshots, inside each qcow2,
+ * so the machine's folder stays its files and a clone or an export carries
+ * them. A disk not qcow2 is refused, saying so -- a raw image has nowhere
+ * to keep one -- and so is a running machine, qemu-img finding its disks
+ * locked. Take on several disks is undone on the ones done where a later
+ * one fails, and restore and delete look first that every disk holds the
+ * name, so the disks never part from each other. */
+static int snapshot(const char *verb, const char *file, const char *name)
+{
+	static char     paths[HULL_OVA_DISKS][4400];
+	static char     table[16384];
+	hull_spec       spec;
+	hull_spec_error error;
+	uint8_t        *data;
+	size_t          length;
+	char            backend[16];
+	char            when[96];
+	char            why[4400] = "";
+	const char     *wrong;
+	unsigned        count;
+	unsigned        left;
+	int             status = 1;
+
+	if (name != NULL && !snapshot_word(name)) {
+		fprintf(stderr, "hull: snapshot: a name is letters, digits, '.', '_' and '-', at most "
+		        "64 of them\n");
+		return 2;
+	}
+	if ((data = spec_text(file, &length)) == NULL)
+		return 125;
+	if (hull_spec_open(&spec, data, length, &error) != HULL_SPEC_OK) {
+		fprintf(stderr, "%s:%u:%u: %s%s%s\n", file, error.line, error.column, error.path,
+		        error.path[0] != '\0' ? ": " : "", error.reason);
+		free(data);
+		return 125;
+	}
+	if (!spec.has_machine || !record_value(&spec, &spec.machine, "backend", backend,
+	                                       sizeof backend) || strcmp(backend, "pc") != 0) {
+		fprintf(stderr, "%s: a snapshot is of a pc machine's disks; a tree's is `hull commit`\n",
+		        file);
+		free(data);
+		return 125;
+	}
+	wrong = pc_disks(file, &spec, &spec.machine, paths, &count, &left);
+	free(data);
+	if (wrong == NULL && count == 0u)
+		wrong = "the machine has no disk";
+	for (unsigned i = 0u; wrong == NULL && i < count; i++)
+		if (!is_qcow2(paths[i])) {
+			snprintf(why, sizeof why, "%s is not a qcow2, the format a snapshot is kept in: "
+			         "`qemu-img convert -O qcow2` makes one", paths[i]);
+			wrong = why;
+		}
+	if (wrong != NULL) {
+		fprintf(stderr, "%s: %s\n", file, wrong);
+		return 125;
+	}
+	if (strcmp(verb, "ls") == 0) {
+		/* The names every disk holds, in the first one's order, with its
+		 * date: a name one disk lacks is no snapshot of the machine. */
+		if (snapshot_table(paths[0], table, sizeof table) != 0) {
+			fprintf(stderr, "hull: snapshot: %s: %s\n", paths[0], table);
+			return 1;
+		}
+		for (const char *line = table; *line != '\0';) {
+			const char *end = strchr(line, '\n');
+			size_t      n = end != NULL ? (size_t)(end - line) : strlen(line);
+			char        id[32];
+			char        tag[128];
+			int         everywhere = 1;
+			char        row[512];
+
+			snprintf(row, sizeof row, "%.*s", (int)(n < sizeof row ? n : sizeof row - 1u), line);
+			line += n + (end != NULL);
+			if (sscanf(row, "%31s %127s", id, tag) != 2 || !isdigit((unsigned char)id[0]) ||
+			    !snapshot_in(table, tag, when, sizeof when))
+				continue;
+			for (unsigned i = 1u; i < count && everywhere; i++) {
+				static char other[16384];
+
+				everywhere = snapshot_table(paths[i], other, sizeof other) == 0 &&
+				             snapshot_in(other, tag, row, sizeof row);
+			}
+			if (everywhere)
+				printf("%s\t%s\n", tag, when);
+		}
+		return 0;
+	}
+	/* Each disk looked at first: restore and delete need the name on all
+	 * of them, take on none. */
+	for (unsigned i = 0u; i < count; i++) {
+		int held;
+
+		if (snapshot_table(paths[i], table, sizeof table) != 0) {
+			table[strcspn(table, "\n")] = '\0';
+			fprintf(stderr, "hull: snapshot: %s: %s\n", paths[i], table);
+			return 1;
+		}
+		held = snapshot_in(table, name, when, sizeof when);
+		if (strcmp(verb, "take") == 0 && held) {
+			fprintf(stderr, "hull: snapshot: the machine has a snapshot %s already\n", name);
+			return 1;
+		}
+		if (strcmp(verb, "take") != 0 && !held) {
+			fprintf(stderr, "hull: snapshot: %s holds no snapshot %s\n", paths[i], name);
+			return 1;
+		}
+	}
+	if (strcmp(verb, "take") == 0) {
+		unsigned made = 0u;
+
+		while (made < count && snapshot_verb("-c", name, paths[made], why, sizeof why) == 0)
+			made++;
+		if (made == count)
+			status = 0;
+		else
+			while (made-- > 0u)
+				snapshot_verb("-d", name, paths[made], when, sizeof when);
+	} else {
+		const char *flag = strcmp(verb, "restore") == 0 ? "-a" : "-d";
+		unsigned    done = 0u;
+
+		while (done < count && snapshot_verb(flag, name, paths[done], why, sizeof why) == 0)
+			done++;
+		status = done == count ? 0 : 1;
+		/* A disk past the first that failed leaves the machine's disks
+		 * at two points: said, naming the ones done. */
+		if (status != 0 && done > 0u)
+			fprintf(stderr, "hull: snapshot: %u of %u disks %s before the failure\n", done,
+			        count, strcmp(verb, "restore") == 0 ? "restored" : "lost it");
+	}
+	if (status != 0) {
+		fprintf(stderr, "hull: snapshot: %s\n", why);
+		return 1;
+	}
+	return 0;
 }
 
 /* `hull disk write FILE TARGET` (section 3.13): the file's (disk ...) to
@@ -9471,6 +9716,12 @@ int main(int argc, char **argv)
 	if (strcmp(command, "manifest") == 0 && (argc == 3 || argc == 4) &&
 	    strcmp(argv[2], "compile") == 0)
 		return compile_manifest(argc == 4 ? argv[3] : NULL);
+	if (strcmp(command, "snapshot") == 0 && argc == 4 && strcmp(argv[2], "ls") == 0)
+		return snapshot("ls", argv[3], NULL);
+	if (strcmp(command, "snapshot") == 0 && argc == 5 &&
+	    (strcmp(argv[2], "take") == 0 || strcmp(argv[2], "restore") == 0 ||
+	     strcmp(argv[2], "delete") == 0))
+		return snapshot(argv[2], argv[3], argv[4]);
 	if (strcmp(command, "board") == 0 && argc == 4 && strcmp(argv[2], "ls") == 0)
 		return board_list(argv[3]);
 	if (strcmp(command, "board") == 0 && argc == 4 && strcmp(argv[2], "fix") == 0) {
