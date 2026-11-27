@@ -47,7 +47,8 @@ new_machine_dialog::new_machine_dialog(const QStringList &images, const QString 
 		source->setCurrentText(chosen);
 	backend = new QComboBox;
 	backend->addItem(QStringLiteral("default (ns)"), QString());
-	for (const char *word : { "ns", "vm", "emu", "pc", "dos", "chroot", "docker", "qemu" })
+	for (const char *word : { "ns", "vm", "emu", "pc", "dos", "chroot", "docker", "qemu",
+	                          "virtualbox" })
 		backend->addItem(QString::fromLatin1(word), QString::fromLatin1(word));
 	command = new QLineEdit;
 	command->setPlaceholderText(QStringLiteral("/bin/sh -c \"...\"  (no shell: words, quoted)"));
@@ -80,8 +81,8 @@ new_machine_dialog::new_machine_dialog(const QStringList &images, const QString 
 	disk->setRange(0, 4096);
 	disk->setSuffix(QStringLiteral(" GiB"));
 	disk->setSpecialValueText(QStringLiteral("none"));
-	disk->setToolTip(QStringLiteral("A new disk, ./disk.qcow2 in the folder, taking room only as "
-	                                "it is written"));
+	disk->setToolTip(QStringLiteral("A new disk in the folder, a qcow2 or for VirtualBox a "
+	                                "VDI, taking room only as it is written"));
 	problem = new QLabel;
 	problem->setWordWrap(true);
 
@@ -94,7 +95,7 @@ new_machine_dialog::new_machine_dialog(const QStringList &images, const QString 
 	form->addRow(QStringLiteral("New &disk:"), disk);
 	/* A pc's two rows, shown for a pc alone; its source then unused. */
 	auto pc_rows = [this, form]() {
-		const bool pc = backend->currentData().toString() == QStringLiteral("pc");
+		const bool pc = is_pc_backend(backend->currentData().toString());
 
 		form->setRowVisible(installer, pc);
 		form->setRowVisible(disk, pc);
@@ -144,7 +145,7 @@ void new_machine_dialog::accept()
 	machine.display = screen->currentData().toString();
 	machine.gpu = gpu->currentData().toString();
 	machine.sound = sound->isChecked();
-	if (machine.backend == QStringLiteral("pc")) {
+	if (is_pc_backend(machine.backend)) {
 		machine.installer = installer->text().trimmed();
 		machine.disk_gigabytes = disk->value();
 		if (!machine.installer.isEmpty())
@@ -173,7 +174,7 @@ void new_machine_dialog::accept()
 	}
 	/* The new disk first, so a file is written only naming one there;
 	 * never over a disk that is. */
-	const QString disk_path = dir + QStringLiteral("/disk.qcow2");
+	const QString disk_path = dir + QLatin1Char('/') + new_disk_name(machine.backend);
 
 	if (machine.disk_gigabytes > 0) {
 		QProcess create;
@@ -186,7 +187,7 @@ void new_machine_dialog::accept()
 		create.setStandardInputFile(QProcess::nullDevice());
 		create.start(QStringLiteral("qemu-img"),
 		             { QStringLiteral("create"), QStringLiteral("-q"), QStringLiteral("-f"),
-		               QStringLiteral("qcow2"), disk_path,
+		               new_disk_name(machine.backend).section(QLatin1Char('.'), 1), disk_path,
 		               QStringLiteral("%1G").arg(machine.disk_gigabytes) });
 		if (!create.waitForFinished(60000) || create.exitStatus() != QProcess::NormalExit ||
 		    create.exitCode() != 0) {

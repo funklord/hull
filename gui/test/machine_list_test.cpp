@@ -189,8 +189,21 @@ int main(int argc, char **argv)
 			check(said.contains(QString::fromLatin1(entry)), entry, said);
 		m.backend = QStringLiteral("vm");
 		QString why;
-		check(spec_text(m, &why).isEmpty() && why.contains(QStringLiteral("pc's")),
+		check(spec_text(m, &why).isEmpty() && why.contains(QStringLiteral("PC's")),
 		      "an installer on a vm refused", why);
+		/* VirtualBox's PC: a VDI, which it opens where a qcow2 it cannot,
+		 * planned as virtualbox-pc's. */
+		QProcess::execute(QStringLiteral("qemu-img"),
+		                  { QStringLiteral("create"), QStringLiteral("-q"), QStringLiteral("-f"),
+		                    QStringLiteral("vdi"), dir + QStringLiteral("/disk.vdi"),
+		                    QStringLiteral("1G") });
+		m.backend = QStringLiteral("virtualbox");
+		const QString vbox = written(dir, m, &code, hull);
+
+		check(code == 0 && vbox.contains(QStringLiteral("machine on virtualbox-pc (pc): ok")),
+		      "a written VirtualBox PC plans as virtualbox-pc's", vbox);
+		check(vbox.contains(QStringLiteral("(medium (type disk) (source \"image:./disk.vdi\"))")),
+		      "its new disk a VDI", vbox);
 	}
 
 	/* What the writer refuses, each with a reason. */

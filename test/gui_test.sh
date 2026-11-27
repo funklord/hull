@@ -270,6 +270,15 @@ if command -v qemu-img > /dev/null; then
 		"New wrote a pc of a new disk"
 	has "$(qemu-img info "$dir/home/hull/gui-npc/disk.qcow2" 2>&1)" '^virtual size: 32 GiB' \
 		"and made the disk"
+	# And on VirtualBox, the backend moved to virtualbox, the ninth below
+	# the default: its disk a VDI, which VirtualBox opens where a qcow2 it
+	# cannot.
+	keys "$dir/newm" "b'\\x0e'" "b'gui-nvb'" "b'\\t\\t\\t'" "b'\\x1b[B'" "b'\\x1b[B'" "b'\\x1b[B'" \
+		"b'\\x1b[B'" "b'\\x1b[B'" "b'\\x1b[B'" "b'\\x1b[B'" "b'\\x1b[B'" "b'\\x1b[B'" "b'\\r'"
+	has "$(cat "$dir/home/hull/gui-nvb/hull.conf" 2>&1)" '^  \(backend virtualbox\)$' \
+		"New wrote a VirtualBox PC"
+	has "$(qemu-img info "$dir/home/hull/gui-nvb/disk.vdi" 2>&1)" '^file format: vdi' \
+		"and made its disk a VDI"
 fi
 
 # Images: one of two refs removed through Store > Images: the menu opened,

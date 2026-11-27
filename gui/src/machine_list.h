@@ -120,4 +120,12 @@ struct new_machine {
  */
 QString spec_text(const new_machine &machine, QString *why);
 
+/* A PC's backend, whose machine New makes of its own media: pc, qemu's,
+ * or virtualbox, VirtualBox's (virtualbox-pc). */
+bool is_pc_backend(const QString &backend);
+
+/* The new disk New makes for `backend`'s PC, beside its file: a qcow2,
+ * or for VirtualBox, which cannot open qemu's, a VDI. */
+QString new_disk_name(const QString &backend);
+
 #endif

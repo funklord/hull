@@ -372,6 +372,17 @@ static QString quoted(const QString &text, bool *ok)
 	return out + QLatin1Char('"');
 }
 
+bool is_pc_backend(const QString &backend)
+{
+	return backend == QStringLiteral("pc") || backend == QStringLiteral("virtualbox");
+}
+
+QString new_disk_name(const QString &backend)
+{
+	return backend == QStringLiteral("virtualbox") ? QStringLiteral("disk.vdi")
+	                                               : QStringLiteral("disk.qcow2");
+}
+
 QString spec_text(const new_machine &machine, QString *why)
 {
 	static const QRegularExpression word(QStringLiteral("^[a-z][a-z0-9-]*$"));
@@ -379,11 +390,12 @@ QString spec_text(const new_machine &machine, QString *why)
 	bool    ok = true;
 	QString text = QStringLiteral("(machine\n");
 
-	const bool own_media = machine.backend == QStringLiteral("pc") &&
+	const bool own_media = is_pc_backend(machine.backend) &&
 	                       (!machine.installer.isEmpty() || machine.disk_gigabytes > 0);
 
 	if ((!machine.installer.isEmpty() || machine.disk_gigabytes > 0) && !own_media) {
-		*why = QStringLiteral("an installer disc and a new disk are a pc's: choose the pc backend");
+		*why = QStringLiteral("an installer disc and a new disk are a PC's: choose the pc or the "
+		                      "virtualbox backend");
 		return QString();
 	}
 	if (machine.source.isEmpty() && !own_media) {
@@ -445,14 +457,16 @@ QString spec_text(const new_machine &machine, QString *why)
 		QString media;
 
 		if (machine.disk_gigabytes > 0)
-			media += QStringLiteral("\n    (medium (type disk) (source \"image:./disk.qcow2\"))");
+			media += QStringLiteral("\n    (medium (type disk) (source \"image:./%1\"))")
+			             .arg(new_disk_name(machine.backend));
 		if (!machine.installer.isEmpty())
 			media += QStringLiteral("\n    (medium (type cdrom) (source %1))")
 			             .arg(quoted(QStringLiteral("image:") + machine.installer, &ok));
 		text += QStringLiteral("  (network nat)\n  (media%1)\n").arg(media);
 	}
-	/* One (tuning ...): a pc's keys are its own, a vm's qemu's. */
-	if (machine.backend == QStringLiteral("pc")) {
+	/* One (tuning ...): a PC's keys are its own, VirtualBox's PC's too, a
+	 * vm's qemu's. */
+	if (is_pc_backend(machine.backend)) {
 		QString pc;
 
 		if (machine.sound)
