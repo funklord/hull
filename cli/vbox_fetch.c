@@ -25,6 +25,23 @@
 #include "vbox.h"
 #include "vbox_fetch.h"
 
+/* The Guest Additions' disc, fetched once beside the package and held to
+ * its sha256, a guest's drivers: 0, or -1 with `why`. */
+static int additions(char *why, size_t cap)
+{
+	char iso[4200];
+
+	if (hull_vbox_additions(iso, sizeof iso) != 0) {
+		snprintf(why, cap, "neither XDG_CACHE_HOME nor HOME names a place for VirtualBox");
+		return -1;
+	}
+	if (access(iso, R_OK) == 0)
+		return 0;
+	fprintf(stderr, "hull: fetching VirtualBox's Guest Additions %s, about 60 MB\n",
+	        HULL_VBOX_VERSION);
+	return hull_fetch_file(HULL_VBOX_ADDITIONS_URL, HULL_VBOX_ADDITIONS_SHA256, iso, why, cap);
+}
+
 int hull_vbox_fetch(char *why, size_t cap)
 {
 	char         dir[4096];
@@ -41,6 +58,8 @@ int hull_vbox_fetch(char *why, size_t cap)
 	}
 	snprintf(made, sizeof made, "%s/%s", dir, HULL_VBOX_HEADLESS);
 	if (access(made, R_OK) == 0) {
+		if (additions(why, cap) != 0)
+			return -1;
 		printf("%s\n", dir);
 		return 0;
 	}
@@ -98,6 +117,8 @@ int hull_vbox_fetch(char *why, size_t cap)
 		snprintf(why, cap, "%s: %s", dir, strerror(errno));
 		goto done;
 	}
+	if (additions(why, cap) != 0)
+		goto done;
 	printf("%s\n", dir);
 	status = 0;
 done:

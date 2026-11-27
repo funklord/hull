@@ -22,6 +22,14 @@
 /* What a fetch made is whole once this is there. */
 #define HULL_VBOX_HEADLESS "usr/lib/virtualbox/VBoxHeadless"
 
+/* VirtualBox's Guest Additions for its guests, a Windows guest's drivers
+ * -- VMSVGA's WDDM driver with its 3D among them -- on a disc, pinned as
+ * the package is (VirtualBox's SHA256SUMS for the version). */
+#define HULL_VBOX_ADDITIONS_URL \
+	"https://download.virtualbox.org/virtualbox/" HULL_VBOX_VERSION "/VBoxGuestAdditions_" \
+	HULL_VBOX_VERSION ".iso"
+#define HULL_VBOX_ADDITIONS_SHA256 "fa720e81f9e8f779de46f7bd62dfaeb9cfb54867008f54ee232dafa34840ca72"
+
 /* Where it is kept, $XDG_CACHE_HOME/hull/virtualbox-VERSION, into `out`. */
 static inline int hull_vbox_dir(char *out, size_t cap)
 {
@@ -35,6 +43,17 @@ static inline int hull_vbox_dir(char *out, size_t cap)
 	else
 		return -1;
 	return 0;
+}
+
+/* The Guest Additions' disc, beside it as virtualbox-VERSION-additions.iso,
+ * into `out`. */
+static inline int hull_vbox_additions(char *out, size_t cap)
+{
+	char dir[3900];
+
+	if (hull_vbox_dir(dir, sizeof dir) != 0)
+		return -1;
+	return snprintf(out, cap, "%s-additions.iso", dir) < (int)cap ? 0 : -1;
 }
 
 /* A machine's work, its disks and the outer vm's runtime directory, on
