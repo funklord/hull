@@ -64,7 +64,7 @@ settings_dialog::settings_dialog(const QString &file_path, bool pc, QWidget *par
 		    { QStringLiteral("tuning"), QStringLiteral("pc"), QStringLiteral("nic") },
 		    { QStringLiteral("e1000"), QStringLiteral("e1000e"), QStringLiteral("rtl8139"),
 		      QStringLiteral("pcnet"), QStringLiteral("ne2k_pci"), QStringLiteral("ne2k_isa"),
-		      QStringLiteral("virtio") },
+		      QStringLiteral("virtio"), QStringLiteral("vmxnet3") },
 		    false, false);
 		add(QStringLiteral("S&ound:"),
 		    { QStringLiteral("tuning"), QStringLiteral("pc"), QStringLiteral("sound") },
