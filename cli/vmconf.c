@@ -288,6 +288,8 @@ static void read_vmx(machine *m, char *text)
 			strcpy(m->nic, "e1000e");
 		else if (strcasecmp(value, "vlance") == 0)
 			strcpy(m->nic, "pcnet");
+		else if (strcasecmp(value, "vmxnet3") == 0)
+			strcpy(m->nic, "vmxnet3");
 		else {
 			char said[160];
 
@@ -763,6 +765,8 @@ static void ovf_hardware(machine *m, const ovf_item *item, const ovf_item *contr
 			strcpy(m->nic, "e1000e");
 		else if (strcasecmp(item->subtype, "virtio") == 0)
 			strcpy(m->nic, "virtio");
+		else if (strcasecmp(item->subtype, "VmxNet3") == 0)
+			strcpy(m->nic, "vmxnet3");
 		else {
 			strcpy(m->nic, "e1000");
 			if (item->subtype[0] != '\0' && strcasecmp(item->subtype, "E1000") != 0) {

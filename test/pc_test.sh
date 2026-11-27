@@ -166,15 +166,18 @@ before=$(sha256sum < "$root/vmware/old-flat.vmdk")
 out=$("$hull" plan --resolved -f "$root/vmware/Old Box.vmx" 2>&1)
 says 'a .vmx is a pc machine of its name' "$out" '(hostname "old-box") (source "media:disk") (memory "256M") (cpus 2) (network nat)'
 says 'its disk where it was' "$out" '(medium (type disk) (source "image:./old.vmdk"))'
-says 'a machine of SATA is a q35' "$out" '(tuning (pc (machine q35) (cpu max) (nic e1000)))'
-says 'a card qemu lacks said' "$out" 'ethernet0, vmxnet3, is given as an e1000'
+says 'a machine of SATA is a q35' "$out" '(tuning (pc (machine q35) (cpu max) (nic vmxnet3)))'
+sed 's/"vmxnet3"/"vmxnet"/' "$root/vmware/Old Box.vmx" > "$root/vmware/vmxnet.vmx"
+says 'a card qemu lacks said' "$("$hull" plan --resolved -f "$root/vmware/vmxnet.vmx" 2>&1)" \
+	'ethernet0, vmxnet, is given as an e1000'
+rm -f "$root/vmware/vmxnet.vmx"
 says 'a host drive said' "$out" "sata0:1, the host's own drive, is not given"
 # Its sound and USB: VMware's default ES1371 is qemu's ES1370, and USB a
 # tablet.
 { cat "$root/vmware/Old Box.vmx"; printf 'sound.present = "TRUE"\nusb.present = "TRUE"\n'; } \
 	> "$root/vmware/sound.vmx"
 out=$("$hull" plan --resolved -f "$root/vmware/sound.vmx" 2>&1)
-says "VMware's sound card and a tablet for its USB" "$out" '(nic e1000) (sound es1370) (pointer tablet)))'
+says "VMware's sound card and a tablet for its USB" "$out" '(nic vmxnet3) (sound es1370) (pointer tablet)))'
 out=$(timeout 120 "$hull" run -f "$root/vmware/Old Box.vmx" 2>&1)
 got=$?
 status 'a .vmx boots' "$got" 0 "$out"
@@ -506,6 +509,9 @@ ovf box.ovf /disk/vmdisk1 5 ''
 out=$("$hull" plan --resolved -f "$root/ovf/box.ovf" 2>&1)
 says 'an .ovf is a pc machine of its name' "$out" '(hostname "exported-box") (source "media:disk") (memory "192M") (cpus 2) (network nat)'
 says 'its disk by its file' "$out" '(medium (type disk) (source "image:./box-disk001.vmdk"))'
+sed 's/>E1000</>VmxNet3</' "$root/ovf/box.ovf" > "$root/ovf/vmxnet3.ovf"
+says "VMware's vmxnet3 kept" "$("$hull" plan --resolved -f "$root/ovf/vmxnet3.ovf" 2>&1)" '(nic vmxnet3)'
+rm -f "$root/ovf/vmxnet3.ovf"
 says 'on IDE, an i440FX' "$out" '(tuning (pc (machine pc) (cpu max) (nic e1000)))'
 (cd "$root/ovf" && tar -cf box.ova box.ovf box-disk001.vmdk)
 out=$(timeout 120 "$hull" run -f "$root/ovf/box.ova" 2>&1)
