@@ -1416,6 +1416,9 @@ void main_window::start()
 	QTimer::singleShot(500, this, [this]() { refresh(); });
 }
 
+/* How long a stop may wait on its guest before the window says so. */
+static const int stop_patience_ms = 3000;
+
 void main_window::stop()
 {
 	const int i = current();
@@ -1424,11 +1427,36 @@ void main_window::stop()
 		return;
 	const QString id = rows[i].id;
 	/* -1: the machine's own grace, as `hull stop` without --timeout. */
-	core_request *request =
+	QPointer<core_request> request =
 	    core_request::send(this, "(4:stop", id, QByteArray("(10:timeout_ms2:-1)"), 0);
-
+	/* Stop is the guest's to act on -- a PC's power button, a workload's
+	 * TERM -- and its grace can be minutes, so a stop still waiting after
+	 * a moment says so, and offers Power Off, which does not wait; the
+	 * question goes when the machine does. */
 	say(QStringLiteral("stopping %1").arg(id));
-	connect(request, &core_request::finished, this,
+	QTimer::singleShot(stop_patience_ms, this, [this, id, request]() {
+		if (request.isNull())
+			return;
+		QMessageBox *box = new QMessageBox(QMessageBox::Question, QStringLiteral("Stop"),
+		                                   QStringLiteral("%1 is still stopping: its guest has "
+		                                                  "not acted on it yet, and is given "
+		                                                  "until its grace runs out. Power it "
+		                                                  "off now?").arg(id),
+		                                   QMessageBox::NoButton, this);
+		QPushButton *off = box->addButton(QStringLiteral("Power Off"), QMessageBox::DestructiveRole);
+
+		box->addButton(QStringLiteral("Keep Waiting"), QMessageBox::RejectRole);
+		box->setAttribute(Qt::WA_DeleteOnClose);
+		box->setDefaultButton(off);
+		say(QStringLiteral("%1: waiting for its guest to stop").arg(id));
+		connect(box, &QMessageBox::buttonClicked, this, [this, id, off](QAbstractButton *button) {
+			if (button == off)
+				power_off(id);
+		});
+		connect(request.data(), &QObject::destroyed, box, &QWidget::close);
+		box->open();
+	});
+	connect(request.data(), &core_request::finished, this,
 	        [this, id](core_request::outcome how, const QString &reason) {
 		        say(how == core_request::done ? QStringLiteral("%1 stopped").arg(id)
 		                                      : QStringLiteral("%1: %2").arg(id, reason));
@@ -1442,7 +1470,12 @@ void main_window::kill_machine()
 
 	if (i < 0 || i >= rows.size() || !rows[i].is_held)
 		return;
-	const QString id = rows[i].id;
+	power_off(rows[i].id);
+}
+
+/* KILL, the plug pulled: the workload, or a PC's emulator, at once. */
+void main_window::power_off(const QString &id)
+{
 	core_request *request =
 	    core_request::send(this, "(4:kill", id, QByteArray("(6:signal4:KILL)"), 10000);
 

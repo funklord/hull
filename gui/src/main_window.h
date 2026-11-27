@@ -88,6 +88,7 @@ private:
 	void edit_settings();
 	void remove_machine();
 	void clone_machine();
+	void power_off(const QString &id);
 	void export_appliance();
 	void ask_add();
 	void ask_import();

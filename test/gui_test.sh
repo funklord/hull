@@ -377,7 +377,7 @@ if command -v qemu-system-i386 > /dev/null 2>&1; then
 		printf '\353\376' | dd of="$dir/$img" conv=notrunc status=none
 		printf '\125\252' | dd of="$dir/$img" bs=1 seek=510 conv=notrunc status=none
 	done
-	printf '%s\n' '(machine (hostname "gui-pc") (backend pc) (source "media:floppy")' \
+	printf '%s\n' '(machine (hostname "gui-pc") (backend pc) (source "media:floppy") (stop_grace "60s")' \
 		'  (media (medium (type floppy) (source "image:./spin.img"))))' > "$dir/pc.conf"
 	(cd "$dir" && exec timeout 120 "$hull" run -f pc.conf > "$dir/pc.out" 2>&1) &
 	run_pid=$!
@@ -399,7 +399,15 @@ if command -v qemu-system-i386 > /dev/null 2>&1; then
 	cases=$((cases + 1))
 	[ "$(od -An -tx1 -N4 "$dir/gui-pc-screen.png" 2>/dev/null | tr -d ' ')" = 89504e47 ] ||
 		fail "F12's screenshot is not a PNG"
-	timeout 30 "$hull" stop gui-pc > /dev/null 2>&1
+	# Stop (Ctrl+T) on a guest spinning in its boot sector, which never
+	# acts on the power button: after a moment the window says it is
+	# still stopping and offers Power Off, which Enter takes -- the
+	# machine stopped well inside its minute's grace, which only Power Off
+	# could do.
+	keys "$dir" "b'gui-pc'" "b'\\x14'" "b''" "b'\\r'" -- pc.conf
+	has "$out" 'gui-pc is still stopping' "Stop says it waits on the guest"
+	has "$out" 'gui-pc +(stopped|exited) +qemu-pc' "and Power Off, offered, ends it"
+	timeout 70 "$hull" stop gui-pc > /dev/null 2>&1
 	wait "$run_pid" 2>/dev/null
 	run_pid=
 else
