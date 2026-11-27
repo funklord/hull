@@ -7296,6 +7296,17 @@ static int snapshot(const char *verb, const char *file, const char *name)
 		fprintf(stderr, "hull: snapshot: %s\n", why);
 		return 1;
 	}
+	/* A saved state beside the snapshot restored would undo it at the
+	 * next start, -loadvm putting its own disks back: discarded, as
+	 * VirtualBox's restore discards a saved state. */
+	if (strcmp(verb, "restore") == 0 && strcmp(name, "hull-saved") != 0 &&
+	    snapshot_table(paths[0], table, sizeof table) == 0 &&
+	    snapshot_in(table, "hull-saved", when, sizeof when)) {
+		for (unsigned i = 0u; i < count; i++)
+			snapshot_verb("-d", "hull-saved", paths[i], why, sizeof why);
+		fprintf(stderr, "hull: snapshot: its saved state is discarded, the machine now as %s "
+		        "had it\n", name);
+	}
 	/* One taken of a running machine holds its memory, which only the
 	 * running machine takes back: on a stopped one the disks are as they
 	 * were mid-run, as after a power cut. */

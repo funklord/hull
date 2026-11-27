@@ -423,6 +423,20 @@ out=$("$hull" export --bootable -f "$root/hull.conf" "$root/saved.ova" 2>&1)
 got=$?
 status 'a saved machine exported is refused' "$got" 125 "$out"
 says 'naming the way to discard its state' "$out" 'hull-saved`, and export it then'
+# A snapshot restored on the saved machine discards the saved state,
+# which would otherwise put its own disk back at the next start.
+"$hull" snapshot take "$root/hull.conf" before-save > /dev/null 2>&1 ||
+	fail 'a snapshot beside a saved state taken' ''
+out=$("$hull" snapshot restore "$root/hull.conf" before-save 2>&1)
+says 'a restore discards the saved state' "$out" 'its saved state is discarded'
+cases=$((cases + 1))
+! "$hull" snapshot ls "$root/hull.conf" 2>&1 | grep -q '^hull-saved' ||
+	fail 'and it is gone' "$("$hull" snapshot ls "$root/hull.conf" 2>&1)"
+"$hull" snapshot delete "$root/hull.conf" before-save > /dev/null 2>&1
+# Saved again, for the resume below.
+live
+"$hull" stop --save pc-live > /dev/null 2>&1
+wait "$spin_pid"
 live
 cases=$((cases + 1))
 tries=0
