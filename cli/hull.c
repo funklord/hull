@@ -6794,6 +6794,10 @@ static const char *pc_disks(const char *file, hull_spec *spec, const hull_sexpr_
  * firmware in the OVF; its discs and floppies left out, as VirtualBox
  * leaves them unless asked, said on stderr. A board, a PowerPC Mac and
  * anything else that is not a PC are refused: an OVF describes a PC. */
+static int is_qcow2(const char *path);
+static int snapshot_table(const char *path, char *out, size_t cap);
+static int snapshot_held(const char *table, const char *name, char *when, size_t cap, int *memory);
+
 static int export_pc(const char *file, hull_spec *spec, const hull_sexpr_form *machine,
                      const char *name, const char *ova)
 {
@@ -6837,6 +6841,22 @@ static int export_pc(const char *file, hull_spec *spec, const hull_sexpr_form *m
 	if ((wrong = pc_disks(file, spec, machine, paths, &count, &left)) != NULL) {
 		fprintf(stderr, "%s: %s\n", file, wrong);
 		return 125;
+	}
+	/* A saved machine's disk is as it was mid-run, which a machine made
+	 * of the appliance would boot as after a power cut: refused, as
+	 * VirtualBox exports a machine powered off. */
+	if (count > 0u && is_qcow2(paths[0])) {
+		static char table[16384];
+		char        when[96];
+		int         memory = 0;
+
+		if (snapshot_table(paths[0], table, sizeof table) == 0 &&
+		    snapshot_held(table, "hull-saved", when, sizeof when, &memory) && memory) {
+			fprintf(stderr, "%s: the machine's state is saved, its disk as it was mid-run: "
+			        "start it and stop it, or discard the state with `hull snapshot delete "
+			        "%s hull-saved`, and export it then\n", file, file);
+			return 125;
+		}
 	}
 	for (unsigned i = 0u; i < count; i++)
 		disks[i] = paths[i];

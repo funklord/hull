@@ -419,6 +419,10 @@ got=$?
 status 'a running machine saved' "$got" 0 "$out"
 wait "$spin_pid"
 says 'its state kept' "$(qemu-img snapshot -l "$root/spin.qcow2" 2>&1)" 'hull-saved'
+out=$("$hull" export --bootable -f "$root/hull.conf" "$root/saved.ova" 2>&1)
+got=$?
+status 'a saved machine exported is refused' "$got" 125 "$out"
+says 'naming the way to discard its state' "$out" 'hull-saved`, and export it then'
 live
 cases=$((cases + 1))
 tries=0
