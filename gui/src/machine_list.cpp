@@ -379,7 +379,14 @@ QString spec_text(const new_machine &machine, QString *why)
 	bool    ok = true;
 	QString text = QStringLiteral("(machine\n");
 
-	if (machine.source.isEmpty()) {
+	const bool own_media = machine.backend == QStringLiteral("pc") &&
+	                       (!machine.installer.isEmpty() || machine.disk_gigabytes > 0);
+
+	if ((!machine.installer.isEmpty() || machine.disk_gigabytes > 0) && !own_media) {
+		*why = QStringLiteral("an installer disc and a new disk are a pc's: choose the pc backend");
+		return QString();
+	}
+	if (machine.source.isEmpty() && !own_media) {
 		*why = QStringLiteral("a machine needs a source");
 		return QString();
 	}
@@ -407,7 +414,16 @@ QString spec_text(const new_machine &machine, QString *why)
 		text += QStringLiteral("  (hostname %1)\n").arg(quoted(machine.hostname, &ok));
 	if (!machine.backend.isEmpty())
 		text += QStringLiteral("  (backend %1)\n").arg(machine.backend);
-	text += QStringLiteral("  (source %1)\n").arg(quoted(machine.source, &ok));
+	/* A PC of its own media boots its installer while there is one, and
+	 * keeps what is installed, as VirtualBox's machine does: Settings'
+	 * Boot from moves it to the disk after. */
+	if (own_media) {
+		text += QStringLiteral("  (source \"media:%1\")\n")
+		            .arg(machine.installer.isEmpty() ? QStringLiteral("disk") : QStringLiteral("cdrom"));
+		text += QStringLiteral("  (mutable direct)\n");
+	} else {
+		text += QStringLiteral("  (source %1)\n").arg(quoted(machine.source, &ok));
+	}
 	if (machine.overlay)
 		text += QStringLiteral("  (mutable overlay)\n");
 	if (!machine.command.isEmpty()) {
@@ -425,6 +441,16 @@ QString spec_text(const new_machine &machine, QString *why)
 		text += QStringLiteral("  (ssh true)\n");
 	if (!machine.display.isEmpty())
 		text += QStringLiteral("  (display %1)\n").arg(machine.display);
+	if (own_media) {
+		QString media;
+
+		if (machine.disk_gigabytes > 0)
+			media += QStringLiteral("\n    (medium (type disk) (source \"image:./disk.qcow2\"))");
+		if (!machine.installer.isEmpty())
+			media += QStringLiteral("\n    (medium (type cdrom) (source %1))")
+			             .arg(quoted(QStringLiteral("image:") + machine.installer, &ok));
+		text += QStringLiteral("  (network nat)\n  (media%1)\n").arg(media);
+	}
 	/* One (tuning ...): a pc's keys are its own, a vm's qemu's. */
 	if (machine.backend == QStringLiteral("pc")) {
 		QString pc;

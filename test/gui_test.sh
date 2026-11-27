@@ -171,7 +171,7 @@ mkdir -p "$dir/settings/config"
 truncate -s 1M "$dir/settings/a.img" "$dir/settings/b.iso"
 ln -sf settings/a.img "$dir/a.img"
 ln -sf settings/b.iso "$dir/b.iso"
-keys "$dir" "b'\\x1bOR'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
+keys "$dir" "b'\\x1bOR'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
 	"b'\\t'" "b'\\t'" "b' '" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
 	"b' '" -- "$dir/settings.conf"
 has "$(cat "$dir/settings.conf")" '^  \(media \(medium \(type cdrom\) \(source "image:\./b\.iso"\)\)\)\)$' \
@@ -185,6 +185,11 @@ mkdir -p "$dir/settings/config"
 keys "$dir" "b'\\x1bOR'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
 	"b'\\x1b[B'" "b'\\x1b[B'" "b'\\r'" -- "$dir/settings.conf"
 has "$(cat "$dir/settings.conf")" '\(tuning \(pc \(firmware uefi\)\)\)' "Settings set a PC's firmware"
+# Boot from, VirtualBox's Boot Order, the eleventh Tab: the installer's
+# disc chosen with Down, written as the machine's source.
+keys "$dir" "b'\\x1bOR'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
+	"b'\\t'" "b'\\t'" "b'\\t'" "b'\\x1b[B'" "b'\\r'" -- "$dir/settings.conf"
+has "$(cat "$dir/settings.conf")" '\(source "media:cdrom"\)' "Settings set what a PC boots from"
 # Every class's ports and shared folders: on a chroot machine the port's
 # Remove is the sixth Tab from Memory, the folder kept.
 printf '(machine (hostname "gui-ports") (source "dir:./rootfs")\n  (ports (port (host 8080) (guest 80)))\n  (volumes (volume (host "./rootfs") (guest "/data") (mode ro))))\n' \
@@ -241,6 +246,17 @@ if ! grep -q '(command "/probe" "say" "made-by-new")' "$dir/home/hull/gui-n/hull
 	fail "New wrote no such command in ~/hull/gui-n" "$(ls -R "$dir/home" "$dir/newm" 2>&1)"
 fi
 has "$out" 'gui-n' "New's machine listed"
+# New for a pc, as VirtualBox's New: the backend moved down to pc, which
+# offers a new disk of 32 GiB and a screen here; Enter makes the disk
+# beside the file it writes.
+if command -v qemu-img > /dev/null; then
+	keys "$dir/newm" "b'\\x0e'" "b'gui-npc'" "b'\\t\\t\\t'" "b'\\x1b[B'" "b'\\x1b[B'" "b'\\x1b[B'" \
+		"b'\\x1b[B'" "b'\\r'"
+	has "$(cat "$dir/home/hull/gui-npc/hull.conf" 2>&1)" '^    \(medium \(type disk\) \(source "image:\./disk\.qcow2"\)\)\)\)$' \
+		"New wrote a pc of a new disk"
+	has "$(qemu-img info "$dir/home/hull/gui-npc/disk.qcow2" 2>&1)" '^virtual size: 32 GiB' \
+		"and made the disk"
+fi
 
 # Images: one of two refs removed through Store > Images: the menu opened,
 # Down onto its item, Enter; Alt+R, which clicks Remove, and Enter for Yes.

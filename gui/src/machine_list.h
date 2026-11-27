@@ -104,6 +104,11 @@ struct new_machine {
 	QString     display;   /* "", window, vnc or local: (display ...) */
 	QString     gpu;       /* "", virgl or venus: (tuning (qemu (gpu ...))) */
 	bool        sound = false;  /* a pc's (sound hda), else qemu's (sound virtio) */
+	/* A pc as VirtualBox's New makes one: an installer disc it boots
+	 * from, and a new disk of this many GiB, ./disk.qcow2 beside its
+	 * file, which the caller makes. Either replaces `source`. */
+	QString     installer;
+	int         disk_gigabytes = 0;
 };
 
 /*

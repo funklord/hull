@@ -43,6 +43,8 @@ private:
 	QComboBox *screen;
 	QComboBox *gpu;
 	QCheckBox *sound;
+	QLineEdit *installer;
+	QSpinBox  *disk;
 	QLabel    *problem;
 	QString    file;
 };

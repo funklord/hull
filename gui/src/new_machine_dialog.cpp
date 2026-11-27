@@ -72,6 +72,16 @@ new_machine_dialog::new_machine_dialog(const QStringList &images, const QString 
 	sound = new QCheckBox(QStringLiteral("So&und, heard where the screen is shown here"));
 	gpu->setToolTip(QStringLiteral("The screen's 3D on a vm or a pc, the guest needing Mesa's driver; Venus needs "
 	                               "/dev/udmabuf open to the user"));
+	/* A pc as VirtualBox's New makes one: the disc to install from, and
+	 * a new disk to install on, both in place of a source. */
+	installer = new QLineEdit;
+	installer->setPlaceholderText(QStringLiteral("an installer's .iso, to boot from"));
+	disk = new QSpinBox;
+	disk->setRange(0, 4096);
+	disk->setSuffix(QStringLiteral(" GiB"));
+	disk->setSpecialValueText(QStringLiteral("none"));
+	disk->setToolTip(QStringLiteral("A new disk, ./disk.qcow2 in the folder, taking room only as "
+	                                "it is written"));
 	problem = new QLabel;
 	problem->setWordWrap(true);
 
@@ -80,6 +90,22 @@ new_machine_dialog::new_machine_dialog(const QStringList &images, const QString 
 	form->addRow(QStringLiteral("&Folder:"), folder);
 	form->addRow(QStringLiteral("S&ource:"), source);
 	form->addRow(QStringLiteral("&Backend:"), backend);
+	form->addRow(QStringLiteral("&Installer disc:"), installer);
+	form->addRow(QStringLiteral("New &disk:"), disk);
+	/* A pc's two rows, shown for a pc alone; its source then unused. */
+	auto pc_rows = [this, form]() {
+		const bool pc = backend->currentData().toString() == QStringLiteral("pc");
+
+		form->setRowVisible(installer, pc);
+		form->setRowVisible(disk, pc);
+		if (pc && disk->value() == 0 && installer->text().isEmpty())
+			disk->setValue(32);
+		/* An installer is watched: a PC is shown, here, unless told. */
+		if (pc && screen->currentData().toString().isEmpty())
+			screen->setCurrentIndex(screen->findData(QStringLiteral("local")));
+	};
+	connect(backend, &QComboBox::currentIndexChanged, this, pc_rows);
+	pc_rows();
 	form->addRow(QStringLiteral("&Command:"), command);
 	form->addRow(QStringLiteral("&Memory:"), memory);
 	form->addRow(QStringLiteral("C&PUs:"), cpus);
@@ -118,6 +144,16 @@ void new_machine_dialog::accept()
 	machine.display = screen->currentData().toString();
 	machine.gpu = gpu->currentData().toString();
 	machine.sound = sound->isChecked();
+	if (machine.backend == QStringLiteral("pc")) {
+		machine.installer = installer->text().trimmed();
+		machine.disk_gigabytes = disk->value();
+		if (!machine.installer.isEmpty())
+			machine.installer = QFileInfo(machine.installer).absoluteFilePath();
+		if (!machine.installer.isEmpty() && !QFileInfo(machine.installer).isFile()) {
+			problem->setText(QStringLiteral("%1: no such file").arg(machine.installer));
+			return;
+		}
+	}
 
 	const QString text = spec_text(machine, &why);
 
@@ -135,12 +171,40 @@ void new_machine_dialog::accept()
 		problem->setText(QStringLiteral("%1 could not be made").arg(dir));
 		return;
 	}
+	/* The new disk first, so a file is written only naming one there;
+	 * never over a disk that is. */
+	const QString disk_path = dir + QStringLiteral("/disk.qcow2");
+
+	if (machine.disk_gigabytes > 0) {
+		QProcess create;
+
+		if (QFileInfo::exists(disk_path)) {
+			problem->setText(QStringLiteral("%1 is there already").arg(disk_path));
+			return;
+		}
+		create.setProcessChannelMode(QProcess::MergedChannels);
+		create.setStandardInputFile(QProcess::nullDevice());
+		create.start(QStringLiteral("qemu-img"),
+		             { QStringLiteral("create"), QStringLiteral("-q"), QStringLiteral("-f"),
+		               QStringLiteral("qcow2"), disk_path,
+		               QStringLiteral("%1G").arg(machine.disk_gigabytes) });
+		if (!create.waitForFinished(60000) || create.exitStatus() != QProcess::NormalExit ||
+		    create.exitCode() != 0) {
+			problem->setText(QStringLiteral("qemu-img could not make %1: %2")
+			                     .arg(disk_path, create.errorString() + QLatin1Char(' ') +
+			                                         QString::fromUtf8(create.readAll()).trimmed()));
+			QFile::remove(disk_path);
+			return;
+		}
+	}
 	QFile out(path);
 
 	if (!out.open(QIODevice::WriteOnly | QIODevice::NewOnly) ||
 	    out.write(text.toUtf8()) != text.toUtf8().size() || !out.flush()) {
 		problem->setText(QStringLiteral("%1: %2").arg(path, out.errorString()));
 		out.remove();
+		if (machine.disk_gigabytes > 0)
+			QFile::remove(disk_path);
 		return;
 	}
 	out.close();

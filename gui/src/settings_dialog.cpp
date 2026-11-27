@@ -100,6 +100,16 @@ settings_dialog::settings_dialog(const QString &file_path, bool pc, QWidget *par
 			      QStringLiteral("virtio"), QStringLiteral("none") },
 			    false, false);
 		}
+		/* VirtualBox's Boot Order: which of its media the PC starts from,
+		 * the installer's disc or the disk it installed on. A source is
+		 * required, so it has no Default to fall back on. */
+		if (spec_value(text, { QStringLiteral("source") }).startsWith(QStringLiteral("\"media:"))) {
+			add(QStringLiteral("&Boot from:"), { QStringLiteral("source") },
+			    { QStringLiteral("media:disk"), QStringLiteral("media:cdrom"),
+			      QStringLiteral("media:floppy") },
+			    false, true);
+			fields.last().box->removeItem(0);
+		}
 
 		/* Its disks and discs, as VirtualBox's Storage page: each record
 		 * shown by its type and source, a new one added by its image. */

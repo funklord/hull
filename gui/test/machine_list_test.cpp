@@ -157,6 +157,42 @@ int main(int argc, char **argv)
 		      "a pc's 3D written as its own tuning", text + why);
 	}
 
+	/* A pc as New makes one, VirtualBox's way: an installer disc booted
+	 * from and a new disk, in place of a source, kept as installed;
+	 * planned by the real planner with both drives. */
+	{
+		new_machine m;
+		int         code = 0;
+		const QString dir = scratch + QStringLiteral("/newpc");
+
+		QDir().mkpath(dir);
+		QProcess::execute(QStringLiteral("qemu-img"),
+		                  { QStringLiteral("create"), QStringLiteral("-q"), QStringLiteral("-f"),
+		                    QStringLiteral("qcow2"), dir + QStringLiteral("/disk.qcow2"),
+		                    QStringLiteral("1G") });
+		{
+			QFile iso(dir + QStringLiteral("/setup \"1\".iso"));
+
+			iso.open(QIODevice::WriteOnly);
+			iso.resize(1 << 20);
+		}
+		m.hostname = QStringLiteral("newpc");
+		m.backend = QStringLiteral("pc");
+		m.installer = dir + QStringLiteral("/setup \"1\".iso");
+		m.disk_gigabytes = 1;
+		const QString said = written(dir, m, &code, hull);
+
+		check(code == 0, "a written pc of its own media plans", said);
+		for (const char *entry : { "(source \"media:cdrom\")", "(mutable direct)",
+		                           "(medium (type disk) (source \"image:./disk.qcow2\"))",
+		                           "(type cdrom)" })
+			check(said.contains(QString::fromLatin1(entry)), entry, said);
+		m.backend = QStringLiteral("vm");
+		QString why;
+		check(spec_text(m, &why).isEmpty() && why.contains(QStringLiteral("pc's")),
+		      "an installer on a vm refused", why);
+	}
+
 	/* What the writer refuses, each with a reason. */
 	{
 		new_machine m;
