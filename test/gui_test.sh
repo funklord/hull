@@ -494,6 +494,10 @@ if command -v qemu-system-x86_64 > /dev/null && command -v qemu-img > /dev/null;
 	has "$out" 'gui-live saved' "and said so"
 	timeout 30 "$hull" stop gui-live > /dev/null 2>&1
 	wait "$run_pid" 2>/dev/null
+	# Its row then saved, as VirtualBox lists a saved machine, until
+	# Start resumes it.
+	keys "$dir" "b''" -- live.conf
+	has "$out" 'gui-live +saved +' "a saved machine listed so"
 	run_pid=
 	rm -f "$dir/live.img" "$dir/live.qcow2" "$dir/live.conf" "$dir/live.out"
 fi

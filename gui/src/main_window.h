@@ -62,6 +62,7 @@ private:
 		QProcess     *run = nullptr;  /* `hull run` started here */
 		QByteArray    output;      /* what that run said */
 		QStringList   accepted;    /* --accept tokens agreed to here, this session */
+		bool          saved = false;  /* a pc whose disk holds Save State's hull-saved */
 	};
 
 	void build_actions();
@@ -71,6 +72,7 @@ private:
 	void show_details();
 	void show_output();
 	void plan_of(int index);
+	void saved_of(const QString &file);
 	int  current() const;
 	void start();
 	void stop();

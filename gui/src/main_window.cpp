@@ -421,7 +421,8 @@ void main_window::rebuild()
 	tree->clear();
 	for (int i = 0; i < rows.size(); i++) {
 		const row &r = rows[i];
-		QString    state = r.is_held ? r.held.state : QStringLiteral("stopped");
+		QString    state = r.is_held ? r.held.state :
+		                   r.saved ? QStringLiteral("saved") : QStringLiteral("stopped");
 		QString    backend;
 
 		if (r.is_held)
@@ -610,6 +611,8 @@ void main_window::plan_of(int index)
 				                                                    "exited %1)\n")
 				                                        .arg(code);
 				r.id = machine_id_of(r.added, hostname_in(resolved));
+				if (name.isEmpty() && resolved.contains(QStringLiteral("(backend pc)")))
+					saved_of(file);
 			}
 		rebuild();
 	});
@@ -621,6 +624,31 @@ void main_window::plan_of(int index)
 		rebuild();
 	});
 	plan->start(hull, arguments);
+}
+
+/* Whether a pc machine's file names a disk holding a saved state, as
+ * VirtualBox lists a machine Saved: `hull snapshot ls`'s hull-saved,
+ * which its next Start resumes. */
+void main_window::saved_of(const QString &file)
+{
+	QProcess *listing = new QProcess(this);
+
+	listing->setStandardInputFile(QProcess::nullDevice());
+	connect(listing, &QProcess::finished, this, [this, listing, file](int code) {
+		const bool saved = code == 0 &&
+		                   QString::fromUtf8(listing->readAllStandardOutput())
+		                       .split(QLatin1Char('\n'))
+		                       .indexOf(QRegularExpression(QStringLiteral("^hull-saved\t.*"))) >= 0;
+
+		listing->deleteLater();
+		for (row &r : rows)
+			if (r.added.file == file && r.added.name.isEmpty() && r.saved != saved) {
+				r.saved = saved;
+				rebuild();
+			}
+	});
+	connect(listing, &QProcess::errorOccurred, listing, &QObject::deleteLater);
+	listing->start(hull, { QStringLiteral("snapshot"), QStringLiteral("ls"), file });
 }
 
 void main_window::selected_changed()
@@ -1355,6 +1383,8 @@ void main_window::start()
 
 	if (i < 0 || i >= rows.size() || rows[i].added.file.isEmpty() || rows[i].run != nullptr)
 		return;
+	/* Its saved state is spent as it starts. */
+	rows[i].saved = false;
 	const added_machine which = rows[i].added;
 	const QStringList   wanted = tokens_wanted(rows[i].explain);
 	const QString       explain = rows[i].explain;
@@ -1527,6 +1557,9 @@ void main_window::save_state()
 		say(how == QProcess::NormalExit && code == 0
 		        ? QStringLiteral("%1 saved: Start carries on where it was").arg(id)
 		        : QStringLiteral("%1 was not saved: %2").arg(id, said));
+		for (const row &r : rows)
+			if (r.id == id && !r.added.file.isEmpty() && r.added.name.isEmpty())
+				saved_of(r.added.file);
 		refresh();
 	});
 	say(QStringLiteral("saving %1").arg(id));
