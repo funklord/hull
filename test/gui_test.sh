@@ -498,6 +498,13 @@ if command -v qemu-system-x86_64 > /dev/null && command -v qemu-img > /dev/null;
 	# Start resumes it.
 	keys "$dir" "b''" -- live.conf
 	has "$out" 'gui-live +saved +' "a saved machine listed so"
+	# and its Settings not offered: its state resumes into the hardware it
+	# was saved from. F3 opens nothing, the file as it was.
+	cp "$dir/live.conf" "$dir/live.orig"
+	keys "$dir" "b''" "b'\\x1bOR'" "b'\\x1b[B'" "b'\\r'" -- live.conf
+	cases=$((cases + 1))
+	cmp -s "$dir/live.conf" "$dir/live.orig" || fail "Settings changed a saved machine" "$(cat "$dir/live.conf")"
+	rm -f "$dir/live.orig"
 	run_pid=
 	rm -f "$dir/live.img" "$dir/live.qcow2" "$dir/live.conf" "$dir/live.out"
 fi

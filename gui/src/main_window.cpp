@@ -743,8 +743,11 @@ void main_window::update_actions()
 	                          rows[i].run == nullptr);
 	/* A running machine keeps the hardware it started with: changed
 	 * after it stops, as VirtualBox greys its own out. */
+	/* Nor a saved one, as VirtualBox greys its settings: its state
+	 * resumes only into the hardware it was saved from. Discarding it,
+	 * Snapshots' Delete of hull-saved, gives them back. */
 	settings_action->setEnabled(any && !rows[i].added.file.isEmpty() && rows[i].added.name.isEmpty() &&
-	                            !held && rows[i].run == nullptr);
+	                            !held && rows[i].run == nullptr && !rows[i].saved);
 	/* An exited machine the core still lists is started again: the core
 	 * takes a new run of the id beside it, as `hull run` does. */
 	start_action->setEnabled(any && (!rows[i].is_held || rows[i].held.state == QStringLiteral("exited")) &&
