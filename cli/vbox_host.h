@@ -22,7 +22,10 @@ int hull_vbox_host(const char *work, const char *root, const char *agent, const 
  * first serial port joined to stdout until it ends. `settings` are the
  * memory in MiB, the processors, the network (nat or none), the firmware
  * (bios or efi), the card's VirtualBox type, the chipset (piix3 or ich9),
- * the TPM (yes or no) and the first boot device (disk, dvd or floppy);
+ * the TPM (yes or no), the first boot device (disk, dvd or floppy), the
+ * screen (none, local or window: VirtualBox's window on X in the outer vm,
+ * the outer vm's screen shown as `(display ...)` shows a vm's) and, for
+ * local, where to link the outer vm's display monitor, else "-";
  * `mode` direct or overlay; `media` a type (disk, cdrom, floppy) and an
  * absolute path for each of `media_count`. `work` is made, and removed at
  * the end. Its status. */

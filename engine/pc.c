@@ -2456,6 +2456,22 @@ static void exec_vbox(const hull_machine *m)
 	argv[n++] = m->machine_type != NULL && strcmp(m->machine_type, "q35") == 0 ? "ich9" : "piix3";
 	argv[n++] = m->tpm ? "yes" : "no";
 	argv[n++] = boot == 'c' ? "dvd" : boot == 'f' ? "floppy" : "disk";
+	/* Its screen: the outer vm's, VirtualBox's window drawn on it. In a
+	 * window of the outer qemu's on the display the run was given, or for
+	 * hull-gui, its monitor linked as a pc's own display.qmp would be. */
+	if (m->local) {
+		argv[n++] = "local";
+		argv[n++] = (char *)run_file(m, "display.qmp");
+	} else if (m->display != NULL) {
+		argv[n++] = "window";
+		argv[n++] = "-";
+		setenv("DISPLAY", m->display, 1);
+		if (m->xauthority != NULL)
+			setenv("XAUTHORITY", m->xauthority, 1);
+	} else {
+		argv[n++] = "none";
+		argv[n++] = "-";
+	}
 	argv[n++] = m->direct ? "direct" : "overlay";
 	for (unsigned i = 0u; i < m->media_count; i++) {
 		argv[n++] = m->media[i].type == 'c' ? "cdrom" : m->media[i].type == 'f' ? "floppy" :
@@ -4233,6 +4249,12 @@ static const hull_cap_entry vbox_pc_entries[] = {
 	{ "network.none",       HULL_SUP_NATIVE,   NULL, NULL },
 	{ "network.nat",        HULL_SUP_NATIVE,
 	  "VirtualBox's NAT, inside the outer vm's own", NULL },
+	{ "display.local",      HULL_SUP_EMULATED,
+	  "VirtualBox's window on X in the outer vm, the outer vm's screen shown in hull-gui",
+	  NULL },
+	{ "display.window",     HULL_SUP_EMULATED,
+	  "VirtualBox's window on X in the outer vm, the outer vm's screen in a window of its "
+	  "qemu's", NULL },
 	{ "memory",             HULL_SUP_NATIVE,   NULL, NULL },
 	{ "cpus",               HULL_SUP_NATIVE,   NULL, NULL },
 	{ "stop_grace",         HULL_SUP_NATIVE,

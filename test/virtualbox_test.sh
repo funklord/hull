@@ -413,6 +413,49 @@ if command -v nasm > /dev/null; then
 	cases=$((cases + 1))
 	printf '%s\n' "$out" | grep -q 'word: written' ||
 		fail 'a VDI under (mutable direct) kept no write' "$out"
+	# A screen for hull-gui, (display local): VirtualBox's window on X in
+	# the outer vm, the outer vm's screen linked by this machine's address
+	# as a pc's own is. An empty disk, whose BIOS says so on the screen:
+	# taken by the display monitor the link names, it is lit.
+	truncate -s 1M "$root/pcvb/empty.img"
+	printf '(machine (backend virtualbox) (hostname "pcvb") (source "media:disk") %s %s)\n' \
+		'(display local) (stop_grace "2s")' \
+		'(media (medium (type disk) (source "image:./empty.img")))' > "$root/pcvb/hull.conf"
+	(cd "$root/pcvb" && exec timeout 300 "$hull" run -f hull.conf > out 2>&1) &
+	pcvb_pid=$!
+	tries=0
+	until ls "$XDG_RUNTIME_DIR"/hull/display/* > /dev/null 2>&1 || [ "$tries" -ge 240 ]; do
+		tries=$((tries + 1))
+		sleep 1
+	done
+	sleep 45
+	rm -f "$root/pcvb/screen.ppm"
+	python3 -I - "$(ls "$XDG_RUNTIME_DIR"/hull/display/* 2>/dev/null | head -1)" \
+		"$root/pcvb/screen.ppm" > /dev/null 2>&1 <<'PY'
+import json, os, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(30)
+s.connect(os.path.realpath(sys.argv[1]))
+f = s.makefile('rw')
+f.readline()
+for c in ({'execute': 'qmp_capabilities'},
+          {'execute': 'screendump', 'arguments': {'filename': sys.argv[2]}}):
+	f.write(json.dumps(c) + '\n')
+	f.flush()
+	f.readline()
+PY
+	lit=$(python3 -I -c 'import sys
+d = open(sys.argv[1], "rb").read()
+parts = d.split(b"\n", 3)
+print(sum(1 for b in parts[3] if b > 128))' "$root/pcvb/screen.ppm" 2>/dev/null)
+	timeout 60 "$hull" stop pcvb > /dev/null 2>&1
+	wait "$pcvb_pid"
+	cases=$((cases + 1))
+	[ "${lit:-0}" -gt 1000 ] ||
+		fail "VirtualBox's screen was not shown by the machine's display link" \
+			"lit=${lit:-none}; $(tail -5 "$root/pcvb/out")"
+	cases=$((cases + 1))
+	[ -z "$(left)" ] || fail 'a VirtualBox PC with a screen left something' "$(left)"
 	pcvb disk.qcow2 direct
 	cases=$((cases + 1))
 	out=$(timeout 60 "$hull" run -f "$root/pcvb/hull.conf" 2>&1)

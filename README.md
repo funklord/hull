@@ -204,7 +204,7 @@ reason, and where one exists, the `--accept` token that takes it anyway).
 | `qemu-pc` | pc | a whole PC, by KVM or emulated | the guest's own | qemu | written |
 | crun | ns | namespaces | the host's | user namespaces | designed |
 | `virtualbox` | vm | hardware virtualization, inside a qemu vm | its own | VirtualBox's `vboxdrv`, `/dev/kvm`, `hull virtualbox fetch` | written |
-| `virtualbox-pc` | pc | a whole PC under VirtualBox, inside a qemu vm | the guest's own | as `virtualbox`; `(backend virtualbox)` with a PC's media | written, headless |
+| `virtualbox-pc` | pc | a whole PC under VirtualBox, inside a qemu vm | the guest's own | as `virtualbox`; `(backend virtualbox)` with a PC's media | written |
 | vmware | vm | hardware virtualization | its own | the hypervisor | designed |
 | hyperv | vm | hardware virtualization | its own | Windows | reserved |
 | `board` | hw | anything hull reaches by ssh | its own | a pool of boards in `pools.conf`, each its sshd, `unshare` and `tar` | written |

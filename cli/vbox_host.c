@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
@@ -311,6 +312,7 @@ int hull_vbox_host(const char *work, const char *root, const char *agent, const 
 static const char pc_script[] =
     "#!/bin/sh\n"
     "memory=$1 cpus=$2 network=$3 firmware=$4 nic=$5 chipset=$6 tpm=$7 boot=$8 bus=$9\n"
+    "screen=${10}\n"
     "release=$(uname -r)\n"
     "insmod /lib/modules/$release/misc/vboxdrv.ko || {\n"
     "	echo \"no vboxdrv.ko for $release: the host's VirtualBox builds it\"; exit 1; }\n"
@@ -319,7 +321,7 @@ static const char pc_script[] =
     "mv /usr/lib/virtualbox.hull /usr/lib/virtualbox || exit 1\n"
     "chown -R 0:0 /usr/lib/virtualbox\n"
     "chmod -R go-w /usr/lib/virtualbox\n"
-    "for f in VBoxHeadless VBoxNetDHCP VBoxNetNAT VBoxNetAdpCtl; do\n"
+    "for f in VBoxHeadless VirtualBoxVM VBoxNetDHCP VBoxNetNAT VBoxNetAdpCtl; do\n"
     "	chmod 4511 /usr/lib/virtualbox/$f\n"
     "done\n"
     "chown 0:0 / /usr /usr/lib\n"
@@ -337,8 +339,46 @@ static const char pc_script[] =
     "[ \"$tpm\" = yes ] && { $manage modifyvm hull --tpm-type 2.0 || exit 1; }\n"
     "$manage storagectl hull --name disks --add $bus || exit 1\n"
     ". /share/media.sh\n"
+    "if [ \"$screen\" = none ]; then\n"
+    "	touch /share/up\n"
+    "	exec /usr/lib/virtualbox/VBoxHeadless --startvm hull\n"
+    "fi\n"
+    /* A screen: X on the outer vm's own, the devices named, there being
+     * no udev to find them, and VirtualBox's window filling it. */
+    "$manage setextradata global GUI/SuppressMessages all\n"
+    "$manage setextradata global GUI/UpdateDate never\n"
+    "$manage modifyvm hull --usb-ohci on --mouse usbtablet || exit 1\n"
+    "{\n"
+    "	printf 'Section \"ServerFlags\"\\n\\tOption \"AutoAddDevices\" \"false\"\\nEndSection\\n'\n"
+    "	printf 'Section \"Device\"\\n\\tIdentifier \"gpu\"\\n\\tDriver \"modesetting\"\\nEndSection\\n'\n"
+    "	n=0\n"
+    "	for e in /dev/input/event*; do\n"
+    "		printf 'Section \"InputDevice\"\\n\\tIdentifier \"in%s\"\\n\\tDriver \"libinput\"\\n' $n\n"
+    "		printf '\\tOption \"Device\" \"%s\"\\nEndSection\\n' $e\n"
+    "		n=$((n + 1))\n"
+    "	done\n"
+    "	printf 'Section \"Screen\"\\n\\tIdentifier \"screen\"\\n\\tDevice \"gpu\"\\nEndSection\\n'\n"
+    "	printf 'Section \"ServerLayout\"\\n\\tIdentifier \"hull\"\\n\\tScreen \"screen\"\\n'\n"
+    "	i=0\n"
+    "	while [ $i -lt $n ]; do printf '\\tInputDevice \"in%s\"\\n' $i; i=$((i + 1)); done\n"
+    "	printf 'EndSection\\n'\n"
+    "} > /tmp/xorg.conf\n"
+    "HOME=/tmp Xorg :0 -config /tmp/xorg.conf -logfile /tmp/Xorg.log -nolisten tcp -noreset vt1 \\\n"
+    "	>/dev/null 2>&1 &\n"
+    "i=0\n"
+    "while ! DISPLAY=:0 xdpyinfo >/dev/null 2>&1 && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done\n"
     "touch /share/up\n"
-    "exec /usr/lib/virtualbox/VBoxHeadless --startvm hull\n";
+    /* Qt loads no plugin into a setuid program unless root owns it,
+     * and the host's tree is nobody's in a share: the kinds a window
+     * loads made root's in the overlay, as VirtualBox's own files are. */
+    "qt=/usr/lib/x86_64-linux-gnu/qt6\n"
+    "chown 0:0 /usr/lib/x86_64-linux-gnu $qt $qt/plugins\n"
+    "for kind in platforms xcbglintegrations platformthemes platforminputcontexts \\\n"
+    "	imageformats iconengines generic egldeviceintegrations; do\n"
+    "	[ -d $qt/plugins/$kind ] && chown -R 0:0 $qt/plugins/$kind\n"
+    "done\n"
+    "export DISPLAY=:0 XDG_RUNTIME_DIR=/tmp\n"
+    "exec /usr/lib/virtualbox/VirtualBoxVM --startvm hull --fullscreen\n";
 
 static volatile sig_atomic_t pc_stopping;
 
@@ -429,10 +469,12 @@ int hull_vbox_pc(const char *work, const char *agent, const char *const *setting
 		goto done;
 	}
 	fprintf(file, "(machine (backend vm) (source \"dir:/\") (mutable overlay)\n"
-	        " (tuning (vm (profile full)))\n"
+	        " (tuning (vm (profile full)))%s\n"
 	        " (memory \"%luM\") (cpus %lu)\n"
 	        " (volumes (volume (host \"%s\") (guest \"/vbox\") (mode ro))\n"
 	        "          (volume (host \"%s\") (guest \"/share\"))\n",
+	        strcmp(settings[8], "local") == 0 ? " (display local)" :
+	        strcmp(settings[8], "window") == 0 ? " (display window)" : "",
 	        strtoul(settings[0], NULL, 10) + OUTER_MEMORY, strtoul(settings[1], NULL, 10) + 1ul,
 	        vbox, share);
 	/* Each medium's folder a share of the outer vm's, read-only unless the
@@ -513,7 +555,7 @@ int hull_vbox_pc(const char *work, const char *agent, const char *const *setting
 	fprintf(file, " )\n (command \"/bin/sh\" \"/share/run.sh\"");
 	for (unsigned i = 0u; i < 8u; i++)
 		fprintf(file, " \"%s\"", settings[i]);
-	fprintf(file, " \"%s\"))\n", bus);
+	fprintf(file, " \"%s\" \"%s\"))\n", bus, settings[8]);
 	if (fclose(attach) != 0 || fclose(file) != 0) {
 		say("the outer vm's spec cannot be written");
 		goto done;
@@ -537,6 +579,33 @@ int hull_vbox_pc(const char *work, const char *agent, const char *const *setting
 			goto done;
 		}
 		nanosleep(&pause, NULL);
+	}
+	/* hull-gui's screen: the outer vm's display monitor, the one its
+	 * core links, linked where the engine said, which the user's own
+	 * core's link for this machine's address names. */
+	if (strcmp(settings[8], "local") == 0 && strcmp(settings[9], "-") != 0) {
+		char       links[4400];
+		DIR       *each;
+		struct dirent *entry;
+
+		snprintf(links, sizeof links, "%s/hull/display", runtime);
+		if ((each = opendir(links)) != NULL) {
+			while ((entry = readdir(each)) != NULL) {
+				char found[4700];
+				char real[PATH_MAX];
+
+				if (entry->d_name[0] == '.')
+					continue;
+				snprintf(found, sizeof found, "%s/%s", links, entry->d_name);
+				if (realpath(found, real) != NULL) {
+					unlink(settings[9]);
+					if (symlink(real, settings[9]) != 0)
+						say("the screen could not be linked");
+				}
+				break;
+			}
+			closedir(each);
+		}
 	}
 	/* A stop presses the machine's power button, as qemu-pc's does; the
 	 * engine's KILL after its grace takes everything else with this. */
