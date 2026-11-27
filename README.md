@@ -743,10 +743,15 @@ for a whole shell, and `ps`, `exec`, `logs` and `stop` go with it.
   own in `~/hull`, and every machine the core runs, whoever started it;
 - each one's plan, state, address, output and what it spends, and its
   screen in a tab beside them;
-- Start, Stop, Power Off, Pause, Resume and a Terminal into it;
-- New, Import of a VirtualBox or VMware machine or appliance into
-  `~/hull`, Settings for its hardware, disks and discs, Clone, and Remove
-  with its files to the trash, as VirtualBox's manager does.
+- Start, Stop (the PC's power button, Power Off offered when its guest
+  takes long), Save State, Power Off, Pause, Resume and a Terminal into
+  it;
+- New -- a PC of a new disk and its installer disc among them -- Import
+  of a VirtualBox or VMware machine or appliance into `~/hull`, Export
+  Appliance back out, Settings for its hardware, firmware, disks, boot
+  order, ports and shared folders, Snapshots of it stopped or running,
+  Clone, and Remove with its files to the trash, as VirtualBox's manager
+  does.
 
 It is a frontend of the same core as the CLI, and starts machines with
 `hull run`. The same window draws on a terminal with
