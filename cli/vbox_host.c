@@ -16,6 +16,11 @@
 
 #define _GNU_SOURCE
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <sys/socket.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -348,8 +353,12 @@ static const char pc_script[] =
     "	$manage modifynvram hull enrollorclpk || exit 1\n"
     "	$manage modifynvram hull secureboot --enable || exit 1\n"
     "fi\n"
-    "$manage storagectl hull --name disks --add $bus || exit 1\n"
+    /* Through the page cache: the media are files on the outer vm's
+     * share, where VirtualBox's own uncached I/O stalled a Windows
+     * install until the guest reset its disk's port (measured). */
+    "$manage storagectl hull --name disks --add $bus --hostiocache on || exit 1\n"
     ". /share/media.sh\n"
+    "[ -f /share/ports.sh ] && . /share/ports.sh\n"
     /* (boot_key N): Enter once a second for N seconds from when VirtualBox
      * has the machine running, as a person at the screen presses it for a
      * disc's \"Press any key to boot from CD\". */
@@ -435,6 +444,167 @@ static int remove_entry(const char *path, const struct stat *st, int type, struc
 	return type == FTW_DP ? rmdir(path) : unlink(path);
 }
 
+/* --- ports: the machine's address to the outer vm's ------------------- */
+
+typedef struct proxy {
+	int             listener;
+	struct in_addr  to;
+	unsigned        port;
+} proxy;
+
+/* One connection: bytes both ways until either end closes. */
+static void *relay_pair(void *arg)
+{
+	int          *ends = arg;
+	struct pollfd fds[2] = { { .fd = ends[0], .events = POLLIN }, { .fd = ends[1], .events = POLLIN } };
+	char          buffer[16384];
+
+	for (;;) {
+		if (poll(fds, 2u, -1) < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (((fds[0].revents | fds[1].revents) & (POLLERR | POLLNVAL)) != 0)
+			break;
+		for (unsigned i = 0u; i < 2u; i++) {
+			ssize_t got;
+
+			if ((fds[i].revents & (POLLIN | POLLHUP)) == 0)
+				continue;
+			got = read(fds[i].fd, buffer, sizeof buffer);
+			if (got <= 0)
+				goto closed;
+			for (ssize_t put = 0; put < got;) {
+				ssize_t wrote = write(fds[1u - i].fd, buffer + put, (size_t)(got - put));
+
+				if (wrote <= 0)
+					goto closed;
+				put += wrote;
+			}
+		}
+	}
+closed:
+	close(ends[0]);
+	close(ends[1]);
+	free(ends);
+	return NULL;
+}
+
+/* A listener's connections, each to the outer vm's address. */
+static void *accept_loop(void *arg)
+{
+	proxy *p = arg;
+
+	for (;;) {
+		int                client = accept4(p->listener, NULL, NULL, SOCK_CLOEXEC);
+		int                outer;
+		int               *ends;
+		pthread_t          thread;
+		struct sockaddr_in at = { .sin_family = AF_INET, .sin_port = htons((uint16_t)p->port),
+		                          .sin_addr = p->to };
+
+		if (client < 0) {
+			if (errno == EINTR || errno == ECONNABORTED)
+				continue;
+			return NULL;
+		}
+		if ((outer = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0 ||
+		    connect(outer, (struct sockaddr *)&at, sizeof at) != 0 ||
+		    (ends = malloc(2u * sizeof *ends)) == NULL) {
+			if (outer >= 0)
+				close(outer);
+			close(client);
+			continue;
+		}
+		ends[0] = client;
+		ends[1] = outer;
+		if (pthread_create(&thread, NULL, relay_pair, ends) != 0) {
+			close(client);
+			close(outer);
+			free(ends);
+			continue;
+		}
+		pthread_detach(thread);
+	}
+}
+
+/* The outer vm's address, as its core lists it: the machine `share`. */
+static int outer_address(const char *self, struct in_addr *out)
+{
+	int   pipe_fds[2];
+	pid_t child;
+	char  listing[4096] = "";
+	size_t have = 0u;
+
+	if (pipe2(pipe_fds, O_CLOEXEC) != 0)
+		return -1;
+	{
+		const char *const argv[] = { self, "ps", NULL };
+
+		child = start(argv, -1, pipe_fds[1]);
+	}
+	close(pipe_fds[1]);
+	for (ssize_t got; have + 1u < sizeof listing &&
+	     (got = read(pipe_fds[0], listing + have, sizeof listing - 1u - have)) > 0;)
+		have += (size_t)got;
+	close(pipe_fds[0]);
+	finish(child);
+	for (char *line = strtok(listing, "\n"); line != NULL; line = strtok(NULL, "\n")) {
+		char id[64];
+		char address[64];
+
+		if (sscanf(line, "%63s %63s", id, address) == 2 && strcmp(id, "share") == 0)
+			return inet_pton(AF_INET, address, out) == 1 ? 0 : -1;
+	}
+	return -1;
+}
+
+/* Each of `ports`, HOST:GUEST, listened on at `address` and carried to
+ * the outer vm's same port, which its own forward and VirtualBox's NAT
+ * take on to the guest. Threads of this process, ending with it. */
+static void forward_ports(const char *self, const char *address, const char *ports)
+{
+	struct in_addr outer;
+	struct in_addr here;
+	char           copy[512];
+	char          *save = NULL;
+
+	if (inet_pton(AF_INET, address, &here) != 1 || outer_address(self, &outer) != 0) {
+		say("the ports could not be forwarded: the outer vm's address is not known");
+		return;
+	}
+	snprintf(copy, sizeof copy, "%s", ports);
+	for (char *each = strtok_r(copy, ",", &save); each != NULL; each = strtok_r(NULL, ",", &save)) {
+		unsigned           host = 0u;
+		unsigned           guest = 0u;
+		int                one = 1;
+		proxy             *p;
+		pthread_t          thread;
+		struct sockaddr_in at = { .sin_family = AF_INET, .sin_addr = here };
+
+		if (sscanf(each, "%u:%u", &host, &guest) != 2 || (p = calloc(1u, sizeof *p)) == NULL)
+			continue;
+		at.sin_port = htons((uint16_t)host);
+		p->to = outer;
+		p->port = host;
+		if ((p->listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0 ||
+		    setsockopt(p->listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0 ||
+		    bind(p->listener, (struct sockaddr *)&at, sizeof at) != 0 ||
+		    listen(p->listener, 16) != 0 || pthread_create(&thread, NULL, accept_loop, p) != 0) {
+			char said[128];
+
+			snprintf(said, sizeof said, "port %u could not be listened on at %s", host, address);
+			say(said);
+			if (p->listener >= 0)
+				close(p->listener);
+			free(p);
+			continue;
+		}
+		pthread_detach(thread);
+	}
+}
+
 int hull_vbox_pc(const char *work, const char *agent, const char *const *settings,
                  const char *mode, char *const *media, unsigned media_count)
 {
@@ -446,6 +616,9 @@ int hull_vbox_pc(const char *work, const char *agent, const char *const *setting
 	char        target[4400];
 	const char *parent_end = strrchr(work, '/');
 	const char *bus = strcmp(settings[5], "ich9") == 0 ? "sata" : "ide";
+	const char *given_ports = getenv("HULL_VBOX_PORTS");
+	const char *address = getenv("HULL_VBOX_ADDRESS");
+	char        ports[512] = "";
 	ssize_t     n = readlink("/proc/self/exe", self, sizeof self - 1u);
 	pid_t       outer;
 	pid_t       link;
@@ -462,6 +635,8 @@ int hull_vbox_pc(const char *work, const char *agent, const char *const *setting
 		return 1;
 	}
 	self[n] = '\0';
+	if (given_ports != NULL && strspn(given_ports, "0123456789:,") == strlen(given_ports))
+		snprintf(ports, sizeof ports, "%s", given_ports);
 	snprintf(path, sizeof path, "%s/%s", vbox, HULL_VBOX_HEADLESS);
 	if (access(path, X_OK) != 0) {
 		say("no VirtualBox has been fetched: `hull virtualbox fetch` downloads it, once");
@@ -588,7 +763,7 @@ int hull_vbox_pc(const char *work, const char *agent, const char *const *setting
 		 * Windows Setup looks for its answer on, behind an xHCI. */
 		if (strcmp(type, "usb") == 0) {
 			fprintf(attach, "[ -n \"$stick\" ] || { $manage modifyvm hull --usb-xhci on && "
-			        "$manage storagectl hull --name stick --add usb; } || exit 1\n"
+			        "$manage storagectl hull --name stick --add usb --hostiocache on; } || exit 1\n"
 			        "stick=$((${stick:--1} + 1))\n"
 			        "$manage storageattach hull --storagectl stick --port $stick --device 0 "
 			        "--type hdd --medium '%s'%s || exit 1\n", inner,
@@ -596,7 +771,7 @@ int hull_vbox_pc(const char *work, const char *agent, const char *const *setting
 			continue;
 		}
 		if (strcmp(drive, "fdd") == 0) {
-			fprintf(attach, "$manage storagectl hull --name floppy --add floppy 2>/dev/null\n"
+			fprintf(attach, "$manage storagectl hull --name floppy --add floppy --hostiocache on 2>/dev/null\n"
 			        "$manage storageattach hull --storagectl floppy --port 0 --device 0 "
 			        "--type fdd --medium '%s' || exit 1\n", inner);
 			continue;
@@ -618,7 +793,37 @@ int hull_vbox_pc(const char *work, const char *agent, const char *const *setting
 			goto done;
 		}
 	}
-	fprintf(file, " )\n (command \"/bin/sh\" \"/share/run.sh\"");
+	fprintf(file, " )\n");
+	/* Each of the machine's ports the outer vm's own, at its address, and
+	 * VirtualBox's NAT forwarding it on to the guest's. */
+	if (ports[0] != '\0') {
+		char        copy[sizeof ports];
+		char       *save = NULL;
+		FILE       *forward;
+		unsigned    count = 0u;
+
+		snprintf(target, sizeof target, "%s/ports.sh", share);
+		if ((forward = fopen(target, "w")) == NULL) {
+			say("the outer vm's files cannot be written");
+			fclose(file);
+			goto done;
+		}
+		fprintf(file, " (ports");
+		snprintf(copy, sizeof copy, "%s", ports);
+		for (char *each = strtok_r(copy, ",", &save); each != NULL; each = strtok_r(NULL, ",", &save)) {
+			unsigned host = 0u;
+			unsigned guest = 0u;
+
+			if (sscanf(each, "%u:%u", &host, &guest) != 2)
+				continue;
+			fprintf(file, " (port (host %u) (guest %u))", host, host);
+			fprintf(forward, "$manage modifyvm hull --natpf1 'p%u,tcp,,%u,,%u' || exit 1\n",
+			        count++, host, guest);
+		}
+		fprintf(file, ")\n");
+		fclose(forward);
+	}
+	fprintf(file, " (command \"/bin/sh\" \"/share/run.sh\"");
 	for (unsigned i = 0u; i < 8u; i++)
 		fprintf(file, " \"%s\"", i == 3u && strcmp(settings[3], "efi-secure") == 0 ? "efi" :
 		        settings[i]);
@@ -675,6 +880,9 @@ int hull_vbox_pc(const char *work, const char *agent, const char *const *setting
 			closedir(each);
 		}
 	}
+	/* The ports at the machine's own address, each to the outer vm's. */
+	if (ports[0] != '\0' && address != NULL && address[0] != '\0')
+		forward_ports(self, address, ports);
 	/* A stop presses the machine's power button, as qemu-pc's does; the
 	 * engine's KILL after its grace takes everything else with this. */
 	{

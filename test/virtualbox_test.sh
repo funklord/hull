@@ -532,6 +532,20 @@ print(sum(1 for b in parts[3] if b > 128))' "$root/pcvb/screen.ppm" 2>/dev/null)
 	esac
 	cases=$((cases + 1))
 	[ -z "$(left)" ] || fail 'a VirtualBox PC with 3D left something' "$(left)"
+	# Ports: TCP at the machine's address through the outer vm and
+	# VirtualBox's NAT, at plan; UDP refused.
+	printf '(machine (backend virtualbox) (source "media:disk") (network nat) %s %s)\n' \
+		'(ports (port (host 2222) (guest 22)))' \
+		'(media (medium (type disk) (source "image:./raw.img")))' > "$root/pcvb/ports.conf"
+	cases=$((cases + 1))
+	out=$("$hull" plan --explain -f "$root/pcvb/ports.conf" 2>&1)
+	printf '%s\n' "$out" | grep -q 'ports: emulated' ||
+		fail 'a TCP port was not planned on virtualbox-pc' "$out"
+	sed 's/(guest 22)/(guest 22) (proto udp)/' "$root/pcvb/ports.conf" > "$root/pcvb/udp.conf"
+	cases=$((cases + 1))
+	out=$(timeout 60 "$hull" run -f "$root/pcvb/udp.conf" 2>&1)
+	[ $? -ne 0 ] && printf '%s\n' "$out" | grep -q 'forwards TCP ports here, not UDP' ||
+		fail 'a UDP port was not refused on virtualbox-pc' "$out"
 	pcvb disk.qcow2 direct
 	cases=$((cases + 1))
 	out=$(timeout 60 "$hull" run -f "$root/pcvb/hull.conf" 2>&1)

@@ -525,7 +525,7 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 	}
 	/* VirtualBox's: a VDI it opens, the answer on a disc of its own, the
 	 * Guest Additions another, Secure Boot its own EFI's; no (cpu
-	 * ...) or (state ...), which are qemu's, and no port for ssh yet.
+	 * ...) or (state ...), which are qemu's.
 	 * Enter for 150 seconds, its EFI nested reaching the disc's prompt
 	 * after 30 have passed, and setup's first reboot -- where a press
 	 * would boot the disc again -- minutes after. */
@@ -592,7 +592,8 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 		spec = NULL;
 		if (asprintf(&spec,
 		    "; Windows under VirtualBox as hull setup windows --virtualbox installed\n"
-		    "; it, its Guest Additions with it: its screen in hull-gui.\n"
+		    "; it, its Guest Additions with it: its screen in hull-gui, and ssh -p\n"
+		    "; 2222 to the machine's address, the account in the answer, your keys.\n"
 		    "(machine\n"
 		    "  (backend virtualbox)\n"
 		    "  (hostname \"windows\")\n"
@@ -602,6 +603,7 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 		    "  (cpus 4)\n"
 		    "  (network nat)\n"
 		    "  (display local)\n"
+		    "  (ports (port (host 2222) (guest 22)))\n"
 		    "  (media (medium (type disk) (source \"image:./disk.vdi\")))\n"
 		    "  (tuning (pc (machine q35) (tpm true) (firmware uefi-secure) (nic e1000))))\n") < 0) {
 			spec = NULL;

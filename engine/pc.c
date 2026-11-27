@@ -1597,6 +1597,9 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 		if (m->gpu != 0 && m->display == NULL && !m->local)
 			return "(gpu virgl) and (gpu venus) are a screen's 3D: the machine needs "
 			       "(display local) or (display window)";
+		for (unsigned i = 0u; i < m->port_count; i++)
+			if (m->port_udp[i])
+				return "VirtualBox's PC forwards TCP ports here, not UDP";
 		if ((wrong = read_media(m, doc, machine)) != NULL)
 			return wrong;
 		for (unsigned i = 0u; i < m->media_count; i++) {
@@ -2484,6 +2487,18 @@ static void exec_vbox(const hull_machine *m)
 	argv[n++] = key;
 	argv[n++] = m->gpu == 2 ? "venus" : m->gpu == 1 ? "virgl" : "none";
 	argv[n++] = m->direct ? "direct" : "overlay";
+	/* Its ports, at its own address: `hull virtualbox pc` forwards each
+	 * through the outer vm and VirtualBox's NAT to the guest. */
+	{
+		static char ports[PC_MAX_PORTS * 16u + 1u];
+		size_t      at = 0u;
+
+		for (unsigned i = 0u; i < m->port_count && at < sizeof ports; i++)
+			at += (size_t)snprintf(ports + at, sizeof ports - at, "%s%u:%u", i > 0u ? "," : "",
+			                       m->port_host[i], m->port_guest[i]);
+		setenv("HULL_VBOX_ADDRESS", m->address, 1);
+		setenv("HULL_VBOX_PORTS", ports, 1);
+	}
 	for (unsigned i = 0u; i < m->media_count; i++) {
 		argv[n++] = m->media[i].type == 'c' ? "cdrom" : m->media[i].type == 'f' ? "floppy" :
 		            m->media[i].type == 'u' ? "usb" : "disk";
@@ -4262,6 +4277,9 @@ static const hull_cap_entry vbox_pc_entries[] = {
 	{ "network.none",       HULL_SUP_NATIVE,   NULL, NULL },
 	{ "network.nat",        HULL_SUP_NATIVE,
 	  "VirtualBox's NAT, inside the outer vm's own", NULL },
+	{ "ports",              HULL_SUP_EMULATED,
+	  "TCP at the machine's address, forwarded to the outer vm's and by VirtualBox's NAT to "
+	  "the guest", NULL },
 	{ "display.local",      HULL_SUP_EMULATED,
 	  "VirtualBox's window on X in the outer vm, the outer vm's screen shown in hull-gui",
 	  NULL },
