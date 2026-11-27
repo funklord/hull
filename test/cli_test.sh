@@ -4990,6 +4990,42 @@ assert any("PreventDeviceEncryption /t REG_DWORD /d 1" in p for p in paths), pat
 		env HOME="$root/setup/home" "$hull" setup windows --user 'a b' "$root/setup/win.iso" "$root/setup/w3"
 	expect 1 'not a disc image' \
 		env HOME="$root/setup/home" "$hull" setup windows "$root/setup/nope.iso" "$root/setup/w4"
+	# --virtualbox: both machines virtualbox-pc's, a VDI disk, the Guest
+	# Additions' disc -- here a stand-in where `hull virtualbox fetch` keeps
+	# it -- a second CD, and the first logon's script installing them
+	# before it powers off; refused beside --drivers, and with no Additions
+	# fetched.
+	vbox_version=$(sed -n 's/^#define HULL_VBOX_VERSION "\(.*\)"/\1/p' engine/vbox.h)
+	mkdir -p "$root/setup/cache/hull" "$root/setup/nocache"
+	head -c 4096 /dev/zero > "$root/setup/cache/hull/virtualbox-$vbox_version-additions.iso"
+	expect 0 'install.conf installs Windows' \
+		env HOME="$root/setup/home" XDG_CACHE_HOME="$root/setup/cache" "$hull" setup windows \
+		--virtualbox "$root/setup/win.iso" "$root/setup/wv"
+	expect 0 'file format: vdi' qemu-img info "$root/setup/wv/disk.vdi"
+	expect 0 'additions\.iso' cat "$root/setup/wv/install.conf"
+	# The answer on a disc VirtualBox makes from a VISO naming the staged
+	# files, not on the stick, which Windows PE comes to too late nested.
+	expect 0 'image:\./answer\.viso' cat "$root/setup/wv/install.conf"
+	expect 0 '^/autounattend\.xml=answer/autounattend\.xml$' cat "$root/setup/wv/answer.viso"
+	cases=$((cases + 1))
+	head -1 "$root/setup/wv/answer.viso" | grep -Eq '^--iprt-iso-maker-file-marker-bourne-sh [0-9a-f-]{36}$' &&
+		! grep -q 'type usb' "$root/setup/wv/install.conf" ||
+		fail 'the answer is not a VISO VirtualBox reads, or is still on a stick' \
+			"$(cat "$root/setup/wv/answer.viso" "$root/setup/wv/install.conf")"
+	expect 0 'machine on virtualbox-pc \(pc\): ok$' "$hull" check -f "$root/setup/wv/install.conf" --backend virtualbox
+	expect 0 'machine on virtualbox-pc \(pc\): ok$' "$hull" check -f "$root/setup/wv/machine.conf" --backend virtualbox
+	cases=$((cases + 1))
+	tr -d '\r' < "$root/setup/wv/answer/hull-setup.ps1" |
+		awk '/add-trusted-publisher/ { c = NR } /VBoxWindowsAdditions.exe.\) -ArgumentList .\/S./ { a = NR }
+		     /^Stop-Computer/ { s = NR } END { exit !(c && a && c < a && a < s) }' ||
+		fail "the first logon's script does not install the Guest Additions before powering off" \
+			"$(cat "$root/setup/wv/answer/hull-setup.ps1")"
+	expect 1 "VirtualBox's drivers are its Guest Additions" \
+		env HOME="$root/setup/home" XDG_CACHE_HOME="$root/setup/cache" "$hull" setup windows \
+		--virtualbox --drivers "$root/setup/win.iso" "$root/setup/win.iso" "$root/setup/wv2"
+	expect 1 'Guest Additions have not been fetched' \
+		env HOME="$root/setup/home" XDG_CACHE_HOME="$root/setup/nocache" "$hull" setup windows \
+		--virtualbox "$root/setup/win.iso" "$root/setup/wv3"
 	# --drivers: a virtio-win disc (iso_tree.py, the display driver and its
 	# service for both releases) whose files go on the stick, not a second
 	# CD of the install; the install on the standard VGA, machine.conf on

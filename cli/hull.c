@@ -9655,11 +9655,18 @@ int main(int argc, char **argv)
 		unsigned long index = 1ul;
 		const char   *user = "hull";
 		const char   *drivers = NULL;
+		int           virtualbox = 0;
 		int           at = 3;
 
 		for (; at + 2 < argc; at += 2) {
 			char *end = NULL;
 
+			/* A flag of no value: the pairs go on from the next. */
+			if (strcmp(argv[at], "--virtualbox") == 0) {
+				virtualbox = 1;
+				at--;
+				continue;
+			}
 			if (strcmp(argv[at], "--index") == 0) {
 				index = strtoul(argv[at + 1], &end, 10);
 				if (end == argv[at + 1] || *end != '\0' || index == 0ul || index > 99ul) {
@@ -9676,11 +9683,11 @@ int main(int argc, char **argv)
 		}
 		if (at + 2 != argc) {
 			fprintf(stderr, "usage: hull setup windows [--index N] [--user NAME] "
-			        "[--drivers VIRTIO-WIN.iso] ISO DIR\n");
+			        "[--drivers VIRTIO-WIN.iso | --virtualbox] ISO DIR\n");
 			return 2;
 		}
-		if (hull_setup_windows(argv[at], argv[at + 1], (unsigned)index, user, drivers, why,
-		                       sizeof why) != 0) {
+		if (hull_setup_windows(argv[at], argv[at + 1], (unsigned)index, user, drivers,
+		                       virtualbox, why, sizeof why) != 0) {
 			fprintf(stderr, "hull: setup: %s\n", why);
 			return 1;
 		}

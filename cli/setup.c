@@ -61,6 +61,7 @@
 #include <unistd.h>
 
 #include "setup.h"
+#include "vbox.h"
 
 /* `argv`, its output to /dev/null: 0 where it ran and exited 0. */
 static int run(char *const argv[])
@@ -248,6 +249,23 @@ static const char script_drivers[] =
     "  Write-Output 'hull: no virtio-win disc with viogpudo found'\r\n"
     "}\r\n";
 
+/* With --virtualbox, before the script's end: VirtualBox's Guest
+ * Additions from whichever drive holds them -- the second disc -- Oracle's
+ * signing certificates trusted first, as its documentation has a silent
+ * install do, so no prompt waits for somebody; their WDDM display driver
+ * is what gives the guest VirtualBox's 3D. */
+static const char script_additions[] =
+    "$ga = Get-PSDrive -PSProvider FileSystem | ForEach-Object { $_.Root } |\r\n"
+    "  Where-Object { Test-Path (Join-Path $_ 'VBoxWindowsAdditions.exe') } | Select-Object -First 1\r\n"
+    "if ($ga) {\r\n"
+    "  Get-ChildItem (Join-Path $ga 'cert\\vbox*.cer') | ForEach-Object {\r\n"
+    "    & (Join-Path $ga 'cert\\VBoxCertUtil.exe') add-trusted-publisher $_.FullName --root $_.FullName\r\n"
+    "  }\r\n"
+    "  Start-Process -Wait (Join-Path $ga 'VBoxWindowsAdditions.exe') -ArgumentList '/S'\r\n"
+    "} else {\r\n"
+    "  Write-Output 'hull: no Guest Additions disc found'\r\n"
+    "}\r\n";
+
 /* The answer file: the disk wiped and partitioned for UEFI, the edition at
  * `index`, the EULA and the online-account pages passed, an
  * administrator `user` logged on once, which runs hull-setup.ps1 from the
@@ -341,9 +359,10 @@ static int virtio_win_disc(const char *iso, char *path, char *why, size_t cap);
 static int virtio_win_stage(const char *iso, const char *stage, char *why, size_t cap);
 
 int hull_setup_windows(const char *iso, const char *dir, unsigned index, const char *user,
-                       const char *drivers, char *why, size_t cap)
+                       const char *drivers, int virtualbox, char *why, size_t cap)
 {
 	char        disc[PATH_MAX];
+	char        additions[PATH_MAX] = "";
 	char        driver_disc[PATH_MAX] = "";
 	char       *full_script = NULL;
 	char        stage[PATH_MAX];
@@ -377,8 +396,25 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 		snprintf(why, cap, "%s: a path with a quote or a backslash cannot be written to a spec", disc);
 		return -1;
 	}
+	if (drivers != NULL && virtualbox) {
+		snprintf(why, cap, "--drivers is virtio-win's for qemu; VirtualBox's drivers are its "
+		         "Guest Additions, which --virtualbox installs");
+		return -1;
+	}
 	if (drivers != NULL && virtio_win_disc(drivers, driver_disc, why, cap) != 0)
 		return -1;
+	/* VirtualBox's Guest Additions, as `hull virtualbox fetch` keeps them. */
+	if (virtualbox && (hull_vbox_additions(additions, sizeof additions) != 0 ||
+	                   access(additions, R_OK) != 0)) {
+		snprintf(why, cap, "VirtualBox's Guest Additions have not been fetched: `hull virtualbox "
+		         "fetch` downloads them with VirtualBox, once");
+		return -1;
+	}
+	if (strchr(additions, '"') != NULL || strchr(additions, '\\') != NULL) {
+		snprintf(why, cap, "%s: a path with a quote or a backslash cannot be written to a spec",
+		         additions);
+		return -1;
+	}
 	if ((keys = public_keys()) == NULL) {
 		snprintf(why, cap, "no public key in ~/.ssh to open the machine's OpenSSH server to: "
 		         "make one with ssh-keygen");
@@ -392,7 +428,7 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 	}
 	snprintf(stage, sizeof stage, "%s/answer", dir);
 	snprintf(image, sizeof image, "%s/answer.img", dir);
-	snprintf(disk, sizeof disk, "%s/disk.qcow2", dir);
+	snprintf(disk, sizeof disk, "%s/disk.%s", dir, virtualbox ? "vdi" : "qcow2");
 	if (password(secret) != 0) {
 		snprintf(why, cap, "/dev/urandom could not be read");
 		goto done;
@@ -411,8 +447,9 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 		if (asprintf(&logon, script_logon, user, secret) < 0)
 			logon = NULL;
 		if (logon == NULL ||
-		    asprintf(&full_script, "%.*s%s%s%s", (int)head, script, logon,
-		             driver_disc[0] != '\0' ? script_drivers : "", end) < 0) {
+		    asprintf(&full_script, "%.*s%s%s%s%s", (int)head, script, logon,
+		             driver_disc[0] != '\0' ? script_drivers : "",
+		             virtualbox ? script_additions : "", end) < 0) {
 			full_script = NULL;
 			free(logon);
 			snprintf(why, cap, "out of memory");
@@ -476,12 +513,105 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 	}
 	{
 		char  size[] = "64G";
-		char *create[] = { "qemu-img", "create", "-q", "-f", "qcow2", disk, size, NULL };
+		char  format[8];
+		char *create[] = { "qemu-img", "create", "-q", "-f", format, disk, size, NULL };
+
+		snprintf(format, sizeof format, "%s", virtualbox ? "vdi" : "qcow2");
 
 		if (run(create) != 0) {
 			snprintf(why, cap, "qemu-img could not make the machine's disk");
 			goto done;
 		}
+	}
+	/* VirtualBox's: a VDI it opens, the answer on a disc of its own, the
+	 * Guest Additions another, Secure Boot its own EFI's; no (cpu
+	 * ...) or (state ...), which are qemu's, and no port for ssh yet.
+	 * Enter for 150 seconds, its EFI nested reaching the disc's prompt
+	 * after 30 have passed, and setup's first reboot -- where a press
+	 * would boot the disc again -- minutes after. */
+	if (virtualbox) {
+		/* The answer on a disc, not the stick: nested, Windows PE comes to
+		 * USB minutes after Setup has looked for its answer once (measured:
+		 * Setup at its language page, the xHCI started six minutes after),
+		 * where a SATA disc is there from boot. VirtualBox makes the disc
+		 * itself from a VISO, a description of an ISO naming the staged
+		 * files, relative to it, with their long names; hull's own ISO
+		 * writer gives DOS's 8.3 alone. */
+		unsigned char id[16];
+		int           random = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+
+		if (random < 0 || read(random, id, sizeof id) != (ssize_t)sizeof id) {
+			if (random >= 0)
+				close(random);
+			snprintf(why, cap, "/dev/urandom could not be read");
+			goto done;
+		}
+		close(random);
+		id[6] = (unsigned char)((id[6] & 0x0fu) | 0x40u);
+		id[8] = (unsigned char)((id[8] & 0x3fu) | 0x80u);
+		if (asprintf(&spec,
+		    "--iprt-iso-maker-file-marker-bourne-sh "
+		    "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n"
+		    "--volume-id=ANSWER\n"
+		    "/autounattend.xml=answer/autounattend.xml\n"
+		    "/hull-setup.ps1=answer/hull-setup.ps1\n"
+		    "/authorized_keys=answer/authorized_keys\n",
+		    id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7], id[8], id[9], id[10],
+		    id[11], id[12], id[13], id[14], id[15]) < 0) {
+			spec = NULL;
+			snprintf(why, cap, "out of memory");
+			goto done;
+		}
+		if (put(dir, "answer.viso", spec, 0644, why, cap) != 0)
+			goto done;
+		free(spec);
+		spec = NULL;
+		if (asprintf(&spec,
+		    "; Installs Windows from the disc under VirtualBox, unattended (hull\n"
+		    "; setup windows --virtualbox), with its Guest Additions: it powers\n"
+		    "; off when the first logon's script is done, and then machine.conf\n"
+		    "; runs it.\n"
+		    "(machine\n"
+		    "  (backend virtualbox)\n"
+		    "  (hostname \"windows\")\n"
+		    "  (source \"media:cdrom\")\n"
+		    "  (mutable direct)\n"
+		    "  (memory \"8G\")\n"
+		    "  (cpus 4)\n"
+		    "  (network nat)\n"
+		    "  (media\n"
+		    "    (medium (type cdrom) (source \"image:%s\"))\n"
+		    "    (medium (type disk) (source \"image:./disk.vdi\"))\n"
+		    "    (medium (type cdrom) (source \"image:./answer.viso\"))\n"
+		    "    (medium (type cdrom) (source \"image:%s\")))\n"
+		    "  (tuning (pc (machine q35) (tpm true) (firmware uefi-secure) (nic e1000)\n"
+		    "              (boot_key 150))))\n", disc, additions) < 0 ||
+		    put(dir, "install.conf", spec, 0644, why, cap) != 0)
+			goto done;
+		free(spec);
+		spec = NULL;
+		if (asprintf(&spec,
+		    "; Windows under VirtualBox as hull setup windows --virtualbox installed\n"
+		    "; it, its Guest Additions with it: its screen in hull-gui.\n"
+		    "(machine\n"
+		    "  (backend virtualbox)\n"
+		    "  (hostname \"windows\")\n"
+		    "  (source \"media:disk\")\n"
+		    "  (mutable direct)\n"
+		    "  (memory \"8G\")\n"
+		    "  (cpus 4)\n"
+		    "  (network nat)\n"
+		    "  (display local)\n"
+		    "  (media (medium (type disk) (source \"image:./disk.vdi\")))\n"
+		    "  (tuning (pc (machine q35) (tpm true) (firmware uefi-secure) (nic e1000))))\n") < 0) {
+			spec = NULL;
+			snprintf(why, cap, "out of memory");
+			goto done;
+		}
+		if (put(dir, "machine.conf", spec, 0644, why, cap) != 0)
+			goto done;
+		result = 0;
+		goto done;
 	}
 	if (asprintf(&spec,
 	    "; Installs Windows from the disc, unattended (hull setup windows): it\n"
