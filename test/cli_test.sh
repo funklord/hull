@@ -5003,16 +5003,10 @@ assert any("PreventDeviceEncryption /t REG_DWORD /d 1" in p for p in paths), pat
 		--virtualbox "$root/setup/win.iso" "$root/setup/wv"
 	expect 0 'file format: vdi' qemu-img info "$root/setup/wv/disk.vdi"
 	expect 0 'additions\.iso' cat "$root/setup/wv/install.conf"
-	# The answer on a disc VirtualBox makes from a VISO naming the staged
-	# files, not on the stick, which Windows PE comes to too late nested.
-	expect 0 'image:\./answer\.viso' cat "$root/setup/wv/install.conf"
-	expect 0 '^/autounattend\.xml=answer/autounattend\.xml$' cat "$root/setup/wv/answer.viso"
-	cases=$((cases + 1))
-	head -1 "$root/setup/wv/answer.viso" | grep -Eq '^--iprt-iso-maker-file-marker-bourne-sh [0-9a-f-]{36}$' &&
-		! grep -q 'type usb' "$root/setup/wv/install.conf" ||
-		fail 'the answer is not a VISO VirtualBox reads, or is still on a stick' \
-			"$(cat "$root/setup/wv/answer.viso" "$root/setup/wv/install.conf")"
-	expect 0 'machine on virtualbox-pc \(pc\): ok$' "$hull" check -f "$root/setup/wv/install.conf" --backend virtualbox
+	# Installed by qemu-pc onto the VDI, Setup nested under VirtualBox
+	# being far too slow; run by virtualbox-pc after.
+	expect 0 'image:\./disk\.vdi' cat "$root/setup/wv/install.conf"
+	expect 0 'machine on qemu-pc \(pc\): ok$' "$hull" check -f "$root/setup/wv/install.conf" --backend pc
 	expect 0 'machine on virtualbox-pc \(pc\): ok$' "$hull" check -f "$root/setup/wv/machine.conf" --backend virtualbox
 	cases=$((cases + 1))
 	tr -d '\r' < "$root/setup/wv/answer/hull-setup.ps1" |

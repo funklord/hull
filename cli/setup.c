@@ -523,56 +523,22 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 			goto done;
 		}
 	}
-	/* VirtualBox's: a VDI it opens, the answer on a disc of its own, the
-	 * Guest Additions another, Secure Boot its own EFI's; no (cpu
-	 * ...) or (state ...), which are qemu's.
-	 * Enter for 150 seconds, its EFI nested reaching the disc's prompt
-	 * after 30 have passed, and setup's first reboot -- where a press
-	 * would boot the disc again -- minutes after. */
+	/* VirtualBox's: installed by qemu-pc, on KVM directly, onto a VDI both
+	 * open, then run by virtualbox-pc. Installed under VirtualBox itself,
+	 * nested in its outer vm, Windows 11 had copied 55% after five hours
+	 * (measured): half of each processor's time is the nesting's, and
+	 * Setup's decompression is all processor. The install's first logon
+	 * puts the Guest Additions on with OpenSSH, so the first start under
+	 * VirtualBox finds its drivers there: the WDDM display driver for
+	 * VMSVGA, with its 3D. */
 	if (virtualbox) {
-		/* The answer on a disc, not the stick: nested, Windows PE comes to
-		 * USB minutes after Setup has looked for its answer once (measured:
-		 * Setup at its language page, the xHCI started six minutes after),
-		 * where a SATA disc is there from boot. VirtualBox makes the disc
-		 * itself from a VISO, a description of an ISO naming the staged
-		 * files, relative to it, with their long names; hull's own ISO
-		 * writer gives DOS's 8.3 alone. */
-		unsigned char id[16];
-		int           random = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-
-		if (random < 0 || read(random, id, sizeof id) != (ssize_t)sizeof id) {
-			if (random >= 0)
-				close(random);
-			snprintf(why, cap, "/dev/urandom could not be read");
-			goto done;
-		}
-		close(random);
-		id[6] = (unsigned char)((id[6] & 0x0fu) | 0x40u);
-		id[8] = (unsigned char)((id[8] & 0x3fu) | 0x80u);
 		if (asprintf(&spec,
-		    "--iprt-iso-maker-file-marker-bourne-sh "
-		    "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n"
-		    "--volume-id=ANSWER\n"
-		    "/autounattend.xml=answer/autounattend.xml\n"
-		    "/hull-setup.ps1=answer/hull-setup.ps1\n"
-		    "/authorized_keys=answer/authorized_keys\n",
-		    id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7], id[8], id[9], id[10],
-		    id[11], id[12], id[13], id[14], id[15]) < 0) {
-			spec = NULL;
-			snprintf(why, cap, "out of memory");
-			goto done;
-		}
-		if (put(dir, "answer.viso", spec, 0644, why, cap) != 0)
-			goto done;
-		free(spec);
-		spec = NULL;
-		if (asprintf(&spec,
-		    "; Installs Windows from the disc under VirtualBox, unattended (hull\n"
-		    "; setup windows --virtualbox), with its Guest Additions: it powers\n"
-		    "; off when the first logon's script is done, and then machine.conf\n"
-		    "; runs it.\n"
+		    "; Installs Windows from the disc, unattended (hull setup windows\n"
+		    "; --virtualbox), on qemu-pc onto a VDI, VirtualBox's Guest Additions\n"
+		    "; with it: it powers off when the first logon's script is done, and\n"
+		    "; then machine.conf runs it under VirtualBox.\n"
 		    "(machine\n"
-		    "  (backend virtualbox)\n"
+		    "  (backend pc)\n"
 		    "  (hostname \"windows\")\n"
 		    "  (source \"media:cdrom\")\n"
 		    "  (mutable direct)\n"
@@ -582,10 +548,10 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 		    "  (media\n"
 		    "    (medium (type cdrom) (source \"image:%s\"))\n"
 		    "    (medium (type disk) (source \"image:./disk.vdi\"))\n"
-		    "    (medium (type cdrom) (source \"image:./answer.viso\"))\n"
+		    "    (medium (type usb) (source \"image:./answer.img\"))\n"
 		    "    (medium (type cdrom) (source \"image:%s\")))\n"
-		    "  (tuning (pc (machine q35) (tpm true) (firmware uefi-secure) (nic e1000)\n"
-		    "              (boot_key 150))))\n", disc, additions) < 0 ||
+		    "  (tuning (pc (machine q35) (cpu host) (tpm true) (firmware uefi-secure)\n"
+		    "              (state \"./\") (nic e1000e) (boot_key 30))))\n", disc, additions) < 0 ||
 		    put(dir, "install.conf", spec, 0644, why, cap) != 0)
 			goto done;
 		free(spec);
