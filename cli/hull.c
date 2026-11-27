@@ -6773,8 +6773,14 @@ static const char *pc_disks(const char *file, hull_spec *spec, const hull_sexpr_
 			}
 			if (*count == HULL_OVA_DISKS)
 				return "a machine of hull's here holds at most 8 disks";
-			if (!record_value(spec, &medium, "source", text, sizeof text) ||
-			    !image_path(file, text, paths[*count], 4400u))
+			if (!record_value(spec, &medium, "source", text, sizeof text))
+				return "a disk names no source";
+			/* A collection is reassembled as the machine starts, and is
+			 * an image only once `hull media export` makes it one. */
+			if (strncmp(text, "dir:", 4u) == 0)
+				return "a disk's source is a collection, dir:, which `hull media export DIR "
+				       "IMAGE` makes an image file of";
+			if (!image_path(file, text, paths[*count], 4400u))
 				return "a disk's source is not an image: file";
 			(*count)++;
 		}

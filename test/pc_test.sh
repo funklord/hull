@@ -462,6 +462,12 @@ out=$("$hull" export --bootable -f "$root/board-export.conf" "$root/board.ova" 2
 got=$?
 status 'a board exported as an appliance is refused' "$got" 125 "$out"
 says 'and said' "$out" 'an appliance describes a PC'
+printf '(machine (backend pc) (source "media:disk") (media (medium (type disk) (source "dir:./"))))\n' \
+	> "$root/board-export.conf"
+out=$("$hull" export --bootable -f "$root/board-export.conf" "$root/board.ova" 2>&1)
+got=$?
+status 'a collection disk exported as an appliance is refused' "$got" 125 "$out"
+says 'naming what makes it an image' "$out" 'hull media export DIR IMAGE'
 rm -rf "$root/reimported"
 rm -f "$root/back.ova" "$root/back2.ova" "$root/board-export.conf"
 # The cache the appliance was unpacked into, so the cases below count
