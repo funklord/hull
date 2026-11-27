@@ -2795,21 +2795,61 @@ static int wait_done(hull_machine *m, int ms)
 	return done;
 }
 
-/* TERM, then KILL after `timeout_ms`. The reader reaps it, so the pid is
- * signalled only while it is not done, under the lock. */
+static const char *monitor_say(hull_machine *m, const char *command, char *why, size_t cap);
+
+/* A PC's stop presses its power button, as VirtualBox's ACPI Shutdown
+ * does: qemu quits at TERM without a word to the guest, which for an XP
+ * or a Linux with its disk mounted is the plug pulled. The guest is given
+ * `timeout_ms` to act on it, then TERM and KILL as before. A board, a
+ * Mac, 86Box's PC, a paused machine and a stop with no grace -- the
+ * core's own end -- take TERM at once, having no button qemu presses.
+ * 1 where the guest powered off, -1 where it was pressed and the grace
+ * ran out, 0 where it was not pressed. */
+static int pressed_power(hull_machine *m, int timeout_ms)
+{
+	static const char command[] = "{\"execute\":\"system_powerdown\"}\n";
+	char              why[256];
+	int               pressed;
+
+	if (timeout_ms <= 0 || m->box || is_mac(m->machine_type) ||
+	    board_named(m->machine_type) != NULL)
+		return 0;
+	pthread_mutex_lock(&m->lock);
+	pressed = !m->done && !m->paused && m->monitor >= 0;
+	pthread_mutex_unlock(&m->lock);
+	if (!pressed)
+		return 0;
+	pthread_mutex_lock(&m->monitor_lock);
+	pressed = monitor_say(m, command, why, sizeof why) == NULL;
+	pthread_mutex_unlock(&m->monitor_lock);
+	if (!pressed)
+		return 0;
+	return wait_done(m, timeout_ms) ? 1 : -1;
+}
+
+/* TERM, then KILL after `timeout_ms`, a PC's power button pressed first.
+ * The reader reaps it, so the pid is signalled only while it is not done,
+ * under the lock. */
 static hull_status pc_stop(hull_core *core, hull_machine *m, int timeout_ms, hull_error *error)
 {
+	int pressed;
+
 	(void)core;
 	(void)error;
 	pthread_mutex_lock(&m->lock);
 	m->stopping = 1;
+	pthread_mutex_unlock(&m->lock);
+	if ((pressed = pressed_power(m, timeout_ms)) == 1)
+		return HULL_OK;
+	pthread_mutex_lock(&m->lock);
 	if (!m->done && m->pid > 0) {
 		if (m->paused)
 			kill(m->pid, SIGCONT);
 		kill(m->pid, SIGTERM);
 	}
 	pthread_mutex_unlock(&m->lock);
-	if (!wait_done(m, timeout_ms > 0 ? timeout_ms : 1)) {
+	/* The grace spent on the button, qemu's TERM is a moment's. */
+	if (!wait_done(m, pressed != 0 ? 2000 : timeout_ms > 0 ? timeout_ms : 1)) {
 		pthread_mutex_lock(&m->lock);
 		if (!m->done && m->pid > 0)
 			kill(m->pid, SIGKILL);
@@ -3613,6 +3653,9 @@ static const hull_cap_entry entries[] = {
 	  "the screen, keyboard and mouse in hull-gui by qemu's D-Bus display, this host only, "
 	  "its frames shared", NULL },
 	{ "memory",             HULL_SUP_NATIVE,   NULL, NULL },
+	{ "stop_grace",         HULL_SUP_NATIVE,
+	  "a PC's power button pressed, its guest given the grace to act on it, then TERM; a "
+	  "board's or a Mac's TERM, then KILL after it", NULL },
 	{ "cpus",               HULL_SUP_NATIVE,   NULL, NULL },
 	{ "pc.pointer.ps2",    HULL_SUP_NATIVE, "a PS/2 mouse, moved by deltas: hull-gui's screen "
 	  "captures it, Right Ctrl releasing", NULL },
@@ -3803,6 +3846,7 @@ static const hull_cap_entry box_entries[] = {
 	{ "display.window",     HULL_SUP_NATIVE,
 	  "86Box's own window on the X display the run was given", NULL },
 	{ "memory",             HULL_SUP_NATIVE,   "the board's RAM, which 86Box rounds to it", NULL },
+	{ "stop_grace",         HULL_SUP_NATIVE,   "86Box's TERM, then KILL after it", NULL },
 	{ "86box.machine.path", HULL_SUP_NATIVE,
 	  "an 86Box machine by its name, its ROM from the fetched set", NULL },
 	{ "86box.cpu.path",     HULL_SUP_NATIVE,   "a CPU family of 86Box's, the board's first if none",

@@ -335,6 +335,31 @@ else
 	printf 'pc: no qemu-system-ppc (make qemu-ppc), the PowerPC Mac not tried\n'
 fi
 
+# Stopped, a PC's power button is pressed and its guest given its grace,
+# as VirtualBox's ACPI Shutdown gives it, where qemu's TERM had quit at
+# once with no word to the guest: a boot sector that spins, which never
+# acts on the button, is stopped only after its three seconds.
+truncate -s 1440K "$root/spin.img"
+printf '\353\376' | dd of="$root/spin.img" conv=notrunc status=none
+printf '\125\252' | dd of="$root/spin.img" bs=1 seek=510 conv=notrunc status=none
+conf '(hostname "pc-spin") (source "media:floppy") (stop_grace "3s")' \
+	'(media (medium (type floppy) (source "image:./spin.img")))'
+(cd "$root" && exec timeout 120 "$hull" run -f "$root/hull.conf" > "$root/spin.out" 2>&1) &
+spin_pid=$!
+tries=0
+until timeout 10 "$hull" ps 2>/dev/null | grep -q 'pc-spin .*running' || [ "$tries" -ge 100 ]; do
+	tries=$((tries + 1))
+	sleep 0.1
+done
+began=$(date +%s)
+timeout 30 "$hull" stop pc-spin > /dev/null 2>&1
+took=$(($(date +%s) - began))
+wait "$spin_pid"
+cases=$((cases + 1))
+[ "$took" -ge 3 ] && [ "$took" -le 8 ] ||
+	fail "a PC's stop waits its grace on the power button: took ${took}s" "$(cat "$root/spin.out")"
+rm -f "$root/spin.img" "$root/spin.out"
+
 # Imported, as hull-gui's Import is: the .vbox copied into a folder of
 # its own, its VDI converted to qcow2 there and its hull.conf saying so,
 # changes kept in the copy; the copy boots, the VDI is as it was, a
