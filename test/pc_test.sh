@@ -410,6 +410,34 @@ wait "$spin_pid"
 cases=$((cases + 1))
 [ -z "$("$hull" snapshot ls "$root/hull.conf" 2>&1)" ] ||
 	fail 'a deleted live snapshot is listed no more' "$("$hull" snapshot ls "$root/hull.conf" 2>&1)"
+# Saved, VirtualBox's Save the machine state: `hull stop --save` keeps
+# its memory and disk as hull-saved and powers it off; started again it
+# resumes from them, says so, and the saved state is spent.
+live
+out=$("$hull" stop --save pc-live 2>&1)
+got=$?
+status 'a running machine saved' "$got" 0 "$out"
+wait "$spin_pid"
+says 'its state kept' "$(qemu-img snapshot -l "$root/spin.qcow2" 2>&1)" 'hull-saved'
+live
+cases=$((cases + 1))
+tries=0
+until grep -q 'resuming from its saved state' "$root/spin.out" 2>/dev/null || [ "$tries" -ge 50 ]; do
+	tries=$((tries + 1))
+	sleep 0.1
+done
+grep -q 'resuming from its saved state' "$root/spin.out" ||
+	fail 'started again, it resumes from its saved state' "$(cat "$root/spin.out")"
+cases=$((cases + 1))
+tries=0
+while qemu-img snapshot -U -l "$root/spin.qcow2" 2>/dev/null | grep -q hull-saved && [ "$tries" -lt 50 ]; do
+	tries=$((tries + 1))
+	sleep 0.1
+done
+! qemu-img snapshot -U -l "$root/spin.qcow2" 2>/dev/null | grep -q hull-saved ||
+	fail 'and its saved state is spent' "$(qemu-img snapshot -U -l "$root/spin.qcow2" 2>&1)"
+timeout 30 "$hull" stop pc-live > /dev/null 2>&1
+wait "$spin_pid"
 conf '(hostname "pc-live") (source "media:disk") (mutable overlay) (stop_grace "1s")' \
 	'(media (medium (type disk) (source "image:./spin.qcow2")))'
 live

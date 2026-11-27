@@ -146,7 +146,7 @@ static void usage(FILE *out)
 	      "       hull 86box fetch\n"
 	      "       hull export --bootable -f FILE [NAME] IMAGE|X.ova\n"
 	      "       hull build [-f FILE] [--check] REF\n"
-	      "       hull ps | hull stop [--timeout S] ID | hull logs [-f] ID | hull attach ID\n"
+	      "       hull ps | hull stop [--timeout S | --save] ID | hull logs [-f] ID | hull attach ID\n"
 	      "       hull exec [-t] ID [--] CMD [ARG...]\n"
 	      "       hull kill [-s SIGNAL] ID | hull stats [--guest] [--over S] ID\n"
 	      "       hull pause ID | hull unpause ID | hull wake ID\n"
@@ -7109,6 +7109,25 @@ static int snapshot_verb(const char *verb, const char *name, const char *path, c
 	return -1;
 }
 
+/* A snapshot verb on a running pc machine, by its id: its engine's, by
+ * qemu's monitor, its memory with its disks. */
+static int snapshot_running(const char *verb, const char *id, const char *name)
+{
+	char  arch[32];
+	char *words[3] = { "snapshot", (char *)verb, (char *)name };
+
+	if (list_machines(id, arch, sizeof arch) != 0) {
+		fprintf(stderr, "hull: snapshot: no file or running machine %s\n", id);
+		return 125;
+	}
+	if (strcmp(listed_engine, "qemu-pc") != 0) {
+		fprintf(stderr, "hull: snapshot: %s is on %s; a snapshot is of a pc machine's disks\n",
+		        id, listed_engine);
+		return 125;
+	}
+	return exec_in(id, words, 3, 0, 0u);
+}
+
 /* `hull snapshot ls|take|restore|delete FILE [NAME]`: a stopped pc
  * machine's disks, every one of them together, as VirtualBox's Snapshots
  * pane keeps a machine's: qemu's internal snapshots, inside each qcow2,
@@ -7143,24 +7162,12 @@ static int snapshot(const char *verb, const char *file, const char *name)
 	/* Not a file: a running machine's id, whose engine takes it with its
 	 * memory, as VirtualBox's Take Snapshot of a running machine does. */
 	if (access(file, F_OK) != 0 && strchr(file, '/') == NULL) {
-		char  arch[32];
-		char *words[3] = { "snapshot", (char *)verb, (char *)name };
-
 		if (name == NULL) {
 			fprintf(stderr, "hull: snapshot: ls reads the machine's file, which a running "
 			        "machine's are read from too\n");
 			return 2;
 		}
-		if (list_machines(file, arch, sizeof arch) != 0) {
-			fprintf(stderr, "hull: snapshot: no file or running machine %s\n", file);
-			return 125;
-		}
-		if (strcmp(listed_engine, "qemu-pc") != 0) {
-			fprintf(stderr, "hull: snapshot: %s is on %s; a snapshot is of a pc machine's "
-			        "disks\n", file, listed_engine);
-			return 125;
-		}
-		return exec_in(file, words, 3, 0, 0u);
+		return snapshot_running(verb, file, name);
 	}
 	if ((data = spec_text(file, &length)) == NULL)
 		return 125;
@@ -9842,10 +9849,13 @@ int main(int argc, char **argv)
 		const char *signal_name = "KILL";
 		int         follow      = 0;
 		long        timeout     = -1;
+		int         save        = 0;
 
 		for (int i = 2; i < argc; i++) {
 			if (strcmp(command, "logs") == 0 && strcmp(argv[i], "-f") == 0)
 				follow = 1;
+			else if (strcmp(command, "stop") == 0 && strcmp(argv[i], "--save") == 0)
+				save = 1;
 			else if (strcmp(command, "stop") == 0 && strcmp(argv[i], "--timeout") == 0 &&
 			         i + 1 < argc)
 				timeout = labs(strtol(argv[++i], NULL, 10)) * 1000L;
@@ -9859,9 +9869,20 @@ int main(int argc, char **argv)
 				break;
 			}
 		}
-		if (id == NULL || signal_name == NULL) {
+		if (id == NULL || signal_name == NULL || (save && timeout >= 0)) {
 			usage(stderr);
 			return 2;
+		}
+		/* VirtualBox's Save the machine state: a PC's memory and disks
+		 * kept as a snapshot, hull-saved, then the machine powered off
+		 * at once, the guest never told; its next start resumes there
+		 * (engine/pc.c, saved_state). */
+		if (save) {
+			int saved = snapshot_running("take", id, "hull-saved");
+
+			if (saved != 0)
+				return saved;
+			return about("kill", id, 0, -1, "KILL");
 		}
 		return about(command, id, follow, timeout, signal_name);
 	}

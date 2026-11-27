@@ -78,6 +78,7 @@
 #include "hostdev.h"
 #include "hw.h"
 #include "86box.h"
+#include "hostnet.h"
 
 #define PC_MAX_MEDIA 6u    /* four on IDE, two floppy drives */
 #define PC_MAX_ARGS  160u  /* a USB stick takes four, an IDE medium two, a card four */
@@ -120,6 +121,7 @@ struct hull_machine {
 	unsigned        media_count;
 	char            boot;           /* -boot's letter */
 	int             direct;         /* (mutable direct) */
+	int             resume;         /* its disks hold its saved state, hull-saved */
 	char           *memory;         /* (memory ...), or NULL for qemu's own */
 	char           *cpus;
 	char           *machine_type;
@@ -2006,6 +2008,12 @@ static void exec_pc(const hull_machine *m)
 	}
 	argv[n++] = "-boot";
 	argv[n++] = boot;
+	/* Its saved state, `hull stop --save`'s: the machine carries on from
+	 * where it was, its memory and disks as they were then. */
+	if (m->resume) {
+		argv[n++] = "-loadvm";
+		argv[n++] = "hull-saved";
+	}
 	/* A card, heard where there is a window, SDL's audio beside its
 	 * video, or where hull-gui shows the screen, on the host's sound
 	 * server or ALSA; and playing to nothing by VNC alone: a system still
@@ -2654,6 +2662,79 @@ static void *press_keys(void *arg)
 }
 
 /* The machine's thread: its images, qemu, and what it says to its end. */
+static int monitor_answer_for(hull_machine *m, char *why, size_t cap, long left, char *said,
+                              size_t said_cap);
+
+/* Whether the machine's disks hold a state `hull stop --save` kept: a
+ * snapshot hull-saved of the running machine, its memory in it, in the
+ * first disk, a qcow2 under (mutable direct). A PC on qemu alone. */
+static int saved_state(hull_machine *m)
+{
+	static char table[16384];
+	const char *disk = NULL;
+
+	if (!m->direct || m->box || is_mac(m->machine_type) || board_named(m->machine_type) != NULL)
+		return 0;
+	for (unsigned i = 0u; i < m->media_count && disk == NULL; i++)
+		if (m->media[i].type == 'd' && m->media[i].path != NULL && m->media[i].collection == NULL)
+			disk = m->media[i].path;
+	if (disk == NULL)
+		return 0;
+	{
+		const char *const argv[] = { "qemu-img", "snapshot", "-U", "-l", disk, NULL };
+
+		memset(table, 0, sizeof table);
+		if (hull_hostnet_run(argv, table, sizeof table) != 0)
+			return 0;
+	}
+	for (const char *line = table; *line != '\0';) {
+		const char *end = strchr(line, '\n');
+		size_t      n = end != NULL ? (size_t)(end - line) : strlen(line);
+		char        row[512];
+		char        id[32];
+		char        tag[128];
+		char        size[32];
+
+		snprintf(row, sizeof row, "%.*s", (int)(n < sizeof row ? n : sizeof row - 1u), line);
+		line += n + (end != NULL);
+		if (sscanf(row, "%31s %127s %31s", id, tag, size) == 3 && isdigit((unsigned char)id[0]) &&
+		    strcmp(tag, "hull-saved") == 0)
+			return strcmp(size, "0") != 0;
+	}
+	return 0;
+}
+
+/* The saved state deleted from every disk once the machine has resumed
+ * from it, by the monitor's delvm: said where it fails, for the next
+ * start would resume from it again. */
+static void drop_saved_state(hull_machine *m)
+{
+	static const char command[] = "{\"execute\":\"human-monitor-command\",\"arguments\":"
+	                              "{\"command-line\":\"delvm hull-saved\"}}\n";
+	char              said[512] = "";
+	const char       *wrong;
+
+	pthread_mutex_lock(&m->monitor_lock);
+	wrong = monitor_say(m, "{\"execute\":\"query-status\"}\n", m->monitor_why,
+	                    sizeof m->monitor_why);
+	if (wrong == NULL) {
+		if (send(m->monitor, command, strlen(command), MSG_NOSIGNAL) < 0 ||
+		    monitor_answer_for(m, m->monitor_why, sizeof m->monitor_why, 60000L, said,
+		                       sizeof said) != 1)
+			wrong = m->monitor_why;
+		else if (said[0] != '\0')
+			wrong = said;
+	}
+	pthread_mutex_unlock(&m->monitor_lock);
+	if (wrong != NULL) {
+		char line[700];
+		int  length = snprintf(line, sizeof line, "its saved state could not be dropped: %s; "
+		                       "`hull snapshot delete FILE hull-saved` does it\n", wrong);
+
+		host->on_data(m->core, NULL, 2, (const uint8_t *)line, (size_t)length);
+	}
+}
+
 static void *run_machine(void *arg)
 {
 	hull_machine *m = arg;
@@ -2674,12 +2755,22 @@ static void *run_machine(void *arg)
 		finish(m, -1, SIGTERM);
 		return NULL;
 	}
+	if (!failed && (m->resume = saved_state(m)) != 0) {
+		static const char said[] = "resuming from its saved state, hull-saved; `hull snapshot "
+		                           "delete FILE hull-saved` discards it\n";
+
+		host->on_data(m->core, NULL, 2, (const uint8_t *)said, sizeof said - 1u);
+	}
 	if (failed || prepare_state(m) != 0 || launch(m) != 0) {
 		host->on_data(m->core, NULL, 2, (const uint8_t *)m->why, strlen(m->why));
 		release_state(m);
 		finish(m, 125, 0);
 		return NULL;
 	}
+	/* Resumed, its saved state is spent, as VirtualBox's is at a start:
+	 * the next start boots, or resumes from a later save. */
+	if (m->resume)
+		drop_saved_state(m);
 	pressing = m->boot_key > 0 && pthread_create(&m->presser, NULL, press_keys, m) == 0;
 	read_machine(m);
 	if (pressing)
