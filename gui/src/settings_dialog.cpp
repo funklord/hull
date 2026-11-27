@@ -75,6 +75,31 @@ settings_dialog::settings_dialog(const QString &file_path, bool pc, QWidget *par
 		add(QStringLiteral("&Pointer:"),
 		    { QStringLiteral("tuning"), QStringLiteral("pc"), QStringLiteral("pointer") },
 		    { QStringLiteral("tablet"), QStringLiteral("ps2") }, false, false);
+		/* A PC's System and Display pages, as VirtualBox's: its chipset,
+		 * firmware, TPM and graphics. A board's or a Mac's machine is its
+		 * own word, which a chipset list would only offer to replace. */
+		const QString board = spec_value(text, { QStringLiteral("tuning"), QStringLiteral("pc"),
+		                                         QStringLiteral("machine") });
+
+		if (board.isEmpty() || board == QStringLiteral("pc") || board == QStringLiteral("q35") ||
+		    board == QStringLiteral("isapc")) {
+			add(QStringLiteral("C&hipset:"),
+			    { QStringLiteral("tuning"), QStringLiteral("pc"), QStringLiteral("machine") },
+			    { QStringLiteral("pc"), QStringLiteral("q35"), QStringLiteral("isapc") }, false,
+			    false);
+			add(QStringLiteral("Firm&ware:"),
+			    { QStringLiteral("tuning"), QStringLiteral("pc"), QStringLiteral("firmware") },
+			    { QStringLiteral("bios"), QStringLiteral("uefi"), QStringLiteral("uefi-secure") },
+			    false, false);
+			add(QStringLiteral("&TPM:"),
+			    { QStringLiteral("tuning"), QStringLiteral("pc"), QStringLiteral("tpm") },
+			    { QStringLiteral("true"), QStringLiteral("false") }, false, false);
+			add(QStringLiteral("&Graphics:"),
+			    { QStringLiteral("tuning"), QStringLiteral("pc"), QStringLiteral("vga") },
+			    { QStringLiteral("std"), QStringLiteral("cirrus"), QStringLiteral("vmware"),
+			      QStringLiteral("virtio"), QStringLiteral("none") },
+			    false, false);
+		}
 
 		/* Its disks and discs, as VirtualBox's Storage page: each record
 		 * shown by its type and source, a new one added by its image. */

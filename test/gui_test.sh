@@ -171,11 +171,20 @@ mkdir -p "$dir/settings/config"
 truncate -s 1M "$dir/settings/a.img" "$dir/settings/b.iso"
 ln -sf settings/a.img "$dir/a.img"
 ln -sf settings/b.iso "$dir/b.iso"
-keys "$dir" "b'\\x1bOR'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
+keys "$dir" "b'\\x1bOR'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
 	"b'\\t'" "b'\\t'" "b' '" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
 	"b' '" -- "$dir/settings.conf"
 has "$(cat "$dir/settings.conf")" '^  \(media \(medium \(type cdrom\) \(source "image:\./b\.iso"\)\)\)\)$' \
 	"Settings removed a disk and kept the disc"
+# A PC's firmware, VirtualBox's Enable EFI: the eighth Tab from Memory,
+# Down past Default and bios to uefi, written into its (tuning (pc ...)).
+printf '(machine (backend pc) (hostname "gui-efi") (source "media:disk")\n  (media (medium (type disk) (source "image:./a.img"))))\n' \
+	> "$dir/settings.conf"
+rm -rf "${dir:?}/settings/config"
+mkdir -p "$dir/settings/config"
+keys "$dir" "b'\\x1bOR'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" "b'\\t'" \
+	"b'\\x1b[B'" "b'\\x1b[B'" "b'\\r'" -- "$dir/settings.conf"
+has "$(cat "$dir/settings.conf")" '\(tuning \(pc \(firmware uefi\)\)\)' "Settings set a PC's firmware"
 # Every class's ports and shared folders: on a chroot machine the port's
 # Remove is the sixth Tab from Memory, the folder kept.
 printf '(machine (hostname "gui-ports") (source "dir:./rootfs")\n  (ports (port (host 8080) (guest 80)))\n  (volumes (volume (host "./rootfs") (guest "/data") (mode ro))))\n' \
