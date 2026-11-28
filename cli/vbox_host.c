@@ -336,7 +336,13 @@ static const char pc_script[] =
     "manage=/usr/lib/virtualbox/VBoxManage\n"
     "$manage createvm --name hull --register --basefolder /share/vbox >/dev/null || exit 1\n"
     "card='--nic1 none'\n"
-    "[ \"$network\" = nat ] && card=\"--nic1 nat --nic-type1 $nic\"\n"
+    /* VirtualBox's NAT on 10.0.3.0/24, not its default 10.0.2.0/24, which
+     * is the outer vm's own: a forwarded port reached by the outer vm's
+     * address 10.0.2.15 went to a guest of that same address and hung
+     * (measured: a banner by 127.0.0.1:2222 in the outer vm, none by
+     * 10.0.2.15:2222), and every port forwarded into the machine comes
+     * by that address. */
+    "[ \"$network\" = nat ] && card=\"--nic1 nat --nic-type1 $nic --natnet1 10.0.3.0/24\"\n"
     "$manage modifyvm hull --memory $memory --cpus $cpus --ioapic on --firmware $firmware \\\n"
     "	--chipset $chipset $card --audio-driver none --usb-ohci off \\\n"
     "	--graphicscontroller vmsvga --vram 128 --boot1 $boot --boot2 disk --boot3 dvd \\\n"

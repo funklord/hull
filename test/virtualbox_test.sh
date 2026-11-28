@@ -548,6 +548,78 @@ print(sum(1 for b in parts[3] if b > 128))' "$root/pcvb/screen.ppm" 2>/dev/null)
 		fail "VirtualBox's guest did not read what was typed" "$(tail -5 "$root/pcvb/out")"
 	cases=$((cases + 1))
 	[ -z "$(left)" ] || fail 'a VirtualBox PC typed into left something' "$(left)"
+	# A port at the machine's address, all the way: a busybox Linux,
+	# exported bootable as the pc suite's, on VirtualBox's e1000 at its
+	# NAT's 10.0.3.15, listening; the host's client reaches it through
+	# hull's forward to the outer vm, the outer vm's to VirtualBox's NAT,
+	# and VirtualBox's to the guest. VirtualBox's NAT on its default
+	# 10.0.2.0/24, the outer vm's own, hung there.
+	busybox=$(command -v busybox)
+	module=$(ls "/lib/modules/$(uname -r)/kernel/drivers/net/ethernet/intel/e1000/"e1000.ko* 2>/dev/null)
+	if [ -n "$busybox" ] && [ -n "$module" ]; then
+		tree=$root/pcvb/tree
+		mkdir -p "$tree/bin" "$tree/proc" "$tree/sys" "$tree/dev"
+		cp "$busybox" "$tree/bin/busybox"
+		for lib in $(ldd "$busybox" | grep -oE '/[^ ]+'); do
+			mkdir -p "$tree$(dirname "$lib")"
+			cp -L "$lib" "$tree$lib"
+		done
+		case $module in
+		*.xz) xz -dc "$module" > "$tree/e1000.ko" ;;
+		*) cp "$module" "$tree/e1000.ko" ;;
+		esac
+		cat > "$tree/init.sh" <<'INIT'
+#!/bin/busybox sh
+/bin/busybox mount -t proc proc /proc
+/bin/busybox --install -s /bin
+echo "a linux on virtualbox"
+insmod /e1000.ko
+ip link set eth0 up
+ip addr add 10.0.3.15/24 dev eth0
+ip route add default via 10.0.3.2
+echo listening
+nc -l -p 7000
+echo served
+poweroff -f
+INIT
+		chmod +x "$tree/init.sh"
+		cases=$((cases + 1))
+		out=$(timeout 120 "$hull" export --bootable "$tree" "$root/pcvb/linux.img" --init /init.sh 2>&1) ||
+			fail 'a bootable export for VirtualBox failed' "$out"
+		printf '(machine (backend virtualbox) (hostname "pcvb") (source "media:disk") %s %s %s)\n' \
+			'(memory "512M") (network nat) (stop_grace "2s") (ports (port (host 7000) (guest 7000)))' \
+			'(media (medium (type disk) (source "image:./linux.img")))' \
+			'(tuning (pc (nic e1000) (firmware uefi)))' > "$root/pcvb/hull.conf"
+		: > "$root/pcvb/out"
+		(cd "$root/pcvb" && exec timeout 300 "$hull" run -f hull.conf > out 2>&1) &
+		pcvb_pid=$!
+		tries=0
+		# Once its link is up -- VirtualBox's e1000 comes up five seconds
+		# after the guest asks -- and not before: a connection tried
+		# earlier is held by VirtualBox's NAT and handed to the guest when
+		# the link comes, its client long gone, and nc -l serves that one
+		# alone (measured: the suite's tries before the link, then nothing).
+		until grep -qa 'Link is Up' "$root/pcvb/out" 2>/dev/null || [ "$tries" -ge 240 ]; do
+			tries=$((tries + 1))
+			sleep 1
+		done
+		sleep 2
+		address=$("$hull" ps | awk '$1 == "pcvb" { print $2 }')
+		printf 'from the host\n' | timeout 20 nc -w 3 "$address" 7000 > /dev/null 2>&1
+		tries=0
+		while kill -0 "$pcvb_pid" 2> /dev/null && [ "$tries" -lt 90 ]; do
+			tries=$((tries + 1))
+			sleep 1
+		done
+		kill -0 "$pcvb_pid" 2> /dev/null && timeout 60 "$hull" stop pcvb > /dev/null 2>&1
+		wait "$pcvb_pid"
+		cases=$((cases + 1))
+		grep -qa 'from the host' "$root/pcvb/out" ||
+			fail "a client at a VirtualBox PC's address did not reach its forwarded port" \
+				"$(tail -8 "$root/pcvb/out")"
+		cases=$((cases + 1))
+		[ -z "$(left)" ] || fail 'a VirtualBox PC with a port left something' "$(left)"
+	fi
 	# 3D: VirtualBox's VMSVGA 3D by its DXVK on the outer vm's Vulkan --
 	# the host's GPU by Venus where the host gives Venus (/dev/udmabuf the
 	# user's and virglrenderer's render server), else llvmpipe by virgl.
