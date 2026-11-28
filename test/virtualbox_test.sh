@@ -530,12 +530,18 @@ print(sum(1 for b in parts[3] if b > 128))' "$root/pcvb/screen.ppm" 2>/dev/null)
 	cases=$((cases + 1))
 	out=$("$hull" type pcvb 'Hi, World!~' 2>&1) && out=$("$hull" key pcvb ret 2>&1) ||
 		fail 'hull type or hull key failed on virtualbox-pc' "$out"
+	# Then it powers itself off by VirtualBox's ACPI, which ends the run.
 	tries=0
-	until grep -q 'typed=' "$root/pcvb/out" 2>/dev/null || [ "$tries" -ge 60 ]; do
+	while kill -0 "$pcvb_pid" 2> /dev/null && [ "$tries" -lt 90 ]; do
 		tries=$((tries + 1))
 		sleep 1
 	done
-	timeout 60 "$hull" stop pcvb > /dev/null 2>&1
+	cases=$((cases + 1))
+	if kill -0 "$pcvb_pid" 2> /dev/null; then
+		fail "a VirtualBox PC's guest powering itself off did not end its run" \
+			"$(tail -5 "$root/pcvb/out")"
+		timeout 60 "$hull" stop pcvb > /dev/null 2>&1
+	fi
 	wait "$pcvb_pid"
 	cases=$((cases + 1))
 	grep -q 'typed=Hi, World!~' "$root/pcvb/out" ||

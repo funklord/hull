@@ -1,7 +1,8 @@
 ; key_boot.asm -- the system test/virtualbox_test.sh boots to see `hull type`
 ; and `hull key` reach a PC's keyboard: one sector, assembled with nasm,
 ; that says it is ready on COM1, reads keys by the BIOS until Enter, and
-; says what they spelled. Then it halts; the test stops the machine.
+; says what they spelled. Then it powers off by VirtualBox's ACPI, as a
+; guest shutting itself down does, and the test sees the run end.
 
 bits 16
 org 0x7c00
@@ -37,6 +38,11 @@ start:
 	call print
 	mov si, crlf
 	call print
+	; Off, by VirtualBox's ACPI: its PM1a control block at 0x4004, S5
+	; (its _S5's type, 5) with SLP_EN.
+	mov dx, 0x4004
+	mov ax, 0x3400
+	out dx, ax
 .halt:
 	hlt
 	jmp .halt
