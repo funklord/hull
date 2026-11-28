@@ -29,7 +29,9 @@
  *                   the driver waits in the store for the device: with the
  *                   disc as a second CD, three installs of four hung for
  *                   good at one of Setup's restarts, two of them on
- *                   virtio-vga and one not (project.md section 5.0);
+ *                   virtio-vga and one not (project.md section 5.0).
+ *                   With --virtualbox, which needs it, its NetKVM instead,
+ *                   for VirtualBox's virtio network card;
  *   password        the account's, which the answer file must carry for
  *                   its automatic logon, 0600. The account logs on at the
  *                   console at every boot, as hull-gui's window wants: the
@@ -262,8 +264,26 @@ static const char script_additions[] =
     "    & (Join-Path $ga 'cert\\VBoxCertUtil.exe') add-trusted-publisher $_.FullName --root $_.FullName\r\n"
     "  }\r\n"
     "  Start-Process -Wait (Join-Path $ga 'VBoxWindowsAdditions.exe') -ArgumentList '/S'\r\n"
+    "  Get-ChildItem (Join-Path $env:ProgramFiles 'Oracle\\VirtualBox Guest Additions') -Recurse "
+    "-Filter *.inf | ForEach-Object { pnputil /add-driver $_.FullName }\r\n"
     "} else {\r\n"
     "  Write-Output 'hull: no Guest Additions disc found'\r\n"
+    "}\r\n";
+
+/* With --virtualbox, before the script's end: virtio-win's NetKVM, from
+ * whichever drive holds it -- the stick -- into the driver store, for
+ * VirtualBox's virtio network card, which is not there yet. Windows 11
+ * has a driver for none of VirtualBox's other cards (measured: its
+ * 82540EM, SUBSYS_001E8086, left unconfigured, where qemu's e1000 binds).
+ * Signed by Microsoft's hardware programme, as viogpudo is. */
+static const char script_netkvm[] =
+    "$os = if ([Environment]::OSVersion.Version.Build -ge 22000) { 'w11' } else { 'w10' }\r\n"
+    "$net = Get-PSDrive -PSProvider FileSystem | ForEach-Object { Join-Path $_.Root \"NetKVM\\$os\\amd64\" } |\r\n"
+    "  Where-Object { Test-Path (Join-Path $_ 'netkvm.inf') } | Select-Object -First 1\r\n"
+    "if ($net) {\r\n"
+    "  pnputil /add-driver (Join-Path $net 'netkvm.inf')\r\n"
+    "} else {\r\n"
+    "  Write-Output 'hull: no virtio-win disc with NetKVM found'\r\n"
     "}\r\n";
 
 /* The answer file: the disk wiped and partitioned for UEFI, the edition at
@@ -355,8 +375,33 @@ static char *answer(unsigned index, const char *user, const char *secret)
 	return text;
 }
 
-static int virtio_win_disc(const char *iso, char *path, char *why, size_t cap);
-static int virtio_win_stage(const char *iso, const char *stage, char *why, size_t cap);
+/* What --drivers takes off a virtio-win disc, for both releases' amd64:
+ * the display driver, its catalogue, the resolution service and the
+ * program the service starts in a user's session -- not the debug
+ * symbols beside them, 30 MB of the disc. */
+static const char *const virtio_win_files[] = {
+	"viogpudo/w11/amd64/viogpudo.inf", "viogpudo/w11/amd64/viogpudo.sys",
+	"viogpudo/w11/amd64/viogpudo.cat", "viogpudo/w11/amd64/vgpusrv.exe",
+	"viogpudo/w11/amd64/viogpuap.exe",
+	"viogpudo/w10/amd64/viogpudo.inf", "viogpudo/w10/amd64/viogpudo.sys",
+	"viogpudo/w10/amd64/viogpudo.cat", "viogpudo/w10/amd64/vgpusrv.exe",
+	"viogpudo/w10/amd64/viogpuap.exe", NULL
+};
+
+/* What --drivers takes for --virtualbox: NetKVM, the network driver, and
+ * what its .inf names beside it -- netkvmp.exe -- for both releases'
+ * amd64. */
+static const char *const netkvm_files[] = {
+	"NetKVM/w11/amd64/netkvm.inf", "NetKVM/w11/amd64/netkvm.sys", "NetKVM/w11/amd64/netkvm.cat",
+	"NetKVM/w11/amd64/netkvmp.exe",
+	"NetKVM/w10/amd64/netkvm.inf", "NetKVM/w10/amd64/netkvm.sys", "NetKVM/w10/amd64/netkvm.cat",
+	"NetKVM/w10/amd64/netkvmp.exe", NULL
+};
+
+static int virtio_win_disc(const char *iso, const char *const *files, char *path, char *why,
+                           size_t cap);
+static int virtio_win_stage(const char *iso, const char *const *files, const char *stage,
+                            char *why, size_t cap);
 
 int hull_setup_windows(const char *iso, const char *dir, unsigned index, const char *user,
                        const char *drivers, int virtualbox, char *why, size_t cap)
@@ -396,12 +441,14 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 		snprintf(why, cap, "%s: a path with a quote or a backslash cannot be written to a spec", disc);
 		return -1;
 	}
-	if (drivers != NULL && virtualbox) {
-		snprintf(why, cap, "--drivers is virtio-win's for qemu; VirtualBox's drivers are its "
-		         "Guest Additions, which --virtualbox installs");
+	if (drivers == NULL && virtualbox) {
+		snprintf(why, cap, "--virtualbox needs --drivers VIRTIO-WIN.ISO: Windows has a driver for "
+		         "none of VirtualBox's network cards but its virtio one, which virtio-win's "
+		         "NetKVM drives");
 		return -1;
 	}
-	if (drivers != NULL && virtio_win_disc(drivers, driver_disc, why, cap) != 0)
+	if (drivers != NULL && virtio_win_disc(drivers, virtualbox ? netkvm_files : virtio_win_files,
+	                                       driver_disc, why, cap) != 0)
 		return -1;
 	/* VirtualBox's Guest Additions, as `hull virtualbox fetch` keeps them. */
 	if (virtualbox && (hull_vbox_additions(additions, sizeof additions) != 0 ||
@@ -448,7 +495,7 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 			logon = NULL;
 		if (logon == NULL ||
 		    asprintf(&full_script, "%.*s%s%s%s%s", (int)head, script, logon,
-		             driver_disc[0] != '\0' ? script_drivers : "",
+		             driver_disc[0] == '\0' ? "" : virtualbox ? script_netkvm : script_drivers,
 		             virtualbox ? script_additions : "", end) < 0) {
 			full_script = NULL;
 			free(logon);
@@ -464,7 +511,9 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 	if (put(stage, "autounattend.xml", xml, 0600, why, cap) != 0 ||
 	    put(stage, "hull-setup.ps1", full_script, 0600, why, cap) != 0 ||
 	    put(stage, "authorized_keys", keys, 0600, why, cap) != 0 ||
-	    (driver_disc[0] != '\0' && virtio_win_stage(driver_disc, stage, why, cap) != 0))
+	    (driver_disc[0] != '\0' &&
+	     virtio_win_stage(driver_disc, virtualbox ? netkvm_files : virtio_win_files, stage, why,
+	                      cap) != 0))
 		goto done;
 	{
 		char *line = NULL;
@@ -477,7 +526,8 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 	}
 	/* The stick: 8 MiB of FAT by mtools, the three files at its root with
 	 * their long names, and with --drivers the virtio-win files, 1.5 MB,
-	 * under viogpudo as on their disc. */
+	 * under viogpudo as on their disc -- NetKVM's, 0.9 MB, for
+	 * VirtualBox. */
 	{
 		int   fd = open(image, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
 		char  label[] = "ANSWER";
@@ -494,14 +544,16 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 			snprintf(why, cap, "mtools' mformat could not make the answer stick: Debian's mtools");
 			goto done;
 		}
+		const char *driver_dir = virtualbox ? "NetKVM" : "viogpudo";
+
 		for (const char *const *f = (const char *const[]){ "autounattend.xml", "hull-setup.ps1",
-		                                                   "authorized_keys", "viogpudo", NULL };
+		                                                   "authorized_keys", driver_dir, NULL };
 		     *f != NULL; f++) {
 			char  from[PATH_MAX + 32];
 			char  recurse[] = "-s";
 			char *copy[] = { "mcopy", recurse, "-i", image, from, "::/", NULL };
 
-			if (strcmp(*f, "viogpudo") == 0 && driver_disc[0] == '\0')
+			if (*f == driver_dir && driver_disc[0] == '\0')
 				break;
 
 			snprintf(from, sizeof from, "%s/%s", stage, *f);
@@ -571,7 +623,7 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 		    "  (display local)\n"
 		    "  (ports (port (host 2222) (guest 22)))\n"
 		    "  (media (medium (type disk) (source \"image:./disk.vdi\")))\n"
-		    "  (tuning (pc (machine q35) (tpm true) (firmware uefi-secure) (nic e1000))))\n") < 0) {
+		    "  (tuning (pc (machine q35) (tpm true) (firmware uefi-secure) (nic virtio))))\n") < 0) {
 			spec = NULL;
 			snprintf(why, cap, "out of memory");
 			goto done;
@@ -1178,24 +1230,12 @@ static char *disc_read(int fd, const char *path)
 	return text;
 }
 
-/* What --drivers takes off a virtio-win disc, for both releases' amd64:
- * the display driver, its catalogue, the resolution service and the
- * program the service starts in a user's session -- not the debug
- * symbols beside them, 30 MB of the disc. */
-static const char *const virtio_win_files[] = {
-	"viogpudo/w11/amd64/viogpudo.inf", "viogpudo/w11/amd64/viogpudo.sys",
-	"viogpudo/w11/amd64/viogpudo.cat", "viogpudo/w11/amd64/vgpusrv.exe",
-	"viogpudo/w11/amd64/viogpuap.exe",
-	"viogpudo/w10/amd64/viogpudo.inf", "viogpudo/w10/amd64/viogpudo.sys",
-	"viogpudo/w10/amd64/viogpudo.cat", "viogpudo/w10/amd64/vgpusrv.exe",
-	"viogpudo/w10/amd64/viogpuap.exe", NULL
-};
-
 /* --drivers' disc: a virtio-win disc, Red Hat's, holding the display
  * driver and its service for both releases' amd64, its real path in `path`
  * (PATH_MAX): 0, or -1 with `why`. Read here rather than an hour into the
  * install, where a wrong disc would leave the plain VGA silently. */
-static int virtio_win_disc(const char *iso, char *path, char *why, size_t cap)
+static int virtio_win_disc(const char *iso, const char *const *files, char *path, char *why,
+                           size_t cap)
 {
 	struct stat st;
 	int         fd;
@@ -1212,7 +1252,7 @@ static int virtio_win_disc(const char *iso, char *path, char *why, size_t cap)
 		snprintf(why, cap, "%s: %s", path, strerror(errno));
 		return -1;
 	}
-	for (const char *const *w = virtio_win_files; *w != NULL; w++) {
+	for (const char *const *w = files; *w != NULL; w++) {
 		struct disc_file file;
 
 		if (disc_find(fd, *w, &file) != 0 || file.length > (1u << 20)) {
@@ -1225,9 +1265,10 @@ static int virtio_win_disc(const char *iso, char *path, char *why, size_t cap)
 	return 0;
 }
 
-/* virtio_win_files copied off the disc into `stage`, at the disc's own
+/* `files` copied off the disc into `stage`, at the disc's own
  * paths, for the answer stick: 0, or -1 with `why`. */
-static int virtio_win_stage(const char *iso, const char *stage, char *why, size_t cap)
+static int virtio_win_stage(const char *iso, const char *const *files, const char *stage,
+                            char *why, size_t cap)
 {
 	int fd = open(iso, O_RDONLY | O_CLOEXEC);
 
@@ -1235,7 +1276,7 @@ static int virtio_win_stage(const char *iso, const char *stage, char *why, size_
 		snprintf(why, cap, "%s: %s", iso, strerror(errno));
 		return -1;
 	}
-	for (const char *const *w = virtio_win_files; *w != NULL; w++) {
+	for (const char *const *w = files; *w != NULL; w++) {
 		struct disc_file file;
 		char             to[PATH_MAX];
 		char            *bytes = NULL;

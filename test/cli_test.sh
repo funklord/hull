@@ -4990,17 +4990,33 @@ assert any("PreventDeviceEncryption /t REG_DWORD /d 1" in p for p in paths), pat
 		env HOME="$root/setup/home" "$hull" setup windows --user 'a b' "$root/setup/win.iso" "$root/setup/w3"
 	expect 1 'not a disc image' \
 		env HOME="$root/setup/home" "$hull" setup windows "$root/setup/nope.iso" "$root/setup/w4"
-	# --virtualbox: both machines virtualbox-pc's, a VDI disk, the Guest
-	# Additions' disc -- here a stand-in where `hull virtualbox fetch` keeps
-	# it -- a second CD, and the first logon's script installing them
-	# before it powers off; refused beside --drivers, and with no Additions
-	# fetched.
+	# --virtualbox: a VDI disk, the Guest Additions' disc -- here a
+	# stand-in where `hull virtualbox fetch` keeps it -- a second CD, and
+	# the first logon's script installing them before it powers off, their
+	# drivers put in the store; --drivers' NetKVM on the stick and in the
+	# store, for VirtualBox's virtio card, which machine.conf has. Refused
+	# without --drivers, and with no Additions fetched.
 	vbox_version=$(sed -n 's/^#define HULL_VBOX_VERSION "\(.*\)"/\1/p' engine/vbox.h)
 	mkdir -p "$root/setup/cache/hull" "$root/setup/nocache"
 	head -c 4096 /dev/zero > "$root/setup/cache/hull/virtualbox-$vbox_version-additions.iso"
+	nk=
+	for os in w11 w10; do
+		for f in netkvm.inf netkvm.sys netkvm.cat netkvmp.exe; do
+			nk="$nk NetKVM/$os/amd64/$f"
+		done
+	done
+	python3 -I "$(dirname "$0")/iso_tree.py" "$root/setup/nk.iso" $nk
 	expect 0 'install.conf installs Windows' \
 		env HOME="$root/setup/home" XDG_CACHE_HOME="$root/setup/cache" "$hull" setup windows \
-		--virtualbox "$root/setup/win.iso" "$root/setup/wv"
+		--virtualbox --drivers "$root/setup/nk.iso" "$root/setup/win.iso" "$root/setup/wv"
+	expect 0 '\(nic virtio\)' cat "$root/setup/wv/machine.conf"
+	expect 0 '(netkvm|NETKVM)( +(inf|INF)|\.inf)' mdir -i "$root/setup/wv/answer.img" ::/NetKVM/w11/amd64
+	cases=$((cases + 1))
+	tr -d '\r' < "$root/setup/wv/answer/hull-setup.ps1" |
+		awk '/Guest Additions.*pnputil \/add-driver/ { g = NR } /pnputil \/add-driver .Join-Path .net/ { n = NR }
+		     /^Stop-Computer/ { s = NR } END { exit !(g && n && g < s && n < s) }' ||
+		fail "the first logon's script does not put the Additions' and NetKVM's drivers in the store" \
+			"$(cat "$root/setup/wv/answer/hull-setup.ps1")"
 	expect 0 'file format: vdi' qemu-img info "$root/setup/wv/disk.vdi"
 	expect 0 'additions\.iso' cat "$root/setup/wv/install.conf"
 	# Installed by qemu-pc onto the VDI, Setup nested under VirtualBox
@@ -5014,12 +5030,15 @@ assert any("PreventDeviceEncryption /t REG_DWORD /d 1" in p for p in paths), pat
 		     /^Stop-Computer/ { s = NR } END { exit !(c && a && c < a && a < s) }' ||
 		fail "the first logon's script does not install the Guest Additions before powering off" \
 			"$(cat "$root/setup/wv/answer/hull-setup.ps1")"
-	expect 1 "VirtualBox's drivers are its Guest Additions" \
+	expect 1 '--virtualbox needs --drivers' \
+		env HOME="$root/setup/home" XDG_CACHE_HOME="$root/setup/cache" "$hull" setup windows \
+		--virtualbox "$root/setup/win.iso" "$root/setup/wv2"
+	expect 1 'not a virtio-win disc: no NetKVM/w11/amd64/netkvm.inf' \
 		env HOME="$root/setup/home" XDG_CACHE_HOME="$root/setup/cache" "$hull" setup windows \
 		--virtualbox --drivers "$root/setup/win.iso" "$root/setup/win.iso" "$root/setup/wv2"
 	expect 1 'Guest Additions have not been fetched' \
 		env HOME="$root/setup/home" XDG_CACHE_HOME="$root/setup/nocache" "$hull" setup windows \
-		--virtualbox "$root/setup/win.iso" "$root/setup/wv3"
+		--virtualbox --drivers "$root/setup/nk.iso" "$root/setup/win.iso" "$root/setup/wv3"
 	# --drivers: a virtio-win disc (iso_tree.py, the display driver and its
 	# service for both releases) whose files go on the stick, not a second
 	# CD of the install; the install on the standard VGA, machine.conf on

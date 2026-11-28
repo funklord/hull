@@ -175,7 +175,8 @@ static void usage(FILE *out)
 	      "       hull key ID KEY... | hull type ID TEXT | hull screenshot ID FILE\n"
 	      "       hull board ls POOL | hull board fix NAME\n"
 	      "       hull vagrant box add NAME FILE\n"
-	      "       hull setup windows [--index N] [--user NAME] [--drivers VIRTIO-WIN.iso] ISO DIR\n"
+	      "       hull setup windows [--index N] [--user NAME] [--virtualbox] [--drivers VIRTIO-WIN.iso]\n"
+	      "                          ISO DIR\n"
 	      "       hull setup freedos [--size MB] [--packages IMAGE] BOOT DIR\n"
 	      "       hull setup reactos [--size MB] ISO DIR\n"
 	      "       hull setup msdos [--size MB] FLOPPY DIR\n"
@@ -9683,7 +9684,7 @@ int main(int argc, char **argv)
 		}
 		if (at + 2 != argc) {
 			fprintf(stderr, "usage: hull setup windows [--index N] [--user NAME] "
-			        "[--drivers VIRTIO-WIN.iso | --virtualbox] ISO DIR\n");
+			        "[--virtualbox] [--drivers VIRTIO-WIN.iso] ISO DIR\n");
 			return 2;
 		}
 		if (hull_setup_windows(argv[at], argv[at + 1], (unsigned)index, user, drivers,
