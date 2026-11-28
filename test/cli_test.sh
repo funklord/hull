@@ -5014,8 +5014,9 @@ assert any("PreventDeviceEncryption /t REG_DWORD /d 1" in p for p in paths), pat
 	cases=$((cases + 1))
 	tr -d '\r' < "$root/setup/wv/answer/hull-setup.ps1" |
 		awk '/Guest Additions.*pnputil \/add-driver/ { g = NR } /pnputil \/add-driver .Join-Path .net/ { n = NR }
-		     /^Stop-Computer/ { s = NR } END { exit !(g && n && g < s && n < s) }' ||
-		fail "the first logon's script does not put the Additions' and NetKVM's drivers in the store" \
+		     /^Register-ScheduledTask -TaskName .hull drivers. -Trigger .New-ScheduledTaskTrigger -AtStartup/ { t = NR }
+		     /^Stop-Computer/ { s = NR } END { exit !(g && n && t && g < s && n < s && t < s) }' ||
+		fail "the first logon's script does not put the Additions' and NetKVM's drivers in the store, and install them at every start" \
 			"$(cat "$root/setup/wv/answer/hull-setup.ps1")"
 	expect 0 'file format: vdi' qemu-img info "$root/setup/wv/disk.vdi"
 	expect 0 'additions\.iso' cat "$root/setup/wv/install.conf"

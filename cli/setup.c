@@ -286,6 +286,28 @@ static const char script_netkvm[] =
     "  Write-Output 'hull: no virtio-win disc with NetKVM found'\r\n"
     "}\r\n";
 
+/* With --virtualbox, last: a task at every start, as SYSTEM, installing
+ * those drivers from the store onto whatever of their devices is there,
+ * and starting VBoxService after. Staged alone, Windows bound none of
+ * them on its first start under VirtualBox (measured: netkvm.inf and
+ * vboxguest.inf in the store as oem2 and oem3, the virtio card
+ * CM_PROB_REINSTALL, the Guest device CM_PROB_NOT_CONFIGURED, an hour
+ * on), where pnputil's /install bound the Guest device at once. Under
+ * qemu, where none of them is, it installs nothing. */
+static const char script_driver_task[] =
+    "$bin = Join-Path $env:ProgramFiles 'hull'\r\n"
+    "New-Item -ItemType Directory -Force -Path $bin | Out-Null\r\n"
+    "Set-Content -Path (Join-Path $bin 'drivers.ps1') -Value @'\r\n"
+    "Get-ChildItem (Join-Path $env:SystemRoot 'System32\\DriverStore\\FileRepository') -Recurse "
+    "-Include netkvm.inf,vboxguest.inf,vboxwddm.inf,vboxmouse.inf | "
+    "ForEach-Object { pnputil /add-driver $_.FullName /install }\r\n"
+    "Start-Service VBoxService -ErrorAction SilentlyContinue\r\n"
+    "'@\r\n"
+    "$act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "
+    "\"-NoProfile -ExecutionPolicy Bypass -File `\"$(Join-Path $bin 'drivers.ps1')`\"\"\r\n"
+    "Register-ScheduledTask -TaskName 'hull drivers' -Trigger (New-ScheduledTaskTrigger -AtStartup) "
+    "-Action $act -User 'SYSTEM' -RunLevel Highest -Force | Out-Null\r\n";
+
 /* The answer file: the disk wiped and partitioned for UEFI, the edition at
  * `index`, the EULA and the online-account pages passed, an
  * administrator `user` logged on once, which runs hull-setup.ps1 from the
@@ -494,9 +516,10 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 		if (asprintf(&logon, script_logon, user, secret) < 0)
 			logon = NULL;
 		if (logon == NULL ||
-		    asprintf(&full_script, "%.*s%s%s%s%s", (int)head, script, logon,
+		    asprintf(&full_script, "%.*s%s%s%s%s%s", (int)head, script, logon,
 		             driver_disc[0] == '\0' ? "" : virtualbox ? script_netkvm : script_drivers,
-		             virtualbox ? script_additions : "", end) < 0) {
+		             virtualbox ? script_additions : "",
+		             virtualbox ? script_driver_task : "", end) < 0) {
 			full_script = NULL;
 			free(logon);
 			snprintf(why, cap, "out of memory");
