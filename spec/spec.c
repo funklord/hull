@@ -595,7 +595,8 @@ static const char *const pc_machine_values[] = {
 	"xiao-esp32c6", "esp32c61", "esp32h2", "esp32-h2-devkitm-1", "esp32p4",
 	"esp32-p4-function-ev-board", NULL
 };
-static const char *const pc_vga_values[]     = { "std", "cirrus", "vmware", "virtio", "none", NULL };
+static const char *const pc_vga_values[]     = { "std", "cirrus", "vmware", "virtio", "vbox", "none",
+                                                 NULL };
 
 static const char *const pc_nic_values[]     = { "ne2k_pci", "ne2k_isa", "pcnet", "rtl8139",
                                                  "e1000", "e1000e", "virtio", "vmxnet3", "wifi", NULL };

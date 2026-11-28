@@ -345,7 +345,7 @@ static const char pc_script[] =
     "[ \"$network\" = nat ] && card=\"--nic1 nat --nic-type1 $nic --natnet1 10.0.3.0/24\"\n"
     "$manage modifyvm hull --memory $memory --cpus $cpus --ioapic on --firmware $firmware \\\n"
     "	--chipset $chipset $card --audio-driver none --usb-ohci off \\\n"
-    "	--graphicscontroller vmsvga --vram 128 --boot1 $boot --boot2 disk --boot3 dvd \\\n"
+    "	--graphicscontroller $(cat /share/graphics) --vram 128 --boot1 $boot --boot2 disk --boot3 dvd \\\n"
     "	--uart1 0x3f8 4 --uart-mode1 server /tmp/uart.sock || exit 1\n"
     "[ \"$tpm\" = yes ] && { $manage modifyvm hull --tpm-type 2.0 || exit 1; }\n"
     /* 3D: VMSVGA's, rendered by VirtualBox's DXVK on the outer vm's
@@ -788,6 +788,25 @@ int hull_vbox_pc(const char *work, const char *agent, const char *const *setting
 		        strcmp(bus, "ide") == 0 ? disks % 2u : 0u, drive, inner,
 		        strcmp(drive, "hdd") == 0 && !writable ? " --mtype immutable" : "");
 		disks++;
+	}
+	/* Its display card, (vga ...) as VirtualBox names it: VMSVGA, VMware's,
+	 * unless asked; VBoxSVGA, its own, for a Windows guest, whose Guest
+	 * Additions' WDDM driver names that card alone (measured: their
+	 * VBoxWddm.inf lists PCI\VEN_80EE&DEV_BEEF, and on VMSVGA Windows
+	 * kept its Basic Display Adapter). */
+	{
+		const char *vga = getenv("HULL_VBOX_VGA");
+		FILE       *marker;
+
+		snprintf(target, sizeof target, "%s/graphics", share);
+		if ((marker = fopen(target, "w")) == NULL ||
+		    fprintf(marker, "%s\n", vga == NULL || strcmp(vga, "vmware") == 0 ? "vmsvga" :
+		            strcmp(vga, "vbox") == 0 ? "vboxsvga" : strcmp(vga, "std") == 0 ? "vboxvga" :
+		            "none") < 0 || fclose(marker) != 0) {
+			say("the outer vm's files cannot be written");
+			fclose(file);
+			goto done;
+		}
 	}
 	if (strcmp(settings[3], "efi-secure") == 0) {
 		FILE *marker;

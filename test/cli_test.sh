@@ -5009,7 +5009,7 @@ assert any("PreventDeviceEncryption /t REG_DWORD /d 1" in p for p in paths), pat
 	expect 0 'install.conf installs Windows' \
 		env HOME="$root/setup/home" XDG_CACHE_HOME="$root/setup/cache" "$hull" setup windows \
 		--virtualbox --drivers "$root/setup/nk.iso" "$root/setup/win.iso" "$root/setup/wv"
-	expect 0 '\(nic virtio\)' cat "$root/setup/wv/machine.conf"
+	expect 0 '\(nic virtio\) \(vga vbox\)' cat "$root/setup/wv/machine.conf"
 	expect 0 '(netkvm|NETKVM)( +(inf|INF)|\.inf)' mdir -i "$root/setup/wv/answer.img" ::/NetKVM/w11/amd64
 	cases=$((cases + 1))
 	tr -d '\r' < "$root/setup/wv/answer/hull-setup.ps1" |

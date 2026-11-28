@@ -1685,8 +1685,13 @@ static const char *read_plan(hull_machine *m, const hull_sexpr_doc *doc,
 	if (m->gpu != 0 && m->display == NULL && !m->vnc && !m->local)
 		return "(gpu virgl) and (gpu venus) are a screen's 3D: the machine needs "
 		       "(display window) or (display vnc), or (display local)";
-	if (m->gpu != 0 && m->vga != NULL && strcmp(m->vga, "virtio") != 0)
+	if (m->gpu != 0 && m->vga != NULL && m->box != 2 && strcmp(m->vga, "virtio") != 0)
 		return "(gpu virgl) and (gpu venus) are virtio-vga's: (vga virtio), or no (vga ...)";
+	/* VirtualBox's 3D is its SVGA's, VMware's card or its own. */
+	if (m->gpu != 0 && m->vga != NULL && m->box == 2 && strcmp(m->vga, "vmware") != 0 &&
+	    strcmp(m->vga, "vbox") != 0)
+		return "(gpu virgl) and (gpu venus) on VirtualBox are its SVGA card's 3D: (vga vbox) or "
+		       "(vga vmware), or no (vga ...)";
 	if ((wrong = read_media(m, doc, machine)) != NULL)
 		return wrong;
 	for (unsigned i = 0u; m->box && i < m->media_count; i++)
@@ -2498,6 +2503,8 @@ static void exec_vbox(const hull_machine *m)
 			                       m->port_host[i], m->port_guest[i]);
 		setenv("HULL_VBOX_ADDRESS", m->address, 1);
 		setenv("HULL_VBOX_PORTS", ports, 1);
+		/* And its display card, (vga ...), VMSVGA where it names none. */
+		setenv("HULL_VBOX_VGA", m->vga != NULL ? m->vga : "vmware", 1);
 	}
 	for (unsigned i = 0u; i < m->media_count; i++) {
 		argv[n++] = m->media[i].type == 'c' ? "cdrom" : m->media[i].type == 'f' ? "floppy" :
@@ -4579,6 +4586,12 @@ static const hull_cap_entry vbox_pc_entries[] = {
 	{ "pc.nic.e1000",       HULL_SUP_NATIVE,   "VirtualBox's Intel PRO/1000 MT, 82540EM", NULL },
 	{ "pc.nic.pcnet",       HULL_SUP_NATIVE,   "VirtualBox's PCnet-FAST III", NULL },
 	{ "pc.nic.virtio",      HULL_SUP_NATIVE,   "VirtualBox's virtio-net", NULL },
+	{ "pc.vga.vmware",      HULL_SUP_NATIVE,
+	  "VirtualBox's VMSVGA, VMware's card, which Linux's vmwgfx drives", NULL },
+	{ "pc.vga.vbox",        HULL_SUP_NATIVE,
+	  "VirtualBox's VBoxSVGA, the card its Guest Additions' WDDM driver and its 3D want", NULL },
+	{ "pc.vga.std",         HULL_SUP_NATIVE,   "VirtualBox's VBoxVGA, Bochs' VBE card", NULL },
+	{ "pc.vga.none",        HULL_SUP_NATIVE,   NULL, NULL },
 	{ "security.no_new_privs", HULL_SUP_NATIVE, NULL, NULL },
 	{ "on_disconnect.stop", HULL_SUP_NATIVE,   NULL, NULL },
 	{ "hostname",           HULL_SUP_NATIVE,   "the machine's name, its OS's own", NULL },

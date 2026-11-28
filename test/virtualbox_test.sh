@@ -500,6 +500,25 @@ print(sum(1 for b in parts[3] if b > 128))' "$root/pcvb/screen.ppm" 2>/dev/null)
 	printf '%s\n' "$out" | grep -q 'pc.firmware.uefi-secure: native' &&
 		printf '%s\n' "$out" | grep -q 'pc.boot_key: native' ||
 		fail 'Secure Boot, a TPM and a boot key were not planned on virtualbox-pc' "$out"
+	# Its display card: VBoxSVGA by (vga vbox), the card the Windows
+	# Guest Additions' WDDM driver names, VirtualBox's alone; cirrus is
+	# not one of VirtualBox's.
+	printf '(machine (backend virtualbox) (source "media:disk") %s %s)\n' \
+		'(media (medium (type disk) (source "image:./raw.img")))' \
+		'(tuning (pc (vga vbox)))' > "$root/pcvb/vga.conf"
+	cases=$((cases + 1))
+	out=$("$hull" plan --explain -f "$root/pcvb/vga.conf" 2>&1)
+	printf '%s\n' "$out" | grep -q 'pc.vga.vbox: native' ||
+		fail '(vga vbox) was not planned on virtualbox-pc' "$out"
+	cases=$((cases + 1))
+	out=$("$hull" plan --backend qemu -f "$root/pcvb/vga.conf" 2>&1)
+	printf '%s\n' "$out" | grep -q 'rejected' ||
+		fail '(vga vbox) was not refused on qemu-pc' "$out"
+	sed 's/(vga vbox)/(vga cirrus)/' "$root/pcvb/vga.conf" > "$root/pcvb/cirrus.conf"
+	cases=$((cases + 1))
+	out=$("$hull" plan -f "$root/pcvb/cirrus.conf" 2>&1)
+	printf '%s\n' "$out" | grep -q 'rejected' ||
+		fail '(vga cirrus) was not refused on virtualbox-pc' "$out"
 	# `hull type`, `hull key` and `hull screenshot` on VirtualBox's own
 	# keyboard and screen, by VBoxManage in the outer vm: a boot sector
 	# reading keys by the BIOS says on COM1 what they spelled, shifted

@@ -646,7 +646,7 @@ int hull_setup_windows(const char *iso, const char *dir, unsigned index, const c
 		    "  (display local)\n"
 		    "  (ports (port (host 2222) (guest 22)))\n"
 		    "  (media (medium (type disk) (source \"image:./disk.vdi\")))\n"
-		    "  (tuning (pc (machine q35) (tpm true) (firmware uefi-secure) (nic virtio))))\n") < 0) {
+		    "  (tuning (pc (machine q35) (tpm true) (firmware uefi-secure) (nic virtio) (vga vbox))))\n") < 0) {
 			spec = NULL;
 			snprintf(why, cap, "out of memory");
 			goto done;
