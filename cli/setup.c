@@ -292,16 +292,24 @@ static const char script_netkvm[] =
  * them on its first start under VirtualBox (measured: netkvm.inf and
  * vboxguest.inf in the store as oem2 and oem3, the virtio card
  * CM_PROB_REINSTALL, the Guest device CM_PROB_NOT_CONFIGURED, an hour
- * on), where pnputil's /install bound the Guest device at once. Under
- * qemu, where none of them is, it installs nothing. */
+ * on), where pnputil's /install bound the Guest device at once. Again
+ * each minute, half an hour at most, while a device of VirtualBox's or
+ * virtio's is not working: Windows came to VBoxSVGA after the task's one
+ * pass (measured: CM_PROB_REINSTALL, the WDDM driver bound by hand).
+ * Under qemu, where none of them is, it installs nothing and ends. */
 static const char script_driver_task[] =
     "$bin = Join-Path $env:ProgramFiles 'hull'\r\n"
     "New-Item -ItemType Directory -Force -Path $bin | Out-Null\r\n"
     "Set-Content -Path (Join-Path $bin 'drivers.ps1') -Value @'\r\n"
-    "Get-ChildItem (Join-Path $env:SystemRoot 'System32\\DriverStore\\FileRepository') -Recurse "
-    "-Include netkvm.inf,vboxguest.inf,vboxwddm.inf,vboxmouse.inf | "
-    "ForEach-Object { pnputil /add-driver $_.FullName /install }\r\n"
-    "Start-Service VBoxService -ErrorAction SilentlyContinue\r\n"
+    "$inf = Get-ChildItem (Join-Path $env:SystemRoot 'System32\\DriverStore\\FileRepository') "
+    "-Recurse -Include netkvm.inf,vboxguest.inf,vboxwddm.inf,vboxmouse.inf\r\n"
+    "for ($i = 0; $i -lt 30; $i++) {\r\n"
+    "  $inf | ForEach-Object { pnputil /add-driver $_.FullName /install }\r\n"
+    "  Start-Service VBoxService -ErrorAction SilentlyContinue\r\n"
+    "  if (-not (Get-PnpDevice -PresentOnly | Where-Object { $_.Status -ne 'OK' -and "
+    "$_.InstanceId -match 'VEN_80EE|VEN_1AF4' })) { break }\r\n"
+    "  Start-Sleep -Seconds 60\r\n"
+    "}\r\n"
     "'@\r\n"
     "$act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "
     "\"-NoProfile -ExecutionPolicy Bypass -File `\"$(Join-Path $bin 'drivers.ps1')`\"\"\r\n"
