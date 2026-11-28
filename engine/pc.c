@@ -3398,6 +3398,271 @@ static hull_status screenshot(hull_machine *m, const char *path, hull_error *err
 	return ask_monitor(m, command, error);
 }
 
+/* virtualbox-pc's keyboard and screen: VBoxManage's, in the outer vm,
+ * reached as its host process reaches it -- `hull exec share` against that
+ * vm's own runtime directory -- running `script`, sh, with $m the
+ * VBoxManage command for this machine. A process and a second or so,
+ * nested; the core waits for it as for qemu's monitor, two minutes at
+ * most, and VirtualBox's own last words are the failure's. */
+static hull_status ask_vbox(hull_machine *m, const char *script, hull_error *error)
+{
+	extern char **environ;
+	static const char prefix[] = "HOME=/root VBOX_USER_HOME=/share/vbox; export HOME "
+	                             "VBOX_USER_HOME; m='/usr/lib/virtualbox/VBoxManage controlvm "
+	                             "hull'; ";
+	char        self[PATH_MAX];
+	char        dir[4096];
+	char        runtime[4400];
+	char        said[4096];
+	char        variable[4500];
+	const char *parent = getenv("XDG_RUNTIME_DIR");
+	ssize_t     length = readlink("/proc/self/exe", self, sizeof self - 1u);
+	size_t      got = 0u;
+	size_t      count = 0u;
+	char      **env;
+	char       *whole;
+	pid_t       child;
+	int         ends[2];
+	int         status = 0;
+	long        left = 120000L;
+
+	pthread_mutex_lock(&m->lock);
+	if (m->done || m->paused || m->vbox_child <= 0) {
+		int gone = m->done;
+		int paused = m->paused;
+
+		pthread_mutex_unlock(&m->lock);
+		return gone ? fail(error, HULL_ERR_GONE, "the machine is not running") :
+		       fail(error, HULL_ERR_BUSY, paused ? "the machine is paused" :
+		            "the machine is still starting");
+	}
+	pthread_mutex_unlock(&m->lock);
+	if (length <= 0 || hull_vbox_dir(dir, sizeof dir) != 0)
+		return fail(error, HULL_ERR_INTERNAL, "this process's own paths cannot be found");
+	self[length] = '\0';
+	/* Where the host process made it: beside the core's own runtime
+	 * directory, or in its work where that one is too deep. */
+	if (parent != NULL && parent[0] == '/' &&
+	    snprintf(runtime, sizeof runtime, "%s/vbox-pc-%ld", parent, (long)m->vbox_child) <
+	    (int)sizeof runtime && access(runtime, F_OK) == 0)
+		;
+	else
+		snprintf(runtime, sizeof runtime, "%s-run/pc-%ld/run", dir, (long)m->vbox_child);
+	snprintf(variable, sizeof variable, "XDG_RUNTIME_DIR=%s", runtime);
+	while (environ[count] != NULL)
+		count++;
+	if ((env = calloc(count + 2u, sizeof *env)) == NULL ||
+	    (whole = malloc(sizeof prefix + strlen(script))) == NULL) {
+		free(env);
+		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+	}
+	count = 0u;
+	for (char **e = environ; *e != NULL; e++)
+		if (strncmp(*e, "XDG_RUNTIME_DIR=", 16u) != 0)
+			env[count++] = *e;
+	env[count] = variable;
+	memcpy(whole, prefix, sizeof prefix - 1u);
+	memcpy(whole + sizeof prefix - 1u, script, strlen(script) + 1u);
+	pthread_mutex_lock(&m->monitor_lock);
+	if (pipe2(ends, O_CLOEXEC) != 0 || (child = fork()) < 0) {
+		pthread_mutex_unlock(&m->monitor_lock);
+		free(env);
+		free(whole);
+		return fail(error, HULL_ERR_INTERNAL, "VirtualBox could not be asked");
+	}
+	if (child == 0) {
+		const char *argv[] = { self, "exec", "share", "--", "/bin/sh", "-c", whole, NULL };
+		int         null = open("/dev/null", O_RDONLY | O_CLOEXEC);
+
+		if (null < 0 || dup2(null, 0) < 0 || dup2(ends[1], 1) < 0 || dup2(ends[1], 2) < 0 ||
+		    prctl(PR_SET_PDEATHSIG, SIGKILL, 0L, 0L, 0L) != 0)
+			_exit(126);
+		execve(self, (char *const *)argv, env);
+		_exit(127);
+	}
+	close(ends[1]);
+	free(env);
+	free(whole);
+	/* All it says, the last of it kept, until it closes or the time is
+	 * up. */
+	while (left > 0) {
+		struct pollfd   wait = { ends[0], POLLIN, 0 };
+		struct timespec before;
+		struct timespec after;
+		ssize_t         n;
+		int             ready;
+
+		clock_gettime(CLOCK_MONOTONIC, &before);
+		ready = poll(&wait, 1u, (int)left);
+		clock_gettime(CLOCK_MONOTONIC, &after);
+		left -= (after.tv_sec - before.tv_sec) * 1000L + (after.tv_nsec - before.tv_nsec) / 1000000L;
+		if (ready < 0 && errno == EINTR)
+			continue;
+		if (ready <= 0)
+			break;
+		if (got == sizeof said - 1u) {
+			memmove(said, said + sizeof said / 2u, sizeof said / 2u - 1u);
+			got = sizeof said / 2u - 1u;
+		}
+		n = read(ends[0], said + got, sizeof said - 1u - got);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0) {
+			left = 1;
+			break;
+		}
+		got += (size_t)n;
+	}
+	close(ends[0]);
+	if (left <= 0)
+		kill(child, SIGKILL);
+	while (waitpid(child, &status, 0) < 0 && errno == EINTR)
+		;
+	pthread_mutex_unlock(&m->monitor_lock);
+	said[got] = '\0';
+	if (left <= 0)
+		return fail(error, HULL_ERR_RUNTIME, "VirtualBox did not answer in two minutes");
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		char *line;
+		char *last = NULL;
+
+		/* VirtualBox's own last line, `VBoxManage: error: ...`. */
+		for (line = strtok(said, "\n"); line != NULL; line = strtok(NULL, "\n"))
+			if (strspn(line, " \t\r") != strlen(line))
+				last = line;
+		snprintf(m->monitor_why, sizeof m->monitor_why, "%s",
+		         last != NULL ? last : "VirtualBox could not do it");
+		return fail(error, HULL_ERR_RUNTIME, m->monitor_why);
+	}
+	return HULL_OK;
+}
+
+/* qemu's key names, as `hull key` and `hull type` give them, as the PC
+ * keyboard's scan codes of set 1, which VirtualBox takes: 0xe000 the
+ * extended's prefix. */
+static const struct {
+	const char    *name;
+	unsigned short code;
+} vbox_keys[] = {
+	{ "esc", 0x01 }, { "1", 0x02 }, { "2", 0x03 }, { "3", 0x04 }, { "4", 0x05 },
+	{ "5", 0x06 }, { "6", 0x07 }, { "7", 0x08 }, { "8", 0x09 }, { "9", 0x0a }, { "0", 0x0b },
+	{ "minus", 0x0c }, { "equal", 0x0d }, { "backspace", 0x0e }, { "tab", 0x0f },
+	{ "q", 0x10 }, { "w", 0x11 }, { "e", 0x12 }, { "r", 0x13 }, { "t", 0x14 }, { "y", 0x15 },
+	{ "u", 0x16 }, { "i", 0x17 }, { "o", 0x18 }, { "p", 0x19 }, { "bracket_left", 0x1a },
+	{ "bracket_right", 0x1b }, { "ret", 0x1c }, { "ctrl", 0x1d }, { "a", 0x1e }, { "s", 0x1f },
+	{ "d", 0x20 }, { "f", 0x21 }, { "g", 0x22 }, { "h", 0x23 }, { "j", 0x24 }, { "k", 0x25 },
+	{ "l", 0x26 }, { "semicolon", 0x27 }, { "apostrophe", 0x28 }, { "grave_accent", 0x29 },
+	{ "shift", 0x2a }, { "backslash", 0x2b }, { "z", 0x2c }, { "x", 0x2d }, { "c", 0x2e },
+	{ "v", 0x2f }, { "b", 0x30 }, { "n", 0x31 }, { "m", 0x32 }, { "comma", 0x33 },
+	{ "dot", 0x34 }, { "slash", 0x35 }, { "shift_r", 0x36 }, { "kp_multiply", 0x37 },
+	{ "alt", 0x38 }, { "spc", 0x39 }, { "caps_lock", 0x3a }, { "f1", 0x3b }, { "f2", 0x3c },
+	{ "f3", 0x3d }, { "f4", 0x3e }, { "f5", 0x3f }, { "f6", 0x40 }, { "f7", 0x41 },
+	{ "f8", 0x42 }, { "f9", 0x43 }, { "f10", 0x44 }, { "num_lock", 0x45 },
+	{ "scroll_lock", 0x46 }, { "kp_7", 0x47 }, { "kp_8", 0x48 }, { "kp_9", 0x49 },
+	{ "kp_subtract", 0x4a }, { "kp_4", 0x4b }, { "kp_5", 0x4c }, { "kp_6", 0x4d },
+	{ "kp_add", 0x4e }, { "kp_1", 0x4f }, { "kp_2", 0x50 }, { "kp_3", 0x51 }, { "kp_0", 0x52 },
+	{ "kp_decimal", 0x53 }, { "sysrq", 0x54 }, { "less", 0x56 }, { "f11", 0x57 },
+	{ "f12", 0x58 }, { "kp_enter", 0xe01c }, { "ctrl_r", 0xe01d }, { "kp_divide", 0xe035 },
+	{ "print", 0xe037 }, { "alt_r", 0xe038 }, { "home", 0xe047 }, { "up", 0xe048 },
+	{ "pgup", 0xe049 }, { "left", 0xe04b }, { "right", 0xe04d }, { "end", 0xe04f },
+	{ "down", 0xe050 }, { "pgdn", 0xe051 }, { "insert", 0xe052 }, { "delete", 0xe053 },
+	{ "meta_l", 0xe05b }, { "meta_r", 0xe05c }, { "menu", 0xe05d }, { "power", 0xe05e },
+	{ "sleep", 0xe05f }, { "wake", 0xe063 },
+};
+
+/* `hull key` on virtualbox-pc: each chord's keys pressed in order and let
+ * go in reverse, as qemu's send-key does, a few chords to each of
+ * VirtualBox's calls so that its keyboard's queue is not overrun. */
+static hull_status press_vbox(hull_machine *m, const char *keys, hull_error *error)
+{
+	size_t      cap = strlen(keys) * 16u + 64u;
+	char       *script = malloc(cap);
+	size_t      at = 0u;
+	size_t      batch = 0u;
+	const char *word = keys;
+	hull_status said;
+
+	if (script == NULL)
+		return fail(error, HULL_ERR_INTERNAL, "out of memory");
+	while (*word != '\0') {
+		size_t         length = strcspn(word, " ");
+		unsigned short chord[8];
+		unsigned       count = 0u;
+
+		if (length == 0u) {
+			word++;
+			continue;
+		}
+		for (size_t i = 0u; i < length; ) {
+			size_t   name = strcspn(word + i, "- ");
+			unsigned k;
+
+			if (name == 0u || name > 32u || count == 8u) {
+				free(script);
+				return fail(error, HULL_ERR_RUNTIME, "a key is a name of qemu's, `ret` or `a`, "
+				            "a chord of up to eight joined by -, `ctrl-alt-delete`");
+			}
+			for (k = 0u; k < sizeof vbox_keys / sizeof vbox_keys[0]; k++)
+				if (strlen(vbox_keys[k].name) == name &&
+				    memcmp(vbox_keys[k].name, word + i, name) == 0)
+					break;
+			if (k == sizeof vbox_keys / sizeof vbox_keys[0]) {
+				snprintf(m->monitor_why, sizeof m->monitor_why, "no key is named `%.*s`: a key "
+				         "is a name of qemu's, `ret`, `spc`, `shift`, `f1`", (int)name, word + i);
+				free(script);
+				return fail(error, HULL_ERR_RUNTIME, m->monitor_why);
+			}
+			chord[count++] = vbox_keys[k].code;
+			i += name + (word[i + name] == '-');
+		}
+		if (batch == 0u)
+			at += (size_t)snprintf(script + at, cap - at, "%s$m keyboardputscancode",
+			                       at > 0u ? " && " : "");
+		for (unsigned i = 0u; i < 2u * count; i++) {
+			unsigned short code = i < count ? chord[i] : chord[2u * count - 1u - i];
+			unsigned       up = i < count ? 0u : 0x80u;
+
+			if (code & 0xe000u)
+				at += (size_t)snprintf(script + at, cap - at, " e0");
+			at += (size_t)snprintf(script + at, cap - at, " %02x", (code & 0xffu) | up);
+		}
+		batch += count;
+		if (batch >= 8u)
+			batch = 0u;
+		word += length;
+	}
+	said = at == 0u ? HULL_OK : ask_vbox(m, script, error);
+	free(script);
+	return said;
+}
+
+/* `hull screenshot` on virtualbox-pc: VirtualBox's PNG, written into the
+ * share and copied to `path`. */
+static hull_status screenshot_vbox(hull_machine *m, const char *path, hull_error *error)
+{
+	static unsigned taken;
+	char            dir[4096];
+	char            script[256];
+	char            made[4500];
+	unsigned        n = __atomic_add_fetch(&taken, 1u, __ATOMIC_RELAXED);
+	hull_status     said;
+
+	if (path == NULL || path[0] != '/')
+		return fail(error, HULL_ERR_RUNTIME, "a screenshot's path is absolute by here");
+	if (hull_vbox_dir(dir, sizeof dir) != 0)
+		return fail(error, HULL_ERR_INTERNAL, "this process's own paths cannot be found");
+	snprintf(script, sizeof script, "$m screenshotpng /share/screen-%u.png", n);
+	snprintf(made, sizeof made, "%s-run/pc-%ld/share/screen-%u.png", dir, (long)m->vbox_child, n);
+	if ((said = ask_vbox(m, script, error)) != HULL_OK)
+		return said;
+	if (copy_file(made, path) != 0) {
+		unlink(made);
+		return fail(error, HULL_ERR_RUNTIME, "the screenshot could not be written");
+	}
+	unlink(made);
+	return HULL_OK;
+}
+
 /* The console's thread: the pipe, to its end, then the stream's end. */
 static void *deliver_console(void *arg)
 {
@@ -3609,15 +3874,18 @@ static hull_status pc_exec(hull_core *core, hull_machine *m, hull_buf spec, hull
 		while (count < 3u && hull_sexpr_next(&doc, &word, &word))
 			words[count++] = hull_access_text(&doc, &word);
 	}
-	/* 86Box has no monitor of qemu's to ask. */
+	/* 86Box has no monitor of qemu's to ask; VirtualBox's media and
+	 * snapshots are not changed while it runs, its keys and screen are
+	 * VBoxManage's. */
 	if (m->box && words[0] != NULL && (strcmp(words[0], "change") == 0 ||
 	                                   strcmp(words[0], "snapshot") == 0 ||
-	                                   strcmp(words[0], "key") == 0 ||
-	                                   strcmp(words[0], "screen") == 0)) {
+	                                   (m->box == 1 && (strcmp(words[0], "key") == 0 ||
+	                                                    strcmp(words[0], "screen") == 0)))) {
 		for (unsigned i = 0u; i < count; i++)
 			free(words[i]);
-		return fail(error, HULL_ERR_UNSUPPORTED, "an 86Box machine's media, keys and screen "
-		            "are its window's");
+		return fail(error, HULL_ERR_UNSUPPORTED, m->box == 1 ?
+		            "an 86Box machine's media, keys and screen are its window's" :
+		            "a VirtualBox PC's media and snapshots do not change while it runs");
 	}
 	/* `hull media change`, which asks and is done. */
 	if (words[0] != NULL && strcmp(words[0], "change") == 0 && words[1] != NULL) {
@@ -3641,7 +3909,9 @@ static hull_status pc_exec(hull_core *core, hull_machine *m, hull_buf spec, hull
 	if (words[0] != NULL && (strcmp(words[0], "key") == 0 || strcmp(words[0], "screen") == 0)) {
 		hull_status done = words[1] == NULL ?
 		                   fail(error, HULL_ERR_RUNTIME, "nothing was given to press or write") :
-		                   words[0][0] == 'k' ? press(m, words[1], error) :
+		                   words[0][0] == 'k' ? (m->box == 2 ? press_vbox(m, words[1], error) :
+		                                         press(m, words[1], error)) :
+		                   m->box == 2 ? screenshot_vbox(m, words[1], error) :
 		                   screenshot(m, words[1], error);
 
 		for (unsigned i = 0u; i < count; i++)

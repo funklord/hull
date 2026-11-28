@@ -500,6 +500,48 @@ print(sum(1 for b in parts[3] if b > 128))' "$root/pcvb/screen.ppm" 2>/dev/null)
 	printf '%s\n' "$out" | grep -q 'pc.firmware.uefi-secure: native' &&
 		printf '%s\n' "$out" | grep -q 'pc.boot_key: native' ||
 		fail 'Secure Boot, a TPM and a boot key were not planned on virtualbox-pc' "$out"
+	# `hull type`, `hull key` and `hull screenshot` on VirtualBox's own
+	# keyboard and screen, by VBoxManage in the outer vm: a boot sector
+	# reading keys by the BIOS says on COM1 what they spelled, shifted
+	# and all, once Enter comes.
+	nasm -f bin -o "$root/key.bin" test/key_boot.asm
+	truncate -s 1M "$root/pcvb/key.img"
+	dd if="$root/key.bin" of="$root/pcvb/key.img" conv=notrunc status=none
+	printf '(machine (backend virtualbox) (hostname "pcvb") (source "media:disk") %s %s)\n' \
+		'(stop_grace "2s")' \
+		'(media (medium (type disk) (source "image:./key.img")))' > "$root/pcvb/hull.conf"
+	: > "$root/pcvb/out"
+	(cd "$root/pcvb" && exec timeout 300 "$hull" run -f hull.conf > out 2>&1) &
+	pcvb_pid=$!
+	tries=0
+	until grep -q 'ready-to-type' "$root/pcvb/out" 2>/dev/null || [ "$tries" -ge 240 ]; do
+		tries=$((tries + 1))
+		sleep 1
+	done
+	rm -f "$root/pcvb/screen.png"
+	cases=$((cases + 1))
+	out=$("$hull" screenshot pcvb "$root/pcvb/screen.png" 2>&1)
+	[ "$(od -An -tx1 -N4 "$root/pcvb/screen.png" 2>/dev/null | tr -d ' ')" = 89504e47 ] ||
+		fail "VirtualBox's screen was not taken as a PNG" "$out; $(tail -3 "$root/pcvb/out")"
+	cases=$((cases + 1))
+	out=$("$hull" key pcvb no-such-key 2>&1)
+	[ "$?" -eq 125 ] && printf '%s\n' "$out" | grep -q 'no key is named' ||
+		fail 'a key with no name of qemu was not refused on virtualbox-pc' "$out"
+	cases=$((cases + 1))
+	out=$("$hull" type pcvb 'Hi, World!~' 2>&1) && out=$("$hull" key pcvb ret 2>&1) ||
+		fail 'hull type or hull key failed on virtualbox-pc' "$out"
+	tries=0
+	until grep -q 'typed=' "$root/pcvb/out" 2>/dev/null || [ "$tries" -ge 60 ]; do
+		tries=$((tries + 1))
+		sleep 1
+	done
+	timeout 60 "$hull" stop pcvb > /dev/null 2>&1
+	wait "$pcvb_pid"
+	cases=$((cases + 1))
+	grep -q 'typed=Hi, World!~' "$root/pcvb/out" ||
+		fail "VirtualBox's guest did not read what was typed" "$(tail -5 "$root/pcvb/out")"
+	cases=$((cases + 1))
+	[ -z "$(left)" ] || fail 'a VirtualBox PC typed into left something' "$(left)"
 	# 3D: VirtualBox's VMSVGA 3D by its DXVK on the outer vm's Vulkan --
 	# the host's GPU by Venus where the host gives Venus (/dev/udmabuf the
 	# user's and virglrenderer's render server), else llvmpipe by virgl.

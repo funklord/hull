@@ -6409,7 +6409,7 @@ static int pc_machine(const char *what, const char *id)
 		fprintf(stderr, "hull: %s: no machine %s\n", what, id);
 		return 125;
 	}
-	if (strcmp(listed_engine, "qemu-pc") != 0) {
+	if (strcmp(listed_engine, "qemu-pc") != 0 && strcmp(listed_engine, "virtualbox-pc") != 0) {
 		fprintf(stderr, "hull: %s: %s is on %s; a pc machine's keyboard and screen are hull's to "
 		        "reach, anything else's own being a shell\n", what, id, listed_engine);
 		return 125;
