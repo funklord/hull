@@ -1116,7 +1116,9 @@ check: style contract test
 # The reader's tests -- the spec's against every ```scheme example in
 # project.md as well -- then the gate's own suite, which travels with the
 # gate. Tests are built here and only here: a plain `make` does not.
-test: $(TEST_BINS) $(HULL) $(PROBE) $(ARM64_PROBE) $(NSS_LIB) $(ROOT_BIN) vectors
+# The agent too, which test/disk_test.sh's vm boots: a fresh BUILD_DIR
+# had none, and four of its cases failed for it.
+test: $(TEST_BINS) $(HULL) $(AGENT_BIN) $(PROBE) $(ARM64_PROBE) $(NSS_LIB) $(ROOT_BIN) vectors
 	$(BUILD_DIR)/test/sexpr_test
 	$(BUILD_DIR)/test/framing_test
 	$(BUILD_DIR)/test/spec_test project.md
